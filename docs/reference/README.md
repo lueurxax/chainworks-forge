@@ -2,7 +2,7 @@
 
 Implementation-oriented reference docs for Chainworks Forge.
 
-If you need a current-head orientation first, start with [current-system-baseline.md](current-system-baseline.md), then read the relevant subsystem documents below.
+If you need a current-head orientation first, start with [current-system-baseline.md](current-system-baseline.md). Its code-derived inventory names the implementation owners to check when behavior landed outside proposal closeout; then read the relevant subsystem documents below.
 
 ## Foundation Layer
 
@@ -12,7 +12,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 
 ## Execution Engine
 
-- [workflow-execution-engine.md](workflow-execution-engine.md) — RunPlan compiler, Workflow Orchestrator, Agent Executor protocol, Artifact Manager, Transition Evaluator, Resume Manager, Execution Service, **durable side effects**, and **lead conflict mediation**
+- [workflow-execution-engine.md](workflow-execution-engine.md) — RunPlan compiler, Workflow Orchestrator, Agent Executor protocol, Artifact Manager, Transition Evaluator, Resume Manager, Execution Service, **durable side effects**, **quality-gate blocker boundary routing**, and **lead conflict mediation**
 - [artifact-discovery-and-settlement-optimization.md](artifact-discovery-and-settlement-optimization.md) — Bounded discovery, settlement pipeline, and pre-prompt metadata
 - [runtime-contract.md](runtime-contract.md) — Frozen run snapshots, state machines, artifact model, storage boundaries, resume/retry rules, and **mediation-owned execution identity**
 - [execution-truth-and-recovery.md](execution-truth-and-recovery.md) — Canonical terminal outcomes, atomic transition settlement, cursor-driven resume, stage-owned recovery evidence, approval restore, runtime binding truth, host interruption, **side-effect reconciliation**, **mediation settlement**, and startup recovery progress readback
@@ -21,7 +21,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [failed-stage-evidence-delivery-preflight-and-mcp-resolution.md](failed-stage-evidence-delivery-preflight-and-mcp-resolution.md) — Rust failed-stage evidence packets, delivery preflight, execution-time MCP resolution, ACP `mcpServers`, and northbound readback
 - [acp-runtime-transport.md](acp-runtime-transport.md) — ACP transport contract, runtime selection, adapter families (Claude/Gemini/Codex/Auggie/Junie), persisted runtime truth, Junie structured-output canary proof, Junie code-writer preflight/launch gating, provider toolchain cache mapping, and capacity management
 - [structured-output-envelope-and-contract-validation.md](structured-output-envelope-and-contract-validation.md) — Named ACP output envelopes, canonical contract binding, validation modes, normalized artifact identity, Junie canary proof, and durable validation-failure substrate
-- [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, canonical artifact-contract transition truth, implementation self-assessment and handoff, generated run-state projection, failed-stage evidence, same-run retry truth, Junie code-writer completion-boundary subtypes, staged repair settlement, declarative Tier 1 enforcement, and bounded proposal compaction
+- [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, canonical artifact-contract transition truth, quality-gate blocker boundary contracts/readback, implementation self-assessment and handoff, generated run-state projection, failed-stage evidence, same-run retry truth, Junie code-writer completion-boundary subtypes, staged repair settlement, declarative Tier 1 enforcement, and bounded proposal compaction
 - [implementation-closeout-readiness.md](implementation-closeout-readiness.md) — Active closeout readiness authority, state-9 release routing, GraphQL/MCP/macOS readback, rollout evidence, and retained gate aliases
 - [p077-rollout-dependency-evidence.md](p077-rollout-dependency-evidence.md) — Retained historical alias evidence file for closeout readiness dependency checklist, rollout metric ledger, expansion decision fields, and rollback evidence contract
 - [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md) — Reusable session lineage, invocation owner keys, binding fingerprints, reuse policy taxonomy, live ACP session ownership, context budget evaluation, checkpoint rehydration, and shell-owned per-agent reset
@@ -34,9 +34,10 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [rust-control-plane.md](rust-control-plane.md) — Rust + SQLite local control-plane daemon: architecture, crate layout, workflow engine, ACP transport, persistence model, side-effect ledger, targeted retry authority and retry payload recovery, boundary shape, configuration, capacity-aware scheduling, DbWriter gateway, write serialization, evidence spooling, provider toolchain homes, **mediation settlement**, and generated-state housekeeping
 - [escalation-policies.md](escalation-policies.md) — Configurable agent escalation chains, policy definition, runtime behavior, and operational controls
 - [local-daemon-lifecycle-supervision-and-packaging.md](local-daemon-lifecycle-supervision-and-packaging.md) — Local daemon lifecycle, supervision, health/readiness, packaged-mode paths, SQLite startup safety, failed-serve behavior, diagnostics, and packaging proof lanes
-- [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md) — Bearer auth, caller-scoped capability filtering, per-command audit journaling, **mixed inbox (stage approvals + mediation confirmations)**, and `journal_id` surfacing on MCP + GraphQL northbound surfaces
+- [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md) — Bearer auth, caller-scoped capability filtering, full current MCP capability registry, per-command audit journaling, **mixed inbox (stage approvals + mediation confirmations)**, and `journal_id` surfacing on MCP + GraphQL northbound surfaces
 - [agent-work-continuation.md](agent-work-continuation.md) — Agent work continuation API contracts: `agents.continue_work` / `agents.continuation_status` / `agents.continuation_candidates` MCP commands, read-only GraphQL continuation status/candidate/history/metrics surfaces, and materialized JSON Schemas under [`p086/schemas/`](p086/schemas) for canonical request/response envelopes and continuation artifacts
 - [auto-retry-observation-ledger.md](auto-retry-observation-ledger.md) — Observe-only auto-retry ledger, known-issue catalog, MCP readback, rollup tooling, and retained proof-gate aliases
+- [bounded-tool-output-and-safe-search-policy.md](bounded-tool-output-and-safe-search-policy.md) — Runtime tool-output budgets, safe-search preflight denial, generated-root denylist, typed failure classification, session quarantine, and `runtime.health` guard readback (retained `proposal-096|p096` gate alias)
 - [ui-action-boundary.md](ui-action-boundary.md) — Governed SwiftUI action boundary: GraphQL reads/subscriptions plus approval mutations; non-approval operations are MCP-only
 - [per-run-workspace-isolation.md](per-run-workspace-isolation.md) — Per-run meta-root derivation, path resolution, ACP env handoff, worktree exemption, transition/normalization isolation, and legacy fallback semantics
 - [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) — Canonical GraphQL projection read contract for the thin macOS client: implemented surfaces, projection freshness, freshness budgets, subscriptions, backpressure, and downstream UI consumption rules
@@ -74,6 +75,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [test-gates.md](test-gates.md) — Layered local and CI execution gates, gate ownership, crash-aware runner behavior
 - [p041-generated-artifact-schemas.md](p041-generated-artifact-schemas.md) — Versioned schemas for server parity runtime artifacts, publication rows, and work products
 - [p031-p041-parity-evidence.json](p031-p041-parity-evidence.json) — Promoted reference snapshot for server parity evidence
+- [recovery-retry-state-machine-test-matrix.md](recovery-retry-state-machine-test-matrix.md) — Canonical P082 recovery/retry scenarios, reason-code vocabulary, nested readback schemas, lane placement, fail-closed side-effect behavior, late-output quarantine, startup-requeue exhausted held state, cancel-then-late-output, observability thresholds, and `proposal-082|p082` gate ownership
 - [agent-ui-test-execution.md](agent-ui-test-execution.md) — How agents should run preview review, focused XCUITest, and app-launched UI proof flows
 
 ## System Health

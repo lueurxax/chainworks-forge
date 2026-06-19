@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
@@ -13,6 +14,7 @@ use sqlx::{Row, SqlitePool};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
+use crate::command_handler::CommandHandler;
 use crate::release::{
     connect::ConnectPublishService,
     coordinator::ReleaseResult,
@@ -70,7 +72,8 @@ use crate::contracts::{
 };
 use crate::event_bus::EventSender;
 use crate::failure_classifier::{
-    classify_observation, observation_from_acp_error_message, RuntimeFailureClassification,
+    classify_observation, observation_from_acp_error_message,
+    observation_from_acp_error_message_at, RuntimeFailureClassification,
 };
 use crate::git_manifest::generate_changed_files_manifest_if_declared;
 use crate::housekeeping::{GeneratedStateHousekeeper, GeneratedStateHousekeepingConfig};
@@ -358,7 +361,14 @@ async fn resolve_escalation_chain_candidate(
     stage_id: &str,
     agent_id: &str,
     backend_profile_id_override: Option<&str>,
-) -> Result<Option<(domain::escalation::EscalationLedger, String, String)>> {
+) -> Result<
+    Option<(
+        domain::escalation::EscalationLedger,
+        String,
+        String,
+        Option<EscalationBackendProfileOverride>,
+    )>,
+> {
     let Some(run) = db::repos::runs::find_by_id(pool, run_id).await? else {
         return Ok(None);
     };
@@ -438,6 +448,16 @@ async fn resolve_escalation_chain_candidate(
         )
     };
 
+    let tier_snapshot = policy_snapshot
+        .tiers
+        .iter()
+        .find(|tier| tier.tier_id == resolved_tier_id);
+    let backend_override = tier_snapshot
+        .filter(|tier| tier.kind == "backend_profile")
+        .map(|tier| resolve_escalation_backend_profile_override(&run, tier))
+        .transpose()?
+        .flatten();
+
     let now = chrono::Utc::now();
     let ledger_candidate = domain::escalation::EscalationLedger {
         id: uuid::Uuid::new_v4().to_string(),
@@ -462,7 +482,228 @@ async fn resolve_escalation_chain_candidate(
         ledger_candidate,
         resolved_tier_id,
         resolved_tier_kind_raw,
+        backend_override,
     )))
+}
+
+type EscalationChainCandidate = (
+    domain::escalation::EscalationLedger,
+    String,
+    String,
+    Option<EscalationBackendProfileOverride>,
+);
+
+#[derive(Debug, Clone)]
+struct EscalationBackendProfileOverride {
+    backend_profile_id: String,
+    provider: String,
+    model: Option<String>,
+    effort: Option<String>,
+    max_turns: Option<u32>,
+    temperature: Option<f64>,
+}
+
+fn resolve_escalation_backend_profile_override(
+    run: &domain::run::Run,
+    tier: &workflow::plan::EscalationTierSnapshot,
+) -> Result<Option<EscalationBackendProfileOverride>> {
+    let Some(target_backend_profile_id) = tier.backend_profile_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(catalog_snapshot_json) = run.catalog_snapshot_json.as_deref() else {
+        return Ok(None);
+    };
+    let catalog: AgentCatalogFile = serde_json::from_str(catalog_snapshot_json)
+        .context("parse frozen catalog snapshot for escalation backend override")?;
+    let Some(profiles) = catalog.backend_profiles.as_ref() else {
+        return Ok(None);
+    };
+    let Some(profile) = profiles.get(target_backend_profile_id) else {
+        return Ok(None);
+    };
+    let provider = ProviderFamily::canonicalize_alias(&profile.provider).with_context(|| {
+        format!(
+            "escalation tier '{}' references backend_profile '{}' with unknown provider '{}'",
+            tier.tier_id, target_backend_profile_id, profile.provider
+        )
+    })?;
+
+    Ok(Some(EscalationBackendProfileOverride {
+        backend_profile_id: target_backend_profile_id.to_string(),
+        provider,
+        model: profile.model.clone(),
+        effort: profile.effort.clone(),
+        max_turns: profile.max_turns,
+        temperature: profile.temperature,
+    }))
+}
+
+enum ProviderQuotaEscalationResolution {
+    Available(EscalationChainCandidate),
+    FallbackQuotaWait {
+        provider_family: String,
+        wait: agent_retry_budget_ledger::ProviderFamilyQuotaWait,
+    },
+    None,
+}
+
+async fn resolve_provider_quota_escalation_candidate(
+    pool: &SqlitePool,
+    run_id: RunId,
+    stage_id: &str,
+    agent_id: &str,
+    backend_profile_id_override: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<ProviderQuotaEscalationResolution> {
+    let Some(run) = db::repos::runs::find_by_id(pool, run_id).await? else {
+        return Ok(ProviderQuotaEscalationResolution::None);
+    };
+    let Some(plan) = crate::command_handler::compile_run_plan_from_snapshot(&run)? else {
+        return Ok(ProviderQuotaEscalationResolution::None);
+    };
+    if plan.escalation_policies.is_empty() {
+        return Ok(ProviderQuotaEscalationResolution::None);
+    }
+
+    let backend_profile_id: Option<String> =
+        backend_profile_id_override.map(String::from).or_else(|| {
+            plan.states
+                .get(stage_id)
+                .and_then(|state| state.owner.backend_profile_id.clone())
+        });
+    let Some(resolved) = workflow::escalation_policy::resolve_policy_for_agent(
+        &plan.escalation_policies,
+        stage_id,
+        agent_id,
+        backend_profile_id.as_deref(),
+    ) else {
+        return Ok(ProviderQuotaEscalationResolution::None);
+    };
+    let Some(policy_snapshot) = plan
+        .escalation_policies
+        .iter()
+        .find(|policy| policy.policy_id == resolved.policy_id)
+    else {
+        return Err(anyhow::anyhow!(
+            "escalation_policy_resolution_internal_error: resolved policy {} is absent from frozen plan",
+            resolved.policy_id
+        ));
+    };
+    if !policy_snapshot
+        .triggers
+        .iter()
+        .any(|trigger| trigger == "provider_quota_exhausted")
+    {
+        return Ok(ProviderQuotaEscalationResolution::None);
+    }
+
+    let mut first_fallback_wait: Option<(
+        String,
+        agent_retry_budget_ledger::ProviderFamilyQuotaWait,
+    )> = None;
+    for tier in &policy_snapshot.tiers {
+        if tier.kind == "pause" {
+            break;
+        }
+        if tier.kind != "backend_profile" {
+            continue;
+        }
+        let Some(backend_override) = resolve_escalation_backend_profile_override(&run, tier)?
+        else {
+            continue;
+        };
+        let provider_family = ProviderFamily::canonicalize_known_alias(&backend_override.provider)
+            .unwrap_or_else(|| backend_override.provider.clone());
+        let candidate_wait = provider_quota_retry_wait_active(
+            pool,
+            &provider_family,
+            backend_override.model.as_deref(),
+            now,
+        )
+        .await?;
+        if let Some(wait) = candidate_wait {
+            first_fallback_wait.get_or_insert((provider_family, wait));
+            continue;
+        }
+
+        let ledger = domain::escalation::EscalationLedger {
+            id: uuid::Uuid::new_v4().to_string(),
+            run_id,
+            stage_id: stage_id.to_string(),
+            agent_id: agent_id.to_string(),
+            policy_id: resolved.policy_id.clone(),
+            policy_hash: resolved.policy_hash.clone(),
+            status_raw: "active".to_string(),
+            current_tier_id: Some(tier.tier_id.clone()),
+            current_tier_kind_raw: Some(tier.kind.clone()),
+            chain_attempt_index: 0,
+            trigger_raw: Some("provider_quota_exhausted".to_string()),
+            pause_reason_raw: None,
+            operator_action_hint: None,
+            runbook_anchor: None,
+            created_at: now,
+            updated_at: now,
+        };
+        return Ok(ProviderQuotaEscalationResolution::Available((
+            ledger,
+            tier.tier_id.clone(),
+            tier.kind.clone(),
+            Some(backend_override),
+        )));
+    }
+
+    if let Some((provider_family, wait)) = first_fallback_wait {
+        Ok(ProviderQuotaEscalationResolution::FallbackQuotaWait {
+            provider_family,
+            wait,
+        })
+    } else {
+        Ok(ProviderQuotaEscalationResolution::None)
+    }
+}
+
+fn apply_escalation_backend_override(
+    payload: &mut serde_json::Value,
+    backend_override: &EscalationBackendProfileOverride,
+) -> (String, Option<String>, String) {
+    let provider = backend_override.provider.clone();
+    let model = backend_override.model.clone();
+    let backend_profile_id = backend_override.backend_profile_id.clone();
+    payload["provider"] = serde_json::json!(provider.clone());
+    payload["backend_profile_id"] = serde_json::json!(backend_profile_id.clone());
+    match backend_override.model.as_deref() {
+        Some(model) => payload["model"] = serde_json::json!(model),
+        None => {
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("model");
+            }
+        }
+    }
+    match backend_override.effort.as_deref() {
+        Some(effort) => payload["effort"] = serde_json::json!(effort),
+        None => {
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("effort");
+            }
+        }
+    }
+    match backend_override.max_turns {
+        Some(max_turns) => payload["max_turns"] = serde_json::json!(max_turns),
+        None => {
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("max_turns");
+            }
+        }
+    }
+    match backend_override.temperature {
+        Some(temperature) => payload["temperature"] = serde_json::json!(temperature),
+        None => {
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("temperature");
+            }
+        }
+    }
+    (provider, model, backend_profile_id)
 }
 
 pub async fn claim_next_invoke_agent_with_start(
@@ -584,11 +825,16 @@ async fn invoke_item_has_start_capacity(
             return Ok(false);
         }
     }
-    let provider_family =
+    let mut provider_family =
         ProviderFamily::canonicalize_known_alias(provider).unwrap_or_else(|| provider.to_string());
-    let model = payload.get("model").and_then(|value| value.as_str());
+    let model = payload
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(String::from);
+    let model_ref = model.as_deref();
+    let now = chrono::Utc::now();
     if let Some(wait) =
-        provider_quota_retry_wait_active(pool, &provider_family, model, chrono::Utc::now()).await?
+        provider_quota_retry_wait_active(pool, &provider_family, model_ref, now).await?
     {
         let stage_execution_id = payload
             .get("stage_execution_id")
@@ -600,8 +846,8 @@ async fn invoke_item_has_start_capacity(
                     pool,
                     stage_execution_id,
                     &provider_family,
-                    model,
-                    chrono::Utc::now(),
+                    model_ref,
+                    now,
                 )
                 .await?
             {
@@ -614,9 +860,65 @@ async fn invoke_item_has_start_capacity(
                     "Operator retry consumed active provider-family quota wait"
                 );
             } else {
-                record_provider_quota_wait_on_pending_item(pool, item, &provider_family, &wait)
-                    .await?;
-                return Ok(false);
+                match resolve_provider_quota_escalation_candidate(
+                    pool,
+                    item.run_id
+                        .ok_or_else(|| anyhow::anyhow!("InvokeAgent work item missing run_id"))?,
+                    payload
+                        .get("stage_id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default(),
+                    payload
+                        .get("agent_id")
+                        .and_then(|value| value.as_str())
+                        .or_else(|| payload.get("stage_id").and_then(|value| value.as_str()))
+                        .unwrap_or_default(),
+                    payload
+                        .get("backend_profile_id")
+                        .and_then(|value| value.as_str()),
+                    now,
+                )
+                .await?
+                {
+                    ProviderQuotaEscalationResolution::Available(candidate) => {
+                        if let Some(backend_override) = candidate.3.as_ref() {
+                            provider_family = ProviderFamily::canonicalize_known_alias(
+                                &backend_override.provider,
+                            )
+                            .unwrap_or_else(|| backend_override.provider.clone());
+                            info!(
+                                work_item_id = %item.id,
+                                blocked_provider_family = %provider,
+                                selected_provider_family = %provider_family,
+                                selected_backend_profile_id = %backend_override.backend_profile_id,
+                                "Provider quota wait bypassed by escalation backend"
+                            );
+                        }
+                    }
+                    ProviderQuotaEscalationResolution::FallbackQuotaWait {
+                        provider_family,
+                        wait,
+                    } => {
+                        record_provider_quota_wait_on_pending_item(
+                            pool,
+                            item,
+                            &provider_family,
+                            &wait,
+                        )
+                        .await?;
+                        return Ok(false);
+                    }
+                    ProviderQuotaEscalationResolution::None => {
+                        record_provider_quota_wait_on_pending_item(
+                            pool,
+                            item,
+                            &provider_family,
+                            &wait,
+                        )
+                        .await?;
+                        return Ok(false);
+                    }
+                }
             }
         } else {
             record_provider_quota_wait_on_pending_item(pool, item, &provider_family, &wait).await?;
@@ -893,12 +1195,12 @@ async fn claim_invoke_agent_work_item_with_start(
         .and_then(|value| value.as_str())
         .unwrap_or(&stage_id)
         .to_string();
-    let provider = payload
+    let mut provider = payload
         .get("provider")
         .and_then(|value| value.as_str())
         .ok_or_else(|| anyhow::anyhow!("InvokeAgent payload missing provider"))?
         .to_string();
-    let model = payload
+    let mut model = payload
         .get("model")
         .and_then(|value| value.as_str())
         .map(String::from);
@@ -907,7 +1209,7 @@ async fn claim_invoke_agent_work_item_with_start(
         .and_then(|value| value.as_str())
         .unwrap_or(&stage_id)
         .to_string();
-    let payload_backend_profile_id = payload
+    let mut payload_backend_profile_id = payload
         .get("backend_profile_id")
         .and_then(|value| value.as_str())
         .map(String::from);
@@ -925,17 +1227,56 @@ async fn claim_invoke_agent_work_item_with_start(
         owner_execution_lineage_id: &owner_execution_lineage_id,
     });
 
-    let esc_candidate = resolve_escalation_chain_candidate(
-        pool,
-        run_id,
-        &stage_id,
-        &agent_id,
-        payload_backend_profile_id.as_deref(),
-    )
-    .await
-    .with_context(|| {
-        format!("P058 escalation chain resolution failed for run={run_id} stage={stage_id}")
-    })?;
+    let provider_family =
+        ProviderFamily::canonicalize_known_alias(&provider).unwrap_or_else(|| provider.clone());
+    let quota_candidate =
+        if provider_quota_retry_wait_active(pool, &provider_family, model.as_deref(), now)
+            .await?
+            .is_some()
+        {
+            match resolve_provider_quota_escalation_candidate(
+                pool,
+                run_id,
+                &stage_id,
+                &agent_id,
+                payload_backend_profile_id.as_deref(),
+                now,
+            )
+            .await?
+            {
+                ProviderQuotaEscalationResolution::Available(candidate) => Some(candidate),
+                ProviderQuotaEscalationResolution::FallbackQuotaWait { .. }
+                | ProviderQuotaEscalationResolution::None => None,
+            }
+        } else {
+            None
+        };
+
+    let esc_candidate = match quota_candidate {
+        Some(candidate) => Some(candidate),
+        None => resolve_escalation_chain_candidate(
+            pool,
+            run_id,
+            &stage_id,
+            &agent_id,
+            payload_backend_profile_id.as_deref(),
+        )
+        .await
+        .with_context(|| {
+            format!("P058 escalation chain resolution failed for run={run_id} stage={stage_id}")
+        })?,
+    };
+
+    if let Some(backend_override) = esc_candidate
+        .as_ref()
+        .and_then(|candidate| candidate.3.as_ref())
+    {
+        let (override_provider, override_model, override_backend_profile_id) =
+            apply_escalation_backend_override(&mut payload, backend_override);
+        provider = override_provider;
+        model = override_model;
+        payload_backend_profile_id = Some(override_backend_profile_id);
+    }
 
     let artifact_claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
         run_id,
@@ -997,31 +1338,37 @@ async fn claim_invoke_agent_work_item_with_start(
         return Ok(None);
     }
 
-    let (esc_policy_id, esc_policy_hash, esc_ledger_id, esc_tier_id, esc_tier_kind_raw) =
-        if let Some(ref candidate) = esc_candidate {
-            match escalation_repo::insert_or_ignore_ledger_tx(&mut tx, &candidate.0).await {
-                Ok(ledger_id) => (
-                    Some(candidate.0.policy_id.clone()),
-                    Some(candidate.0.policy_hash.clone()),
-                    Some(ledger_id),
-                    Some(candidate.1.clone()),
-                    Some(candidate.2.clone()),
-                ),
-                Err(error) => {
-                    if let Some(drift) =
-                        error.downcast_ref::<escalation_repo::EscalationPolicyDrift>()
-                    {
-                        let ledger_id = drift.ledger_id.clone();
-                        drop(tx);
-                        escalation_repo::open_drift_pause(pool, &ledger_id).await?;
-                        return Ok(None);
-                    }
-                    return Err(error);
+    let (
+        esc_policy_id,
+        esc_policy_hash,
+        esc_ledger_id,
+        esc_tier_id,
+        esc_tier_kind_raw,
+        esc_trigger_raw,
+    ) = if let Some(ref candidate) = esc_candidate {
+        match escalation_repo::insert_or_ignore_ledger_tx(&mut tx, &candidate.0).await {
+            Ok(ledger_id) => (
+                Some(candidate.0.policy_id.clone()),
+                Some(candidate.0.policy_hash.clone()),
+                Some(ledger_id),
+                Some(candidate.1.clone()),
+                Some(candidate.2.clone()),
+                candidate.0.trigger_raw.clone(),
+            ),
+            Err(error) => {
+                if let Some(drift) = error.downcast_ref::<escalation_repo::EscalationPolicyDrift>()
+                {
+                    let ledger_id = drift.ledger_id.clone();
+                    drop(tx);
+                    escalation_repo::open_drift_pause(pool, &ledger_id).await?;
+                    return Ok(None);
                 }
+                return Err(error);
             }
-        } else {
-            (None, None, None, None, None)
-        };
+        }
+    } else {
+        (None, None, None, None, None, None)
+    };
 
     agent_executions::insert_tx(
         &mut tx,
@@ -1071,7 +1418,7 @@ async fn claim_invoke_agent_work_item_with_start(
             escalation_policy_hash: esc_policy_hash,
             escalation_tier_id: esc_tier_id.clone(),
             escalation_tier_kind_raw: esc_tier_kind_raw.clone(),
-            escalation_trigger_raw: None,
+            escalation_trigger_raw: esc_trigger_raw.clone(),
             escalation_digest_version: None,
             escalation_ledger_id: esc_ledger_id.clone(),
         },
@@ -1091,7 +1438,7 @@ async fn claim_invoke_agent_work_item_with_start(
                 tier_id: tier_id.clone(),
                 tier_kind_raw: tier_kind_raw.clone(),
                 tier_attempt_index,
-                trigger_raw: None,
+                trigger_raw: esc_trigger_raw.clone(),
                 digest_version: None,
                 capacity_probe_counter: 0,
                 created_at: now,
@@ -1271,6 +1618,14 @@ struct BackgroundStewardAgentExecutor {
     runtime_inputs: Arc<crate::steward::config::StewardRuntimeInputs>,
 }
 
+fn advance_run_process_timeout() -> Duration {
+    std::env::var("CHAINWORKS_ADVANCE_RUN_PROCESS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(45))
+}
+
 #[async_trait::async_trait]
 impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExecutor {
     async fn run_steward_agent(
@@ -1350,6 +1705,7 @@ impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExe
                 reuse_existing_session: false,
                 session_generation_id: None,
                 provider_session_id: None,
+                provider_runtime_home: None,
                 mcp_servers: mcp_resolution.payloads,
                 chainworks_meta_root: Some(
                     invocation
@@ -1381,13 +1737,492 @@ impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExe
     }
 }
 
+#[cfg(unix)]
+fn write_discovered_output(path: &str, content: &[u8]) -> Result<()> {
+    write_discovered_output_dirfd_unix(Path::new(path), content)
+}
+
+#[cfg(unix)]
+fn write_discovered_output_dirfd_unix(path: &Path, content: &[u8]) -> Result<()> {
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    fn component_cstring(component: &std::ffi::OsStr) -> Result<CString> {
+        CString::new(component.as_bytes()).context("output path component contains NUL byte")
+    }
+
+    fn open_dir_at(parent_fd: RawFd, component: &std::ffi::OsStr) -> Result<File> {
+        let component = component_cstring(component)?;
+        let fd = unsafe {
+            libc::openat(
+                parent_fd,
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("open output directory component without following symlinks");
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn mkdir_at(parent_fd: RawFd, component: &std::ffi::OsStr) -> Result<()> {
+        let component = component_cstring(component)?;
+        let rc = unsafe { libc::mkdirat(parent_fd, component.as_ptr(), 0o755) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EEXIST) {
+            return Ok(());
+        }
+        Err(error).context("create output directory component without following symlinks")
+    }
+
+    let traversal_path = normalize_trusted_root_symlink_alias_unix(path);
+    let mut components = Vec::new();
+    let mut absolute = false;
+    for component in traversal_path.components() {
+        match component {
+            Component::RootDir => absolute = true,
+            Component::Normal(value) => components.push(value.to_os_string()),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                anyhow::bail!(
+                    "refusing to materialize output path with non-normal component: {}",
+                    traversal_path.display()
+                );
+            }
+        }
+    }
+
+    let Some((file_name, parent_components)) = components.split_last() else {
+        anyhow::bail!(
+            "refusing to materialize output without a file name: {}",
+            traversal_path.display()
+        );
+    };
+
+    let mut dir = File::open(if absolute { "/" } else { "." })
+        .context("open trusted output traversal root")?;
+    for component in parent_components {
+        mkdir_at(dir.as_raw_fd(), component.as_os_str())?;
+        dir = open_dir_at(dir.as_raw_fd(), component.as_os_str())?;
+    }
+
+    let file_name = component_cstring(file_name.as_os_str())?;
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            file_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o644,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "open output file without following symlinks: {}",
+                traversal_path.display()
+            )
+        });
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.write_all(content)
+        .with_context(|| format!("write discovered output: {}", traversal_path.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn normalize_trusted_root_symlink_alias_unix(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return path.to_path_buf();
+    }
+    let Some(Component::Normal(first)) = components.next() else {
+        return path.to_path_buf();
+    };
+
+    let root_child = Path::new("/").join(first);
+    let Ok(metadata) = std::fs::symlink_metadata(&root_child) else {
+        return path.to_path_buf();
+    };
+    if !metadata.file_type().is_symlink() {
+        return path.to_path_buf();
+    }
+
+    let Ok(mut normalized) = std::fs::canonicalize(&root_child) else {
+        return path.to_path_buf();
+    };
+    for component in components {
+        normalized.push(component.as_os_str());
+    }
+    normalized
+}
+
+#[cfg(not(unix))]
 fn write_discovered_output(path: &str, content: &[u8]) -> Result<()> {
     let path_obj = std::path::Path::new(path);
     if let Some(parent) = path_obj.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_discovered_output_parent_no_symlink(parent)?;
     }
-    std::fs::write(path_obj, content)?;
+    if let Ok(metadata) = std::fs::symlink_metadata(path_obj) {
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("discovered output target contains a symlink component");
+        }
+        if metadata.is_dir() {
+            anyhow::bail!("discovered output target is a directory");
+        }
+    }
+    write_file_no_follow(path_obj, content)?;
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_discovered_output_parent_no_symlink(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::Normal(_) => current.push(component.as_os_str()),
+            Component::CurDir => continue,
+            Component::ParentDir | Component::Prefix(_) => {
+                anyhow::bail!("discovered output target contains an unsafe path component");
+            }
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    anyhow::bail!("discovered output target contains a symlink component");
+                }
+                if !metadata.is_dir() {
+                    anyhow::bail!("discovered output target parent is not a directory");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)
+                    .with_context(|| format!("create output directory {}", current.display()))?;
+                let metadata = std::fs::symlink_metadata(&current)
+                    .with_context(|| format!("verify output directory {}", current.display()))?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    anyhow::bail!("discovered output target parent changed during creation");
+                }
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect output directory {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_file_no_follow(path: &Path, content: &[u8]) -> Result<()> {
+    use std::fs::File;
+    use std::os::fd::FromRawFd;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("output target has no parent directory"))?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("output target has no file name"))?;
+    let parent_fd = open_dir_no_symlink_at(parent, true, "output target parent")
+        .with_context(|| format!("open output parent without symlinks {}", parent.display()))?;
+    let leaf_name = cstring_path_component(leaf)?;
+    let fd = unsafe {
+        libc::openat(
+            parent_fd.fd,
+            leaf_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ELOOP)) {
+            anyhow::bail!("output target contains a symlink component");
+        }
+        return Err(error)
+            .with_context(|| format!("open output without following symlinks {}", path.display()));
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.write_all(content)
+        .with_context(|| format!("write output {}", path.display()))
+}
+
+#[cfg(unix)]
+fn create_discovered_output_parent_no_symlink(path: &Path) -> Result<()> {
+    open_dir_no_symlink_at(path, true, "discovered output target parent").map(|_| ())
+}
+
+#[cfg(unix)]
+struct FdGuard {
+    fd: libc::c_int,
+}
+
+#[cfg(unix)]
+impl Drop for FdGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn open_dir_no_symlink_at(path: &Path, create_missing: bool, field: &str) -> Result<FdGuard> {
+    use std::ffi::CString;
+
+    let start = if path.is_absolute() {
+        CString::new("/")?
+    } else {
+        CString::new(".")?
+    };
+    let mut fd = unsafe {
+        libc::open(
+            start.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open traversal root");
+    }
+
+    for component in path.components() {
+        let component_name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(part) => cstring_path_component(part)?,
+            Component::ParentDir | Component::Prefix(_) => {
+                unsafe {
+                    libc::close(fd);
+                }
+                anyhow::bail!("{field} contains an unsafe path component");
+            }
+        };
+
+        let mut next_fd = unsafe {
+            libc::openat(
+                fd,
+                component_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if next_fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if create_missing && error.raw_os_error() == Some(libc::ENOENT) {
+                let mkdir_result = unsafe { libc::mkdirat(fd, component_name.as_ptr(), 0o700) };
+                if mkdir_result < 0 {
+                    let mkdir_error = std::io::Error::last_os_error();
+                    if mkdir_error.raw_os_error() != Some(libc::EEXIST) {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                        return Err(mkdir_error)
+                            .with_context(|| format!("create directory component for {field}"));
+                    }
+                }
+                next_fd = unsafe {
+                    libc::openat(
+                        fd,
+                        component_name.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    )
+                };
+            }
+        }
+        if next_fd < 0 {
+            let error = std::io::Error::last_os_error();
+            let child_is_symlink = matches!(error.raw_os_error(), Some(libc::ENOTDIR))
+                && openat_child_is_symlink(fd, &component_name);
+            unsafe {
+                libc::close(fd);
+            }
+            if matches!(error.raw_os_error(), Some(libc::ELOOP)) || child_is_symlink {
+                anyhow::bail!("{field} contains a symlink component");
+            }
+            if matches!(error.raw_os_error(), Some(libc::ENOTDIR)) {
+                anyhow::bail!("{field} path component is not a directory");
+            }
+            return Err(error).with_context(|| format!("open directory component for {field}"));
+        }
+        unsafe {
+            libc::close(fd);
+        }
+        fd = next_fd;
+    }
+
+    Ok(FdGuard { fd })
+}
+
+#[cfg(unix)]
+fn openat_child_is_symlink(parent_fd: libc::c_int, name: &std::ffi::CString) -> bool {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            parent_fd,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return false;
+    }
+    let stat = unsafe { stat.assume_init() };
+    (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK
+}
+
+#[cfg(unix)]
+fn cstring_path_component(component: &std::ffi::OsStr) -> Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(component.as_bytes())
+        .map_err(|_| anyhow::anyhow!("path component contains a null byte"))
+}
+
+#[cfg(not(unix))]
+fn write_file_no_follow(path: &Path, content: &[u8]) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .with_context(|| format!("open output {}", path.display()))?;
+    file.write_all(content)
+        .with_context(|| format!("write output {}", path.display()))
+}
+
+fn write_p086_continuation_artifact_bytes(
+    artifact_root: &str,
+    continuation_id: &str,
+    name: &str,
+    artifact_id: domain::ids::ArtifactId,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    let artifact_root = normalize_executor_trusted_system_aliases(Path::new(artifact_root));
+    reject_executor_path_symlink_components(&artifact_root, "Run artifact_root")?;
+    let canonical_artifact_root = std::fs::canonicalize(&artifact_root)
+        .with_context(|| format!("canonicalize run artifact_root {}", artifact_root.display()))?;
+    let path = canonical_artifact_root
+        .join("continuations")
+        .join(continuation_id)
+        .join(format!("{name}-{artifact_id}.json"));
+    if let Some(parent) = path.parent() {
+        create_executor_dir_all_no_symlink_under(
+            parent,
+            &canonical_artifact_root,
+            "P086 continuation artifact",
+        )?;
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("P086 continuation artifact target contains a symlink component");
+        }
+        if metadata.is_dir() {
+            anyhow::bail!("P086 continuation artifact target is a directory");
+        }
+    }
+    write_file_no_follow(&path, bytes)
+        .with_context(|| format!("write P086 continuation artifact {}", path.display()))?;
+    Ok(path)
+}
+
+fn ensure_executor_artifact_root_no_symlink(artifact_root: &str) -> Result<PathBuf> {
+    let root = normalize_executor_trusted_system_aliases(Path::new(artifact_root));
+    reject_executor_path_symlink_components(&root, "Run artifact_root")?;
+    if !root.exists() {
+        if let Some(parent) = root.parent() {
+            create_discovered_output_parent_no_symlink(parent)?;
+        }
+        std::fs::create_dir(&root)
+            .with_context(|| format!("create run artifact_root {}", root.display()))?;
+        let metadata = std::fs::symlink_metadata(&root)
+            .with_context(|| format!("verify run artifact_root {}", root.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            anyhow::bail!("Run artifact_root changed during creation");
+        }
+    }
+    std::fs::canonicalize(&root)
+        .with_context(|| format!("canonicalize run artifact_root {}", root.display()))
+}
+
+fn write_executor_artifact_file_no_symlink(
+    artifact_root: &str,
+    path: &Path,
+    bytes: &[u8],
+    field: &str,
+) -> Result<PathBuf> {
+    let raw_root = normalize_executor_trusted_system_aliases(Path::new(artifact_root));
+    let path = normalize_executor_trusted_system_aliases(path);
+    let canonical_root = ensure_executor_artifact_root_no_symlink(artifact_root)?;
+    let relative = path
+        .strip_prefix(&raw_root)
+        .or_else(|_| path.strip_prefix(&canonical_root))
+        .with_context(|| format!("{field} escapes run artifact_root"))?;
+    for component in relative.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("{field} contains an unsafe path component");
+            }
+        }
+    }
+    let target = canonical_root.join(relative);
+    if let Some(parent) = target.parent() {
+        create_executor_dir_all_no_symlink_under(parent, &canonical_root, field)?;
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(&target) {
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("{field} target contains a symlink component");
+        }
+        if metadata.is_dir() {
+            anyhow::bail!("{field} target is a directory");
+        }
+    }
+    write_file_no_follow(&target, bytes)
+        .with_context(|| format!("write {field} {}", target.display()))?;
+    Ok(target)
+}
+
+fn executor_path_is_under_root(path: &Path, root: &Path) -> Result<bool> {
+    let root = normalize_executor_trusted_system_aliases(root);
+    reject_executor_path_symlink_components(&root, "Run workspace_root")?;
+    let canonical_root =
+        std::fs::canonicalize(&root).with_context(|| format!("canonicalize {}", root.display()))?;
+    let path = normalize_executor_trusted_system_aliases(path);
+    Ok(path.starts_with(&canonical_root) || path.starts_with(&root))
+}
+
+fn write_executor_workspace_file_no_symlink(
+    workspace_root: &str,
+    path: &Path,
+    bytes: &[u8],
+    field: &str,
+) -> Result<PathBuf> {
+    let path = normalize_executor_trusted_system_aliases(path);
+    prepare_executor_artifact_parent(workspace_root, &path, field)?;
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("{field} target contains a symlink component");
+        }
+        if metadata.is_dir() {
+            anyhow::bail!("{field} target is a directory");
+        }
+    }
+    write_file_no_follow(&path, bytes)
+        .with_context(|| format!("write {field} {}", path.display()))?;
+    Ok(path)
 }
 
 fn path_looks_like_directory_target(path: &str) -> bool {
@@ -1552,9 +2387,11 @@ fn build_declared_output_discovery_settlement_with_filesystem(
             continue;
         }
 
+        let direct_file_ref_artifact =
+            find_direct_file_ref_artifact_for_spec(discovered_artifacts, spec);
         let envelope = find_provider_envelope_for_spec(discovered_artifacts, spec);
         let exact_path = find_exact_path_artifact_for_spec(discovered_artifacts, spec);
-        let direct_file_ref = envelope.and_then(|artifact| {
+        let direct_file_ref = direct_file_ref_artifact.and_then(|artifact| {
             read_direct_file_ref_output(spec, artifact, pre_prompt_expected_outputs, filesystem)
         });
         let candidate = if let Some(candidate) = direct_file_ref {
@@ -1832,6 +2669,8 @@ fn materialize_validated_output_candidate(
 fn merge_repair_captured_outputs(
     original: &[CapturedOutput],
     repair: &[CapturedOutput],
+    repair_settlement: &DeclaredOutputDiscoverySettlement,
+    original_validation: Option<&TaskValidationSummary>,
 ) -> Vec<CapturedOutput> {
     original
         .iter()
@@ -1839,22 +2678,47 @@ fn merge_repair_captured_outputs(
             let repair_output = repair.iter().find(|candidate| {
                 candidate.declared.output_name == original_output.declared.output_name
             });
+            let repair_output_accepted = repair_settlement.decisions.iter().any(|decision| {
+                decision.output_name == original_output.declared.output_name
+                    && decision.status == OutputDiscoveryStatus::Accepted
+            });
+            let original_already_valid = output_passed_validation(
+                original_validation,
+                &original_output.declared.output_name,
+            );
             CapturedOutput {
                 declared: original_output.declared.clone(),
-                machine_bytes: repair_output
-                    .and_then(|output| output.machine_bytes.clone())
+                machine_bytes: (!original_already_valid && repair_output_accepted)
+                    .then(|| repair_output.and_then(|output| output.machine_bytes.clone()))
+                    .flatten()
                     .or_else(|| original_output.machine_bytes.clone()),
-                companion_bytes: repair_output
-                    .and_then(|output| output.companion_bytes.clone())
+                companion_bytes: (!original_already_valid && repair_output_accepted)
+                    .then(|| repair_output.and_then(|output| output.companion_bytes.clone()))
+                    .flatten()
                     .or_else(|| original_output.companion_bytes.clone()),
             }
         })
         .collect()
 }
 
+fn output_passed_validation(validation: Option<&TaskValidationSummary>, output_name: &str) -> bool {
+    validation
+        .and_then(|validation| {
+            validation
+                .output_results
+                .iter()
+                .find(|result| result.output_name == output_name)
+        })
+        .is_some_and(|result| {
+            result.status == domain::validation::ValidationStatus::Passed
+                || result.status == domain::validation::ValidationStatus::NoContractDeclared
+        })
+}
+
 fn merge_repair_discovery_settlements(
     original: &DeclaredOutputDiscoverySettlement,
     repair: &DeclaredOutputDiscoverySettlement,
+    original_validation: Option<&TaskValidationSummary>,
 ) -> DeclaredOutputDiscoverySettlement {
     let mut decisions = original.decisions.clone();
     for repair_decision in &repair.decisions {
@@ -1862,7 +2726,14 @@ fn merge_repair_discovery_settlements(
             decision.output_name == repair_decision.output_name
                 && decision.output_role == repair_decision.output_role
         }) {
-            *existing = repair_decision.clone();
+            let original_already_valid =
+                output_passed_validation(original_validation, &existing.output_name);
+            if !original_already_valid
+                && (repair_decision.status == OutputDiscoveryStatus::Accepted
+                    || existing.status != OutputDiscoveryStatus::Accepted)
+            {
+                *existing = repair_decision.clone();
+            }
         } else {
             decisions.push(repair_decision.clone());
         }
@@ -2353,6 +3224,25 @@ fn find_provider_envelope_for_spec<'a>(
     })
 }
 
+fn find_direct_file_ref_artifact_for_spec<'a>(
+    discovered_artifacts: &'a [acp::DiscoveredArtifact],
+    spec: &ExpectedOutputSpec,
+) -> Option<&'a acp::DiscoveredArtifact> {
+    discovered_artifacts.iter().find(|artifact| {
+        artifact.source_path.is_none()
+            && matches!(
+                artifact.source_kind,
+                acp::DiscoveredArtifactSourceKind::ProviderEnvelope
+                    | acp::DiscoveredArtifactSourceKind::ChainworksOutput
+            )
+            && direct_file_ref_manifest_matches(
+                &artifact.content,
+                &spec.output_name,
+                &spec.target_path,
+            )
+    })
+}
+
 fn find_exact_path_artifact_for_spec<'a>(
     discovered_artifacts: &'a [acp::DiscoveredArtifact],
     spec: &ExpectedOutputSpec,
@@ -2443,16 +3333,34 @@ fn read_direct_file_ref_output(
 
     let previous = pre_prompt_expected_outputs.iter().find(|metadata| {
         metadata.output_name == spec.output_name && metadata.target_path == spec.target_path
-    })?;
-    let reason = match previous.baseline_status {
-        ExpectedPathBaselineStatus::Absent => OutputDiscoveryReason::ExactPathNew,
-        ExpectedPathBaselineStatus::RegularContentCaptured => {
-            if previous.content_digest.as_deref() == Some(digest.as_str()) {
+    });
+    let (reason, baseline_status) = match previous {
+        Some(previous) => {
+            let reason = match previous.baseline_status {
+                ExpectedPathBaselineStatus::Absent => OutputDiscoveryReason::ExactPathNew,
+                ExpectedPathBaselineStatus::RegularContentCaptured => {
+                    if previous.content_digest.as_deref() == Some(digest.as_str()) {
+                        if manifest.digest.as_ref().is_none_or(|manifest_digest| {
+                            normalize_sha256_digest(manifest_digest) != digest
+                        }) || manifest
+                            .size_bytes
+                            .is_none_or(|expected| expected != bytes.len() as u64)
+                        {
+                            return None;
+                        }
+                    }
+                    OutputDiscoveryReason::ExactPathChanged
+                }
+                _ => OutputDiscoveryReason::ExactPathChanged,
+            };
+            (reason, Some(previous.baseline_status))
+        }
+        None => {
+            if manifest.digest.is_none() || manifest.size_bytes.is_none() {
                 return None;
             }
-            OutputDiscoveryReason::ExactPathChanged
+            (OutputDiscoveryReason::ExactPathChanged, None)
         }
-        _ => OutputDiscoveryReason::ExactPathChanged,
     };
 
     Some((
@@ -2462,7 +3370,7 @@ fn read_direct_file_ref_output(
         exact_path_payload_ref(&spec.output_name),
         bytes,
         Some(manifest.path),
-        Some(previous.baseline_status),
+        baseline_status,
     ))
 }
 
@@ -2521,6 +3429,11 @@ fn direct_file_ref_manifest(content: &[u8], output_name: &str) -> Option<DirectF
         digest,
         size_bytes,
     })
+}
+
+fn direct_file_ref_manifest_matches(content: &[u8], output_name: &str, target_path: &str) -> bool {
+    direct_file_ref_manifest(content, output_name)
+        .is_some_and(|manifest| manifest.path == target_path)
 }
 
 fn normalize_sha256_digest(value: &str) -> String {
@@ -3001,9 +3914,51 @@ fn runtime_facts_for_acp_error(
     facts.transport_error_code = classification.transport_error_code;
     facts.supervision_classification = classification.supervision_classification;
     if let Some(receipt) = acp::runtime_receipt_from_error(error) {
+        if let Some(receipt_classification) = provider_quota_classification_from_receipt(receipt) {
+            apply_runtime_failure_classification(&mut facts, &receipt_classification, now);
+        }
         enrich_runtime_facts_with_receipt(&mut facts, receipt);
     }
     facts
+}
+
+fn apply_runtime_failure_classification(
+    facts: &mut AgentExecutionRuntimeFacts,
+    classification: &RuntimeFailureClassification,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    facts.failure_kind = Some(classification.failure_kind.clone());
+    facts.operator_action_hint = Some(classification.operator_action_hint.clone());
+    facts.retry_after = retry_after_or_default_for_provider_quota(classification, now);
+    facts.transport_error_code = classification.transport_error_code.clone();
+    facts.supervision_classification = classification.supervision_classification.clone();
+}
+
+fn provider_quota_classification_from_receipt(
+    receipt: &acp::AcpRuntimeReceipt,
+) -> Option<RuntimeFailureClassification> {
+    if !matches!(
+        receipt.failure_phase.as_deref(),
+        Some("prompt_error_response" | "provider_quota")
+    ) {
+        return None;
+    }
+    let provider_error = receipt.provider_error_message_redacted.as_deref()?;
+    let observed_at = receipt_timestamp(receipt).unwrap_or_else(chrono::Utc::now);
+    let classification = classify_observation(observation_from_acp_error_message_at(
+        provider_error,
+        observed_at,
+    ));
+    (classification.failure_kind == AgentFailureKind::ProviderQuota).then_some(classification)
+}
+
+fn receipt_timestamp(receipt: &acp::AcpRuntimeReceipt) -> Option<chrono::DateTime<chrono::Utc>> {
+    receipt
+        .completed_at
+        .as_deref()
+        .or(Some(receipt.started_at.as_str()))
+        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
 fn runtime_receipt_record_from_receipt(
@@ -3188,18 +4143,6 @@ fn xcode_broker_required_for_invocation(
             || requested_mcp_server_ids.iter().any(|id| id == "xcode"))
 }
 
-fn is_reused_live_session_transport_error(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("no live acp session registered for generation id")
-        || lower.contains("acp: send session/prompt")
-        || lower.contains("write acp message to subprocess stdin")
-        || lower.contains("broken pipe")
-        || lower.contains("epipe")
-        || lower.contains("stdout closed")
-        || lower.contains("transport closed")
-        || lower.contains("session closed during active prompt")
-}
-
 fn session_scope_can_remain_live_after_settlement(scope: &str) -> bool {
     scope != "none"
 }
@@ -3317,6 +4260,21 @@ fn runtime_facts_for_execution_result(
             facts.supervision_classification = classification.supervision_classification.clone();
             facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
         }
+        Some(domain::validation::ValidationFailureClass::NoOutputProduced)
+            if observed_failure_classification
+                .as_ref()
+                .is_some_and(is_codex_tool_session_control_failure_classification) =>
+        {
+            let classification = observed_failure_classification
+                .as_ref()
+                .expect("checked above");
+            facts.failure_kind = Some(classification.failure_kind.clone());
+            facts.operator_action_hint = Some(classification.operator_action_hint.clone());
+            facts.retry_after = retry_after_or_default_for_provider_quota(classification, now);
+            facts.transport_error_code = classification.transport_error_code.clone();
+            facts.supervision_classification = classification.supervision_classification.clone();
+            facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
+        }
         Some(domain::validation::ValidationFailureClass::NoOutputProduced) => {
             facts.failure_kind = Some(AgentFailureKind::MissingRequiredOutputs);
             facts.operator_action_hint = Some(OperatorActionHint::Retry);
@@ -3384,6 +4342,15 @@ fn runtime_facts_for_execution_result(
     }
     p090_enrich_runtime_facts_with_preflight_json(&mut facts, runtime_tool_path_preflight_json);
     facts
+}
+
+fn is_codex_tool_session_control_failure_classification(
+    classification: &RuntimeFailureClassification,
+) -> bool {
+    classification
+        .transport_error_code
+        .as_deref()
+        .is_some_and(|code| code == "CODEX_TOOL_SESSION_CONTROL_FAILURE")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3932,9 +4899,15 @@ fn session_reuse_reason_for_policy_decision(decision: &SessionPolicyDecision) ->
 fn observed_failure_classification_for_execution_result(
     result_status: &AgentStatus,
     transcript_text: Option<&str>,
+    runtime_receipt: Option<&acp::AcpRuntimeReceipt>,
 ) -> Option<RuntimeFailureClassification> {
     if *result_status != AgentStatus::Failed {
         return None;
+    }
+    if let Some(classification) =
+        runtime_receipt.and_then(provider_quota_classification_from_receipt)
+    {
+        return Some(classification);
     }
     transcript_text.map(|text| classify_observation(observation_from_acp_error_message(text)))
 }
@@ -3947,25 +4920,97 @@ fn output_contract_repair_skip_classification(
     if *result_status != AgentStatus::Failed {
         return None;
     }
-    if runtime_receipt
-        .and_then(|receipt| receipt.failure_phase.as_deref())
-        .is_some_and(|phase| phase == "provider_quota")
-    {
-        return Some(classify_observation(
-            crate::failure_classifier::RuntimeFailureObservation::ProviderQuota {
-                retry_after: transcript_text
-                    .map(observation_from_acp_error_message)
-                    .and_then(|observation| match observation {
-                        crate::failure_classifier::RuntimeFailureObservation::ProviderQuota {
-                            retry_after,
-                        } => retry_after,
-                        _ => None,
-                    }),
-            },
-        ));
+    observed_failure_classification_for_execution_result(
+        result_status,
+        transcript_text,
+        runtime_receipt,
+    )
+    .filter(|classification| classification.failure_kind == AgentFailureKind::ProviderQuota)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ContinuityMode {
+    NormalFreshExecution,
+    NormalLiveReuse,
+    ProviderSessionResurrection,
+    OutputOnlyRecovery,
+    OperatorActionRequired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ContinuityModeDecision {
+    mode: ContinuityMode,
+    reason: &'static str,
+    normal_live_reuse_allowed: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ContinuityModeInput<'a> {
+    requested_live_reuse: bool,
+    provider_session_id: Option<&'a str>,
+    required_outputs_missing: bool,
+    useful_work_observed: bool,
+    source_edits_allowed: bool,
+    runtime_receipt: Option<&'a acp::AcpRuntimeReceipt>,
+}
+
+fn resolve_continuity_mode(input: ContinuityModeInput<'_>) -> ContinuityModeDecision {
+    if input.required_outputs_missing && input.useful_work_observed && !input.source_edits_allowed {
+        return ContinuityModeDecision {
+            mode: ContinuityMode::OutputOnlyRecovery,
+            reason: "useful_work_missing_outputs",
+            normal_live_reuse_allowed: false,
+        };
     }
-    observed_failure_classification_for_execution_result(result_status, transcript_text)
-        .filter(|classification| classification.failure_kind == AgentFailureKind::ProviderQuota)
+
+    if continuity_boundary_is_ambiguous(input.runtime_receipt) {
+        return if input.provider_session_id.is_some() {
+            ContinuityModeDecision {
+                mode: ContinuityMode::ProviderSessionResurrection,
+                reason: "ambiguous_boundary_with_provider_session",
+                normal_live_reuse_allowed: false,
+            }
+        } else {
+            ContinuityModeDecision {
+                mode: ContinuityMode::OperatorActionRequired,
+                reason: "ambiguous_boundary_without_provider_session",
+                normal_live_reuse_allowed: false,
+            }
+        };
+    }
+
+    if input.requested_live_reuse {
+        return ContinuityModeDecision {
+            mode: ContinuityMode::NormalLiveReuse,
+            reason: "clean_live_reuse",
+            normal_live_reuse_allowed: true,
+        };
+    }
+
+    ContinuityModeDecision {
+        mode: ContinuityMode::NormalFreshExecution,
+        reason: "fresh_execution",
+        normal_live_reuse_allowed: false,
+    }
+}
+
+fn continuity_boundary_is_ambiguous(runtime_receipt: Option<&acp::AcpRuntimeReceipt>) -> bool {
+    let Some(receipt) = runtime_receipt else {
+        return false;
+    };
+    matches!(
+        receipt.failure_phase.as_deref(),
+        Some(
+            "prompt_closed_during_stream"
+                | "transport_closed"
+                | "provider_timeout"
+                | "progress_timeout"
+                | "read_poll_elapsed_without_message"
+        )
+    ) || (receipt.status == "failed"
+        && receipt.handshake.prompt_sent_at_ms.is_some()
+        && receipt.handshake.terminal_response_at_ms.is_none()
+        && receipt.counters.meaningful_progress_count > 0)
 }
 
 fn redact_runtime_message(message: &str) -> String {
@@ -4065,22 +5110,6 @@ fn find_discovered_artifact_for_output<'a>(
     discovered_artifacts
         .iter()
         .find(|artifact| artifact.name == output_name || artifact.name == target_path)
-}
-
-fn discovered_artifact_matches_declared_output(
-    discovered: &acp::DiscoveredArtifact,
-    declared: &DeclaredOutput,
-) -> bool {
-    discovered.name == declared.output_name
-        || discovered.name == declared.target_path
-        || declared
-            .companion_output_name
-            .as_deref()
-            .is_some_and(|name| discovered.name == name)
-        || declared
-            .companion_path
-            .as_deref()
-            .is_some_and(|path| discovered.name == path)
 }
 
 fn declared_machine_artifact_name<'a>(declared: &'a DeclaredOutput) -> &'a str {
@@ -4344,6 +5373,62 @@ impl BackgroundExecutor {
             steward_runtime_inputs: Some(steward_runtime_inputs),
             db_writer,
         }
+    }
+
+    #[doc(hidden)]
+    pub async fn p082_import_declared_contract_outputs_for_regression(
+        &self,
+        declared_outputs: &[DeclaredOutput],
+        captured_outputs: &[CapturedOutput],
+        workspace_root: &str,
+        run_id: RunId,
+        stage_id: &str,
+        agent_id: &str,
+        provider: &str,
+        model: Option<String>,
+        stage_execution_id: domain::ids::StageExecutionId,
+        agent_exec_id: domain::ids::AgentExecutionId,
+        work_item_id: &str,
+        artifact_claim_key: &ArtifactSourceGenerationClaimKey,
+        session_generation_id: Option<&str>,
+        result_status: AgentStatus,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let mut persisted_paths = HashSet::new();
+        let declared_artifacts = self.prepare_declared_output_artifacts(
+            declared_outputs,
+            None,
+            workspace_root,
+            run_id,
+            stage_id,
+            agent_id,
+            provider,
+            model,
+            completed_at,
+            &mut persisted_paths,
+        )?;
+        self.import_declared_contract_outputs(
+            declared_outputs,
+            captured_outputs,
+            &declared_artifacts,
+            &declared_artifacts,
+            stage_execution_id,
+            agent_exec_id,
+            work_item_id,
+            artifact_claim_key,
+            session_generation_id,
+            result_status,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &workflow::plan::DegradedOutputPolicy::default(),
+            None,
+            completed_at,
+        )
+        .await?;
+        Ok(())
     }
 
     async fn record_output_contract_repair_event(
@@ -4877,6 +5962,13 @@ impl BackgroundExecutor {
 
     /// Start the background loop. Returns a JoinHandle.
     pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let quota_auto_resume_executor = Arc::clone(&self);
+        tokio::spawn(async move {
+            quota_auto_resume_executor
+                .run_quota_ledger_auto_resume_loop()
+                .await;
+        });
+
         let housekeeping_executor = Arc::clone(&self);
         tokio::spawn(async move {
             housekeeping_executor
@@ -4901,6 +5993,54 @@ impl BackgroundExecutor {
         tokio::spawn(async move {
             self.run_loop().await;
         })
+    }
+
+    async fn run_quota_ledger_auto_resume_loop(self: Arc<Self>) {
+        let interval = Duration::from_secs(
+            std::env::var("CHAINWORKS_QUOTA_LEDGER_AUTO_RESUME_INTERVAL_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(30),
+        );
+        info!(
+            interval_secs = interval.as_secs(),
+            "Quota ledger auto-resume loop started"
+        );
+        loop {
+            sleep(interval).await;
+            let handler = CommandHandler::new_with_acp_capacity_and_db_writer(
+                self.pool.clone(),
+                self.events.clone(),
+                self.work_queue.clone(),
+                Arc::clone(&self.acp),
+                self.work_queue.invoke_agent_capacity_config(),
+                Some(Arc::clone(&self.db_writer)),
+            );
+            match handler
+                .auto_resume_elapsed_quota_ledgers(chrono::Utc::now())
+                .await
+            {
+                Ok(0) => {}
+                Ok(count) => {
+                    info!(
+                        scheduled_count = count,
+                        "Quota ledger auto-resume scheduled retries"
+                    );
+                    if let Err(error) = self.work_queue.refresh_scheduler_projection().await {
+                        warn!(
+                            error = %error,
+                            "Quota ledger auto-resume failed to refresh scheduler projection"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "Quota ledger auto-resume loop iteration failed"
+                    );
+                }
+            }
+        }
     }
 
     /// P086: Periodically sweep accepted/queued/starting continuation rows older than
@@ -5021,20 +6161,13 @@ impl BackgroundExecutor {
     ) -> anyhow::Result<(String, String)> {
         let bytes = serde_json::to_vec_pretty(value)?;
         let checksum = sha256_digest(&bytes);
-        let path = Path::new(&run.artifact_root)
-            .join("continuations")
-            .join(continuation_id)
-            .join(format!("{name}-{artifact_id}.json"));
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "create P086 continuation artifact directory {}",
-                    parent.display()
-                )
-            })?;
-        }
-        std::fs::write(&path, &bytes)
-            .with_context(|| format!("write P086 continuation artifact {}", path.display()))?;
+        let path = write_p086_continuation_artifact_bytes(
+            &run.artifact_root,
+            continuation_id,
+            name,
+            artifact_id,
+            &bytes,
+        )?;
 
         let artifact = Artifact {
             id: artifact_id,
@@ -6246,7 +7379,9 @@ You are continuing the same Chainworks agent execution through an existing live 
         };
         let terminal_reason = if post_continuation_change && provider_send_recorded {
             if transcript_absence_reason.is_some() {
-                Some("reconciled_from_post_continuation_worktree_evidence_with_explicit_transcript_absence")
+                Some(
+                    "reconciled_from_post_continuation_worktree_evidence_with_explicit_transcript_absence",
+                )
             } else {
                 Some("reconciled_from_post_continuation_worktree_and_transcript_evidence")
             }
@@ -6780,6 +7915,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                 reuse_existing_session: true,
                 session_generation_id: Some(session_generation_id.clone()),
                 provider_session_id: ctx.provider_session_id.clone(),
+                provider_runtime_home: None,
                 mcp_servers: Vec::new(),
                 chainworks_meta_root: ctx.chainworks_meta_root,
                 legacy_broad_discovery_policy:
@@ -7074,49 +8210,6 @@ You are continuing the same Chainworks agent execution through an existing live 
         }
     }
 
-    async fn mark_agent_execution_failed_if_running(
-        &self,
-        agent_execution_id: domain::ids::AgentExecutionId,
-        item_id: &str,
-        error_message: &str,
-    ) {
-        match agent_executions::find_by_id(&self.pool, agent_execution_id).await {
-            Ok(Some(execution)) if execution.status == AgentStatus::Running => {
-                if let Err(update_error) = agent_executions::update_completed(
-                    &self.pool,
-                    agent_execution_id,
-                    AgentStatus::Failed,
-                    chrono::Utc::now(),
-                )
-                .await
-                {
-                    error!(
-                        item_id = %item_id,
-                        agent_execution_id = %agent_execution_id,
-                        error = %update_error,
-                        "Failed to close running agent execution after InvokeAgent work item failure"
-                    );
-                } else {
-                    warn!(
-                        item_id = %item_id,
-                        agent_execution_id = %agent_execution_id,
-                        failure = %error_message,
-                        "Closed stale running agent execution after InvokeAgent work item failure"
-                    );
-                }
-            }
-            Ok(Some(_)) | Ok(None) => {}
-            Err(find_error) => {
-                error!(
-                    item_id = %item_id,
-                    agent_execution_id = %agent_execution_id,
-                    error = %find_error,
-                    "Failed to inspect agent execution after InvokeAgent work item failure"
-                );
-            }
-        }
-    }
-
     /// Claim and process the next pending work item. Returns `Ok(true)` if an
     /// item was processed, `Ok(false)` if the queue was empty.
     /// Intended for test use — the production path uses `start()`.
@@ -7139,6 +8232,20 @@ You are continuing the same Chainworks agent execution through an existing live 
                                     .await?;
                                 if requeued {
                                     warn!(item_id = %item_id, kind = %kind, error = %message, "Work item requeued after transient SQLite contention during completion");
+                                    return Ok(true);
+                                }
+                            } else if kind == WorkItemKind::InvokeAgent {
+                                let message = format!(
+                                    "invoke_agent_terminal_failed_without_valid_outputs: {e}"
+                                );
+                                if self
+                                    .work_queue
+                                    .fail_if_terminal_failed_invoke_without_valid_outputs(
+                                        &item_id, &message,
+                                    )
+                                    .await?
+                                {
+                                    warn!(item_id = %item_id, kind = %kind, error = %message, "InvokeAgent work item failed after terminal provider execution without valid outputs");
                                     return Ok(true);
                                 }
                             }
@@ -7507,7 +8614,26 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                 }
                                             }
                                         } else {
-                                            error!(item_id = %item_id, error = %e, "Failed to mark work item complete");
+                                            let message = format!(
+                                                "invoke_agent_terminal_failed_without_valid_outputs: {e}"
+                                            );
+                                            match executor
+                                                .work_queue
+                                                .fail_if_terminal_failed_invoke_without_valid_outputs(
+                                                    &item_id, &message,
+                                                )
+                                                .await
+                                            {
+                                                Ok(true) => {
+                                                    warn!(item_id = %item_id, kind = %kind, error = %message, "InvokeAgent work item failed after terminal provider execution without valid outputs");
+                                                }
+                                                Ok(false) => {
+                                                    error!(item_id = %item_id, error = %e, "Failed to mark work item complete");
+                                                }
+                                                Err(e2) => {
+                                                    error!(item_id = %item_id, error = %e2, completion_error = %e, "Failed to settle InvokeAgent completion error");
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -7548,8 +8674,118 @@ You are continuing the same Chainworks agent execution through an existing live 
                                 }
                             }
                         });
+                    } else if matches!(kind, WorkItemKind::AdvanceRun) {
+                        let executor = Arc::clone(self);
+                        tokio::spawn(async move {
+                            let timeout = advance_run_process_timeout();
+                            let process_item_id = item_id.clone();
+                            let process_kind = kind.clone();
+                            let process_executor = Arc::clone(&executor);
+                            let process_handle =
+                                tokio::spawn(
+                                    async move { process_executor.process_item(item).await },
+                                );
+
+                            let process_result = match tokio::time::timeout(timeout, process_handle)
+                                .await
+                            {
+                                Ok(Ok(result)) => result,
+                                Ok(Err(join_error)) => Err(anyhow::anyhow!(
+                                    "advance_run task join error: {join_error}"
+                                )),
+                                Err(_) => {
+                                    let reason = format!(
+                                        "advance_run_process_timeout_after_{}s",
+                                        timeout.as_secs()
+                                    );
+                                    match executor
+                                        .work_queue
+                                        .requeue_running_advance_item(&process_item_id, &reason)
+                                        .await
+                                    {
+                                        Ok(true) => {
+                                            warn!(
+                                                item_id = %process_item_id,
+                                                kind = %process_kind,
+                                                timeout_secs = timeout.as_secs(),
+                                                "AdvanceRun work item timed out and was requeued"
+                                            );
+                                        }
+                                        Ok(false) => {
+                                            error!(
+                                                item_id = %process_item_id,
+                                                kind = %process_kind,
+                                                timeout_secs = timeout.as_secs(),
+                                                "AdvanceRun work item timed out but was no longer running"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                item_id = %process_item_id,
+                                                kind = %process_kind,
+                                                error = %e,
+                                                timeout_secs = timeout.as_secs(),
+                                                "Failed to requeue timed-out AdvanceRun work item"
+                                            );
+                                        }
+                                    }
+                                    return;
+                                }
+                            };
+
+                            match process_result {
+                                Ok(()) => {
+                                    if let Err(e) =
+                                        executor.work_queue.complete(&process_item_id).await
+                                    {
+                                        error!(item_id = %process_item_id, kind = %process_kind, error = %e, "Failed to complete AdvanceRun work item");
+                                    }
+                                }
+                                Err(e) if is_work_item_requeued(&e) => {
+                                    info!(item_id = %process_item_id, kind = %process_kind, reason = %e, "AdvanceRun work item requeued");
+                                }
+                                Err(e) if is_transient_persistence_contention_error(&e) => {
+                                    let message = e.to_string();
+                                    match executor
+                                        .work_queue
+                                        .requeue_after_transient_persistence_contention(
+                                            &process_item_id,
+                                            &message,
+                                        )
+                                        .await
+                                    {
+                                        Ok(true) => {
+                                            warn!(item_id = %process_item_id, kind = %process_kind, error = %message, "AdvanceRun work item requeued after transient SQLite contention");
+                                        }
+                                        Ok(false) => {
+                                            if let Err(e2) = executor
+                                                .work_queue
+                                                .fail(&process_item_id, &message)
+                                                .await
+                                            {
+                                                error!(item_id = %process_item_id, error = %e2, "Failed to mark AdvanceRun work item failed after transient contention requeue no-op");
+                                            }
+                                        }
+                                        Err(e2) => {
+                                            error!(item_id = %process_item_id, error = %e2, "Failed to requeue AdvanceRun work item after transient SQLite contention");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(item_id = %process_item_id, kind = %process_kind, error = %e, "AdvanceRun work item failed");
+                                    if let Err(e2) = executor
+                                        .work_queue
+                                        .fail(&process_item_id, &e.to_string())
+                                        .await
+                                    {
+                                        error!(item_id = %process_item_id, error = %e2, "Failed to mark AdvanceRun work item failed");
+                                    }
+                                }
+                            }
+                        });
                     } else {
-                        match self.process_item(item).await {
+                        let process_result = self.process_item(item).await;
+                        match process_result {
                             Ok(()) => {
                                 if let Err(e) = self.work_queue.complete(&item_id).await {
                                     if is_transient_persistence_contention_error(&e) {
@@ -8011,11 +9247,13 @@ You are continuing the same Chainworks agent execution through an existing live 
                     )
                     .await?;
 
-                    let mut facts =
-                        domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, now);
-                    facts.session_reuse_reason =
-                        Some(session_reuse_reason_for_policy_decision(decision));
-                    agent_execution_runtime_facts::upsert(&self.pool, &facts).await?;
+                    agent_execution_runtime_facts::update_session_reuse_reason(
+                        &self.pool,
+                        agent_exec_id,
+                        &session_reuse_reason_for_policy_decision(decision),
+                        now,
+                    )
+                    .await?;
                 }
                 if let Some(decision) = policy_decision.as_ref() {
                     self.persist_session_checkpoint_artifact_if_needed(
@@ -8144,11 +9382,13 @@ You are continuing the same Chainworks agent execution through an existing live 
                     )
                     .await?;
 
-                    let mut facts =
-                        domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, now);
-                    facts.session_reuse_reason =
-                        Some(session_reuse_reason_for_policy_decision(decision));
-                    agent_execution_runtime_facts::upsert(&self.pool, &facts).await?;
+                    agent_execution_runtime_facts::update_session_reuse_reason(
+                        &self.pool,
+                        agent_exec_id,
+                        &session_reuse_reason_for_policy_decision(decision),
+                        now,
+                    )
+                    .await?;
                 }
 
                 if !mcp_resolution.report.blocking_issues.is_empty() {
@@ -8390,6 +9630,8 @@ You are continuing the same Chainworks agent execution through an existing live 
                     worktree_write_enabled,
                 );
 
+                let original_prompt_turn_id =
+                    format!("{agent_exec_id}:original:{stage_attempt_number}");
                 let execution_prompt = if policy_decision.is_some() || !declared_outputs.is_empty()
                 {
                     prompt_with_runtime_invocation_contract(
@@ -8401,6 +9643,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                 .map(|id| id.to_string())
                                 .unwrap_or_else(|| owner_execution_lineage_id.clone()),
                             agent_execution_id: agent_exec_id.to_string(),
+                            prompt_turn_id: original_prompt_turn_id.clone(),
                             work_item_id: item.id.clone(),
                             session_generation_id: policy_decision
                                 .as_ref()
@@ -8454,6 +9697,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     provider_session_id: policy_decision
                         .as_ref()
                         .and_then(|decision| decision.generation.provider_session_id.clone()),
+                    provider_runtime_home: None,
                     mcp_servers: mcp_resolution.payloads,
                     chainworks_meta_root: run.chainworks_meta_root.clone(),
                     legacy_broad_discovery_policy: legacy_broad_discovery_policy.clone(),
@@ -8509,6 +9753,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     {
                         Ok(fingerprint) => {
                             p088_pre_original_fingerprint_path = persist_p088_worktree_fingerprint(
+                                &run.workspace_root,
                                 &run.artifact_root,
                                 agent_exec_id,
                                 &fingerprint,
@@ -8701,6 +9946,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                     Ok(fingerprint) => {
                                         p088_error_post_fingerprint_path =
                                             persist_p088_worktree_fingerprint(
+                                                &run.workspace_root,
                                                 &run.artifact_root,
                                                 agent_exec_id,
                                                 &fingerprint,
@@ -8736,6 +9982,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                 if let Err(persist_error) =
                                     persist_p088_code_writer_completion_receipt(
                                         &self.pool,
+                                        &run.workspace_root,
                                         &run.artifact_root,
                                         run_id,
                                         stage_execution_id,
@@ -9058,6 +10305,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                             Ok(fingerprint) => {
                                 p088_post_original_fingerprint_path =
                                     persist_p088_worktree_fingerprint(
+                                        &run.workspace_root,
                                         &run.artifact_root,
                                         agent_exec_id,
                                         &fingerprint,
@@ -9340,6 +10588,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                     let p088_repair_prompt_artifact_path =
                                         if p088_completion_eligible {
                                             persist_p088_prompt_artifact(
+                                                &run.workspace_root,
                                                 &run.artifact_root,
                                                 agent_exec_id,
                                                 "code_writer_completion_repair",
@@ -9354,6 +10603,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                     let p088_expected_output_snapshot = if p088_completion_eligible
                                     {
                                         persist_p088_expected_output_snapshot(
+                                            &run.workspace_root,
                                             &run.artifact_root,
                                             agent_exec_id,
                                             "code_writer_completion_repair",
@@ -9434,6 +10684,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                             {
                                                 Ok(fingerprint) => {
                                                     let _ = persist_p088_worktree_fingerprint(
+                                                        &run.workspace_root,
                                                         &run.artifact_root,
                                                         agent_exec_id,
                                                         &fingerprint,
@@ -9587,6 +10838,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                 {
                                                     Ok(fingerprint) => {
                                                         let _ = persist_p088_worktree_fingerprint(
+                                                            &run.workspace_root,
                                                             &run.artifact_root,
                                                             agent_exec_id,
                                                             &fingerprint,
@@ -9681,6 +10933,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                                 merge_repair_discovery_settlements(
                                                                     original_settlement,
                                                                     &repair_settlement,
+                                                                    Some(&validation),
                                                                 )
                                                             })
                                                             .unwrap_or_else(|| {
@@ -9690,6 +10943,8 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                             merge_repair_captured_outputs(
                                                                 &captured,
                                                                 &repair_captured,
+                                                                &repair_settlement,
+                                                                Some(&validation),
                                                             );
                                                         let (
                                                             repair_found_count,
@@ -9698,6 +10953,14 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                             repair_rejected_count,
                                                         ) = output_discovery_decision_counts(
                                                             &repair_settlement.decisions,
+                                                        );
+                                                        let (
+                                                            merged_found_count,
+                                                            merged_missing_count,
+                                                            merged_stale_count,
+                                                            merged_rejected_count,
+                                                        ) = output_discovery_decision_counts(
+                                                            &merged_repair_settlement.decisions,
                                                         );
                                                         let repair_validation = self
                                                 .validate_task_outputs_with_conflict_resolution_context(
@@ -9708,8 +10971,9 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                 )
                                                 .await?;
                                                         let staged_repair_materialization =
-                                                            if p090_staged_repair_settlement_enabled(
+                                                            if p090_staged_repair_settlement_enabled_for_settlement(
                                                                 &provider,
+                                                                &merged_repair_settlement,
                                                             ) && stage_execution_id.is_some()
                                                             {
                                                                 Some(stage_p090_repair_materialization(
@@ -9732,7 +10996,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                                     agent_exec_id
                                                                 ),
                                                                 &declared_outputs,
-                                                                &repair_settlement,
+                                                                &merged_repair_settlement,
                                                                 &repair_validation,
                                                                 chrono::Utc::now(),
                                                             )?)
@@ -9742,7 +11006,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                             {
                                                                 materialize_validated_discovery_decisions(
                                                                 &declared_outputs,
-                                                                &repair_settlement,
+                                                                &merged_repair_settlement,
                                                                 &repair_validation,
                                                             )?;
                                                                 None
@@ -9757,7 +11021,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                         p090_staged_repair_materialization =
                                                             staged_repair_materialization;
                                                         declared_output_settlement =
-                                                            Some(merged_repair_settlement);
+                                                            Some(merged_repair_settlement.clone());
                                                         if repair_validation.failure_class.is_none()
                                                         {
                                                             if p088_completion_eligible {
@@ -9767,6 +11031,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                             merge_contract_repair_result(
                                                                 &mut result,
                                                                 repair_result,
+                                                                &merged_repair_settlement,
                                                             );
                                                             info!(
                                                                 run_id = %run_id,
@@ -9774,10 +11039,14 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                                 agent_id = %agent_id,
                                                                 agent_execution_id = %agent_exec_id,
                                                                 session_generation_id = %session_generation_id,
-                                                                repair_found_count,
-                                                                repair_missing_count,
-                                                                repair_stale_count,
-                                                                repair_rejected_count,
+                                                                repair_turn_found_count = repair_found_count,
+                                                                repair_turn_missing_count = repair_missing_count,
+                                                                repair_turn_stale_count = repair_stale_count,
+                                                                repair_turn_rejected_count = repair_rejected_count,
+                                                                merged_found_count,
+                                                                merged_missing_count,
+                                                                merged_stale_count,
+                                                                merged_rejected_count,
                                                                 "Output contract repair turn produced valid declared outputs"
                                                             );
                                                             self.record_output_contract_repair_event(
@@ -9786,10 +11055,15 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                         serde_json::json!({
                                                             "agent_execution_id": agent_exec_id.to_string(),
                                                             "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
-                                                            "repair_found_count": repair_found_count,
-                                                            "repair_missing_count": repair_missing_count,
-                                                            "repair_stale_count": repair_stale_count,
-                                                            "repair_rejected_count": repair_rejected_count,
+                                                            "repair_turn_found_count": repair_found_count,
+                                                            "repair_turn_missing_count": repair_missing_count,
+                                                            "repair_turn_stale_count": repair_stale_count,
+                                                            "repair_turn_rejected_count": repair_rejected_count,
+                                                            "repair_found_count": merged_found_count,
+                                                            "repair_missing_count": merged_missing_count,
+                                                            "repair_stale_count": merged_stale_count,
+                                                            "repair_rejected_count": merged_rejected_count,
+                                                            "repair_settlement_merge_mode": "preserve_valid_original_outputs",
                                                         }),
                                                         run_id,
                                                         &stage_id,
@@ -9805,10 +11079,15 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                                 "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
                                                                 "repair_turn_count": output_contract_repair_turn_count,
                                                                 "result": "succeeded",
-                                                                "repair_found_count": repair_found_count,
-                                                                "repair_missing_count": repair_missing_count,
-                                                                "repair_stale_count": repair_stale_count,
-                                                                "repair_rejected_count": repair_rejected_count,
+                                                                "repair_turn_found_count": repair_found_count,
+                                                                "repair_turn_missing_count": repair_missing_count,
+                                                                "repair_turn_stale_count": repair_stale_count,
+                                                                "repair_turn_rejected_count": repair_rejected_count,
+                                                                "repair_found_count": merged_found_count,
+                                                                "repair_missing_count": merged_missing_count,
+                                                                "repair_stale_count": merged_stale_count,
+                                                                "repair_rejected_count": merged_rejected_count,
+                                                                "repair_settlement_merge_mode": "preserve_valid_original_outputs",
                                                             }),
                                                             run_id,
                                                             &stage_id,
@@ -10592,6 +11871,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         observed_failure_classification_for_execution_result(
                             &result.status,
                             result.transcript_text.as_deref(),
+                            result.runtime_receipt.as_ref(),
                         ),
                         result.close_diagnostic.as_ref(),
                         result.runtime_receipt.as_ref(),
@@ -10643,6 +11923,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                 if p088_code_writer_completion_candidate {
                     if let Err(error) = persist_p088_code_writer_completion_receipt(
                         &self.pool,
+                        &run.workspace_root,
                         &run.artifact_root,
                         run_id,
                         stage_execution_id,
@@ -10999,9 +12280,17 @@ You are continuing the same Chainworks agent execution through an existing live 
         _effort: Option<String>,
         _worktree_write_enabled: bool,
         _worktree_strategy: Option<String>,
-        _payload: serde_json::Value,
+        payload: serde_json::Value,
     ) -> Result<()> {
         let now = chrono::Utc::now();
+        let artifact_claim_key: ArtifactSourceGenerationClaimKey = serde_json::from_value(
+            payload
+                .pointer("/p058_claimed/artifact_claim_key")
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Release agent execution missing p058_claimed artifact claim")
+                })?,
+        )?;
         let mut delivery_config = match self.load_delivery_configuration(&run).await {
             Ok(config) => config,
             Err(error) => {
@@ -11173,6 +12462,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         )
                         .await?;
                     artifacts::insert_tx(&mut tx, &manifest_artifact).await?;
+                    let settlement_txn_id = uuid::Uuid::new_v4().to_string();
                     let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &commit_lease.effect_id,
                         owner_instance_id: &commit_lease.owner_instance_id,
@@ -11180,7 +12470,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         observed_lease_renewed_at: commit_lease.lease_renewed_at,
                         new_status: domain::side_effect::SideEffectStatus::Settled,
                         observed_evidence_summary_json: Some(evidence_summary.as_str()),
-                        settlement_txn_id: &uuid::Uuid::new_v4().to_string(),
+                        settlement_txn_id: settlement_txn_id.as_str(),
                         last_error_kind: None,
                         last_error: None,
                         now: chrono::Utc::now(),
@@ -11190,6 +12480,14 @@ You are continuing the same Chainworks agent execution through an existing live 
                         decision_json_hash: None,
                         disposition_id: None,
                     };
+                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                        .await?
+                    {
+                        anyhow::bail!(
+                            "side_effect_cas_lost: settle CAS missed for effect {}; release git_commit success not committed",
+                            commit_lease.effect_id
+                        );
+                    }
                     tx.commit().await?;
                     let _ = self
                         .events
@@ -11198,6 +12496,14 @@ You are continuing the same Chainworks agent execution through an existing live 
                             artifact_id: manifest_artifact.id,
                         });
                     projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                    let mut facts =
+                        AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, chrono::Utc::now());
+                    facts.output_settlement =
+                        AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+                    facts.valid_required_outputs = true;
+                    facts.supervision_classification =
+                        Some("native_release_side_effects_settled".to_string());
+                    agent_execution_runtime_facts::upsert(&self.pool, &facts).await?;
                     info!(
                         run_id = %run_id,
                         stage_id = %stage_id,
@@ -11250,6 +12556,13 @@ You are continuing the same Chainworks agent execution through an existing live 
                         last_error: &error_str,
                         now: chrono::Utc::now(),
                     };
+                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
+                    {
+                        anyhow::bail!(
+                            "side_effect_cas_lost: fail CAS missed for effect {}; release git_commit failure not committed",
+                            commit_lease.effect_id
+                        );
+                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -11291,6 +12604,14 @@ You are continuing the same Chainworks agent execution through an existing live 
                             status: domain::stage::StageStatus::Failed,
                         });
                     projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                    let mut facts =
+                        AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, chrono::Utc::now());
+                    facts.output_settlement =
+                        AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+                    facts.valid_required_outputs = true;
+                    facts.supervision_classification =
+                        Some("native_release_side_effects_settled".to_string());
+                    agent_execution_runtime_facts::upsert(&self.pool, &facts).await?;
                     info!(
                         run_id = %run_id,
                         stage_id = %stage_id,
@@ -11398,6 +12719,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         )
                         .await?;
                     artifacts::insert_tx(&mut tx, &receipt_artifact).await?;
+                    let settlement_txn_id = uuid::Uuid::new_v4().to_string();
                     let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &push_lease.effect_id,
                         owner_instance_id: &push_lease.owner_instance_id,
@@ -11405,7 +12727,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         observed_lease_renewed_at: push_lease.lease_renewed_at,
                         new_status: domain::side_effect::SideEffectStatus::Settled,
                         observed_evidence_summary_json: Some(evidence_summary.as_str()),
-                        settlement_txn_id: &uuid::Uuid::new_v4().to_string(),
+                        settlement_txn_id: settlement_txn_id.as_str(),
                         last_error_kind: None,
                         last_error: None,
                         now,
@@ -11415,10 +12737,25 @@ You are continuing the same Chainworks agent execution through an existing live 
                         decision_json_hash: None,
                         disposition_id: None,
                     };
+                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                        .await?
+                    {
+                        anyhow::bail!(
+                            "side_effect_cas_lost: settle CAS missed for effect {}; release git_push success not committed",
+                            push_lease.effect_id
+                        );
+                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
                         AgentStatus::Completed,
+                        now,
+                    )
+                    .await?;
+                    mark_release_required_outputs_valid_tx(
+                        &mut tx,
+                        agent_exec_id,
+                        &artifact_claim_key,
                         now,
                     )
                     .await?;
@@ -11493,6 +12830,13 @@ You are continuing the same Chainworks agent execution through an existing live 
                         last_error: &error_str,
                         now,
                     };
+                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
+                    {
+                        anyhow::bail!(
+                            "side_effect_cas_lost: fail CAS missed for effect {}; release git_push failure not committed",
+                            push_lease.effect_id
+                        );
+                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -11653,6 +12997,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         )
                         .await?;
                     artifacts::insert_tx(&mut tx, &bundle_artifact).await?;
+                    let settlement_txn_id = uuid::Uuid::new_v4().to_string();
                     let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &build_lease.effect_id,
                         owner_instance_id: &build_lease.owner_instance_id,
@@ -11660,7 +13005,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         observed_lease_renewed_at: build_lease.lease_renewed_at,
                         new_status: domain::side_effect::SideEffectStatus::Settled,
                         observed_evidence_summary_json: Some(evidence_summary.as_str()),
-                        settlement_txn_id: &uuid::Uuid::new_v4().to_string(),
+                        settlement_txn_id: settlement_txn_id.as_str(),
                         last_error_kind: None,
                         last_error: None,
                         now: chrono::Utc::now(),
@@ -11670,6 +13015,14 @@ You are continuing the same Chainworks agent execution through an existing live 
                         decision_json_hash: None,
                         disposition_id: None,
                     };
+                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                        .await?
+                    {
+                        anyhow::bail!(
+                            "side_effect_cas_lost: settle CAS missed for effect {}; release build_archive success not committed",
+                            build_lease.effect_id
+                        );
+                    }
                     tx.commit().await?;
                     let _ = self
                         .events
@@ -11730,6 +13083,13 @@ You are continuing the same Chainworks agent execution through an existing live 
                         last_error: &error_str,
                         now,
                     };
+                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
+                    {
+                        anyhow::bail!(
+                            "side_effect_cas_lost: fail CAS missed for effect {}; release build_archive failure not committed",
+                            build_lease.effect_id
+                        );
+                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -11918,6 +13278,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
+                    let settlement_txn_id = uuid::Uuid::new_v4().to_string();
                     let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &connect_lease.effect_id,
                         owner_instance_id: &connect_lease.owner_instance_id,
@@ -11925,7 +13286,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         observed_lease_renewed_at: connect_lease.lease_renewed_at,
                         new_status: domain::side_effect::SideEffectStatus::Settled,
                         observed_evidence_summary_json: Some(evidence_summary.as_str()),
-                        settlement_txn_id: &uuid::Uuid::new_v4().to_string(),
+                        settlement_txn_id: settlement_txn_id.as_str(),
                         last_error_kind: None,
                         last_error: None,
                         now,
@@ -11935,6 +13296,14 @@ You are continuing the same Chainworks agent execution through an existing live 
                         decision_json_hash: None,
                         disposition_id: None,
                     };
+                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                        .await?
+                    {
+                        anyhow::bail!(
+                            "side_effect_cas_lost: settle CAS missed for effect {}; release connect_upload success not committed",
+                            connect_lease.effect_id
+                        );
+                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -11946,6 +13315,13 @@ You are continuing the same Chainworks agent execution through an existing live 
                         &mut tx,
                         stage_execution_id,
                         domain::stage::StageSettlementKind::Completed,
+                        now,
+                    )
+                    .await?;
+                    mark_release_required_outputs_valid_tx(
+                        &mut tx,
+                        agent_exec_id,
+                        &artifact_claim_key,
                         now,
                     )
                     .await?;
@@ -12034,6 +13410,13 @@ You are continuing the same Chainworks agent execution through an existing live 
                         last_error: &error_str,
                         now,
                     };
+                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
+                    {
+                        anyhow::bail!(
+                            "side_effect_cas_lost: fail CAS missed for effect {}; release connect_upload failure not committed",
+                            connect_lease.effect_id
+                        );
+                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -12433,6 +13816,8 @@ You are continuing the same Chainworks agent execution through an existing live 
                 runtime_facts.valid_required_outputs = false;
             }
         }
+        // Track whether any late output was ignored for post-commit P082-R03/R17 recovery snapshot.
+        let has_ignored_late_output = runtime_facts.ignored_late_output_count > 0;
         if let Some(discovery_diagnostics) = discovery_diagnostics {
             agent_execution_discovery_diagnostics::upsert_tx(&mut tx, discovery_diagnostics)
                 .await?;
@@ -12477,6 +13862,121 @@ You are continuing the same Chainworks agent execution through an existing live 
             )
             .await?;
         artifact_contracts::close_source_generation_claim_tx(&mut tx, artifact_claim_key).await?;
+        if has_ignored_late_output {
+            let now_for_terminalization = completed_at.to_rfc3339();
+            sqlx::query(
+                r#"UPDATE work_items
+                   SET status = ?1,
+                       failed_at = COALESCE(failed_at, ?2),
+                       completed_at = NULL,
+                       last_error = COALESCE(last_error, ?3)
+                   WHERE id = ?4
+                     AND status IN ('pending', 'running', 'cancelled')"#,
+            )
+            .bind(WorkItemStatus::Failed.to_string())
+            .bind(&now_for_terminalization)
+            .bind("ignored_late_output: superseded provider output was quarantined")
+            .bind(work_item_id)
+            .execute(&mut **tx)
+            .await?;
+
+            let p082_late_claim_state = sqlx::query_scalar::<_, String>(
+                r#"SELECT claim_state
+                   FROM artifact_source_generation_claims
+                   WHERE run_id = ?1
+                     AND owner_kind = ?2
+                     AND owner_id = ?3
+                     AND agent_execution_id = ?4
+                     AND source_work_item_id = ?5
+                   LIMIT 1"#,
+            )
+            .bind(artifact_claim_key.run_id.to_string())
+            .bind(artifact_claim_key.owner_kind.to_string())
+            .bind(&artifact_claim_key.owner_id)
+            .bind(agent_exec_id.to_string())
+            .bind(work_item_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+
+            let p082_late_work_item_status =
+                sqlx::query_scalar::<_, String>("SELECT status FROM work_items WHERE id = ?1")
+                    .bind(work_item_id)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+
+            // P082-R03/R17 readback is part of the same durable settlement as
+            // claim/work-item terminalization. Writing it before commit prevents a
+            // crash window where late output is terminalized but no matrix row exists.
+            let run_has_durable_cancellation =
+                db::repos::runs::find_by_id_tx(&mut tx, artifact_claim_key.run_id)
+                    .await?
+                    .map(|r| r.cancellation_requested_at.is_some())
+                    .unwrap_or(false);
+            let cancelled_provider_requested =
+                result_status == AgentStatus::Cancelled || run_has_durable_cancellation;
+            let cancelled_provider = if cancelled_provider_requested {
+                ensure_cancelled_provider_session_evidence_tx(
+                    &mut tx,
+                    source_session_generation_id,
+                    &agent_exec_id.to_string(),
+                    completed_at,
+                )
+                .await?
+            } else {
+                false
+            };
+            let scenario_id = if cancelled_provider {
+                "P082-R17"
+            } else {
+                "P082-R03"
+            };
+            let reason_code = if cancelled_provider {
+                domain::recovery_matrix::REASON_CANCELLED_PROVIDER_LATE_OUTPUT_IGNORED
+            } else {
+                domain::recovery_matrix::REASON_IGNORED_LATE_OUTPUTS
+            };
+            let now_ts = chrono::Utc::now().to_rfc3339();
+            let settlement = domain::recovery_matrix::build_late_output_settlement(
+                &agent_exec_id.to_string(),
+                work_item_id,
+                source_session_generation_id,
+                session_generation_id.unwrap_or(""),
+                p082_late_claim_state.as_deref().unwrap_or("superseded"),
+                "ignored",
+                runtime_facts.ignored_late_output_count,
+                late_output_source_terminal_status_for_readback(
+                    p082_late_work_item_status.as_deref(),
+                ),
+                cancelled_provider,
+            );
+            let readback = domain::recovery_matrix::set_readback_late_output_settlement(
+                domain::recovery_matrix::build_readback_v1(
+                    scenario_id,
+                    "repaired",
+                    "no_mutation",
+                    reason_code,
+                    "Late output from superseded or cancelled source was ignored; active projection unchanged.",
+                    "agent_execution_runtime_facts, artifact_source_generation_claims, work_items",
+                    "agent_execution_runtime_facts, artifact_contracts, work_items",
+                    &stage_execution_id.to_string(),
+                    Some("stage_executions.recovery_snapshot_json.p082_recovery_matrix_readback"),
+                    "valid",
+                    &now_ts,
+                ),
+                settlement,
+            );
+            let snapshot = serde_json::json!({ "p082_recovery_matrix_readback": readback });
+            db::repos::stages::update_recovery_snapshot_json_tx(
+                &mut tx,
+                stage_execution_id,
+                &snapshot.to_string(),
+            )
+            .await?;
+            db::metrics::increment_counter_with_label(
+                "p082_late_output_quarantine_total",
+                &format!("ignored:{source_session_generation_id}"),
+            );
+        }
         tx.commit().await?;
         db::pool::log_write_transaction("executor.import_declared_outputs", tx_started);
         if invalidated_session_after_missing_outputs {
@@ -12726,6 +14226,9 @@ You are continuing the same Chainworks agent execution through an existing live 
             {
                 continue;
             }
+            if discovered_artifact_is_declared_direct_file_ref(discovered, declared_outputs) {
+                continue;
+            }
             if should_ignore_undeclared_envelope_artifact(&discovered.name) {
                 warn!(
                     stage_id = %stage_id,
@@ -12743,22 +14246,12 @@ You are continuing the same Chainworks agent execution through an existing live 
                 .join("undeclared_envelope_outputs")
                 .join(stage_id)
                 .join(format!("{}-{}.{}", file_stem, artifact_id, extension));
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    anyhow::anyhow!(
-                        "create undeclared envelope artifact dir {}: {}",
-                        parent.display(),
-                        e
-                    )
-                })?;
-            }
-            std::fs::write(&path, &discovered.content).map_err(|e| {
-                anyhow::anyhow!(
-                    "write undeclared envelope artifact {}: {}",
-                    path.display(),
-                    e
-                )
-            })?;
+            let path = write_executor_artifact_file_no_symlink(
+                &run.artifact_root,
+                &path,
+                &discovered.content,
+                "undeclared envelope artifact",
+            )?;
 
             let artifact = domain::artifact::Artifact {
                 id: artifact_id,
@@ -13119,11 +14612,6 @@ You are continuing the same Chainworks agent execution through an existing live 
             .join("session_checkpoints")
             .join(stage_id)
             .join(format!("{checkpoint_id}.json"));
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                anyhow::anyhow!("create session checkpoint dir {}: {}", parent.display(), e)
-            })?;
-        }
 
         let disposition = serde_json::to_value(&decision.disposition)
             .ok()
@@ -13139,13 +14627,12 @@ You are continuing the same Chainworks agent execution through an existing live 
             "created_at": created_at.to_rfc3339(),
         });
         let bytes = serde_json::to_vec_pretty(&payload)?;
-        std::fs::write(&path, &bytes).map_err(|e| {
-            anyhow::anyhow!(
-                "write session checkpoint artifact {}: {}",
-                path.display(),
-                e
-            )
-        })?;
+        let path = write_executor_artifact_file_no_symlink(
+            &run.artifact_root,
+            &path,
+            &bytes,
+            "session checkpoint artifact",
+        )?;
 
         let artifact = domain::artifact::Artifact {
             id: checkpoint_id,
@@ -13189,19 +14676,13 @@ You are continuing the same Chainworks agent execution through an existing live 
     ) -> Result<domain::artifact::Artifact> {
         let artifact_name = format!("validation_failure_{}_{}", agent_id, record.id);
         let path = std::path::Path::new(&run.artifact_root).join(format!("{artifact_name}.json"));
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                anyhow::anyhow!("create validation artifact dir {}: {}", parent.display(), e)
-            })?;
-        }
         let encoded = serde_json::to_string_pretty(&record)?;
-        std::fs::write(&path, encoded).map_err(|e| {
-            anyhow::anyhow!(
-                "write validation failure artifact {}: {}",
-                path.display(),
-                e
-            )
-        })?;
+        let path = write_executor_artifact_file_no_symlink(
+            &run.artifact_root,
+            &path,
+            encoded.as_bytes(),
+            "validation failure artifact",
+        )?;
 
         let artifact = domain::artifact::Artifact {
             id: record.artifact_id,
@@ -13265,13 +14746,27 @@ You are continuing the same Chainworks agent execution through an existing live 
         value: &T,
     ) -> Result<Artifact> {
         let path = self.resolve_release_artifact_path(run, name);
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| anyhow::anyhow!("create artifact dir {}: {}", parent.display(), e))?;
-        }
         let json = serde_json::to_string_pretty(value)?;
-        std::fs::write(&path, &json)
-            .map_err(|e| anyhow::anyhow!("write artifact {}: {}", path, e))?;
+        let path = if executor_path_is_under_root(
+            std::path::Path::new(&path),
+            std::path::Path::new(&run.workspace_root),
+        )? {
+            write_executor_workspace_file_no_symlink(
+                &run.workspace_root,
+                std::path::Path::new(&path),
+                json.as_bytes(),
+                "release JSON artifact",
+            )?
+        } else {
+            write_executor_artifact_file_no_symlink(
+                &run.artifact_root,
+                std::path::Path::new(&path),
+                json.as_bytes(),
+                "release JSON artifact",
+            )?
+        }
+        .to_string_lossy()
+        .into_owned();
 
         Ok(Artifact {
             id: domain::ids::ArtifactId::new(),
@@ -13368,7 +14863,6 @@ You are continuing the same Chainworks agent execution through an existing live 
         let evidence_root_hash = sha256_hex(evidence_root.as_bytes());
         let evidence_root_slug = &evidence_root_hash[..16];
         let artifact_root = Path::new(&run.artifact_root);
-        tokio::fs::create_dir_all(artifact_root).await?;
         let now = chrono::Utc::now();
 
         struct SpoolInput {
@@ -13492,6 +14986,12 @@ You are continuing the same Chainworks agent execution through an existing live 
                 evidence_root_slug,
                 input.file_name
             );
+            prepare_executor_parent_under_root(
+                &run.artifact_root,
+                "Run artifact_root",
+                &artifact_root.join(&relative_path),
+                "Run artifact_root",
+            )?;
             let spool = db::evidence_spool::write_spool_file(
                 artifact_root,
                 &run.id.to_string(),
@@ -13588,12 +15088,14 @@ You are continuing the same Chainworks agent execution through an existing live 
         let bytes = serde_json::to_vec_pretty(&manifest)?;
         let manifest_relative_path = format!(
             "evidence/runs/{}/stages/{}/agents/{}/receipt/side-effects/{}/{}/evidence-manifest.json",
-            run.id,
-            stage_execution_id,
-            agent_id,
-            effect_kind,
-            evidence_root_slug
+            run.id, stage_execution_id, agent_id, effect_kind, evidence_root_slug
         );
+        prepare_executor_parent_under_root(
+            &run.artifact_root,
+            "Run artifact_root",
+            &artifact_root.join(&manifest_relative_path),
+            "Run artifact_root",
+        )?;
         let manifest_spool = db::evidence_spool::write_spool_file(
             artifact_root,
             &run.id.to_string(),
@@ -13706,11 +15208,19 @@ You are continuing the same Chainworks agent execution through an existing live 
                 None => None,
             }
         };
+        let p082_readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&self.pool, run.id)
+            .await
+            .unwrap_or_default();
+        db::repos::p082_recovery_matrix::emit_readback_lane_metrics(
+            &p082_readbacks,
+            "release_receipt",
+        );
         let receipt = match DeliveryReceiptBuilder::build_receipt(
             run,
             delivery_config,
             Some(release_result),
             rollout_contract_readback,
+            p082_readbacks,
             idea_title,
             review_status,
         ) {
@@ -13749,29 +15259,6 @@ You are continuing the same Chainworks agent execution through an existing live 
             attempt_count: 0,
             last_error: None,
         })
-    }
-
-    async fn persist_json_artifact<T: Serialize>(
-        &self,
-        run: &domain::run::Run,
-        stage_id: &str,
-        agent_id: &str,
-        provider: &str,
-        model: Option<String>,
-        name: &str,
-        value: &T,
-    ) -> Result<String> {
-        let artifact = self
-            .prepare_release_json_artifact(run, stage_id, agent_id, provider, model, name, value)?;
-        let path = artifact.file_path.clone();
-        artifacts::insert(&self.pool, &artifact).await?;
-        let _ = self
-            .events
-            .send(domain::events::DomainEvent::ArtifactCreated {
-                run_id: run.id,
-                artifact_id: artifact.id,
-            });
-        Ok(path)
     }
 
     async fn persist_delivery_receipt_if_absent(
@@ -13975,6 +15462,20 @@ fn release_artifact_path(artifact_root: &str, name: &str) -> String {
         .into_owned()
 }
 
+async fn mark_release_required_outputs_valid_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    agent_exec_id: domain::ids::AgentExecutionId,
+    artifact_claim_key: &ArtifactSourceGenerationClaimKey,
+    completed_at: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, completed_at);
+    facts.output_settlement = AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+    facts.valid_required_outputs = true;
+    facts.session_reuse_reason = Some("native_release".to_string());
+    agent_execution_runtime_facts::upsert_tx(tx, &facts).await?;
+    artifact_contracts::close_source_generation_claim_tx(tx, artifact_claim_key).await
+}
+
 fn suppress_duplicate_approved_proposal_output(
     declared_outputs: &mut Vec<DeclaredOutput>,
     prompt: &mut String,
@@ -14021,6 +15522,20 @@ fn should_suppress_duplicate_approved_proposal_output(
 
 fn should_ignore_undeclared_envelope_artifact(name: &str) -> bool {
     name == APPROVED_PROPOSAL_OUTPUT_NAME
+}
+
+fn discovered_artifact_is_declared_direct_file_ref(
+    discovered: &acp::DiscoveredArtifact,
+    declared_outputs: &[DeclaredOutput],
+) -> bool {
+    discovered.source_path.is_none()
+        && declared_outputs.iter().any(|declared| {
+            direct_file_ref_manifest_matches(
+                &discovered.content,
+                &declared.output_name,
+                &declared.target_path,
+            )
+        })
 }
 
 fn filter_duplicate_approved_proposal_declared_artifacts(
@@ -14117,6 +15632,7 @@ struct RuntimeInvocationContractInput<'a> {
     stage_id: String,
     stage_execution_id: String,
     agent_execution_id: String,
+    prompt_turn_id: String,
     work_item_id: String,
     session_generation_id: Option<String>,
     session_reuse_disposition: Option<String>,
@@ -14142,6 +15658,7 @@ fn prompt_with_runtime_invocation_contract(
         "- Agent execution id: `{}`\n",
         input.agent_execution_id
     ));
+    prompt.push_str(&format!("- Prompt turn id: `{}`\n", input.prompt_turn_id));
     prompt.push_str(&format!("- Work item id: `{}`\n", input.work_item_id));
     if let Some(session_generation_id) = input.session_generation_id.as_deref() {
         prompt.push_str(&format!(
@@ -14422,7 +15939,138 @@ fn output_discovery_decision_counts(
     (found, missing, stale, rejected)
 }
 
+fn prepare_executor_artifact_parent(
+    workspace_root: &str,
+    artifact_path: &Path,
+    field: &str,
+) -> Result<()> {
+    prepare_executor_parent_under_root(workspace_root, "Run workspace_root", artifact_path, field)
+}
+
+fn prepare_executor_parent_under_root(
+    root: &str,
+    root_field: &str,
+    artifact_path: &Path,
+    field: &str,
+) -> Result<()> {
+    let root = normalize_executor_trusted_system_aliases(Path::new(root));
+    let artifact_path = normalize_executor_trusted_system_aliases(artifact_path);
+    reject_executor_path_symlink_components(&root, root_field)?;
+    let canonical_root = std::fs::canonicalize(&root)
+        .with_context(|| format!("canonicalize {} {}", root_field, root.display()))?;
+    if artifact_path.exists() {
+        reject_executor_path_symlink_components(&artifact_path, field)?;
+    }
+    if !artifact_path.starts_with(&canonical_root) {
+        let boundary = match root_field {
+            "Run workspace_root" => "workspace_root",
+            "Run artifact_root" => "artifact_root",
+            _ => root_field,
+        };
+        anyhow::bail!("{field} escapes canonical {boundary}");
+    }
+    let parent = artifact_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{field} has no parent directory"))?;
+    create_executor_dir_all_no_symlink_under(parent, &canonical_root, field)
+}
+
+fn normalize_executor_trusted_system_aliases(path: &Path) -> PathBuf {
+    if !path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    #[cfg(unix)]
+    {
+        let mut components = path.components();
+        if !matches!(components.next(), Some(Component::RootDir)) {
+            return path.to_path_buf();
+        }
+        if !matches!(components.next(), Some(Component::Normal(first)) if first == "var") {
+            return path.to_path_buf();
+        }
+
+        let mut normalized = PathBuf::from("/private/var");
+        for component in components {
+            match component {
+                Component::Normal(part) => normalized.push(part),
+                Component::CurDir => {}
+                other => normalized.push(other.as_os_str()),
+            }
+        }
+        normalized
+    }
+
+    #[cfg(not(unix))]
+    {
+        path.to_path_buf()
+    }
+}
+
+fn create_executor_dir_all_no_symlink_under(
+    path: &Path,
+    canonical_root: &Path,
+    field: &str,
+) -> Result<()> {
+    let relative = path
+        .strip_prefix(canonical_root)
+        .with_context(|| format!("{field} escapes canonical root"))?;
+    let mut current = canonical_root.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => current.push(part),
+            Component::CurDir => continue,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("{field} contains an unsafe path component");
+            }
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    anyhow::bail!("{field} contains a symlink component");
+                }
+                if !metadata.is_dir() {
+                    anyhow::bail!("{field} path component is not a directory");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)
+                    .with_context(|| format!("create directory {}", current.display()))?;
+                let metadata = std::fs::symlink_metadata(&current)
+                    .with_context(|| format!("verify directory {}", current.display()))?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    anyhow::bail!("{field} created path was replaced before verification");
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", current.display()));
+            }
+        }
+    }
+    let canonical_current = std::fs::canonicalize(&current)
+        .with_context(|| format!("canonicalize directory {}", current.display()))?;
+    if !canonical_current.starts_with(canonical_root) {
+        anyhow::bail!("{field} escapes canonical root after creation");
+    }
+    Ok(())
+}
+
+fn reject_executor_path_symlink_components(path: &Path, field: &str) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+            break;
+        };
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("{field} contains a symlink component");
+        }
+    }
+    Ok(())
+}
+
 async fn persist_p088_worktree_fingerprint(
+    workspace_root: &str,
     artifact_root: &str,
     agent_exec_id: domain::ids::AgentExecutionId,
     fingerprint: &WorktreeFingerprintV1,
@@ -14436,15 +16084,19 @@ async fn persist_p088_worktree_fingerprint(
         .join("p088")
         .join(agent_exec_id.to_string())
         .join(format!("{phase}-worktree-fingerprint.json"));
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    prepare_executor_artifact_parent(workspace_root, &path, "Run artifact_root")?;
     let bytes = serde_json::to_vec_pretty(fingerprint)?;
-    tokio::fs::write(&path, bytes).await?;
+    let path = write_executor_artifact_file_no_symlink(
+        artifact_root,
+        &path,
+        &bytes,
+        "P088 worktree fingerprint artifact",
+    )?;
     Ok(path.to_string_lossy().into_owned())
 }
 
 async fn persist_p088_prompt_artifact(
+    workspace_root: &str,
     artifact_root: &str,
     agent_exec_id: domain::ids::AgentExecutionId,
     prompt_kind: &str,
@@ -14456,14 +16108,19 @@ async fn persist_p088_prompt_artifact(
         .join("p088")
         .join(agent_exec_id.to_string())
         .join(format!("{prompt_kind}-{turn_index}-prompt-redacted.txt"));
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    tokio::fs::write(&path, redact_runtime_message(prompt_text)).await?;
+    prepare_executor_artifact_parent(workspace_root, &path, "Run artifact_root")?;
+    let bytes = redact_runtime_message(prompt_text);
+    let path = write_executor_artifact_file_no_symlink(
+        artifact_root,
+        &path,
+        bytes.as_bytes(),
+        "P088 prompt artifact",
+    )?;
     Ok(path.to_string_lossy().into_owned())
 }
 
 async fn persist_p088_expected_output_snapshot(
+    workspace_root: &str,
     artifact_root: &str,
     agent_exec_id: domain::ids::AgentExecutionId,
     prompt_kind: &str,
@@ -14477,16 +16134,20 @@ async fn persist_p088_expected_output_snapshot(
         .join(format!(
             "{prompt_kind}-{turn_index}-expected-output-contracts.json"
         ));
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    prepare_executor_artifact_parent(workspace_root, &path, "Run artifact_root")?;
     let bytes = serde_json::to_vec_pretty(declared_outputs)?;
     let sha = sha256_hex(&bytes);
-    tokio::fs::write(&path, bytes).await?;
+    let path = write_executor_artifact_file_no_symlink(
+        artifact_root,
+        &path,
+        &bytes,
+        "P088 expected output snapshot artifact",
+    )?;
     Ok((sha, path.to_string_lossy().into_owned()))
 }
 
 async fn persist_p088_completion_text_artifacts(
+    workspace_root: &str,
     artifact_root: &str,
     agent_exec_id: domain::ids::AgentExecutionId,
     prompt_kind: &str,
@@ -14500,13 +16161,25 @@ async fn persist_p088_completion_text_artifacts(
         .join("evidence")
         .join("p088")
         .join(agent_exec_id.to_string());
-    tokio::fs::create_dir_all(&base).await?;
     let raw_path = base.join(format!("{prompt_kind}-{turn_index}-completion-raw.txt"));
     let redacted_path = base.join(format!(
         "{prompt_kind}-{turn_index}-completion-redacted.txt"
     ));
-    let raw_result = tokio::fs::write(&raw_path, text).await;
-    let redacted_result = tokio::fs::write(&redacted_path, redact_runtime_message(text)).await;
+    prepare_executor_artifact_parent(workspace_root, &raw_path, "Run artifact_root")?;
+    prepare_executor_artifact_parent(workspace_root, &redacted_path, "Run artifact_root")?;
+    let raw_result = write_executor_artifact_file_no_symlink(
+        artifact_root,
+        &raw_path,
+        text.as_bytes(),
+        "P088 raw completion text artifact",
+    );
+    let redacted_text = redact_runtime_message(text);
+    let redacted_result = write_executor_artifact_file_no_symlink(
+        artifact_root,
+        &redacted_path,
+        redacted_text.as_bytes(),
+        "P088 redacted completion text artifact",
+    );
     let storage_error = raw_result
         .as_ref()
         .err()
@@ -14514,11 +16187,11 @@ async fn persist_p088_completion_text_artifacts(
         .map(|error| error.to_string());
     Ok(Some(P088TextArtifactPaths {
         raw_path: raw_result
-            .is_ok()
-            .then(|| raw_path.to_string_lossy().into_owned()),
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned()),
         redacted_path: redacted_result
-            .is_ok()
-            .then(|| redacted_path.to_string_lossy().into_owned()),
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned()),
         storage_error,
     }))
 }
@@ -14530,6 +16203,7 @@ struct P088TextArtifactPaths {
 }
 
 async fn persist_p088_receipt_artifact(
+    workspace_root: &str,
     artifact_root: &str,
     agent_exec_id: domain::ids::AgentExecutionId,
     receipt: &CodeWriterCompletionReceiptRecord,
@@ -14541,20 +16215,25 @@ async fn persist_p088_receipt_artifact(
         .join("p088")
         .join(agent_exec_id.to_string())
         .join("code-writer-completion-receipt-v1.json");
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    prepare_executor_artifact_parent(workspace_root, &path, "Run artifact_root")?;
     let value = serde_json::json!({
         "schema_version": "code_writer_completion_receipt_v1",
         "receipt": receipt,
         "text_captures": captures,
         "output_decisions": decisions,
     });
-    tokio::fs::write(&path, serde_json::to_vec_pretty(&value)?).await?;
+    let bytes = serde_json::to_vec_pretty(&value)?;
+    let path = write_executor_artifact_file_no_symlink(
+        artifact_root,
+        &path,
+        &bytes,
+        "P088 completion receipt artifact",
+    )?;
     Ok(path.to_string_lossy().into_owned())
 }
 
 async fn persist_p088_failed_stage_evidence(
+    workspace_root: &str,
     artifact_root: &str,
     agent_exec_id: domain::ids::AgentExecutionId,
     receipt: &CodeWriterCompletionReceiptRecord,
@@ -14566,9 +16245,7 @@ async fn persist_p088_failed_stage_evidence(
         .join("p088")
         .join(agent_exec_id.to_string())
         .join("failed-stage-evidence.json");
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    prepare_executor_artifact_parent(workspace_root, &path, "Run artifact_root")?;
     let value = serde_json::json!({
         "report_kind": "failed_stage_evidence",
         "evidence_source": "p088_code_writer_completion",
@@ -14580,12 +16257,19 @@ async fn persist_p088_failed_stage_evidence(
         "text_captures": captures,
         "output_decisions": decisions,
     });
-    tokio::fs::write(&path, serde_json::to_vec_pretty(&value)?).await?;
+    let bytes = serde_json::to_vec_pretty(&value)?;
+    let path = write_executor_artifact_file_no_symlink(
+        artifact_root,
+        &path,
+        &bytes,
+        "P088 failed stage evidence artifact",
+    )?;
     Ok(path.to_string_lossy().into_owned())
 }
 
 async fn persist_p088_code_writer_completion_receipt(
     pool: &SqlitePool,
+    workspace_root: &str,
     artifact_root: &str,
     run_id: RunId,
     stage_execution_id: domain::ids::StageExecutionId,
@@ -14618,6 +16302,7 @@ async fn persist_p088_code_writer_completion_receipt(
     let receipt_id = format!("{agent_exec_id}:code_writer_completion_receipt_v1");
     let mut partial_write_reasons = Vec::new();
     let original_text_artifacts_result = persist_p088_completion_text_artifacts(
+        workspace_root,
         artifact_root,
         agent_exec_id,
         "original",
@@ -14634,9 +16319,11 @@ async fn persist_p088_code_writer_completion_receipt(
             partial_write_reasons.push(format!("original_completion_text:{error}"));
         }
     }
+    let staged_repair_settlement_enabled = p090_staged_repair_materialization.is_some();
     let repair_text_artifacts = match repair_capture {
         Some(capture) => {
             let result = persist_p088_completion_text_artifacts(
+                workspace_root,
                 artifact_root,
                 agent_exec_id,
                 "code_writer_completion_repair",
@@ -14915,18 +16602,21 @@ async fn persist_p088_code_writer_completion_receipt(
                 p090_staged_repair_missing_strict_warning(provider),
             ),
         repair_materialization_mode: Some(
-            p090_repair_materialization_mode_for_flags(
-                provider,
-                completion_turn_attempted,
-                p090_strict_final_payload_enabled(provider),
-                p090_staged_repair_settlement_requested(provider),
-                p090_staged_repair_disabled(provider),
-            )
+            if staged_repair_settlement_enabled {
+                "staged_per_output"
+            } else {
+                p090_repair_materialization_mode_for_flags(
+                    provider,
+                    completion_turn_attempted,
+                    p090_strict_final_payload_enabled(provider),
+                    p090_staged_repair_settlement_requested(provider),
+                    p090_staged_repair_disabled(provider),
+                )
+            }
             .to_string(),
         ),
         strict_final_payload_enabled: p090_strict_final_payload_enabled(provider),
-        staged_repair_settlement_enabled: completion_turn_attempted
-            && p090_staged_repair_settlement_enabled(provider),
+        staged_repair_settlement_enabled,
         terminal_response_status,
         completion_turn_attempted,
         completion_turn_result: normalized_completion_turn_result,
@@ -14981,6 +16671,7 @@ async fn persist_p088_code_writer_completion_receipt(
         created_at,
     };
     match persist_p088_receipt_artifact(
+        workspace_root,
         artifact_root,
         agent_exec_id,
         &receipt,
@@ -14997,6 +16688,7 @@ async fn persist_p088_code_writer_completion_receipt(
     }
     if receipt.failure_class.is_some() || receipt.missing_required_output_count > 0 {
         match persist_p088_failed_stage_evidence(
+            workspace_root,
             artifact_root,
             agent_exec_id,
             &receipt,
@@ -15035,6 +16727,29 @@ async fn persist_p088_code_writer_completion_receipt(
         publish_p090_committed_repair_artifact_generations(pool, &settlement_rows).await?;
         receipt.repair_materialization_summary_json =
             p090_repair_materialization_summary_json(completion_turn_attempted, &settlement_rows);
+        match persist_p088_receipt_artifact(
+            workspace_root,
+            artifact_root,
+            agent_exec_id,
+            &receipt,
+            &captures,
+            &decisions,
+        )
+        .await
+        {
+            Ok(path) => receipt.receipt_artifact_path = Some(path),
+            Err(error) => {
+                receipt.failure_class = Some("completion_receipt_partial_write".to_string());
+                receipt.transcript_absence_reason = Some("storage_write_failed".to_string());
+                warn!(
+                    run_id = %run_id,
+                    stage_id = %stage_id,
+                    agent_execution_id = %agent_exec_id,
+                    error = %error,
+                    "P090 committed repair receipt artifact refresh failed"
+                );
+            }
+        }
         return code_writer_completion_receipts::upsert_with_runtime_receipts_and_settlement_rows(
             pool,
             &receipt,
@@ -15572,6 +17287,31 @@ fn p090_staged_repair_settlement_enabled(provider: &str) -> bool {
         && p090_staged_repair_settlement_requested(provider)
 }
 
+fn p090_staged_repair_settlement_enabled_for_settlement(
+    provider: &str,
+    settlement: &DeclaredOutputDiscoverySettlement,
+) -> bool {
+    p090_staged_repair_settlement_enabled(provider)
+        || (p090_provider_supports_direct_file_staged_repair(provider)
+            && p090_settlement_has_direct_file_ref(settlement))
+}
+
+fn p090_provider_supports_direct_file_staged_repair(provider: &str) -> bool {
+    matches!(
+        provider,
+        "claude" | "claude_acp" | "codex" | "codex_acp" | "junie"
+    )
+}
+
+fn p090_settlement_has_direct_file_ref(settlement: &DeclaredOutputDiscoverySettlement) -> bool {
+    settlement.decisions.iter().any(|decision| {
+        decision
+            .diagnostics
+            .get("output_mode")
+            .is_some_and(|mode| mode == "direct_file_ref")
+    })
+}
+
 fn p090_junie_preflight_enforce_enabled(provider: &str) -> bool {
     provider == "junie"
 }
@@ -15774,6 +17514,85 @@ fn p090_preflight_remediation_from_json(json: &str) -> Option<String> {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string)
         })
+}
+
+fn late_output_source_terminal_status_for_readback(status: Option<&str>) -> &'static str {
+    match status {
+        Some("completed") => "completed",
+        Some("failed") => "failed",
+        _ => "failed",
+    }
+}
+
+async fn ensure_cancelled_provider_session_evidence_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    generation_id: &str,
+    agent_execution_id: &str,
+    recorded_at: chrono::DateTime<chrono::Utc>,
+) -> Result<bool> {
+    if generation_id.is_empty() {
+        return Ok(false);
+    }
+    let Some(lineage_id) =
+        sqlx::query_scalar::<_, String>("SELECT lineage_id FROM session_generations WHERE id = ?1")
+            .bind(generation_id)
+            .fetch_optional(&mut **tx)
+            .await?
+    else {
+        return Ok(false);
+    };
+
+    let recorded_at_rfc3339 = recorded_at.to_rfc3339();
+    sqlx::query(
+        r#"UPDATE session_generations
+           SET status = CASE
+                 WHEN status = 'active' THEN 'closed'
+                 ELSE status
+               END,
+               ended_at = COALESCE(ended_at, ?1),
+               end_reason = COALESCE(end_reason, 'cancelled_provider_late_output')
+           WHERE id = ?2"#,
+    )
+    .bind(&recorded_at_rfc3339)
+    .bind(generation_id)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        r#"INSERT INTO session_events
+           (id, lineage_id, generation_id, event_type, recorded_at, details_json)
+           VALUES (?1, ?2, ?3, 'closed', ?4, ?5)"#,
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&lineage_id)
+    .bind(generation_id)
+    .bind(&recorded_at_rfc3339)
+    .bind(
+        serde_json::json!({
+            "reason": "cancelled_provider_late_output",
+            "agent_execution_id": agent_execution_id,
+        })
+        .to_string(),
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    let evidence_count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM session_generations sg
+           WHERE sg.id = ?1
+             AND sg.status IN ('closed', 'invalidated', 'reset')
+             AND EXISTS (
+               SELECT 1
+                 FROM session_events se
+                WHERE se.generation_id = sg.id
+                  AND se.event_type IN ('closed', 'invalidated', 'operator_reset')
+             )"#,
+    )
+    .bind(generation_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(evidence_count > 0)
 }
 
 fn p090_enrich_runtime_facts_with_preflight_json(
@@ -16293,13 +18112,20 @@ fn p088_activation_source(
 ) -> String {
     if operator_retry_completion_recovery {
         "operator_retry_completion_recovery".to_string()
-    } else if missing_required_output_count > 0
-        && work_change_kind == Some("current_attempt_diff")
-        && original_runtime_receipt.is_some_and(receipt_indicates_recoverable_handoff_gap)
-    {
-        "p037_idle_terminalization".to_string()
     } else {
-        "declared_output_settlement_failed".to_string()
+        let decision = resolve_continuity_mode(ContinuityModeInput {
+            requested_live_reuse: false,
+            provider_session_id: None,
+            required_outputs_missing: missing_required_output_count > 0,
+            useful_work_observed: work_change_kind == Some("current_attempt_diff")
+                && original_runtime_receipt.is_some_and(receipt_indicates_recoverable_handoff_gap),
+            source_edits_allowed: false,
+            runtime_receipt: original_runtime_receipt,
+        });
+        match decision.mode {
+            ContinuityMode::OutputOnlyRecovery => "p037_idle_terminalization".to_string(),
+            _ => "declared_output_settlement_failed".to_string(),
+        }
     }
 }
 
@@ -16318,6 +18144,12 @@ fn p088_capture_source(source: &acp::AcpCompletionCaptureSource) -> String {
         }
         acp::AcpCompletionCaptureSource::StreamedUpdateTail => "streamed_update_tail".to_string(),
         acp::AcpCompletionCaptureSource::CappedStream => "session_update_stream".to_string(),
+        acp::AcpCompletionCaptureSource::ProviderSessionStoreTaskComplete => {
+            "provider_session_store_task_complete".to_string()
+        }
+        acp::AcpCompletionCaptureSource::ProviderSessionStoreFinalResponse => {
+            "provider_session_store_final_response".to_string()
+        }
     }
 }
 
@@ -16518,11 +18350,21 @@ fn code_writer_completion_repair_prompt(
     prompt
 }
 
-fn merge_contract_repair_result(initial: &mut acp::ExecutionResult, repair: acp::ExecutionResult) {
+fn merge_contract_repair_result(
+    initial: &mut acp::ExecutionResult,
+    repair: acp::ExecutionResult,
+    _merged_settlement: &DeclaredOutputDiscoverySettlement,
+) {
     initial.status = repair.status;
     initial.artifact_paths.extend(repair.artifact_paths);
-    initial.discovered_artifacts = repair.discovered_artifacts;
-    initial.pre_prompt_expected_outputs = repair.pre_prompt_expected_outputs;
+    initial.discovered_artifacts = merge_repair_discovered_artifacts(
+        &initial.discovered_artifacts,
+        repair.discovered_artifacts,
+    );
+    initial.pre_prompt_expected_outputs = merge_repair_pre_prompt_expected_outputs(
+        &initial.pre_prompt_expected_outputs,
+        repair.pre_prompt_expected_outputs,
+    );
     initial.cost_cents =
         Some(initial.cost_cents.unwrap_or_default() + repair.cost_cents.unwrap_or_default());
     initial.usage = repair.usage.or_else(|| initial.usage.clone());
@@ -16573,9 +18415,168 @@ fn merge_contract_repair_result(initial: &mut acp::ExecutionResult, repair: acp:
     };
 }
 
+fn merge_repair_discovered_artifacts(
+    original: &[acp::DiscoveredArtifact],
+    repair: Vec<acp::DiscoveredArtifact>,
+) -> Vec<acp::DiscoveredArtifact> {
+    let mut merged = original.to_vec();
+    for repair_artifact in repair {
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|artifact| artifact.name == repair_artifact.name)
+        {
+            *existing = repair_artifact;
+        } else {
+            merged.push(repair_artifact);
+        }
+    }
+    merged
+}
+
+fn merge_repair_pre_prompt_expected_outputs(
+    original: &[PrePromptExpectedOutputMetadata],
+    repair: Vec<PrePromptExpectedOutputMetadata>,
+) -> Vec<PrePromptExpectedOutputMetadata> {
+    let mut merged = original.to_vec();
+    for repair_metadata in repair {
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|metadata| metadata.output_name == repair_metadata.output_name)
+        {
+            *existing = repair_metadata;
+        } else {
+            merged.push(repair_metadata);
+        }
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn execution_result_for_repair_merge(
+        names: &[&str],
+        transcript_text: Option<&str>,
+    ) -> acp::ExecutionResult {
+        acp::ExecutionResult {
+            agent_execution_id: domain::ids::AgentExecutionId::new(),
+            status: AgentStatus::Completed,
+            artifact_paths: Vec::new(),
+            discovered_artifacts: names
+                .iter()
+                .map(|name| acp::DiscoveredArtifact {
+                    name: (*name).to_string(),
+                    content: format!("{name}-payload").into_bytes(),
+                    source_path: Some(format!("/tmp/{name}.json")),
+                    source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+                })
+                .collect(),
+            pre_prompt_expected_outputs: names
+                .iter()
+                .map(|name| PrePromptExpectedOutputMetadata {
+                    output_name: (*name).to_string(),
+                    target_path: format!("/tmp/{name}.json"),
+                    canonical_path: None,
+                    root_class: OutputRootClass::Workspace,
+                    existed: false,
+                    file_type: "absent".to_string(),
+                    size_bytes: None,
+                    file_count: None,
+                    content_digest: None,
+                    mtime_ns: None,
+                    baseline_status: ExpectedPathBaselineStatus::Absent,
+                    agent_execution_id: "agent-exec".to_string(),
+                    stage_execution_id: "stage-exec".to_string(),
+                    attempt_number: 1,
+                    session_generation_id: "session-gen".to_string(),
+                    prompt_turn_id: "prompt-turn".to_string(),
+                    discovery_generation_id: "discovery-gen".to_string(),
+                })
+                .collect(),
+            completion_text_capture: Default::default(),
+            transcript_text: transcript_text.map(str::to_string),
+            cost_cents: None,
+            usage: None,
+            provider_session_id: None,
+            reused_existing_session: false,
+            session_generation_id: None,
+            mcp_observation: None,
+            actual_mcp_extensions: Vec::new(),
+            actual_mcp_runtime_ids: Vec::new(),
+            mcp_session_startup_latency_ms: None,
+            xcode_shim_warning_events: Vec::new(),
+            close_diagnostic: None,
+            provider_session_store_capture: None,
+            acp_pre_initialize_local_latency_ms: None,
+            acp_initialize_latency_ms: None,
+            acp_session_new_latency_ms: None,
+            acp_prompt_duration_ms: None,
+            acp_pre_prompt_metadata_latency_ms: None,
+            acp_pre_prompt_metadata_timeout: false,
+            acp_pre_prompt_metadata_digest_bytes: 0,
+            legacy_broad_discovery_snapshot: None,
+            runtime_receipt: None,
+            runtime_tool_path_preflight_json: None,
+        }
+    }
+
+    #[test]
+    fn contract_repair_result_preserves_original_outputs_not_returned_by_partial_repair() {
+        let mut initial = execution_result_for_repair_merge(
+            &[
+                "proposal_current",
+                "proposal_revision_summary",
+                "proposal_feedback_coverage",
+            ],
+            Some("original transcript"),
+        );
+        let repair = execution_result_for_repair_merge(
+            &["proposal_current", "proposal_revision_summary"],
+            Some("repair transcript"),
+        );
+        let settlement = DeclaredOutputDiscoverySettlement {
+            decisions: Vec::new(),
+            accepted_payloads: HashMap::new(),
+            idempotency_key: None,
+            accepted_aggregate_bytes: 0,
+            aggregate_cap_hit: false,
+        };
+
+        merge_contract_repair_result(&mut initial, repair, &settlement);
+
+        let discovered_names: Vec<_> = initial
+            .discovered_artifacts
+            .iter()
+            .map(|artifact| artifact.name.as_str())
+            .collect();
+        assert_eq!(
+            discovered_names,
+            vec![
+                "proposal_current",
+                "proposal_revision_summary",
+                "proposal_feedback_coverage",
+            ]
+        );
+        let pre_prompt_names: Vec<_> = initial
+            .pre_prompt_expected_outputs
+            .iter()
+            .map(|metadata| metadata.output_name.as_str())
+            .collect();
+        assert_eq!(
+            pre_prompt_names,
+            vec![
+                "proposal_current",
+                "proposal_revision_summary",
+                "proposal_feedback_coverage",
+            ]
+        );
+        assert!(initial
+            .transcript_text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("--- output contract repair turn ---"));
+    }
 
     #[test]
     fn dbwriter_write_timeout_is_transient_persistence_contention() {
@@ -16584,6 +18585,549 @@ mod tests {
         );
 
         assert!(is_transient_persistence_contention_error(&error));
+    }
+
+    #[test]
+    fn p082_executor_artifact_parent_rejects_symlink_swapped_artifact_root() {
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let artifact_root = workspace.path().join("artifacts");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &artifact_root)
+            .expect("artifact_root symlink fixture");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), &artifact_root)
+            .expect("artifact_root symlink fixture");
+
+        let path = artifact_root
+            .join("evidence")
+            .join("p088")
+            .join("receipt.json");
+        let err = prepare_executor_artifact_parent(
+            &workspace.path().to_string_lossy(),
+            &path,
+            "Run artifact_root",
+        )
+        .expect_err("symlink-swapped artifact_root must fail closed");
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "P082 executor writes must reject artifact_root symlink swaps; got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn p082_executor_artifact_parent_rejects_workspace_escape() {
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let workspace_root = workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let path = outside.path().join("evidence").join("receipt.json");
+
+        let err = prepare_executor_artifact_parent(
+            &workspace_root.to_string_lossy(),
+            &path,
+            "Run artifact_root",
+        )
+        .expect_err("artifact path outside workspace must fail closed");
+
+        assert!(
+            err.to_string().contains("escapes canonical workspace_root"),
+            "P082 executor writes must reject paths outside workspace; got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn p082_executor_artifact_parent_rejects_parent_dir_escape() {
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let workspace_root = workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let path = workspace_root
+            .join("artifacts")
+            .join("..")
+            .join("..")
+            .join("outside")
+            .join("receipt.json");
+
+        let err = prepare_executor_artifact_parent(
+            &workspace_root.to_string_lossy(),
+            &path,
+            "Run artifact_root",
+        )
+        .expect_err("parent-directory artifact path escape must fail closed");
+
+        assert!(
+            err.to_string().contains("unsafe path component")
+                || err.to_string().contains("escapes canonical"),
+            "P082 executor writes must reject parent-directory escapes; got: {err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p082_executor_artifact_parent_allows_macos_var_alias_inside_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let canonical_workspace = workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let Ok(var_suffix) = canonical_workspace.strip_prefix("/private/var") else {
+            return;
+        };
+        let alias_workspace = Path::new("/var").join(var_suffix);
+        if std::fs::symlink_metadata("/var")
+            .map(|metadata| !metadata.file_type().is_symlink())
+            .unwrap_or(true)
+            || !alias_workspace.exists()
+        {
+            return;
+        }
+
+        let path = alias_workspace
+            .join("artifacts")
+            .join("evidence")
+            .join("receipt.json");
+
+        prepare_executor_artifact_parent(
+            &alias_workspace.to_string_lossy(),
+            &path,
+            "Run artifact_root",
+        )
+        .expect("trusted macOS /var alias should normalize inside canonical workspace");
+
+        assert!(canonical_workspace
+            .join("artifacts")
+            .join("evidence")
+            .is_dir());
+    }
+
+    #[test]
+    fn p086_continuation_artifact_write_rejects_parent_symlink() {
+        let artifact_root = tempfile::tempdir().expect("artifact root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let continuations_dir = artifact_root.path().join("continuations");
+        std::fs::create_dir(&continuations_dir).expect("continuations dir");
+        let continuation_dir = continuations_dir.join("cont-1");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &continuation_dir)
+            .expect("continuation symlink fixture");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), &continuation_dir)
+            .expect("continuation symlink fixture");
+
+        let err = write_p086_continuation_artifact_bytes(
+            &artifact_root.path().to_string_lossy(),
+            "cont-1",
+            "continuation_response_snapshot",
+            domain::ids::ArtifactId::new(),
+            br#"{"ok":true}"#,
+        )
+        .expect_err("P086 continuation artifacts must reject parent symlinks");
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert!(
+            std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+            "parent symlink target must not receive continuation artifacts"
+        );
+    }
+
+    #[test]
+    fn p086_continuation_artifact_write_rejects_final_path_symlink() {
+        let artifact_root = tempfile::tempdir().expect("artifact root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let artifact_id = domain::ids::ArtifactId::new();
+        let parent = artifact_root.path().join("continuations").join("cont-1");
+        std::fs::create_dir_all(&parent).expect("continuation artifact parent");
+        let target = parent.join(format!("continuation_response_snapshot-{artifact_id}.json"));
+        let outside_file = outside.path().join("outside.json");
+        std::fs::write(&outside_file, b"outside").expect("outside file");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_file, &target).expect("final symlink fixture");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&outside_file, &target).expect("final symlink fixture");
+
+        let err = write_p086_continuation_artifact_bytes(
+            &artifact_root.path().to_string_lossy(),
+            "cont-1",
+            "continuation_response_snapshot",
+            artifact_id,
+            br#"{"ok":true}"#,
+        )
+        .expect_err("P086 continuation artifacts must reject final-path symlinks");
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside_file).unwrap(),
+            "outside",
+            "final symlink target must not be overwritten"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p082_write_file_no_follow_rejects_parent_symlink_directly() {
+        let artifact_root = tempfile::tempdir().expect("artifact root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let parent = artifact_root.path().join("provider-envelope");
+        std::os::unix::fs::symlink(outside.path(), &parent).expect("parent symlink fixture");
+        let target = parent.join("artifact.json");
+
+        let err = write_file_no_follow(&target, br#"{"ok":true}"#)
+            .expect_err("descriptor-relative writer must reject parent symlinks");
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert!(
+            std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+            "parent symlink target must not receive direct writer output"
+        );
+    }
+
+    #[test]
+    fn p082_executor_daemon_artifact_write_rejects_parent_symlink() {
+        let artifact_root = tempfile::tempdir().expect("artifact root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let output_dir = artifact_root.path().join("undeclared_envelope_outputs");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &output_dir)
+            .expect("daemon artifact parent symlink fixture");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), &output_dir)
+            .expect("daemon artifact parent symlink fixture");
+        let target = output_dir.join("stage").join("artifact.json");
+
+        let err = write_executor_artifact_file_no_symlink(
+            &artifact_root.path().to_string_lossy(),
+            &target,
+            br#"{"ok":true}"#,
+            "daemon artifact",
+        )
+        .expect_err("daemon artifact writes must reject parent symlinks");
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert!(
+            std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+            "parent symlink target must not receive daemon artifacts"
+        );
+    }
+
+    #[test]
+    fn p082_executor_daemon_artifact_write_rejects_final_path_symlink() {
+        let artifact_root = tempfile::tempdir().expect("artifact root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let parent = artifact_root
+            .path()
+            .join("session_checkpoints")
+            .join("stage");
+        std::fs::create_dir_all(&parent).expect("daemon artifact parent");
+        let target = parent.join("checkpoint.json");
+        let outside_file = outside.path().join("outside.json");
+        std::fs::write(&outside_file, b"outside").expect("outside file");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_file, &target)
+            .expect("daemon artifact final symlink fixture");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&outside_file, &target)
+            .expect("daemon artifact final symlink fixture");
+
+        let err = write_executor_artifact_file_no_symlink(
+            &artifact_root.path().to_string_lossy(),
+            &target,
+            br#"{"ok":true}"#,
+            "daemon artifact",
+        )
+        .expect_err("daemon artifact writes must reject final-path symlinks");
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside_file).unwrap(),
+            "outside",
+            "final symlink target must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn p082_executor_daemon_artifact_writer_lanes_reject_final_path_symlinks() {
+        let lanes = [
+            (
+                "undeclared envelope artifact",
+                vec!["undeclared_envelope_outputs", "stage", "artifact.json"],
+            ),
+            (
+                "session checkpoint artifact",
+                vec!["session_checkpoints", "stage", "checkpoint.json"],
+            ),
+            (
+                "validation failure artifact",
+                vec!["validation_failure_agent_record.json"],
+            ),
+            (
+                "release JSON artifact",
+                vec!["release", "release-receipt.json"],
+            ),
+        ];
+
+        for (label, components) in lanes {
+            let artifact_root = tempfile::tempdir().expect("artifact root");
+            let outside = tempfile::tempdir().expect("outside target");
+            let mut target = artifact_root.path().to_path_buf();
+            for component in &components {
+                target.push(component);
+            }
+            let parent = target.parent().expect("target parent");
+            std::fs::create_dir_all(parent).expect("daemon artifact parent");
+            let outside_file = outside
+                .path()
+                .join(format!("outside-{}.json", label.replace([' ', '-'], "_")));
+            std::fs::write(&outside_file, b"outside").expect("outside file");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&outside_file, &target)
+                .expect("daemon artifact final symlink fixture");
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(&outside_file, &target)
+                .expect("daemon artifact final symlink fixture");
+
+            let err = write_executor_artifact_file_no_symlink(
+                &artifact_root.path().to_string_lossy(),
+                &target,
+                br#"{"ok":true}"#,
+                label,
+            )
+            .expect_err("daemon artifact lane writes must reject final-path symlinks");
+
+            assert!(
+                err.to_string().contains("symlink"),
+                "{label}: expected symlink rejection, got {err:#}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(outside_file).unwrap(),
+                "outside",
+                "{label}: final symlink target must not be overwritten"
+            );
+        }
+    }
+
+    #[test]
+    fn p088_evidence_artifact_writer_lanes_reject_final_path_symlinks() {
+        let agent_exec_id = domain::ids::AgentExecutionId::new().to_string();
+        let lanes = [
+            (
+                "P088 worktree fingerprint artifact",
+                format!("pre-worktree-fingerprint.json"),
+            ),
+            (
+                "P088 prompt artifact",
+                format!("original-0-prompt-redacted.txt"),
+            ),
+            (
+                "P088 expected output snapshot artifact",
+                format!("original-0-expected-output-contracts.json"),
+            ),
+            (
+                "P088 raw completion text artifact",
+                format!("original-0-completion-raw.txt"),
+            ),
+            (
+                "P088 redacted completion text artifact",
+                format!("original-0-completion-redacted.txt"),
+            ),
+            (
+                "P088 completion receipt artifact",
+                "code-writer-completion-receipt-v1.json".to_string(),
+            ),
+            (
+                "P088 failed stage evidence artifact",
+                "failed-stage-evidence.json".to_string(),
+            ),
+        ];
+
+        for (label, filename) in lanes {
+            let artifact_root = tempfile::tempdir().expect("artifact root");
+            let outside = tempfile::tempdir().expect("outside target");
+            let target = artifact_root
+                .path()
+                .join("evidence")
+                .join("p088")
+                .join(&agent_exec_id)
+                .join(filename);
+            let parent = target.parent().expect("target parent");
+            std::fs::create_dir_all(parent).expect("P088 artifact parent");
+            let outside_file = outside
+                .path()
+                .join(format!("outside-{}.json", label.replace([' ', '-'], "_")));
+            std::fs::write(&outside_file, b"outside").expect("outside file");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&outside_file, &target).expect("P088 final symlink fixture");
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(&outside_file, &target)
+                .expect("P088 final symlink fixture");
+
+            let err = write_executor_artifact_file_no_symlink(
+                &artifact_root.path().to_string_lossy(),
+                &target,
+                br#"{"ok":true}"#,
+                label,
+            )
+            .expect_err("P088 evidence artifacts must reject final-path symlinks");
+
+            assert!(
+                err.to_string().contains("symlink"),
+                "{label}: expected symlink rejection, got {err:#}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(outside_file).unwrap(),
+                "outside",
+                "{label}: final symlink target must not be overwritten"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p088_evidence_artifact_writer_rejects_dangling_final_symlink() {
+        let artifact_root = tempfile::tempdir().expect("artifact root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let target = artifact_root
+            .path()
+            .join("evidence")
+            .join("p088")
+            .join(domain::ids::AgentExecutionId::new().to_string())
+            .join("original-0-prompt-redacted.txt");
+        std::fs::create_dir_all(target.parent().unwrap()).expect("P088 artifact parent");
+        let missing_target = outside.path().join("missing.txt");
+        std::os::unix::fs::symlink(&missing_target, &target)
+            .expect("dangling final symlink fixture");
+
+        let err = write_executor_artifact_file_no_symlink(
+            &artifact_root.path().to_string_lossy(),
+            &target,
+            b"redacted prompt",
+            "P088 prompt artifact",
+        )
+        .expect_err("P088 evidence artifacts must reject dangling final symlinks");
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert!(
+            !missing_target.exists(),
+            "dangling symlink target must not be created"
+        );
+    }
+
+    #[test]
+    fn p088_evidence_artifact_writer_rejects_parent_symlink() {
+        let artifact_root = tempfile::tempdir().expect("artifact root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let p088_dir = artifact_root.path().join("evidence").join("p088");
+        std::fs::create_dir_all(p088_dir.parent().unwrap()).expect("evidence parent");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &p088_dir).expect("P088 parent symlink fixture");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), &p088_dir)
+            .expect("P088 parent symlink fixture");
+        let target = p088_dir
+            .join(domain::ids::AgentExecutionId::new().to_string())
+            .join("failed-stage-evidence.json");
+
+        let err = write_executor_artifact_file_no_symlink(
+            &artifact_root.path().to_string_lossy(),
+            &target,
+            br#"{"ok":true}"#,
+            "P088 failed stage evidence artifact",
+        )
+        .expect_err("P088 evidence artifacts must reject parent symlinks");
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert!(
+            std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+            "parent symlink target must not receive P088 artifacts"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p088_evidence_artifact_writer_rejects_final_path_swap_after_parent_validation() {
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let artifact_root = workspace.path().join("artifacts");
+        let target = artifact_root
+            .join("evidence")
+            .join("p088")
+            .join(domain::ids::AgentExecutionId::new().to_string())
+            .join("code-writer-completion-receipt-v1.json");
+
+        prepare_executor_artifact_parent(
+            &workspace.path().to_string_lossy(),
+            &target,
+            "Run artifact_root",
+        )
+        .expect("initial P088 parent validation should pass");
+        let outside_file = outside.path().join("outside.json");
+        std::fs::write(&outside_file, b"outside").expect("outside file");
+        std::os::unix::fs::symlink(&outside_file, &target)
+            .expect("post-validation final symlink swap fixture");
+
+        let err = write_executor_artifact_file_no_symlink(
+            &artifact_root.to_string_lossy(),
+            &target,
+            br#"{"schema_version":"code_writer_completion_receipt_v1"}"#,
+            "P088 completion receipt artifact",
+        )
+        .expect_err("P088 evidence artifacts must reject final-path swaps");
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside_file).unwrap(),
+            "outside",
+            "post-validation symlink target must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn p082_r17_late_output_readback_normalizes_cancelled_source_status() {
+        assert_eq!(
+            late_output_source_terminal_status_for_readback(Some("completed")),
+            "completed"
+        );
+        assert_eq!(
+            late_output_source_terminal_status_for_readback(Some("failed")),
+            "failed"
+        );
+        assert_eq!(
+            late_output_source_terminal_status_for_readback(Some("cancelled")),
+            "failed",
+            "P082-R17 readback must not expose cancelled source work item status"
+        );
+        assert_eq!(
+            late_output_source_terminal_status_for_readback(None),
+            "failed"
+        );
     }
 
     #[test]
@@ -16694,6 +19238,8 @@ mod tests {
             logical_stage_id: Some("state_implementation".into()),
             stage_type: Some("implementation".into()),
             agent_status: "completed".into(),
+            provider: "claude".into(),
+            provider_family: Some("claude".into()),
             session_generation_id: Some("session-1".into()),
             provider_session_id: Some("provider-session-1".into()),
             catalog_snapshot_json: None,
@@ -16986,6 +19532,7 @@ plain progress line without gate evidence";
                 stage_id: "state_5_proposal_refined".to_string(),
                 stage_execution_id: stage_execution_id.to_string(),
                 agent_execution_id: agent_execution_id.to_string(),
+                prompt_turn_id: "prompt-turn-1".to_string(),
                 work_item_id: "p058-invoke:stage:0".to_string(),
                 session_generation_id: Some("generation-1".to_string()),
                 session_reuse_disposition: Some("reused".to_string()),
@@ -16997,6 +19544,7 @@ plain progress line without gate evidence";
         assert!(prompt.contains("### Runtime Invocation Contract"));
         assert!(prompt.contains("provider session may be reused"));
         assert!(prompt.contains(&stage_execution_id.to_string()));
+        assert!(prompt.contains("prompt-turn-1"));
         assert!(prompt.contains("p058-invoke:stage:0"));
         assert!(prompt.contains("proposal_current"));
         assert!(prompt.contains("/workspace/.chainworks/runs/run-1/proposals/current.md"));
@@ -17031,6 +19579,7 @@ plain progress line without gate evidence";
                 stage_id: "state_2_system_context_collected".to_string(),
                 stage_execution_id: domain::ids::StageExecutionId::new().to_string(),
                 agent_execution_id: domain::ids::AgentExecutionId::new().to_string(),
+                prompt_turn_id: "prompt-turn-directory".to_string(),
                 work_item_id: "work-system-context".to_string(),
                 session_generation_id: None,
                 session_reuse_disposition: None,
@@ -17072,6 +19621,7 @@ plain progress line without gate evidence";
                 stage_id: "state_9_implementation_reviewed".to_string(),
                 stage_execution_id: domain::ids::StageExecutionId::new().to_string(),
                 agent_execution_id: domain::ids::AgentExecutionId::new().to_string(),
+                prompt_turn_id: "prompt-turn-docs".to_string(),
                 work_item_id: "work-docs".to_string(),
                 session_generation_id: None,
                 session_reuse_disposition: None,
@@ -17121,6 +19671,7 @@ plain progress line without gate evidence";
                 stage_id: "state_8_implemented".to_string(),
                 stage_execution_id: domain::ids::StageExecutionId::new().to_string(),
                 agent_execution_id: domain::ids::AgentExecutionId::new().to_string(),
+                prompt_turn_id: "prompt-turn-code".to_string(),
                 work_item_id: "work-code".to_string(),
                 session_generation_id: None,
                 session_reuse_disposition: None,
@@ -17725,7 +20276,24 @@ plain progress line without gate evidence";
             },
         ];
 
-        let merged = merge_repair_captured_outputs(&original, &repair);
+        let repair_payload_ref = "repair:implementation_self_assessment".to_string();
+        let repair_settlement = DeclaredOutputDiscoverySettlement {
+            decisions: vec![p090_test_decision(
+                "implementation_self_assessment",
+                OutputDiscoveryStatus::Accepted,
+                OutputDiscoveryReason::ProviderEnvelope,
+                Some(&repair_payload_ref),
+            )],
+            accepted_payloads: HashMap::from([(
+                repair_payload_ref,
+                repair[1].machine_bytes.clone().unwrap(),
+            )]),
+            idempotency_key: None,
+            accepted_aggregate_bytes: repair[1].machine_bytes.as_ref().unwrap().len() as u64,
+            aggregate_cap_hit: false,
+        };
+
+        let merged = merge_repair_captured_outputs(&original, &repair, &repair_settlement, None);
         let validation = validate_task_outputs(&merged);
 
         assert!(validation.failure_class.is_none());
@@ -17734,6 +20302,80 @@ plain progress line without gate evidence";
             .output_results
             .iter()
             .all(|result| result.status == domain::validation::ValidationStatus::Passed));
+    }
+
+    #[test]
+    fn output_contract_repair_result_preserves_original_and_repair_discovery_metadata() {
+        fn execution_result(
+            execution_id: &str,
+            output_name: &str,
+            target_path: &str,
+        ) -> acp::ExecutionResult {
+            serde_json::from_value(serde_json::json!({
+                "agent_execution_id": execution_id,
+                "status": "completed",
+                "artifact_paths": [target_path],
+                "discovered_artifacts": [{
+                    "name": output_name,
+                    "content": [123, 125],
+                    "source_path": target_path,
+                    "source_kind": "chainworks_output"
+                }],
+                "pre_prompt_expected_outputs": [{
+                    "output_name": output_name,
+                    "target_path": target_path,
+                    "canonical_path": target_path,
+                    "root_class": "workspace",
+                    "existed": false,
+                    "file_type": "absent",
+                    "baseline_status": "absent",
+                    "agent_execution_id": execution_id,
+                    "stage_execution_id": "01900000-0000-7000-8000-000000000101",
+                    "attempt_number": 1,
+                    "session_generation_id": "session-generation-1",
+                    "prompt_turn_id": "turn-1",
+                    "discovery_generation_id": format!("discovery-{output_name}")
+                }],
+                "cost_cents": 0
+            }))
+            .expect("compact execution result fixture must deserialize")
+        }
+
+        let mut initial = execution_result(
+            "01900000-0000-7000-8000-000000000201",
+            "implementation_progress",
+            "/workspace/.chainworks/implementation/progress.json",
+        );
+        let repair = execution_result(
+            "01900000-0000-7000-8000-000000000202",
+            "implementation_self_assessment",
+            "/workspace/.chainworks/implementation/self-assessment.json",
+        );
+        let merged_settlement = DeclaredOutputDiscoverySettlement {
+            decisions: Vec::new(),
+            accepted_payloads: HashMap::new(),
+            idempotency_key: None,
+            accepted_aggregate_bytes: 0,
+            aggregate_cap_hit: false,
+        };
+
+        merge_contract_repair_result(&mut initial, repair, &merged_settlement);
+
+        let discovered_names: HashSet<_> = initial
+            .discovered_artifacts
+            .iter()
+            .map(|artifact| artifact.name.as_str())
+            .collect();
+        assert!(discovered_names.contains("implementation_progress"));
+        assert!(discovered_names.contains("implementation_self_assessment"));
+
+        let pre_prompt_names: HashSet<_> = initial
+            .pre_prompt_expected_outputs
+            .iter()
+            .map(|metadata| metadata.output_name.as_str())
+            .collect();
+        assert!(pre_prompt_names.contains("implementation_progress"));
+        assert!(pre_prompt_names.contains("implementation_self_assessment"));
     }
 
     #[test]
@@ -18181,6 +20823,7 @@ plain progress line without gate evidence";
                 stage_id: "state_5".to_string(),
                 stage_execution_id: "stage-exec-1".to_string(),
                 agent_execution_id: "agent-exec-1".to_string(),
+                prompt_turn_id: "prompt-turn-stable".to_string(),
                 work_item_id: "p058-invoke:stage-exec-1:0".to_string(),
                 session_generation_id: Some("generation-1".to_string()),
                 session_reuse_disposition: Some("reused".to_string()),
@@ -18583,6 +21226,48 @@ plain progress line without gate evidence";
     }
 
     #[test]
+    fn codex_tool_session_control_failure_overrides_no_output_validation_failure_kind() {
+        let validation = TaskValidationSummary {
+            output_results: vec![],
+            contract_metadata: vec![],
+            raw_output_exists: false,
+            failure_class: Some(domain::validation::ValidationFailureClass::NoOutputProduced),
+            failure_summary: Some("required output was not produced".into()),
+        };
+        let classification = classify_observation(
+            crate::failure_classifier::RuntimeFailureObservation::ProviderToolSessionControlFailure,
+        );
+
+        let facts = runtime_facts_for_execution_result(
+            domain::ids::AgentExecutionId::new(),
+            AgentStatus::Failed,
+            Some(&validation),
+            Some(classification),
+            chrono::Utc::now(),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            facts.failure_kind,
+            Some(AgentFailureKind::ProviderInternalError)
+        );
+        assert_eq!(
+            facts.transport_error_code.as_deref(),
+            Some("CODEX_TOOL_SESSION_CONTROL_FAILURE")
+        );
+        assert_eq!(
+            facts.supervision_classification.as_deref(),
+            Some("codex_tool_session_control_failure")
+        );
+        assert_eq!(
+            facts.output_settlement,
+            AgentOutputSettlement::MissingRequiredOutputs
+        );
+    }
+
+    #[test]
     fn provider_quota_prompt_error_skips_output_contract_repair() {
         let mut receipt = sample_runtime_receipt(
             acp::AcpRuntimeReceiptCounters {
@@ -18617,6 +21302,229 @@ plain progress line without gate evidence";
             classification.operator_action_hint,
             OperatorActionHint::WaitUntilRetryAfter
         );
+    }
+
+    #[test]
+    fn provider_quota_prompt_error_uses_receipt_reset_for_repair_skip() {
+        let mut receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 2,
+                session_update_count: 1,
+                permission_request_count: 0,
+                permission_grant_sent_count: 0,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 0,
+                agent_thought_chunk_count: 0,
+                tool_call_count: 0,
+                tool_call_update_count: 0,
+                plan_update_count: 0,
+                meaningful_progress_count: 1,
+                unknown_notification_count: 1,
+            },
+            Some("prompt_error_response"),
+        );
+        receipt.provider = "claude".into();
+        receipt.completed_at = Some("2026-06-11T22:16:16.294297+00:00".into());
+        receipt.provider_error_message_redacted = Some(
+            "ACP session/prompt returned error: Internal error: You're out of extra usage · resets 4am (Asia/Nicosia)"
+                .into(),
+        );
+
+        let classification = output_contract_repair_skip_classification(
+            &AgentStatus::Failed,
+            Some("I'll read the input artifacts to understand what refinements are needed."),
+            Some(&receipt),
+        )
+        .expect("provider quota prompt error should skip output contract repair");
+
+        assert_eq!(classification.failure_kind, AgentFailureKind::ProviderQuota);
+        assert_eq!(
+            classification.retry_after.map(|dt| dt.to_rfc3339()),
+            Some("2026-06-12T01:00:00+00:00".to_string())
+        );
+    }
+
+    #[test]
+    fn provider_quota_receipt_overrides_no_output_validation_failure() {
+        let mut receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 2,
+                session_update_count: 1,
+                permission_request_count: 0,
+                permission_grant_sent_count: 0,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 0,
+                agent_thought_chunk_count: 0,
+                tool_call_count: 0,
+                tool_call_update_count: 0,
+                plan_update_count: 0,
+                meaningful_progress_count: 1,
+                unknown_notification_count: 1,
+            },
+            Some("prompt_error_response"),
+        );
+        receipt.provider = "claude".into();
+        receipt.completed_at = Some("2026-06-11T22:16:16.294297+00:00".into());
+        receipt.provider_error_message_redacted = Some(
+            "ACP session/prompt returned error: Internal error: You're out of extra usage · resets 4am (Asia/Nicosia)"
+                .into(),
+        );
+        let validation = TaskValidationSummary {
+            output_results: vec![],
+            contract_metadata: vec![],
+            raw_output_exists: false,
+            failure_class: Some(domain::validation::ValidationFailureClass::NoOutputProduced),
+            failure_summary: Some("required output was not produced".into()),
+        };
+
+        let facts = runtime_facts_for_execution_result(
+            domain::ids::AgentExecutionId::new(),
+            AgentStatus::Failed,
+            Some(&validation),
+            observed_failure_classification_for_execution_result(
+                &AgentStatus::Failed,
+                Some("I'll read the input artifacts to understand what refinements are needed."),
+                Some(&receipt),
+            ),
+            chrono::DateTime::parse_from_rfc3339("2026-06-11T22:16:16.294297Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            None,
+            Some(&receipt),
+            None,
+        );
+
+        assert_eq!(facts.failure_kind, Some(AgentFailureKind::ProviderQuota));
+        assert_eq!(
+            facts.operator_action_hint,
+            Some(OperatorActionHint::WaitUntilRetryAfter)
+        );
+        assert_eq!(
+            facts.retry_after.map(|dt| dt.to_rfc3339()),
+            Some("2026-06-12T01:00:00+00:00".to_string())
+        );
+        assert_eq!(
+            facts.output_settlement,
+            AgentOutputSettlement::MissingRequiredOutputs
+        );
+    }
+
+    #[test]
+    fn p088_capture_source_names_provider_session_store_final_response() {
+        assert_eq!(
+            p088_capture_source(
+                &acp::AcpCompletionCaptureSource::ProviderSessionStoreFinalResponse
+            ),
+            "provider_session_store_final_response"
+        );
+    }
+
+    #[test]
+    fn continuity_mode_forbids_normal_live_reuse_after_prompt_closed_during_stream() {
+        let mut receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 376,
+                session_update_count: 376,
+                permission_request_count: 0,
+                permission_grant_sent_count: 0,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 12,
+                agent_thought_chunk_count: 0,
+                tool_call_count: 10,
+                tool_call_update_count: 149,
+                plan_update_count: 0,
+                meaningful_progress_count: 161,
+                unknown_notification_count: 0,
+            },
+            Some("prompt_closed_during_stream"),
+        );
+        receipt.provider = "claude".into();
+        receipt.provider_session_id = Some("claude-session-1".into());
+
+        let decision = resolve_continuity_mode(ContinuityModeInput {
+            requested_live_reuse: true,
+            provider_session_id: Some("claude-session-1"),
+            required_outputs_missing: true,
+            useful_work_observed: true,
+            source_edits_allowed: false,
+            runtime_receipt: Some(&receipt),
+        });
+
+        assert_eq!(decision.mode, ContinuityMode::OutputOnlyRecovery);
+        assert!(!decision.normal_live_reuse_allowed);
+        assert_eq!(decision.reason, "useful_work_missing_outputs");
+    }
+
+    #[test]
+    fn continuity_mode_uses_resurrection_for_ambiguous_boundary_with_provider_session() {
+        let mut receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 12,
+                session_update_count: 10,
+                permission_request_count: 0,
+                permission_grant_sent_count: 0,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 1,
+                agent_thought_chunk_count: 0,
+                tool_call_count: 1,
+                tool_call_update_count: 8,
+                plan_update_count: 0,
+                meaningful_progress_count: 9,
+                unknown_notification_count: 0,
+            },
+            Some("transport_closed"),
+        );
+        receipt.provider = "claude".into();
+        receipt.provider_session_id = Some("claude-session-2".into());
+
+        let decision = resolve_continuity_mode(ContinuityModeInput {
+            requested_live_reuse: true,
+            provider_session_id: Some("claude-session-2"),
+            required_outputs_missing: false,
+            useful_work_observed: false,
+            source_edits_allowed: false,
+            runtime_receipt: Some(&receipt),
+        });
+
+        assert_eq!(decision.mode, ContinuityMode::ProviderSessionResurrection);
+        assert!(!decision.normal_live_reuse_allowed);
+        assert_eq!(decision.reason, "ambiguous_boundary_with_provider_session");
+    }
+
+    #[test]
+    fn continuity_mode_allows_live_reuse_only_for_clean_boundary() {
+        let mut receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 2,
+                session_update_count: 1,
+                permission_request_count: 0,
+                permission_grant_sent_count: 0,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 1,
+                agent_thought_chunk_count: 0,
+                tool_call_count: 0,
+                tool_call_update_count: 0,
+                plan_update_count: 0,
+                meaningful_progress_count: 1,
+                unknown_notification_count: 0,
+            },
+            None,
+        );
+        receipt.status = "completed".into();
+        receipt.handshake.terminal_response_at_ms = Some(42);
+
+        let decision = resolve_continuity_mode(ContinuityModeInput {
+            requested_live_reuse: true,
+            provider_session_id: Some("provider-session-1"),
+            required_outputs_missing: false,
+            useful_work_observed: false,
+            source_edits_allowed: false,
+            runtime_receipt: Some(&receipt),
+        });
+
+        assert_eq!(decision.mode, ContinuityMode::NormalLiveReuse);
+        assert!(decision.normal_live_reuse_allowed);
+        assert_eq!(decision.reason, "clean_live_reuse");
     }
 
     #[test]
@@ -19003,6 +21911,7 @@ plain progress line without gate evidence";
             reuse_existing_session: false,
             session_generation_id: Some("session-generation-p090".into()),
             provider_session_id: None,
+            provider_runtime_home: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: Some(meta_root.to_string_lossy().into_owned()),
             legacy_broad_discovery_policy: Default::default(),
@@ -19169,23 +22078,425 @@ plain progress line without gate evidence";
         assert!(!p090_staged_repair_disabled("junie"));
         assert!(!p090_strict_final_payload_enabled("codex"));
         assert!(!p090_staged_repair_settlement_enabled("codex"));
+        assert!(!p090_staged_repair_settlement_enabled("claude"));
+        assert!(p090_provider_supports_direct_file_staged_repair("codex"));
+        assert!(p090_provider_supports_direct_file_staged_repair("claude"));
         assert!(!p090_junie_preflight_enforce_enabled("codex"));
     }
 
     #[test]
-    fn proposal_090_staged_repair_without_strict_is_explicitly_reported() {
-        let mode = p090_repair_materialization_mode_for_flags("junie", true, false, true, false);
-        assert_eq!(mode, "staged_repair_disabled_missing_strict_final_payload");
+    fn proposal_090_claude_direct_file_repair_uses_per_output_settlement_without_strict_payload() {
+        let mut direct_file_decision = p090_test_decision(
+            "implementation_progress",
+            OutputDiscoveryStatus::Accepted,
+            OutputDiscoveryReason::ExactPathChanged,
+            Some("direct-file:implementation_progress"),
+        );
+        direct_file_decision
+            .diagnostics
+            .insert("output_mode".to_string(), "direct_file_ref".to_string());
+        let settlement = DeclaredOutputDiscoverySettlement {
+            decisions: vec![direct_file_decision],
+            accepted_payloads: HashMap::from([(
+                "direct-file:implementation_progress".to_string(),
+                b"fresh progress".to_vec(),
+            )]),
+            idempotency_key: None,
+            accepted_aggregate_bytes: 14,
+            aggregate_cap_hit: false,
+        };
+
+        assert!(p090_staged_repair_settlement_enabled_for_settlement(
+            "claude",
+            &settlement
+        ));
+        assert!(p090_staged_repair_settlement_enabled_for_settlement(
+            "codex_acp",
+            &settlement
+        ));
         let summary = p090_repair_materialization_summary_json_with_config_warning(
             true,
             &[],
-            Some("staged_repair_requested_without_strict_final_payload"),
+            p090_staged_repair_missing_strict_warning("claude"),
         )
         .expect("summary json");
         let value: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        assert_eq!(value["config_warnings"], serde_json::json!([]));
+    }
+
+    fn p090_test_decision(
+        output_name: &str,
+        status: OutputDiscoveryStatus,
+        reason: OutputDiscoveryReason,
+        payload_ref: Option<&str>,
+    ) -> OutputDiscoveryDecision {
+        OutputDiscoveryDecision {
+            output_name: output_name.to_string(),
+            output_role: domain::discovery::ExpectedOutputRole::Machine,
+            target_path: format!("/tmp/{output_name}.json"),
+            companion_of: None,
+            status,
+            reason,
+            provenance: Some(OutputDiscoveryProvenance::ExactPath),
+            canonical_path: Some(format!("/tmp/{output_name}.json")),
+            root_class: Some(OutputRootClass::ChainworksMetaRoot),
+            baseline_status: Some(ExpectedPathBaselineStatus::RegularContentCaptured),
+            size_bytes: Some(12),
+            content_digest: Some(format!("sha256:{output_name}")),
+            max_bytes_applied: Some(10 * 1024 * 1024),
+            aggregate_bytes_after_acceptance: payload_ref.map(|_| 12),
+            accepted_payload_ref: payload_ref.map(str::to_string),
+            accepted_bytes_sha256: payload_ref.map(|_| format!("sha256:{output_name}")),
+            generated_by: None,
+            diagnostics: Default::default(),
+            decision_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn proposal_090_repair_merge_preserves_original_accepted_outputs_when_repair_is_stale() {
+        let original_progress_ref = "original:implementation_progress".to_string();
+        let repair_changed_ref = "repair:changed_files_manifest".to_string();
+        let original = DeclaredOutputDiscoverySettlement {
+            decisions: vec![
+                p090_test_decision(
+                    "implementation_progress",
+                    OutputDiscoveryStatus::Accepted,
+                    OutputDiscoveryReason::ExactPathChanged,
+                    Some(&original_progress_ref),
+                ),
+                p090_test_decision(
+                    "changed_files_manifest",
+                    OutputDiscoveryStatus::Missing,
+                    OutputDiscoveryReason::MissingAfterPrompt,
+                    None,
+                ),
+            ],
+            accepted_payloads: HashMap::from([(
+                original_progress_ref.clone(),
+                b"fresh progress".to_vec(),
+            )]),
+            idempotency_key: Some("original".to_string()),
+            accepted_aggregate_bytes: 14,
+            aggregate_cap_hit: false,
+        };
+        let repair = DeclaredOutputDiscoverySettlement {
+            decisions: vec![
+                p090_test_decision(
+                    "implementation_progress",
+                    OutputDiscoveryStatus::Missing,
+                    OutputDiscoveryReason::StaleExpectedOutput,
+                    None,
+                ),
+                p090_test_decision(
+                    "changed_files_manifest",
+                    OutputDiscoveryStatus::Accepted,
+                    OutputDiscoveryReason::ExactPathChanged,
+                    Some(&repair_changed_ref),
+                ),
+            ],
+            accepted_payloads: HashMap::from([(
+                repair_changed_ref.clone(),
+                br#"{"files":[]}"#.to_vec(),
+            )]),
+            idempotency_key: Some("repair".to_string()),
+            accepted_aggregate_bytes: 12,
+            aggregate_cap_hit: false,
+        };
+
+        let merged = merge_repair_discovery_settlements(&original, &repair, None);
+        let progress = merged
+            .decisions
+            .iter()
+            .find(|decision| decision.output_name == "implementation_progress")
+            .unwrap();
+        let changed_files = merged
+            .decisions
+            .iter()
+            .find(|decision| decision.output_name == "changed_files_manifest")
+            .unwrap();
+
+        assert_eq!(progress.status, OutputDiscoveryStatus::Accepted);
         assert_eq!(
-            value["config_warnings"],
-            serde_json::json!(["staged_repair_requested_without_strict_final_payload"])
+            progress.accepted_payload_ref.as_deref(),
+            Some(original_progress_ref.as_str())
+        );
+        assert_eq!(changed_files.status, OutputDiscoveryStatus::Accepted);
+        assert_eq!(
+            changed_files.accepted_payload_ref.as_deref(),
+            Some(repair_changed_ref.as_str())
+        );
+    }
+
+    #[test]
+    fn proposal_090_repair_merge_does_not_replace_original_valid_output_with_repair_payload() {
+        let declared = DeclaredOutput {
+            output_name: "implementation_progress".to_string(),
+            target_path: "/tmp/implementation_progress.json".to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let original_progress_ref = "original:implementation_progress".to_string();
+        let repair_progress_ref = "repair:implementation_progress".to_string();
+        let original = DeclaredOutputDiscoverySettlement {
+            decisions: vec![p090_test_decision(
+                "implementation_progress",
+                OutputDiscoveryStatus::Accepted,
+                OutputDiscoveryReason::ExactPathChanged,
+                Some(&original_progress_ref),
+            )],
+            accepted_payloads: HashMap::from([(
+                original_progress_ref.clone(),
+                b"valid original progress".to_vec(),
+            )]),
+            idempotency_key: None,
+            accepted_aggregate_bytes: 23,
+            aggregate_cap_hit: false,
+        };
+        let repair = DeclaredOutputDiscoverySettlement {
+            decisions: vec![p090_test_decision(
+                "implementation_progress",
+                OutputDiscoveryStatus::Accepted,
+                OutputDiscoveryReason::ProviderEnvelope,
+                Some(&repair_progress_ref),
+            )],
+            accepted_payloads: HashMap::from([(
+                repair_progress_ref.clone(),
+                b"malformed repair progress".to_vec(),
+            )]),
+            idempotency_key: None,
+            accepted_aggregate_bytes: 25,
+            aggregate_cap_hit: false,
+        };
+        let original_validation = TaskValidationSummary {
+            output_results: vec![domain::validation::OutputValidationResult {
+                output_name: "implementation_progress".to_string(),
+                contract_id: Some("implementation_progress".to_string()),
+                status: domain::validation::ValidationStatus::Passed,
+                missing_fields: vec![],
+                validation_error: None,
+                raw_payload_size: 23,
+            }],
+            contract_metadata: vec![],
+            raw_output_exists: true,
+            failure_class: None,
+            failure_summary: None,
+        };
+        let original_captured = vec![CapturedOutput {
+            declared: declared.clone(),
+            machine_bytes: Some(b"valid original progress".to_vec()),
+            companion_bytes: None,
+        }];
+        let repair_captured = vec![CapturedOutput {
+            declared,
+            machine_bytes: Some(b"malformed repair progress".to_vec()),
+            companion_bytes: None,
+        }];
+
+        let merged_settlement =
+            merge_repair_discovery_settlements(&original, &repair, Some(&original_validation));
+        let merged_captured = merge_repair_captured_outputs(
+            &original_captured,
+            &repair_captured,
+            &repair,
+            Some(&original_validation),
+        );
+        let progress_decision = merged_settlement
+            .decisions
+            .iter()
+            .find(|decision| decision.output_name == "implementation_progress")
+            .unwrap();
+
+        assert_eq!(
+            progress_decision.accepted_payload_ref.as_deref(),
+            Some(original_progress_ref.as_str())
+        );
+        assert_eq!(
+            merged_captured[0].machine_bytes.as_deref(),
+            Some(&b"valid original progress"[..])
+        );
+    }
+
+    #[test]
+    fn proposal_090_repair_merge_preserves_valid_proposal_feedback_coverage_when_repair_omits_it() {
+        let proposal_current = DeclaredOutput {
+            output_name: "proposal_current".to_string(),
+            target_path: "/tmp/proposal.md".to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let proposal_revision_summary = DeclaredOutput {
+            output_name: "proposal_revision_summary".to_string(),
+            target_path: "/tmp/revision-summary.json".to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let proposal_feedback_coverage = DeclaredOutput {
+            output_name: "proposal_feedback_coverage".to_string(),
+            target_path: "/tmp/feedback-coverage.json".to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+
+        let original_current_ref = "original:proposal_current".to_string();
+        let original_summary_ref = "original:proposal_revision_summary".to_string();
+        let original_coverage_ref = "original:proposal_feedback_coverage".to_string();
+        let repair_current_ref = "repair:proposal_current".to_string();
+        let repair_summary_ref = "repair:proposal_revision_summary".to_string();
+
+        let original = DeclaredOutputDiscoverySettlement {
+            decisions: vec![
+                p090_test_decision(
+                    "proposal_current",
+                    OutputDiscoveryStatus::Accepted,
+                    OutputDiscoveryReason::ProviderEnvelope,
+                    Some(&original_current_ref),
+                ),
+                p090_test_decision(
+                    "proposal_revision_summary",
+                    OutputDiscoveryStatus::Accepted,
+                    OutputDiscoveryReason::ProviderEnvelope,
+                    Some(&original_summary_ref),
+                ),
+                p090_test_decision(
+                    "proposal_feedback_coverage",
+                    OutputDiscoveryStatus::Accepted,
+                    OutputDiscoveryReason::ProviderEnvelope,
+                    Some(&original_coverage_ref),
+                ),
+            ],
+            accepted_payloads: HashMap::from([
+                (original_current_ref.clone(), b"invalid proposal".to_vec()),
+                (original_summary_ref.clone(), b"old summary".to_vec()),
+                (original_coverage_ref.clone(), b"valid coverage".to_vec()),
+            ]),
+            idempotency_key: Some("original".to_string()),
+            accepted_aggregate_bytes: 39,
+            aggregate_cap_hit: false,
+        };
+        let repair = DeclaredOutputDiscoverySettlement {
+            decisions: vec![
+                p090_test_decision(
+                    "proposal_current",
+                    OutputDiscoveryStatus::Accepted,
+                    OutputDiscoveryReason::ProviderEnvelope,
+                    Some(&repair_current_ref),
+                ),
+                p090_test_decision(
+                    "proposal_revision_summary",
+                    OutputDiscoveryStatus::Accepted,
+                    OutputDiscoveryReason::ProviderEnvelope,
+                    Some(&repair_summary_ref),
+                ),
+            ],
+            accepted_payloads: HashMap::from([
+                (repair_current_ref.clone(), b"fixed proposal".to_vec()),
+                (repair_summary_ref.clone(), b"repair summary".to_vec()),
+            ]),
+            idempotency_key: Some("repair".to_string()),
+            accepted_aggregate_bytes: 27,
+            aggregate_cap_hit: false,
+        };
+        let original_validation = TaskValidationSummary {
+            output_results: vec![
+                domain::validation::OutputValidationResult {
+                    output_name: "proposal_current".to_string(),
+                    contract_id: Some("proposal_current_v1".to_string()),
+                    status: domain::validation::ValidationStatus::Failed,
+                    missing_fields: vec![],
+                    validation_error: Some("forbidden field cutover_policy.policy".to_string()),
+                    raw_payload_size: 16,
+                },
+                domain::validation::OutputValidationResult {
+                    output_name: "proposal_revision_summary".to_string(),
+                    contract_id: Some("proposal_revision_summary_v1".to_string()),
+                    status: domain::validation::ValidationStatus::Passed,
+                    missing_fields: vec![],
+                    validation_error: None,
+                    raw_payload_size: 11,
+                },
+                domain::validation::OutputValidationResult {
+                    output_name: "proposal_feedback_coverage".to_string(),
+                    contract_id: Some("proposal_feedback_coverage_v1".to_string()),
+                    status: domain::validation::ValidationStatus::Passed,
+                    missing_fields: vec![],
+                    validation_error: None,
+                    raw_payload_size: 14,
+                },
+            ],
+            contract_metadata: vec![],
+            raw_output_exists: true,
+            failure_class: Some(domain::validation::ValidationFailureClass::OutputContractMismatch),
+            failure_summary: Some("proposal_current contract mismatch".to_string()),
+        };
+        let original_captured = vec![
+            CapturedOutput {
+                declared: proposal_current.clone(),
+                machine_bytes: Some(b"invalid proposal".to_vec()),
+                companion_bytes: None,
+            },
+            CapturedOutput {
+                declared: proposal_revision_summary.clone(),
+                machine_bytes: Some(b"old summary".to_vec()),
+                companion_bytes: None,
+            },
+            CapturedOutput {
+                declared: proposal_feedback_coverage.clone(),
+                machine_bytes: Some(b"valid coverage".to_vec()),
+                companion_bytes: None,
+            },
+        ];
+        let repair_captured = vec![
+            CapturedOutput {
+                declared: proposal_current,
+                machine_bytes: Some(b"fixed proposal".to_vec()),
+                companion_bytes: None,
+            },
+            CapturedOutput {
+                declared: proposal_revision_summary,
+                machine_bytes: Some(b"repair summary".to_vec()),
+                companion_bytes: None,
+            },
+        ];
+
+        let merged_settlement =
+            merge_repair_discovery_settlements(&original, &repair, Some(&original_validation));
+        let merged_captured = merge_repair_captured_outputs(
+            &original_captured,
+            &repair_captured,
+            &repair,
+            Some(&original_validation),
+        );
+        let coverage_decision = merged_settlement
+            .decisions
+            .iter()
+            .find(|decision| decision.output_name == "proposal_feedback_coverage")
+            .unwrap();
+        let coverage_captured = merged_captured
+            .iter()
+            .find(|captured| captured.declared.output_name == "proposal_feedback_coverage")
+            .unwrap();
+
+        assert_eq!(coverage_decision.status, OutputDiscoveryStatus::Accepted);
+        assert_eq!(
+            coverage_decision.accepted_payload_ref.as_deref(),
+            Some(original_coverage_ref.as_str())
+        );
+        assert_eq!(
+            coverage_captured.machine_bytes.as_deref(),
+            Some(&b"valid coverage"[..])
+        );
+        assert_eq!(
+            output_discovery_decision_counts(&merged_settlement.decisions),
+            (3, 0, 0, 0)
         );
     }
 
@@ -19773,6 +23084,146 @@ plain progress line without gate evidence";
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn p082_provider_envelope_materialization_rejects_final_path_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let output_dir = tmp.path().join("outputs");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        let outside_file = outside.path().join("escaped.json");
+        std::fs::write(&outside_file, br#"{"status":"outside"}"#).unwrap();
+        let machine_path = output_dir.join("proposal_review.json");
+        std::os::unix::fs::symlink(&outside_file, &machine_path).unwrap();
+
+        let declared = DeclaredOutput {
+            output_name: "proposal_review".to_string(),
+            target_path: machine_path.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: "proposal_review".to_string(),
+            content: br#"{"status":"green"}"#.to_vec(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
+        }];
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            None,
+            false,
+        );
+
+        let err = match settle_agent_outputs_from_discovery_decisions(
+            &[declared],
+            &specs,
+            &discovered,
+            &[],
+        ) {
+            Ok(_) => panic!("provider-envelope materialization must reject final-path symlinks"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside_file).unwrap(),
+            r#"{"status":"outside"}"#
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p082_provider_envelope_materialization_rejects_parent_directory_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let output_dir = tmp.path().join("outputs");
+        std::os::unix::fs::symlink(outside.path(), &output_dir).unwrap();
+        let machine_path = output_dir.join("proposal_review.json");
+
+        let declared = DeclaredOutput {
+            output_name: "proposal_review".to_string(),
+            target_path: machine_path.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: "proposal_review".to_string(),
+            content: br#"{"status":"green"}"#.to_vec(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
+        }];
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            None,
+            false,
+        );
+
+        let err = match settle_agent_outputs_from_discovery_decisions(
+            &[declared],
+            &specs,
+            &discovered,
+            &[],
+        ) {
+            Ok(_) => panic!("provider-envelope materialization must reject parent symlinks"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert!(
+            !outside.path().join("proposal_review.json").exists(),
+            "parent symlink must not receive materialized output"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p082_p090_commit_helper_rejects_final_path_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let staged_path = tmp.path().join("staged.json");
+        std::fs::write(&staged_path, br#"{"status":"green"}"#).unwrap();
+        let outside_file = outside.path().join("canonical.json");
+        std::fs::write(&outside_file, br#"{"status":"outside"}"#).unwrap();
+        let canonical_path = tmp.path().join("canonical.json");
+        std::os::unix::fs::symlink(&outside_file, &canonical_path).unwrap();
+        let now = chrono::Utc::now();
+        let staged = P090StagedRepairMaterialization {
+            rows: Vec::new(),
+            commits: vec![P090StagedRepairCommit {
+                output_name: "implementation_self_assessment".to_string(),
+                staging_path: staged_path.to_string_lossy().into_owned(),
+                canonical_path: canonical_path.to_string_lossy().into_owned(),
+            }],
+        };
+
+        let err = commit_p090_staged_repair_materialization(staged, now)
+            .expect_err("P090 commit must reject final-path symlinks");
+
+        let err_chain = format!("{err:#}");
+        assert!(
+            err_chain.contains("symlink"),
+            "expected symlink rejection, got {err_chain}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside_file).unwrap(),
+            r#"{"status":"outside"}"#
+        );
+    }
+
     #[test]
     fn proposal_090_repair_materializes_valid_outputs_without_overwriting_malformed_sibling() {
         let tmp = tempfile::tempdir().unwrap();
@@ -20125,6 +23576,134 @@ plain progress line without gate evidence";
     }
 
     #[test]
+    fn mixed_path_keyed_inline_outputs_survive_direct_file_manifest_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let progress_path = tmp.path().join("implementation/progress.md");
+        let self_assessment_path = tmp.path().join("implementation/self-assessment.json");
+        let changed_files_path = tmp.path().join("implementation/changed-files.json");
+        let tests_path = tmp.path().join("implementation/tests.json");
+        std::fs::create_dir_all(changed_files_path.parent().unwrap()).unwrap();
+        let changed_bytes = br#"{"files":["control-plane/crates/engine/src/executor.rs"]}"#;
+        std::fs::write(&changed_files_path, changed_bytes).unwrap();
+
+        let declared = vec![
+            DeclaredOutput {
+                output_name: "implementation_progress".to_string(),
+                target_path: progress_path.to_string_lossy().into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "implementation_self_assessment".to_string(),
+                target_path: self_assessment_path.to_string_lossy().into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "changed_files_manifest".to_string(),
+                target_path: changed_files_path.to_string_lossy().into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "tests_result".to_string(),
+                target_path: tests_path.to_string_lossy().into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+        ];
+        let specs =
+            build_expected_output_specs(&declared, tmp.path().to_str().unwrap(), None, None, false);
+        let metadata_context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "prompt-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let pre_prompt_metadata: Vec<_> = specs
+            .iter()
+            .map(|spec| PrePromptExpectedOutputMetadata::absent(spec, &metadata_context))
+            .collect();
+        let discovered = vec![
+            acp::DiscoveredArtifact {
+                name: progress_path.to_string_lossy().into_owned(),
+                content: b"progress complete".to_vec(),
+                source_path: None,
+                source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+            },
+            acp::DiscoveredArtifact {
+                name: self_assessment_path.to_string_lossy().into_owned(),
+                content: br#"{"implementation_complete":true,"verification_green":true,"remaining_code_tasks":[]}"#.to_vec(),
+                source_path: None,
+                source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+            },
+            acp::DiscoveredArtifact {
+                name: changed_files_path.to_string_lossy().into_owned(),
+                content: serde_json::to_vec(&serde_json::json!({
+                    "mode": "direct_file",
+                    "output_name": "changed_files_manifest",
+                    "path": changed_files_path.to_string_lossy(),
+                    "digest": sha256_digest(changed_bytes),
+                    "size_bytes": changed_bytes.len()
+                }))
+                .unwrap(),
+                source_path: None,
+                source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+            },
+            acp::DiscoveredArtifact {
+                name: tests_path.to_string_lossy().into_owned(),
+                content: br#"{"status":"complete","summary":"passed"}"#.to_vec(),
+                source_path: None,
+                source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+            },
+        ];
+
+        let settlement =
+            build_declared_output_discovery_settlement(&specs, &discovered, &pre_prompt_metadata);
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &declared,
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+
+        for output_name in [
+            "implementation_progress",
+            "implementation_self_assessment",
+            "changed_files_manifest",
+            "tests_result",
+        ] {
+            let decision = settlement
+                .decisions
+                .iter()
+                .find(|decision| decision.output_name == output_name)
+                .unwrap();
+            assert_eq!(
+                decision.status,
+                OutputDiscoveryStatus::Accepted,
+                "{output_name} should be accepted: {decision:?}"
+            );
+        }
+        assert_eq!(captured.len(), 4);
+        assert_eq!(
+            captured
+                .iter()
+                .find(|output| output.declared.output_name == "implementation_progress")
+                .and_then(|output| output.machine_bytes.as_deref()),
+            Some(&b"progress complete"[..])
+        );
+    }
+
+    #[test]
     fn direct_file_ref_manifest_accepts_changed_canonical_file_output() {
         let tmp = tempfile::tempdir().unwrap();
         let output_path = tmp.path().join("proposals/current/proposal.json");
@@ -20211,6 +23790,110 @@ plain progress line without gate evidence";
     }
 
     #[test]
+    fn p079_recovered_session_store_final_accepts_changed_canonical_files_by_exact_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_root = tmp.path().join(".chainworks/runs/run-p079");
+        let implementation_dir = run_root.join("implementation");
+        std::fs::create_dir_all(&implementation_dir).unwrap();
+        let outputs = [
+            (
+                "implementation_progress",
+                "progress.json",
+                br#"{"status":"complete","current_phase":"runtime-recovery","completed_items":[],"deferred_items":[],"notes":""}"#
+                    .as_slice(),
+            ),
+            (
+                "implementation_self_assessment",
+                "self-assessment.json",
+                br#"{"implementation_complete":true,"verification_green":true,"remaining_code_tasks":[],"handoff_tasks":[],"known_risks":[],"tests_run":[],"docs_impacted":[]}"#
+                    .as_slice(),
+            ),
+            (
+                "changed_files_manifest",
+                "changed-files.json",
+                br#"{"files":[]}"#.as_slice(),
+            ),
+            (
+                "tests_result",
+                "tests.json",
+                br#"{"status":"pass","summary":"focused recovery tests"}"#.as_slice(),
+            ),
+        ];
+        let declared: Vec<DeclaredOutput> = outputs
+            .iter()
+            .map(|(name, file_name, _)| DeclaredOutput {
+                output_name: (*name).to_string(),
+                target_path: implementation_dir
+                    .join(file_name)
+                    .to_string_lossy()
+                    .into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            })
+            .collect();
+        let specs = build_expected_output_specs(
+            &declared,
+            tmp.path().to_str().unwrap(),
+            None,
+            Some(run_root.to_str().unwrap()),
+            false,
+        );
+        let metadata_context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-p079".to_string(),
+            stage_execution_id: "stage-exec-p079".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-p079".to_string(),
+            prompt_turn_id: "prompt-p079".to_string(),
+            discovery_generation_id: "discovery-p079".to_string(),
+        };
+        let pre_prompt_metadata: Vec<_> = specs
+            .iter()
+            .map(|spec| PrePromptExpectedOutputMetadata::absent(spec, &metadata_context))
+            .collect();
+        let mut discovered = Vec::new();
+        for ((name, _file_name, bytes), spec) in outputs.iter().zip(specs.iter()) {
+            std::fs::write(&spec.target_path, bytes).unwrap();
+            discovered.push(acp::DiscoveredArtifact {
+                name: (*name).to_string(),
+                content: bytes.to_vec(),
+                source_path: Some(spec.target_path.clone()),
+                source_kind: acp::DiscoveredArtifactSourceKind::ExactPath,
+            });
+        }
+
+        let settlement =
+            build_declared_output_discovery_settlement(&specs, &discovered, &pre_prompt_metadata);
+
+        assert!(settlement
+            .decisions
+            .iter()
+            .all(|decision| decision.status == OutputDiscoveryStatus::Accepted));
+        let changed_files = settlement
+            .decisions
+            .iter()
+            .find(|decision| decision.output_name == "changed_files_manifest")
+            .expect("changed files decision");
+        assert_eq!(
+            changed_files.reason,
+            OutputDiscoveryReason::ControlPlaneGenerated
+        );
+        assert!(
+            settlement.decisions.iter().all(|decision| {
+                decision.output_name == "changed_files_manifest"
+                    || matches!(
+                        decision.reason,
+                        OutputDiscoveryReason::ExactPathNew
+                            | OutputDiscoveryReason::ExactPathChanged
+                    )
+            }),
+            "unexpected decisions: {:?}",
+            settlement.decisions
+        );
+    }
+
+    #[test]
     fn direct_file_ref_manifest_accepts_compact_path_digest_size_shape() {
         let tmp = tempfile::tempdir().unwrap();
         let output_path = tmp.path().join("proposals/current/proposal.json");
@@ -20284,6 +23967,538 @@ plain progress line without gate evidence";
             Some(&output_bytes[..])
         );
         assert!(validation.failure_class.is_none());
+    }
+
+    #[test]
+    fn direct_file_ref_manifest_accepts_path_keyed_manifest_by_inner_output_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("implementation/progress.md");
+        std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+        let output_bytes = b"## Progress\n\n- Implemented direct-file settlement.\n";
+        std::fs::write(&output_path, output_bytes).unwrap();
+        let declared = DeclaredOutput {
+            output_name: "implementation_progress".to_string(),
+            target_path: output_path.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            Some(tmp.path().to_str().unwrap()),
+            false,
+        );
+        let metadata_context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "prompt-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let pre_prompt_metadata = vec![PrePromptExpectedOutputMetadata::absent(
+            &specs[0],
+            &metadata_context,
+        )];
+        let manifest = serde_json::json!({
+            "mode": "direct_file",
+            "output_name": "implementation_progress",
+            "path": output_path.to_string_lossy(),
+            "digest": sha256_digest(output_bytes),
+            "size_bytes": output_bytes.len()
+        });
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: "path-keyed-output-entry".to_string(),
+            content: serde_json::to_vec(&manifest).unwrap(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+        }];
+
+        let settlement =
+            build_declared_output_discovery_settlement(&specs, &discovered, &pre_prompt_metadata);
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &[declared],
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+        let validation = validate_task_outputs(&captured);
+
+        assert_eq!(
+            settlement.decisions[0].status,
+            OutputDiscoveryStatus::Accepted
+        );
+        assert_eq!(
+            settlement.decisions[0].reason,
+            OutputDiscoveryReason::ExactPathNew
+        );
+        assert_eq!(
+            settlement.decisions[0].diagnostics.get("output_mode"),
+            Some(&"direct_file_ref".to_string())
+        );
+        assert_eq!(
+            captured[0].machine_bytes.as_deref(),
+            Some(&output_bytes[..])
+        );
+        assert!(validation.failure_class.is_none());
+    }
+
+    #[test]
+    fn code_writer_multi_output_direct_file_manifests_are_accepted_by_inner_output_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let implementation_dir = tmp.path().join("implementation");
+        std::fs::create_dir_all(&implementation_dir).unwrap();
+        let outputs = [
+            (
+                "implementation_progress",
+                "progress.md",
+                b"## Progress\n\n- Direct-file settlement complete.\n".to_vec(),
+            ),
+            (
+                "implementation_self_assessment",
+                "self-assessment.json",
+                br#"{"implementation_complete":true,"verification_green":true,"remaining_code_tasks":[]}"#
+                    .to_vec(),
+            ),
+            (
+                "tests_result",
+                "tests.json",
+                br#"{"status":"pass","summary":"focused tests passed"}"#.to_vec(),
+            ),
+        ];
+        let declared = outputs
+            .iter()
+            .map(|(output_name, file_name, _)| DeclaredOutput {
+                output_name: (*output_name).to_string(),
+                target_path: implementation_dir
+                    .join(file_name)
+                    .to_string_lossy()
+                    .into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            })
+            .collect::<Vec<_>>();
+        for (output_name, file_name, bytes) in outputs {
+            let path = implementation_dir.join(file_name);
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(
+                declared
+                    .iter()
+                    .any(|declared| declared.output_name == output_name
+                        && declared.target_path == path.to_string_lossy()),
+                "{output_name} should have a declared canonical path"
+            );
+        }
+        let specs =
+            build_expected_output_specs(&declared, tmp.path().to_str().unwrap(), None, None, false);
+        let metadata_context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "prompt-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let pre_prompt_metadata = specs
+            .iter()
+            .map(|spec| PrePromptExpectedOutputMetadata::absent(spec, &metadata_context))
+            .collect::<Vec<_>>();
+        let discovered = declared
+            .iter()
+            .map(|declared| {
+                let bytes = std::fs::read(&declared.target_path).unwrap();
+                acp::DiscoveredArtifact {
+                    name: declared.target_path.clone(),
+                    content: serde_json::to_vec(&serde_json::json!({
+                        "mode": "direct_file",
+                        "output_name": declared.output_name,
+                        "path": declared.target_path,
+                        "digest": sha256_digest(&bytes),
+                        "size_bytes": bytes.len()
+                    }))
+                    .unwrap(),
+                    source_path: None,
+                    source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let settlement =
+            build_declared_output_discovery_settlement(&specs, &discovered, &pre_prompt_metadata);
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &declared,
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+        let validation = validate_task_outputs(&captured);
+
+        for declared in &declared {
+            let decision = settlement
+                .decisions
+                .iter()
+                .find(|decision| decision.output_name == declared.output_name)
+                .unwrap();
+            assert_eq!(decision.status, OutputDiscoveryStatus::Accepted);
+            assert_eq!(
+                decision.diagnostics.get("output_mode"),
+                Some(&"direct_file_ref".to_string())
+            );
+            let captured_output = captured
+                .iter()
+                .find(|captured| captured.declared.output_name == declared.output_name)
+                .unwrap();
+            assert_eq!(
+                captured_output.machine_bytes.as_deref(),
+                Some(&std::fs::read(&declared.target_path).unwrap()[..])
+            );
+        }
+        assert!(validation.failure_class.is_none());
+    }
+
+    #[test]
+    fn code_writer_repair_direct_file_manifests_validate_canonical_file_payloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let implementation_dir = tmp.path().join(".chainworks/runs/run-p083/implementation");
+        std::fs::create_dir_all(&implementation_dir).unwrap();
+        let outputs = [
+            (
+                "implementation_progress",
+                "progress.md",
+                "implementation_progress_v1",
+                vec![
+                    "status",
+                    "current_phase",
+                    "completed_items",
+                    "deferred_items",
+                    "notes",
+                ],
+                br#"{"status":"complete","current_phase":"settlement","completed_items":["accepted canonical direct-file outputs"],"deferred_items":[],"notes":"strict payload lives on disk"}"#.to_vec(),
+            ),
+            (
+                "implementation_self_assessment",
+                "self-assessment.json",
+                IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+                vec![
+                    "implementation_complete",
+                    "verification_green",
+                    "remaining_code_tasks",
+                    "handoff_tasks",
+                    "known_risks",
+                    "tests_run",
+                    "docs_impacted",
+                ],
+                br#"{"implementation_complete":true,"verification_green":true,"remaining_code_tasks":[],"handoff_tasks":[],"known_risks":[],"tests_run":["cargo test -p engine p083"],"docs_impacted":[]}"#
+                    .to_vec(),
+            ),
+            (
+                "changed_files_manifest",
+                "changed-files.json",
+                "changed_files_manifest_v1",
+                vec!["files"],
+                br#"{"files":[{"path":"control-plane/crates/engine/src/executor.rs","status":"modified"}]}"#
+                    .to_vec(),
+            ),
+            (
+                "tests_result",
+                "tests.json",
+                "tests_result_v1",
+                vec!["status", "summary"],
+                br#"{"status":"green","summary":"focused settlement test"}"#.to_vec(),
+            ),
+        ];
+        let declared = outputs
+            .iter()
+            .map(
+                |(output_name, file_name, contract_id, required_fields, _)| DeclaredOutput {
+                    output_name: (*output_name).to_string(),
+                    target_path: implementation_dir
+                        .join(file_name)
+                        .to_string_lossy()
+                        .into_owned(),
+                    schema: Some(workflow::plan::OutputSchema {
+                        contract_id: (*contract_id).to_string(),
+                        format: "json".to_string(),
+                        human_format: None,
+                        machine_format: Some("json".to_string()),
+                        validation_mode: Some("strict_structured".to_string()),
+                        normalized_artifact_name: None,
+                        raw_artifact_name: None,
+                        required_fields: required_fields
+                            .iter()
+                            .map(|field| field.to_string())
+                            .collect(),
+                    }),
+                    reuse_policy: None,
+                    companion_output_name: None,
+                    companion_path: None,
+                },
+            )
+            .collect::<Vec<_>>();
+        for ((_, _, _, _, bytes), declared) in outputs.iter().zip(declared.iter()) {
+            std::fs::write(&declared.target_path, bytes).unwrap();
+        }
+        let run_root = tmp.path().join(".chainworks/runs/run-p083");
+        let specs = build_expected_output_specs(
+            &declared,
+            tmp.path().to_str().unwrap(),
+            None,
+            Some(run_root.to_str().unwrap()),
+            false,
+        );
+        let metadata_context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-p083".to_string(),
+            stage_execution_id: "stage-exec-p083".to_string(),
+            attempt_number: 2,
+            session_generation_id: "session-p083".to_string(),
+            prompt_turn_id: "prompt-p083".to_string(),
+            discovery_generation_id: "discovery-p083".to_string(),
+        };
+        let pre_prompt_metadata = specs
+            .iter()
+            .map(|spec| PrePromptExpectedOutputMetadata::absent(spec, &metadata_context))
+            .collect::<Vec<_>>();
+        let discovered = declared
+            .iter()
+            .map(|declared| {
+                let bytes = std::fs::read(&declared.target_path).unwrap();
+                acp::DiscoveredArtifact {
+                    name: declared.output_name.clone(),
+                    content: serde_json::to_vec(&serde_json::json!({
+                        "mode": "direct_file",
+                        "output_name": declared.output_name,
+                        "path": declared.target_path,
+                        "digest": sha256_digest(&bytes),
+                        "size_bytes": bytes.len()
+                    }))
+                    .unwrap(),
+                    source_path: None,
+                    source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let settlement =
+            build_declared_output_discovery_settlement(&specs, &discovered, &pre_prompt_metadata);
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &declared,
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+        let validation = validate_task_outputs(&captured);
+
+        for declared in &declared {
+            let decision = settlement
+                .decisions
+                .iter()
+                .find(|decision| decision.output_name == declared.output_name)
+                .unwrap();
+            assert_eq!(decision.status, OutputDiscoveryStatus::Accepted);
+            assert_eq!(
+                decision.diagnostics.get("output_mode"),
+                Some(&"direct_file_ref".to_string())
+            );
+            assert_eq!(
+                captured
+                    .iter()
+                    .find(|captured| captured.declared.output_name == declared.output_name)
+                    .and_then(|captured| captured.machine_bytes.as_deref()),
+                Some(&std::fs::read(&declared.target_path).unwrap()[..]),
+                "{} should validate the canonical file, not the direct-file manifest",
+                declared.output_name
+            );
+        }
+        assert!(validation.failure_class.is_none(), "{validation:?}");
+        assert!(
+            p090_staged_repair_settlement_enabled_for_settlement("claude", &settlement),
+            "direct-file repair outputs must use per-output settlement instead of legacy all-or-nothing materialization"
+        );
+    }
+
+    #[test]
+    fn repair_direct_file_manifest_without_pre_prompt_metadata_reads_canonical_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_root = tmp.path().join(".chainworks/runs/run-p083");
+        let output_path = run_root.join("implementation/tests.json");
+        std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+        let output_bytes = br#"{"status":"green","summary":"canonical file recovered without pre-prompt metadata"}"#;
+        std::fs::write(&output_path, output_bytes).unwrap();
+        let declared = DeclaredOutput {
+            output_name: "tests_result".to_string(),
+            target_path: output_path.to_string_lossy().into_owned(),
+            schema: Some(workflow::plan::OutputSchema {
+                contract_id: "tests_result_v1".to_string(),
+                format: "json".to_string(),
+                human_format: None,
+                machine_format: Some("json".to_string()),
+                validation_mode: Some("strict_structured".to_string()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec!["status".to_string(), "summary".to_string()],
+            }),
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            Some(run_root.to_str().unwrap()),
+            false,
+        );
+        let manifest = serde_json::json!({
+            "mode": "direct_file",
+            "output_name": "tests_result",
+            "path": output_path.to_string_lossy(),
+            "digest": sha256_digest(output_bytes),
+            "size_bytes": output_bytes.len()
+        });
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: "tests_result".to_string(),
+            content: serde_json::to_vec(&manifest).unwrap(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+        }];
+
+        let settlement = build_declared_output_discovery_settlement(&specs, &discovered, &[]);
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &[declared],
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+        let validation = validate_task_outputs(&captured);
+
+        assert_eq!(
+            captured[0].machine_bytes.as_deref(),
+            Some(&output_bytes[..]),
+            "settlement must read the canonical file instead of validating the manifest"
+        );
+        assert_eq!(
+            settlement.decisions[0].diagnostics.get("output_mode"),
+            Some(&"direct_file_ref".to_string())
+        );
+        assert!(validation.failure_class.is_none(), "{validation:?}");
+    }
+
+    #[test]
+    fn direct_file_ref_manifest_accepts_digest_proven_unchanged_canonical_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("reviews/proposal/feedback-coverage.json");
+        std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+        let output_bytes =
+            br#"{"addressed_feedback":["a"],"unaddressed_feedback":[],"coverage_notes":"done"}"#;
+        std::fs::write(&output_path, output_bytes).unwrap();
+        let declared = DeclaredOutput {
+            output_name: "proposal_feedback_coverage".to_string(),
+            target_path: output_path.to_string_lossy().into_owned(),
+            schema: Some(workflow::plan::OutputSchema {
+                contract_id: "proposal_feedback_coverage_v1".to_string(),
+                format: "json".to_string(),
+                human_format: None,
+                machine_format: Some("json".to_string()),
+                validation_mode: Some("strict_structured".to_string()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec![
+                    "addressed_feedback".to_string(),
+                    "unaddressed_feedback".to_string(),
+                    "coverage_notes".to_string(),
+                ],
+            }),
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            Some(tmp.path().to_str().unwrap()),
+            false,
+        );
+        let metadata_context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 2,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "prompt-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let digest = sha256_digest(output_bytes);
+        let mut pre_prompt = PrePromptExpectedOutputMetadata::absent(&specs[0], &metadata_context);
+        pre_prompt.existed = true;
+        pre_prompt.file_type = "file".to_string();
+        pre_prompt.size_bytes = Some(output_bytes.len() as u64);
+        pre_prompt.content_digest = Some(digest.clone());
+        pre_prompt.baseline_status = ExpectedPathBaselineStatus::RegularContentCaptured;
+        let manifest = serde_json::json!({
+            "mode": "direct_file",
+            "output_name": "proposal_feedback_coverage",
+            "path": output_path.to_string_lossy(),
+            "digest": digest,
+            "size_bytes": output_bytes.len()
+        });
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: output_path.to_string_lossy().into_owned(),
+            content: serde_json::to_vec(&manifest).unwrap(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+        }];
+
+        let settlement =
+            build_declared_output_discovery_settlement(&specs, &discovered, &[pre_prompt]);
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &[declared],
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+        let validation = validate_task_outputs(&captured);
+
+        assert_eq!(
+            settlement.decisions[0].status,
+            OutputDiscoveryStatus::Accepted
+        );
+        assert_eq!(
+            captured[0].machine_bytes.as_deref(),
+            Some(&output_bytes[..])
+        );
+        assert!(validation.failure_class.is_none());
+    }
+
+    #[test]
+    fn direct_file_ref_manifest_is_not_treated_as_undeclared_envelope_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("reviews/proposal/feedback-coverage.json");
+        let declared = DeclaredOutput {
+            output_name: "proposal_feedback_coverage".to_string(),
+            target_path: output_path.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let manifest = serde_json::json!({
+            "mode": "direct_file",
+            "output_name": "proposal_feedback_coverage",
+            "path": output_path.to_string_lossy(),
+            "digest": "sha256:abc",
+            "size_bytes": 42
+        });
+        let discovered = acp::DiscoveredArtifact {
+            name: output_path.to_string_lossy().into_owned(),
+            content: serde_json::to_vec(&manifest).unwrap(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+        };
+
+        assert!(discovered_artifact_is_declared_direct_file_ref(
+            &discovered,
+            &[declared]
+        ));
     }
 
     #[test]

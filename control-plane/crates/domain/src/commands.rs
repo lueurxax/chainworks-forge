@@ -42,6 +42,7 @@ pub enum Command {
     MainSyncRepairState(MainSyncRepairStateCmd),
     MainSyncRecordRecoveryDecision(MainSyncRecordRecoveryDecisionCmd),
     KnowledgeCapsuleIgnore(KnowledgeCapsuleIgnoreCmd),
+    RetrofitCatalogSnapshot(RetrofitCatalogSnapshotCmd),
     CancelRun(CancelRunCmd),
     ResetSession(ResetSessionCmd),
     RunStewardAnalysis(RunStewardAnalysisCmd),
@@ -177,6 +178,27 @@ pub struct OverrideLegacyDiscoveryPolicyCmd {
     pub target_attempt_number: i64,
     pub legacy_discovery_override_policy: LegacyBroadDiscoveryPolicy,
     pub legacy_discovery_override_reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogSnapshotRetrofitScope {
+    EscalationPolicyOnly,
+}
+
+impl Default for CatalogSnapshotRetrofitScope {
+    fn default() -> Self {
+        Self::EscalationPolicyOnly
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RetrofitCatalogSnapshotCmd {
+    pub run_id: RunId,
+    pub expected_catalog_snapshot_hash: String,
+    pub reason: String,
+    #[serde(default)]
+    pub scope: CatalogSnapshotRetrofitScope,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

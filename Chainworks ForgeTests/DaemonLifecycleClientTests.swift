@@ -8,6 +8,7 @@
 import XCTest
 @testable import Chainworks_Forge
 
+@MainActor
 final class DaemonLifecycleClientTests: XCTestCase {
 
     // MARK: - Wire decoding

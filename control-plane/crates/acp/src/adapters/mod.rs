@@ -6,6 +6,7 @@ pub mod junie;
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
@@ -65,6 +66,7 @@ pub struct AcpLaunchSpec {
     pub runtime_tool_path_preflight_json: Option<String>,
     pub provider_launch_gate: Option<Arc<dyn AcpProviderLaunchGate>>,
     pub xcode_shim_runtime: Option<XcodeShimLaunchRuntime>,
+    pub provider_runtime_home: Option<PathBuf>,
     expected_capability_fingerprint: Option<CapabilitySliceFingerprint>,
 }
 
@@ -85,6 +87,7 @@ impl std::fmt::Debug for AcpLaunchSpec {
                 &self.provider_launch_gate.as_ref().map(|_| "<configured>"),
             )
             .field("xcode_shim_runtime", &self.xcode_shim_runtime)
+            .field("provider_runtime_home", &self.provider_runtime_home)
             .field(
                 "expected_capability_fingerprint",
                 &self.expected_capability_fingerprint,
@@ -152,6 +155,7 @@ impl AcpLaunchSpec {
             runtime_tool_path_preflight_json: None,
             provider_launch_gate: None,
             xcode_shim_runtime: None,
+            provider_runtime_home: None,
             expected_capability_fingerprint: None,
         }
     }
@@ -164,6 +168,11 @@ impl AcpLaunchSpec {
     pub fn with_envs(mut self, env: Vec<(String, String)>) -> Self {
         self.env = env;
         ensure_default_path_env(&mut self.env);
+        self
+    }
+
+    pub fn with_provider_runtime_home(mut self, path: impl Into<PathBuf>) -> Self {
+        self.provider_runtime_home = Some(path.into());
         self
     }
 
@@ -190,11 +199,49 @@ impl AcpLaunchSpec {
         fingerprint
     }
 
+    fn has_recorded_capability_fingerprint(&self) -> bool {
+        self.expected_capability_fingerprint.is_some()
+    }
+
     pub fn apply_chainworks_meta_root_env(&mut self, req: &ExecutionRequest) {
         if let Some(meta_root) = chainworks_meta_root_env_value(req) {
             self.env.retain(|(name, _)| name != "CHAINWORKS_META_ROOT");
             self.env
                 .push(("CHAINWORKS_META_ROOT".to_string(), meta_root));
+        }
+    }
+
+    pub fn apply_chainworks_rust_cache_env(&mut self) {
+        let shared_target = chainworks_shared_cargo_target_dir();
+        upsert_env(&mut self.env, "CARGO_TARGET_DIR", shared_target.clone());
+        upsert_env(
+            &mut self.env,
+            "CHAINWORKS_SHARED_CARGO_TARGET_DIR",
+            shared_target.clone(),
+        );
+        upsert_env(
+            &mut self.env,
+            "CHAINWORKS_GATE_CARGO_TARGET_ROOT",
+            chainworks_gate_cargo_target_root(&shared_target),
+        );
+        if !has_env(&self.env, "SCCACHE_DIR") {
+            self.env
+                .push(("SCCACHE_DIR".to_string(), chainworks_sccache_dir()));
+        }
+        if !has_env(&self.env, "SCCACHE_CACHE_SIZE") {
+            self.env
+                .push(("SCCACHE_CACHE_SIZE".to_string(), "20G".to_string()));
+        }
+        if !has_env(&self.env, "RUSTC_WRAPPER") {
+            if let Some(sccache) = find_sccache_binary() {
+                self.env.push(("RUSTC_WRAPPER".to_string(), sccache));
+            }
+        }
+        if let Some(real_cargo) = find_cargo_binary() {
+            upsert_env(&mut self.env, "CHAINWORKS_REAL_CARGO", real_cargo);
+        }
+        if let Some(wrapper_dir) = ensure_chainworks_cargo_wrapper_dir() {
+            prepend_path_env(&mut self.env, &wrapper_dir);
         }
     }
 
@@ -506,22 +553,6 @@ fn strip_path_prefix(path_value: &str, prefix: Option<&str>) -> String {
         .to_string()
 }
 
-fn prepend_path_env(env: &mut Vec<(String, String)>, prefix: &str) {
-    let current = env
-        .iter()
-        .find(|(name, _)| name == "PATH")
-        .map(|(_, value)| value.clone())
-        .or_else(|| std::env::var("PATH").ok())
-        .unwrap_or_default();
-    env.retain(|(name, _)| name != "PATH");
-    let next = if current.is_empty() {
-        prefix.to_string()
-    } else {
-        format!("{prefix}:{current}")
-    };
-    env.push(("PATH".to_string(), next));
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProbeKey {
     pub adapter_family: String,
@@ -772,6 +803,13 @@ pub trait AcpAdapter: Send + Sync {
         true
     }
 
+    /// Whether this adapter can start a fresh ACP subprocess attached to a
+    /// recorded provider-native session id and prove the requested session
+    /// before a prompt is sent. Default is fail-closed.
+    fn supports_provider_session_resurrection(&self) -> bool {
+        false
+    }
+
     fn capability_probe_timeout(&self) -> Duration {
         crate::transport::handshake_timeout_for_provider(self.provider_name())
     }
@@ -875,8 +913,26 @@ pub trait AcpAdapter: Send + Sync {
         mut launch_spec: AcpLaunchSpec,
         session_new_spec: AcpSessionNewSpec,
     ) -> Result<OpenedAcpAdapterSession> {
+        let effective_req;
+        let req = if req.provider_runtime_home.is_none() {
+            if let Some(runtime_home) = launch_spec.provider_runtime_home.as_ref() {
+                effective_req = Some({
+                    let mut req = req.clone();
+                    req.provider_runtime_home = Some(runtime_home.to_string_lossy().into_owned());
+                    req
+                });
+                effective_req.as_ref().expect("effective request just set")
+            } else {
+                req
+            }
+        } else {
+            req
+        };
         let mut command = Command::new(&launch_spec.binary_path);
-        launch_spec.apply_chainworks_meta_root_env(req);
+        if !launch_spec.has_recorded_capability_fingerprint() {
+            launch_spec.apply_chainworks_meta_root_env(req);
+            launch_spec.apply_chainworks_rust_cache_env();
+        }
         ensure_chainworks_meta_root_launch_dir(req)?;
         self.preflight_launch(req, &mut launch_spec)?;
         if let Some(gate) = launch_spec.provider_launch_gate.as_ref() {
@@ -964,6 +1020,7 @@ pub trait AcpAdapter: Send + Sync {
         let mut resources = LaunchResourceGuard::default();
         let mut launch_spec = self.prepare_launch_spec(req, &mut resources)?;
         launch_spec.apply_chainworks_meta_root_env(req);
+        launch_spec.apply_chainworks_rust_cache_env();
         launch_spec.record_capability_fingerprint(None, None);
         self.ensure_brokered_xcode_http_capability(req, &launch_spec, capability_cache)
             .await?;
@@ -1056,19 +1113,76 @@ fn ensure_chainworks_meta_root_launch_dir(req: &ExecutionRequest) -> Result<()> 
     let Some(meta_root) = chainworks_meta_root_env_value(req) else {
         return Ok(());
     };
+    let workspace_root = Path::new(&req.workspace_root);
+    reject_path_symlink_components(workspace_root, "workspace_root")?;
+    let canonical_workspace = std::fs::canonicalize(workspace_root)
+        .with_context(|| format!("canonicalize workspace_root {}", workspace_root.display()))?;
     let meta_root = Path::new(&meta_root);
+    let absolute_meta_root = if meta_root.is_absolute() {
+        meta_root.to_path_buf()
+    } else {
+        canonical_workspace.join(meta_root)
+    };
+    if absolute_meta_root.exists() {
+        reject_path_symlink_components(&absolute_meta_root, "CHAINWORKS_META_ROOT")?;
+    }
+    if !absolute_meta_root.starts_with(&canonical_workspace) {
+        bail!("CHAINWORKS_META_ROOT escapes canonical workspace_root");
+    }
     for child in ["", "artifacts", "context", "state", "summaries"] {
         let path = if child.is_empty() {
-            meta_root.to_path_buf()
+            absolute_meta_root.clone()
         } else {
-            meta_root.join(child)
+            absolute_meta_root.join(child)
         };
-        std::fs::create_dir_all(&path).with_context(|| {
-            format!(
-                "missing_chainworks_meta_root: create launch directory {}",
-                path.display()
-            )
-        })?;
+        create_dir_all_no_symlink_under(&path, &canonical_workspace, "CHAINWORKS_META_ROOT")?;
+    }
+    Ok(())
+}
+
+fn create_dir_all_no_symlink_under(path: &Path, canonical_root: &Path, field: &str) -> Result<()> {
+    let relative = path
+        .strip_prefix(canonical_root)
+        .with_context(|| format!("{field} escapes canonical root"))?;
+    let mut current = canonical_root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    bail!("{field} contains a symlink component");
+                }
+                if !metadata.is_dir() {
+                    bail!("{field} path component is not a directory");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)
+                    .with_context(|| format!("create directory {}", current.display()))?;
+                let metadata = std::fs::symlink_metadata(&current)
+                    .with_context(|| format!("verify directory {}", current.display()))?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    bail!("{field} created path was replaced before verification");
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_path_symlink_components(path: &Path, field: &str) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+            break;
+        };
+        if metadata.file_type().is_symlink() {
+            bail!("{field} contains a symlink component");
+        }
     }
     Ok(())
 }
@@ -1093,6 +1207,205 @@ fn ensure_provider_execution_root(path: &Path) -> Result<()> {
             path.display()
         )
     }
+}
+
+fn has_env(env: &[(String, String)], key: &str) -> bool {
+    env.iter().any(|(name, _)| name == key)
+}
+
+fn upsert_env(env: &mut Vec<(String, String)>, key: &str, value: String) {
+    if let Some((_, existing)) = env.iter_mut().find(|(name, _)| name == key) {
+        *existing = value;
+    } else {
+        env.push((key.to_string(), value));
+    }
+}
+
+pub(crate) fn chainworks_shared_cargo_target_dir() -> String {
+    env_nonempty("CHAINWORKS_AGENT_CARGO_TARGET_DIR")
+        .or_else(|| env_nonempty("CHAINWORKS_SHARED_CARGO_TARGET_DIR"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| chainworks_cache_root().join("cargo-target").join("agents"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+pub(crate) fn chainworks_sccache_dir() -> String {
+    env_nonempty("SCCACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| chainworks_cache_root().join("sccache"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn chainworks_gate_cargo_target_root(shared_target: &str) -> String {
+    env_nonempty("CHAINWORKS_GATE_CARGO_TARGET_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(shared_target).join("gates"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+pub(crate) fn find_sccache_binary() -> Option<String> {
+    if matches!(
+        env_nonempty("CHAINWORKS_CARGO_SCCACHE")
+            .unwrap_or_else(|| "auto".to_string())
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "off" | "no"
+    ) {
+        return None;
+    }
+    if let Some(explicit) = env_nonempty("CHAINWORKS_SCCACHE_BINARY") {
+        return Path::new(&explicit).is_file().then_some(explicit);
+    }
+    if let Some(existing) = env_nonempty("RUSTC_WRAPPER") {
+        return Some(existing);
+    }
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .chain([
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr/local/bin"),
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join(".cargo")
+                .join("bin"),
+        ])
+        .map(|dir| dir.join("sccache"))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+}
+
+fn chainworks_cache_root() -> PathBuf {
+    dirs::home_dir()
+        .map(|home| home.join("Library").join("Caches").join("Chainworks Forge"))
+        .unwrap_or_else(|| std::env::temp_dir().join("chainworks-forge-cache"))
+}
+
+fn chainworks_cargo_wrapper_dir() -> PathBuf {
+    env_nonempty("CHAINWORKS_CARGO_WRAPPER_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| chainworks_cache_root().join("bin"))
+}
+
+fn find_cargo_binary() -> Option<String> {
+    if let Some(explicit) = env_nonempty("CHAINWORKS_REAL_CARGO") {
+        return Path::new(&explicit).is_file().then_some(explicit);
+    }
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|dir| dir.join("cargo"))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+}
+
+fn ensure_chainworks_cargo_wrapper_dir() -> Option<String> {
+    let wrapper_dir = chainworks_cargo_wrapper_dir();
+    if let Err(err) = fs::create_dir_all(&wrapper_dir) {
+        tracing::warn!(
+            path = %wrapper_dir.display(),
+            error = %err,
+            "failed to create Chainworks Cargo wrapper directory"
+        );
+        return None;
+    }
+    let wrapper_path = wrapper_dir.join("cargo");
+    if let Err(err) = fs::write(&wrapper_path, CHAINWORKS_CARGO_WRAPPER_SCRIPT) {
+        tracing::warn!(
+            path = %wrapper_path.display(),
+            error = %err,
+            "failed to write Chainworks Cargo wrapper"
+        );
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) = fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755)) {
+            tracing::warn!(
+                path = %wrapper_path.display(),
+                error = %err,
+                "failed to make Chainworks Cargo wrapper executable"
+            );
+            return None;
+        }
+    }
+    Some(wrapper_dir.to_string_lossy().into_owned())
+}
+
+fn prepend_path_env(env: &mut Vec<(String, String)>, path: &str) {
+    let existing = env
+        .iter()
+        .find(|(name, _)| name == "PATH")
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(default_provider_path_value);
+    let already_present = std::env::split_paths(&OsString::from(&existing))
+        .any(|candidate| candidate == Path::new(path));
+    if already_present {
+        upsert_env(env, "PATH", existing);
+    } else {
+        upsert_env(env, "PATH", format!("{path}:{existing}"));
+    }
+}
+
+const CHAINWORKS_CARGO_WRAPPER_SCRIPT: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+real_cargo="${CHAINWORKS_REAL_CARGO:-}"
+if [[ -z "$real_cargo" || ! -x "$real_cargo" ]]; then
+  echo "chainworks cargo wrapper: CHAINWORKS_REAL_CARGO is not executable" >&2
+  exit 127
+fi
+
+if [[ ! "${CHAINWORKS_ALLOW_LOCAL_CARGO_TARGET_DIR:-0}" =~ ^(1|true|TRUE|yes|YES)$ ]]; then
+  requested="${CARGO_TARGET_DIR:-}"
+  suffix=""
+  case "$requested" in
+    target)
+      suffix="default"
+      ;;
+    target/*)
+      suffix="${requested#target/}"
+      ;;
+    control-plane/target)
+      suffix="default"
+      ;;
+    control-plane/target/*)
+      suffix="${requested#control-plane/target/}"
+      ;;
+    */control-plane/target)
+      suffix="default"
+      ;;
+    */control-plane/target/*)
+      suffix="${requested#*/control-plane/target/}"
+      ;;
+  esac
+
+  if [[ -n "$suffix" ]]; then
+    if [[ -z "$suffix" || "$suffix" == "." ]]; then
+      suffix="default"
+    fi
+    safe_suffix="$(printf '%s' "$suffix" | sed -E 's#[/[:space:]]+#-#g; s#[^A-Za-z0-9._-]#_#g; s#^[-.]+##; s#[-.]+$##')"
+    if [[ -z "$safe_suffix" ]]; then
+      safe_suffix="default"
+    fi
+    gate_root="${CHAINWORKS_GATE_CARGO_TARGET_ROOT:-${CHAINWORKS_SHARED_CARGO_TARGET_DIR:-}/gates}"
+    if [[ "$gate_root" == "/gates" || -z "$gate_root" ]]; then
+      gate_root="${HOME:-/tmp}/Library/Caches/Chainworks Forge/cargo-target/gates"
+    fi
+    export CARGO_TARGET_DIR="${gate_root}/${safe_suffix}"
+    mkdir -p "$CARGO_TARGET_DIR"
+  fi
+fi
+
+exec "$real_cargo" "$@"
+"#;
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -1286,6 +1599,7 @@ mod tests {
             reuse_existing_session: false,
             session_generation_id: None,
             provider_session_id: None,
+            provider_runtime_home: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: Some(".chainworks/run-meta".to_string()),
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -1330,8 +1644,87 @@ mod tests {
     }
 
     #[test]
+    fn rust_cache_env_is_frozen_before_capability_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target_dir = tmp.path().join("agent-target");
+        let wrapper_dir = tmp.path().join("wrapper-bin");
+        let fake_sccache = tmp.path().join("sccache");
+        let fake_cargo = tmp.path().join("cargo");
+        std::fs::write(&fake_sccache, "fixture").unwrap();
+        std::fs::write(&fake_cargo, "fixture").unwrap();
+
+        let previous_target = std::env::var_os("CHAINWORKS_SHARED_CARGO_TARGET_DIR");
+        let previous_wrapper_dir = std::env::var_os("CHAINWORKS_CARGO_WRAPPER_DIR");
+        let previous_sccache = std::env::var_os("CHAINWORKS_SCCACHE_BINARY");
+        let previous_cargo = std::env::var_os("CHAINWORKS_REAL_CARGO");
+        std::env::set_var("CHAINWORKS_SHARED_CARGO_TARGET_DIR", &target_dir);
+        std::env::set_var("CHAINWORKS_CARGO_WRAPPER_DIR", &wrapper_dir);
+        std::env::set_var("CHAINWORKS_SCCACHE_BINARY", &fake_sccache);
+        std::env::set_var("CHAINWORKS_REAL_CARGO", &fake_cargo);
+
+        let mut spec = AcpLaunchSpec::new("provider-acp");
+        spec.apply_chainworks_rust_cache_env();
+        let expected = spec.record_capability_fingerprint(Some("profile-a"), None);
+
+        match previous_target {
+            Some(value) => std::env::set_var("CHAINWORKS_SHARED_CARGO_TARGET_DIR", value),
+            None => std::env::remove_var("CHAINWORKS_SHARED_CARGO_TARGET_DIR"),
+        }
+        match previous_sccache {
+            Some(value) => std::env::set_var("CHAINWORKS_SCCACHE_BINARY", value),
+            None => std::env::remove_var("CHAINWORKS_SCCACHE_BINARY"),
+        }
+        match previous_wrapper_dir {
+            Some(value) => std::env::set_var("CHAINWORKS_CARGO_WRAPPER_DIR", value),
+            None => std::env::remove_var("CHAINWORKS_CARGO_WRAPPER_DIR"),
+        }
+        match previous_cargo {
+            Some(value) => std::env::set_var("CHAINWORKS_REAL_CARGO", value),
+            None => std::env::remove_var("CHAINWORKS_REAL_CARGO"),
+        }
+
+        let target_value = target_dir.to_string_lossy().into_owned();
+        let sccache_value = fake_sccache.to_string_lossy().into_owned();
+        let cargo_value = fake_cargo.to_string_lossy().into_owned();
+        let wrapper_value = wrapper_dir.to_string_lossy().into_owned();
+        assert!(spec
+            .env
+            .iter()
+            .any(|(name, value)| name == "CARGO_TARGET_DIR" && value == &target_value));
+        assert!(spec
+            .env
+            .iter()
+            .any(|(name, value)| name == "CHAINWORKS_SHARED_CARGO_TARGET_DIR"
+                && value == &target_value));
+        assert!(spec
+            .env
+            .iter()
+            .any(|(name, value)| name == "CHAINWORKS_REAL_CARGO" && value == &cargo_value));
+        assert!(spec.env.iter().any(|(name, value)| {
+            name == "PATH"
+                && value
+                    .split(':')
+                    .next()
+                    .map(|first| first == wrapper_value)
+                    .unwrap_or(false)
+        }));
+        assert!(wrapper_dir.join("cargo").is_file());
+        assert!(spec
+            .env
+            .iter()
+            .any(|(name, value)| name == "RUSTC_WRAPPER" && value == &sccache_value));
+        assert_eq!(
+            expected,
+            spec.capability_fingerprint(Some("profile-a"), None)
+        );
+        spec.verify_capability_fingerprint()
+            .expect("cache env must be part of the recorded fingerprint");
+    }
+
+    #[test]
     fn launch_preflight_creates_missing_chainworks_meta_root_directories() {
         let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().canonicalize().unwrap();
         let req = crate::ExecutionRequest {
             agent_execution_id: None,
             run_id: domain::ids::RunId::new(),
@@ -1342,7 +1735,7 @@ mod tests {
             provider: "gemini".to_string(),
             model: None,
             effort: None,
-            workspace_root: tmp.path().to_string_lossy().into_owned(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
             prompt: "prompt".to_string(),
             worktree_root: None,
             worktree_write_enabled: false,
@@ -1353,6 +1746,7 @@ mod tests {
             reuse_existing_session: false,
             session_generation_id: None,
             provider_session_id: None,
+            provider_runtime_home: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: Some(".chainworks/run-meta".to_string()),
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -1366,7 +1760,7 @@ mod tests {
             toolchain_home: None,
             toolchain_go_scope_enabled: false,
         };
-        let meta_root = tmp.path().join(".chainworks/run-meta");
+        let meta_root = workspace_root.join(".chainworks/run-meta");
 
         assert!(!meta_root.exists());
         ensure_chainworks_meta_root_launch_dir(&req).unwrap();
@@ -1383,6 +1777,59 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn p082_launch_preflight_rejects_symlinked_chainworks_meta_root_component() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = tmp.path().join(".chainworks");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), &link).unwrap();
+
+        let req = crate::ExecutionRequest {
+            agent_execution_id: None,
+            run_id: domain::ids::RunId::new(),
+            stage_execution_id: None,
+            stage_id: "stage_meta".to_string(),
+            attempt_number: 1,
+            agent_id: "agent_meta".to_string(),
+            provider: "claude".to_string(),
+            model: None,
+            effort: None,
+            workspace_root: tmp.path().to_string_lossy().into_owned(),
+            prompt: "prompt".to_string(),
+            worktree_root: None,
+            worktree_write_enabled: false,
+            worktree_strategy: None,
+            expected_output_paths: Vec::new(),
+            expected_outputs: Vec::new(),
+            keep_session_alive: false,
+            reuse_existing_session: false,
+            session_generation_id: None,
+            provider_session_id: None,
+            provider_runtime_home: None,
+            mcp_servers: Vec::new(),
+            chainworks_meta_root: Some(".chainworks/run-meta".to_string()),
+            legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
+            owner_kind: "stage_execution".to_string(),
+            owner_id: None,
+            origin_stage_id: None,
+            origin_stage_execution_id: None,
+            mediation_record_id: None,
+            toolchain_home: None,
+            toolchain_go_scope_enabled: false,
+        };
+
+        let err = ensure_chainworks_meta_root_launch_dir(&req).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "ACP launch preflight must reject symlink-swapped meta roots; got: {err:#}"
+        );
     }
 
     #[test]
@@ -1411,6 +1858,7 @@ mod tests {
             reuse_existing_session: false,
             session_generation_id: None,
             provider_session_id: None,
+            provider_runtime_home: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: None,
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,

@@ -5,7 +5,7 @@
 | Date | 2026-04-30 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | P057/P058 output settlement and artifact claims, P063 MCP field shaping, P065 operator retry instructions, [auto-retry observation ledger](../reference/auto-retry-observation-ledger.md) |
+| Depends on | [output settlement and artifact claims](../reference/output-contracts-failure-evidence-and-recovery.md), [escalation source-generation/readback contract](../reference/escalation-policies.md), P063 MCP field shaping, P065 operator retry instructions, [auto-retry observation ledger](../reference/auto-retry-observation-ledger.md) |
 | Related | P017 workflow conflict mediation, P069 discovery diagnostics UI, P095 two-phase agent invocation, `docs/reference/output-contracts-failure-evidence-and-recovery.md`, `docs/reference/artifact-discovery-and-settlement-optimization.md` |
 | Scope | Make missing/invalid required agent outputs recoverable inside the invocation lifecycle before a run becomes durably blocked. |
 | Non-goal | No automatic human approvals, no acceptance of invalid artifacts, no live-provider-only acceptance gate, and no replacement for the observe-only auto-retry ledger or cooldown policy. |
@@ -30,7 +30,7 @@ The expensive failure mode is:
 4. auto-retry or the operator starts a fresh attempt,
 5. useful context is lost or repeated, and the workflow spends another full provider invocation.
 
-This is not a human approval problem and not a generic retry problem. It is an invocation settlement problem: before the system closes the invocation as failed, it should try to repair contract output in the same session, validate the repaired output through the same P057/P058 contract pipeline, and only then fall back to controlled retry or provider fallback.
+This is not a human approval problem and not a generic retry problem. It is an invocation settlement problem: before the system closes the invocation as failed, it should try to repair contract output in the same session, validate the repaired output through the implemented output-settlement and escalation source-generation contracts, and only then fall back to controlled retry or provider fallback.
 
 ## 2. Current Implementation Baseline
 
@@ -39,7 +39,7 @@ The repository already contains a partial output-contract repair path in the Rus
 - runtime prompts list exact required output names and canonical output paths,
 - the executor can issue an `Output Contract Repair` prompt to the same ACP session,
 - fixture tests cover a repair turn that emits a valid `CHAINWORKS_OUTPUT` block,
-- P057/P058 settlement values distinguish `missing_required_outputs`, `invalid_required_outputs`, and valid outputs from failed executions.
+- output-settlement values distinguish `missing_required_outputs`, `invalid_required_outputs`, and valid outputs from failed executions.
 
 That baseline is useful but not yet a complete proposal-level contract. The missing durable behavior is:
 
@@ -62,7 +62,7 @@ P079 makes this behavior explicit and bounded.
   - `proposal_writer`
   - `proposal_reviewer_*`
   - `lead_orchestrator`
-- Preserve P057/P058 as the only authority for artifact validity and source-generation ownership.
+- Preserve the implemented output-settlement and escalation source-generation contracts as the only authority for artifact validity and source-generation ownership.
 - Preserve human approval gates as human gates.
 - Expose repair/fallback evidence through MCP/GraphQL reports so auto-retry can stop treating every missing output as a generic blocked run.
 - Validate with deterministic fixture ACP transports, not live providers.
@@ -338,7 +338,7 @@ instead of treating every recurrence as a generic `missing_required_outputs` ret
 
 ## 11. Settlement Rules
 
-P079 must preserve the existing P057/P058 settlement model.
+P079 must preserve the existing output-settlement and escalation source-generation model.
 
 - Valid repaired output settles as normal valid output for the current source generation.
 - Invalid repaired output is rejected and does not update active artifact truth.

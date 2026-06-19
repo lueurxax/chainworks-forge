@@ -64,6 +64,110 @@ fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
     }
 }
 
+async fn seed_p094_boundary_status(pool: &sqlx::SqlitePool, run_id: RunId) {
+    let dir = std::env::temp_dir().join(format!("p094-graphql-{run_id}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let raw_path = dir.join("blocker-boundary-status.json");
+    std::fs::write(
+        &raw_path,
+        serde_json::json!({
+            "schema_version": "blocker_boundary_status_v1",
+            "status": "awaiting_human_boundary_approval",
+            "followup_proposal_required": false,
+            "has_release_blocking_external_blockers": true,
+            "has_no_release_blocking_external_blockers": false,
+            "projection_integrity": "valid",
+            "primary_owner_class": "external_evidence",
+            "workflow_route_hint": "human_boundary_approval",
+            "blocker_freshness": "fresh",
+            "allowed_workflow_routes": ["state_9_blocker_boundary_approval"],
+            "blockers": [{
+                "id": "external-proof",
+                "summary": "external proof required",
+                "blocker_signature_id": "sig-external-proof",
+                "evidence_fingerprint": "fingerprint-external-proof",
+                "source_artifact_generation_id": "generation-external-proof",
+                "observed_after_stage_execution_id": "stage-exec-1",
+                "observed_after_agent_execution_id": "agent-exec-1",
+                "owner_class": "external_environment",
+                "class": "remote_host",
+                "evidence_freshness": "fresh",
+                "allowed_workflow_routes": ["state_9_blocker_boundary_approval"]
+            }],
+            "hard_blockers": [{
+                "id": "external-proof",
+                "blocker_signature_id": "sig-external-proof",
+                "evidence_fingerprint": "fingerprint-external-proof"
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    artifact_contracts::upsert_generation_and_rebuild(
+        pool,
+        ActiveArtifactGenerationInput {
+            run_id,
+            artifact_id: ArtifactId::new(),
+            contract_id: "blocker_boundary_status_v1".into(),
+            canonical_path: "quality-gate/blocker-boundary-status.json".into(),
+            raw_path: raw_path.to_string_lossy().into_owned(),
+            raw_status: "unknown".into(),
+            generation_id: format!("p094-boundary-{run_id}"),
+            source_agent_execution_id: Some("system.quality_gate_boundary".into()),
+            source_stage_execution_id: Some("state_9_quality_gate_boundary_evaluated".into()),
+            source_session_generation_id: None,
+            source_work_item_id: None,
+            supersedes_generation_id: None,
+            output_settlement:
+                domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution,
+            partial: false,
+            warnings: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    let request_path = dir.join("blocker-boundary-approval-request.json");
+    std::fs::write(
+        &request_path,
+        serde_json::json!({
+            "schema_version": "blocker_boundary_approval_request_v1",
+            "status": "requested",
+            "question": "Accept the server-evaluated boundary?",
+            "allowed_decisions": ["accept", "reject"],
+            "label_to_approval_state": {
+                "accept": "granted",
+                "reject": "rejected"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    artifact_contracts::upsert_generation_and_rebuild(
+        pool,
+        ActiveArtifactGenerationInput {
+            run_id,
+            artifact_id: ArtifactId::new(),
+            contract_id: "blocker_boundary_approval_request_v1".into(),
+            canonical_path: "quality-gate/blocker-boundary-approval-request.json".into(),
+            raw_path: request_path.to_string_lossy().into_owned(),
+            raw_status: "requested".into(),
+            generation_id: format!("p094-approval-request-{run_id}"),
+            source_agent_execution_id: Some("system.quality_gate_boundary".into()),
+            source_stage_execution_id: Some("state_9_quality_gate_boundary_evaluated".into()),
+            source_session_generation_id: None,
+            source_work_item_id: None,
+            supersedes_generation_id: None,
+            output_settlement:
+                domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution,
+            partial: false,
+            warnings: vec![],
+        },
+    )
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn proposal_057_graphql_run_detail_exposes_canonical_artifact_contract_truth() {
     let pool = test_pool().await;
@@ -173,4 +277,82 @@ async fn proposal_057_graphql_run_detail_exposes_canonical_artifact_contract_tru
     .unwrap();
     assert_eq!(active["contracts"]["prepush_review_v1"]["status"], "pass");
     assert_eq!(overrides[0]["to_status"], "implemented");
+}
+
+#[tokio::test]
+async fn proposal_094_graphql_run_detail_exposes_boundary_readback() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "Idea".into(),
+            body: "Body".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    let boundary_root = std::env::temp_dir().join(format!("p094-graphql-{run_id}"));
+    let mut run = make_run(run_id, idea_id);
+    run.chainworks_meta_root = Some(boundary_root.to_string_lossy().into_owned());
+    run.artifact_root = boundary_root.to_string_lossy().into_owned();
+    runs::insert(&pool, &run).await.unwrap();
+    seed_p094_boundary_status(&pool, run_id).await;
+
+    let events = event_bus::new_bus(16);
+    let handler = Arc::new(CommandHandler::new(
+        pool.clone(),
+        events.clone(),
+        WorkQueue::new(pool.clone()),
+    ));
+    let schema = build_schema(
+        pool,
+        handler,
+        events.clone(),
+        auth::PrincipalTable::test_fixture(),
+        LifecycleReporter::new(15, "test-build", events.clone()),
+    );
+    let response = schema
+        .execute(
+            Request::new(format!(
+                r#"{{ run(id: "{}") {{ p094BoundaryReadbackJson }} }}"#,
+                run_id
+            ))
+            .data(auth::Principal::new(
+                "operator",
+                auth::PrincipalClass::Operator,
+            )),
+        )
+        .await;
+    assert!(
+        response.errors.is_empty(),
+        "graphql errors: {:?}",
+        response.errors
+    );
+    let data = response.data.into_json().unwrap();
+    assert_eq!(
+        data["run"]["p094BoundaryReadbackJson"]["blocker_boundary_status"]["primary_owner_class"],
+        "external_evidence"
+    );
+    assert_eq!(
+        data["run"]["p094BoundaryReadbackJson"]["blocker_boundary_status"]
+            ["allowed_workflow_routes"],
+        serde_json::json!(["state_9_blocker_boundary_approval"])
+    );
+    assert_eq!(
+        data["run"]["p094BoundaryReadbackJson"]["blocker_boundary_status"]["blockers"][0]
+            ["blocker_signature_id"],
+        "sig-external-proof"
+    );
+    assert_eq!(
+        data["run"]["p094BoundaryReadbackJson"]["blocker_boundary_approval_request"]["status"],
+        "requested"
+    );
 }

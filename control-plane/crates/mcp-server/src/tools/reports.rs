@@ -59,98 +59,181 @@ pub async fn execute(
 ) -> Result<serde_json::Value> {
     match tool_name {
         "reports.get" => {
+            if !matches!(principal.class, auth::PrincipalClass::Operator) {
+                anyhow::bail!("forbidden: reports.get requires Operator principal");
+            }
+
             let run_id: RunId = params["run_id"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
                 .parse()?;
 
             let all_artifacts = artifacts::list_by_run(pool, run_id).await?;
+            let run = runs::find_by_id(pool, run_id).await?;
+            let artifact_root = run
+                .as_ref()
+                .map(|run| run.artifact_root.as_str())
+                .unwrap_or("");
             let rollout_contract_readback = rollout_contract_readback_json(pool, run_id).await?;
+            let p082_readbacks =
+                p082_recovery_matrix_readbacks_json(pool, run_id, &principal.class, "reports.get")
+                    .await?;
+            let is_operator = principal.class == auth::PrincipalClass::Operator;
             let mut reports = Vec::new();
             for artifact in all_artifacts.into_iter() {
                 if artifact.report_kind.is_some() || is_release_report_artifact(&artifact.name) {
                     reports.push(
-                        artifact_report_json(pool, &artifact, Some(&rollout_contract_readback))
-                            .await?,
+                        artifact_report_json(
+                            pool,
+                            &artifact,
+                            Some(&rollout_contract_readback),
+                            &principal.class,
+                            artifact_root,
+                            // Pass pre-fetched readbacks so artifact_report_json does not
+                            // re-fetch or re-emit lane metrics (already emitted above).
+                            Some(&p082_readbacks),
+                        )
+                        .await?,
                     );
                 }
             }
             let closeout_readiness_summary = closeout_readiness_summary_json(pool, run_id).await?;
-            let code_writer_completion_receipts =
-                code_writer_completion_receipts_json(pool, run_id).await?;
-            let implementation_completion = implementation_completion_json(pool, run_id).await?;
-            reports.push(serde_json::json!({
-                "id": uuid::Uuid::new_v4().to_string(),
-                "run_id": run_id.to_string(),
-                "stage_id": "__run__",
-                "agent_id": "system",
-                "name": "mcp_execution_truth",
-                "contract_id": "mcp_execution_truth",
-                "format": "json",
-                "artifact_metadata_pointer": serde_json::Value::Null,
-                "checksum_sha256": serde_json::Value::Null,
-                "size_bytes": serde_json::Value::Null,
-                "provider": "system",
-                "model": serde_json::Value::Null,
-                "created_at": chrono::Utc::now().to_rfc3339(),
-                "is_pinned": false,
-                "report_kind": "mcp_execution_truth",
-                "report_version": 1,
-                "agent_executions": execution_mcp_truth_json(
-                    pool,
-                    run_id,
-                    principal.class == auth::PrincipalClass::Operator,
-                )
-                .await?,
-                "code_writer_completion_receipts": code_writer_completion_receipts,
-                "implementationCompletion": implementation_completion,
-                "workflow_conflict": workflow_conflict_json(pool, cmd_handler, run_id).await?,
-                "retryAuthority": retry_authority_current_json(pool, run_id).await?,
-                "retryAuthorityHistory": retry_authority_history_json(pool, run_id).await?,
-                "p091OrphanRepairReadback": p091_orphan_repair_readback_json(pool, run_id).await?,
-                "implementation_handoff_status": implementation_handoff_status_json(pool, run_id).await?,
-                "implementation_self_assessment_summary": implementation_self_assessment_summary_json(pool, run_id).await?,
-                "rollout_contract_readback": rollout_contract_readback,
-                "implementation_closeout_readiness_summary": closeout_readiness_summary.clone(),
-                "closeout_readiness_summary": closeout_readiness_summary,
-            }));
-            if let Some(projection) =
-                db::repos::artifact_contracts::find_run_state_projection(pool, run_id).await?
-            {
-                let overrides = db::repos::artifact_contracts::list_overrides(pool, run_id).await?;
-                reports.push(serde_json::json!({
-                    "id": uuid::Uuid::new_v4().to_string(),
-                    "run_id": run_id.to_string(),
-                    "stage_id": "__run__",
-                    "agent_id": "system",
-                    "name": "canonical_artifact_contracts",
-                    "contract_id": "canonical_artifact_contracts",
-                    "format": "json",
-                    "artifact_metadata_pointer": {
-                        "schemaVersion": "artifact_metadata_pointer.v1",
-                        "artifactId": "canonical_artifact_contracts",
-                        "checksumSha256": serde_json::Value::Null,
-                        "sizeBytes": serde_json::Value::Null,
-                        "authorizedPayloadRoute": serde_json::Value::Null,
-                        "payloadPathRedacted": true,
-                        "forbiddenFields": ["absolutePath", "filesystemPath", "rawPayload"]
-                    },
-                    "checksum_sha256": serde_json::Value::Null,
-                    "size_bytes": serde_json::Value::Null,
-                    "provider": "system",
-                    "model": serde_json::Value::Null,
-                    "created_at": projection.updated_at.to_rfc3339(),
-                    "is_pinned": true,
-                    "report_kind": "canonical_artifact_contracts",
-                    "report_version": 1,
-                    "active_index": projection.active_index_json,
-                    "run_state_projection": projection.run_state_json,
-                    "operator_overrides": overrides,
-                    "legacy_discovery_overrides": legacy_discovery_overrides::list_by_run(pool, run_id).await?,
-                }));
+            let mut execution_truth = serde_json::Map::new();
+            execution_truth.insert(
+                "id".into(),
+                serde_json::json!(uuid::Uuid::new_v4().to_string()),
+            );
+            execution_truth.insert("run_id".into(), serde_json::json!(run_id.to_string()));
+            execution_truth.insert("stage_id".into(), serde_json::json!("__run__"));
+            execution_truth.insert("agent_id".into(), serde_json::json!("system"));
+            execution_truth.insert("name".into(), serde_json::json!("mcp_execution_truth"));
+            execution_truth.insert(
+                "contract_id".into(),
+                serde_json::json!("mcp_execution_truth"),
+            );
+            execution_truth.insert("format".into(), serde_json::json!("json"));
+            execution_truth.insert("artifact_metadata_pointer".into(), serde_json::Value::Null);
+            execution_truth.insert("checksum_sha256".into(), serde_json::Value::Null);
+            execution_truth.insert("size_bytes".into(), serde_json::Value::Null);
+            execution_truth.insert("provider".into(), serde_json::json!("system"));
+            execution_truth.insert("model".into(), serde_json::Value::Null);
+            execution_truth.insert(
+                "created_at".into(),
+                serde_json::json!(chrono::Utc::now().to_rfc3339()),
+            );
+            execution_truth.insert("is_pinned".into(), serde_json::json!(false));
+            execution_truth.insert(
+                "report_kind".into(),
+                serde_json::json!("mcp_execution_truth"),
+            );
+            execution_truth.insert("report_version".into(), serde_json::json!(1));
+            execution_truth.insert(
+                "agent_executions".into(),
+                execution_mcp_truth_json(pool, run_id, is_operator).await?,
+            );
+            execution_truth.insert(
+                "p082_recovery_matrix_readbacks".into(),
+                p082_readbacks.clone(),
+            );
+            execution_truth.insert(
+                "p094_boundary_readback".into(),
+                db::repos::artifact_contracts::p094_readback_json(pool, run_id).await?,
+            );
+            execution_truth.insert(
+                "p094_rollout_decision".into(),
+                p094_rollout_decision_json(pool, run_id).await?,
+            );
+            execution_truth.insert(
+                "implementation_handoff_status".into(),
+                implementation_handoff_status_json(pool, run_id).await?,
+            );
+            execution_truth.insert(
+                "implementation_self_assessment_summary".into(),
+                implementation_self_assessment_summary_json(pool, run_id).await?,
+            );
+            execution_truth.insert(
+                "implementation_closeout_readiness_summary".into(),
+                closeout_readiness_summary.clone(),
+            );
+            execution_truth.insert(
+                "closeout_readiness_summary".into(),
+                closeout_readiness_summary,
+            );
+            if is_operator {
+                execution_truth.insert(
+                    "code_writer_completion_receipts".into(),
+                    code_writer_completion_receipts_json(pool, run_id).await?,
+                );
+                execution_truth.insert(
+                    "implementationCompletion".into(),
+                    implementation_completion_json(pool, run_id).await?,
+                );
+                execution_truth.insert(
+                    "workflow_conflict".into(),
+                    workflow_conflict_json(pool, cmd_handler, run_id).await?,
+                );
+                execution_truth.insert(
+                    "retryAuthority".into(),
+                    retry_authority_current_json(pool, run_id).await?,
+                );
+                execution_truth.insert(
+                    "retryAuthorityHistory".into(),
+                    retry_authority_history_json(pool, run_id).await?,
+                );
+                execution_truth.insert(
+                    "p091OrphanRepairReadback".into(),
+                    p091_orphan_repair_readback_json(pool, run_id).await?,
+                );
+                execution_truth.insert(
+                    "rollout_contract_readback".into(),
+                    rollout_contract_readback,
+                );
+            }
+            reports.push(serde_json::Value::Object(execution_truth));
+            if is_operator {
+                if let Some(projection) =
+                    db::repos::artifact_contracts::find_run_state_projection(pool, run_id).await?
+                {
+                    let overrides =
+                        db::repos::artifact_contracts::list_overrides(pool, run_id).await?;
+                    reports.push(serde_json::json!({
+                        "id": uuid::Uuid::new_v4().to_string(),
+                        "run_id": run_id.to_string(),
+                        "stage_id": "__run__",
+                        "agent_id": "system",
+                        "name": "canonical_artifact_contracts",
+                        "contract_id": "canonical_artifact_contracts",
+                        "format": "json",
+                        "artifact_metadata_pointer": {
+                            "schemaVersion": "artifact_metadata_pointer.v1",
+                            "artifactId": "canonical_artifact_contracts",
+                            "checksumSha256": serde_json::Value::Null,
+                            "sizeBytes": serde_json::Value::Null,
+                            "authorizedPayloadRoute": serde_json::Value::Null,
+                            "payloadPathRedacted": true,
+                            "forbiddenFields": ["absolutePath", "filesystemPath", "rawPayload"]
+                        },
+                        "checksum_sha256": serde_json::Value::Null,
+                        "size_bytes": serde_json::Value::Null,
+                        "provider": "system",
+                        "model": serde_json::Value::Null,
+                        "created_at": projection.updated_at.to_rfc3339(),
+                        "is_pinned": true,
+                        "report_kind": "canonical_artifact_contracts",
+                        "report_version": 1,
+                        "active_index": projection.active_index_json,
+                        "run_state_projection": projection.run_state_json,
+                        "p094_boundary_readback": db::repos::artifact_contracts::p094_readback_json(pool, run_id).await?,
+                        "operator_overrides": overrides,
+                        "legacy_discovery_overrides": legacy_discovery_overrides::list_by_run(pool, run_id).await?,
+                    }));
+                }
             }
 
-            Ok(serde_json::Value::Array(reports))
+            Ok(serde_json::json!({
+                "reports": reports,
+                "p082_recovery_matrix_readbacks": p082_readbacks
+            }))
         }
 
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
@@ -210,6 +293,42 @@ pub(crate) async fn retry_authority_current_json(
         value["retry_payload_recovery"] = readback;
     }
     Ok(value)
+}
+
+/// P082: singular latest p082_recovery_matrix_readback for runs.get (null when none applies).
+///
+/// Returns null for non-Operator principals — recovery readbacks contain session/work-item
+/// identifiers and operator messages that must not be exposed to Agent or Observer principals
+/// (SEC-P082-HIGH-1 fix).
+pub async fn p082_recovery_matrix_readback_json(
+    pool: &SqlitePool,
+    run_id: domain::ids::RunId,
+    principal_class: &auth::PrincipalClass,
+) -> anyhow::Result<serde_json::Value> {
+    if *principal_class != auth::PrincipalClass::Operator {
+        return Ok(serde_json::Value::Null);
+    }
+    db::repos::p082_recovery_matrix::latest_readback_for_run(pool, run_id).await
+}
+
+/// P082: plural p082_recovery_matrix_readbacks for runs.get, reports.get, report resource,
+/// run report, and release receipt diagnostic context.
+///
+/// Returns an empty array for non-Operator principals (SEC-P082-HIGH-1 fix).
+/// `lane` is the readback lane label for the `p082_recovery_reason_readback_total` metric
+/// (e.g. `"mcp"`, `"reports.get"`, `"report_resource"`, `"release_receipt"`).
+pub async fn p082_recovery_matrix_readbacks_json(
+    pool: &SqlitePool,
+    run_id: domain::ids::RunId,
+    principal_class: &auth::PrincipalClass,
+    lane: &str,
+) -> anyhow::Result<serde_json::Value> {
+    if *principal_class != auth::PrincipalClass::Operator {
+        return Ok(serde_json::Value::Array(vec![]));
+    }
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(pool, run_id).await?;
+    db::repos::p082_recovery_matrix::emit_readback_lane_metrics(&readbacks, lane);
+    Ok(serde_json::Value::Array(readbacks))
 }
 
 pub(crate) async fn p091_orphan_repair_readback_json(
@@ -706,6 +825,21 @@ pub(crate) async fn execution_mcp_truth_json(
             }
             None => serde_json::Value::Null,
         };
+        let code_writer_completion_receipt = if include_operator_debug {
+            completion_receipts_by_execution_id
+                .get(&execution_id)
+                .map(|readback| {
+                    serde_json::to_value(
+                        domain::code_writer_completion::project_implementation_completion(
+                            std::slice::from_ref(*readback),
+                        ),
+                    )
+                })
+                .transpose()?
+                .unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        };
         items.push(serde_json::json!({
             "agent_execution_id": execution_id,
             "stage_execution_id": execution.stage_execution_id.map(|id| id.to_string()),
@@ -728,15 +862,7 @@ pub(crate) async fn execution_mcp_truth_json(
             "mcp_session_startup_latency_ms": execution.mcp_session_startup_latency_ms,
             "runtime_facts": runtime_facts,
             "discovery_diagnostics": discovery_diagnostics,
-            "code_writer_completion_receipt": completion_receipts_by_execution_id
-                .get(&execution_id)
-                .map(|readback| {
-                    serde_json::to_value(domain::code_writer_completion::project_implementation_completion(
-                        std::slice::from_ref(*readback),
-                    ))
-                })
-                .transpose()?
-                .unwrap_or(serde_json::Value::Null),
+            "code_writer_completion_receipt": code_writer_completion_receipt,
             // P066: toolchain mapping diagnostics — always non-null, legacy rows synthesized.
             "actual_toolchain_mapping_diagnostics": toolchain_mapping_diagnostics_mcp(
                 execution.actual_toolchain_mapping_diagnostics_json.as_deref()
@@ -952,6 +1078,69 @@ pub(crate) async fn rollout_contract_readback_json(
     }
 }
 
+pub(crate) async fn p094_rollout_decision_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let mut decision = crate::tools::runtime::p094_quality_gate_boundary_readback()
+        .get("rolloutDecision")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let Some(object) = decision.as_object_mut() else {
+        return Ok(decision);
+    };
+
+    object.insert(
+        "metricValues".to_string(),
+        db::metrics::p094_rollout_metric_values_json(),
+    );
+
+    let Some(check) =
+        rollout_contract_checks::find_terminal_rollout_contract_check_for_run(pool, run_id.inner())
+            .await?
+            .filter(|check| check.proposal_id == "P094")
+    else {
+        return Ok(decision);
+    };
+
+    let rollout_contract_entry_id = check.id.to_string();
+    let decision_state = check.decision.to_string();
+    let enforcing_allowed = check.decision
+        == rollout_contract_checks::RolloutContractDecision::Release
+        && check.status == rollout_contract_checks::RolloutContractStatus::Pass
+        && check.projection_integrity == rollout_contract_checks::ProjectionIntegrity::Valid;
+    object.insert(
+        "ownerDecision".to_string(),
+        serde_json::json!({
+            "state": decision_state,
+            "reason": "P094 rollout decision is backed by terminal rollout_contract_checks truth.",
+            "commandJournalEntryId": null,
+            "rolloutContractEntryId": rollout_contract_entry_id,
+            "source": "rollout_contract_checks",
+            "enteredAt": check.updated_at.to_rfc3339(),
+            "proposalRevisionId": check.proposal_revision_id,
+        }),
+    );
+    object.insert(
+        "promotionReadiness".to_string(),
+        serde_json::json!({
+            "enforcingAllowed": enforcing_allowed,
+            "blockedReason": if enforcing_allowed {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!("rollout_contract_decision_not_release")
+            },
+            "requiresBeforeEnforcing": "non_null_command_journal_or_rollout_contract_entry",
+            "rolloutContractEntryId": check.id.to_string(),
+        }),
+    );
+    object.insert(
+        "rolloutContractReadback".to_string(),
+        check.operator_readback_json_for_lane("run_report"),
+    );
+    Ok(decision)
+}
+
 /// P077: Serialize the active closeout readiness generation for MCP readback.
 /// Routes through CloseoutReadinessSummaryAccessor (R14 §architecture.single_accessor).
 /// Returns null when no active generation exists (run not yet at state_9 or gate not settled).
@@ -1045,10 +1234,18 @@ pub(crate) fn public_artifact_index_row(
     })
 }
 
+/// `p082_readbacks_prefetched`: when Some, the caller already fetched and emitted lane
+/// metrics — embed directly without re-fetching or re-emitting. When None, fetch and
+/// emit metrics for the per-artifact lane (run_report or release_receipt). This prevents
+/// double-counting when artifact_report_json is called from a container-level handler
+/// (reports.get, report://) that already emitted its own lane metric.
 pub(crate) async fn artifact_report_json(
     pool: &SqlitePool,
     artifact: &Artifact,
     rollout_contract_readback: Option<&serde_json::Value>,
+    principal_class: &auth::PrincipalClass,
+    _artifact_root: &str,
+    p082_readbacks_prefetched: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value> {
     let mut value = serde_json::to_value(artifact)?;
     if let serde_json::Value::Object(ref mut map) = value {
@@ -1058,8 +1255,8 @@ pub(crate) async fn artifact_report_json(
             artifact_metadata_pointer(artifact),
         );
     }
-    let include_rollout_readback =
-        artifact.report_kind.is_some() || is_release_report_artifact(&artifact.name);
+    let include_rollout_readback = *principal_class == auth::PrincipalClass::Operator
+        && (artifact.report_kind.is_some() || is_release_report_artifact(&artifact.name));
 
     if include_rollout_readback {
         if let serde_json::Value::Object(ref mut map) = value {
@@ -1068,6 +1265,35 @@ pub(crate) async fn artifact_report_json(
                 None => rollout_contract_readback_json(pool, artifact.run_id).await?,
             };
             map.insert("rollout_contract_readback".to_string(), readback);
+        }
+    }
+    if artifact.name == "run_report" || is_release_report_artifact(&artifact.name) {
+        let lane = if artifact.name == "run_report" {
+            "run_report"
+        } else {
+            "release_receipt"
+        };
+        let readbacks = if let Some(prefetched) = p082_readbacks_prefetched {
+            let readbacks = prefetched.as_array().cloned().unwrap_or_default();
+            // Container-level callers emit their own lane (reports.get/report_resource).
+            // The embedded artifact is also a distinct operator readback lane, so
+            // emit artifact-level metrics without re-fetching.
+            db::repos::p082_recovery_matrix::emit_readback_lane_metrics(&readbacks, lane);
+            readbacks
+        } else {
+            // Direct artifact access: fetch and emit per-artifact lane metrics.
+            p082_recovery_matrix_readbacks_json(pool, artifact.run_id, principal_class, lane)
+                .await
+                .unwrap_or_default()
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        };
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.insert(
+                "p082_recovery_matrix_readbacks".to_string(),
+                serde_json::Value::Array(readbacks),
+            );
         }
     }
 
@@ -1539,6 +1765,36 @@ mod tests {
         auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
     }
 
+    #[tokio::test]
+    async fn p082_reports_get_rejects_non_operator_before_report_lanes_are_loaded() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        persist_rollout_contract_readback(&pool, run_id).await;
+        let handler = make_command_handler(pool.clone());
+
+        for class in [auth::PrincipalClass::Agent, auth::PrincipalClass::Observer] {
+            let error = execute(
+                "reports.get",
+                serde_json::json!({ "run_id": run_id.to_string() }),
+                &pool,
+                &handler,
+                &auth::Principal::new("non-operator", class),
+            )
+            .await
+            .expect_err("non-Operator reports.get must fail closed")
+            .to_string();
+            assert!(
+                error.contains("requires Operator"),
+                "unexpected reports.get denial: {error}"
+            );
+        }
+    }
+
     #[test]
     fn xcode_runtime_observation_readback_redacts_raw_stored_tokens() {
         let raw = serde_json::json!({
@@ -1907,7 +2163,8 @@ mod tests {
 
         // reports.get returns enriched serde_json::Value objects with file_path stripped,
         // so we extract names from the JSON array rather than deserializing as Vec<Artifact>.
-        let reports: Vec<serde_json::Value> = serde_json::from_value(result).unwrap();
+        let reports: Vec<serde_json::Value> =
+            serde_json::from_value(result["reports"].clone()).unwrap();
         let names: Vec<String> = reports
             .into_iter()
             .filter_map(|v| v["name"].as_str().map(String::from))
@@ -1952,7 +2209,7 @@ mod tests {
         .await
         .unwrap();
 
-        let reports = result.as_array().expect("reports array");
+        let reports = result["reports"].as_array().expect("reports array");
         let mcp_truth = reports
             .iter()
             .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
@@ -2006,7 +2263,7 @@ mod tests {
         .await
         .unwrap();
 
-        let reports = result.as_array().expect("reports array");
+        let reports = result["reports"].as_array().expect("reports array");
         let mcp_truth = reports
             .iter()
             .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
@@ -2050,7 +2307,7 @@ mod tests {
         .await
         .unwrap();
 
-        let reports = result.as_array().expect("reports array");
+        let reports = result["reports"].as_array().expect("reports array");
         let mcp_truth = reports
             .iter()
             .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
@@ -2124,7 +2381,7 @@ mod tests {
         .await
         .unwrap();
 
-        let reports = result.as_array().expect("reports array");
+        let reports = result["reports"].as_array().expect("reports array");
         let mcp_truth = reports
             .iter()
             .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
@@ -2171,7 +2428,7 @@ mod tests {
         .await
         .unwrap();
 
-        let reports = result.as_array().expect("reports array");
+        let reports = result["reports"].as_array().expect("reports array");
         let mcp_truth = reports
             .iter()
             .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
@@ -2385,7 +2642,7 @@ mod tests {
         .await
         .unwrap();
 
-        let reports = result.as_array().expect("reports array");
+        let reports = result["reports"].as_array().expect("reports array");
         let mcp_truth = reports
             .iter()
             .find(|r| r["report_kind"] == serde_json::json!("mcp_execution_truth"))
@@ -2544,7 +2801,7 @@ mod tests {
         .await
         .unwrap();
 
-        let reports = result.as_array().expect("array");
+        let reports = result["reports"].as_array().expect("array");
         let validation_failure = reports
             .iter()
             .find(|artifact| artifact["report_kind"] == serde_json::json!("validation_failure"))
@@ -2591,7 +2848,7 @@ mod tests {
         .await
         .unwrap();
 
-        let reports = result.as_array().expect("reports array");
+        let reports = result["reports"].as_array().expect("reports array");
         let mcp_truth = reports
             .iter()
             .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
@@ -2654,7 +2911,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let reports = result.as_array().expect("reports array");
+        let reports = result["reports"].as_array().expect("reports array");
         assert!(reports.iter().any(|report| {
             report["name"] == serde_json::json!("p041_operator_report")
                 && report["report_kind"] == serde_json::json!("operator_summary")
@@ -2743,7 +3000,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let reports = result.as_array().expect("reports array");
+        let reports = result["reports"].as_array().expect("reports array");
         let evidence = reports
             .iter()
             .find(|report| report["report_kind"] == serde_json::json!("failed_stage_evidence"))
@@ -2819,7 +3076,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let reports = result.as_array().expect("reports array");
+        let reports = result["reports"].as_array().expect("reports array");
         let evidence = reports
             .iter()
             .find(|report| report["report_kind"] == serde_json::json!("failed_stage_evidence"))

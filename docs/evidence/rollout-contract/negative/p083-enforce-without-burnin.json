@@ -1,0 +1,48 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "applicability": "required",
+  "operator_message": "P083-r59 negative fixture: enforce transition without permissive burn-in must fail proposal-083 gate.",
+  "gate_aliases": [
+    "proposal-083"
+  ],
+  "commands": {
+    "allowlist": [
+      "./scripts/test-gate.sh proposal-083"
+    ]
+  },
+  "migrations": {
+    "not_applicable": false,
+    "justification": "P083 migrations are required."
+  },
+  "metrics": {
+    "adoption_metric": "p083_applicable_runs_with_passing_execution_truth_preflight_percent"
+  },
+  "readback_lanes": [
+    "run_report"
+  ],
+  "readback_fields": [
+    "rollout_contract_status"
+  ],
+  "readback_fixture": "docs/evidence/rollout-contract/operator-readback/p083-full-surface.fixture.json",
+  "operator_report_fields": [
+    "rollout_contract_status"
+  ],
+  "hold_conditions": [
+    "burn_in_incomplete"
+  ],
+  "rollback_disposition": {
+    "mode": "p083.rollback_execution_to_permissive_or_disabled",
+    "data_loss_risk": "none"
+  },
+  "decision_vocabulary": [
+    "pass"
+  ],
+  "negative_fixtures": {},
+  "cutover_policy": {
+    "revision": "p083-rollout-cutover-v16-r59",
+    "enforcement_mode_at_cutover": "enforce",
+    "applicable_to": "post_ready_implementation_starts",
+    "grandfathered_rendering": "not_applicable",
+    "effective_timestamp_iso8601": "2026-06-02T00:00:00Z"
+  }
+}

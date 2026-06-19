@@ -13,6 +13,7 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{sleep, timeout, Duration};
+use tracing::warn;
 use uuid::Uuid;
 
 const CHECKER_VERSION: &str = "p084-engine-preflight-v1";
@@ -1918,9 +1919,9 @@ fn effective_cutover_decision(
         };
     };
 
-    let applies_to_post_cutover_starts =
-        lint.cutover_applicable_to.as_deref() == Some("post_cutover_implementation_starts");
-    if applies_to_post_cutover_starts && run.started_at < effective_at {
+    let applies_to_post_ready_starts =
+        lint.cutover_applicable_to.as_deref() == Some("post_ready_implementation_starts");
+    if applies_to_post_ready_starts && run.started_at < effective_at {
         return EffectiveCutoverDecision {
             enforcement_mode: policy.enforcement_mode.clone(),
             grandfathered_not_applicable: lint.cutover_grandfathered_rendering.as_deref()
@@ -3302,12 +3303,21 @@ fn write_rollout_contract_check_projection(
 ) -> Result<()> {
     let projection_path = rollout_contract_check_projection_path(run);
     let projection = rollout_contract_check_projection_value(check)?;
-    atomic_write_json(&projection_path, &projection).with_context(|| {
+    if let Err(error) = atomic_write_json(&projection_path, &projection).with_context(|| {
         format!(
             "write rollout contract check projection {}",
             projection_path.display()
         )
-    })
+    }) {
+        warn!(
+            run_id = %run.id,
+            rollout_contract_check_id = %check.id,
+            projection_path = %projection_path.display(),
+            error = %error,
+            "Rollout contract check projection write failed; preserving authoritative DB record"
+        );
+    }
+    Ok(())
 }
 
 fn classify_existing_projection(
@@ -4240,7 +4250,7 @@ mod tests {
         contract["cutover_policy"] = serde_json::json!({
             "revision": "p084-cutover-v1",
             "enforcement_mode_at_cutover": "enforce",
-            "applicable_to": "post_cutover_implementation_starts",
+            "applicable_to": "post_ready_implementation_starts",
             "grandfathered_rendering": "not_applicable",
             "effective_timestamp_iso8601": "2026-05-02T00:00:00Z"
         });
@@ -4314,7 +4324,7 @@ mod tests {
         contract["cutover_policy"] = serde_json::json!({
             "revision": "p084-cutover-v1",
             "enforcement_mode_at_cutover": "enforce",
-            "applicable_to": "post_cutover_implementation_starts",
+            "applicable_to": "post_ready_implementation_starts",
             "grandfathered_rendering": "not_applicable",
             "effective_timestamp_iso8601": "2026-05-02T00:00:00Z"
         });
@@ -4679,6 +4689,41 @@ mod tests {
             serde_json::json!(PREFLIGHT_TIMEOUT_SECONDS)
         );
         assert!(projection.get("preflight_timeout_seconds").is_none());
+    }
+
+    #[tokio::test]
+    async fn preflight_does_not_fail_when_projection_write_is_denied() {
+        let dir = TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let pool = test_pool(&url).await;
+        let mut run = test_run();
+        run.workspace_root = dir.path().to_string_lossy().to_string();
+        run.chainworks_meta_root = Some("not-a-directory/run-meta".to_string());
+        run.artifact_root = dir
+            .path()
+            .join("run-artifacts")
+            .to_string_lossy()
+            .to_string();
+        apply_enforce_policy(&mut run);
+        std::fs::write(dir.path().join("not-a-directory"), b"file").unwrap();
+
+        let proposal_path = dir.path().join("approved-proposal.json");
+        let proposal = serde_json::json!({
+            "source_proposal": "docs/proposals/084-executable-rollout-gates-and-observability-contract.md",
+            "proposal_revision_id": "p084-r5",
+            "rollout_contract_v1": valid_rollout_contract()
+        });
+        std::fs::write(&proposal_path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+        let artifact = test_artifact(&run, proposal_path.to_string_lossy().to_string());
+
+        let evaluation =
+            implementation_run_start_rollout_contract_preflight(&pool, &run, Some(&artifact))
+                .await
+                .unwrap();
+
+        assert_eq!(evaluation.action, RolloutContractPreflightAction::Allow);
+        assert!(!evaluation.would_block);
+        assert_eq!(evaluation.check.status, RolloutContractStatus::Pass);
     }
 
     #[tokio::test]

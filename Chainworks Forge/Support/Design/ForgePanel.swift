@@ -7,11 +7,7 @@ struct ForgePanelStyle: ViewModifier {
     func body(content: Content) -> some View {
         content
             .padding(ForgeSpacing.large)
-            .background(fill, in: RoundedRectangle(cornerRadius: ForgeRadius.panel, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: ForgeRadius.panel, style: .continuous)
-                    .strokeBorder(tint.opacity(0.4), lineWidth: 1)
-            )
+            .forgeGlassSurface(.panel, tint: tint, fill: fill)
     }
 }
 

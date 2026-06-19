@@ -255,6 +255,20 @@ pub async fn update_recovery_snapshot_json(
     Ok(())
 }
 
+pub async fn update_recovery_snapshot_json_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: StageExecutionId,
+    recovery_snapshot_json: &str,
+) -> Result<()> {
+    sqlx::query(r#"UPDATE stage_executions SET recovery_snapshot_json = ?1 WHERE id = ?2"#)
+        .bind(recovery_snapshot_json)
+        .bind(id.to_string())
+        .execute(&mut **tx)
+        .await
+        .context("update stage recovery snapshot json")?;
+    Ok(())
+}
+
 pub async fn update_evidence_packet_json(
     pool: &SqlitePool,
     id: StageExecutionId,

@@ -31,11 +31,12 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 ### Execution engine
 
-- [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — RunPlan compiler, orchestrator, executors, artifact management, resume, declarative workflow authority, durable side-effect ledger, and conflict resolution / lead mediation
+- [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — RunPlan compiler, orchestrator, executors, artifact management, resume, declarative workflow authority, quality-gate blocker boundary routing, durable side-effect ledger, and conflict resolution / lead mediation
 - [reference/artifact-discovery-and-settlement-optimization.md](reference/artifact-discovery-and-settlement-optimization.md) — Bounded discovery, settlement pipeline, and pre-prompt metadata
 - [reference/runtime-contract.md](reference/runtime-contract.md) — Frozen run snapshots, state machines, artifact model
 - [reference/execution-truth-and-recovery.md](reference/execution-truth-and-recovery.md) — Terminal outcomes, atomic transition settlement, cursor-driven resume, recovery precedence, host interruption, workflow conflict recovery, durable side-effect reconciliation, and startup recovery progress
 - [reference/rust-control-plane.md](reference/rust-control-plane.md) — Rust + SQLite daemon: architecture, crate layout, persistence, side-effect ledger, targeted retry authority, retry payload recovery, boundaries, capacity-aware scheduling, DbWriter gateway, write serialization, evidence spooling, provider toolchain homes, and generated-state housekeeping
+- [reference/escalation-policies.md](reference/escalation-policies.md) — Configurable escalation policies, durable tier advancement, readback shape, macOS read surface, rollout gate, and release-proof boundary
 
 ### Agents, skills, and MCP
 
@@ -47,6 +48,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 ### ACP transport and sessions
 
 - [reference/acp-runtime-transport.md](reference/acp-runtime-transport.md) — ACP transport contract, adapter families (Claude/Gemini/Codex/Auggie/Junie), runtime selection, Junie structured-output canary proof, Junie code-writer preflight/launch gating, and capacity management
+- [reference/bounded-tool-output-and-safe-search-policy.md](reference/bounded-tool-output-and-safe-search-policy.md) — Runtime-owned safe-search policy: generated-root denylist, typed preflight denial, provider wrapper caps, output-budget classification, quarantine behavior, and `runtime.health.toolOutputGuard` readback
 - [reference/acp-runtime-transport.md#toolchain-cache-mapping](reference/acp-runtime-transport.md#toolchain-cache-mapping) — Provider toolchain cache mapping: Xcode/Go isolation, environment redirection, and exclusive serialization
 - [reference/xcode-mcp-bridge-pool.md](reference/xcode-mcp-bridge-pool.md) — Brokered Xcode MCP leases, host-user Xcode boundary, shim dispatch, runtime observations, and broker health
 - [reference/session-lineage-reuse-and-operator-reset.md](reference/session-lineage-reuse-and-operator-reset.md) — Session reuse, invocation-owner keys, binding fingerprints, context budget, checkpoint rehydration, operator reset
@@ -55,7 +57,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 ### Outputs, contracts, and feedback
 
 - [reference/structured-output-envelope-and-contract-validation.md](reference/structured-output-envelope-and-contract-validation.md) — Named envelopes, contract binding, validation, Junie canary proof, failure substrate
-- [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, implementation self-assessment and handoff, failed-stage evidence, Junie code-writer completion-boundary subtypes, staged repair settlement, narrow recovery
+- [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, quality-gate blocker boundary contracts/readback, implementation self-assessment and handoff, failed-stage evidence, Junie code-writer completion-boundary subtypes, staged repair settlement, narrow recovery
 - [reference/implementation-closeout-readiness.md](reference/implementation-closeout-readiness.md) — Active closeout readiness authority, state-9 release routing, readback, rollout evidence, and retained gate aliases
 - [reference/proposal-loop-feedback-fidelity-and-rereview.md](reference/proposal-loop-feedback-fidelity-and-rereview.md) — Review-corpus fidelity, backlog carry-forward, targeted rereview
 - [reference/context-strategy-and-experiment-framework.md](reference/context-strategy-and-experiment-framework.md) — Strategy-profile freezing, handoff compilation, normalized telemetry
@@ -100,6 +102,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 - [reference/test-suite-architecture.md](reference/test-suite-architecture.md) — Swift Testing suite structure
 - [reference/test-gates.md](reference/test-gates.md) — Layered fast/UI/focused/full gates
 - [reference/p041-generated-artifact-schemas.md](reference/p041-generated-artifact-schemas.md) — Versioned schemas for server parity runtime artifacts, publication rows, and work products
+- [reference/recovery-retry-state-machine-test-matrix.md](reference/recovery-retry-state-machine-test-matrix.md) — Canonical P082 recovery/retry state-machine matrix, reason-code vocabulary, readback schemas, lane placement, and `proposal-082|p082` proof gate ownership
 - [reference/agent-ui-test-execution.md](reference/agent-ui-test-execution.md) — Agent-facing UI execution rules
 
 ### Risk analysis

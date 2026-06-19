@@ -5,7 +5,7 @@
 | Date | 2026-04-30 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | P037 ACP supervision, P058 claim/start ownership, P061 scheduler/write coordination, P065 retry instructions, [auto-retry observation ledger](../reference/auto-retry-observation-ledger.md) |
+| Depends on | P037 ACP supervision, implemented claim/start ownership in [execution truth and recovery](../reference/execution-truth-and-recovery.md), P061 scheduler/write coordination, P065 retry instructions, [auto-retry observation ledger](../reference/auto-retry-observation-ledger.md) |
 | Related | P051 Xcode MCP bridge pool, [local persistence write-budget contract](../reference/rust-control-plane.md#sqlite-write-serialization-and-gateway-dbwriter), [durable side-effect reconciliation](../reference/execution-truth-and-recovery.md#durable-side-effect-ledger-and-reconciliation), `docs/reference/rust-control-plane.md`, `docs/reference/session-lineage-reuse-and-operator-reset.md` |
 | Scope | Add a continuous reconciliation subsystem for stale running execution truth, provider/session ownership, and helper-process lifecycle. |
 | Non-goal | No automatic human approval, no blind retry of release side effects, and no replacement for existing startup repair or provider idle supervision. |
@@ -29,7 +29,7 @@ Startup-only repair is not enough because the daemon may stay alive while the pr
 Implemented pieces today:
 
 - `RecoveryService::run_startup_repair()` runs at daemon startup.
-- P061/P058 repair can requeue abandoned running `InvokeAgent` work at startup.
+- Startup recovery repair can requeue abandoned running `InvokeAgent` work.
 - P037 supervises idle ACP prompt activity once a prompt is active.
 - P051 keeps Xcode MCP broker warm and classifies modal stalls.
 - The auto-retry ledger observes repeated blocked/retry signatures.

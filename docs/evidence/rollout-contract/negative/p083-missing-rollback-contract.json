@@ -1,0 +1,35 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "applicability": "required",
+  "operator_message": "P083-r59 negative fixture: missing rollback execution contract must fail proposal-083 gate.",
+  "gate_aliases": [
+    "proposal-083"
+  ],
+  "commands": {
+    "allowlist": [
+      "./scripts/test-gate.sh proposal-083"
+    ]
+  },
+  "migrations": {
+    "not_applicable": false,
+    "justification": "P083 migrations are required."
+  },
+  "metrics": {
+    "adoption_metric": "p083_applicable_runs_with_passing_execution_truth_preflight_percent"
+  },
+  "readback_lanes": [
+    "run_report"
+  ],
+  "readback_fields": [
+    "rollout_contract_status"
+  ],
+  "readback_fixture": "docs/evidence/rollout-contract/operator-readback/p083-full-surface.fixture.json",
+  "operator_report_fields": [
+    "rollout_contract_status"
+  ],
+  "hold_conditions": [],
+  "decision_vocabulary": [
+    "pass"
+  ],
+  "negative_fixtures": {}
+}

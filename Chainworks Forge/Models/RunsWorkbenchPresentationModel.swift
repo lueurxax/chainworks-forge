@@ -112,14 +112,14 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
                     isCurrent: stage.isCurrent,
                     iterationText: stage.iterationText,
                     attemptText: stage.attemptText,
-                    startedLabel: nil,
-                    completedLabel: nil,
-                    durationLabel: nil,
+                    startedLabel: stage.startedLabel,
+                    completedLabel: stage.completedLabel,
+                    durationLabel: stage.durationLabel,
                     evidenceLabels: Self.stageTopologyEvidenceLabels(for: stage),
                     artifactCount: stage.artifactCount,
                     communicationCount: stage.communicationCount,
                     approvalRequired: stage.approvalRequired,
-                    occurrences: stage.occurrences.prefix(3).map { occurrence in
+                    occurrences: stage.occurrences.map { occurrence in
                         StageOccurrence(
                             id: "\(stage.stageID)-\(occurrence.agentID)-\(occurrence.taskName)",
                             agentTitle: occurrence.agentTitle,
@@ -129,7 +129,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
                             executionCountLabel: occurrence.executionCountLabel
                         )
                     },
-                    hiddenOccurrenceCount: max(0, stage.occurrences.count - 3),
+                    hiddenOccurrenceCount: 0,
                     transitions: stage.transitions.map { transition in
                         StageTransition(
                             id: "\(stage.stageID)-\(transition.toStageID)",
@@ -302,6 +302,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
                 id: entry.agentID,
                 title: entry.title,
                 providerID: entry.providerID,
+                modelID: entry.modelID,
                 stageID: entry.stageID,
                 stageLabel: entry.stageLabel,
                 taskLabel: entry.taskLabel,
@@ -322,33 +323,6 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
         } else {
             deferredStates = []
         }
-    }
-
-    private static func entriesForFocusedActiveAgent(
-        _ entries: [FocusedTimelineSpineEntry],
-        selectedAgentID: String?
-    ) -> [FocusedTimelineSpineEntry] {
-        let completedAgentIDs = Set(
-            entries.compactMap { entry -> String? in
-                guard entry.kind == .agentSummary else { return nil }
-                return entry.agentID
-            }
-        )
-        let activeEntries = entries.filter { entry in
-            guard let agentID = entry.agentID else { return false }
-            return !completedAgentIDs.contains(agentID)
-        }
-        let resolvedAgentID: String? = {
-            if let selectedAgentID,
-               activeEntries.contains(where: { $0.agentID == selectedAgentID }) {
-                return selectedAgentID
-            }
-            return activeEntries
-                .max(by: { $0.timestamp < $1.timestamp })?
-                .agentID
-        }()
-        guard let resolvedAgentID else { return [] }
-        return activeEntries.filter { $0.agentID == resolvedAgentID }
     }
 
     func populate(from inbox: P031ApprovalInboxPresentation) {
@@ -578,8 +552,9 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
         }
 
         private static func fullMVPLayout(byID: [String: StageCard]) -> Layout {
-            func stage(_ id: String, heightUnits: Int = 1) -> StageTopologySlot {
-                StageTopologySlot.stage(byID[id]!, heightUnits: heightUnits)
+            func stage(_ id: String, heightUnits: Int? = nil) -> StageTopologySlot {
+                let stage = byID[id]!
+                return StageTopologySlot.stage(stage, heightUnits: heightUnits ?? defaultHeightUnits(for: stage))
             }
             func column(_ id: String, _ title: String, _ slots: [StageTopologySlot]) -> StageTopologyColumn {
                 StageTopologyColumn(id: "column-\(id)", title: title, slots: slots)
@@ -652,7 +627,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
                 StageTopologyColumn(
                     id: "column-\(stage.id)",
                     title: "Stage \(stage.ordinal)",
-                    slots: [.stage(stage)]
+                    slots: [.stage(stage, heightUnits: defaultHeightUnits(for: stage))]
                 )
             }
             let connectors = stages.dropLast().map { stage in
@@ -664,6 +639,17 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
                 )
             }
             return Layout(columns: columns, connectors: connectors)
+        }
+
+        private static func defaultHeightUnits(for stage: StageCard) -> Int {
+            switch stage.occurrences.count {
+            case 0...2:
+                return 1
+            case 3...5:
+                return 2
+            default:
+                return 3
+            }
         }
     }
 
@@ -731,6 +717,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
         let id: String
         let title: String
         let providerID: String?
+        let modelID: String?
         let stageID: String?
         let stageLabel: String?
         let taskLabel: String?
@@ -740,6 +727,36 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
         let eventCount: Int
         let selectionOrder: Int?
         let selectionUnavailableReason: String?
+
+        init(
+            id: String,
+            title: String,
+            providerID: String?,
+            modelID: String? = nil,
+            stageID: String?,
+            stageLabel: String?,
+            taskLabel: String?,
+            status: String,
+            sessionID: String?,
+            latestAt: Date,
+            eventCount: Int,
+            selectionOrder: Int?,
+            selectionUnavailableReason: String?
+        ) {
+            self.id = id
+            self.title = title
+            self.providerID = providerID
+            self.modelID = modelID
+            self.stageID = stageID
+            self.stageLabel = stageLabel
+            self.taskLabel = taskLabel
+            self.status = status
+            self.sessionID = sessionID
+            self.latestAt = latestAt
+            self.eventCount = eventCount
+            self.selectionOrder = selectionOrder
+            self.selectionUnavailableReason = selectionUnavailableReason
+        }
     }
 
     struct TimelineEntry: Identifiable, Equatable {

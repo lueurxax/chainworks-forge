@@ -5,7 +5,7 @@
 | Date | 2026-05-11 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | P037 ACP supervision and idle-hang watchdog, P058 output settlement and strict contract authority, P079 contract-aware output repair and provider fallback, P083 execution-truth ownership invariants |
+| Depends on | P037 ACP supervision and idle-hang watchdog, implemented output settlement and strict contract authority in [output contracts, failure evidence, and recovery](../reference/output-contracts-failure-evidence-and-recovery.md), P079 contract-aware output repair and provider fallback, P083 execution-truth ownership invariants |
 | Related | P095 two-phase agent invocation, macOS operator navigation in `docs/reference/macos-operator-navigation.md`, agent work continuation in `docs/reference/agent-work-continuation.md`, storage tiering/read-path liveness in `docs/reference/query-projections-and-client-consumption-contract.md` and `docs/reference/rust-control-plane.md`, `docs/reference/output-contracts-failure-evidence-and-recovery.md` |
 | Scope | Contain and diagnose the `code_writer` completion-handoff class where substantive implementation work exists but fresh structured outputs for the current attempt do not settle. |
 | Non-goal | No weakening of output contracts, no acceptance of stale files as fresh truth, no provider-specific hotfixes as the main contract, no global missing-output fix for all agents, and no retroactive silent repair of historical blocked runs. |
