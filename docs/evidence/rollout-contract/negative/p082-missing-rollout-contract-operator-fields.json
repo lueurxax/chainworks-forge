@@ -1,39 +1,7 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
-  },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-082",
-    "p082"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:missing_rollout_contract_operator_fields",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "schema_version": "p082_negative_fixture_v1",
+  "fixture_id": "p082-neg-006",
+  "expected_failure_code": "p082_missing_rollout_contract_operator_fields",
+  "mutated_contract_or_matrix": "Release receipt returned without rollout_contract_* operator fields",
+  "assertion": "Gate must fail because rollout_contract_* fields (rollout_contract_status, rollout_contract_decision, etc.) are required in release receipts"
 }

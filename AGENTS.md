@@ -56,7 +56,7 @@ RUST_LOG=info,acp=debug
 
 Connect Claude Code to the running daemon as an MCP server via `.mcp.json` at repo root (`"type": "http"`, `"url": "http://127.0.0.1:4000/mcp"`).
 
-The daemon requires a bearer token for MCP auth (P029). On first start, it auto-creates `~/.chainworks/auth/principals.json` with a default operator token and logs it at `info` level. Set `CHAINWORKS_MCP_TOKEN=<token>` in your shell environment before connecting. The `.mcp.json` already includes the `Authorization: Bearer ${CHAINWORKS_MCP_TOKEN}` header.
+The daemon requires a bearer token for MCP auth (P029). On first start, it auto-creates `~/.chainworks/auth/principals.json` with a default operator token and logs only the path with a redacted note; read the raw token from the principals file. Set `CHAINWORKS_MCP_TOKEN=<token>` in your shell environment before connecting. The `.mcp.json` already includes the `Authorization: Bearer ${CHAINWORKS_MCP_TOKEN}` header.
 
 ## Architecture: big picture
 

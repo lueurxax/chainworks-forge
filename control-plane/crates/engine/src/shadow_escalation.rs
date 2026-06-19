@@ -44,6 +44,8 @@ pub fn classify_trigger_from_failure_kind(
         | AgentFailureKind::ProviderPermissionRejected
         | AgentFailureKind::HostInterruption
         | AgentFailureKind::McpPermissionModalStall
+        | AgentFailureKind::ToolOutputBudgetExceeded
+        | AgentFailureKind::ToolOutputBudgetPreflightDenied
         | AgentFailureKind::Unknown => None,
     }
 }
@@ -225,6 +227,10 @@ fn failure_kind_digest_value(failure_kind: Option<&AgentFailureKind>) -> &'stati
         Some(AgentFailureKind::MissingRequiredOutputs) => "missing_required_outputs",
         Some(AgentFailureKind::InvalidOutputContract) => "invalid_output_contract",
         Some(AgentFailureKind::ProviderInternalError) => "provider_internal_error",
+        Some(AgentFailureKind::ToolOutputBudgetExceeded) => "tool_output_budget_exceeded",
+        Some(AgentFailureKind::ToolOutputBudgetPreflightDenied) => {
+            "tool_output_budget_preflight_denied"
+        }
         Some(AgentFailureKind::ProviderTimeout) => "provider_timeout",
         Some(AgentFailureKind::XcodeHostEnvironmentError) => "xcode_host_environment_error",
         Some(AgentFailureKind::CancelledByOperator) => "cancelled_by_operator",

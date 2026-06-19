@@ -72,6 +72,8 @@ pub enum AgentFailureKind {
     ProviderPermissionRejected,
     ProviderTimeout,
     ProviderInternalError,
+    ToolOutputBudgetExceeded,
+    ToolOutputBudgetPreflightDenied,
     TransportEpipe,
     TransportProtocolError,
     TransportClosed,
@@ -243,6 +245,8 @@ pub struct GqlRunStageTopologyNode {
     pub is_current: bool,
     pub iteration: Option<i64>,
     pub attempt_number: Option<i64>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
     pub approval_required: bool,
     pub artifact_count: i64,
     pub communication_count: i64,
@@ -1442,6 +1446,12 @@ impl GqlAgentExecutionRuntimeFacts {
                 }
                 domain::agent::AgentFailureKind::ProviderInternalError => {
                     AgentFailureKind::ProviderInternalError
+                }
+                domain::agent::AgentFailureKind::ToolOutputBudgetExceeded => {
+                    AgentFailureKind::ToolOutputBudgetExceeded
+                }
+                domain::agent::AgentFailureKind::ToolOutputBudgetPreflightDenied => {
+                    AgentFailureKind::ToolOutputBudgetPreflightDenied
                 }
                 domain::agent::AgentFailureKind::TransportEpipe => AgentFailureKind::TransportEpipe,
                 domain::agent::AgentFailureKind::TransportProtocolError => {

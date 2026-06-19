@@ -1,0 +1,68 @@
+{
+  "fixture_purpose": "P083 rollout_contract_v1 operator readback fixture placeholder for proposal freeze. Implementation must replace with concrete same-tree run evidence before release.",
+  "schema_version": "operator_readback_v1",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r64-refined-3da64326",
+  "source_lane": "run_report",
+  "rollout_contract_status": "fail",
+  "rollout_contract_decision": "hold",
+  "rollout_contract_failure_reasons": [
+    "placeholder_pending_implementation_evidence"
+  ],
+  "rollout_contract_waiver_state": "none",
+  "rollout_contract_waiver_expires_at": null,
+  "rollout_contract_enforcement_mode": "disabled",
+  "rollout_contract_enforcement_mode_reason": "proposal_fixture_placeholder",
+  "rollout_contract_hold_conditions": [
+    "Replace placeholder with concrete P083 rollout evidence."
+  ],
+  "rollout_contract_rollback_disposition": {
+    "mode": "p083.rollback_execution_to_permissive_or_disabled",
+    "data_loss_risk": "none"
+  },
+  "rollout_contract_source_lane": "run_report",
+  "rollout_contract_enabled_state": "disabled",
+  "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
+  "rollout_contract_action_id": null,
+  "rollout_contract_operator_message": "P083 rollout fixture placeholder; not release evidence.",
+  "rollout_contract_projection_integrity": "stale",
+  "rollout_contract_cutover_policy_revision": "p083-rollout-cutover-v21-r64",
+  "rollout_contract_diagnostic_redaction": "none",
+  "rollout_contract_next_steps": [
+    "replace_placeholder_with_concrete_p083_evidence"
+  ],
+  "p083_rollback_ttl_expires_at": null,
+  "p083_last_preflight_hash": null,
+  "parity_lanes": {
+    "run_report": {
+      "proposal_id": "P083",
+      "proposal_revision_id": "P083-r64-refined-3da64326",
+      "rollout_contract_status": "fail",
+      "rollout_contract_decision": "hold",
+      "proposalRevisionId": null
+    },
+    "mcp": {
+      "proposal_id": "P083",
+      "proposal_revision_id": "P083-r64-refined-3da64326",
+      "rollout_contract_status": "fail",
+      "rollout_contract_decision": "hold",
+      "proposalRevisionId": null
+    },
+    "release_receipt": {
+      "proposal_id": "P083",
+      "proposal_revision_id": "P083-r64-refined-3da64326",
+      "rollout_contract_status": "fail",
+      "rollout_contract_decision": "hold",
+      "proposalRevisionId": null
+    },
+    "graphql": {
+      "proposalId": "P083",
+      "proposalRevisionId": "P083-r64-refined-3da64326",
+      "rolloutContractStatus": "fail",
+      "rolloutContractDecision": "hold",
+      "proposal_revision_id": null
+    }
+  },
+  "rollout_contract_shutdown_deadline_config_state": "valid",
+  "rollout_contract_command_lease_ttl_config_state": "valid"
+}

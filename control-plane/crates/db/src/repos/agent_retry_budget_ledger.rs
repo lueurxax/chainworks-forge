@@ -39,6 +39,16 @@ pub struct ProviderFamilyQuotaConsumeResult {
     pub consumed_count: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuotaLedgerAutoRetryCandidate {
+    pub ledger_id: String,
+    pub run_id: RunId,
+    pub stage_execution_id: StageExecutionId,
+    pub stage_id: String,
+    pub agent_execution_id: AgentExecutionId,
+    pub retry_after: DateTime<Utc>,
+}
+
 pub async fn upsert_quota_failure(
     pool: &SqlitePool,
     run_id: RunId,
@@ -238,6 +248,77 @@ pub async fn mark_elapsed_provider_quota_waits_tx(
     .await?
     .rows_affected();
     Ok(updated)
+}
+
+pub async fn list_reset_elapsed_auto_retry_candidates(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+) -> Result<Vec<QuotaLedgerAutoRetryCandidate>> {
+    mark_elapsed_provider_quota_waits(pool, now).await?;
+    let rows = sqlx::query(
+        r#"SELECT ledger.id AS ledger_id,
+                  ledger.run_id AS run_id,
+                  ledger.stage_execution_id AS stage_execution_id,
+                  se.stage_id AS stage_id,
+                  ledger.agent_execution_id AS agent_execution_id,
+                  ledger.retry_after AS retry_after
+           FROM agent_retry_budget_ledger ledger
+           INNER JOIN agent_executions ae ON ae.id = ledger.agent_execution_id
+           INNER JOIN agent_execution_runtime_facts facts
+             ON facts.agent_execution_id = ledger.agent_execution_id
+           INNER JOIN stage_executions se ON se.id = ledger.stage_execution_id
+           WHERE ledger.failure_kind = ?1
+             AND ledger.normal_budget_consumed = 0
+             AND ledger.state = 'reset_elapsed'
+             AND ledger.retry_after IS NOT NULL
+             AND ledger.retry_after <= ?2
+             AND ledger.stage_execution_id IS NOT NULL
+             AND ae.status = 'failed'
+             AND facts.failure_kind = ?1
+           ORDER BY ledger.retry_after ASC, ledger.created_at ASC"#,
+    )
+    .bind(AgentFailureKind::ProviderQuota.to_string())
+    .bind(now.to_rfc3339())
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(parse_auto_retry_candidate_row).collect()
+}
+
+pub async fn mark_reset_elapsed_retry_scheduled_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    ledger_id: &str,
+    journal_id: &str,
+) -> Result<AgentRetryBudgetLedgerRow> {
+    let now = Utc::now().to_rfc3339();
+    let updated = sqlx::query(
+        r#"UPDATE agent_retry_budget_ledger
+           SET normal_budget_consumed = 1,
+               early_retry_journal_id = COALESCE(early_retry_journal_id, ?1),
+               state = 'reset_elapsed_retry_scheduled',
+               updated_at = ?2
+           WHERE failure_kind = ?4
+             AND normal_budget_consumed = 0
+             AND state = 'reset_elapsed'
+             AND EXISTS (
+               SELECT 1
+               FROM agent_retry_budget_ledger source
+               WHERE source.id = ?3
+                 AND source.run_id = agent_retry_budget_ledger.run_id
+                 AND source.owner_kind = agent_retry_budget_ledger.owner_kind
+                 AND source.owner_id = agent_retry_budget_ledger.owner_id
+             )"#,
+    )
+    .bind(journal_id)
+    .bind(&now)
+    .bind(ledger_id)
+    .bind(AgentFailureKind::ProviderQuota.to_string())
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        anyhow::bail!("quota ledger {ledger_id} was already consumed or is not reset_elapsed");
+    }
+    find_by_id_tx(tx, ledger_id).await
 }
 
 pub async fn consume_early_quota_retry_tx(
@@ -486,6 +567,27 @@ fn parse_provider_family_quota_wait_row(
         stage_execution_id: stage_execution_id
             .map(|value| value.parse().map_err(|e| anyhow::anyhow!("{e}")))
             .transpose()?,
+        agent_execution_id: agent_execution_id
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        retry_after: DateTime::parse_from_rfc3339(&retry_after)?.with_timezone(&Utc),
+    })
+}
+
+fn parse_auto_retry_candidate_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<QuotaLedgerAutoRetryCandidate> {
+    let run_id: String = row.get("run_id");
+    let stage_execution_id: String = row.get("stage_execution_id");
+    let agent_execution_id: String = row.get("agent_execution_id");
+    let retry_after: String = row.get("retry_after");
+    Ok(QuotaLedgerAutoRetryCandidate {
+        ledger_id: row.get("ledger_id"),
+        run_id: run_id.parse().map_err(|e| anyhow::anyhow!("{e}"))?,
+        stage_execution_id: stage_execution_id
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        stage_id: row.get("stage_id"),
         agent_execution_id: agent_execution_id
             .parse()
             .map_err(|e| anyhow::anyhow!("{e}"))?,

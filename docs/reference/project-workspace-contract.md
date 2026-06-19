@@ -59,6 +59,15 @@ If the YAML field is absent, it defaults to `false`.
 
 ## Start and preflight rules
 
+MCP `runs.start` uses the idea's persisted `workspace_root_path` as the
+trusted filesystem boundary before it reads workflow, catalog, or artifact
+paths. The idea root must exist, must not be a symlink or contain symlink
+components, must not be a broad root such as `/`, `/tmp`, `/Users`, or the
+operator home directory, and the submitted `workspace_root` must canonicalize
+to that same idea root. `artifact_root`, `workflow_yaml_path`, and
+`agent_catalog_yaml_path` must canonicalize under that trusted root. A caller
+cannot widen the boundary by submitting a broader `workspace_root`.
+
 When `requiresProjectAccess == true`:
 
 - diagnostic Start Run placeholder blocks if the idea has no valid workspace root,
@@ -68,8 +77,11 @@ When `requiresProjectAccess == true`:
 When `requiresProjectAccess == false`:
 
 - workspace readiness is optional,
-- start may proceed without a project root,
-- repo-agnostic flows remain directory-free by design.
+- workflow-level project readiness does not block start, but current MCP
+  `runs.start` still requires the idea workspace root as its filesystem
+  confinement boundary,
+- repo-agnostic workflow semantics remain directory-free; the northbound MCP
+  start envelope still carries bounded filesystem paths.
 
 ## Frozen run contract
 

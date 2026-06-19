@@ -113,6 +113,18 @@ impl WorkQueue {
         Ok(())
     }
 
+    pub async fn fail_if_terminal_failed_invoke_without_valid_outputs(
+        &self,
+        id: &str,
+        error: &str,
+    ) -> Result<bool> {
+        if !work_items::running_invoke_agent_has_terminal_failed_outputs(&self.pool, id).await? {
+            return Ok(false);
+        }
+        self.fail(id, error).await?;
+        Ok(true)
+    }
+
     pub async fn requeue_after_transient_persistence_contention(
         &self,
         id: &str,
@@ -129,6 +141,16 @@ impl WorkQueue {
             self.refresh_scheduler_projection().await?;
         }
         Ok(requeued)
+    }
+
+    pub async fn requeue_running_advance_item(&self, id: &str, reason: &str) -> Result<bool> {
+        let requeued =
+            work_items::requeue_running_advance_work_item_by_id(&self.pool, id, Utc::now(), reason)
+                .await?;
+        if requeued > 0 {
+            self.refresh_scheduler_projection().await?;
+        }
+        Ok(requeued > 0)
     }
 
     pub async fn refresh_scheduler_projection(&self) -> Result<()> {

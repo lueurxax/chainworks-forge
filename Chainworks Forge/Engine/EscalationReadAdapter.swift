@@ -23,7 +23,7 @@ final class EscalationReadAdapter: ObservableObject {
 
     nonisolated let runId: String
 
-    nonisolated init(runId: String) {
+    init(runId: String) {
         self.runId = runId
     }
 

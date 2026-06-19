@@ -78,16 +78,6 @@ fn reject_duplicate_json_keys(json_str: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate that `value` is well-formed JSON if present.
-/// The proposal requires repository-layer JSON rejection even without sqlite json1.
-fn validate_json_field(field_name: &str, value: &Option<String>) -> Result<()> {
-    if let Some(json_str) = value {
-        serde_json::from_str::<serde_json::Value>(json_str)
-            .map_err(|e| anyhow!("field {field_name} contains malformed JSON: {e}"))?;
-    }
-    Ok(())
-}
-
 /// Approved non-dereferenceable prefixes for `redacted_evidence_ref` and
 /// `redacted_message_fragment_hash` payload fields (P058-SEC-02).
 /// Rejects URL schemes (`https://`), absolute paths (`/...`), and bare credentials (`sk-...`)
@@ -572,6 +562,7 @@ pub fn digest_inputs_for_meta_from_events(
 }
 
 /// Thin wrapper for callers that only need pass/fail validation (unit tests, etc.).
+#[cfg(test)]
 fn validate_payload_json_shape(json_str: &str) -> Result<()> {
     canonicalize_and_validate_payload_json(json_str).map(|_| ())
 }
@@ -1513,8 +1504,7 @@ pub async fn insert_event_tx(
     // "redacted_evidence_ref":"sha256:abc"} cannot persist the credential under the first key
     // while the validator only sees the deduplicated safe value.
     // The canonical string (not the original raw input) is what gets stored and surfaced
-    // through GraphQL/MCP readback. validate_json_field is redundant after this but kept as
-    // an explicit guard for the Option<None> case.
+    // through GraphQL/MCP readback.
     let canonical_payload_json: Option<String> = match &event.payload_json {
         None => None,
         Some(json_str) => Some(canonicalize_and_validate_payload_json(json_str)?),

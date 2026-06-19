@@ -66,7 +66,7 @@ async fn handle_mcp_post(
         let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
         match auth_header {
             Some(header_value) => match auth::extract_bearer_token(header_value) {
-                Ok(token) => match auth::resolve_bearer(token, &mcp.principal_table) {
+                Ok(token) => match mcp.resolve_current_bearer(token) {
                     Ok(p) => {
                         let tid = auth::derive_token_id(token, &p.id);
                         (p, Some(tid))
@@ -232,6 +232,87 @@ mod tests {
         let json = response_json(response).await;
         assert_eq!(json["error"]["code"], -32000);
         assert_eq!(json["error"]["message"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn sec_high_001_mcp_http_observes_live_principal_revocation() {
+        let mcp = test_server().await;
+        let live_source = mcp.live_principal_source();
+        live_source.update(auth::PrincipalTable::test_fixture());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer test-token-xxxxxxxxxxxxxxxxxxxxx".parse().unwrap(),
+        );
+        let authorized = handle_mcp_post(
+            State(mcp.clone()),
+            headers.clone(),
+            None,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string(),
+        )
+        .await;
+        let authorized_json = response_json(authorized).await;
+        assert!(
+            authorized_json.get("error").is_none(),
+            "known bearer should authorize before revocation: {authorized_json}"
+        );
+
+        live_source.update(auth::PrincipalTable::test_fixture_with_class(
+            "observer-token-xxxxxxxxxxxxxxxxxx",
+            "test-operator",
+            auth::PrincipalClass::Observer,
+        ));
+        let revoked = handle_mcp_post(
+            State(mcp.clone()),
+            headers.clone(),
+            None,
+            r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}"#.to_string(),
+        )
+        .await;
+        let revoked_json = response_json(revoked).await;
+        assert_eq!(revoked_json["error"]["code"], -32000);
+        assert_eq!(revoked_json["error"]["message"], "unauthorized");
+
+        live_source.update(auth::PrincipalTable::test_fixture_disabled_token(
+            "test-token-xxxxxxxxxxxxxxxxxxxxx",
+            "test-operator",
+        ));
+        let disabled = handle_mcp_post(
+            State(mcp.clone()),
+            headers.clone(),
+            None,
+            r#"{"jsonrpc":"2.0","id":3,"method":"initialize","params":{}}"#.to_string(),
+        )
+        .await;
+        let disabled_json = response_json(disabled).await;
+        assert_eq!(disabled_json["error"]["code"], -32000);
+        assert_eq!(disabled_json["error"]["message"], "unauthorized");
+
+        live_source.update(auth::PrincipalTable::test_fixture_with_class(
+            "test-token-xxxxxxxxxxxxxxxxxxxxx",
+            "test-operator",
+            auth::PrincipalClass::Observer,
+        ));
+        let rescoped = handle_mcp_post(
+            State(mcp),
+            headers,
+            None,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}"#.to_string(),
+        )
+        .await;
+        let rescoped_json = response_json(rescoped).await;
+        assert!(
+            rescoped_json.get("error").is_none(),
+            "re-scoped bearer should remain valid with new class: {rescoped_json}"
+        );
+        let tools = rescoped_json["result"]["tools"]
+            .as_array()
+            .expect("tools/list result");
+        assert!(
+            !tools.iter().any(|tool| tool["name"] == "reports_get"),
+            "re-scoped Observer bearer must not retain reports.get capability"
+        );
     }
 
     /// R12 API-001 / AC-15: every error response MUST include the

@@ -190,9 +190,9 @@ async fn seed_execution_with_diagnostics(
 }
 
 fn mcp_execution_truth_report(payload: &serde_json::Value) -> &serde_json::Value {
-    payload
+    payload["reports"]
         .as_array()
-        .expect("payload must be array")
+        .expect("payload must have reports array")
         .iter()
         .find(|item| item["report_kind"] == "mcp_execution_truth")
         .expect("mcp_execution_truth report must be present")

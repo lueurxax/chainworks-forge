@@ -137,6 +137,9 @@ pub fn redact_for_journal(cmd: &Command, payload_json: &str) -> String {
         Command::KnowledgeCapsuleIgnore(_) => {
             // P064 Phase 0: preserve all frozen contract fields.
         }
+        Command::RetrofitCatalogSnapshot(_) => {
+            // Preserve typed repair fields. The free-form reason is operator audit material.
+        }
         Command::CancelRun(_) => {
             // §8.1: preserve all fields.
         }
@@ -213,8 +216,8 @@ mod tests {
         MainSyncRepairStateCmd, MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd,
         MainSyncTriggerReason, OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd, ResetSessionCmd,
         ResolveApprovalCmd, ResolveLeadMediationConfirmationCmd,
-        ResolveWorkflowConflictTransitionCmd, RetryStageCmd, RunStewardAnalysisCmd, StartRunCmd,
-        WorkflowLoopBudgetExtensionCmd,
+        ResolveWorkflowConflictTransitionCmd, RetrofitCatalogSnapshotCmd, RetryStageCmd,
+        RunStewardAnalysisCmd, StartRunCmd, WorkflowLoopBudgetExtensionCmd,
     };
     use domain::discovery::LegacyBroadDiscoveryPolicy;
     use domain::ids::{IdeaId, RunId, StageExecutionId};
@@ -413,6 +416,23 @@ mod tests {
         // structural fields still preserved
         assert_eq!(inner["run_id"], serde_json::json!(run_id));
         assert_eq!(inner["stage_id"], Value::String("state_7".into()));
+    }
+
+    #[test]
+    fn test_redact_catalog_snapshot_retrofit_preserves_guard_fields() {
+        let run_id = RunId::new();
+        let cmd = Command::RetrofitCatalogSnapshot(RetrofitCatalogSnapshotCmd {
+            run_id,
+            expected_catalog_snapshot_hash: "a".repeat(64),
+            reason: "operator-approved emergency retrofit".into(),
+            scope: Default::default(),
+        });
+        let original: Value = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+        let redacted = round_trip(&cmd);
+        assert_eq!(
+            original, redacted,
+            "RetrofitCatalogSnapshot audit payload must preserve hash guard and reason"
+        );
     }
 
     #[test]
@@ -641,6 +661,12 @@ mod tests {
                 stage_id: "state_3".into(),
                 idempotency_key: None,
             }),
+            Command::RetrofitCatalogSnapshot(RetrofitCatalogSnapshotCmd {
+                run_id: RunId::new(),
+                expected_catalog_snapshot_hash: "b".repeat(64),
+                reason: "operator-approved emergency retrofit".into(),
+                scope: Default::default(),
+            }),
         ];
 
         for cmd in &samples {
@@ -672,6 +698,7 @@ mod tests {
                 Command::MainSyncRepairState(_) => {}
                 Command::MainSyncRecordRecoveryDecision(_) => {}
                 Command::KnowledgeCapsuleIgnore(_) => {}
+                Command::RetrofitCatalogSnapshot(_) => {}
                 Command::CancelRun(_) => {}
                 Command::ResetSession(_) => {}
                 Command::RunStewardAnalysis(_) => {}

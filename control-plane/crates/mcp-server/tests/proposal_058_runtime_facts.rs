@@ -397,7 +397,7 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
     .await
     .unwrap();
 
-    let canonical = payload
+    let canonical = payload["reports"]
         .as_array()
         .unwrap()
         .iter()
@@ -468,7 +468,7 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
     )
     .await
     .unwrap();
-    let observer_canonical = observer_payload
+    let observer_canonical = observer_payload["reports"]
         .as_array()
         .unwrap()
         .iter()
@@ -484,7 +484,6 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
         Arc::new(make_command_handler(pool.clone())),
         auth::PrincipalTable::test_fixture(),
     );
-    // HIGH-001: report:// exposes execution evidence; Operator-only.
     let resource_response = server
         .handle_request(
             JsonRpcRequest {
@@ -498,7 +497,6 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
             &auth::Principal::new("operator", auth::PrincipalClass::Operator),
         )
         .await;
-    // HIGH-001: report:// is Operator-only; Observer must be denied.
     let observer_server = McpServer::new(
         pool.clone(),
         Arc::new(make_command_handler(pool.clone())),
@@ -516,8 +514,20 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
         )
         .await;
     assert!(
-        observer_resource_response.error.is_some(),
-        "Observer must NOT be able to read report:// (HIGH-001 regression)"
+        observer_resource_response.error.is_none(),
+        "Observer report:// read should succeed with redacted payload: {:?}",
+        observer_resource_response.error
+    );
+    let observer_resource_text = observer_resource_response.result.as_ref().unwrap()["contents"][0]
+        ["text"]
+        .as_str()
+        .expect("observer resource text");
+    let observer_resource_payload: serde_json::Value =
+        serde_json::from_str(observer_resource_text).unwrap();
+    assert_eq!(
+        observer_resource_payload["agent_executions"][0]["runtime_facts"]["failure_kind_raw_debug"],
+        serde_json::Value::Null,
+        "Observer report:// payload must redact raw runtime facts"
     );
 
     assert!(
@@ -592,7 +602,7 @@ async fn proposal_053_reports_get_projects_discovery_reconciliation_pending() {
     .await
     .unwrap();
 
-    let canonical = payload
+    let canonical = payload["reports"]
         .as_array()
         .unwrap()
         .iter()

@@ -56,7 +56,7 @@ RUST_LOG=info,acp=debug \
 
 Connect Claude Code to the running daemon as an MCP server via `.mcp.json` at repo root (`"type": "http"`, `"url": "http://127.0.0.1:4000/mcp"`).
 
-The daemon requires a bearer token for MCP auth (P029). On first start, it auto-creates `~/.chainworks/auth/principals.json` with a default operator token and logs it at `info` level. Set `CHAINWORKS_MCP_TOKEN=<token>` in your shell environment before connecting. The `.mcp.json` already includes the `Authorization: Bearer ${CHAINWORKS_MCP_TOKEN}` header.
+The daemon requires a bearer token for MCP auth (P029). On first start, it auto-creates `~/.chainworks/auth/principals.json` with a default operator token and logs only the path with a redacted note; read the raw token from the principals file. Set `CHAINWORKS_MCP_TOKEN=<token>` in your shell environment before connecting. The `.mcp.json` already includes the `Authorization: Bearer ${CHAINWORKS_MCP_TOKEN}` header.
 
 ## Architecture: big picture
 
@@ -81,18 +81,20 @@ ACP transport lives in the Rust control plane:
 
 ### Rust control-plane (parity replica)
 
-8-crate workspace at `control-plane/crates/`:
+9-crate workspace at `control-plane/crates/`:
 
 ```
 daemon ─┬─► graphql-server ─┐
         ├─► mcp-server      ├─► engine ─┬─► db ─► SQLite (WAL, projections, work queue)
+        │                   │           ├─► auth ─► principal table + boundary caller class
         │                   │           └─► acp ─► ACP subprocess adapters
         │                   └─► workflow ─► YAML compiler (runs & agent catalogs)
         └─► (single binary, both northbound servers on :4000)
 ```
 
 - `domain` — IDs, enums, command/event types (no I/O), mediation types
-- `db` — SQLite repos + projection rebuild logic; owner-aware `agent_executions` migration; 3 migrations; WAL mode for concurrent reads
+- `db` — SQLite repos + projection rebuild logic, versioned migrations, WAL mode for concurrent reads, work queue, and projection metadata
+- `auth` — bearer principals, principal-table loading, caller-class derivation, and shared boundary authorization helpers
 - `workflow` — parses `examples/workflows/*.yaml` + `examples/agents/*.yaml`, builds `RunPlan` with resolved `ResolvedAgent { provider, model, effort, prompt }`
 - `engine` — `Orchestrator` (state machine), `BackgroundExecutor` (work-queue worker), `CommandHandler` (writes to `command_journal`), `MediationSettlementService`, `RecoveryService`
 - `acp` — JSON-RPC 2.0 ndjson transport with permission auto-grant, 5 provider adapters

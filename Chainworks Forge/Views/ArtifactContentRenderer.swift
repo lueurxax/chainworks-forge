@@ -7,32 +7,11 @@ nonisolated enum ArtifactRenderProvenance: Equatable {
     case artifactBacked
     case explicit
 }
-
 nonisolated struct ArtifactRenderContext: Equatable {
     let format: ArtifactFormat
     let artifactName: String?
     let localRoots: [URL]
     let provenance: ArtifactRenderProvenance
-
-    static func artifactBacked(artifact: Artifact, run: Run? = nil) -> ArtifactRenderContext {
-        var roots: [URL] = [
-            URL(fileURLWithPath: artifact.filePath).deletingLastPathComponent()
-        ]
-        if let run {
-            if !run.artifactRoot.isEmpty {
-                roots.append(URL(fileURLWithPath: run.artifactRoot, isDirectory: true))
-            }
-            if !run.workspaceRoot.isEmpty {
-                roots.append(URL(fileURLWithPath: run.workspaceRoot, isDirectory: true))
-            }
-        }
-        return ArtifactRenderContext(
-            format: artifact.format,
-            artifactName: artifact.name,
-            localRoots: deduplicatedRoots(roots),
-            provenance: .artifactBacked
-        )
-    }
 
     static func explicit(format: ArtifactFormat, localRoots: [URL] = []) -> ArtifactRenderContext {
         ArtifactRenderContext(
@@ -1700,57 +1679,6 @@ struct DiffArtifactView: View {
     }
 }
 
-struct WorkflowRunArtifactSnapshot {
-    let latestArtifacts: [Artifact]
-    let approvalContextArtifacts: [Artifact]
-    let latestDebugArtifacts: [Artifact]
-
-    init(artifacts: [Artifact]) {
-        let visibleArtifacts = artifacts.filter { $0.reportKind != "immutable_history" }
-        self.latestArtifacts = visibleArtifacts.sorted { lhs, rhs in
-            if lhs.name == "final_feature_report" && rhs.name != "final_feature_report" {
-                return true
-            }
-            if rhs.name == "final_feature_report" && lhs.name != "final_feature_report" {
-                return false
-            }
-            return lhs.createdAt > rhs.createdAt
-        }
-
-        self.approvalContextArtifacts = visibleArtifacts
-            .filter { artifact in
-                artifact.name == "proposal_review_summary" || artifact.name == "proposal_current"
-            }
-            .reduce(into: [String: Artifact]()) { latestByName, artifact in
-                if let current = latestByName[artifact.name], current.createdAt >= artifact.createdAt {
-                    return
-                }
-                latestByName[artifact.name] = artifact
-            }
-            .values
-            .sorted { lhs, rhs in
-                Self.approvalContextRank(lhs.name) < Self.approvalContextRank(rhs.name)
-            }
-
-        self.latestDebugArtifacts = visibleArtifacts
-            .filter { artifact in
-                artifact.name.contains("transcript") || artifact.name.contains("receipt")
-            }
-            .sorted { $0.createdAt > $1.createdAt }
-    }
-
-    private static func approvalContextRank(_ name: String) -> Int {
-        switch name {
-        case "proposal_review_summary":
-            return 0
-        case "proposal_current":
-            return 1
-        default:
-            return 2
-        }
-    }
-}
-
 enum ArtifactInspectorSkillTruthFormatter {
     static func compactSummary(_ summary: String) -> String? {
         let compacted = summary
@@ -1761,40 +1689,5 @@ enum ArtifactInspectorSkillTruthFormatter {
         let maxLength = 221
         guard compacted.count > maxLength else { return compacted }
         return String(compacted.prefix(maxLength - 1)) + "…"
-    }
-}
-
-enum ArtifactInspectorTraceabilityResolver {
-    static func downstreamConsumers(
-        artifact: Artifact,
-        run: Run,
-        modelContext: ModelContext
-    ) -> [AgentExecution] {
-        let runID = run.id
-        let descriptor = FetchDescriptor<StageExecution>()
-        guard let stages = try? modelContext.fetch(descriptor) else { return [] }
-
-        return stages
-            .filter { $0.run?.id == runID }
-            .flatMap { stage in stage.agentExecutions }
-            .filter { execution in
-                guard let data = execution.inputBindingsJSON,
-                      let bindings = try? JSONDecoder().decode([InputBinding].self, from: data)
-                else { return false }
-                return bindings.contains { binding in
-                    binding.artifactName == artifact.name && binding.producingAgentID == artifact.agentID
-                }
-            }
-    }
-}
-
-enum RunReportSupersedence {
-    static func notice(for artifact: Artifact, run: Run) -> String? {
-        guard artifact.reportKind == "immutable_history",
-              let reportVersion = artifact.reportVersion,
-              reportVersion < run.latestReportVersion
-        else { return nil }
-
-        return "This immutable run report was superseded after the run continued to version \(run.latestReportVersion)."
     }
 }

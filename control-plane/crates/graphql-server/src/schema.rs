@@ -938,6 +938,7 @@ async fn require_graphql_read(
     // P081 Phase 3: evaluate BoundaryPolicy for ALL callers including Operators.
     // In shadow mode decisions are logged but not enforced; in legacy_compat mode
     // the legacy P072 guards below remain authoritative.
+    let mut boundary_allow_row_id: Option<String> = None;
     if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
         let started = std::time::Instant::now();
         let decision = policy.evaluate(caller_class.as_str(), "graphql_query", action);
@@ -959,10 +960,7 @@ async fn require_graphql_read(
                     None,
                     policy.mode().as_str(),
                 );
-                return Ok(GraphqlReadAuthorization {
-                    caller_class: caller_class.as_str().to_string(),
-                    row_id,
-                });
+                boundary_allow_row_id = row_id;
             }
             auth::boundary::PolicyDecision::Deny {
                 reason_code,
@@ -1083,10 +1081,7 @@ async fn require_graphql_read(
                             None,
                             policy.mode().as_str(),
                         );
-                        return Ok(GraphqlReadAuthorization {
-                            caller_class: caller_class.as_str().to_string(),
-                            row_id,
-                        });
+                        boundary_allow_row_id = row_id;
                     }
                     _ => {}
                 }
@@ -1128,31 +1123,35 @@ async fn require_graphql_read(
     }
 
     // P072: enforce allow_queries surface policy when present.
-    if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
+    if let Some(allowed) = auth::is_query_allowed_by_principal_surface_policy(principal) {
+        if !allowed {
+            // MEDIUM-001: best-effort audit for P072 surface-policy denials.
+            if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
+                let caller_class = auth::derive_caller_class(principal);
+                write_graphql_legacy_deny_audit(
+                    ctx,
+                    principal,
+                    "graphql_query",
+                    "query",
+                    "CAPABILITY_OUT_OF_SCOPE",
+                    None,
+                    caller_class.as_str(),
+                    &policy,
+                )
+                .await;
+            }
+            return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
+        }
+    } else if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
         if let Some(allowed) = auth::is_query_allowed_by_surface_policy(table, &principal.id) {
             if !allowed {
-                // MEDIUM-001: best-effort audit for P072 surface-policy denials.
-                if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
-                    let caller_class = auth::derive_caller_class(principal);
-                    write_graphql_legacy_deny_audit(
-                        ctx,
-                        principal,
-                        "graphql_query",
-                        "query",
-                        "CAPABILITY_OUT_OF_SCOPE",
-                        None,
-                        caller_class.as_str(),
-                        &policy,
-                    )
-                    .await;
-                }
                 return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
             }
         }
     }
     Ok(GraphqlReadAuthorization {
         caller_class: caller_class.as_str().to_string(),
-        row_id: None,
+        row_id: boundary_allow_row_id,
     })
 }
 
@@ -1287,28 +1286,26 @@ async fn require_subscription_read(ctx: &Context<'_>) -> Result<()> {
         return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
     }
 
-    // P081 fix: subscriptions must check allow_subscriptions, not allow_queries.
-    if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
-        if let Some(allowed) = auth::is_subscription_allowed_by_surface_policy(table, &principal.id)
-        {
-            if !allowed {
-                // MEDIUM-001: best-effort audit for P072 surface-policy subscription denials.
-                if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
-                    let caller_class = auth::derive_caller_class(principal);
-                    write_graphql_legacy_deny_audit(
-                        ctx,
-                        principal,
-                        "graphql_subscription",
-                        "subscription",
-                        "CAPABILITY_OUT_OF_SCOPE",
-                        None,
-                        caller_class.as_str(),
-                        &policy,
-                    )
-                    .await;
-                }
-                return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
+    // P081 fix: subscriptions must check the live-resolved Principal's
+    // allow_subscriptions policy, not the daemon startup PrincipalTable.
+    if let Some(allowed) = auth::is_subscription_allowed_by_principal_surface_policy(principal) {
+        if !allowed {
+            // MEDIUM-001: best-effort audit for P072 surface-policy subscription denials.
+            if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
+                let caller_class = auth::derive_caller_class(principal);
+                write_graphql_legacy_deny_audit(
+                    ctx,
+                    principal,
+                    "graphql_subscription",
+                    "subscription",
+                    "CAPABILITY_OUT_OF_SCOPE",
+                    None,
+                    caller_class.as_str(),
+                    &policy,
+                )
+                .await;
             }
+            return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
         }
     }
     Ok(())
@@ -1413,6 +1410,9 @@ async fn enrich_run_with_artifact_contracts(
             .await?
             .map(|check| Json(check.operator_readback_json_for_lane("graphql")));
     gql.side_effect_readback_json = Some(Json(side_effect_readback_json(pool, run_id).await?));
+    gql.p094_boundary_readback_json = Some(Json(
+        db::repos::artifact_contracts::p094_readback_json(pool, run_id).await?,
+    ));
     let code_writer_completion_readbacks =
         code_writer_completion_receipts::list_by_run(pool, run_id).await?;
     let canonical_code_writer_completion_readbacks =
@@ -1677,6 +1677,8 @@ fn p036_topology_nodes(
                 is_current: p036_is_current_stage(run, &stage_id, latest),
                 iteration: latest.map(|row| row.iteration),
                 attempt_number: latest.map(|row| row.attempt_number),
+                started_at: latest.map(|row| row.started_at.clone()),
+                completed_at: latest.and_then(|row| row.completed_at.clone()),
                 approval_required: state.is_manual_gate
                     || latest.is_some_and(|row| row.has_pending_approval),
                 artifact_count: artifacts_by_stage_id.get(&stage_id).copied().unwrap_or(0),
@@ -4199,6 +4201,15 @@ async fn mutation_allowed(
         }
     }
 
+    if let Some(allowed) =
+        auth::is_mutation_allowed_by_principal_surface_policy(principal, mutation.graphql_name())
+    {
+        if !(allowed && principal.class == auth::PrincipalClass::Operator) {
+            return Err(boundary_denial_error("NON_APPROVAL_MUTATION", None, None));
+        }
+        return Ok(());
+    }
+
     if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
         if let Some(allowed) = auth::is_mutation_allowed_by_surface_policy(
             table,
@@ -4868,13 +4879,10 @@ impl SubscriptionRoot {
         if principal.class != auth::PrincipalClass::Operator {
             return Err(Error::new("forbidden"));
         }
-        if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
-            if let Some(allowed) =
-                auth::is_subscription_allowed_by_surface_policy(table, &principal.id)
-            {
-                if !allowed {
-                    return Err(Error::new("forbidden"));
-                }
+        if let Some(allowed) = auth::is_subscription_allowed_by_principal_surface_policy(principal)
+        {
+            if !allowed {
+                return Err(Error::new("forbidden"));
             }
         }
         let p046 = ctx.data::<P046Config>()?;
@@ -5838,6 +5846,7 @@ mod tests {
     use engine::event_bus;
     use engine::work_queue::WorkQueue;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -11528,6 +11537,122 @@ mod tests {
         let table = auth::PrincipalTable::load_or_bootstrap(file.path()).unwrap();
         let principal = auth::resolve_bearer("legacy-agent-token", &table).unwrap();
         (table, principal)
+    }
+
+    fn p072_query_policy_table(
+        token: &str,
+        id: &str,
+        class: auth::PrincipalClass,
+        allow_queries: bool,
+    ) -> (auth::PrincipalTable, auth::Principal) {
+        let class_name = match class {
+            auth::PrincipalClass::Operator => "operator",
+            auth::PrincipalClass::Agent => "agent",
+            auth::PrincipalClass::Observer => "observer",
+        };
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("principals.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{
+                  "schema_version": 3,
+                  "principals": [
+                    {{
+                      "token": "{token}",
+                      "id": "{id}",
+                      "class": "{class_name}",
+                      "surface_policies": {{
+                        "graphql": {{
+                          "allow_queries": {allow_queries},
+                          "allow_subscriptions": true,
+                          "allowed_mutations": ["approveApproval", "rejectApproval"]
+                        }},
+                        "mcp": {{
+                          "allowed_tools": []
+                        }}
+                      }}
+                    }}
+                  ]
+                }}"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let table = auth::PrincipalTable::load_or_bootstrap(&path).unwrap();
+        let principal = auth::resolve_bearer(token, &table).unwrap();
+        (table, principal)
+    }
+
+    #[tokio::test]
+    async fn test_graphql_boundary_allow_still_honors_live_query_denial() {
+        for mode in [
+            auth::boundary::PolicyMode::Shadow,
+            auth::boundary::PolicyMode::Enforce,
+        ] {
+            let pool = test_pool().await;
+            let (principal_table, principal) = p072_query_policy_table(
+                "query-denied-operator-token-xxxxxxxx",
+                "query-denied-operator",
+                auth::PrincipalClass::Operator,
+                false,
+            );
+            let schema = build_schema_inner(
+                pool.clone(),
+                make_command_handler(pool),
+                event_bus::new_bus(64),
+                principal_table,
+                test_reporter(),
+                None,
+                Some(Arc::new(
+                    auth::boundary::BoundaryPolicy::from_embedded_with_mode(mode.clone()).unwrap(),
+                )),
+            );
+
+            let response = schema
+                .execute(Request::new("{ daemonStatus { state } }").data(principal))
+                .await;
+            assert!(
+                !response.errors.is_empty(),
+                "allow_queries=false must deny operator reads after BoundaryPolicy {mode:?} allow: {response:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_graphql_observer_opt_in_still_honors_live_query_denial() {
+        for mode in [
+            auth::boundary::PolicyMode::Shadow,
+            auth::boundary::PolicyMode::Enforce,
+        ] {
+            let pool = test_pool().await;
+            let (principal_table, principal) = p072_query_policy_table(
+                "query-denied-observer-token-xxxxxxxx",
+                "query-denied-observer",
+                auth::PrincipalClass::Observer,
+                false,
+            );
+            let schema = build_schema_inner(
+                pool.clone(),
+                make_command_handler(pool),
+                event_bus::new_bus(64),
+                principal_table,
+                test_reporter(),
+                None,
+                Some(Arc::new(
+                    auth::boundary::BoundaryPolicy::from_embedded_with_mode(mode.clone()).unwrap(),
+                )),
+            );
+
+            let response = schema
+                .execute(Request::new("{ operatorAlerts { id } }").data(principal))
+                .await;
+            assert!(
+                !response.errors.is_empty(),
+                "allow_queries=false must deny observer opt-in reads after BoundaryPolicy {mode:?} allow: {response:?}"
+            );
+        }
     }
 
     #[tokio::test]

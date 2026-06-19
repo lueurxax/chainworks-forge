@@ -2400,6 +2400,56 @@ async fn test_projection_pending_approvals_uses_canonical_approvals_when_summary
     assert!(found.projection_lag);
 }
 
+#[tokio::test]
+async fn cancelled_run_pending_approval_is_not_actionable_in_projection_or_inbox() {
+    let pool = test_pool().await;
+
+    let run_id = insert_p017_run(&pool).await;
+    let requested_at = Utc::now();
+    let approval = Approval {
+        id: ApprovalId::new(),
+        run_id,
+        stage_id: "manual_release".into(),
+        decision: ApprovalDecision::Requested,
+        requested_at,
+        decided_at: None,
+        comment: None,
+        expires_at: None,
+    };
+    approvals::insert(&pool, &approval).await.unwrap();
+    runs::mark_cancelled(&pool, run_id, requested_at)
+        .await
+        .unwrap();
+
+    projections::rebuild_all_for_run(&pool, run_id)
+        .await
+        .unwrap();
+
+    let found = projections::find_run_projection(&pool, &run_id.to_string())
+        .await
+        .unwrap()
+        .expect("cancelled run projection");
+    assert_eq!(found.status, "cancelled");
+    assert_eq!(
+        found.pending_approvals, 0,
+        "pending approvals on cancelled runs are not actionable"
+    );
+
+    let inbox = projections::list_pending_inbox_projection(&pool)
+        .await
+        .unwrap();
+    assert!(
+        inbox.is_empty(),
+        "cancelled run approvals must not remain in the operator inbox"
+    );
+
+    let pending = approvals::list_pending(&pool).await.unwrap();
+    assert!(
+        pending.is_empty(),
+        "MCP approvals.list canonical read must also exclude cancelled runs"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // File-backed SQLite durability proof (REQ-002 / READY-001)
 //

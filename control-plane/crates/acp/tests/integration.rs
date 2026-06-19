@@ -568,6 +568,117 @@ sys.exit(0)
         script.to_string_lossy().into_owned()
     }
 
+    /// Write a fixture ACP server whose parent exits during `session/prompt`
+    /// while a forked child keeps stdout open. This simulates provider trees
+    /// where the adapter subprocess is a zombie, but inherited pipes prevent
+    /// the transport reader from observing EOF.
+    pub fn create_prompt_parent_exit_with_stdout_holder_script(
+        tmpdir: &std::path::Path,
+        holder_pid_path: &std::path::Path,
+    ) -> String {
+        let script = tmpdir.join("acp_prompt_parent_exit_stdout_holder.py");
+        let holder_pid = holder_pid_path.to_string_lossy();
+        let code = format!(
+            r#"#!/usr/bin/env python3
+import sys, json, os, time
+
+HOLDER_PID = {holder_pid:?}
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"protocolVersion": 1}}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"sessionId": "fixture-parent-exit"}}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+
+pid = os.fork()
+if pid == 0:
+    with open(HOLDER_PID, "w") as f:
+        f.write(str(os.getpid()))
+    time.sleep(30)
+    os._exit(0)
+
+os._exit(42)
+"#
+        );
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    /// Write a fixture ACP server whose parent exits before responding to
+    /// `initialize` while a forked child keeps stdout open. This exercises the
+    /// startup/handshake liveness path before a provider session id exists.
+    pub fn create_initialize_parent_exit_with_stdout_holder_script(
+        tmpdir: &std::path::Path,
+        holder_pid_path: &std::path::Path,
+    ) -> String {
+        let script = tmpdir.join("acp_initialize_parent_exit_stdout_holder.py");
+        let holder_pid = holder_pid_path.to_string_lossy();
+        let code = format!(
+            r#"#!/usr/bin/env python3
+import sys, json, os, time
+
+HOLDER_PID = {holder_pid:?}
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+
+pid = os.fork()
+if pid == 0:
+    with open(HOLDER_PID, "w") as f:
+        f.write(str(os.getpid()))
+    time.sleep(30)
+    os._exit(0)
+
+os._exit(42)
+"#
+        );
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
     /// Write a fixture ACP server script that overwrites a pre-existing
     /// canonical output file instead of creating a brand-new one.
     pub fn create_overwrite_script(tmpdir: &std::path::Path) -> String {
@@ -1001,6 +1112,149 @@ send({
 })
 
 send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn", "sessionId": session_id}})
+sys.exit(0)
+"#;
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    /// Write a Codex-like fixture that records a native session-store
+    /// task_complete event containing CHAINWORKS_OUTPUT, then exits without
+    /// sending a terminal ACP session/prompt response.
+    pub fn create_codex_task_complete_without_terminal_script(tmpdir: &std::path::Path) -> String {
+        let script = tmpdir.join("acp_codex_task_complete_without_terminal.py");
+        let code = r#"#!/usr/bin/env python3
+import sys, json, os
+from pathlib import Path
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": 1}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+cwd = msg.get("params", {}).get("cwd", "/tmp")
+session_id = "codex-fixture-session-store-terminal"
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": session_id}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+
+target_path = os.path.join(cwd, "audit", "proposal-vs-implementation.json")
+payload = {
+    "CHAINWORKS_OUTPUT": {
+        target_path: {
+            "status": "needs_code_fixes",
+            "matches_proposal": False,
+            "missing_items": []
+        }
+    }
+}
+session_line = {
+    "timestamp": "2026-05-31T08:30:25.238Z",
+    "type": "event_msg",
+    "payload": {
+        "type": "task_complete",
+        "turn_id": "turn-1",
+        "last_agent_message": json.dumps(payload, separators=(",", ":"))
+    }
+}
+session_path = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "05" / "31" / "rollout.jsonl"
+session_path.parent.mkdir(parents=True, exist_ok=True)
+session_path.write_text(json.dumps(session_line) + "\n")
+
+sys.exit(0)
+"#;
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    /// Write a Codex-like fixture that returns a generic JSON-RPC prompt
+    /// error after recording the real credits-exhausted signal in the native
+    /// Codex session store.
+    pub fn create_codex_credits_exhausted_prompt_error_script(tmpdir: &std::path::Path) -> String {
+        let script = tmpdir.join("acp_codex_credits_exhausted_prompt_error.py");
+        let code = r#"#!/usr/bin/env python3
+import sys, json, os
+from pathlib import Path
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": 1}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+session_id = "codex-fixture-credits-exhausted"
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": session_id}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+
+session_line = {
+    "timestamp": "2026-06-15T08:00:00.000Z",
+    "type": "event_msg",
+    "payload": {
+        "type": "token_count",
+        "rate_limits": {
+            "credits": {
+                "has_credits": False,
+                "balance": 0,
+                "unlimited": False,
+                "limit_id": "codex-free-tier"
+            }
+        }
+    }
+}
+session_path = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "06" / "15" / "credits.jsonl"
+session_path.parent.mkdir(parents=True, exist_ok=True)
+session_path.write_text(json.dumps(session_line) + "\n")
+
+send({"jsonrpc": "2.0", "id": msg["id"],
+      "error": {"code": -32603, "message": "Internal error"}})
 sys.exit(0)
 "#;
         std::fs::write(&script, code).unwrap();
@@ -1455,7 +1709,33 @@ sys.exit(0)
 }
 
 #[cfg(unix)]
+fn canonical_tempdir_path(tmp: &tempfile::TempDir) -> String {
+    tmp.path()
+        .canonicalize()
+        .unwrap_or_else(|_| tmp.path().to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(unix)]
+fn python3_fixture_command() -> String {
+    if let Ok(path) = std::env::var("CHAINWORKS_TEST_PYTHON3") {
+        return path;
+    }
+    [
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+        "/usr/bin/python3",
+    ]
+    .into_iter()
+    .find(|candidate| std::path::Path::new(candidate).is_file())
+    .unwrap_or("/usr/bin/python3")
+    .to_string()
+}
+
+#[cfg(unix)]
 fn brokered_xcode_request(tmp: &tempfile::TempDir, provider: &str) -> acp::ExecutionRequest {
+    let workspace_root = canonical_tempdir_path(tmp);
     acp::ExecutionRequest {
         run_id: domain::ids::RunId::new(),
         stage_execution_id: None,
@@ -1466,7 +1746,7 @@ fn brokered_xcode_request(tmp: &tempfile::TempDir, provider: &str) -> acp::Execu
         provider: provider.into(),
         model: None,
         effort: None,
-        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        workspace_root,
         prompt: "use xcode".into(),
         worktree_root: None,
         worktree_write_enabled: false,
@@ -1477,6 +1757,7 @@ fn brokered_xcode_request(tmp: &tempfile::TempDir, provider: &str) -> acp::Execu
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: vec![acp::AcpMcpServerPayload {
             id: "xcode-broker".into(),
             extension_id: "xcode".into(),
@@ -1536,7 +1817,12 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
         model: None,
         effort: None,
         // workspace_root == cwd the fixture receives; it creates result.json there
-        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        workspace_root: tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf())
+            .to_string_lossy()
+            .into_owned(),
         prompt: "test prompt".into(),
         worktree_root: None,
         worktree_write_enabled: false,
@@ -1547,6 +1833,7 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -1613,7 +1900,12 @@ async fn test_claude_adapter_legacy_broad_discovery_ignores_preexisting_files_on
         provider: "claude".into(),
         model: None,
         effort: None,
-        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        workspace_root: tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf())
+            .to_string_lossy()
+            .into_owned(),
         prompt: "test prompt".into(),
         worktree_root: None,
         worktree_write_enabled: false,
@@ -1624,6 +1916,7 @@ async fn test_claude_adapter_legacy_broad_discovery_ignores_preexisting_files_on
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -1675,7 +1968,12 @@ async fn test_claude_adapter_keeps_legacy_broad_discovery_disabled_by_default() 
         provider: "claude".into(),
         model: None,
         effort: None,
-        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        workspace_root: tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf())
+            .to_string_lossy()
+            .into_owned(),
         prompt: "test prompt".into(),
         worktree_root: None,
         worktree_write_enabled: false,
@@ -1686,6 +1984,7 @@ async fn test_claude_adapter_keeps_legacy_broad_discovery_disabled_by_default() 
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -1753,6 +2052,7 @@ async fn p053_manual_reference_workspace_pre_initialize_latency() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -1817,6 +2117,7 @@ async fn mcp_servers_session_new_serialization_tests() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: vec![AcpMcpServerPayload {
             id: "fs-runtime".into(),
             extension_id: "filesystem".into(),
@@ -1885,6 +2186,7 @@ async fn http_mcp_servers_session_new_serialization_tests() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: vec![AcpMcpServerPayload {
             id: "xcode-broker".into(),
             extension_id: "xcode".into(),
@@ -1959,6 +2261,7 @@ async fn transport_sends_set_mode_after_session_new_when_configured() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -2029,6 +2332,7 @@ async fn transport_fails_when_required_config_option_is_rejected() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -2098,6 +2402,7 @@ async fn transport_resolves_required_model_alias_from_session_config_options() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -2155,6 +2460,7 @@ async fn adapter_launch_and_session_specs_are_prepared_separately() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -2261,6 +2567,7 @@ async fn launch_resources_are_cleaned_when_spawn_fails() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -2547,7 +2854,7 @@ async fn xcode_mcp_bridge_pool_resolves_target_snapshot_before_reserving_lease()
     }
 
     let tmp = tempfile::tempdir().unwrap();
-    let workspace = tmp.path().to_string_lossy().into_owned();
+    let workspace = canonical_tempdir_path(&tmp);
     let host = HostProbeContext {
         expected_gui_uid: Some(501),
         operator_home: Some("/Users/gui".to_string()),
@@ -2693,7 +3000,7 @@ async fn xcode_mcp_bridge_pool_closes_drifted_pid_and_targets_refreshed_snapshot
     }
 
     let tmp = tempfile::tempdir().unwrap();
-    let workspace = tmp.path().to_string_lossy().into_owned();
+    let workspace = canonical_tempdir_path(&tmp);
     let host = HostProbeContext {
         expected_gui_uid: Some(501),
         operator_home: Some("/Users/gui".to_string()),
@@ -2849,7 +3156,7 @@ async fn xcode_mcp_bridge_pool_serializes_initialize_per_xcode_pid() {
     }
 
     let tmp = tempfile::tempdir().unwrap();
-    let workspace = tmp.path().to_string_lossy().into_owned();
+    let workspace = canonical_tempdir_path(&tmp);
     let host = HostProbeContext {
         expected_gui_uid: Some(501),
         operator_home: Some("/Users/gui".to_string()),
@@ -3006,7 +3313,7 @@ async fn xcode_mcp_bridge_pool_records_action_required_after_initialize_lock_wai
     }
 
     let tmp = tempfile::tempdir().unwrap();
-    let workspace = tmp.path().to_string_lossy().into_owned();
+    let workspace = canonical_tempdir_path(&tmp);
     let host = HostProbeContext {
         expected_gui_uid: Some(501),
         operator_home: Some("/Users/gui".to_string()),
@@ -3168,7 +3475,7 @@ async fn xcode_mcp_bridge_pool_records_action_required_during_slow_tools_list() 
     }
 
     let tmp = tempfile::tempdir().unwrap();
-    let workspace = tmp.path().to_string_lossy().into_owned();
+    let workspace = canonical_tempdir_path(&tmp);
     let host = HostProbeContext {
         expected_gui_uid: Some(501),
         operator_home: Some("/Users/gui".to_string()),
@@ -3309,7 +3616,7 @@ async fn xcode_mcp_bridge_pool_times_out_backend_request_after_action_required_b
     }
 
     let tmp = tempfile::tempdir().unwrap();
-    let workspace = tmp.path().to_string_lossy().into_owned();
+    let workspace = canonical_tempdir_path(&tmp);
     let host = HostProbeContext {
         expected_gui_uid: Some(501),
         operator_home: Some("/Users/gui".to_string()),
@@ -3457,7 +3764,7 @@ for line in sys.stdin:
         std::fs::set_permissions(&backend_script, permissions).unwrap();
     }
 
-    let workspace = tmp.path().to_string_lossy().into_owned();
+    let workspace = canonical_tempdir_path(&tmp);
     let host = HostProbeContext {
         expected_gui_uid: Some(501),
         operator_home: Some("/Users/gui".to_string()),
@@ -3475,8 +3782,8 @@ for line in sys.stdin:
         }],
     };
     let backend = Arc::new(XcodeMcpProcessBackend::new(XcodeMcpProcessBackendConfig {
-        command: backend_script.to_string_lossy().into_owned(),
-        args: Vec::new(),
+        command: python3_fixture_command(),
+        args: vec![backend_script.to_string_lossy().into_owned()],
         request_timeout: Duration::from_secs(15),
     }));
     let pool = XcodeMcpBridgePool::new_with_sink_and_backend(
@@ -3603,7 +3910,7 @@ for line in sys.stdin:
         std::fs::set_permissions(&backend_script, permissions).unwrap();
     }
 
-    let workspace = tmp.path().to_string_lossy().into_owned();
+    let workspace = canonical_tempdir_path(&tmp);
     let host = HostProbeContext {
         expected_gui_uid: Some(501),
         operator_home: Some("/Users/gui".to_string()),
@@ -3621,8 +3928,9 @@ for line in sys.stdin:
         }],
     };
     let backend = Arc::new(XcodeMcpProcessBackend::new(XcodeMcpProcessBackendConfig {
-        command: backend_script.to_string_lossy().into_owned(),
+        command: python3_fixture_command(),
         args: vec![
+            backend_script.to_string_lossy().into_owned(),
             spawn_count_path.to_string_lossy().into_owned(),
             request_log.to_string_lossy().into_owned(),
         ],
@@ -3823,7 +4131,7 @@ for line in sys.stdin:
         std::fs::set_permissions(&backend_script, permissions).unwrap();
     }
 
-    let workspace = tmp.path().to_string_lossy().into_owned();
+    let workspace = canonical_tempdir_path(&tmp);
     let host = HostProbeContext {
         expected_gui_uid: Some(501),
         operator_home: Some("/Users/gui".to_string()),
@@ -3841,8 +4149,11 @@ for line in sys.stdin:
         }],
     };
     let backend = Arc::new(XcodeMcpProcessBackend::new(XcodeMcpProcessBackendConfig {
-        command: backend_script.to_string_lossy().into_owned(),
-        args: vec![notification_log.to_string_lossy().into_owned()],
+        command: python3_fixture_command(),
+        args: vec![
+            backend_script.to_string_lossy().into_owned(),
+            notification_log.to_string_lossy().into_owned(),
+        ],
         request_timeout: Duration::from_secs(15),
     }));
     let pool = XcodeMcpBridgePool::new_with_sink_and_backend(
@@ -3950,7 +4261,7 @@ async fn xcode_mcp_bridge_pool_warmup_runs_full_handshake_before_provider_receiv
     }
 
     let tmp = tempfile::tempdir().unwrap();
-    let workspace = tmp.path().to_string_lossy().into_owned();
+    let workspace = canonical_tempdir_path(&tmp);
     let host = HostProbeContext {
         expected_gui_uid: Some(501),
         operator_home: Some("/Users/gui".to_string()),
@@ -4034,7 +4345,7 @@ async fn xcode_mcp_bridge_pool_warmup_refreshes_first_connect_deadline() {
     }
 
     let tmp = tempfile::tempdir().unwrap();
-    let workspace = tmp.path().to_string_lossy().into_owned();
+    let workspace = canonical_tempdir_path(&tmp);
     let host = HostProbeContext {
         expected_gui_uid: Some(501),
         operator_home: Some("/Users/gui".to_string()),
@@ -4077,7 +4388,10 @@ async fn xcode_mcp_bridge_pool_warmup_refreshes_first_connect_deadline() {
         .unwrap();
 
     assert!(
-        pool.cleanup_first_connect_timeouts().await.unwrap().is_empty(),
+        pool.cleanup_first_connect_timeouts()
+            .await
+            .unwrap()
+            .is_empty(),
         "successful broker warmup must not leave the reserved lease expired before provider session/new"
     );
 }
@@ -4131,7 +4445,7 @@ for line in sys.stdin:
         std::fs::set_permissions(&backend_script, permissions).unwrap();
     }
 
-    let workspace = tmp.path().to_string_lossy().into_owned();
+    let workspace = canonical_tempdir_path(&tmp);
     let host = HostProbeContext {
         expected_gui_uid: Some(501),
         operator_home: Some("/Users/gui".to_string()),
@@ -4149,8 +4463,11 @@ for line in sys.stdin:
         }],
     };
     let backend = Arc::new(XcodeMcpProcessBackend::new(XcodeMcpProcessBackendConfig {
-        command: backend_script.to_string_lossy().into_owned(),
-        args: vec![spawn_count_path.to_string_lossy().into_owned()],
+        command: python3_fixture_command(),
+        args: vec![
+            backend_script.to_string_lossy().into_owned(),
+            spawn_count_path.to_string_lossy().into_owned(),
+        ],
         request_timeout: Duration::from_secs(15),
     }));
     let pool = XcodeMcpBridgePool::new_with_sink_and_backend(
@@ -4257,7 +4574,7 @@ async fn xcode_mcp_bridge_pool_records_backend_request_observations() {
     }
 
     let tmp = tempfile::tempdir().unwrap();
-    let workspace = tmp.path().to_string_lossy().into_owned();
+    let workspace = canonical_tempdir_path(&tmp);
     let host = HostProbeContext {
         expected_gui_uid: Some(501),
         operator_home: Some("/Users/gui".to_string()),
@@ -5274,6 +5591,7 @@ async fn test_claude_adapter_returns_failed_on_session_error() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5337,6 +5655,7 @@ async fn adapter_execute_closes_session_after_prompt_transport_error() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5422,6 +5741,7 @@ async fn test_gemini_adapter_executes_subprocess_and_returns_artifacts() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5481,6 +5801,7 @@ async fn test_claude_adapter_reports_expected_output_paths_when_overwriting_exis
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5545,6 +5866,7 @@ async fn test_claude_adapter_does_not_report_unchanged_expected_output_path() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5632,6 +5954,7 @@ async fn test_claude_adapter_prefers_typed_expected_outputs_for_baseline_capture
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5651,7 +5974,10 @@ async fn test_claude_adapter_prefers_typed_expected_outputs_for_baseline_capture
     let result = adapter.execute(req).await.unwrap();
     assert_eq!(result.status, AgentStatus::Completed);
     assert!(
-        result.artifact_paths.iter().any(|path| path == &typed_path_string),
+        result
+            .artifact_paths
+            .iter()
+            .any(|path| path == &typed_path_string),
         "changed typed expected output should be reported even when the legacy path list is stale: {:?}",
         result.artifact_paths
     );
@@ -5718,6 +6044,7 @@ async fn test_claude_adapter_excludes_initialize_created_file_from_prompt_artifa
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5787,6 +6114,7 @@ async fn test_claude_adapter_extracts_chainworks_output_envelopes_without_filesy
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5852,6 +6180,7 @@ async fn test_claude_adapter_extracts_chainworks_output_from_terminal_result_out
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5976,6 +6305,7 @@ async fn p084_like_stringified_terminal_output_materializes_required_outputs() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -6046,6 +6376,7 @@ async fn test_claude_adapter_extracts_json_object_chainworks_output_envelope() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -6088,6 +6419,172 @@ async fn test_claude_adapter_extracts_json_object_chainworks_output_envelope() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_task_complete_session_store_recovers_missing_acp_terminal_response() {
+    use acp::adapters::codex::CodexAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::{AcpCompletionCaptureSource, ExecutionRequest};
+    use domain::agent::AgentStatus;
+    use domain::discovery::{
+        ExpectedOutputRole, ExpectedOutputSpec, OutputReusePolicy, SourceGenerationOwner,
+    };
+    use domain::ids::RunId;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let script = fixture::create_codex_task_complete_without_terminal_script(tmp.path());
+    let adapter = CodexAdapter::new_with_binary(script);
+    let audit_path = tmp
+        .path()
+        .join("audit/proposal-vs-implementation.json")
+        .to_string_lossy()
+        .into_owned();
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: None,
+        stage_id: "state_9_implementation_reviewed".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
+        agent_id: "proposal_implementation_auditor".into(),
+        provider: "codex".into(),
+        model: Some("gpt-5.5".into()),
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "audit".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        expected_outputs: vec![ExpectedOutputSpec {
+            output_name: "audit_report".into(),
+            output_role: ExpectedOutputRole::Machine,
+            target_path: audit_path.clone(),
+            companion_of: None,
+            display_label: "Audit report".into(),
+            contract_id: Some("audit_report_v1".into()),
+            required: true,
+            reuse_policy: OutputReusePolicy::MustProduce,
+            max_bytes: 128 * 1024,
+            aggregate_acceptance_cap_bytes: 256 * 1024,
+            authorized_roots: Vec::new(),
+            source_generation_owner: SourceGenerationOwner::Agent,
+        }],
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        provider_runtime_home: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
+    };
+
+    let result = adapter.execute(req).await.unwrap();
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(
+        result.completion_text_capture.capture_source,
+        Some(AcpCompletionCaptureSource::ProviderSessionStoreTaskComplete)
+    );
+    assert!(result.runtime_receipt.as_ref().is_some_and(|receipt| {
+        receipt.status == "completed"
+            && receipt
+                .last_events
+                .iter()
+                .any(|event| event.kind == "provider_session_store_task_complete_recovered")
+    }));
+    assert!(result.discovered_artifacts.iter().any(|artifact| {
+        artifact.name == audit_path
+            && serde_json::from_slice::<serde_json::Value>(&artifact.content)
+                .ok()
+                .and_then(|value| value.get("status").cloned())
+                == Some(serde_json::json!("needs_code_fixes"))
+    }));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_prompt_error_uses_session_store_credits_signal_as_provider_quota() {
+    use acp::adapters::codex::CodexAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::ExecutionRequest;
+    use domain::agent::AgentStatus;
+    use domain::ids::RunId;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let script = fixture::create_codex_credits_exhausted_prompt_error_script(tmp.path());
+    let adapter = CodexAdapter::new_with_binary(script);
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: None,
+        stage_id: "state_9_implementation_reviewed".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
+        agent_id: "proposal_implementation_auditor".into(),
+        provider: "codex".into(),
+        model: Some("gpt-5.5".into()),
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "audit".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        provider_runtime_home: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
+    };
+
+    let result = adapter.execute(req).await.unwrap();
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    let receipt = result
+        .runtime_receipt
+        .as_ref()
+        .expect("prompt error must write a runtime receipt");
+    assert_eq!(receipt.failure_phase.as_deref(), Some("provider_quota"));
+    assert_eq!(receipt.jsonrpc_error_code, Some(-32603));
+    assert!(receipt
+        .provider_error_message_redacted
+        .as_deref()
+        .is_some_and(|message| message.contains("Codex credits exhausted")));
+    assert!(receipt.last_events.iter().any(|event| {
+        event.kind == "provider_failure"
+            && event
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("codex_credits_exhausted"))
+    }));
+    assert!(result
+        .transcript_text
+        .as_deref()
+        .is_some_and(|text| text.contains("Codex credits exhausted")));
+}
+
 /// AcpRuntimeManager should keep a live session handle and reuse it for a
 /// second prompt without starting a fresh ACP session.
 #[cfg(unix)]
@@ -6126,6 +6623,7 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         reuse_existing_session: false,
         session_generation_id: Some("generation-1".into()),
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -6177,6 +6675,7 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         reuse_existing_session: true,
         session_generation_id: Some(session_generation_id.clone()),
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -6272,6 +6771,7 @@ async fn runtime_manager_reports_prompt_progress_before_terminal_response() {
         reuse_existing_session: false,
         session_generation_id: Some("generation-progress".into()),
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -6372,6 +6872,7 @@ async fn test_runtime_manager_closes_inflight_one_shot_session_by_generation_id(
         reuse_existing_session: false,
         session_generation_id: Some(generation_id.into()),
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: Default::default(),
@@ -6425,6 +6926,143 @@ async fn test_runtime_manager_closes_inflight_one_shot_session_by_generation_id(
 
 #[cfg(unix)]
 #[tokio::test]
+async fn adapter_execute_detects_provider_parent_exit_with_stdout_held_open() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::ExecutionRequest;
+    use domain::ids::RunId;
+    use tokio::time::{timeout, Duration};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let holder_pid_path = tmp.path().join("stdout-holder.pid");
+    let script =
+        fixture::create_prompt_parent_exit_with_stdout_holder_script(tmp.path(), &holder_pid_path);
+    let adapter = ClaudeAgentAdapter::new_with_binary(script);
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: None,
+        stage_id: "stage_parent_exit".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
+        agent_id: "parent-exit-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "exit parent while stdout is inherited".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        provider_runtime_home: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
+    };
+
+    let result = timeout(Duration::from_secs(5), adapter.execute(req)).await;
+    if let Ok(pid) = std::fs::read_to_string(&holder_pid_path) {
+        let _ = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.trim())
+            .status();
+    }
+    let error = result
+        .expect("provider parent exit must be detected without waiting for EOF")
+        .expect_err("provider parent exit during prompt must fail the execution");
+    assert!(
+        error
+            .to_string()
+            .contains("provider subprocess exited during active prompt"),
+        "unexpected parent-exit prompt error: {error:#}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn adapter_execute_detects_provider_parent_exit_during_initialize_with_stdout_held_open() {
+    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::ExecutionRequest;
+    use domain::ids::RunId;
+    use tokio::time::{timeout, Duration};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let holder_pid_path = tmp.path().join("initialize-stdout-holder.pid");
+    let script = fixture::create_initialize_parent_exit_with_stdout_holder_script(
+        tmp.path(),
+        &holder_pid_path,
+    );
+    let adapter = ClaudeAgentAdapter::new_with_binary(script);
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: None,
+        stage_id: "stage_initialize_parent_exit".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
+        agent_id: "initialize-parent-exit-agent".into(),
+        provider: "claude".into(),
+        model: None,
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "exit parent during initialize while stdout is inherited".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        provider_runtime_home: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
+    };
+
+    let result = timeout(Duration::from_secs(5), adapter.execute(req)).await;
+    if let Ok(pid) = std::fs::read_to_string(&holder_pid_path) {
+        let _ = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.trim())
+            .status();
+    }
+    let error = result
+        .expect("initialize parent exit must be detected without waiting for EOF")
+        .expect_err("provider parent exit during initialize must fail the execution");
+    let error_chain = format!("{error:#}");
+    assert!(
+        error_chain.contains("subprocess exited") && error_chain.contains("initialize handshake"),
+        "unexpected initialize parent-exit error: {error:#}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
     use acp::adapters::claude::ClaudeAgentAdapter;
     use acp::adapters::AcpAdapter;
@@ -6459,6 +7097,7 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         reuse_existing_session: false,
         session_generation_id: Some("generation-1".into()),
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -6511,6 +7150,7 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         reuse_existing_session: true,
         session_generation_id: Some(session_generation_id),
         provider_session_id,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -6570,6 +7210,7 @@ async fn test_claude_adapter_surfaces_usage_snapshot_from_stream_updates() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -6664,7 +7305,12 @@ sys.exit(0)
         provider: "claude".into(),
         model: None,
         effort: None,
-        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        workspace_root: tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf())
+            .to_string_lossy()
+            .into_owned(),
         prompt: "probe env".into(),
         worktree_root: None,
         worktree_write_enabled: false,
@@ -6675,6 +7321,7 @@ sys.exit(0)
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: vec![],
         chainworks_meta_root: Some(".chainworks/runs/env-test-run".into()),
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -6691,7 +7338,10 @@ sys.exit(0)
         p079_repair_canonical_paths: None,
     };
 
-    let _ = adapter.execute(req).await;
+    adapter
+        .execute(req)
+        .await
+        .expect("Claude ACP fixture should execute before asserting launch env");
 
     // The fixture wrote the env var value to a file.
     let recorded =

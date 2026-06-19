@@ -441,6 +441,7 @@ impl AcpRuntimeManager {
         let mut launch_spec = adapter.prepare_launch_spec(req, &mut resources)?;
         launch_spec.provider_launch_gate = Some(self.provider_launch_gate());
         launch_spec.apply_chainworks_meta_root_env(req);
+        launch_spec.apply_chainworks_rust_cache_env();
         let runtime_profile_id = req
             .brokered_xcode_intents()
             .into_iter()
@@ -465,7 +466,13 @@ impl AcpRuntimeManager {
             attacher: attacher.clone(),
             lease_ids: attachment.lease_ids.clone(),
         });
-        let session_req = attachment.request;
+        let mut session_req = attachment.request;
+        if session_req.provider_runtime_home.is_none() {
+            session_req.provider_runtime_home = launch_spec
+                .provider_runtime_home
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned());
+        }
         self.attach_xcode_shim_runtime_if_needed(&session_req, &mut launch_spec)
             .await?;
 
@@ -1126,6 +1133,7 @@ mod tests {
             reuse_existing_session: false,
             session_generation_id: Some("generation-go".to_string()),
             provider_session_id: None,
+            provider_runtime_home: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: None,
             legacy_broad_discovery_policy: LegacyBroadDiscoveryPolicy::Disabled,
@@ -1277,6 +1285,7 @@ mod tests {
             reuse_existing_session: false,
             session_generation_id: None,
             provider_session_id: None,
+            provider_runtime_home: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: None,
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -1347,6 +1356,7 @@ mod tests {
             reuse_existing_session: false,
             session_generation_id: None,
             provider_session_id: None,
+            provider_runtime_home: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: None,
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,

@@ -113,6 +113,11 @@ pub struct ExecutionRequest {
     /// and the underlying ACP session handle.
     #[serde(default)]
     pub provider_session_id: Option<String>,
+    /// Provider-local runtime home prepared for this ACP process. Codex uses
+    /// this as CODEX_HOME; the transport monitor uses it to read the exact
+    /// session store instead of bounded-scanning all historical runtime homes.
+    #[serde(default)]
+    pub provider_runtime_home: Option<String>,
     /// Executable MCP server payloads resolved from Chainworks extension ids
     /// into provider-local runtime ids before ACP startup.
     #[serde(default)]
@@ -356,6 +361,8 @@ pub enum AcpCompletionCaptureSource {
     TerminalFinalResponse,
     StreamedUpdateTail,
     CappedStream,
+    ProviderSessionStoreTaskComplete,
+    ProviderSessionStoreFinalResponse,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
