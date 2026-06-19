@@ -1,0 +1,30 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "P079",
+  "fixture_id": "p079_negative_symlink_swapped_after_check_rejected",
+  "negative_case": "symlink_swapped_after_check_rejected",
+  "applicability": "required",
+  "description": "Output materialization must not follow a provider-writable parent directory that has been replaced by a symlink before the write.",
+  "input": {
+    "target_path_shape": "/trusted-output-root/proposal_review.json",
+    "attacker_action": "replace trusted-output-root with a symlink to an outside directory before materialization",
+    "payload": {
+      "status": "green"
+    }
+  },
+  "expected_decision": "fail",
+  "expected_failure_code": "output_materialization_parent_symlink_rejected",
+  "expected_invariants": [
+    "materialization returns an error",
+    "outside/proposal_review.json is not created",
+    "the write path uses openat/mkdirat with O_NOFOLLOW for provider-writable components"
+  ],
+  "proof": {
+    "rust_test": "executor::tests::write_discovered_output_rejects_parent_symlink_escape",
+    "command": "cd control-plane && cargo test -p engine write_discovered_output_rejects_parent_symlink_escape -- --nocapture"
+  },
+  "rollback_disposition": {
+    "mode": "not_applicable",
+    "data_loss_risk": "none"
+  }
+}

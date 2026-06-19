@@ -77,7 +77,7 @@ protocol P046SessionStore: Sendable {
 
 // MARK: - GraphQL documents
 
-enum P046GraphQLDocuments {
+nonisolated enum P046GraphQLDocuments {
     // Lightweight capability probe: queries sessionObservabilityAvailable which is
     // absent from the schema when P046 is disabled. A "Cannot query field" error
     // means no P046 documents should be issued to this daemon.

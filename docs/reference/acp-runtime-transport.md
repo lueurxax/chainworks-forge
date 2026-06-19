@@ -40,6 +40,7 @@ It does not define:
 - [provider-platform.md](provider-platform.md)
 - [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md)
 - [live-provider-execution-slice.md](live-provider-execution-slice.md)
+- [bounded-tool-output-and-safe-search-policy.md](bounded-tool-output-and-safe-search-policy.md)
 
 ## Canonical transport contract
 
@@ -152,6 +153,23 @@ are normalized into canonical provider families (`claude`, `gemini`, `codex`,
 Shared ACP plumbing lives in `control-plane/crates/acp/src/transport.rs`.
 Junie must be launched in explicit ACP mode with `--acp true`; plain `junie`
 does not enter the JSON-RPC ACP handshake.
+
+### Bounded Tool Output And Safe Search
+
+The ACP transport consults the runtime-owned safe-search policy before granting
+provider permission for broad shell discovery. Repo/worktree-root `rg` and
+`find` commands are denied with the typed
+`tool_output_budget_preflight_denied` error unless they narrow the search path
+or include the complete generated/build-root denylist. This denial happens
+before output reaches provider context and does not quarantine the session.
+
+Provider-local activity monitoring and Codex wrapper output markers classify
+escaped unbounded output as `tool_output_budget_exceeded` or
+`codex_unbounded_tool_output` before generic provider fallback. Those failures
+poison the provider session and require fresh-session retry. The durable policy,
+denylist, wrapper caps, failure codes, quarantine behavior, and health readback
+are specified in
+[bounded-tool-output-and-safe-search-policy.md](bounded-tool-output-and-safe-search-policy.md).
 
 Junie structured-output capability is covered by the retained
 `proposal-089|p089` gate alias. That gate preserves native Junie CLI proof for

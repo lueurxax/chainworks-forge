@@ -2,11 +2,10 @@ use acp::AcpRuntimeManager;
 use anyhow::{anyhow, Context, Result};
 use auth;
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
-use std::future::Future;
 use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::pin::Pin;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -16,7 +15,7 @@ use tracing::{info, warn};
 
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger,
-    approval_mutation_idempotency, approvals, artifact_contracts, audit_log, closeout,
+    approval_mutation_idempotency, approvals, artifact_contracts, artifacts, audit_log, closeout,
     code_writer_completion_receipts, command_journal, ideas, legacy_discovery_overrides,
     mcp_command_idempotency, projections, retry_operator_instructions,
     retry_stage_execution_authorities, runs, scheduler, sessions, stages, work_items,
@@ -25,17 +24,20 @@ use db::repos::{
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use db::write_class::WriteLane;
 use db::writer::{class_a_operation, DbWriter};
-use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement};
+use domain::agent::{
+    AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement, AgentStatus,
+};
 use domain::approval::ApprovalDecision;
+use domain::artifact::{Artifact, ArtifactFormat};
 use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
 use domain::commands::{
     ApprovalResolutionDecision, CallerContext, Command, ConsumeProviderQuotaHoldCmd,
-    ExtendWorkflowLoopBudgetCmd, ProposalGateSettlementAction, SettleProposalGateCmd,
-    WorkflowLoopBudgetExtensionCmd,
+    ExtendWorkflowLoopBudgetCmd, ProposalGateSettlementAction, RetrofitCatalogSnapshotCmd,
+    RetryStageCmd, SettleProposalGateCmd, WorkflowLoopBudgetExtensionCmd,
 };
 use domain::discovery::{LegacyBroadDiscoveryPolicy, LegacyDiscoveryOverrideInput};
 use domain::events::DomainEvent;
-use domain::ids::{ApprovalId, RunId};
+use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, RunId, StageExecutionId};
 use domain::proposal_gate_result::{
     ProposalGateFailureClassification, ProposalGateLineage, ProposalGateResult, ProposalGateStatus,
 };
@@ -45,13 +47,13 @@ use domain::retry_authority::{
     RetryStageExecutionAuthority, TargetedRetryPayloadIdentity,
 };
 use domain::run::{Run, RunStatus};
+use domain::side_effect::FEATURE_P078_HEURISTIC_RETRY_GUARD_ENABLED;
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use domain::workflow_conflict::{
     CandidateTransitionEvaluation, CandidateTransitionResult, WorkflowConflictStatus,
     WorkflowTransitionCursorRecord,
 };
 use domain::PrincipalClass;
-use sha2::{Digest, Sha256};
 
 use crate::cancellation;
 use crate::closeout_fingerprint::{
@@ -63,7 +65,7 @@ use crate::event_bus::EventSender;
 use crate::preflight::{
     missing_delivery_configuration_preflight, run_delivery_preflight, DeliveryPreflightResult,
 };
-use crate::side_effects::{retry_preflight_within_tx, run_cancel_preflight_within_tx};
+use crate::side_effects::retry_preflight_within_tx;
 use crate::synthesizers::closeout_readiness::{
     synthesize_implementation_closeout_readiness_for_state9_with_runtime_guards, NoDiffConvergence,
     SynthesizerInputs, NO_DIFF_CONVERGENCE_THRESHOLD,
@@ -82,6 +84,21 @@ pub struct CommandHandler {
     /// Used to record policy mode and fixture version in audit_log entries written
     /// inside command transactions.
     boundary_policy: Option<Arc<auth::boundary::BoundaryPolicy>>,
+}
+
+fn ensure_run_can_be_retried(run: &Run) -> Result<()> {
+    if run.status.is_terminal()
+        || run.status == RunStatus::Cancelling
+        || run.cancellation_requested_at.is_some()
+        || run.cancellation_settled_at.is_some()
+    {
+        anyhow::bail!(
+            "Run {} is {} / cancellation-settled and cannot be retried",
+            run.id,
+            run.status
+        );
+    }
+    Ok(())
 }
 
 pub enum CommandResult {
@@ -123,6 +140,12 @@ pub enum CommandResult {
         counter: String,
         previous_max: u64,
         new_max: u64,
+    },
+    CatalogSnapshotRetrofitted {
+        run_id: RunId,
+        previous_catalog_snapshot_hash: String,
+        new_catalog_snapshot_hash: String,
+        applied_policy_ids: Vec<String>,
     },
     LegacyDiscoveryOverrideCreated {
         override_id: String,
@@ -246,6 +269,15 @@ struct CommandJournalEntry {
     boundary_row_id: Option<String>,
 }
 
+struct RetryIdentifierKindRejection {
+    message: String,
+    provided_identifier: String,
+    provided_identifier_kind: &'static str,
+    expected_identifier_kind: &'static str,
+    valid_identifier_examples: Vec<String>,
+    operator_message: String,
+}
+
 fn ensure_run_meta_root_exists(run: &Run) -> Result<()> {
     let Some(meta_root) = run
         .chainworks_meta_root
@@ -256,12 +288,27 @@ fn ensure_run_meta_root_exists(run: &Run) -> Result<()> {
         return Ok(());
     };
 
+    let workspace_root = Path::new(&run.workspace_root);
+    reject_command_path_symlink_components(workspace_root, "Run workspace_root")?;
+    let canonical_workspace = std::fs::canonicalize(workspace_root).with_context(|| {
+        format!(
+            "canonicalize run workspace_root {}",
+            workspace_root.display()
+        )
+    })?;
+
     let meta_root = Path::new(meta_root);
     let absolute_meta_root = if meta_root.is_absolute() {
         meta_root.to_path_buf()
     } else {
-        Path::new(&run.workspace_root).join(meta_root)
+        canonical_workspace.join(meta_root)
     };
+    if absolute_meta_root.exists() {
+        reject_command_path_symlink_components(&absolute_meta_root, "Run chainworks_meta_root")?;
+    }
+    if !absolute_meta_root.starts_with(&canonical_workspace) {
+        anyhow::bail!("Run chainworks_meta_root escapes canonical workspace_root");
+    }
 
     for child in ["", "artifacts", "context", "state", "summaries"] {
         let path = if child.is_empty() {
@@ -269,10 +316,127 @@ fn ensure_run_meta_root_exists(run: &Run) -> Result<()> {
         } else {
             absolute_meta_root.join(child)
         };
-        std::fs::create_dir_all(&path)
-            .with_context(|| format!("create run meta-root directory {}", path.display()))?;
+        create_command_dir_all_no_symlink_under(
+            &path,
+            &canonical_workspace,
+            "Run chainworks_meta_root",
+        )?;
     }
 
+    Ok(())
+}
+
+fn create_command_dir_all_no_symlink_under(
+    path: &Path,
+    canonical_root: &Path,
+    field: &str,
+) -> Result<()> {
+    let relative = path
+        .strip_prefix(canonical_root)
+        .with_context(|| format!("{field} escapes canonical root"))?;
+    let mut current = canonical_root.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => current.push(part),
+            Component::CurDir => continue,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("{field} contains an unsafe path component");
+            }
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    anyhow::bail!("{field} contains a symlink component");
+                }
+                if !metadata.is_dir() {
+                    anyhow::bail!("{field} path component is not a directory");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)
+                    .with_context(|| format!("create directory {}", current.display()))?;
+                let metadata = std::fs::symlink_metadata(&current)
+                    .with_context(|| format!("verify directory {}", current.display()))?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    anyhow::bail!("{field} created path was replaced before verification");
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", current.display()));
+            }
+        }
+    }
+    let canonical_current = std::fs::canonicalize(&current)
+        .with_context(|| format!("canonicalize directory {}", current.display()))?;
+    if !canonical_current.starts_with(canonical_root) {
+        anyhow::bail!("{field} escapes canonical root after creation");
+    }
+    Ok(())
+}
+
+fn canonicalize_governed_workspace_root_for_idea(raw: &str) -> Result<String> {
+    if raw.contains('\0') {
+        anyhow::bail!("CreateIdea workspace_root_path contains a null byte");
+    }
+    if raw.contains('\\') {
+        anyhow::bail!("CreateIdea workspace_root_path contains a backslash separator");
+    }
+    if raw.contains("://") {
+        anyhow::bail!("CreateIdea workspace_root_path contains a URI scheme separator");
+    }
+    for component in raw.split('/') {
+        if component == ".." {
+            anyhow::bail!("CreateIdea workspace_root_path contains '..'");
+        }
+    }
+    let path = Path::new(raw);
+    if !path.exists() {
+        anyhow::bail!("CreateIdea workspace_root_path does not exist");
+    }
+    if !path.is_dir() {
+        anyhow::bail!("CreateIdea workspace_root_path must be a directory");
+    }
+    reject_command_path_symlink_components(path, "CreateIdea workspace_root_path")?;
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("canonicalize CreateIdea workspace_root_path '{raw}'"))?;
+    reject_broad_command_workspace_root(&canonical)?;
+    Ok(canonical.to_string_lossy().to_string())
+}
+
+fn reject_broad_command_workspace_root(canonical: &Path) -> Result<()> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| std::fs::canonicalize(home).ok());
+    let broad_literals = [
+        Path::new("/"),
+        Path::new("/tmp"),
+        Path::new("/private/tmp"),
+        Path::new("/var"),
+        Path::new("/private/var"),
+        Path::new("/Users"),
+        Path::new("/home"),
+    ];
+    if broad_literals.iter().any(|broad| canonical == *broad)
+        || home.as_deref().is_some_and(|home| canonical == home)
+    {
+        anyhow::bail!(
+            "CreateIdea workspace_root_path is too broad to use as a trusted filesystem boundary"
+        );
+    }
+    Ok(())
+}
+
+fn reject_command_path_symlink_components(path: &Path, field: &str) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("{field} contains a symlink component");
+        }
+    }
     Ok(())
 }
 
@@ -816,6 +980,64 @@ fn workflow_snapshot_hash(raw: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn sanitized_audit_reason(reason: &str) -> Result<String> {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("catalog snapshot retrofit reason is required");
+    }
+    if trimmed.len() > 2_000 {
+        anyhow::bail!("catalog snapshot retrofit reason exceeds 2000 bytes");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn remove_catalog_retrofit_allowed_fields(value: &mut serde_json::Value) -> Result<()> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("catalog snapshot JSON must be an object"))?;
+    object.remove("escalation_policies");
+    object.remove("backend_profiles");
+    Ok(())
+}
+
+fn validate_escalation_policy_only_catalog_retrofit(
+    previous_catalog_snapshot_json: &str,
+    new_catalog_snapshot_json: &str,
+    current_state: Option<&str>,
+    new_plan: &workflow::plan::RunPlan,
+) -> Result<Vec<String>> {
+    let mut previous: serde_json::Value = serde_json::from_str(previous_catalog_snapshot_json)
+        .context("parse previous catalog snapshot JSON")?;
+    let mut new: serde_json::Value = serde_json::from_str(new_catalog_snapshot_json)
+        .context("parse new catalog snapshot JSON")?;
+    remove_catalog_retrofit_allowed_fields(&mut previous)?;
+    remove_catalog_retrofit_allowed_fields(&mut new)?;
+    if previous != new {
+        anyhow::bail!(
+            "catalog snapshot retrofit rejected: current catalog differs outside escalation_policies/backend_profiles"
+        );
+    }
+
+    let current_state = current_state
+        .map(str::trim)
+        .filter(|state| !state.is_empty())
+        .ok_or_else(|| anyhow!("catalog snapshot retrofit requires a current workflow state"))?;
+    let applied_policy_ids = new_plan
+        .escalation_policies
+        .iter()
+        .filter(|policy| {
+            policy.enabled_default && policy.applies_to_stage_id.as_deref() == Some(current_state)
+        })
+        .map(|policy| policy.policy_id.clone())
+        .collect::<Vec<_>>();
+    if applied_policy_ids.is_empty() {
+        anyhow::bail!(
+            "catalog snapshot retrofit rejected: current catalog has no enabled escalation policy for current state {current_state}"
+        );
+    }
+    Ok(applied_policy_ids)
+}
+
 fn find_loop_budget_variable(snapshot: &serde_json::Value, counter: &str) -> Result<(String, u64)> {
     fn visit<'a>(value: &'a serde_json::Value, counter: &str) -> Option<&'a str> {
         let object = value.as_object()?;
@@ -932,6 +1154,7 @@ impl CommandJournalEntry {
             Command::MainSyncRepairState(_) => "MainSyncRepairState",
             Command::MainSyncRecordRecoveryDecision(_) => "MainSyncRecordRecoveryDecision",
             Command::KnowledgeCapsuleIgnore(_) => "KnowledgeCapsuleIgnore",
+            Command::RetrofitCatalogSnapshot(_) => "RetrofitCatalogSnapshot",
             Command::CancelRun(_) => "CancelRun",
             Command::ResetSession(_) => "ResetSession",
             Command::RunStewardAnalysis(_) => "RunStewardAnalysis",
@@ -958,6 +1181,7 @@ impl CommandJournalEntry {
             Command::MainSyncRepairState(c) => Some(c.run_id.to_string()),
             Command::MainSyncRecordRecoveryDecision(c) => Some(c.run_id.to_string()),
             Command::KnowledgeCapsuleIgnore(c) => Some(c.run_id.to_string()),
+            Command::RetrofitCatalogSnapshot(c) => Some(c.run_id.to_string()),
             Command::CancelRun(c) => Some(c.run_id.to_string()),
             Command::ResetSession(c) => Some(c.run_id.to_string()),
             Command::RunStewardAnalysis(_) => None,
@@ -1011,6 +1235,7 @@ impl CommandJournalEntry {
                 | "MainSyncRepairState"
                 | "MainSyncRecordRecoveryDecision"
                 | "KnowledgeCapsuleIgnore"
+                | "RetrofitCatalogSnapshot"
         )
     }
 }
@@ -1266,6 +1491,18 @@ fn retry_requires_effect_reconciliation(
         || target_agent_id.is_some_and(is_release_agent)
 }
 
+fn p078_heuristic_retry_guard_enabled() -> bool {
+    std::env::var(FEATURE_P078_HEURISTIC_RETRY_GUARD_ENABLED)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn retry_state_has_release_post_approval_tasks(run: &Run, stage_id: &str) -> Result<bool> {
     let plan = match (
         run.workflow_snapshot_json.as_deref(),
@@ -1297,7 +1534,7 @@ fn retry_state_has_release_post_approval_tasks(run: &Run, stage_id: &str) -> Res
     }))
 }
 
-pub fn compile_run_plan_for_run(run: &Run) -> Result<Option<workflow::plan::RunPlan>> {
+fn compile_run_plan_for_run(run: &Run) -> Result<Option<workflow::plan::RunPlan>> {
     match (
         run.workflow_snapshot_json.as_deref(),
         run.catalog_snapshot_json.as_deref(),
@@ -1327,10 +1564,8 @@ pub fn compile_run_plan_for_run(run: &Run) -> Result<Option<workflow::plan::RunP
 }
 
 /// Compile a RunPlan exclusively from frozen snapshots stamped at run start.
-/// Returns `Ok(None)` when no frozen snapshots are available — does NOT fall back
-/// to mutable on-disk YAML, enforcing the frozen-snapshot invariant (P058-SEC-003).
-/// Use this in contexts where YAML drift would violate the proposal contract
-/// (e.g., escalation policy resolution during live agent execution).
+/// Returns `Ok(None)` when no frozen snapshots are available and never falls
+/// back to mutable on-disk YAML.
 pub fn compile_run_plan_from_snapshot(run: &Run) -> Result<Option<workflow::plan::RunPlan>> {
     match (
         run.workflow_snapshot_json.as_deref(),
@@ -1373,6 +1608,11 @@ fn requires_effect_reconciliation_error(stage: &StageExecution) -> anyhow::Error
         stage.stage_id,
         stage.id
     )
+}
+
+fn is_implicit_targeted_retry_stage(stage_id: &str) -> bool {
+    matches!(stage_id, "state_9_implementation_reviewed")
+        || stage_id.ends_with("_implementation_reviewed")
 }
 
 pub(crate) fn find_source_invoke_work_item<'a>(
@@ -1840,12 +2080,6 @@ impl CommandHandler {
         }
     }
 
-    /// P081 Phase 3: inject the shared immutable BoundaryPolicy for audit-log entries.
-    pub fn with_boundary_policy(mut self, policy: Arc<auth::boundary::BoundaryPolicy>) -> Self {
-        self.boundary_policy = Some(policy);
-        self
-    }
-
     pub fn new_with_acp(
         pool: SqlitePool,
         events: EventSender,
@@ -1859,6 +2093,111 @@ impl CommandHandler {
             acp,
             InvokeAgentCapacityConfig::default(),
         )
+    }
+
+    async fn persist_p094_boundary_human_decision(
+        &self,
+        run_id: RunId,
+        stage_id: &str,
+        decision_label: &str,
+        canonical_approval_state: &str,
+        comment: Option<String>,
+        requested_at: DateTime<Utc>,
+        approval_id: ApprovalId,
+    ) -> Result<()> {
+        if stage_id != "state_9_blocker_boundary_approval" {
+            return Ok(());
+        }
+        let run = runs::find_by_id(&self.pool, run_id)
+            .await?
+            .context("P094 boundary approval run not found")?;
+        let target_path = crate::orchestrator::resolve_path_template(
+            "${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/blocker-boundary-human-decision.json",
+            &run.workspace_root,
+            run.chainworks_meta_root.as_deref(),
+        );
+        if let Some(parent) = std::path::Path::new(&target_path).parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "create P094 blocker boundary human decision directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let payload = serde_json::json!({
+            "schema_version": "blocker_boundary_human_decision_v1",
+            "approval_id": approval_id,
+            "decision_label": decision_label,
+            "canonical_approval_state": canonical_approval_state,
+            "comment": comment,
+            "decided_at": Utc::now().to_rfc3339(),
+            "decided_by": "operator",
+        });
+        let bytes = serde_json::to_vec_pretty(&payload)
+            .context("serialize blocker_boundary_human_decision_v1")?;
+        std::fs::write(&target_path, &bytes)
+            .with_context(|| format!("write P094 boundary human decision {target_path}"))?;
+
+        let artifact_id = ArtifactId::new();
+        let generation_id = format!("{stage_id}-p094-human-decision-{canonical_approval_state}");
+        artifact_contracts::upsert_verified_generation_and_rebuild(
+            &self.pool,
+            domain::artifact_contracts::ActiveArtifactGenerationInput {
+                run_id,
+                artifact_id,
+                contract_id: "blocker_boundary_human_decision_v1".into(),
+                canonical_path: target_path.clone(),
+                raw_path: target_path.clone(),
+                raw_status: canonical_approval_state.to_string(),
+                generation_id,
+                source_agent_execution_id: None,
+                source_stage_execution_id: None,
+                source_session_generation_id: None,
+                source_work_item_id: None,
+                supersedes_generation_id: None,
+                output_settlement: AgentOutputSettlement::ValidOutputsFromCompletedExecution,
+                partial: false,
+                warnings: vec![],
+            },
+        )
+        .await?;
+
+        artifacts::insert(
+            &self.pool,
+            &Artifact {
+                id: artifact_id,
+                run_id,
+                stage_id: stage_id.to_string(),
+                agent_id: "operator".to_string(),
+                name: "blocker_boundary_human_decision".to_string(),
+                contract_id: "blocker_boundary_human_decision_v1".to_string(),
+                format: ArtifactFormat::Json,
+                file_path: target_path,
+                checksum_sha256: Some(format!("{:x}", Sha256::digest(&bytes))),
+                size_bytes: Some(bytes.len() as i64),
+                provider: "operator.approval".to_string(),
+                model: None,
+                created_at: Utc::now(),
+                is_pinned: false,
+                report_kind: None,
+                report_version: None,
+                agent_execution_id: None,
+            },
+        )
+        .await?;
+        db::metrics::record_p094_boundary_approval(canonical_approval_state);
+        let latency = Utc::now()
+            .signed_duration_since(requested_at)
+            .to_std()
+            .unwrap_or_else(|_| Duration::from_secs(0));
+        db::metrics::record_p094_human_boundary_approval_latency(latency);
+        if canonical_approval_state == "granted" {
+            db::metrics::record_p094_external_blocker_accepted("quality_gate_boundary");
+        } else if canonical_approval_state == "rejected" {
+            db::metrics::record_p094_post_boundary_reopen("operator_rejected_boundary");
+            db::metrics::record_p094_accepted_boundary_later_rejected("operator_rejected_boundary");
+        }
+        Ok(())
     }
 
     pub fn new_with_acp_and_capacity(
@@ -1899,6 +2238,12 @@ impl CommandHandler {
         }
     }
 
+    /// P081 Phase 3: inject the shared immutable BoundaryPolicy for audit-log entries.
+    pub fn with_boundary_policy(mut self, policy: Arc<auth::boundary::BoundaryPolicy>) -> Self {
+        self.boundary_policy = Some(policy);
+        self
+    }
+
     async fn begin_command_transaction(
         &self,
         operation_name: &'static str,
@@ -1931,15 +2276,17 @@ impl CommandHandler {
         Ok(())
     }
 
-    pub fn handle(
-        &self,
-        cmd: Command,
-        caller: CallerContext,
-    ) -> Pin<Box<dyn Future<Output = Result<Commanded>> + Send + '_>> {
-        Box::pin(async move { self.handle_inner(cmd, caller).await })
-    }
-
-    async fn handle_inner(&self, cmd: Command, caller: CallerContext) -> Result<Commanded> {
+    pub async fn handle(&self, cmd: Command, caller: CallerContext) -> Result<Commanded> {
+        if matches!(&cmd, Command::StartRun(_))
+            && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: StartRun requires operator principal");
+        }
+        if matches!(&cmd, Command::CreateIdea(c) if c.workspace_root_path.is_some())
+            && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: CreateIdea workspace_root_path requires operator principal");
+        }
         if matches!(&cmd, Command::OverrideArtifactContract(_))
             && caller.principal_class != PrincipalClass::Operator
         {
@@ -2005,10 +2352,27 @@ impl CommandHandler {
         {
             anyhow::bail!("forbidden: Proposal 064 commands require operator principal");
         }
+        if matches!(&cmd, Command::RetrofitCatalogSnapshot(_))
+            && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: RetrofitCatalogSnapshot requires operator principal");
+        }
         if matches!(&cmd, Command::ResolveApproval(_))
             && caller.principal_class != PrincipalClass::Operator
         {
             anyhow::bail!("forbidden: ResolveApproval requires operator principal");
+        }
+        if let Command::ResolveApproval(ref c) = cmd {
+            if c.stage_id == "state_9_blocker_boundary_approval"
+                && c.decision == ApprovalResolutionDecision::Rejected
+                && c.rationale
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty()
+            {
+                anyhow::bail!("P094 blocker-boundary rejection requires a comment");
+            }
         }
         if matches!(&cmd, Command::SettleProposalGate(_))
             && caller.principal_class != PrincipalClass::Operator
@@ -2294,11 +2658,18 @@ impl CommandHandler {
         let journal_id = journal.id.as_str();
         match cmd {
             Command::CreateIdea(c) => {
+                let workspace_root_path = c
+                    .workspace_root_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|root| !root.is_empty())
+                    .map(canonicalize_governed_workspace_root_for_idea)
+                    .transpose()?;
                 let idea = domain::idea::Idea {
                     id: domain::ids::IdeaId::new(),
                     title: c.title,
                     body: c.body,
-                    workspace_root_path: c.workspace_root_path,
+                    workspace_root_path,
                     project_key: c.project_key,
                     status: domain::idea::IdeaStatus::Draft,
                     created_at: Utc::now(),
@@ -2312,6 +2683,11 @@ impl CommandHandler {
                 command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
                 tx.commit().await.context("commit create idea command")?;
                 Ok(CommandResult::IdeaCreated { idea })
+            }
+            Command::ConsumeProviderQuotaHold(c) => {
+                return self
+                    .consume_provider_quota_hold(c, journal, journal_id)
+                    .await;
             }
             Command::StartRun(c) => {
                 let now = Utc::now();
@@ -2642,6 +3018,7 @@ impl CommandHandler {
 
             Command::ApproveStage(c) => {
                 let now = Utc::now();
+                let approval_comment = c.comment.clone();
                 let has_post_tasks = self
                     .check_has_post_approval_tasks(c.run_id, &c.stage_id)
                     .await;
@@ -2753,6 +3130,16 @@ impl CommandHandler {
                     decision: ApprovalDecision::Granted,
                 });
                 projections::rebuild_approval_inbox(&self.pool, c.run_id).await?;
+                self.persist_p094_boundary_human_decision(
+                    c.run_id,
+                    &c.stage_id,
+                    "accept",
+                    "granted",
+                    approval_comment,
+                    approval.requested_at,
+                    approval.id,
+                )
+                .await?;
 
                 Ok(CommandResult::StageApproved {
                     approval_id: approval.id,
@@ -2761,6 +3148,16 @@ impl CommandHandler {
 
             Command::RejectStage(c) => {
                 let now = Utc::now();
+                let rejection_comment = c.comment.clone();
+                if c.stage_id == "state_9_blocker_boundary_approval"
+                    && rejection_comment
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .is_empty()
+                {
+                    anyhow::bail!("P094 blocker-boundary rejection requires a comment");
+                }
                 let tx_started = Instant::now();
                 let mut tx = self
                     .begin_command_transaction("command.RejectStage", journal.id.clone())
@@ -2864,16 +3261,20 @@ impl CommandHandler {
                     decision: ApprovalDecision::Rejected,
                 });
                 projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
+                self.persist_p094_boundary_human_decision(
+                    c.run_id,
+                    &c.stage_id,
+                    "reject",
+                    "rejected",
+                    rejection_comment,
+                    approval.requested_at,
+                    approval.id,
+                )
+                .await?;
 
                 Ok(CommandResult::StageRejected {
                     approval_id: approval.id,
                 })
-            }
-
-            Command::ConsumeProviderQuotaHold(c) => {
-                return self
-                    .consume_provider_quota_hold(c, journal, journal_id)
-                    .await;
             }
 
             Command::RetryStage(c) => {
@@ -2886,6 +3287,18 @@ impl CommandHandler {
                 } else {
                     None
                 };
+                if let Some(rejection) = self.retry_stage_identifier_kind_rejection(&c).await? {
+                    self.record_retry_stage_identifier_rejection(journal, &rejection)
+                        .await?;
+                    db::metrics::increment_counter_with_label(
+                        "p082_recovery_mutation_rejected_total",
+                        &format!(
+                            "{}:RetryStage",
+                            domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE
+                        ),
+                    );
+                    return Err(anyhow!(rejection.message));
+                }
 
                 if let Some(agent_execution_id) = c.agent_execution_id {
                     if c.legacy_discovery_override_policy.is_some() {
@@ -2905,6 +3318,26 @@ impl CommandHandler {
                             &caller,
                         )
                         .await;
+                }
+
+                if c.legacy_discovery_override_policy.is_none() {
+                    if let Some(agent_execution_id) = self
+                        .implicit_targeted_retry_candidate(c.run_id, &c.stage_id)
+                        .await?
+                    {
+                        return self
+                            .retry_agent_execution(
+                                c.run_id,
+                                &c.stage_id,
+                                agent_execution_id,
+                                c.consume_quota_budget_now,
+                                journal_id,
+                                journal,
+                                validated_instruction.as_deref(),
+                                &caller,
+                            )
+                            .await;
+                    }
                 }
 
                 let now = Utc::now();
@@ -2940,6 +3373,18 @@ impl CommandHandler {
                 let run = runs::find_by_id_tx(&mut retry_tx, c.run_id)
                     .await?
                     .ok_or_else(|| anyhow!("Run {} not found", c.run_id))?;
+                if let Err(error) = ensure_run_can_be_retried(&run) {
+                    command_journal::fail_entry_tx(
+                        &mut retry_tx,
+                        &journal.id,
+                        Utc::now(),
+                        &error.to_string(),
+                    )
+                    .await?;
+                    retry_tx.commit().await?;
+                    db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
+                    return Err(error);
+                }
                 ensure_run_meta_root_exists(&run)?;
                 let completed_current_stage_on_blocked_run =
                     if old_stage.status == StageStatus::Completed {
@@ -2958,15 +3403,45 @@ impl CommandHandler {
                         c.stage_id,
                         old_stage.status
                     );
+                    let now_ts = Utc::now();
+                    let p082_envelope =
+                        domain::recovery_matrix::build_rejected_command_error_envelope(
+                            domain::recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY,
+                            "RetryStage",
+                            &format!(
+                                "Stage {} latest attempt is {} and cannot be retried yet. No mutation was performed.",
+                                c.stage_id, old_stage.status
+                            ),
+                            domain::recovery_matrix::build_readback_v1(
+                                "P082-R02",
+                                "rejected",
+                                "no_mutation",
+                                domain::recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY,
+                                "Stage is not in a retryable status. No mutation was performed.",
+                                "command_journal, stage_executions",
+                                "command_journal, stages",
+                                &journal.id,
+                                Some("command_journal.error.p082_recovery_matrix_readback"),
+                                "valid",
+                                &now_ts.to_rfc3339(),
+                            ),
+                        );
                     command_journal::fail_entry_tx(
                         &mut retry_tx,
                         &journal.id,
-                        Utc::now(),
-                        &error.to_string(),
+                        now_ts,
+                        &p082_envelope,
                     )
                     .await?;
                     retry_tx.commit().await?;
                     db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
+                    db::metrics::increment_counter_with_label(
+                        "p082_recovery_mutation_rejected_total",
+                        &format!(
+                            "{}:RetryStage",
+                            domain::recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY
+                        ),
+                    );
                     return Err(error);
                 }
 
@@ -2990,34 +3465,100 @@ impl CommandHandler {
                 if let Err(ledger_err) =
                     retry_preflight_within_tx(&mut retry_tx, &c.run_id, &old_stage.id, None).await
                 {
+                    let now_ts = Utc::now();
+                    let p082_envelope =
+                        domain::recovery_matrix::build_rejected_command_error_envelope(
+                            domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+                            "RetryStage",
+                            "Retry blocked: unresolved side-effect ledger entries exist. No mutation was performed.",
+                            domain::recovery_matrix::set_readback_side_effect_hold(
+                                domain::recovery_matrix::build_readback_v1(
+                                    "P082-R07",
+                                    "held",
+                                    "reconcile_side_effects",
+                                    domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+                                    "Reconcile unresolved side effects before retrying this stage.",
+                                    "side_effects, command_journal",
+                                    "side_effects, command_journal",
+                                    &journal.id,
+                                    Some("command_journal.error.p082_recovery_matrix_readback"),
+                                    "valid",
+                                    &now_ts.to_rfc3339(),
+                                ),
+                                "unresolved_side_effect_entries",
+                                "Retry blocked: unresolved side-effect ledger entries exist. Reconcile side effects before retrying.",
+                            ),
+                        );
                     command_journal::fail_entry_tx(
                         &mut retry_tx,
                         &journal.id,
-                        Utc::now(),
-                        &ledger_err.to_string(),
+                        now_ts,
+                        &p082_envelope,
                     )
                     .await?;
                     retry_tx.commit().await?;
                     db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
+                    db::metrics::increment_counter_with_label(
+                        "p082_recovery_mutation_rejected_total",
+                        &format!(
+                            "{}:RetryStage",
+                            domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION
+                        ),
+                    );
                     return Err(ledger_err);
                 }
 
-                // Heuristic guard: still catch release stages not yet wired to the ledger.
-                if retry_requires_effect_reconciliation(
-                    old_stage,
-                    None,
-                    has_release_post_approval_tasks,
-                ) {
+                // Ledger preflight above is authoritative. The legacy heuristic guard is
+                // opt-in only because it can block retries that failed before any durable
+                // side-effect intent was recorded.
+                if p078_heuristic_retry_guard_enabled()
+                    && retry_requires_effect_reconciliation(
+                        old_stage,
+                        None,
+                        has_release_post_approval_tasks,
+                    )
+                {
                     let error = requires_effect_reconciliation_error(old_stage);
+                    let now_ts = Utc::now();
+                    let p082_envelope =
+                        domain::recovery_matrix::build_rejected_command_error_envelope(
+                            domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+                            "RetryStage",
+                            "Retry blocked: release stage has unresolved side effects requiring reconciliation. No mutation was performed.",
+                            domain::recovery_matrix::set_readback_side_effect_hold(
+                                domain::recovery_matrix::build_readback_v1(
+                                    "P082-R07",
+                                    "held",
+                                    "reconcile_side_effects",
+                                    domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+                                    "Reconcile unresolved side effects before retrying this stage.",
+                                    "side_effects, command_journal",
+                                    "side_effects, command_journal",
+                                    &journal.id,
+                                    Some("command_journal.error.p082_recovery_matrix_readback"),
+                                    "valid",
+                                    &now_ts.to_rfc3339(),
+                                ),
+                                "unresolved_side_effect_entries",
+                                "Retry blocked: release stage has unresolved side effects requiring reconciliation. Reconcile side effects before retrying.",
+                            ),
+                        );
                     command_journal::fail_entry_tx(
                         &mut retry_tx,
                         &journal.id,
-                        Utc::now(),
-                        &error.to_string(),
+                        now_ts,
+                        &p082_envelope,
                     )
                     .await?;
                     retry_tx.commit().await?;
                     db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
+                    db::metrics::increment_counter_with_label(
+                        "p082_recovery_mutation_rejected_total",
+                        &format!(
+                            "{}:RetryStage",
+                            domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION
+                        ),
+                    );
                     return Err(error);
                 }
 
@@ -3623,6 +4164,170 @@ impl CommandHandler {
                 })
             }
 
+            Command::RetrofitCatalogSnapshot(RetrofitCatalogSnapshotCmd {
+                run_id,
+                expected_catalog_snapshot_hash,
+                reason,
+                scope: _,
+            }) => {
+                let reason = sanitized_audit_reason(&reason)?;
+                let now = Utc::now();
+                let tx_started = Instant::now();
+                let mut tx = self
+                    .begin_command_transaction(
+                        "command.RetrofitCatalogSnapshot",
+                        journal.id.clone(),
+                    )
+                    .await?;
+                record_command_journal_tx(&mut tx, journal).await?;
+
+                let run = runs::find_by_id_tx(&mut tx, run_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("Run {run_id} not found"))?;
+                if run.status != RunStatus::Blocked {
+                    anyhow::bail!(
+                        "catalog snapshot retrofit requires blocked run; current status is {}",
+                        run.status
+                    );
+                }
+                if work_items::has_pending_or_running_by_run_tx(&mut tx, run_id).await? {
+                    anyhow::bail!(
+                        "catalog snapshot retrofit rejected: run has pending/running work items"
+                    );
+                }
+                let previous_catalog_snapshot_hash = run
+                    .catalog_snapshot_hash
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("Run {run_id} has no frozen catalog snapshot hash"))?
+                    .to_string();
+                if previous_catalog_snapshot_hash != expected_catalog_snapshot_hash {
+                    anyhow::bail!(
+                        "catalog snapshot hash mismatch: expected {}, found {}",
+                        expected_catalog_snapshot_hash,
+                        previous_catalog_snapshot_hash
+                    );
+                }
+                let previous_catalog_snapshot_json = run
+                    .catalog_snapshot_json
+                    .as_deref()
+                    .filter(|raw| !raw.trim().is_empty())
+                    .ok_or_else(|| anyhow!("Run {run_id} has no frozen catalog snapshot JSON"))?;
+                let workflow_yaml_path = run
+                    .workflow_yaml_path
+                    .as_deref()
+                    .filter(|path| !path.trim().is_empty())
+                    .ok_or_else(|| anyhow!("Run {run_id} has no workflow YAML path"))?;
+                let agent_catalog_yaml_path = run
+                    .agent_catalog_yaml_path
+                    .as_deref()
+                    .filter(|path| !path.trim().is_empty())
+                    .ok_or_else(|| anyhow!("Run {run_id} has no agent catalog YAML path"))?;
+                let new_plan =
+                    workflow::compiler::compile(workflow_yaml_path, agent_catalog_yaml_path)
+                        .context(
+                            "compile current workflow/catalog for catalog snapshot retrofit",
+                        )?;
+                if let Some(frozen_workflow_hash) = run.workflow_snapshot_hash.as_deref() {
+                    if frozen_workflow_hash != new_plan.workflow_snapshot_hash {
+                        anyhow::bail!(
+                            "catalog snapshot retrofit rejected: workflow snapshot hash changed from {} to {}",
+                            frozen_workflow_hash,
+                            new_plan.workflow_snapshot_hash
+                        );
+                    }
+                }
+                if previous_catalog_snapshot_hash == new_plan.catalog_snapshot_hash {
+                    anyhow::bail!(
+                        "catalog snapshot retrofit rejected: current catalog hash is unchanged"
+                    );
+                }
+                let applied_policy_ids = validate_escalation_policy_only_catalog_retrofit(
+                    previous_catalog_snapshot_json,
+                    &new_plan.catalog_snapshot_json,
+                    run.current_state.as_deref(),
+                    &new_plan,
+                )?;
+                let new_catalog_snapshot_hash = new_plan.catalog_snapshot_hash.clone();
+
+                sqlx::query(
+                    "UPDATE runs SET catalog_snapshot_json = ?1, catalog_snapshot_hash = ?2 WHERE id = ?3",
+                )
+                .bind(&new_plan.catalog_snapshot_json)
+                .bind(&new_catalog_snapshot_hash)
+                .bind(run_id.to_string())
+                .execute(&mut **tx)
+                .await
+                .context("persist retrofitted catalog snapshot")?;
+                db::repos::workflow_conflicts::record_phase_c_validation_outcome_tx(
+                    &mut tx,
+                    run_id,
+                    "pass",
+                    "catalog_snapshot_retrofit",
+                    now,
+                )
+                .await?;
+                let audit_note = serde_json::json!({
+                    "reason": reason,
+                    "scope": "escalation_policy_only",
+                    "previous_catalog_snapshot_hash": previous_catalog_snapshot_hash.clone(),
+                    "new_catalog_snapshot_hash": new_catalog_snapshot_hash.clone(),
+                    "applied_policy_ids": applied_policy_ids.clone(),
+                });
+                let raw_audit_payload = audit_note.to_string();
+                let (stored_audit_payload, _payload_sha, audit_truncated) =
+                    audit_log::build_envelope(&raw_audit_payload);
+                let (policy_mode, fixture_ver) = match &self.boundary_policy {
+                    Some(p) => (p.mode().to_string(), p.fixture_digest().to_string()),
+                    None => ("legacy_compat".to_string(), "embedded".to_string()),
+                };
+                let audit_request_id = journal
+                    .request_id
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(journal.id.as_str());
+                let audit_id = uuid::Uuid::now_v7().to_string();
+                let audit_entry = audit_log::AuditEntry {
+                    id: &audit_id,
+                    request_id: audit_request_id,
+                    timestamp_ms: now.timestamp_millis(),
+                    event_type: "run_catalog_snapshot_retrofit",
+                    principal_id: journal.caller_principal_id.as_deref(),
+                    principal_class: journal.caller_principal_class.as_deref(),
+                    caller_class: journal.caller_class.as_deref(),
+                    token_id: journal.token_id.as_deref(),
+                    transport: "mcp_tools_call",
+                    action_attempted: "runs.retrofit_catalog_snapshot",
+                    decision: "allow",
+                    denial_reason_code: None,
+                    row_id: Some("p081.agent_operator.mcp_tools_call.command"),
+                    env_gate_state: None,
+                    source_ip_hash_or_local_process_id: None,
+                    boundary_policy_mode: &policy_mode,
+                    fixture_version: &fixture_ver,
+                    payload: &stored_audit_payload,
+                    original_payload_bytes: if audit_truncated {
+                        Some(&raw_audit_payload)
+                    } else {
+                        None
+                    },
+                    diagnostic_truncated: audit_truncated,
+                    checkpoint_id: None,
+                    created_at_ms: now.timestamp_millis(),
+                };
+                audit_log::append_tx(&mut tx, &audit_entry).await?;
+                command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.RetrofitCatalogSnapshot", tx_started);
+                projections::rebuild_all_for_run(&self.pool, run_id).await?;
+
+                Ok(CommandResult::CatalogSnapshotRetrofitted {
+                    run_id,
+                    previous_catalog_snapshot_hash,
+                    new_catalog_snapshot_hash,
+                    applied_policy_ids,
+                })
+            }
+
             Command::OverrideLegacyDiscoveryPolicy(c) => {
                 let run = runs::find_by_id(&self.pool, c.run_id)
                     .await?
@@ -3734,22 +4439,9 @@ impl CommandHandler {
                     return Err(error);
                 }
 
-                // Ledger-backed preflight: block cancel when any unresolved side effects exist
-                // for this run, regardless of CHAINWORKS_RELEASE_SIDE_EFFECTS_ENABLED.
-                // Use the tx-scoped variant to avoid deadlocking on single-connection pools.
-                if let Err(ledger_err) = run_cancel_preflight_within_tx(&mut tx, &c.run_id).await {
-                    command_journal::fail_entry_tx(
-                        &mut tx,
-                        &journal.id,
-                        Utc::now(),
-                        &ledger_err.to_string(),
-                    )
-                    .await?;
-                    tx.commit().await?;
-                    db::pool::log_write_transaction("command.CancelRun", tx_started);
-                    return Err(ledger_err);
-                }
-
+                // P082-R13: cancellation may start while side effects are unresolved, but
+                // final settlement stays held/cancelling until the side-effect ledger is
+                // reconciled. Side effects are NOT touched by cancellation.
                 let settlement = cancellation::begin_settlement_tx(
                     &mut tx,
                     c.run_id,
@@ -3764,18 +4456,6 @@ impl CommandHandler {
                 self.work_queue
                     .publish_scheduler_notification(settlement.scheduler_refresh);
 
-                let _ = self.events.send(DomainEvent::RunStatusChanged {
-                    run_id: c.run_id,
-                    status: RunStatus::Cancelling,
-                });
-
-                cancellation::spawn_finalize_settlement(
-                    self.pool.clone(),
-                    self.events.clone(),
-                    self.acp.clone(),
-                    c.run_id,
-                );
-
                 // Worktree cleanup on cancel (Proposal 007).
                 if let Some(ref wt) = run.worktree_root {
                     if let Err(e) =
@@ -3789,6 +4469,18 @@ impl CommandHandler {
                         );
                     }
                 }
+
+                let _ = self.events.send(DomainEvent::RunStatusChanged {
+                    run_id: c.run_id,
+                    status: RunStatus::Cancelling,
+                });
+
+                cancellation::spawn_finalize_settlement(
+                    self.pool.clone(),
+                    self.events.clone(),
+                    self.acp.clone(),
+                    c.run_id,
+                );
 
                 Ok(CommandResult::RunCancelled { run_id: c.run_id })
             }
@@ -4181,11 +4873,6 @@ impl CommandHandler {
                 self.work_queue
                     .publish_scheduler_notification(scheduler_refresh);
 
-                // Notify session subscribers that a session event was persisted.
-                let _ = self
-                    .events
-                    .send(DomainEvent::SessionEventRecorded { run_id: c.run_id });
-
                 if let Some(acp) = &self.acp {
                     for generation_id in generation_ids_to_close {
                         let _ = acp.close_session(&generation_id).await;
@@ -4201,7 +4888,7 @@ impl CommandHandler {
                 })
             }
 
-            // ── P072/P081: Converged approval resolution by approval_id ──────
+            // ── P072: Converged approval resolution by approval_id ──────
             Command::ResolveApproval(c) => {
                 let now = Utc::now();
                 let decision = match c.decision {
@@ -4212,6 +4899,7 @@ impl CommandHandler {
                     ApprovalResolutionDecision::Approved => "approve",
                     ApprovalResolutionDecision::Rejected => "reject",
                 };
+                let rationale = c.rationale.clone();
 
                 let has_post_tasks = if decision == ApprovalDecision::Granted {
                     self.check_has_post_approval_tasks(c.run_id, &c.stage_id)
@@ -4343,108 +5031,6 @@ impl CommandHandler {
                 approvals::resolve_tx(&mut tx, approval.id, decision.clone(), now, c.rationale)
                     .await?;
 
-                let mut stage_status_event = None;
-                let mut should_enqueue_advance = decision == ApprovalDecision::Granted;
-                let run_stages = stages::list_by_run_tx(&mut tx, authoritative_run_id).await?;
-
-                if decision == ApprovalDecision::Granted {
-                    if let Some(stage) = run_stages.iter().find(|s| {
-                        s.stage_id == authoritative_stage_id
-                            && s.status == StageStatus::WaitingApproval
-                    }) {
-                        if stage.stage_type.as_deref() == Some("manual_gate") {
-                            if has_post_tasks {
-                                stages::update_status_tx(&mut tx, stage.id, StageStatus::Running)
-                                    .await?;
-                                stage_status_event = Some((stage.id, StageStatus::Running));
-                            } else {
-                                stages::settle_tx(
-                                    &mut tx,
-                                    stage.id,
-                                    StageSettlementKind::Completed,
-                                    now,
-                                )
-                                .await?;
-                                stage_status_event = Some((stage.id, StageStatus::Completed));
-                            }
-                        } else {
-                            stages::update_status_tx(&mut tx, stage.id, StageStatus::Running)
-                                .await?;
-                            stage_status_event = Some((stage.id, StageStatus::Running));
-                        }
-                    }
-                } else {
-                    // Rejection path — mirrors RejectStage logic.
-                    if let Some(stage) = run_stages.iter().find(|s| {
-                        s.stage_id == authoritative_stage_id
-                            && s.status == StageStatus::WaitingApproval
-                    }) {
-                        if stage.stage_type.as_deref() == Some("manual_gate") {
-                            stages::settle_tx(
-                                &mut tx,
-                                stage.id,
-                                StageSettlementKind::Completed,
-                                now,
-                            )
-                            .await?;
-                            stage_status_event = Some((stage.id, StageStatus::Completed));
-                            should_enqueue_advance = true;
-                            if stage.stage_id == "state_11_manual_release" {
-                                sqlx::query(
-                                    "UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3",
-                                )
-                                .bind(RunStatus::Running.to_string())
-                                .bind("state_10_implementation_refined")
-                                .bind(authoritative_run_id.to_string())
-                                .execute(&mut **tx)
-                                .await?;
-                                supersede_current_workflow_conflict_for_manual_release_rejection_tx(
-                                    &mut tx,
-                                    authoritative_run_id,
-                                    &stage.stage_id,
-                                    now,
-                                    &journal.id,
-                                )
-                                .await?;
-                            }
-                        } else {
-                            stages::update_status_tx(&mut tx, stage.id, StageStatus::Blocked)
-                                .await?;
-                            stage_status_event = Some((stage.id, StageStatus::Blocked));
-                        }
-                    }
-                }
-
-                if should_enqueue_advance {
-                    work_items::enqueue_tx(
-                        &mut tx,
-                        &WorkItem {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            kind: WorkItemKind::AdvanceRun,
-                            payload_json: serde_json::json!({
-                                "run_id": authoritative_run_id.to_string()
-                            })
-                            .to_string(),
-                            status: WorkItemStatus::Pending,
-                            run_id: Some(authoritative_run_id),
-                            stage_id: None,
-                            created_at: now,
-                            scheduled_at: now,
-                            attempt_count: 0,
-                            last_error: None,
-                        },
-                    )
-                    .await?;
-                }
-                let scheduler_refresh = scheduler::refresh_queue_summaries_for_notification_tx(
-                    &mut tx,
-                    &self.capacity_config,
-                    now,
-                    "command.ResolveApproval",
-                    0,
-                )
-                .await?;
-
                 // P081 Phase 5: idempotency record in same transaction as settlement.
                 if let Some(ref key) = c.idempotency_key {
                     // SEC-P081-001: Use SHA-256 over canonical fields separated by RS (0x1E)
@@ -4563,6 +5149,107 @@ impl CommandHandler {
                     })?;
                 }
 
+                let mut stage_status_event = None;
+                let mut should_enqueue_advance = decision == ApprovalDecision::Granted;
+                let run_stages = stages::list_by_run_tx(&mut tx, authoritative_run_id).await?;
+
+                if decision == ApprovalDecision::Granted {
+                    if let Some(stage) = run_stages.iter().find(|s| {
+                        s.stage_id == authoritative_stage_id
+                            && s.status == StageStatus::WaitingApproval
+                    }) {
+                        if stage.stage_type.as_deref() == Some("manual_gate") {
+                            if has_post_tasks {
+                                stages::update_status_tx(&mut tx, stage.id, StageStatus::Running)
+                                    .await?;
+                                stage_status_event = Some((stage.id, StageStatus::Running));
+                            } else {
+                                stages::settle_tx(
+                                    &mut tx,
+                                    stage.id,
+                                    StageSettlementKind::Completed,
+                                    now,
+                                )
+                                .await?;
+                                stage_status_event = Some((stage.id, StageStatus::Completed));
+                            }
+                        } else {
+                            stages::update_status_tx(&mut tx, stage.id, StageStatus::Running)
+                                .await?;
+                            stage_status_event = Some((stage.id, StageStatus::Running));
+                        }
+                    }
+                } else {
+                    // Rejection path — mirrors RejectStage logic.
+                    if let Some(stage) = run_stages.iter().find(|s| {
+                        s.stage_id == authoritative_stage_id
+                            && s.status == StageStatus::WaitingApproval
+                    }) {
+                        if stage.stage_type.as_deref() == Some("manual_gate") {
+                            stages::settle_tx(
+                                &mut tx,
+                                stage.id,
+                                StageSettlementKind::Completed,
+                                now,
+                            )
+                            .await?;
+                            stage_status_event = Some((stage.id, StageStatus::Completed));
+                            should_enqueue_advance = true;
+                            if stage.stage_id == "state_11_manual_release" {
+                                sqlx::query(
+                                    "UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3",
+                                )
+                                .bind(RunStatus::Running.to_string())
+                                .bind("state_10_implementation_refined")
+                                .bind(authoritative_run_id.to_string())
+                                .execute(&mut **tx)
+                                .await?;
+                                supersede_current_workflow_conflict_for_manual_release_rejection_tx(
+                                    &mut tx,
+                                    authoritative_run_id,
+                                    &stage.stage_id,
+                                    now,
+                                    &journal.id,
+                                )
+                                .await?;
+                            }
+                        } else {
+                            stages::update_status_tx(&mut tx, stage.id, StageStatus::Blocked)
+                                .await?;
+                            stage_status_event = Some((stage.id, StageStatus::Blocked));
+                        }
+                    }
+                }
+
+                if should_enqueue_advance {
+                    work_items::enqueue_tx(
+                        &mut tx,
+                        &WorkItem {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            kind: WorkItemKind::AdvanceRun,
+                            payload_json: serde_json::json!({
+                                "run_id": authoritative_run_id.to_string()
+                            })
+                            .to_string(),
+                            status: WorkItemStatus::Pending,
+                            run_id: Some(authoritative_run_id),
+                            stage_id: None,
+                            created_at: now,
+                            scheduled_at: now,
+                            attempt_count: 0,
+                            last_error: None,
+                        },
+                    )
+                    .await?;
+                }
+                let scheduler_refresh = scheduler::refresh_queue_summaries_for_notification_tx(
+                    &mut tx,
+                    &self.capacity_config,
+                    now,
+                    "command.ResolveApproval",
+                    0,
+                )
+                .await?;
                 command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
                 tx.commit().await?;
                 db::pool::log_write_transaction("command.ResolveApproval", tx_started);
@@ -4586,6 +5273,20 @@ impl CommandHandler {
                     decision,
                 });
                 projections::rebuild_all_for_run(&self.pool, authoritative_run_id).await?;
+                let (decision_label, canonical_approval_state) = match c.decision {
+                    ApprovalResolutionDecision::Approved => ("accept", "granted"),
+                    ApprovalResolutionDecision::Rejected => ("reject", "rejected"),
+                };
+                self.persist_p094_boundary_human_decision(
+                    authoritative_run_id,
+                    &authoritative_stage_id,
+                    decision_label,
+                    canonical_approval_state,
+                    rationale,
+                    approval.requested_at,
+                    approval.id,
+                )
+                .await?;
 
                 let result = match c.decision {
                     ApprovalResolutionDecision::Approved => CommandResult::StageApproved {
@@ -4739,6 +5440,7 @@ impl CommandHandler {
                         }
                         _ => None,
                     };
+
                 let consecutive_no_diff_code_writer_attempts =
                     code_writer_completion_receipts::consecutive_completed_no_diff_count_by_run(
                         &self.pool, run.id,
@@ -4996,6 +5698,240 @@ impl CommandHandler {
         })
     }
 
+    pub async fn auto_resume_elapsed_quota_ledgers(&self, now: DateTime<Utc>) -> Result<usize> {
+        let candidates =
+            agent_retry_budget_ledger::list_reset_elapsed_auto_retry_candidates(&self.pool, now)
+                .await?;
+        let mut scheduled = 0_usize;
+        for candidate in candidates {
+            let skip_reason = self
+                .quota_auto_retry_skip_reason(&candidate)
+                .await
+                .with_context(|| {
+                    format!("preflight quota ledger auto retry {}", candidate.ledger_id)
+                })?;
+            if let Some(reason) = skip_reason {
+                warn!(
+                    ledger_id = %candidate.ledger_id,
+                    run_id = %candidate.run_id,
+                    stage_execution_id = %candidate.stage_execution_id,
+                    stage_id = %candidate.stage_id,
+                    agent_execution_id = %candidate.agent_execution_id,
+                    retry_after = %candidate.retry_after,
+                    skip_reason = reason,
+                    "Quota ledger auto retry skipped"
+                );
+                continue;
+            }
+
+            let cmd = Command::RetryStage(RetryStageCmd {
+                run_id: candidate.run_id,
+                stage_id: candidate.stage_id.clone(),
+                consume_quota_budget_now: false,
+                agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            });
+            let caller = CallerContext::mcp(
+                "chainworks-daemon",
+                &PrincipalClass::Operator,
+                "quota_ledger_auto_resume",
+            )
+            .with_request_id(format!("quota-ledger-auto-resume:{}", candidate.ledger_id));
+            let mut journal = CommandJournalEntry::new(&cmd, &caller);
+            journal.id = format!("quota-ledger-auto-retry-{}", candidate.ledger_id);
+            let journal_id = journal.id.clone();
+
+            match self
+                .retry_stage_latest_attempt(
+                    candidate.run_id,
+                    &candidate.stage_id,
+                    false,
+                    &journal_id,
+                    &journal,
+                    "quota_ledger_reset_elapsed_auto_retry",
+                    None,
+                    &caller,
+                    Some(&candidate.ledger_id),
+                )
+                .await
+            {
+                Ok(_) => {
+                    scheduled += 1;
+                    info!(
+                        ledger_id = %candidate.ledger_id,
+                        run_id = %candidate.run_id,
+                        stage_execution_id = %candidate.stage_execution_id,
+                        stage_id = %candidate.stage_id,
+                        agent_execution_id = %candidate.agent_execution_id,
+                        retry_after = %candidate.retry_after,
+                        journal_id = %journal_id,
+                        "Quota ledger reset elapsed; scheduled automatic stage retry"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        ledger_id = %candidate.ledger_id,
+                        run_id = %candidate.run_id,
+                        stage_execution_id = %candidate.stage_execution_id,
+                        stage_id = %candidate.stage_id,
+                        agent_execution_id = %candidate.agent_execution_id,
+                        error = %error,
+                        "Quota ledger auto retry failed pre-commit"
+                    );
+                }
+            }
+        }
+        Ok(scheduled)
+    }
+
+    async fn quota_auto_retry_skip_reason(
+        &self,
+        candidate: &agent_retry_budget_ledger::QuotaLedgerAutoRetryCandidate,
+    ) -> Result<Option<&'static str>> {
+        let Some(run) = runs::find_by_id(&self.pool, candidate.run_id).await? else {
+            return Ok(Some("run_not_blocked"));
+        };
+        if run.status != RunStatus::Blocked {
+            return Ok(Some("run_not_blocked"));
+        }
+        if run.current_state.as_deref() != Some(candidate.stage_id.as_str()) {
+            return Ok(Some("stage_not_current"));
+        }
+
+        let Some(source_stage) =
+            stages::find_by_id(&self.pool, candidate.stage_execution_id).await?
+        else {
+            return Ok(Some("stage_not_current"));
+        };
+        if source_stage.run_id != candidate.run_id || source_stage.stage_id != candidate.stage_id {
+            return Ok(Some("stage_not_current"));
+        }
+
+        let latest_stage = stages::list_by_run(&self.pool, candidate.run_id)
+            .await?
+            .into_iter()
+            .filter(|stage| stage.stage_id == candidate.stage_id)
+            .max_by_key(|stage| stage.started_at);
+        if latest_stage.as_ref().map(|stage| stage.id) != Some(candidate.stage_execution_id) {
+            return Ok(Some("stage_not_current"));
+        }
+
+        if !matches!(
+            source_stage.status,
+            StageStatus::Failed | StageStatus::Blocked | StageStatus::Completed
+        ) {
+            return Ok(Some("stage_not_retryable"));
+        }
+
+        let active_work_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+               FROM work_items
+               WHERE run_id = ?1
+                 AND status IN ('pending', 'running')"#,
+        )
+        .bind(candidate.run_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        if active_work_count > 0 {
+            return Ok(Some("live_work_present"));
+        }
+
+        let running_agent_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+               FROM agent_executions ae
+               LEFT JOIN stage_executions se ON se.id = ae.stage_execution_id
+               WHERE (se.run_id = ?1 OR ae.owner_id = ?1)
+                 AND ae.status = 'running'"#,
+        )
+        .bind(candidate.run_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        if running_agent_count > 0 {
+            return Ok(Some("live_work_present"));
+        }
+
+        Ok(None)
+    }
+
+    async fn implicit_targeted_retry_candidate(
+        &self,
+        run_id: RunId,
+        stage_id: &str,
+    ) -> Result<Option<AgentExecutionId>> {
+        if !is_implicit_targeted_retry_stage(stage_id) {
+            return Ok(None);
+        }
+
+        let Some(run) = runs::find_by_id(&self.pool, run_id).await? else {
+            return Ok(None);
+        };
+        if run.status != RunStatus::Blocked || run.current_state.as_deref() != Some(stage_id) {
+            return Ok(None);
+        }
+
+        let latest_stage = stages::list_by_run(&self.pool, run_id)
+            .await?
+            .into_iter()
+            .filter(|stage| stage.stage_id == stage_id)
+            .max_by_key(|stage| stage.started_at);
+        let Some(latest_stage) = latest_stage else {
+            return Ok(None);
+        };
+        if !matches!(
+            latest_stage.status,
+            StageStatus::Failed | StageStatus::Blocked
+        ) {
+            return Ok(None);
+        }
+
+        let executions = agent_executions::find_by_stage(&self.pool, latest_stage.id).await?;
+        let failed = executions
+            .iter()
+            .filter(|execution| execution.status == AgentStatus::Failed)
+            .collect::<Vec<_>>();
+        if failed.len() != 1 {
+            return Ok(None);
+        }
+
+        let candidate = failed[0];
+        let run_work_items = work_items::list_by_run(&self.pool, run_id).await?;
+        let Some(source_item) = find_source_invoke_work_item(
+            &run_work_items,
+            &latest_stage.id.to_string(),
+            &candidate.agent_id,
+            &candidate.id.to_string(),
+        ) else {
+            warn!(
+                run_id = %run_id,
+                stage_id = %stage_id,
+                stage_execution_id = %latest_stage.id,
+                agent_execution_id = %candidate.id,
+                agent_id = %candidate.agent_id,
+                "Implicit targeted retry candidate skipped because source InvokeAgent work item was not found"
+            );
+            return Ok(None);
+        };
+        if matches!(
+            source_item.status,
+            WorkItemStatus::Pending | WorkItemStatus::Running
+        ) {
+            return Ok(None);
+        }
+
+        info!(
+            run_id = %run_id,
+            stage_id = %stage_id,
+            stage_execution_id = %latest_stage.id,
+            agent_execution_id = %candidate.id,
+            agent_id = %candidate.agent_id,
+            source_work_item_id = %source_item.id,
+            "RetryStage selected implicit targeted agent retry for blocked implementation review"
+        );
+        Ok(Some(candidate.id))
+    }
+
     async fn retry_stage_latest_attempt(
         &self,
         run_id: RunId,
@@ -5006,6 +5942,7 @@ impl CommandHandler {
         retry_reason: &str,
         validated_instruction: Option<&str>,
         caller: &CallerContext,
+        auto_retry_ledger_id: Option<&str>,
     ) -> Result<CommandResult> {
         let run_stages = stages::list_by_run(&self.pool, run_id).await?;
         let matching_stages = run_stages
@@ -5017,10 +5954,11 @@ impl CommandHandler {
             .copied()
             .max_by_key(|s| s.started_at)
             .ok_or_else(|| anyhow!("Stage {} not found", stage_id))?;
+        let run = runs::find_by_id(&self.pool, run_id)
+            .await?
+            .ok_or_else(|| anyhow!("Run {} not found", run_id))?;
+        ensure_run_can_be_retried(&run)?;
         let completed_current_stage_on_blocked_run = if old_stage.status == StageStatus::Completed {
-            let run = runs::find_by_id(&self.pool, run_id)
-                .await?
-                .ok_or_else(|| anyhow!("Run {} not found", run_id))?;
             run.status == RunStatus::Blocked
                 && (run.current_state.as_deref() == Some(stage_id)
                     || old_stage.stage_id == stage_id)
@@ -5081,6 +6019,14 @@ impl CommandHandler {
             journal_id,
         )
         .await?;
+        if let Some(ledger_id) = auto_retry_ledger_id {
+            agent_retry_budget_ledger::mark_reset_elapsed_retry_scheduled_tx(
+                &mut retry_tx,
+                ledger_id,
+                journal_id,
+            )
+            .await?;
+        }
         stages::settle_tx(
             &mut retry_tx,
             old_stage.id,
@@ -5222,9 +6168,7 @@ impl CommandHandler {
         let run = runs::find_by_id(&self.pool, run_id)
             .await?
             .ok_or_else(|| anyhow!("Run {} not found", run_id))?;
-        if run.status.is_terminal() {
-            return Err(anyhow!("Run {} is already in terminal state", run_id));
-        }
+        ensure_run_can_be_retried(&run)?;
 
         let target_exec = agent_executions::find_by_id(&self.pool, agent_execution_id)
             .await?
@@ -5244,35 +6188,126 @@ impl CommandHandler {
                     agent_execution_id
                 )
             })?;
-        if old_stage.run_id != run_id || old_stage.stage_id != stage_id {
-            return Err(anyhow!(
-                "Agent execution {} belongs to run {} stage {}, not run {} stage {}",
-                agent_execution_id,
-                old_stage.run_id,
-                old_stage.stage_id,
-                run_id,
-                stage_id
-            ));
-        }
-
         let run_stages = stages::list_by_run(&self.pool, run_id).await?;
         let matching_stages = run_stages
             .iter()
             .filter(|s| s.stage_id == stage_id)
             .collect::<Vec<_>>();
-        let latest_stage = matching_stages
-            .iter()
-            .copied()
-            .max_by_key(|s| s.started_at)
-            .ok_or_else(|| anyhow!("Stage {} not found", stage_id))?;
+        let latest_stage = matching_stages.iter().copied().max_by_key(|s| s.started_at);
+        let example_stage_execution_id = latest_stage.map(|stage| stage.id).unwrap_or(old_stage.id);
+        let valid_agent_execution_examples =
+            agent_executions::find_by_stage(&self.pool, example_stage_execution_id)
+                .await?
+                .into_iter()
+                .map(|execution| execution.id.to_string())
+                .collect::<Vec<_>>();
+        if old_stage.run_id != run_id || old_stage.stage_id != stage_id {
+            let err_msg = format!(
+                "Targeted retry rejected: agent execution {} belongs to run {} stage {}, not run {} stage {}. No mutation was performed.",
+                agent_execution_id, old_stage.run_id, old_stage.stage_id, run_id, stage_id
+            );
+            let now_ts = Utc::now();
+            let valid_identifier_example_refs = valid_agent_execution_examples
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let guidance = domain::recovery_matrix::build_retry_identifier_guidance(
+                "RetryAgentExecution",
+                &agent_execution_id.to_string(),
+                "unknown",
+                "stage_execution_uuid",
+                &valid_identifier_example_refs,
+            );
+            let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
+                domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
+                "RetryAgentExecution",
+                "Targeted retry rejected: provided agent_execution_id belongs to a different run or stage. No mutation was performed.",
+                domain::recovery_matrix::set_readback_identifier_guidance(
+                    domain::recovery_matrix::build_readback_v1(
+                        "P082-R08",
+                        "rejected",
+                        "no_mutation",
+                        domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
+                        "Provide a valid targeted retry UUID from the current stage execution.",
+                        "command_journal",
+                        "command_journal, agent_executions, stage_executions",
+                        &journal.id,
+                        Some("command_journal.error.p082_recovery_matrix_readback"),
+                        "valid",
+                        &now_ts.to_rfc3339(),
+                    ),
+                    guidance,
+                ),
+            );
+            self.record_failed_command_transaction(
+                journal,
+                "command.RetryAgentExecution",
+                &p082_envelope,
+            )
+            .await?;
+            db::metrics::increment_counter_with_label(
+                "p082_recovery_mutation_rejected_total",
+                &format!(
+                    "{}:RetryAgentExecution",
+                    domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE
+                ),
+            );
+            return Err(anyhow!("{err_msg}"));
+        }
+
+        let latest_stage = latest_stage.ok_or_else(|| anyhow!("Stage {} not found", stage_id))?;
         if latest_stage.id != old_stage.id {
-            return Err(anyhow!(
-                "Agent execution {} is on stale stage execution {}; latest for {} is {}",
-                agent_execution_id,
-                old_stage.id,
-                stage_id,
-                latest_stage.id
-            ));
+            let err_msg = format!(
+                "Targeted retry rejected: agent execution {} is on stale stage execution {}; latest for {} is {}. No mutation was performed.",
+                agent_execution_id, old_stage.id, stage_id, latest_stage.id
+            );
+            let now_ts = Utc::now();
+            let valid_identifier_example_refs = valid_agent_execution_examples
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let guidance = domain::recovery_matrix::build_retry_identifier_guidance(
+                "RetryAgentExecution",
+                &agent_execution_id.to_string(),
+                "unknown",
+                "stage_execution_uuid",
+                &valid_identifier_example_refs,
+            );
+            let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
+                domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
+                "RetryAgentExecution",
+                "Targeted retry rejected: provided agent_execution_id references a stale (superseded) stage execution. Use the latest stage execution. No mutation was performed.",
+                domain::recovery_matrix::set_readback_identifier_guidance(
+                    domain::recovery_matrix::build_readback_v1(
+                        "P082-R08",
+                        "rejected",
+                        "no_mutation",
+                        domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
+                        "Provide a valid targeted retry UUID from the latest stage execution attempt.",
+                        "command_journal",
+                        "command_journal, agent_executions, stage_executions",
+                        &journal.id,
+                        Some("command_journal.error.p082_recovery_matrix_readback"),
+                        "valid",
+                        &now_ts.to_rfc3339(),
+                    ),
+                    guidance,
+                ),
+            );
+            self.record_failed_command_transaction(
+                journal,
+                "command.RetryAgentExecution",
+                &p082_envelope,
+            )
+            .await?;
+            db::metrics::increment_counter_with_label(
+                "p082_recovery_mutation_rejected_total",
+                &format!(
+                    "{}:RetryAgentExecution",
+                    domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE
+                ),
+            );
+            return Err(anyhow!("{err_msg}"));
         }
 
         let completed_current_stage_on_blocked_run = old_stage.status == StageStatus::Completed
@@ -5281,12 +6316,49 @@ impl CommandHandler {
         if !matches!(old_stage.status, StageStatus::Failed | StageStatus::Blocked)
             && !completed_current_stage_on_blocked_run
         {
-            return Err(anyhow!(
+            let error = anyhow!(
                 "Stage {} latest attempt is {} and cannot be targeted-retried yet",
                 stage_id,
                 old_stage.status
-            ));
+            );
+            let now_ts = Utc::now();
+            let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
+                domain::recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY,
+                "RetryAgentExecution",
+                &format!(
+                    "Targeted retry rejected: stage {} latest attempt is {} and is not in a retryable status. No mutation was performed.",
+                    stage_id, old_stage.status
+                ),
+                domain::recovery_matrix::build_readback_v1(
+                    "P082-R02",
+                    "rejected",
+                    "no_mutation",
+                    domain::recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY,
+                    "Stage is not in a targeted-retryable status. No mutation was performed.",
+                    "command_journal, stage_executions",
+                    "command_journal, stages",
+                    &journal.id,
+                    Some("command_journal.error.p082_recovery_matrix_readback"),
+                    "valid",
+                    &now_ts.to_rfc3339(),
+                ),
+            );
+            self.record_failed_command_transaction(
+                journal,
+                "command.RetryAgentExecution",
+                &p082_envelope,
+            )
+            .await?;
+            db::metrics::increment_counter_with_label(
+                "p082_recovery_mutation_rejected_total",
+                &format!(
+                    "{}:RetryAgentExecution",
+                    domain::recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY
+                ),
+            );
+            return Err(error);
         }
+
         let has_release_post_approval_tasks = match retry_state_has_release_post_approval_tasks(
             &run,
             &old_stage.stage_id,
@@ -5302,18 +6374,51 @@ impl CommandHandler {
                 false
             }
         };
-        if retry_requires_effect_reconciliation(
-            &old_stage,
-            Some(&target_exec.agent_id),
-            has_release_post_approval_tasks,
-        ) {
+        if p078_heuristic_retry_guard_enabled()
+            && retry_requires_effect_reconciliation(
+                &old_stage,
+                Some(&target_exec.agent_id),
+                has_release_post_approval_tasks,
+            )
+        {
             let error = requires_effect_reconciliation_error(&old_stage);
+            let now_ts = Utc::now();
+            let p082_envelope =
+                domain::recovery_matrix::build_rejected_command_error_envelope(
+                    domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+                    "RetryAgentExecution",
+                    "Retry blocked: release stage has unresolved side effects requiring reconciliation. No mutation was performed.",
+                    domain::recovery_matrix::set_readback_side_effect_hold(
+                        domain::recovery_matrix::build_readback_v1(
+                            "P082-R07",
+                            "held",
+                            "reconcile_side_effects",
+                            domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+                            "Reconcile unresolved side effects before retrying this agent execution.",
+                            "side_effects, command_journal",
+                            "side_effects, command_journal",
+                            &journal.id,
+                            Some("command_journal.error.p082_recovery_matrix_readback"),
+                            "valid",
+                            &now_ts.to_rfc3339(),
+                        ),
+                        "unresolved_side_effect_entries",
+                        "Retry blocked: release stage has unresolved side effects requiring reconciliation. Reconcile side effects before retrying.",
+                    ),
+                );
             self.record_failed_command_transaction(
                 journal,
                 "command.RetryAgentExecution",
-                &error.to_string(),
+                &p082_envelope,
             )
             .await?;
+            db::metrics::increment_counter_with_label(
+                "p082_recovery_mutation_rejected_total",
+                &format!(
+                    "{}:RetryAgentExecution",
+                    domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION
+                ),
+            );
             return Err(error);
         }
 
@@ -5421,25 +6526,28 @@ impl CommandHandler {
             new_stage.id, agent_execution_id
         );
         let retry_authority_id = format!("p091-retry-authority:{}", new_stage.id);
-        if retry_payload.as_object().is_some() {
-            sanitize_targeted_retry_invoke_payload(
-                &mut retry_payload,
-                &TargetedRetryPayloadIdentity {
-                    run_id,
-                    stage_id: stage_id.to_string(),
-                    target_stage_execution_id: new_stage.id,
-                    retry_authority_id: retry_authority_id.clone(),
-                    source_stage_execution_id: old_stage.id,
-                    source_agent_execution_id: Some(agent_execution_id.to_string()),
-                    source_work_item_id: source_item.id.clone(),
-                    reason: "operator_targeted_retry".to_string(),
-                    journal_id: Some(journal_id.to_string()),
-                },
+        sanitize_targeted_retry_invoke_payload(
+            &mut retry_payload,
+            &TargetedRetryPayloadIdentity {
+                run_id,
+                stage_id: stage_id.to_string(),
+                target_stage_execution_id: new_stage.id,
+                retry_authority_id: retry_authority_id.clone(),
+                source_stage_execution_id: old_stage.id,
+                source_agent_execution_id: Some(agent_execution_id.to_string()),
+                source_work_item_id: source_item.id.clone(),
+                reason: "operator_targeted_retry".to_string(),
+                journal_id: Some(journal_id.to_string()),
+            },
+        )
+        .map_err(|e| {
+            anyhow!(
+                "Source InvokeAgent work item {} cannot be sanitized for targeted retry: {}",
+                source_item.id,
+                e
             )
-            .map_err(|error| anyhow!(error))?;
-            let object = retry_payload
-                .as_object_mut()
-                .expect("sanitized targeted retry payload stays object");
+        })?;
+        if let Some(object) = retry_payload.as_object_mut() {
             if let Some(evidence_path) = p088_completion_retry_evidence.as_deref() {
                 attach_p088_operator_retry_completion_recovery_payload(
                     object,
@@ -5494,6 +6602,54 @@ impl CommandHandler {
             .begin_command_transaction("command.RetryAgentExecution", journal.id.clone())
             .await?;
         record_command_journal_tx(&mut retry_tx, journal).await?;
+        // Ledger-backed preflight: check unresolved side effects inside the
+        // same BEGIN IMMEDIATE write unit that records the command journal and
+        // performs retry mutations. This mirrors RetryStage and closes the
+        // preflight/mutation TOCTOU window.
+        if let Err(ledger_err) = retry_preflight_within_tx(
+            &mut retry_tx,
+            &run_id,
+            &old_stage.id,
+            Some(&agent_execution_id),
+        )
+        .await
+        {
+            let now_ts = Utc::now();
+            let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
+                domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+                "RetryAgentExecution",
+                "Retry blocked: unresolved side-effect ledger entries exist. No mutation was performed.",
+                domain::recovery_matrix::set_readback_side_effect_hold(
+                    domain::recovery_matrix::build_readback_v1(
+                        "P082-R07",
+                        "held",
+                        "reconcile_side_effects",
+                        domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+                        "Reconcile unresolved side effects before retrying this agent execution.",
+                        "side_effects, command_journal",
+                        "side_effects, command_journal",
+                        &journal.id,
+                        Some("command_journal.error.p082_recovery_matrix_readback"),
+                        "valid",
+                        &now_ts.to_rfc3339(),
+                    ),
+                    "unresolved_side_effect_entries",
+                    "Retry blocked: unresolved side-effect ledger entries exist. Reconcile side effects before retrying.",
+                ),
+            );
+            command_journal::fail_entry_tx(&mut retry_tx, &journal.id, now_ts, &p082_envelope)
+                .await?;
+            retry_tx.commit().await?;
+            db::pool::log_write_transaction("command.RetryAgentExecution", retry_tx_started);
+            db::metrics::increment_counter_with_label(
+                "p082_recovery_mutation_rejected_total",
+                &format!(
+                    "{}:RetryAgentExecution",
+                    domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION
+                ),
+            );
+            return Err(ledger_err);
+        }
         apply_quota_retry_budget_for_stage_tx(
             &mut retry_tx,
             run_id,
@@ -5616,6 +6772,134 @@ impl CommandHandler {
             legacy_discovery_override_id: None,
             retry_instruction_binding_id,
         })
+    }
+
+    async fn retry_stage_identifier_kind_rejection(
+        &self,
+        c: &domain::commands::RetryStageCmd,
+    ) -> Result<Option<RetryIdentifierKindRejection>> {
+        if let Ok(uuid) = uuid::Uuid::parse_str(&c.stage_id) {
+            let stage_execution_id = StageExecutionId::from(uuid);
+            if let Some(stage) = stages::find_by_id(&self.pool, stage_execution_id).await? {
+                if stage.run_id == c.run_id {
+                    return Ok(Some(RetryIdentifierKindRejection {
+                        message: format!(
+                            "wrong_identifier_kind: stages.retry expected logical stage_id but received stage_execution_uuid '{}'. next_action: retry with stage_id '{}' for a full-stage retry, or choose a valid targeted retry UUID from that stage execution.",
+                            c.stage_id, stage.stage_id
+                        ),
+                        provided_identifier: c.stage_id.clone(),
+                        provided_identifier_kind: "stage_execution_uuid",
+                        expected_identifier_kind: "workflow_stage_id",
+                        valid_identifier_examples: vec![stage.stage_id],
+                        operator_message:
+                            "Retry with the logical workflow stage_id, not a stage execution UUID."
+                                .to_string(),
+                    }));
+                }
+            }
+
+            let agent_execution_id = AgentExecutionId::from(uuid);
+            if let Some(agent_execution) =
+                agent_executions::find_by_id(&self.pool, agent_execution_id).await?
+            {
+                if let Some(stage_execution_id) = agent_execution.stage_execution_id {
+                    if let Some(stage) = stages::find_by_id(&self.pool, stage_execution_id).await? {
+                        if stage.run_id == c.run_id {
+                            return Ok(Some(RetryIdentifierKindRejection {
+                                message: format!(
+                                    "wrong_identifier_kind: stages.retry expected logical stage_id but received targeted retry UUID '{}'. next_action: retry with stage_id '{}' and choose targeted retry UUID '{}'.",
+                                    c.stage_id, stage.stage_id, agent_execution.id
+                                ),
+                                provided_identifier: c.stage_id.clone(),
+                                provided_identifier_kind: "unknown",
+                                expected_identifier_kind: "workflow_stage_id",
+                                valid_identifier_examples: vec![stage.stage_id],
+                                operator_message:
+                                    "Retry with the logical workflow stage_id; use the listed targeted retry UUID only for targeted retry."
+                                        .to_string(),
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(agent_execution_id) = c.agent_execution_id {
+            if agent_executions::find_by_id(&self.pool, agent_execution_id)
+                .await?
+                .is_none()
+            {
+                let stage_execution_id = StageExecutionId::from(agent_execution_id.inner());
+                if let Some(stage) = stages::find_by_id(&self.pool, stage_execution_id).await? {
+                    if stage.run_id == c.run_id {
+                        let valid_identifier_examples =
+                            agent_executions::find_by_stage(&self.pool, stage_execution_id)
+                                .await?
+                                .into_iter()
+                                .map(|execution| execution.id.to_string())
+                                .collect::<Vec<_>>();
+                        return Ok(Some(RetryIdentifierKindRejection {
+                            message: format!(
+                                "wrong_identifier_kind: stages.retry received stage_execution_uuid '{}' in the targeted retry field. next_action: retry with workflow stage_id '{}' for a full-stage retry, or choose a listed targeted retry UUID from that stage execution.",
+                                agent_execution_id, stage.stage_id
+                            ),
+                            provided_identifier: agent_execution_id.to_string(),
+                            provided_identifier_kind: "stage_execution_uuid",
+                            expected_identifier_kind: "stage_execution_uuid",
+                            valid_identifier_examples,
+                            operator_message:
+                                "For targeted retry, choose one of the listed targeted retry UUIDs; for full-stage retry, use the workflow stage_id."
+                                    .to_string(),
+                        }));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn record_retry_stage_identifier_rejection(
+        &self,
+        journal: &CommandJournalEntry,
+        rejection: &RetryIdentifierKindRejection,
+    ) -> Result<()> {
+        let now_ts = Utc::now();
+        let example_refs = rejection
+            .valid_identifier_examples
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let guidance = domain::recovery_matrix::build_retry_identifier_guidance(
+            "RetryStage",
+            &rejection.provided_identifier,
+            rejection.provided_identifier_kind,
+            rejection.expected_identifier_kind,
+            &example_refs,
+        );
+        let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
+            domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
+            "RetryStage",
+            "Retry rejected: identifier kind does not match the command field. No mutation was performed.",
+            domain::recovery_matrix::set_readback_identifier_guidance(
+                domain::recovery_matrix::build_readback_v1(
+                    "P082-R08",
+                    "rejected",
+                    "no_mutation",
+                    domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
+                    &rejection.operator_message,
+                    "command_journal",
+                    "command_journal, agent_executions, stage_executions",
+                    &journal.id,
+                    Some("command_journal.error.p082_recovery_matrix_readback"),
+                    "valid",
+                    &now_ts.to_rfc3339(),
+                ),
+                guidance,
+            ),
+        );
+        self.record_failed_command_transaction(journal, "command.RetryStage", &p082_envelope)
+            .await
     }
 
     async fn record_completed_command_transaction(
@@ -6009,6 +7293,128 @@ fn validate_accepted_risk_lineage(c: &SettleProposalGateCmd) -> Result<()> {
 mod tests {
     use super::*;
     use domain::ids::{IdeaId, RunId};
+
+    #[test]
+    fn p082_ensure_run_meta_root_rejects_symlinked_chainworks_component() {
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let link = workspace.path().join(".chainworks");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &link).expect(".chainworks symlink fixture");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), &link)
+            .expect(".chainworks symlink fixture");
+
+        let run = Run {
+            id: RunId::new(),
+            idea_id: IdeaId::new(),
+            status: RunStatus::Running,
+            workflow_id: "wf".into(),
+            workflow_title: "Workflow".into(),
+            workspace_root: workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace")
+                .to_string_lossy()
+                .into_owned(),
+            artifact_root: workspace
+                .path()
+                .join("artifacts")
+                .to_string_lossy()
+                .into_owned(),
+            started_at: Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: Some("state_impl".into()),
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
+            chainworks_meta_root: Some(".chainworks/runs/test-run".into()),
+            review_routing_json: None,
+            closeout_readiness_mode: None,
+        };
+
+        let err = ensure_run_meta_root_exists(&run).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "P082: run meta-root creation must reject symlinked .chainworks components; got: {err}"
+        );
+    }
+
+    #[test]
+    fn p082_ensure_run_meta_root_rejects_parent_dir_escape() {
+        let workspace = tempfile::tempdir().expect("workspace root");
+
+        let run = Run {
+            id: RunId::new(),
+            idea_id: IdeaId::new(),
+            status: RunStatus::Running,
+            workflow_id: "wf".into(),
+            workflow_title: "Workflow".into(),
+            workspace_root: workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace")
+                .to_string_lossy()
+                .into_owned(),
+            artifact_root: workspace
+                .path()
+                .join("artifacts")
+                .to_string_lossy()
+                .into_owned(),
+            started_at: Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: Some("state_impl".into()),
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
+            chainworks_meta_root: Some(".chainworks/../outside/run-meta".into()),
+            review_routing_json: None,
+            closeout_readiness_mode: None,
+        };
+
+        let err = ensure_run_meta_root_exists(&run).unwrap_err();
+        assert!(
+            err.to_string().contains("unsafe path component")
+                || err.to_string().contains("escapes canonical"),
+            "P082: run meta-root creation must reject parent-directory escapes; got: {err}"
+        );
+    }
 
     #[test]
     fn p060_idea_body_review_mode_and_reviewer_override_are_canonicalized() {

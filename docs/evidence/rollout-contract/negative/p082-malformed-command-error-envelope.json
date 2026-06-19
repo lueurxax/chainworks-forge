@@ -1,39 +1,7 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
-  },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-082",
-    "p082"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:malformed_command_error_envelope",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "schema_version": "p082_negative_fixture_v1",
+  "fixture_id": "p082-neg-014",
+  "expected_failure_code": "p082_malformed_command_error_envelope",
+  "mutated_contract_or_matrix": "command_journal.error contains JSON with schema_version=p082_rejected_command_error_v1 but missing required reason_code field",
+  "assertion": "Gate must fail because malformed p082_rejected_command_error_v1 envelope (valid JSON but missing required fields) must be detected and treated as unavailable readback, not exposed as partial operator data"
 }

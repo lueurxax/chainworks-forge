@@ -726,7 +726,7 @@ struct CoalescedEntry {
 ///
 /// Flush is triggered by:
 /// - Merge count reaching `COALESCE_FLUSH_MAX_MERGES`.
-/// - Key age exceeding `COALESCE_MAX_KEY_AGE_MS` (checked by the 500 ms timer task).
+/// - The periodic 500 ms timer task, which drains all pending entries.
 /// - Daemon graceful shutdown (force-flush all).
 struct CoalescingBuffer {
     entries: std::collections::HashMap<String, CoalescedEntry>,
@@ -753,21 +753,6 @@ impl CoalescingBuffer {
     fn drain_all(&mut self) -> Vec<CoalescedEntry> {
         self.merge_count = 0;
         self.entries.drain().map(|(_, v)| v).collect()
-    }
-
-    /// Drain entries whose `enqueued_at` age exceeds `max_age`.
-    fn drain_stale(&mut self, max_age: Duration) -> Vec<CoalescedEntry> {
-        let now = Instant::now();
-        let stale: Vec<String> = self
-            .entries
-            .iter()
-            .filter(|(_, e)| now.duration_since(e.enqueued_at) >= max_age)
-            .map(|(k, _)| k.clone())
-            .collect();
-        stale
-            .into_iter()
-            .filter_map(|k| self.entries.remove(&k))
-            .collect()
     }
 }
 

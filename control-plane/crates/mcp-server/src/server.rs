@@ -1,6 +1,8 @@
+use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
@@ -11,18 +13,19 @@ use db::writer::DbWriterHeartbeat;
 use engine::command_handler::CommandHandler;
 use engine::event_bus::EventSender;
 
+use crate::hot_read_guard;
 use crate::protocol::JsonRpcRequest;
 use crate::protocol::JsonRpcResponse;
 use crate::protocol::McpTool;
 use crate::tools;
 use domain::events::DomainEvent;
-use domain::CapabilityToolId;
 use domain::ResourceTemplateId;
 
 pub struct McpServer {
     pool: SqlitePool,
     cmd_handler: Arc<CommandHandler>,
     pub principal_table: auth::PrincipalTable,
+    principal_source: auth::LivePrincipalSource,
     events: Option<EventSender>,
     storage_writer_heartbeat: Option<Arc<DbWriterHeartbeat>>,
     // P081 Phase 3: shared immutable boundary policy service injected at daemon startup.
@@ -40,6 +43,31 @@ async fn write_json_line<T: serde::Serialize>(stdout: &Arc<Mutex<tokio::io::Stdo
     if let Ok(json) = serde_json::to_string(value) {
         let mut stdout = stdout.lock().await;
         let _ = stdout.write_all(format!("{json}\n").as_bytes()).await;
+        let _ = stdout.flush().await;
+    }
+}
+
+fn public_json_rpc_request_id(id: &Option<serde_json::Value>) -> String {
+    let Some(value) = id.as_ref() else {
+        return uuid::Uuid::new_v4().to_string();
+    };
+
+    match value {
+        serde_json::Value::String(raw) => public_request_id_reference(raw),
+        serde_json::Value::Number(number) => public_request_id_reference(&number.to_string()),
+        _ => uuid::Uuid::new_v4().to_string(),
+    }
+}
+
+fn public_request_id_reference(raw: &str) -> String {
+    if raw.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        let mut hasher = Sha256::new();
+        hasher.update(raw.as_bytes());
+        let digest = hasher.finalize();
+        let short: String = format!("{digest:x}").chars().take(16).collect();
+        format!("request_id:sha256:{short}")
     }
 }
 
@@ -136,10 +164,12 @@ impl McpServer {
         cmd_handler: Arc<CommandHandler>,
         principal_table: auth::PrincipalTable,
     ) -> Self {
+        let principal_source = auth::LivePrincipalSource::new(principal_table.clone());
         Self {
             pool,
             cmd_handler,
             principal_table,
+            principal_source,
             events: None,
             storage_writer_heartbeat: None,
             boundary_policy: Some(embedded_shadow_boundary_policy()),
@@ -152,10 +182,12 @@ impl McpServer {
         principal_table: auth::PrincipalTable,
         storage_writer_heartbeat: Arc<DbWriterHeartbeat>,
     ) -> Self {
+        let principal_source = auth::LivePrincipalSource::new(principal_table.clone());
         Self {
             pool,
             cmd_handler,
             principal_table,
+            principal_source,
             events: None,
             storage_writer_heartbeat: Some(storage_writer_heartbeat),
             boundary_policy: Some(embedded_shadow_boundary_policy()),
@@ -169,10 +201,12 @@ impl McpServer {
         storage_writer_heartbeat: Arc<DbWriterHeartbeat>,
         boundary_policy: Arc<auth::boundary::BoundaryPolicy>,
     ) -> Self {
+        let principal_source = auth::LivePrincipalSource::new(principal_table.clone());
         Self {
             pool,
             cmd_handler,
             principal_table,
+            principal_source,
             events: None,
             storage_writer_heartbeat: Some(storage_writer_heartbeat),
             boundary_policy: Some(boundary_policy),
@@ -185,10 +219,12 @@ impl McpServer {
         principal_table: auth::PrincipalTable,
         events: EventSender,
     ) -> Self {
+        let principal_source = auth::LivePrincipalSource::new(principal_table.clone());
         Self {
             pool,
             cmd_handler,
             principal_table,
+            principal_source,
             events: Some(events),
             storage_writer_heartbeat: None,
             boundary_policy: Some(embedded_shadow_boundary_policy()),
@@ -196,10 +232,37 @@ impl McpServer {
     }
 
     /// P081 Phase 3: attach the shared immutable boundary policy service.
-    /// Call this after construction; the daemon chains it on the existing constructor.
     pub fn with_boundary_policy(mut self, policy: Arc<auth::boundary::BoundaryPolicy>) -> Self {
         self.boundary_policy = Some(policy);
         self
+    }
+
+    pub fn with_live_principal_source(mut self, source: auth::LivePrincipalSource) -> Self {
+        self.principal_source = source;
+        self
+    }
+
+    pub fn live_principal_source(&self) -> auth::LivePrincipalSource {
+        self.principal_source.clone()
+    }
+
+    pub fn principal_table_handle(&self) -> auth::LivePrincipalSource {
+        self.live_principal_source()
+    }
+
+    pub fn resolve_current_bearer(&self, token: &str) -> anyhow::Result<auth::Principal> {
+        self.principal_source
+            .resolve_bearer(token)
+            .map_err(|_| anyhow::anyhow!("unauthorized"))
+    }
+
+    pub fn resolve_current_credential(
+        &self,
+        credential: &auth::LivePrincipalCredential,
+    ) -> anyhow::Result<auth::Principal> {
+        self.principal_source
+            .resolve_credential(credential)
+            .map_err(|_| anyhow::anyhow!("unauthorized"))
     }
 
     pub async fn run_stdio(&self) -> Result<()> {
@@ -209,7 +272,7 @@ impl McpServer {
         let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
         let mut reader = BufReader::new(stdin);
         let mut line = String::new();
-        let mut session_principal: Option<auth::Principal> = None;
+        let mut session_credential: Option<auth::LivePrincipalCredential> = None;
         let mut notification_task: Option<tokio::task::JoinHandle<()>> = None;
 
         loop {
@@ -241,7 +304,7 @@ impl McpServer {
 
             // Handle initialize: bind session principal from clientInfo.principal_token
             if request.method == "initialize" {
-                if session_principal.is_some() {
+                if session_credential.is_some() {
                     // Re-initialize rejected
                     let resp = JsonRpcResponse::error(
                         request.id.clone(),
@@ -276,15 +339,17 @@ impl McpServer {
                             ),
                         )
                         .await;
+                        break;
                     }
-                    Some(t) => match auth::resolve_bearer(t, &self.principal_table) {
+                    Some(t) => match self.resolve_current_bearer(t) {
                         Ok(p) => {
                             let is_operator = matches!(p.class, auth::PrincipalClass::Operator);
-                            session_principal = Some(p);
+                            session_credential = Some(auth::LivePrincipalCredential {
+                                principal_id: p.id.clone(),
+                                token_fingerprint: auth::token_fingerprint(t),
+                            });
                             // Return normal initialize response
-                            let resp = self
-                                .handle_request(request, session_principal.as_ref().unwrap())
-                                .await;
+                            let resp = self.handle_request(request, &p).await;
                             if notification_task.is_none() && is_operator {
                                 if let Some(events) = &self.events {
                                     notification_task = Some(spawn_scheduler_notification_pump(
@@ -325,8 +390,19 @@ impl McpServer {
             }
 
             // For all other methods, require session_principal
-            let principal = match session_principal.as_ref() {
-                Some(p) => p,
+            let principal = match session_credential.as_ref() {
+                Some(credential) => match self.resolve_current_credential(credential) {
+                    Ok(principal) => principal,
+                    Err(_) => {
+                        let resp = JsonRpcResponse::error(
+                            request.id.clone(),
+                            -32000,
+                            "unauthorized".to_string(),
+                        );
+                        write_json_line(&stdout, &resp).await;
+                        break;
+                    }
+                },
                 None => {
                     let resp = JsonRpcResponse::error(
                         request.id.clone(),
@@ -340,9 +416,9 @@ impl McpServer {
 
             if is_notification {
                 // Fire-and-forget: process but don't reply.
-                let _ = self.handle_request(request, principal).await;
+                let _ = self.handle_request(request, &principal).await;
             } else {
-                let response = self.handle_request(request, principal).await;
+                let response = self.handle_request(request, &principal).await;
                 write_json_line(&stdout, &response).await;
             }
         }
@@ -376,12 +452,9 @@ impl McpServer {
 
         match req.method.as_str() {
             "initialize" => {
-                // P081 Phase 4: evaluate BoundaryPolicy for mcp_initialize so the same
-                // daemon-injected policy instance governs this transport.
-                // Denied callers receive an auth failure without capability inventory.
-                // Shadow mode logs the matrix decision but proceeds with the response.
+                // P081 Phase 4: evaluate BoundaryPolicy for mcp_initialize.
                 if let Some(policy) = &self.boundary_policy {
-                    let caller_class = auth::derive_caller_class_for_mcp(&principal);
+                    let caller_class = auth::derive_caller_class_for_mcp(principal);
                     match policy.evaluate(
                         caller_class.as_str(),
                         "mcp_initialize",
@@ -398,9 +471,6 @@ impl McpServer {
                                 row_id = ?row_id,
                                 "BoundaryPolicy: mcp_initialize denied; returning auth failure"
                             );
-                            // P081 AC25: durable deny audit before returning denial.
-                            // Fail closed if the audit write cannot commit.
-                            // matrix_row: p081.agent_operator.mcp_initialize.capability
                             if let Err(e) = write_mcp_deny_audit(
                                 &self.pool,
                                 self.boundary_policy.as_deref(),
@@ -448,38 +518,44 @@ impl McpServer {
                     }
                 }
 
-                // P081 Phase 4: include boundary_policy capability metadata when the
-                // shared policy service is available so clients can detect -32004 semantics.
-                let mut capabilities = serde_json::json!({ "tools": {} });
-                if let Some(policy) = &self.boundary_policy {
-                    capabilities["boundary_policy"] = serde_json::json!({
+                let boundary_policy_cap = self.boundary_policy.as_ref().map(|policy| {
+                    serde_json::json!({
                         "matrix_id": "p081-boundary-matrix-v1",
                         "schema_version": 1,
                         "capability_schema_version": 1,
                         "mode": policy.mode().as_str(),
                         "denied_known_tool_code": -32004,
                         "field_casing": "snake_case"
-                    });
-                }
-                JsonRpcResponse::success(
+                    })
+                });
+
+                let request_id = public_json_rpc_request_id(&id);
+                self.handle_hot_read_json_rpc(
                     id,
-                    serde_json::json!({
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": capabilities,
-                        "serverInfo": {
-                            "name": "chainworks-control-plane",
-                            "version": "0.1.0"
+                    "initialize",
+                    async move {
+                        let mut capabilities = serde_json::json!({ "tools": {} });
+                        if let Some(cap) = boundary_policy_cap {
+                            capabilities["boundary_policy"] = cap;
                         }
-                    }),
+                        Ok(serde_json::json!({
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": capabilities,
+                            "serverInfo": {
+                                "name": "chainworks-control-plane",
+                                "version": "0.1.0"
+                            }
+                        }))
+                    },
+                    &request_id,
                 )
+                .await
             }
 
             "tools/list" => {
                 // P081 Phase 3: evaluate BoundaryPolicy for mcp_tools_list.
-                // Denied callers see an empty tools list; no command_journal write.
-                // Shadow mode logs the matrix decision without filtering.
                 if let Some(policy) = &self.boundary_policy {
-                    let caller_class = auth::derive_caller_class_for_mcp(&principal);
+                    let caller_class = auth::derive_caller_class_for_mcp(principal);
                     let started = std::time::Instant::now();
                     let decision = policy.evaluate(
                         caller_class.as_str(),
@@ -505,9 +581,6 @@ impl McpServer {
                                 row_id = ?row_id,
                                 "BoundaryPolicy: mcp_tools_list denied; returning empty list"
                             );
-                            // P081 AC25: durable deny audit before returning the filtered response.
-                            // Fail closed if the audit write cannot commit.
-                            // matrix_row: p081.agent_operator.mcp_tools_list.discovery
                             if let Err(e) = write_mcp_deny_audit(
                                 &self.pool,
                                 self.boundary_policy.as_deref(),
@@ -545,7 +618,7 @@ impl McpServer {
                                     caller_class = caller_class.as_str(),
                                     reason_code = %reason_code,
                                     row_id = ?row_id,
-                                    "BoundaryPolicy shadow: matrix would filter mcp_tools_list"
+                                    "BoundaryPolicy shadow: matrix would deny mcp_tools_list"
                                 );
                                 if principal.class == auth::PrincipalClass::Operator {
                                     db::metrics::record_p081_boundary_policy_enforcement_parity(
@@ -568,19 +641,28 @@ impl McpServer {
                     }
                 }
 
-                let tools_json: Vec<serde_json::Value> = self
-                    .visible_tool_specs(principal)
-                    .into_iter()
-                    .map(|t| {
-                        serde_json::json!({
-                            "name": t.name,
-                            "description": t.description,
-                            "inputSchema": t.input_schema
-                        })
-                    })
-                    .collect();
+                let request_id = public_json_rpc_request_id(&id);
+                self.handle_hot_read_json_rpc(
+                    id,
+                    "tools.list",
+                    async {
+                        let tools_json: Vec<serde_json::Value> = self
+                            .visible_tool_specs(principal)
+                            .into_iter()
+                            .map(|t| {
+                                serde_json::json!({
+                                    "name": t.name,
+                                    "description": t.description,
+                                    "inputSchema": t.input_schema
+                                })
+                            })
+                            .collect();
 
-                JsonRpcResponse::success(id, serde_json::json!({ "tools": tools_json }))
+                        Ok(serde_json::json!({ "tools": tools_json }))
+                    },
+                    &request_id,
+                )
+                .await
             }
 
             "tools/call" => {
@@ -591,33 +673,31 @@ impl McpServer {
                         return JsonRpcResponse::error(id, -32602, "Missing tool name".to_string());
                     }
                 };
+                let request_id = public_json_rpc_request_id(&id);
 
                 let Some(tool_id) = tools::capability_id_for(&tool_name) else {
-                    // Unknown tool — not in the registry at all → -32601 per spec.
                     return JsonRpcResponse::error(
                         id,
                         -32601,
                         format!("Method not found: {tool_name}"),
-                    );
+                    )
+                    .with_error_request_id(Some(&request_id));
                 };
                 let canonical_tool_name = tools::canonical_tool_name(&tool_name);
 
                 if !tools::p064_operator_tool_enabled(canonical_tool_name) {
-                    // Tool exists but is disabled by P064 feature gate → -32601 (same as unknown).
                     return JsonRpcResponse::error(
                         id,
                         -32601,
                         format!("Method not found: {tool_name}"),
-                    );
+                    )
+                    .with_error_request_id(Some(&request_id));
                 }
 
-                // P081 Phase 3: evaluate BoundaryPolicy for mcp_tools_call when injected.
-                // Known-but-denied tools return -32004, not -32601, per the MCP contract.
-                // Shadow mode: log disagreement but fall through. LegacyPassthrough: no check.
-                // Capture the Allow row_id so it can be threaded into CallerContext via task-local.
+                // P081 Phase 3: evaluate BoundaryPolicy for mcp_tools_call.
                 let mut policy_allowed_row_id: Option<String> = None;
                 if let Some(policy) = &self.boundary_policy {
-                    let caller_class = auth::derive_caller_class_for_mcp(&principal);
+                    let caller_class = auth::derive_caller_class_for_mcp(principal);
                     let started = std::time::Instant::now();
                     let decision = policy.evaluate(
                         caller_class.as_str(),
@@ -637,15 +717,20 @@ impl McpServer {
                             row_id,
                             ..
                         } => {
-                            // P081 AC25: durable deny audit before returning denial.
-                            // Fail closed if the audit write cannot commit.
-                            // matrix_row: p081.agent_operator.mcp_tools_call.command
+                            tracing::debug!(
+                                caller_class = caller_class.as_str(),
+                                transport = "mcp_tools_call",
+                                tool = %tool_name,
+                                reason_code = %reason_code,
+                                row_id = ?row_id,
+                                "BoundaryPolicy: mcp_tools_call denied; returning auth failure"
+                            );
                             if let Err(e) = write_mcp_deny_audit(
                                 &self.pool,
                                 self.boundary_policy.as_deref(),
                                 principal,
                                 "mcp_tools_call",
-                                &tool_name,
+                                canonical_tool_name,
                                 &reason_code,
                                 row_id.as_deref(),
                             )
@@ -659,15 +744,15 @@ impl McpServer {
                                     id,
                                     -32000,
                                     "unauthorized".to_string(),
-                                );
+                                )
+                                .with_error_request_id(Some(&request_id));
                             }
-                            return JsonRpcResponse::policy_denial(
+                            return JsonRpcResponse::error(
                                 id,
-                                &reason_code,
-                                caller_class.as_str(),
-                                row_id.as_deref(),
-                                "p081-boundary-matrix-v1",
-                            );
+                                -32004,
+                                format!("auth_failure: {reason_code}"),
+                            )
+                            .with_error_request_id(Some(&request_id));
                         }
                         auth::boundary::PolicyDecision::Shadow { matched_decision } => {
                             if let auth::boundary::PolicyDecision::Deny {
@@ -706,12 +791,9 @@ impl McpServer {
                         auth::boundary::PolicyDecision::LegacyPassthrough => {}
                     }
                 }
-
                 if !principal.tool_capabilities.contains(&tool_id) {
                     // Known tool, allowed by boundary policy, but caller lacks token capability.
                     // P081 AC25: durable deny audit required; fail closed if write fails.
-                    // H-003: write_mcp_deny_audit must be called for ALL capability denials,
-                    // including storage tools; the audit write happens before any response.
                     let caller_class = auth::derive_caller_class_for_mcp(&principal);
                     if let Err(e) = write_mcp_deny_audit(
                         &self.pool,
@@ -733,8 +815,6 @@ impl McpServer {
                             "p081-boundary-matrix-v1",
                         );
                     }
-                    // Storage tools use a typed response protocol so clients can distinguish
-                    // storage-specific error codes. Return typed-success after audit commit.
                     if canonical_tool_name.starts_with("storage.") {
                         let result = tools::storage::typed_error(
                             canonical_tool_name,
@@ -752,7 +832,6 @@ impl McpServer {
                             }),
                         );
                     }
-                    // Return -32004 to distinguish known-but-denied from unknown tools (-32601).
                     return JsonRpcResponse::policy_denial(
                         id,
                         "CAPABILITY_OUT_OF_SCOPE",
@@ -763,36 +842,6 @@ impl McpServer {
                 }
 
                 let tool_params = params["arguments"].clone();
-                if canonical_tool_name == "automation.auto_retry.latest" {
-                    let requested_versions = tool_params
-                        .get("client_supported_versions")
-                        .and_then(|value| value.as_array())
-                        .map(|values| {
-                            values
-                                .iter()
-                                .filter_map(|value| value.as_str().map(str::to_owned))
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_else(|| vec!["auto_retry_readback.v1".to_string()]);
-                    if !requested_versions
-                        .iter()
-                        .any(|version| version == "auto_retry_readback.v1")
-                    {
-                        let request_id = crate::request_context::current_request_id();
-                        return JsonRpcResponse::error_with_data(
-                            id,
-                            -32076,
-                            "unsupported_version".to_string(),
-                            serde_json::json!({
-                                "code": "unsupported_version",
-                                "supported_versions": ["auto_retry_readback.v1"],
-                                "unsupported_versions": requested_versions,
-                                "requested_versions": requested_versions
-                            }),
-                        )
-                        .with_error_request_id(request_id.as_deref());
-                    }
-                }
 
                 if is_state_changing_call(canonical_tool_name, &tool_params) {
                     match db::repos::audit_log::audit_budget_requires_safe_mode(&self.pool).await {
@@ -877,7 +926,12 @@ impl McpServer {
                         idempotency_claimed_hash.clone(),
                         crate::request_context::scope_boundary_row_id(
                             policy_allowed_row_id.clone(),
-                            self.dispatch_tool(canonical_tool_name, tool_params, principal),
+                            self.dispatch_tool(
+                                canonical_tool_name,
+                                tool_params,
+                                principal,
+                                &request_id,
+                            ),
                         ),
                     ),
                 )
@@ -955,51 +1009,51 @@ impl McpServer {
             }
 
             "resources/list" => {
-                // P081: evaluate BoundaryPolicy before exposing resource listing.
-                // Observer compact reads are modeled as mcp_tools_call in the matrix;
-                // operator/automation discovery remains mcp_tools_list.
-                // matrix_row: p081.agent_operator.mcp_tools_list.discovery
-                // matrix_row: p081.observer.mcp_tools_call.compact_read
+                // Expose domain resource URI templates.
+                // Primary scheme matches the proposal contract:
+                //   run://{id}  idea://{id}  artifact://{id}  report://{run_id}
+                // The chainworks:// family is also kept for backward compatibility.
+                // SEC-HIGH-001: evaluate BoundaryPolicy for resources/list as a first-class action.
                 if let Some(policy) = &self.boundary_policy {
-                    let caller_class = auth::derive_caller_class_for_mcp(&principal);
-                    let policy_transport = resources_list_policy_transport(caller_class.as_str());
-                    match policy.evaluate(
+                    let caller_class = auth::derive_caller_class_for_mcp(principal);
+                    let decision = policy.evaluate(
                         caller_class.as_str(),
-                        policy_transport,
+                        "mcp_tools_list",
                         Some("resources.list"),
-                    ) {
+                    );
+                    match decision {
                         auth::boundary::PolicyDecision::Deny {
                             reason_code,
                             row_id,
                             ..
                         } => {
+                            tracing::debug!(
+                                caller_class = caller_class.as_str(),
+                                reason_code = %reason_code,
+                                row_id = ?row_id,
+                                "BoundaryPolicy: resources/list denied"
+                            );
                             if let Err(e) = write_mcp_deny_audit(
                                 &self.pool,
                                 self.boundary_policy.as_deref(),
                                 principal,
-                                policy_transport,
-                                "resources/list",
+                                "mcp_tools_list",
+                                "resources.list",
                                 &reason_code,
                                 row_id.as_deref(),
                             )
                             .await
                             {
-                                tracing::error!(
-                                    error = %e,
-                                    "boundary deny audit write failed; failing closed (resources/list)"
-                                );
+                                tracing::error!(error = %e, "resources/list denial audit write failed; failing closed");
                                 return JsonRpcResponse::error(
                                     id,
-                                    -32000,
-                                    "unauthorized".to_string(),
+                                    -32603,
+                                    "audit_store_failure".to_string(),
                                 );
                             }
-                            return JsonRpcResponse::policy_denial(
+                            return JsonRpcResponse::success(
                                 id,
-                                &reason_code,
-                                caller_class.as_str(),
-                                row_id.as_deref(),
-                                "p081-boundary-matrix-v1",
+                                serde_json::json!({ "resources": [] }),
                             );
                         }
                         auth::boundary::PolicyDecision::Shadow { matched_decision } => {
@@ -1021,10 +1075,6 @@ impl McpServer {
                         | auth::boundary::PolicyDecision::LegacyPassthrough => {}
                     }
                 }
-                // Expose domain resource URI templates.
-                // Primary scheme matches the proposal contract:
-                //   run://{id}  idea://{id}  artifact://{id}  report://{run_id}
-                // The chainworks:// family is also kept for backward compatibility.
                 let filtered: Vec<_> =
                     auth::filter_resources(principal, &auth::all_resource_templates())
                         .into_iter()
@@ -1035,116 +1085,112 @@ impl McpServer {
             }
 
             "resources/templates/list" => {
-                // P081: evaluate BoundaryPolicy for resource template discovery.
-                // Use concrete action so absent matrix rows fail closed (H-002 fix).
-                // matrix_row: p081.agent_operator.mcp_tools_list.discovery
+                // No parameterized resource templates yet.
+                // SEC-HIGH-001: evaluate BoundaryPolicy for resources/templates/list.
                 if let Some(policy) = &self.boundary_policy {
-                    let caller_class = auth::derive_caller_class_for_mcp(&principal);
-                    match policy.evaluate(
+                    let caller_class = auth::derive_caller_class_for_mcp(principal);
+                    let decision = policy.evaluate(
                         caller_class.as_str(),
                         "mcp_tools_list",
                         Some("resources.templates.list"),
-                    ) {
+                    );
+                    match decision {
                         auth::boundary::PolicyDecision::Deny {
                             reason_code,
                             row_id,
                             ..
                         } => {
+                            tracing::debug!(
+                                caller_class = caller_class.as_str(),
+                                reason_code = %reason_code,
+                                row_id = ?row_id,
+                                "BoundaryPolicy: resources/templates/list denied"
+                            );
                             if let Err(e) = write_mcp_deny_audit(
                                 &self.pool,
                                 self.boundary_policy.as_deref(),
                                 principal,
                                 "mcp_tools_list",
-                                "resources/templates/list",
+                                "resources.templates.list",
                                 &reason_code,
                                 row_id.as_deref(),
                             )
                             .await
                             {
-                                tracing::error!(
-                                    error = %e,
-                                    "boundary deny audit write failed; failing closed (resources/templates/list)"
-                                );
+                                tracing::error!(error = %e, "resources/templates/list denial audit write failed; failing closed");
                                 return JsonRpcResponse::error(
                                     id,
-                                    -32000,
-                                    "unauthorized".to_string(),
+                                    -32603,
+                                    "audit_store_failure".to_string(),
                                 );
                             }
-                            return JsonRpcResponse::policy_denial(
+                            return JsonRpcResponse::success(
                                 id,
-                                &reason_code,
-                                caller_class.as_str(),
-                                row_id.as_deref(),
-                                "p081-boundary-matrix-v1",
+                                serde_json::json!({ "resourceTemplates": [] }),
                             );
                         }
-                        auth::boundary::PolicyDecision::Shadow { matched_decision } => {
-                            if let auth::boundary::PolicyDecision::Deny {
-                                reason_code,
-                                row_id,
-                                ..
-                            } = *matched_decision
-                            {
-                                tracing::debug!(
-                                    caller_class = caller_class.as_str(),
-                                    reason_code = %reason_code,
-                                    row_id = ?row_id,
-                                    "BoundaryPolicy shadow: matrix would deny resources/templates/list"
-                                );
-                            }
-                        }
+                        auth::boundary::PolicyDecision::Shadow { .. } => {}
                         auth::boundary::PolicyDecision::Allow { .. }
                         | auth::boundary::PolicyDecision::LegacyPassthrough => {}
                     }
                 }
-                // No parameterized resource templates yet.
                 JsonRpcResponse::success(id, serde_json::json!({ "resourceTemplates": [] }))
             }
 
             "resources/read" => {
-                // P081: evaluate BoundaryPolicy before exposing resource data.
-                // Use concrete action "resources.read" so absent matrix rows fail closed (H-002 fix).
-                // matrix_row: p081.agent_operator.mcp_tools_call.command
+                let params = req.params.unwrap_or(serde_json::Value::Null);
+                let uri = match params["uri"].as_str() {
+                    Some(u) => u.to_string(),
+                    None => {
+                        return JsonRpcResponse::error(
+                            id,
+                            -32602,
+                            "resources/read requires a 'uri' parameter".to_string(),
+                        );
+                    }
+                };
+                // SEC-HIGH-001: evaluate BoundaryPolicy for resources/read as a first-class action.
                 if let Some(policy) = &self.boundary_policy {
-                    let caller_class = auth::derive_caller_class_for_mcp(&principal);
-                    match policy.evaluate(
+                    let caller_class = auth::derive_caller_class_for_mcp(principal);
+                    let decision = policy.evaluate(
                         caller_class.as_str(),
                         "mcp_tools_call",
                         Some("resources.read"),
-                    ) {
+                    );
+                    match decision {
                         auth::boundary::PolicyDecision::Deny {
                             reason_code,
                             row_id,
                             ..
                         } => {
+                            tracing::debug!(
+                                caller_class = caller_class.as_str(),
+                                reason_code = %reason_code,
+                                row_id = ?row_id,
+                                "BoundaryPolicy: resources/read denied"
+                            );
                             if let Err(e) = write_mcp_deny_audit(
                                 &self.pool,
                                 self.boundary_policy.as_deref(),
                                 principal,
                                 "mcp_tools_call",
-                                "resources/read",
+                                "resources.read",
                                 &reason_code,
                                 row_id.as_deref(),
                             )
                             .await
                             {
-                                tracing::error!(
-                                    error = %e,
-                                    "boundary deny audit write failed; failing closed (resources/read)"
-                                );
+                                tracing::error!(error = %e, "resources/read denial audit write failed; failing closed");
                                 return JsonRpcResponse::error(
                                     id,
-                                    -32000,
-                                    "unauthorized".to_string(),
+                                    -32603,
+                                    "audit_store_failure".to_string(),
                                 );
                             }
-                            return JsonRpcResponse::policy_denial(
+                            return JsonRpcResponse::error(
                                 id,
-                                &reason_code,
-                                caller_class.as_str(),
-                                row_id.as_deref(),
-                                "p081-boundary-matrix-v1",
+                                -32004,
+                                format!("auth_failure: {reason_code}"),
                             );
                         }
                         auth::boundary::PolicyDecision::Shadow { matched_decision } => {
@@ -1166,17 +1212,7 @@ impl McpServer {
                         | auth::boundary::PolicyDecision::LegacyPassthrough => {}
                     }
                 }
-                let params = req.params.unwrap_or(serde_json::Value::Null);
-                let uri = match params["uri"].as_str() {
-                    Some(u) => u.to_string(),
-                    None => {
-                        return JsonRpcResponse::error(
-                            id,
-                            -32602,
-                            "resources/read requires a 'uri' parameter".to_string(),
-                        );
-                    }
-                };
+                let request_id = public_json_rpc_request_id(&id);
                 if matches!(
                     principal.class,
                     auth::PrincipalClass::Agent | auth::PrincipalClass::Observer
@@ -1188,7 +1224,22 @@ impl McpServer {
                 {
                     return JsonRpcResponse::error(id, -32002, "Resource not found".to_string());
                 }
-                self.handle_resource_read(id, &uri, principal).await
+                self.handle_hot_read_json_rpc(
+                    id,
+                    "artifacts.metadata.get",
+                    async {
+                        let data = self.read_resource_for_principal(&uri, principal).await?;
+                        Ok(serde_json::json!({
+                            "contents": [{
+                                "uri": uri,
+                                "mimeType": "application/json",
+                                "text": data.to_string()
+                            }]
+                        }))
+                    },
+                    &request_id,
+                )
+                .await
             }
 
             "notifications/initialized" => {
@@ -1212,51 +1263,71 @@ impl McpServer {
             .filter(|id| tools::p064_operator_tool_enabled(&tools::mcp_tool_for(*id).name))
             .map(tools::mcp_tool_for)
             .map(tools::codex_compatible_tool)
-            .chain(
-                principal
-                    .tool_capabilities
-                    .contains(&CapabilityToolId::RuntimeHealth)
-                    .then(|| {
-                        tools::codex_compatible_tool(tools::runtime::boundary_runtime_tool_spec())
-                    }),
-            )
             .collect()
     }
 
-    async fn handle_resource_read(
+    async fn handle_hot_read_json_rpc<F>(
         &self,
         id: Option<serde_json::Value>,
-        uri: &str,
-        principal: &auth::Principal,
-    ) -> JsonRpcResponse {
-        let result: anyhow::Result<serde_json::Value> =
-            self.read_resource_for_principal(uri, principal).await;
+        surface: &str,
+        read: F,
+        request_id: &str,
+    ) -> JsonRpcResponse
+    where
+        F: Future<Output = anyhow::Result<serde_json::Value>>,
+    {
+        let guard = hot_read_guard::HotReadGuard::new(self.pool.clone(), surface);
+        let check = match guard.check(Some(request_id)).await {
+            Ok(check) => check,
+            Err(error) => {
+                return JsonRpcResponse::error(id, -32603, error.to_string())
+                    .with_error_request_id(Some(request_id))
+            }
+        };
+        let (is_probe, _probe_guard) = match check {
+            hot_read_guard::CheckResult::Allowed {
+                is_probe,
+                probe_guard,
+            } => (is_probe, probe_guard),
+            hot_read_guard::CheckResult::Denied(err) => return JsonRpcResponse::success(id, err),
+        };
+
+        let timeout_ms = if is_probe { 500 } else { 10_000 };
+        let start = std::time::Instant::now();
+
+        // P087: Create a cancellation token so timeout-dropped futures release SQLite/metadata/lane resources.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _cancel_guard = cancel.clone().drop_guard();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            db::writer::CANCELLATION_TOKEN.scope(cancel, read),
+        )
+        .await;
+        let duration = start.elapsed();
+        db::metrics::record_hot_read_latency(surface, duration);
+        // initialize/tools.list are MCP handshake probes; runtime.health is the explicit liveness surface.
+        if surface == "runtime.health" || surface == "tools.list" || surface == "initialize" {
+            db::metrics::record_mcp_liveness_gate_duration(duration);
+        }
+
         match result {
-            Ok(data) => JsonRpcResponse::success(
-                id,
-                serde_json::json!({
-                    "contents": [{
-                        "uri": uri,
-                        "mimeType": "application/json",
-                        "text": data.to_string()
-                    }]
-                }),
-            ),
-            Err(e) => {
-                // SEC-P081-003: Log full error chain server-side; return bounded envelope
-                // with request_id correlation only — no raw error text to clients.
-                let rid = crate::request_context::current_request_id();
-                tracing::error!(
-                    error = %e,
-                    request_id = ?rid,
-                    uri = %uri,
-                    "mcp resources/read: internal error"
-                );
-                let data = serde_json::json!({
-                    "code": "INTERNAL",
-                    "request_id": rid,
-                });
-                JsonRpcResponse::error_with_data(id, -32603, "INTERNAL", data)
+            Ok(Ok(value)) => {
+                let _ = guard.record_success().await;
+                JsonRpcResponse::success(id, value)
+            }
+            Ok(Err(error)) => JsonRpcResponse::error(id, -32603, error.to_string())
+                .with_error_request_id(Some(request_id)),
+            Err(_) => {
+                let _ = guard.record_violation("timeout").await;
+                JsonRpcResponse::success(
+                    id,
+                    tools::storage::typed_error(
+                        surface,
+                        tools::storage::ERR_TIMEOUT,
+                        format!("hot read timeout ({timeout_ms}ms)"),
+                        Some(request_id),
+                    ),
+                )
             }
         }
     }
@@ -1275,6 +1346,15 @@ impl McpServer {
         uri: &str,
         principal: &auth::Principal,
     ) -> anyhow::Result<serde_json::Value> {
+        if matches!(
+            principal.class,
+            auth::PrincipalClass::Agent | auth::PrincipalClass::Observer
+        ) && (uri.starts_with("artifact://") || uri.starts_with("report://"))
+        {
+            // matrix_row: p081.agent_operator.resources_read.report
+            anyhow::bail!("Resource not found");
+        }
+
         if let Some(run_id) = uri.strip_prefix("run://") {
             return self.read_canonical_run_resource(run_id, principal).await;
         }
@@ -1309,6 +1389,15 @@ impl McpServer {
                     "name": art.name,
                     "contract_id": art.contract_id,
                     "format": art.format.to_string(),
+                    "artifact_metadata_pointer": {
+                        "schemaVersion": "artifact_metadata_pointer.v1",
+                        "artifactId": art.id.to_string(),
+                        "checksumSha256": art.checksum_sha256,
+                        "sizeBytes": art.size_bytes,
+                        "authorizedPayloadRoute": format!("/artifacts/{}/payload", art.id),
+                        "payloadPathRedacted": true,
+                        "forbiddenFields": ["absolutePath", "filesystemPath", "rawPayload"]
+                    },
                     "provider": art.provider,
                     "report_kind": art.report_kind,
                     "created_at": art.created_at.to_rfc3339(),
@@ -1326,22 +1415,30 @@ impl McpServer {
                 .map_err(|_| anyhow::anyhow!("Invalid run id: {run_id}"))?
                 .into();
             let stage_rows = projections::list_stages_projection(&self.pool, run_id).await?;
-            let artifact_rows_raw =
-                projections::list_artifacts_projection(&self.pool, run_id).await?;
-            let artifact_rows: Vec<serde_json::Value> = artifact_rows_raw
+            let artifact_rows = projections::list_artifacts_projection(&self.pool, run_id).await?;
+            let public_artifact_index: Vec<_> = artifact_rows
                 .iter()
-                .map(|row| {
-                    let mut v = serde_json::to_value(row).unwrap_or_default();
-                    if let serde_json::Value::Object(ref mut m) = v {
-                        m.remove("file_path");
-                    }
-                    v
-                })
+                .map(tools::reports::public_artifact_index_row)
                 .collect();
             let run_artifacts =
                 db::repos::artifacts::list_by_run(&self.pool, run_id_parsed).await?;
-            let (mcp_rollout_readback, run_report_rollout_readback) =
-                rollout_contract_readback_lanes_json(&self.pool, run_id_parsed).await?;
+            let is_operator = principal.class == auth::PrincipalClass::Operator;
+            let (mcp_rollout_readback, run_report_rollout_readback) = if is_operator {
+                rollout_contract_readback_lanes_json(&self.pool, run_id_parsed).await?
+            } else {
+                (serde_json::Value::Null, serde_json::Value::Null)
+            };
+            // Fetch p082 readbacks once and emit "report_resource" lane metrics.
+            // Pass the pre-fetched value into artifact_report_json so per-artifact
+            // lanes are not re-emitted for each artifact in the loop.
+            let p082_recovery_matrix_readbacks =
+                tools::reports::p082_recovery_matrix_readbacks_json(
+                    &self.pool,
+                    run_id_parsed,
+                    &principal.class,
+                    "report_resource",
+                )
+                .await?;
             let mut artifact_payloads = Vec::with_capacity(run_artifacts.len());
             for artifact in &run_artifacts {
                 artifact_payloads.push(
@@ -1349,51 +1446,114 @@ impl McpServer {
                         &self.pool,
                         artifact,
                         Some(&run_report_rollout_readback),
+                        &principal.class,
+                        &run_proj.artifact_root,
+                        Some(&p082_recovery_matrix_readbacks),
                     )
                     .await?,
                 );
             }
             let closeout_readiness_summary =
                 tools::reports::closeout_readiness_summary_json(&self.pool, run_id_parsed).await?;
-            let code_writer_completion_receipts =
-                tools::reports::code_writer_completion_receipts_json(&self.pool, run_id_parsed)
-                    .await?;
-            let implementation_completion =
-                tools::reports::implementation_completion_json(&self.pool, run_id_parsed).await?;
-            let retry_authority_history =
-                tools::reports::retry_authority_history_json(&self.pool, run_id_parsed).await?;
-            let retry_authority =
-                tools::reports::retry_authority_current_json(&self.pool, run_id_parsed).await?;
-            let p091_orphan_repair_readback =
-                tools::reports::p091_orphan_repair_readback_json(&self.pool, run_id_parsed).await?;
-
-            return Ok(serde_json::json!({
-                "run_id": run_id,
-                "status": run_proj.status,
-                "total_stages": run_proj.total_stages,
-                "completed_stages": run_proj.completed_stages,
-                "failed_stages": run_proj.failed_stages,
-                "has_artifacts": !artifact_rows.is_empty(),
-                "stages": stage_rows,
-                "agent_executions": tools::reports::execution_mcp_truth_json(
+            let mut response = serde_json::Map::new();
+            response.insert("run_id".into(), serde_json::json!(run_id));
+            response.insert("status".into(), serde_json::json!(run_proj.status));
+            response.insert(
+                "total_stages".into(),
+                serde_json::json!(run_proj.total_stages),
+            );
+            response.insert(
+                "completed_stages".into(),
+                serde_json::json!(run_proj.completed_stages),
+            );
+            response.insert(
+                "failed_stages".into(),
+                serde_json::json!(run_proj.failed_stages),
+            );
+            response.insert(
+                "has_artifacts".into(),
+                serde_json::json!(!artifact_rows.is_empty()),
+            );
+            response.insert("stages".into(), serde_json::to_value(stage_rows)?);
+            response.insert(
+                "agent_executions".into(),
+                tools::reports::execution_mcp_truth_json(&self.pool, run_id_parsed, is_operator)
+                    .await?,
+            );
+            response.insert(
+                "p082_recovery_matrix_readbacks".into(),
+                p082_recovery_matrix_readbacks,
+            );
+            response.insert(
+                "implementation_self_assessment_summary".into(),
+                tools::reports::implementation_self_assessment_summary_json(
                     &self.pool,
                     run_id_parsed,
-                    principal.class == auth::PrincipalClass::Operator,
                 )
                 .await?,
-                "code_writer_completion_receipts": code_writer_completion_receipts,
-                "implementationCompletion": implementation_completion,
-                "workflow_conflict": tools::reports::workflow_conflict_json(&self.pool, &self.cmd_handler, run_id_parsed).await?,
-                "retryAuthority": retry_authority,
-                "retryAuthorityHistory": retry_authority_history,
-                "p091OrphanRepairReadback": p091_orphan_repair_readback,
-                "implementation_self_assessment_summary": tools::reports::implementation_self_assessment_summary_json(&self.pool, run_id_parsed).await?,
-                "rollout_contract_readback": mcp_rollout_readback,
-                "implementation_closeout_readiness_summary": closeout_readiness_summary.clone(),
-                "closeout_readiness_summary": closeout_readiness_summary,
-                "artifact_index": artifact_rows,
-                "artifacts": artifact_payloads,
-            }));
+            );
+            response.insert(
+                "implementation_closeout_readiness_summary".into(),
+                closeout_readiness_summary.clone(),
+            );
+            response.insert(
+                "closeout_readiness_summary".into(),
+                closeout_readiness_summary,
+            );
+            response.insert(
+                "artifact_index".into(),
+                serde_json::to_value(public_artifact_index)?,
+            );
+            response.insert(
+                "artifacts".into(),
+                serde_json::Value::Array(artifact_payloads),
+            );
+            if is_operator {
+                response.insert(
+                    "code_writer_completion_receipts".into(),
+                    tools::reports::code_writer_completion_receipts_json(&self.pool, run_id_parsed)
+                        .await?,
+                );
+                response.insert(
+                    "implementationCompletion".into(),
+                    tools::reports::implementation_completion_json(&self.pool, run_id_parsed)
+                        .await?,
+                );
+                response.insert(
+                    "workflow_conflict".into(),
+                    tools::reports::workflow_conflict_json(
+                        &self.pool,
+                        &self.cmd_handler,
+                        run_id_parsed,
+                    )
+                    .await?,
+                );
+                response.insert(
+                    "retryAuthority".into(),
+                    tools::reports::retry_authority_current_json(&self.pool, run_id_parsed).await?,
+                );
+                response.insert(
+                    "retryAuthorityHistory".into(),
+                    tools::reports::retry_authority_history_json(&self.pool, run_id_parsed).await?,
+                );
+                response.insert(
+                    "p091OrphanRepairReadback".into(),
+                    tools::reports::p091_orphan_repair_readback_json(&self.pool, run_id_parsed)
+                        .await?,
+                );
+                response.insert(
+                    "p094_boundary_readback".into(),
+                    db::repos::artifact_contracts::p094_readback_json(&self.pool, run_id_parsed)
+                        .await?,
+                );
+                response.insert(
+                    "p094_rollout_decision".into(),
+                    tools::reports::p094_rollout_decision_json(&self.pool, run_id_parsed).await?,
+                );
+                response.insert("rollout_contract_readback".into(), mcp_rollout_readback);
+            }
+
+            return Ok(serde_json::Value::Object(response));
         }
 
         if let Some(analysis_id) = uri.strip_prefix("steward-analysis://") {
@@ -1411,18 +1571,19 @@ impl McpServer {
         }
 
         if uri == "chainworks://runs" {
-            let is_operator = principal.class == auth::PrincipalClass::Operator;
             let rows = projections::list_active_projection(&self.pool).await?;
-            // SEC-003: Redact local filesystem path fields for non-Operator principals.
-            let values = rows
-                .into_iter()
-                .map(|row| {
-                    let mut v = serde_json::to_value(row)?;
-                    tools::runs::redact_run_projection_paths(&mut v, is_operator);
-                    Ok(v)
-                })
-                .collect::<std::result::Result<Vec<serde_json::Value>, serde_json::Error>>()?;
-            return Ok(serde_json::Value::Array(values));
+            if principal.class != auth::PrincipalClass::Operator {
+                let sanitized: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|row| {
+                        let mut v = serde_json::to_value(row).unwrap_or(serde_json::Value::Null);
+                        tools::runs::redact_non_operator_run_projection(&mut v);
+                        v
+                    })
+                    .collect();
+                return Ok(serde_json::to_value(sanitized)?);
+            }
+            return Ok(serde_json::to_value(rows)?);
         }
 
         if uri == "chainworks://ideas" {
@@ -1453,17 +1614,25 @@ impl McpServer {
                 return Ok(serde_json::to_value(rows)?);
             } else if let Some(rid) = run_id.strip_suffix("/artifacts") {
                 let rows = projections::list_artifacts_projection(&self.pool, rid).await?;
-                let redacted: Vec<serde_json::Value> = rows
-                    .iter()
-                    .map(|row| {
-                        let mut v = serde_json::to_value(row).unwrap_or_default();
-                        if let serde_json::Value::Object(ref mut m) = v {
-                            m.remove("file_path");
-                        }
-                        v
-                    })
-                    .collect();
-                return Ok(serde_json::to_value(redacted)?);
+                if principal.class != auth::PrincipalClass::Operator {
+                    let sanitized: Vec<serde_json::Value> = rows
+                        .iter()
+                        .map(|row| {
+                            let mut v =
+                                serde_json::to_value(row).unwrap_or(serde_json::Value::Null);
+                            if let Some(obj) = v.as_object_mut() {
+                                obj.remove("file_path");
+                                obj.remove("source_agent_execution_id");
+                                obj.remove("source_stage_execution_id");
+                                obj.remove("source_session_generation_id");
+                                obj.remove("source_work_item_id");
+                            }
+                            v
+                        })
+                        .collect();
+                    return Ok(serde_json::to_value(sanitized)?);
+                }
+                return Ok(serde_json::to_value(rows)?);
             } else {
                 return self.read_canonical_run_resource(run_id, principal).await;
             }
@@ -1484,13 +1653,15 @@ impl McpServer {
         let run = runs::find_by_id(&self.pool, run_id_parsed)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Run not found: {run_id}"))?;
-        let is_operator = matches!(principal.class, auth::PrincipalClass::Operator);
         let mut value = serde_json::to_value(run)?;
-        // SEC HIGH-001: strip operator-only snapshot fields before any caller-visible return.
-        tools::runs::redact_run_snapshot_fields(&mut value, is_operator);
         if let Some(obj) = value.as_object_mut() {
-            // HIGH-002: projection, overrides, and rollout readback are Operator-only.
-            if is_operator {
+            // SEC-HIGH-002: strip sensitive fields for non-Operator principals.
+            if principal.class != auth::PrincipalClass::Operator {
+                tools::runs::redact_run_for_non_operator(obj);
+            }
+            // active_artifact_index and run_state_projection include operator-only
+            // recovery diagnostics, local paths, and source IDs — Operator only.
+            if principal.class == auth::PrincipalClass::Operator {
                 if let Some(projection) = db::repos::artifact_contracts::find_run_state_projection(
                     &self.pool,
                     run_id_parsed,
@@ -1510,10 +1681,6 @@ impl McpServer {
                         )?,
                     );
                 }
-                obj.insert(
-                    "rollout_contract_readback".into(),
-                    rollout_contract_readback_json(&self.pool, run_id_parsed).await?,
-                );
             }
             if let Some(row) = projections::find_run_projection(&self.pool, run_id).await? {
                 obj.insert("total_stages".into(), serde_json::json!(row.total_stages));
@@ -1527,64 +1694,36 @@ impl McpServer {
                     serde_json::json!(row.pending_approvals),
                 );
             }
-            obj.insert(
-                "implementation_self_assessment_summary".into(),
-                tools::reports::implementation_self_assessment_summary_json(
-                    &self.pool,
-                    run_id_parsed,
-                )
-                .await?,
-            );
-            // SEC-001: escalation attribution columns are Operator-only; strip them from
-            // agent_executions rows served to Agent and Observer principals.
-            let is_operator = matches!(principal.class, auth::PrincipalClass::Operator);
-            const ESCALATION_EXECUTION_FIELDS: &[&str] = &[
-                "escalation_policy_id",
-                "escalation_policy_hash",
-                "escalation_tier_id",
-                "escalation_tier_kind_raw",
-                "escalation_trigger_raw",
-                "escalation_digest_version",
-                "escalation_ledger_id",
-            ];
-            let stage_rows = stages::list_by_run(&self.pool, run_id_parsed).await?;
-            let mut stage_values = Vec::new();
-            for stage in stage_rows {
-                let executions = agent_executions::find_by_stage(&self.pool, stage.id).await?;
-                let mut stage_value = serde_json::to_value(&stage)?;
-                if let Some(stage_obj) = stage_value.as_object_mut() {
-                    let exec_values: Vec<serde_json::Value> = executions
-                        .iter()
-                        .map(|exec| {
-                            let mut v = serde_json::to_value(exec)
-                                .map_err(|e| anyhow::anyhow!("exec serialize: {e}"))?;
-                            if !is_operator {
-                                if let Some(o) = v.as_object_mut() {
-                                    for field in ESCALATION_EXECUTION_FIELDS {
-                                        o.remove(*field);
-                                    }
-                                }
-                            }
-                            Ok(v)
-                        })
-                        .collect::<anyhow::Result<_>>()?;
-                    stage_obj.insert(
-                        "agent_executions".into(),
-                        serde_json::Value::Array(exec_values),
-                    );
+            // Detail run resources are readable by Agent/Observer, but operator
+            // diagnostics and execution internals are not. Keep the same base
+            // run/projection redaction above and attach rich recovery/readback
+            // lanes only for Operators.
+            if principal.class == auth::PrincipalClass::Operator {
+                obj.insert(
+                    "implementation_self_assessment_summary".into(),
+                    tools::reports::implementation_self_assessment_summary_json(
+                        &self.pool,
+                        run_id_parsed,
+                    )
+                    .await?,
+                );
+                obj.insert(
+                    "rollout_contract_readback".into(),
+                    rollout_contract_readback_json(&self.pool, run_id_parsed).await?,
+                );
+                let stage_rows = stages::list_by_run(&self.pool, run_id_parsed).await?;
+                let mut stage_values = Vec::new();
+                for stage in stage_rows {
+                    let executions = agent_executions::find_by_stage(&self.pool, stage.id).await?;
+                    let mut stage_value = serde_json::to_value(&stage)?;
+                    if let Some(stage_obj) = stage_value.as_object_mut() {
+                        stage_obj
+                            .insert("agent_executions".into(), serde_json::to_value(executions)?);
+                    }
+                    stage_values.push(stage_value);
                 }
-                stage_values.push(stage_value);
+                obj.insert("stages".into(), serde_json::Value::Array(stage_values));
             }
-            obj.insert("stages".into(), serde_json::Value::Array(stage_values));
-            // P058 Phase 1: attach escalation_readback parity on run:// resource.
-            // Full chain detail only for Operator; summary-only for Agent/Observer.
-            let escalation_readback = if is_operator {
-                tools::runs::build_escalation_readback_json(&self.pool, run_id_parsed).await?
-            } else {
-                tools::runs::build_escalation_readback_summary_json(&self.pool, run_id_parsed)
-                    .await?
-            };
-            obj.insert("escalation_readback".into(), escalation_readback);
         }
         Ok(value)
     }
@@ -1594,6 +1733,157 @@ impl McpServer {
         tool_name: &str,
         params: serde_json::Value,
         principal: &auth::Principal,
+        request_id: &str,
+    ) -> Result<serde_json::Value> {
+        let span = tracing::info_span!("dispatch_tool", tool_name, request_id);
+        self.dispatch_tool_with_span(tool_name, params, principal, span, request_id)
+            .await
+    }
+
+    async fn dispatch_tool_with_span(
+        &self,
+        tool_name: &str,
+        params: serde_json::Value,
+        principal: &auth::Principal,
+        span: tracing::Span,
+        request_id: &str,
+    ) -> Result<serde_json::Value> {
+        use tracing::Instrument;
+        self.dispatch_tool_instrumented(tool_name, params, principal, request_id)
+            .instrument(span)
+            .await
+    }
+
+    async fn dispatch_tool_instrumented(
+        &self,
+        tool_name: &str,
+        params: serde_json::Value,
+        principal: &auth::Principal,
+        request_id: &str,
+    ) -> Result<serde_json::Value> {
+        let pool = &self.pool;
+
+        if hot_read_guard::is_hot_read_tool(tool_name) {
+            let guard = hot_read_guard::HotReadGuard::new(pool.clone(), tool_name);
+            let check = guard.check(Some(request_id)).await?;
+            let (is_probe, _probe_guard) = match check {
+                hot_read_guard::CheckResult::Allowed {
+                    is_probe,
+                    probe_guard,
+                } => (is_probe, probe_guard),
+                hot_read_guard::CheckResult::Denied(err) => return Ok(err),
+            };
+
+            // P087: Enforce probe budget capped at 500 ms, 10s cancellation for normal reads.
+            let timeout_ms = if is_probe { 500 } else { 10000 };
+            let start = std::time::Instant::now();
+
+            // P087: Create a cancellation token and link it to a drop guard.
+            // When tokio::time::timeout expires, the future is dropped, triggerring cancellation.
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let _cancel_guard = cancel.clone().drop_guard();
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms),
+                db::writer::CANCELLATION_TOKEN.scope(
+                    cancel.clone(),
+                    self.dispatch_tool_internal(tool_name, params, principal, cancel, request_id),
+                ),
+            )
+            .await;
+            let duration = start.elapsed();
+            db::metrics::record_hot_read_latency(tool_name, duration);
+            if tool_name == "runtime.health" {
+                db::metrics::record_mcp_liveness_gate_duration(duration);
+            }
+
+            let mut result = match result {
+                Ok(res) => res,
+                Err(_) => {
+                    let _ = guard.record_violation("timeout").await;
+                    return Ok(tools::storage::typed_error(
+                        tool_name,
+                        tools::storage::ERR_TIMEOUT,
+                        format!("hot read timeout ({}ms)", timeout_ms),
+                        Some(request_id),
+                    ));
+                }
+            };
+
+            match &result {
+                Ok(val) if val["error"].as_bool() == Some(true) => {
+                    // Domain error, check if it counts as violation
+                    let code = val["errorCode"].as_str().unwrap_or("");
+                    db::metrics::increment_counter_with_label(
+                        "mcp_hot_read_error_total_by_code",
+                        code,
+                    );
+                    if matches!(
+                        code,
+                        tools::storage::ERR_TIMEOUT
+                            | tools::storage::ERR_BUSY
+                            | tools::storage::ERR_UNAVAILABLE
+                    ) {
+                        let _ = guard.record_violation(code).await;
+                    }
+                }
+                Ok(val) => {
+                    let _ = guard.record_success().await;
+                    // P087: Inject hotRead success metadata if missing
+                    if val.is_object() && val["hotRead"].is_null() {
+                        if let Ok(obj) = result.as_mut() {
+                            if let Some(map) = obj.as_object_mut() {
+                                let (status, _, _, _, _, _) =
+                                    db::repos::hot_read_circuit::get_circuit_state(pool, tool_name)
+                                        .await
+                                        .unwrap_or((
+                                            db::repos::hot_read_circuit::CircuitStatus::Closed,
+                                            0,
+                                            0,
+                                            None,
+                                            None,
+                                            false,
+                                        ));
+                                map.insert(
+                                    "hotRead".to_string(),
+                                    serde_json::json!({
+                                        "status": "healthy",
+                                        "circuitState": status.as_str()
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("timeout")
+                        || msg.contains("busy")
+                        || msg.contains("unavailable")
+                    {
+                        let _ = guard.record_violation(&msg).await;
+                    }
+                }
+            }
+            result
+        } else {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            db::writer::CANCELLATION_TOKEN
+                .scope(
+                    cancel.clone(),
+                    self.dispatch_tool_internal(tool_name, params, principal, cancel, request_id),
+                )
+                .await
+        }
+    }
+
+    async fn dispatch_tool_internal(
+        &self,
+        tool_name: &str,
+        params: serde_json::Value,
+        principal: &auth::Principal,
+        cancel: tokio_util::sync::CancellationToken,
+        request_id: &str,
     ) -> Result<serde_json::Value> {
         let pool = &self.pool;
         let cmd = self.cmd_handler.as_ref();
@@ -1616,10 +1906,10 @@ impl McpServer {
             tools::artifacts::execute(tool_name, params, pool, cmd, principal).await
         } else if tool_name.starts_with("steward.") {
             tools::steward::execute(tool_name, params, pool, cmd, principal).await
-        } else if tool_name.starts_with("effects.") {
-            tools::effects::execute(tool_name, params, pool, principal).await
         } else if tool_name == "runtime.health" {
             tools::runtime::execute(params, pool, self.boundary_policy.as_deref()).await
+        } else if tool_name.starts_with("effects.") {
+            tools::effects::execute(tool_name, params, pool, principal).await
         } else if tool_name.starts_with("runtime.") {
             tools::runtime::execute_with_name(
                 tool_name,
@@ -1628,25 +1918,7 @@ impl McpServer {
                 self.boundary_policy.as_deref(),
             )
             .await
-        } else if tool_name == "boundary.runtime.get" {
-            tools::runtime::execute_with_name(
-                tool_name,
-                params,
-                pool,
-                self.boundary_policy.as_deref(),
-            )
-            .await
-        } else if tool_name == "operator.alerts.list" {
-            tools::runtime::execute_with_name(
-                tool_name,
-                params,
-                pool,
-                self.boundary_policy.as_deref(),
-            )
-            .await
         } else if tool_name.starts_with("storage.") {
-            let cancel = tokio_util::sync::CancellationToken::new();
-            let request_id = crate::request_context::current_request_id();
             tools::storage::execute_with_writer(
                 tool_name,
                 params,
@@ -1656,16 +1928,21 @@ impl McpServer {
                     .map(|heartbeat| heartbeat.as_ref()),
                 principal,
                 cancel,
-                request_id.as_deref(),
+                Some(request_id),
             )
             .await
         } else if tool_name.starts_with("agents.") {
-            // Box::pin isolates the agents future from dispatch_tool_internal's state machine,
-            // preventing the large agents executor from inflating the state machine of all
-            // non-agents paths (storage, runs, runtime, etc.) in debug builds.
-            Box::pin(tools::agents::execute(tool_name, params, pool, principal)).await
+            tools::agents::execute(tool_name, params, pool, principal).await
         } else if tool_name.starts_with("automation.") {
             tools::automation::execute(tool_name, params).await
+        } else if tool_name.starts_with("operator.") {
+            tools::runtime::execute_with_name(
+                tool_name,
+                params,
+                pool,
+                self.boundary_policy.as_deref(),
+            )
+            .await
         } else {
             Err(anyhow::anyhow!("Unknown tool namespace: {tool_name}"))
         }
@@ -1689,6 +1966,7 @@ fn is_state_changing_tool(tool_name: &str) -> bool {
             | "runs.main_sync.repair_state"
             | "runs.main_sync.record_recovery_decision"
             | "runs.knowledge_capsule.ignore"
+            | "runs.retrofit_catalog_snapshot"
             | "runs.settle_proposal_gate"
             | "ideas.create"
             | "stages.retry"
@@ -2225,14 +2503,6 @@ fn resource_template_id_for_uri(uri: &str) -> Option<ResourceTemplateId> {
         .find(|id| uri_matches_template(uri, resource_template_uri(*id)))
 }
 
-fn resources_list_policy_transport(caller_class: &str) -> &'static str {
-    if caller_class == "observer" {
-        "mcp_tools_call"
-    } else {
-        "mcp_tools_list"
-    }
-}
-
 fn resource_template_uri(id: ResourceTemplateId) -> &'static str {
     match id {
         ResourceTemplateId::RunEntity => "run://{run_id}",
@@ -2462,8 +2732,8 @@ mod p029_capability_tests {
             "approvals.list",
             "approvals.resolve",
             "stages.retry",
-            "stages.consume_provider_quota_hold",
             "workflow_conflicts.resolve",
+            "workflow_loop_budget.extend",
             "legacy_discovery_override_create",
             "reports.get",
             "steward.run_analysis",
@@ -2482,15 +2752,20 @@ mod p029_capability_tests {
     fn test_mcp_tools_list_filtered_for_agent() {
         let ag = Principal::new("ag", PrincipalClass::Agent);
         let names = tools_list_names_for(&ag);
-        // SEC-001: Agents can create ideas, list and get runs, but cannot start runs
-        // (runs.start supplies filesystem paths to the daemon — Operator-only).
-        // Agents also cannot approve, cancel, retry, or enter the steward surface.
-        for expected in ["ideas.create", "ideas.list", "runs.list", "runs.get"] {
+        // Agents can create ideas, start runs, and read reports but cannot approve,
+        // cancel, retry, or enter the steward surface.
+        for expected in [
+            "ideas.create",
+            "ideas.list",
+            "runs.start",
+            "runs.list",
+            "runs.get",
+            "reports.get",
+        ] {
             let expected = expected.replace('.', "_");
             assert!(names.contains(&expected), "agent missing {expected}");
         }
         for forbidden in [
-            "runs.start", // SEC-001: Operator-only (supplies daemon-side filesystem paths)
             "runs.main_sync.request",
             "runs.main_sync.retry",
             "runs.main_sync.set_override",
@@ -2500,13 +2775,11 @@ mod p029_capability_tests {
             "approvals.list",
             "approvals.resolve",
             "stages.retry",
-            "stages.consume_provider_quota_hold",
             "legacy_discovery_override_create",
             "runs.cancel",
             "steward.run_analysis",
             "steward.list_analyses",
             "steward.get_analysis",
-            "reports.get", // SEC-HIGH-001: exposes file_path, evidence, rollout readback — Operator-only
         ] {
             let forbidden = forbidden.replace('.', "_");
             assert!(
@@ -2520,12 +2793,13 @@ mod p029_capability_tests {
     fn test_mcp_tools_list_filtered_for_observer() {
         let ob = Principal::new("ob", PrincipalClass::Observer);
         let names = tools_list_names_for(&ob);
-        // Observer is read-only: sees list/get surfaces + approvals.list +
+        // Observer is read-only: sees list/get/report surfaces + approvals.list +
         // steward readers. Must not see any command tool.
         for expected in [
             "ideas.list",
             "runs.list",
             "runs.get",
+            "reports.get",
             "approvals.list",
             "steward.list_analyses",
             "steward.get_analysis",
@@ -2539,10 +2813,8 @@ mod p029_capability_tests {
             "runs.cancel",
             "approvals.resolve",
             "stages.retry",
-            "stages.consume_provider_quota_hold",
             "legacy_discovery_override_create",
             "steward.run_analysis",
-            "reports.get", // SEC-HIGH-001: exposes file_path, evidence, rollout readback — Operator-only
         ] {
             let forbidden = forbidden.replace('.', "_");
             assert!(
@@ -2577,33 +2849,22 @@ mod p029_capability_tests {
     fn test_mcp_resources_list_is_capability_filtered() {
         let ag = Principal::new("ag", PrincipalClass::Agent);
         let uris = resource_list_uris_for(&ag);
-        // Agent must NOT see steward-analysis template, approvals inbox,
-        // chainworks run stages/artifacts, or artifact:// / report:// (HIGH-001).
+        // Agent must NOT see steward-analysis template or approvals inbox /
+        // chainworks run stages / chainworks run artifacts (operator+observer-only).
         for forbidden in [
             "steward-analysis://{analysis_id}",
             "chainworks://approvals/inbox",
             "chainworks://runs/{run_id}/stages",
             "chainworks://runs/{run_id}/artifacts",
-            "artifact://{artifact_id}",
-            "report://{run_id}",
         ] {
             assert!(!uris.contains(forbidden), "agent must not see {forbidden}");
         }
 
-        // Observer sees the approvals inbox and the steward template but NOT
-        // artifact:// or report:// (HIGH-001).
+        // Observer sees the approvals inbox and the steward template.
         let ob = Principal::new("ob", PrincipalClass::Observer);
         let ob_uris = resource_list_uris_for(&ob);
         assert!(ob_uris.contains("steward-analysis://{analysis_id}"));
         assert!(ob_uris.contains("chainworks://approvals/inbox"));
-        assert!(
-            !ob_uris.contains("artifact://{artifact_id}"),
-            "observer must not see artifact://"
-        );
-        assert!(
-            !ob_uris.contains("report://{run_id}"),
-            "observer must not see report://"
-        );
     }
 
     // ── resources/read denial ────────────────────────────────────────
@@ -2615,27 +2876,21 @@ mod p029_capability_tests {
         let ag = Principal::new("ag", PrincipalClass::Agent);
         assert!(!resources_read_allowed(&ag, "steward-analysis://abc-123"));
 
-        // Agent can read run:// and idea://.
+        // Agent CAN read run://, idea://.
         assert!(resources_read_allowed(&ag, "run://r-1"));
         assert!(resources_read_allowed(&ag, "idea://i-1"));
-
-        // HIGH-001: artifact:// and report:// are Operator-only; Agent must be denied.
-        assert!(!resources_read_allowed(&ag, "artifact://a-1"));
-        assert!(!resources_read_allowed(&ag, "report://r-1"));
-
-        // Observer also denied artifact:// and report://.
-        let ob = Principal::new("ob", PrincipalClass::Observer);
-        assert!(!resources_read_allowed(&ob, "artifact://a-1"));
-        assert!(!resources_read_allowed(&ob, "report://r-1"));
+        assert!(!resources_read_allowed(&ag, "report://some-run-id"));
 
         // Unknown URI scheme also denied.
         assert!(!resources_read_allowed(&ag, "bogus://1"));
 
-        // Operator can read steward-analysis, artifact://, and report://.
+        let ob = Principal::new("ob", PrincipalClass::Observer);
+        assert!(!resources_read_allowed(&ob, "report://some-run-id"));
+
+        // Operator can read steward-analysis and report://.
         let op = Principal::new("op", PrincipalClass::Operator);
         assert!(resources_read_allowed(&op, "steward-analysis://abc-123"));
-        assert!(resources_read_allowed(&op, "artifact://a-1"));
-        assert!(resources_read_allowed(&op, "report://r-1"));
+        assert!(resources_read_allowed(&op, "report://some-run-id"));
     }
 
     // ── Steward-specific capability tests ────────────────────────────
@@ -2717,8 +2972,8 @@ mod tests {
     use chrono::Utc;
     use db::pool::create_pool;
     use db::repos::{
-        artifact_contracts, artifacts, audit_log, command_journal, ideas, projections,
-        rollout_contract_checks, runs, steward, validation,
+        artifact_contracts, artifacts, ideas, projections, rollout_contract_checks, runs,
+        startup_repairs, steward, validation,
     };
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
@@ -2933,10 +3188,12 @@ mod tests {
         let pool = create_pool("sqlite::memory:")
             .await
             .expect("in-memory pool failed");
-        let writer = std::sync::Arc::new(db::writer::DbWriter::new(pool.clone()));
-        db::writer::register_shared_writer(&pool, writer)
-            .await
-            .expect("register shared DbWriter for test pool");
+        db::writer::register_shared_writer(
+            &pool,
+            std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .expect("register shared writer");
         pool
     }
 
@@ -3234,6 +3491,19 @@ mod tests {
             .iter()
             .find(|artifact| artifact["report_kind"] == serde_json::json!("validation_failure"))
             .expect("validation failure artifact");
+        let rendered = value.to_string();
+        assert!(
+            !rendered.contains("file_path"),
+            "report:// public payload must not expose raw file_path fields"
+        );
+        assert!(
+            !rendered.contains(payload_path.to_string_lossy().as_ref()),
+            "report:// public payload must not expose filesystem paths"
+        );
+        assert_eq!(
+            validation_failure["artifact_metadata_pointer"]["payloadPathRedacted"],
+            serde_json::json!(true)
+        );
 
         assert_eq!(
             validation_failure["validation_failure_record"]["failureSummary"],
@@ -3298,13 +3568,12 @@ mod tests {
         let idea_id = IdeaId::new();
         let run_id = RunId::new();
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-
-        // SEC-P081: evidence file must reside inside the run's artifact_root.
+        // Use a real temp dir as artifact_root so read_failed_stage_evidence_safe
+        // passes the containment check (canonical_path must start_with artifact_root).
         let artifact_dir = tempfile::TempDir::new().unwrap();
         let mut run = make_run(run_id, idea_id);
         run.artifact_root = artifact_dir.path().to_string_lossy().to_string();
         runs::insert(&pool, &run).await.unwrap();
-
         let payload_path = artifact_dir
             .path()
             .join(format!("failed-stage-evidence-report-{run_id}.json"));
@@ -3414,7 +3683,7 @@ mod tests {
             .await
             .expect("register P041 fixture shared writer");
             let handler = make_command_handler(pool.clone());
-            let tool_value = match crate::tools::reports::execute(
+            let tool_value = crate::tools::reports::execute(
                 "reports.get",
                 serde_json::json!({ "run_id": run_id }),
                 &pool,
@@ -3422,34 +3691,13 @@ mod tests {
                 &auth::Principal::new("operator", auth::PrincipalClass::Operator),
             )
             .await
-            {
-                Ok(v) => v,
-                Err(e) if e.to_string().contains("Run not found") => {
-                    eprintln!(
-                        "P041 MCP readback: skipping fixture '{fixture_id}' — \
-                         run {run_id} not found in fixture DB (stale parity DB, \
-                         re-run engine integration tests): {e}"
-                    );
-                    continue;
-                }
-                Err(e) => panic!("P041 reports.get failed for fixture {fixture_id}: {e}"),
-            };
+            .unwrap();
             let server =
                 McpServer::new(pool.clone(), handler, auth::PrincipalTable::test_fixture());
-            let resource_value = match server.read_resource(&format!("report://{}", run_id)).await {
-                Ok(v) => v,
-                Err(e)
-                    if e.to_string().contains("Run not found")
-                        || e.to_string().contains("not found") =>
-                {
-                    eprintln!(
-                        "P041 MCP readback: skipping fixture '{fixture_id}' resource read — \
-                         run {run_id} not found in fixture DB (stale parity DB): {e}"
-                    );
-                    continue;
-                }
-                Err(e) => panic!("P041 read_resource failed for fixture {fixture_id}: {e}"),
-            };
+            let resource_value = server
+                .read_resource(&format!("report://{}", run_id))
+                .await
+                .unwrap();
             let actual = normalize_p041_mcp_actual(tool_value, resource_value);
             update_p041_surface(
                 &mut report,
@@ -3545,7 +3793,7 @@ mod tests {
     ) -> serde_json::Value {
         // P041 §6.5: exclude mcp_execution_truth (runtime-only) and
         // canonical_artifact_contracts (P057 system projection, not in golden fixtures).
-        let tool_reports = tool_value
+        let tool_reports = tool_value["reports"]
             .as_array()
             .cloned()
             .unwrap_or_default()
@@ -3562,7 +3810,7 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let tool_report_artifacts = report_artifact_names_from_reports(&tool_value);
+        let tool_report_artifacts = report_artifact_names_from_reports(&tool_value["reports"]);
         let resource_report_artifacts =
             report_artifact_names_from_reports(&resource_value["artifacts"]);
         serde_json::json!({
@@ -3787,135 +4035,325 @@ mod tests {
         auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
     }
 
-    fn observer_principal() -> auth::Principal {
-        auth::Principal::new("test-observer", auth::PrincipalClass::Observer)
-    }
-
-    async fn force_p081_audit_budget_safe_mode(pool: &sqlx::SqlitePool) {
-        let now_ms = Utc::now().timestamp_millis();
-        let payload = "x".repeat(16_100);
-        let entry = audit_log::AuditEntry {
-            id: "p081-mcp-budget-safe-mode",
-            request_id: "p081-mcp-budget-safe-mode",
-            timestamp_ms: now_ms,
-            event_type: "policy_denied",
-            principal_id: Some("test-operator"),
-            principal_class: Some("operator"),
-            caller_class: Some("ui_operator"),
-            token_id: None,
-            transport: "mcp_tools_call",
-            action_attempted: "ideas.create",
-            decision: "deny",
-            denial_reason_code: None,
-            row_id: Some("p081.audit_budget.safe_mode"),
-            env_gate_state: None,
-            source_ip_hash_or_local_process_id: None,
-            boundary_policy_mode: "enforce",
-            fixture_version: "p081-boundary-matrix-v1",
-            payload: &payload,
-            original_payload_bytes: None,
-            diagnostic_truncated: false,
-            checkpoint_id: None,
-            created_at_ms: now_ms,
-        };
-        audit_log::append(pool, &entry).await.unwrap();
-        let health = audit_log::health_snapshot(pool).await.unwrap();
-        assert_eq!(health.payload_budget_state, "read_only_safe_mode");
-    }
-
     #[tokio::test]
-    async fn proposal_081_observer_resources_list_matches_compact_read_matrix_row() {
+    async fn p082_mcp_stdio_session_recheck_uses_live_principal_table_after_reload() {
         let pool = test_pool().await;
-        let policy = Arc::new(
-            auth::boundary::BoundaryPolicy::from_embedded_with_mode(
-                auth::boundary::PolicyMode::Enforce,
-            )
-            .unwrap(),
-        );
         let server = McpServer::new(
             pool.clone(),
             make_command_handler(pool.clone()),
             auth::PrincipalTable::test_fixture(),
-        )
-        .with_boundary_policy(policy);
+        );
+        let source = server.live_principal_source();
+        let token = "test-token-xxxxxxxxxxxxxxxxxxxxx";
+        let credential = auth::LivePrincipalCredential {
+            principal_id: "test-operator".into(),
+            token_fingerprint: auth::token_fingerprint(token),
+        };
 
+        assert!(
+            source.resolve_credential(&credential).is_ok(),
+            "stdio initialized session precondition"
+        );
+
+        source.update(auth::PrincipalTable::test_fixture_disabled_token(
+            token,
+            "test-operator",
+        ));
+        assert!(
+            source.resolve_credential(&credential).is_err(),
+            "disabled bearer must be rejected by stdio live-session recheck"
+        );
+
+        source.update(auth::PrincipalTable::test_fixture_with_class(
+            "observer-token-xxxxxxxxxxxxxxxxxx",
+            "test-operator",
+            auth::PrincipalClass::Observer,
+        ));
+        assert!(
+            source.resolve_credential(&credential).is_err(),
+            "revoked bearer fingerprint must be rejected by stdio live-session recheck"
+        );
+
+        source.update(auth::PrincipalTable::test_fixture_with_class(
+            token,
+            "test-operator",
+            auth::PrincipalClass::Observer,
+        ));
+        let current = source
+            .resolve_credential(&credential)
+            .expect("re-scoped bearer remains resolvable");
+        assert_eq!(current.class, auth::PrincipalClass::Observer);
+        assert!(
+            !current
+                .tool_capabilities
+                .contains(&domain::CapabilityToolId::ReportsGet),
+            "stdio must observe re-scoped capabilities after reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn p082_reports_get_tools_call_denies_non_operator_principals() {
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+
+        for principal in [
+            auth::Principal::new("agent-report-reader", auth::PrincipalClass::Agent),
+            auth::Principal::new("observer-report-reader", auth::PrincipalClass::Observer),
+        ] {
+            let response = server
+                .handle_request(
+                    JsonRpcRequest {
+                        jsonrpc: "2.0".to_string(),
+                        id: Some(serde_json::json!(82)),
+                        method: "tools/call".to_string(),
+                        params: Some(serde_json::json!({
+                            "name": "reports.get",
+                            "arguments": {
+                                "run_id": domain::ids::RunId::new().to_string()
+                            }
+                        })),
+                    },
+                    &principal,
+                )
+                .await;
+
+            let error = response
+                .error
+                .expect("non-Operator reports.get call must be denied");
+            assert_eq!(error.code, -32004);
+            assert!(
+                response.result.is_none(),
+                "non-Operator reports.get must not return report lanes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn p082_report_resource_read_denies_non_operator_principals() {
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+
+        for principal in [
+            auth::Principal::new("agent-report-resource", auth::PrincipalClass::Agent),
+            auth::Principal::new("observer-report-resource", auth::PrincipalClass::Observer),
+        ] {
+            let response = server
+                .handle_request(
+                    JsonRpcRequest {
+                        jsonrpc: "2.0".to_string(),
+                        id: Some(serde_json::json!(83)),
+                        method: "resources/read".to_string(),
+                        params: Some(serde_json::json!({
+                            "uri": format!("report://{}", domain::ids::RunId::new())
+                        })),
+                    },
+                    &principal,
+                )
+                .await;
+
+            let error = response
+                .error
+                .expect("non-Operator report:// read must be denied");
+            assert_eq!(error.code, -32002);
+            assert!(
+                response.result.is_none(),
+                "non-Operator report:// must not return report contents"
+            );
+        }
+    }
+
+    async fn read_runs_resource_json(
+        server: &McpServer,
+        principal: &auth::Principal,
+    ) -> serde_json::Value {
         let response = server
             .handle_request(
                 JsonRpcRequest {
                     jsonrpc: "2.0".to_string(),
                     id: Some(serde_json::json!(1)),
-                    method: "resources/list".to_string(),
-                    params: Some(serde_json::json!({})),
+                    method: "resources/read".to_string(),
+                    params: Some(serde_json::json!({"uri": "chainworks://runs"})),
                 },
-                &observer_principal(),
+                principal,
             )
             .await;
-
         assert!(
             response.error.is_none(),
-            "observer resources/list must be governed by p081.observer.mcp_tools_call.compact_read: {:?}",
+            "resources/read chainworks://runs returned error: {:?}",
             response.error
         );
-        let resources = response.result.expect("resources/list result")["resources"]
-            .as_array()
-            .cloned()
-            .expect("resources/list returns resource array");
-        assert!(
-            resources
-                .iter()
-                .any(|resource| resource["uri"] == "chainworks://approvals/inbox"),
-            "observer compact resources/list must still expose observer-readable resources"
-        );
+        let text = response.result.expect("resources/read result")["contents"][0]["text"]
+            .as_str()
+            .expect("resources/read text")
+            .to_string();
+        serde_json::from_str(&text).expect("chainworks://runs resource is JSON")
     }
 
-    #[tokio::test]
-    async fn proposal_081_audit_budget_safe_mode_denies_state_changing_mcp_call() {
-        let pool = test_pool().await;
-        force_p081_audit_budget_safe_mode(&pool).await;
-        let policy = Arc::new(
-            auth::boundary::BoundaryPolicy::from_embedded_with_mode(
-                auth::boundary::PolicyMode::Enforce,
-            )
-            .unwrap(),
-        );
-        let server = McpServer::new(
-            pool.clone(),
-            make_command_handler(pool.clone()),
-            auth::PrincipalTable::test_fixture(),
-        )
-        .with_boundary_policy(policy);
-
+    async fn read_resource_json(
+        server: &McpServer,
+        principal: &auth::Principal,
+        uri: &str,
+    ) -> serde_json::Value {
         let response = server
             .handle_request(
                 JsonRpcRequest {
                     jsonrpc: "2.0".to_string(),
-                    id: Some(serde_json::json!(81)),
-                    method: "tools/call".to_string(),
-                    params: Some(serde_json::json!({
-                        "name": "ideas.create",
-                        "arguments": {
-                            "title": "blocked by audit budget",
-                            "body": "must not commit",
-                            "idempotency_key": "01900000-0000-7000-8081-000000000001"
-                        }
-                    })),
+                    id: Some(serde_json::json!(1)),
+                    method: "resources/read".to_string(),
+                    params: Some(serde_json::json!({ "uri": uri })),
                 },
-                &operator_principal(),
+                principal,
             )
             .await;
+        assert!(
+            response.error.is_none(),
+            "resources/read {uri} returned error: {:?}",
+            response.error
+        );
+        let text = response.result.expect("resources/read result")["contents"][0]["text"]
+            .as_str()
+            .expect("resources/read text")
+            .to_string();
+        serde_json::from_str(&text).expect("resource payload is JSON")
+    }
 
-        let error = response
-            .error
-            .expect("audit budget safe mode must deny state-changing call");
-        assert_eq!(error.code, -32004);
-        let data = error.data.expect("policy denial data");
-        assert_eq!(data["reason_code"], "AUDIT_BUDGET_EXHAUSTED");
-        assert_eq!(data["row_id"], "p081.audit_budget.safe_mode");
-        let ideas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ideas")
-            .fetch_one(&pool)
+    #[tokio::test]
+    async fn p082_chainworks_runs_resource_redacts_operator_only_projection_fields_for_non_operators(
+    ) {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
             .await
             .unwrap();
-        assert_eq!(ideas, 0, "denied MCP call must not mutate domain state");
+        persist_blocked_implementation_summary(&pool, run_id).await;
+        projections::rebuild_run_summary(&pool, run_id)
+            .await
+            .unwrap();
+
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let operator_runs = read_runs_resource_json(&server, &operator_principal()).await;
+        let operator_row = operator_runs
+            .as_array()
+            .and_then(|rows| rows.first())
+            .expect("operator chainworks://runs row");
+        assert!(
+            operator_row.get("workspace_root").is_some(),
+            "operator resource read should include workspace_root before non-operator redaction"
+        );
+        assert!(
+            operator_row.get("implementationCompletion").is_some(),
+            "operator resource read should include projected implementationCompletion before non-operator redaction"
+        );
+
+        for principal_class in [auth::PrincipalClass::Observer, auth::PrincipalClass::Agent] {
+            let principal = auth::Principal::new("non-operator", principal_class);
+            let runs_json = read_runs_resource_json(&server, &principal).await;
+            let row = runs_json
+                .as_array()
+                .and_then(|rows| rows.first())
+                .expect("non-operator chainworks://runs row");
+            for field in [
+                "workspace_root",
+                "artifact_root",
+                "chainworks_meta_root",
+                "implementationCompletion",
+                "closeout_readiness_summary",
+                "implementation_closeout_readiness_summary",
+            ] {
+                assert!(
+                    row.get(field).is_none(),
+                    "non-operator chainworks://runs resource must redact {field}: {row}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn p082_run_detail_resources_redact_operator_only_diagnostics_for_non_operators() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        persist_blocked_implementation_summary(&pool, run_id).await;
+        persist_rollout_contract_readback(&pool, run_id).await;
+        seed_validation_attempt(&pool, run_id).await;
+        projections::rebuild_run_summary(&pool, run_id)
+            .await
+            .unwrap();
+
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+
+        let operator = operator_principal();
+        let operator_run = read_resource_json(&server, &operator, &format!("run://{run_id}")).await;
+        assert!(
+            operator_run
+                .get("implementation_self_assessment_summary")
+                .is_some(),
+            "operator run:// must retain implementation summary"
+        );
+        assert!(
+            operator_run.get("rollout_contract_readback").is_some(),
+            "operator run:// must retain rollout readback"
+        );
+        assert!(
+            operator_run["stages"][0].get("agent_executions").is_some(),
+            "operator run:// must retain execution details"
+        );
+
+        for principal_class in [auth::PrincipalClass::Observer, auth::PrincipalClass::Agent] {
+            let principal = auth::Principal::new("non-operator-run-detail", principal_class);
+            let public_payload =
+                read_resource_json(&server, &principal, &format!("run://{run_id}")).await;
+            let direct_chainworks_payload = server
+                .read_resource_for_principal(&format!("chainworks://runs/{run_id}"), &principal)
+                .await
+                .expect("direct chainworks run detail resource should resolve");
+            for (uri, payload) in [
+                (format!("run://{run_id}"), public_payload),
+                (
+                    format!("chainworks://runs/{run_id}"),
+                    direct_chainworks_payload,
+                ),
+            ] {
+                for field in [
+                    "implementation_self_assessment_summary",
+                    "rollout_contract_readback",
+                    "active_artifact_index",
+                    "run_state_projection",
+                    "operator_overrides",
+                ] {
+                    assert!(
+                        payload.get(field).is_none(),
+                        "non-Operator {uri} must redact {field}: {payload}"
+                    );
+                }
+                assert!(
+                    payload.get("stages").is_none(),
+                    "non-Operator {uri} must not receive raw stage/agent execution internals: {payload}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -3963,10 +4401,45 @@ mod tests {
         assert_eq!(payload["tool"], "storage.reconcile_evidence_orphans");
     }
 
+    async fn open_hot_read_circuit(pool: &sqlx::SqlitePool, surface: &str) {
+        for _ in 0..3 {
+            db::repos::hot_read_circuit::record_violation(pool, surface, "timeout")
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn json_rpc_result(
+        server: &McpServer,
+        principal: &auth::Principal,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(format!("p087-{method}"))),
+            method: method.to_string(),
+            params,
+        };
+        let resp = server.handle_request(req, principal).await;
+        assert!(
+            resp.error.is_none(),
+            "P087 liveness request {method} returned JSON-RPC error: {:?}",
+            resp.error
+        );
+        resp.result
+            .unwrap_or_else(|| panic!("P087 liveness request {method} must return result"))
+    }
+
     #[tokio::test]
-    async fn test_mcp_tools_call_response_includes_journal_id_in_content_text() {
-        // runs.cancel is a command tool — its payload must carry journal_id
-        // inside the MCP content[0].text wire format.
+    async fn proposal_087_mcp_liveness_sequence_survives_running_maintenance_and_records_metrics() {
+        let _guard = crate::hot_read_guard::P087_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
         let run_id = RunId::new();
@@ -3974,30 +4447,425 @@ mod tests {
         runs::insert(&pool, &make_run(run_id, idea_id))
             .await
             .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+        let now_ms = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO maintenance_operations \
+             (id, operation_kind, status, idempotency_key, slot_generation, created_at_ms, updated_at_ms) \
+             VALUES ('p087-running-maintenance', 'repair_slot', 'running', 'p087-running-maintenance', 1, ?, ?)",
+        )
+        .bind(now_ms)
+        .bind(now_ms)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let server = McpServer::new(
             pool.clone(),
             make_command_handler(pool.clone()),
             auth::PrincipalTable::test_fixture(),
         );
-        let payload = call_tool_and_parse(
+        let principal = operator_principal();
+        let started = std::time::Instant::now();
+
+        json_rpc_result(
             &server,
-            &operator_principal(),
-            "runs.cancel",
-            serde_json::json!({
-                "run_id": run_id.to_string(),
-                "idempotency_key": uuid::Uuid::now_v7().to_string(),
-            }),
+            &principal,
+            "initialize",
+            Some(serde_json::json!({})),
         )
         .await;
-
-        let journal_id = payload["journal_id"]
-            .as_str()
-            .expect("runs.cancel response must contain journal_id as a string");
+        let tools_result = json_rpc_result(&server, &principal, "tools/list", None).await;
         assert!(
-            !journal_id.is_empty(),
-            "journal_id must be non-empty (uuid from CommandHandler::handle)"
+            tools_result["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| {
+                    tool["name"] == serde_json::json!("runtime.health")
+                        || tool["name"] == serde_json::json!("runtime_health")
+                }),
+            "P087 liveness inventory must include runtime.health"
         );
+        let runs_list =
+            call_tool_and_parse(&server, &principal, "runs.list", serde_json::json!({})).await;
+        assert!(
+            runs_list.as_array().is_some(),
+            "runs.list must remain a direct bounded read payload"
+        );
+        let runtime_health =
+            call_tool_and_parse(&server, &principal, "runtime.health", serde_json::json!({})).await;
+        assert_eq!(runtime_health["schemaVersion"], "runtime_health.v1");
+        assert_eq!(
+            runtime_health["runtimeHealthProjection"]["schemaVersion"],
+            "runtime_health_projection.v1"
+        );
+        assert!(runtime_health["runtimeHealthProjection"]["activeSessions"].is_number());
+        assert!(
+            runtime_health["runtimeHealthProjection"]["degradedFlags"]["hotReadCircuitOpen"]
+                .is_boolean()
+        );
+        assert!(
+            runtime_health["runtimeHealthProjection"]["writePressureFlags"]
+                ["writerHeartbeatRequiredForStorageHealth"]
+                .is_boolean()
+        );
+        assert!(runtime_health["runtimeHealthProjection"]["sideEffectUnresolvedCount"].is_number());
+        assert!(runtime_health["runtimeHealthProjection"]["continuationActiveCount"].is_number());
+        let storage_health =
+            call_tool_and_parse(&server, &principal, "storage.health", serde_json::json!({})).await;
+        assert_eq!(storage_health["tool"], "storage.health");
+        assert_eq!(
+            storage_health["errorCode"],
+            tools::storage::ERR_STALE,
+            "storage.health should fail fast with typed degraded status without a live writer"
+        );
+        json_rpc_result(
+            &server,
+            &principal,
+            "resources/read",
+            Some(serde_json::json!({"uri": format!("run://{run_id}")})),
+        )
+        .await;
+        let _elapsed = started.elapsed();
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+
+        assert!(db::metrics::get_hot_read_p95("tools.list").is_some());
+        assert!(db::metrics::get_hot_read_p95("runs.list").is_some());
+        assert!(db::metrics::get_runs_list_read_latency_p95().is_some());
+        assert!(db::metrics::get_hot_read_p95("runtime.health").is_some());
+        assert!(db::metrics::get_hot_read_p95("storage.health").is_some());
+        assert!(db::metrics::get_hot_read_p95("artifacts.metadata.get").is_some());
+        assert!(db::metrics::get_mcp_liveness_gate_duration_p95().is_some());
+
+        let readback = db::repos::storage_health::storage_health(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            readback["artifactNoiseProjection"]["schemaVersion"],
+            "artifact_noise_projection.v1"
+        );
+        assert!(readback["readPathMetrics"]["runsListReadLatencyP95Ms"].is_number());
+        assert!(readback["readPathMetrics"]["mcpLivenessGateDurationP95Ms"].is_number());
+        assert_eq!(
+            readback["readPathMetrics"]["mcpLivenessGateDurationSource"],
+            "runtime.health"
+        );
+        assert!(readback["readPathMetrics"]["mcpLivenessGateLastRecordedAtMs"].is_number());
+    }
+
+    #[tokio::test]
+    async fn proposal_087_runs_list_seeded_load_stays_under_500ms_and_records_p95() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        for _ in 0..10 {
+            let run_id = RunId::new();
+            runs::insert(&pool, &make_run(run_id, idea_id))
+                .await
+                .unwrap();
+            db::repos::projections::rebuild_run_summary(&pool, run_id)
+                .await
+                .unwrap();
+        }
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let principal = operator_principal();
+
+        for _ in 0..7 {
+            let started = std::time::Instant::now();
+            let payload =
+                call_tool_and_parse(&server, &principal, "runs.list", serde_json::json!({})).await;
+            let elapsed_ms = started.elapsed().as_millis();
+            assert!(
+                elapsed_ms < 500,
+                "P087 runs.list seeded hot-read budget exceeded: {elapsed_ms}ms"
+            );
+            assert!(
+                payload.as_array().is_some_and(|items| items.len() >= 10),
+                "runs.list must return the seeded active run projection set"
+            );
+        }
+
+        let p95 = db::metrics::get_runs_list_read_latency_p95()
+            .expect("runs.list p95 must be recorded by production hot-read wrapper");
+        assert!(p95 < 500, "P087 runs.list p95 budget exceeded: {p95}ms");
+    }
+
+    #[tokio::test]
+    async fn proposal_087_tools_list_json_rpc_is_hot_read_guarded() {
+        let _guard = crate::hot_read_guard::P087_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
+        let pool = test_pool().await;
+        open_hot_read_circuit(&pool, "tools.list").await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!("p087-tools-list")),
+            method: "tools/list".to_string(),
+            params: None,
+        };
+        let resp = server.handle_request(req, &operator_principal()).await;
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+
+        let result = resp.result.expect("hot-read denial is a typed result");
+        assert_eq!(result["error"], true);
+        assert_eq!(
+            result["errorCode"],
+            tools::storage::ERR_HOT_READ_CIRCUIT_OPEN
+        );
+        assert_eq!(result["tool"], "tools.list");
+    }
+
+    #[tokio::test]
+    async fn proposal_087_initialize_json_rpc_is_hot_read_guarded() {
+        let _guard = crate::hot_read_guard::P087_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
+        let pool = test_pool().await;
+        open_hot_read_circuit(&pool, "initialize").await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!("p087-initialize")),
+            method: "initialize".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+        let resp = server.handle_request(req, &operator_principal()).await;
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+
+        let result = resp.result.expect("hot-read denial is a typed result");
+        assert_eq!(result["error"], true);
+        assert_eq!(
+            result["errorCode"],
+            tools::storage::ERR_HOT_READ_CIRCUIT_OPEN
+        );
+        assert_eq!(result["tool"], "initialize");
+    }
+
+    #[tokio::test]
+    async fn proposal_087_tools_list_typed_error_sanitizes_request_id() {
+        let _guard = crate::hot_read_guard::P087_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
+        let pool = test_pool().await;
+        open_hot_read_circuit(&pool, "tools.list").await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let raw_id = format!("p087-tools-list\n{}", "x".repeat(2_048));
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(raw_id.clone())),
+            method: "tools/list".to_string(),
+            params: None,
+        };
+        let resp = server.handle_request(req, &operator_principal()).await;
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+
+        let result = resp.result.expect("hot-read denial is a typed result");
+        let request_id = result["requestId"].as_str().unwrap();
+        assert_ne!(request_id, raw_id);
+        assert!(request_id.len() <= 128);
+        assert!(!request_id.contains('\n'));
+        assert!(request_id.starts_with("request_id:sha256:"));
+        assert_eq!(
+            result["errorCode"],
+            tools::storage::ERR_HOT_READ_CIRCUIT_OPEN
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_087_tools_list_typed_error_rejects_structured_request_id() {
+        let _guard = crate::hot_read_guard::P087_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
+        let pool = test_pool().await;
+        open_hot_read_circuit(&pool, "tools.list").await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!({"raw": "do-not-publish"})),
+            method: "tools/list".to_string(),
+            params: None,
+        };
+        let resp = server.handle_request(req, &operator_principal()).await;
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+
+        let result = resp.result.expect("hot-read denial is a typed result");
+        let request_id = result["requestId"].as_str().unwrap();
+        assert!(!request_id.contains("do-not-publish"));
+        assert!(uuid::Uuid::parse_str(request_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn proposal_087_storage_health_tool_call_open_circuit_is_typed_result() {
+        let _guard = crate::hot_read_guard::P087_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
+        let pool = test_pool().await;
+        open_hot_read_circuit(&pool, "storage.health").await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!("p087-storage-health")),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "storage.health",
+                "arguments": {}
+            })),
+        };
+        let resp = server.handle_request(req, &operator_principal()).await;
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+
+        assert!(
+            resp.error.is_none(),
+            "storage.health hot-read denial must not become JSON-RPC -32603"
+        );
+        let result = resp.result.expect("typed tool-result body is returned");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tools/call result text must be JSON");
+        let payload: serde_json::Value = serde_json::from_str(text).expect("typed error JSON");
+        assert_eq!(payload["error"], true);
+        assert_eq!(
+            payload["errorCode"],
+            tools::storage::ERR_HOT_READ_CIRCUIT_OPEN
+        );
+        assert_eq!(payload["tool"], "storage.health");
+        assert!(payload["retryAfterMs"].as_i64().is_some());
+        assert_eq!(payload["hotRead"]["status"], "open");
+    }
+
+    #[tokio::test]
+    async fn proposal_087_resources_read_json_rpc_is_hot_read_guarded() {
+        let _guard = crate::hot_read_guard::P087_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
+        let pool = test_pool().await;
+        open_hot_read_circuit(&pool, "artifacts.metadata.get").await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!("p087-resource-read")),
+            method: "resources/read".to_string(),
+            params: Some(serde_json::json!({"uri": "run://00000000-0000-0000-0000-000000000001"})),
+        };
+        let resp = server.handle_request(req, &operator_principal()).await;
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+
+        let result = resp.result.expect("hot-read denial is a typed result");
+        assert_eq!(result["error"], true);
+        assert_eq!(
+            result["errorCode"],
+            tools::storage::ERR_HOT_READ_CIRCUIT_OPEN
+        );
+        assert_eq!(result["tool"], "artifacts.metadata.get");
+    }
+
+    #[test]
+    fn test_mcp_tools_call_response_includes_journal_id_in_content_text() {
+        // runs.cancel exercises a deep async call chain (handle_request →
+        // dispatch_tool_instrumented → dispatch_tool_internal → CommandHandler).
+        // In debug builds the combined future state machines can overflow the
+        // default tokio worker-thread stack (2 MiB), so spawn on a dedicated
+        // thread with a larger stack.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let pool = test_pool().await;
+                        let idea_id = IdeaId::new();
+                        let run_id = RunId::new();
+                        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+                        runs::insert(&pool, &make_run(run_id, idea_id))
+                            .await
+                            .unwrap();
+
+                        let server = McpServer::new(
+                            pool.clone(),
+                            make_command_handler(pool.clone()),
+                            auth::PrincipalTable::test_fixture(),
+                        );
+                        let payload = call_tool_and_parse(
+                            &server,
+                            &operator_principal(),
+                            "runs.cancel",
+                            serde_json::json!({
+                                "run_id": run_id.to_string(),
+                                "idempotency_key": uuid::Uuid::now_v7().to_string(),
+                            }),
+                        )
+                        .await;
+
+                        let journal_id = payload["journal_id"]
+                            .as_str()
+                            .expect("runs.cancel response must contain journal_id as a string");
+                        assert!(
+                            !journal_id.is_empty(),
+                            "journal_id must be non-empty (uuid from CommandHandler::handle)"
+                        );
+                    })
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -4052,8 +4920,8 @@ mod tests {
         assert!(
             health["readPath"]["mcpLivenessGate"]["sampleCount"]
                 .as_u64()
-                .is_some_and(|n| n >= 1),
-            "expected at least 1 liveness gate sample after tools/list call"
+                .is_some_and(|c| c >= 1),
+            "tools/list must record at least one mcp_liveness_gate_duration sample"
         );
         assert!(
             health["readPath"]["mcpLivenessGate"]["mcp_liveness_gate_duration_ms"]
@@ -4094,140 +4962,6 @@ mod tests {
             payload["runtimeHealthProjection"]["degradedFlags"]["hotReadCircuitOpen"]
                 .as_bool()
                 .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn proposal_081_runtime_health_includes_boundary_runtime_readback() {
-        let pool = test_pool().await;
-        let policy = Arc::new(
-            auth::boundary::BoundaryPolicy::from_embedded_with_mode(
-                auth::boundary::PolicyMode::Enforce,
-            )
-            .unwrap(),
-        );
-        let server = McpServer::new(
-            pool.clone(),
-            make_command_handler(pool.clone()),
-            auth::PrincipalTable::test_fixture(),
-        )
-        .with_boundary_policy(policy);
-
-        let payload = call_tool_and_parse(
-            &server,
-            &operator_principal(),
-            "runtime.health",
-            serde_json::json!({}),
-        )
-        .await;
-        let boundary = &payload["boundaryRuntime"];
-
-        assert_eq!(boundary["schemaVersion"], "boundary_runtime.v1");
-        assert_eq!(boundary["matrixId"], "p081-boundary-matrix-v1");
-        assert_eq!(boundary["policyInjected"], true);
-        assert_eq!(boundary["policyMode"], "enforce");
-        assert_eq!(boundary["safeModeActive"], false);
-        assert_eq!(
-            boundary["auditLogHealth"]["schemaVersion"],
-            "audit_log_health.v1"
-        );
-        assert!(boundary["auditLogHealth"]["rowCount"].as_i64().is_some());
-        assert_eq!(boundary["auditLogHealth"]["writable"], true);
-        assert_eq!(boundary["auditLogHealth"]["retentionMinDays"], 90);
-        assert!(boundary["auditLogHealth"]["cleanupState"]
-            .as_str()
-            .is_some());
-        assert!(boundary["auditLogHealth"]["cleanupEligibleRowCount"]
-            .as_i64()
-            .is_some());
-        assert!(boundary["auditLogHealth"]["cleanupProtectedRowCount"]
-            .as_i64()
-            .is_some());
-        assert!(boundary["auditLogHealth"]["payloadBudgetBytes"]
-            .as_i64()
-            .is_some());
-        assert!(boundary["auditLogHealth"]["payloadUsedBytes"]
-            .as_i64()
-            .is_some());
-        assert_eq!(
-            boundary["auditLogHealth"]["shadowCoverageReportRef"],
-            "docs/evidence/boundary-policy-shadow-coverage/report.json"
-        );
-        assert!(boundary["auditLogHealth"]["integrityState"]
-            .as_str()
-            .is_some());
-        assert!(
-            boundary.get("rows").is_none(),
-            "runtime.health must expose bounded audit health, not raw audit rows"
-        );
-
-        let snake_payload = call_tool_and_parse(
-            &server,
-            &operator_principal(),
-            "boundary.runtime.get",
-            serde_json::json!({}),
-        )
-        .await;
-        assert_eq!(snake_payload["schema_version"], "boundary_runtime.v1");
-        assert_eq!(snake_payload["matrix_id"], "p081-boundary-matrix-v1");
-        assert_eq!(snake_payload["policy_injected"], true);
-        assert_eq!(
-            snake_payload["audit_log_health"]["schema_version"],
-            "audit_log_health.v1"
-        );
-        assert!(snake_payload["auditLogHealth"].is_null());
-        assert_eq!(
-            snake_payload["subscription_replay"]["sequence_cursor"],
-            "seq-0"
-        );
-    }
-
-    #[tokio::test]
-    async fn proposal_081_operator_alerts_list_exposes_safe_mode_alert() {
-        let pool = test_pool().await;
-        let policy = Arc::new(
-            auth::boundary::BoundaryPolicy::from_embedded_with_mode(
-                auth::boundary::PolicyMode::ReadOnlySafeMode,
-            )
-            .unwrap(),
-        );
-        let server = McpServer::new(
-            pool.clone(),
-            make_command_handler(pool.clone()),
-            auth::PrincipalTable::test_fixture(),
-        )
-        .with_boundary_policy(policy);
-
-        let payload = call_tool_and_parse(
-            &server,
-            &operator_principal(),
-            "operator.alerts.list",
-            serde_json::json!({}),
-        )
-        .await;
-
-        assert_eq!(payload["schemaVersion"], "operator_alerts_readback_v1");
-        let alerts = payload["alerts"].as_array().expect("alerts array");
-        let safe_mode = alerts
-            .iter()
-            .find(|alert| alert["dedupeKey"] == "p081.boundary.safe_mode_active")
-            .expect("safe-mode alert must be present");
-        assert_eq!(safe_mode["schemaVersion"], "operator_alert_v1");
-        assert_eq!(safe_mode["severity"], "critical");
-        assert_eq!(safe_mode["active"], true);
-        assert_eq!(safe_mode["silenceable"], false);
-        assert_eq!(safe_mode["lifecycle"]["state"], "active_unacknowledged");
-        assert_eq!(
-            safe_mode["nativeDelivery"]["dedupePolicy"],
-            "dedupe_key_until_clear"
-        );
-        assert_eq!(
-            safe_mode["boundaryRuntime"]["safeModeActive"],
-            serde_json::Value::Bool(true)
-        );
-        assert!(
-            !payload.to_string().contains("\"rows\""),
-            "operator.alerts.list must not expose raw audit rows"
         );
     }
 
@@ -4275,10 +5009,6 @@ mod tests {
         assert!(
             tools.iter().any(|tool| tool["name"] == "runtime_health"),
             "operator tools/list must expose runtime.health as Codex-compatible runtime_health"
-        );
-        assert!(
-            tools.iter().any(|tool| tool["name"] == "boundary_runtime_get"),
-            "operator tools/list must expose P081 boundary.runtime.get as Codex-compatible boundary_runtime_get"
         );
 
         let runs_resource = server
@@ -4496,357 +5226,242 @@ mod tests {
         }
     }
 
+    // ── P082: report:// resource parity tests ──────────────────────────────
+
     #[tokio::test]
-    async fn p081_ideas_create_records_command_journal_and_idempotency_linkage() {
+    async fn p082_report_resource_includes_plural_readbacks_not_singular() {
+        // P082 lane contract: report://{run_id} exposes p082_recovery_matrix_readbacks
+        // (plural array) only. The singular p082_recovery_matrix_readback must NOT be
+        // present in the report resource payload.
         let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
         let server = McpServer::new(
             pool.clone(),
             make_command_handler(pool.clone()),
             auth::PrincipalTable::test_fixture(),
         );
-        let key = uuid::Uuid::now_v7().to_string();
+        let value = server
+            .read_resource(&format!("report://{run_id}"))
+            .await
+            .unwrap();
 
-        let payload = call_tool_and_parse(
-            &server,
-            &operator_principal(),
-            "ideas.create",
-            serde_json::json!({
-                "title": "P081 journaled idea",
-                "body": "state-changing MCP calls must be journaled",
-                "idempotency_key": key,
-            }),
-        )
-        .await;
-
-        let journal_id = payload["journal_id"]
-            .as_str()
-            .expect("ideas.create must return journal_id after command settlement");
+        // Plural must be present and must be an array (empty when no recovery rows).
         assert!(
-            payload["idea"]["id"].as_str().is_some(),
-            "ideas.create must still return the created idea payload"
+            value.get("p082_recovery_matrix_readbacks").is_some(),
+            "P082: report:// resource must include p082_recovery_matrix_readbacks (plural)"
+        );
+        assert!(
+            value["p082_recovery_matrix_readbacks"].is_array(),
+            "P082: report:// p082_recovery_matrix_readbacks must be an array"
         );
 
-        let row: (String, String, String, Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT command_type, result_status, mcp_idempotency_key, boundary_row_id, caller_class \
-             FROM command_journal WHERE id = ?1",
-        )
-        .bind(journal_id)
-        .fetch_one(&pool)
-        .await
-        .expect("journal row must exist");
-        assert_eq!(row.0, "CreateIdea");
-        assert_eq!(row.1, "completed");
-        assert_eq!(row.2, key);
-        assert_eq!(row.4.as_deref(), Some("agent_operator"));
-
-        let idempotency: (String, Option<String>) = sqlx::query_as(
-            "SELECT result_json, command_journal_id FROM mcp_command_idempotency \
-             WHERE idempotency_key = ?1",
-        )
-        .bind(&key)
-        .fetch_one(&pool)
-        .await
-        .expect("idempotency row must exist");
-        assert_eq!(
-            idempotency.1.as_deref(),
-            Some(journal_id),
-            "idempotency record must link back to the command_journal row"
-        );
-        assert_ne!(
-            idempotency.0,
-            db::repos::mcp_command_idempotency::PENDING_SENTINEL,
-            "idempotency record must be committed, not left pending"
+        // Singular must NOT be present per the lane contract.
+        assert!(
+            value.get("p082_recovery_matrix_readback").is_none(),
+            "P082: report:// resource must NOT include singular p082_recovery_matrix_readback (lane contract)"
         );
     }
 
     #[tokio::test]
-    async fn p081_ideas_create_idempotency_replay_does_not_duplicate_command_commit() {
+    async fn p082_report_resource_non_empty_readbacks_when_startup_repair_exists() {
+        // When a startup_repair row carries a valid P082 readback in its notes,
+        // report://{run_id} must return a non-empty p082_recovery_matrix_readbacks array
+        // with content byte-equivalent to reports.get mcp_execution_truth lane.
+        use db::repos::startup_repairs;
+        use domain::recovery_matrix;
+
         let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        // Seed a startup_repair with a valid P082 readback in notes.
+        let repair_id = format!("p082-requeue:cj-server-test:{run_id}:1");
+        let readback = recovery_matrix::set_readback_startup_repair(
+            recovery_matrix::build_readback_v1(
+                "P082-R01",
+                "repaired",
+                "retry",
+                recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+                "Startup requeue scheduled; requeue_generation=1.",
+                "startup_repairs, work_items, command_journal",
+                "startup_repairs, work_items",
+                &repair_id,
+                Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+                "valid",
+                "2026-05-22T00:00:00Z",
+            ),
+            recovery_matrix::build_startup_repair_summary(
+                &repair_id,
+                "wi-server-test",
+                "cj-server-test",
+                1,
+                1,
+                false,
+                60_000,
+                "2026-05-22T00:00:00Z",
+                false,
+                None,
+                "global",
+            ),
+            None,
+        );
+        let notes = serde_json::json!({
+            "requeue_generation": 1,
+            "max_requeue_generation": 1,
+            "p082_recovery_matrix_readback": readback,
+        })
+        .to_string();
+
+        startup_repairs::record(
+            &pool,
+            &format!("p082-requeue:cj-server-test:{run_id}:1"),
+            &run_id.to_string(),
+            "requeue_once",
+            Utc::now(),
+            Some(&notes),
+        )
+        .await
+        .unwrap();
+
         let server = McpServer::new(
             pool.clone(),
             make_command_handler(pool.clone()),
             auth::PrincipalTable::test_fixture(),
         );
-        let key = uuid::Uuid::now_v7().to_string();
-        let args = serde_json::json!({
-            "title": "P081 replayed idea",
-            "body": "same request must not duplicate durable writes",
-            "idempotency_key": key,
-        });
+        let value = server
+            .read_resource(&format!("report://{run_id}"))
+            .await
+            .unwrap();
 
-        let first =
-            call_tool_and_parse(&server, &operator_principal(), "ideas.create", args.clone()).await;
-        let second =
-            call_tool_and_parse(&server, &operator_principal(), "ideas.create", args).await;
+        let readbacks = value["p082_recovery_matrix_readbacks"]
+            .as_array()
+            .expect("P082: p082_recovery_matrix_readbacks must be an array");
 
         assert_eq!(
-            first["idea"]["id"], second["idea"]["id"],
-            "same idempotency key + same request must replay the original result"
+            readbacks.len(),
+            1,
+            "P082: report:// must return exactly one readback row when one startup_repair row exists"
         );
-        let journal_count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM command_journal WHERE mcp_idempotency_key = ?1")
-                .bind(&key)
-                .fetch_one(&pool)
-                .await
-                .expect("journal count");
         assert_eq!(
-            journal_count.0, 1,
-            "idempotency replay must not append a second command_journal row"
+            readbacks[0]["scenario_id"].as_str(),
+            Some("P082-R01"),
+            "P082: report:// readback must have scenario_id=P082-R01"
         );
-        let idea_count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM ideas WHERE title = 'P081 replayed idea'")
-                .fetch_one(&pool)
-                .await
-                .expect("idea count");
         assert_eq!(
-            idea_count.0, 1,
-            "idempotency replay must not duplicate domain writes"
+            readbacks[0]["scenario_status"].as_str(),
+            Some("repaired"),
+            "P082: report:// readback must use approved vocabulary (repaired)"
+        );
+        assert_eq!(
+            readbacks[0]["recovery_reason_code"].as_str(),
+            Some("startup_requeue_once"),
+            "P082: report:// readback must have correct reason_code"
+        );
+        // Singular must not be present in report:// resource.
+        assert!(
+            value.get("p082_recovery_matrix_readback").is_none(),
+            "P082: report:// resource must NOT expose singular p082_recovery_matrix_readback"
         );
     }
 
-    #[test]
-    fn p081_canonical_request_hash_sorts_nested_argument_objects() {
-        let left = serde_json::json!({
-            "idempotency_key": uuid::Uuid::now_v7().to_string(),
-            "projectionName": "runs_home",
-            "nested": {
-                "b": 2,
-                "a": 1,
-                "array": [
-                    { "z": true, "a": false }
-                ]
-            }
-        });
-        let right = serde_json::json!({
-            "projectionName": "runs_home",
-            "nested": {
-                "array": [
-                    { "a": false, "z": true }
-                ],
-                "a": 1,
-                "b": 2
+    #[tokio::test]
+    async fn p082_report_resource_run_report_artifact_empty_for_non_operator() {
+        use domain::recovery_matrix;
+
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        let repair_id = format!("p082-requeue:cj-server-authz:{run_id}:1");
+        let readback = recovery_matrix::build_readback_v1(
+            "P082-R01",
+            "repaired",
+            "retry",
+            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+            "Startup requeue scheduled; requeue_generation=1.",
+            "startup_repairs",
+            "startup_repairs, work_items",
+            &repair_id,
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "valid",
+            &now.to_rfc3339(),
+        );
+        let notes = serde_json::json!({ "p082_recovery_matrix_readback": readback }).to_string();
+        startup_repairs::record(
+            &pool,
+            &repair_id,
+            &run_id.to_string(),
+            "requeue_once",
+            now,
+            Some(&notes),
+        )
+        .await
+        .unwrap();
+        artifacts::insert(
+            &pool,
+            &Artifact {
+                id: ArtifactId::new(),
+                run_id,
+                stage_id: "state_12_workflow_complete".into(),
+                agent_id: "lead_orchestrator".into(),
+                name: "run_report".into(),
+                contract_id: "run_report_v1".into(),
+                format: ArtifactFormat::Json,
+                file_path: "/tmp/p082-report-resource-run-report.json".into(),
+                checksum_sha256: None,
+                size_bytes: Some(2),
+                provider: "system".into(),
+                model: None,
+                created_at: now,
+                is_pinned: false,
+                report_kind: Some("run_report".into()),
+                report_version: Some(1),
+                agent_execution_id: None,
             },
-            "idempotencyKey": uuid::Uuid::now_v7().to_string()
-        });
-
-        assert_eq!(
-            compute_canonical_request_hash(
-                "storage.projections.clear_backlog",
-                &left,
-                "agent_operator",
-                "test-operator",
-                "token:test",
-                Some("p081.agent_operator.mcp_tools_call.command"),
-            ),
-            compute_canonical_request_hash(
-                "storage.projections.clear_backlog",
-                &right,
-                "agent_operator",
-                "test-operator",
-                "token:test",
-                Some("p081.agent_operator.mcp_tools_call.command"),
-            ),
-            "nested JSON key order and idempotency-key casing must not change the retry hash"
-        );
-    }
-
-    #[tokio::test]
-    async fn p081_storage_clear_backlog_claims_idempotency_in_write_unit() {
-        let pool = test_pool().await;
-        let principal = operator_principal();
-        let key = uuid::Uuid::now_v7().to_string();
-        let request_hash = "sha256:p081-storage-request";
-        let row_id = "p081.agent_operator.mcp_tools_call.command";
-        let args = serde_json::json!({
-            "projectionName": "p081-test-projection",
-            "sourceName": "p081-test-source",
-        });
-
-        let first = crate::request_context::scope_idempotency_key(
-            Some(key.clone()),
-            crate::request_context::scope_idempotency_request_hash(
-                Some(request_hash.to_string()),
-                crate::request_context::scope_boundary_row_id(
-                    Some(row_id.to_string()),
-                    tools::storage::execute_with_writer(
-                        "storage.projections.clear_backlog",
-                        args,
-                        &pool,
-                        None,
-                        &principal,
-                        tokio_util::sync::CancellationToken::new(),
-                        Some("request-p081-storage"),
-                    ),
-                ),
-            ),
         )
         .await
-        .expect("storage projection clear must succeed");
-
-        let journal_id = first["journal_id"]
-            .as_str()
-            .expect("storage projection clear must return journal_id");
-
-        let journal_count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM command_journal WHERE mcp_idempotency_key = ?1")
-                .bind(&key)
-                .fetch_one(&pool)
-                .await
-                .expect("journal count");
-        assert_eq!(
-            journal_count.0, 1,
-            "storage write unit must append exactly one command_journal row"
-        );
-
-        let idempotency: (String, Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT result_json, command_journal_id, row_id FROM mcp_command_idempotency \
-             WHERE idempotency_key = ?1",
-        )
-        .bind(&key)
-        .fetch_one(&pool)
-        .await
-        .expect("idempotency row must exist");
-        assert_eq!(
-            idempotency.0,
-            db::repos::mcp_command_idempotency::PENDING_SENTINEL,
-            "direct handler leaves final result update to the MCP server"
-        );
-        assert!(idempotency.1.is_none());
-        assert_eq!(idempotency.2.as_deref(), Some(row_id));
-
-        let result_json = serde_json::to_string(&first).unwrap();
-        let committed = db::repos::mcp_command_idempotency::update_result(
-            &pool,
-            &key,
-            &result_json,
-            None,
-            Some(journal_id),
-        )
-        .await
-        .expect("server-side idempotency finalization must update pending row");
-        assert!(committed);
-    }
-
-    #[tokio::test]
-    async fn p081_idempotency_pending_sentinel_recovers_committed_unack_without_reexecution() {
-        let pool = test_pool().await;
-        let key = uuid::Uuid::now_v7().to_string();
-        let journal_id = uuid::Uuid::new_v4().to_string();
-        let row_id = "p081.agent_operator.mcp_tools_call.command";
-
-        db::repos::mcp_command_idempotency::insert_pending(
-            &pool,
-            &key,
-            "ideas.create",
-            "test-operator",
-            "hash-before-dispatch",
-            Some(row_id),
-        )
-        .await
-        .expect("pending idempotency preclaim");
-        sqlx::query(
-            "UPDATE mcp_command_idempotency SET committed_at_ms = ?1 WHERE idempotency_key = ?2",
-        )
-        .bind(Utc::now().timestamp_millis() - 60_000)
-        .bind(&key)
-        .execute(&pool)
-        .await
-        .expect("age pending sentinel past in-flight timeout");
-
-        command_journal::record(
-            &pool,
-            &journal_id,
-            "CreateIdea",
-            r#"{"title":"committed before response"}"#,
-            None,
-            Utc::now(),
-            Some("mcp"),
-            Some("test-operator"),
-            Some("operator"),
-            Some("ideas.create"),
-            Some("request-1"),
-            Some("agent_operator"),
-            Some(&key),
-            Some(row_id),
-        )
-        .await
-        .expect("journal record");
-        command_journal::complete_entry(&pool, &journal_id, Utc::now())
+        .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
             .await
-            .expect("journal complete");
+            .unwrap();
 
-        let args = serde_json::json!({
-            "title": "committed before response",
-            "body": "retry must recover from journal instead of re-running",
-            "idempotency_key": key,
-        });
-        let outcome = mcp_idempotency_precheck(
-            &pool,
-            Some(serde_json::json!(1)),
-            "ideas.create",
-            &args,
-            &operator_principal(),
-            Some(row_id),
-        )
-        .await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
 
-        let IdempotencyOutcome::Cached(response) = outcome else {
-            panic!("expected committed-unack cached recovery response");
-        };
-        assert!(response.error.is_none());
-        let result = response.result.expect("success result");
-        assert_eq!(result["_idempotency"], "committed_unack_recovery");
-        let text = result["content"][0]["text"].as_str().expect("text result");
-        let recovery: serde_json::Value = serde_json::from_str(text).expect("recovery json");
-        assert_eq!(recovery["journal_id"], journal_id);
-
-        let rows: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM command_journal WHERE mcp_idempotency_key = ?1")
-                .bind(&key)
-                .fetch_one(&pool)
+        for principal_class in [auth::PrincipalClass::Agent, auth::PrincipalClass::Observer] {
+            let principal = auth::Principal::new("non-operator", principal_class);
+            let err = server
+                .read_resource_for_principal(&format!("report://{run_id}"), &principal)
                 .await
-                .expect("journal count");
-        assert_eq!(rows.0, 1, "recovery must not create a second command row");
-        let record = db::repos::mcp_command_idempotency::find_by_key(&pool, &key)
-            .await
-            .expect("idempotency lookup")
-            .expect("idempotency record");
-        assert_ne!(
-            record.result_json,
-            db::repos::mcp_command_idempotency::PENDING_SENTINEL,
-            "recovery must replace the pending sentinel with a durable recovery result"
-        );
-        assert_eq!(
-            record.command_journal_id.as_deref(),
-            Some(journal_id.as_str())
-        );
-    }
-
-    #[tokio::test]
-    async fn p081_idempotency_storage_unavailable_fails_closed_with_sqlite_contention_code() {
-        let pool = test_pool().await;
-        pool.close().await;
-
-        let outcome = mcp_idempotency_precheck(
-            &pool,
-            Some(serde_json::json!(1)),
-            "ideas.create",
-            &serde_json::json!({
-                "title": "contention",
-                "body": "closed pool simulates storage outage before dispatch",
-                "idempotency_key": uuid::Uuid::now_v7().to_string(),
-            }),
-            &operator_principal(),
-            Some("p081.agent_operator.mcp_tools_call.command"),
-        )
-        .await;
-
-        let IdempotencyOutcome::Denied(response) = outcome else {
-            panic!("storage outage must fail closed before dispatch");
-        };
-        let error = response.error.expect("error response");
-        assert_eq!(error.code, -32603);
-        let data = error.data.expect("structured error data");
-        assert_eq!(data["code"], "SQLITE_CONTENTION_RETRY_EXHAUSTED");
+                .expect_err("non-operator report:// helper must deny before materialization");
+            assert!(
+                err.to_string().contains("Resource not found"),
+                "P082 SEC-HIGH-1: report:// must deny non-Operators before payload materialization"
+            );
+        }
     }
 }

@@ -14,6 +14,7 @@
 import XCTest
 @testable import Chainworks_Forge
 
+@MainActor
 final class DiagnosticsBundleTests: XCTestCase {
 
     // MARK: - Fixtures

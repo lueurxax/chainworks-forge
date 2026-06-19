@@ -20,12 +20,18 @@ use domain::discovery::{
     LegacyBroadDiscoverySnapshot, NoopDiscoveryOperationRecorder, PrePromptExpectedOutputContext,
     PrePromptExpectedOutputMetadata, StdDiscoveryFilesystem,
 };
+use domain::tool_policy::{
+    default_safe_search_guidance, preflight_shell_command, ToolPreflightDecision,
+    DEFAULT_CUMULATIVE_TOOL_OUTPUT_MAX_BYTES, DEFAULT_TOOL_OUTPUT_MAX_BYTES,
+    DEFAULT_TOOL_OUTPUT_MAX_LINES, GENERATED_ROOT_DENYLIST, TOOL_GUARD_VERSION,
+    TOOL_POLICY_VERSION,
+};
 use domain::xcode_runtime::XcodeShimWarningEvent;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -353,9 +359,12 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Max time without meaningful agent progress while the transport remains alive.
 /// Keepalive/status-only ACP messages reset transport idleness, but not progress.
 const PROGRESS_TIMEOUT: Duration = Duration::from_secs(300);
+const CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT: Duration = Duration::from_secs(900);
 const PROMPT_PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(15);
 const CLAUDE_LOCAL_ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const ACP_PROMPT_SUBPROCESS_EXIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const CLAUDE_LOCAL_ACTIVITY_MAX_READ_BYTES: u64 = 1024 * 1024;
+const PROVIDER_SESSION_STORE_LINE_CAP_BYTES: usize = 16 * 1024 * 1024;
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const LATE_RESPONSE_DIAGNOSTIC_WINDOW: Duration = Duration::from_secs(2);
 
@@ -363,6 +372,29 @@ enum AcpPromptReadOutcome {
     Read(Result<usize>),
     PollElapsed,
     CloseRequested,
+}
+
+fn provider_subprocess_exit_status_during_prompt(
+    child: &mut Child,
+    closed: &mut bool,
+    session_id: &str,
+) -> Result<Option<std::process::ExitStatus>> {
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            *closed = true;
+            warn!(
+                session_id = %session_id,
+                exit_status = ?status,
+                "ACP provider subprocess exited during active prompt"
+            );
+            Ok(Some(status))
+        }
+        Ok(None) => Ok(None),
+        Err(error) => {
+            *closed = true;
+            Err(error).context("ACP provider subprocess wait failed during active prompt")
+        }
+    }
 }
 
 const OUTPUT_START_MARKER: &str = "<<<CHAINWORKS_OUTPUT:";
@@ -394,12 +426,494 @@ struct ClaudeLocalActivitySummary {
     last_prompts: u64,
     type_counts: HashMap<String, u64>,
     last_event_type: Option<String>,
+    last_assistant_message_id: Option<String>,
+    last_assistant_stop_reason: Option<String>,
+    last_assistant_incomplete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcpSilenceDeadlineDecision {
+    Continue,
+    WarnGrace,
+    Timeout,
+}
+
+fn claude_silent_after_activity_timeout_decision(
+    has_observed_local_activity: bool,
+    elapsed: Duration,
+    warning_recorded: bool,
+) -> AcpSilenceDeadlineDecision {
+    if !has_observed_local_activity {
+        return if elapsed >= PROGRESS_TIMEOUT {
+            AcpSilenceDeadlineDecision::Timeout
+        } else {
+            AcpSilenceDeadlineDecision::Continue
+        };
+    }
+    if elapsed >= CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT {
+        AcpSilenceDeadlineDecision::Timeout
+    } else if elapsed >= PROGRESS_TIMEOUT && !warning_recorded {
+        AcpSilenceDeadlineDecision::WarnGrace
+    } else {
+        AcpSilenceDeadlineDecision::Continue
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 struct ClaudeLocalActivityObservation {
     should_extend_watchdog: bool,
     new_event_count: u64,
+    has_open_local_activity: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CodexLocalActivitySummary {
+    event_count: u64,
+    function_calls: u64,
+    function_outputs: u64,
+    running_processes_started: u64,
+    running_process_outputs: u64,
+    running_processes_finished: u64,
+    turn_aborted: bool,
+    turn_completed: bool,
+    stdin_closed_control_failures: u64,
+    unbounded_tool_outputs: u64,
+    max_original_token_count: Option<u64>,
+    max_total_output_lines: Option<u64>,
+    cumulative_function_output_bytes: u64,
+    session_store_bytes_read: u64,
+    session_store_path_found: bool,
+    session_store_search_limit_hit: bool,
+    session_store_candidate_root_count: u64,
+    session_store_visited_dirs: u64,
+    session_store_visited_files: u64,
+    turn_aborted_after_open_process: bool,
+    last_pathology: Option<String>,
+    last_event_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CodexLocalActivityObservation {
+    should_extend_watchdog: bool,
+    new_event_count: u64,
+    has_open_local_activity: bool,
+}
+
+#[derive(Debug)]
+struct CodexLocalActivityMonitor {
+    session_id: Option<String>,
+    candidate_roots: Vec<PathBuf>,
+    session_path: Option<PathBuf>,
+    offset: u64,
+    summary: CodexLocalActivitySummary,
+    active_call_process_ids: HashMap<String, String>,
+    open_process_ids: HashSet<String>,
+}
+
+impl CodexLocalActivityMonitor {
+    fn for_request(req: &ExecutionRequest, session_id: &str) -> Option<Self> {
+        if !req.provider.eq_ignore_ascii_case("codex") {
+            return None;
+        }
+        let mut candidate_roots = Vec::new();
+        if let Some(runtime_home) = req.provider_runtime_home.as_deref() {
+            push_unique_codex_session_store_candidate(
+                &mut candidate_roots,
+                Path::new(runtime_home),
+            );
+        }
+        push_codex_runtime_root_candidate(&mut candidate_roots, Path::new(&req.workspace_root));
+        if let Some(worktree_root) = req.worktree_root.as_deref() {
+            push_codex_runtime_root_candidate(&mut candidate_roots, Path::new(worktree_root));
+        }
+        if candidate_roots.is_empty() {
+            return None;
+        }
+        Some(Self {
+            session_id: Some(session_id.to_string()),
+            candidate_roots,
+            session_path: None,
+            offset: 0,
+            summary: CodexLocalActivitySummary::default(),
+            active_call_process_ids: HashMap::new(),
+            open_process_ids: HashSet::new(),
+        })
+    }
+
+    #[cfg(test)]
+    fn new_for_path(session_path: PathBuf) -> Self {
+        let offset = std::fs::metadata(&session_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let summary = CodexLocalActivitySummary {
+            session_store_path_found: true,
+            ..CodexLocalActivitySummary::default()
+        };
+        Self {
+            session_id: None,
+            candidate_roots: Vec::new(),
+            session_path: Some(session_path),
+            offset,
+            summary,
+            active_call_process_ids: HashMap::new(),
+            open_process_ids: HashSet::new(),
+        }
+    }
+
+    fn poll(&mut self, _now: Instant) -> Result<CodexLocalActivityObservation> {
+        self.ensure_session_path();
+        let Some(session_path) = self.session_path.as_ref() else {
+            return Ok(CodexLocalActivityObservation {
+                should_extend_watchdog: self.has_open_local_activity(),
+                new_event_count: 0,
+                has_open_local_activity: self.has_open_local_activity(),
+            });
+        };
+
+        let mut new_event_count = 0;
+        let metadata = match std::fs::metadata(session_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(CodexLocalActivityObservation {
+                    should_extend_watchdog: self.has_open_local_activity(),
+                    new_event_count: 0,
+                    has_open_local_activity: self.has_open_local_activity(),
+                });
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Codex local activity: stat session {}",
+                        session_path.display()
+                    )
+                });
+            }
+        };
+        let len = metadata.len();
+        if len < self.offset {
+            self.offset = 0;
+        }
+        if len > self.offset {
+            let pending_bytes = len - self.offset;
+            let bytes_to_read = pending_bytes.min(CLAUDE_LOCAL_ACTIVITY_MAX_READ_BYTES);
+            if pending_bytes > DEFAULT_CUMULATIVE_TOOL_OUTPUT_MAX_BYTES {
+                self.summary.unbounded_tool_outputs += 1;
+                self.summary.last_pathology = Some("tool_output_budget_exceeded".to_string());
+            }
+            let mut file = std::fs::File::open(session_path).with_context(|| {
+                format!(
+                    "Codex local activity: open session {}",
+                    session_path.display()
+                )
+            })?;
+            file.seek(SeekFrom::Start(self.offset)).with_context(|| {
+                format!(
+                    "Codex local activity: seek session {}",
+                    session_path.display()
+                )
+            })?;
+            let mut reader = file.take(bytes_to_read);
+            let mut chunk = String::new();
+            reader.read_to_string(&mut chunk).with_context(|| {
+                format!(
+                    "Codex local activity: read session {}",
+                    session_path.display()
+                )
+            })?;
+            self.offset = self.offset.saturating_add(bytes_to_read);
+            self.summary.session_store_bytes_read = self
+                .summary
+                .session_store_bytes_read
+                .saturating_add(bytes_to_read);
+            if self.summary.session_store_bytes_read > DEFAULT_CUMULATIVE_TOOL_OUTPUT_MAX_BYTES {
+                self.summary.unbounded_tool_outputs += 1;
+                self.summary.last_pathology = Some("tool_output_budget_exceeded".to_string());
+            }
+            for line in chunk.lines().map(str::trim).filter(|line| !line.is_empty()) {
+                if let Ok(entry) = serde_json::from_str::<Value>(line) {
+                    if self.observe_entry(&entry) {
+                        new_event_count += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(CodexLocalActivityObservation {
+            should_extend_watchdog: new_event_count > 0 || self.has_open_local_activity(),
+            new_event_count,
+            has_open_local_activity: self.has_open_local_activity(),
+        })
+    }
+
+    fn ensure_session_path(&mut self) {
+        if self.session_path.is_none() {
+            let Some(session_id) = self.session_id.as_deref() else {
+                return;
+            };
+            let search = find_codex_session_store(&self.candidate_roots, session_id);
+            self.summary.session_store_candidate_root_count = search.candidate_root_count as u64;
+            self.summary.session_store_search_limit_hit |= search.limit_hit;
+            self.summary.session_store_visited_dirs = self
+                .summary
+                .session_store_visited_dirs
+                .max(search.visited_dirs as u64);
+            self.summary.session_store_visited_files = self
+                .summary
+                .session_store_visited_files
+                .max(search.visited_files as u64);
+            if let Some(path) = search.path {
+                self.summary.session_store_path_found = true;
+                self.session_path = Some(path);
+            }
+        }
+    }
+
+    fn quota_failure_event_from_session_store(&mut self) -> Option<ProviderFailureEvent> {
+        self.ensure_session_path();
+        self.session_path
+            .as_deref()
+            .and_then(codex_session_store_credits_exhausted_failure)
+    }
+
+    fn provider_failure_event_from_local_activity(&self) -> Option<ProviderFailureEvent> {
+        let pathology = self.summary.last_pathology.as_deref()?;
+        let detail = format!(
+            "{pathology}; {}; max_original_token_count={}; max_total_output_lines={}",
+            self.summary_for_error(),
+            self.summary
+                .max_original_token_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            self.summary
+                .max_total_output_lines
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        Some(ProviderFailureEvent {
+            failure_phase: if pathology == "tool_output_budget_exceeded" {
+                "tool_output_budget_exceeded"
+            } else {
+                "codex_tool_session_control_failure"
+            },
+            message: format!(
+                "Codex tool/session control failure: {pathology}; {}",
+                self.summary_for_error()
+            ),
+            detail,
+        })
+    }
+
+    fn observe_entry(&mut self, entry: &Value) -> bool {
+        let entry_type = entry
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if entry_type == "event_msg" {
+            match entry.pointer("/payload/type").and_then(Value::as_str) {
+                Some("turn_aborted") => {
+                    self.summary.event_count += 1;
+                    self.summary.turn_aborted = true;
+                    if !self.open_process_ids.is_empty() {
+                        self.summary.turn_aborted_after_open_process = true;
+                        self.summary.last_pathology =
+                            Some("codex_turn_aborted_after_open_process".to_string());
+                    }
+                    self.summary.last_event_type = Some("turn_aborted".to_string());
+                    self.active_call_process_ids.clear();
+                    self.open_process_ids.clear();
+                    return true;
+                }
+                Some("task_complete") => {
+                    self.summary.event_count += 1;
+                    self.summary.turn_completed = true;
+                    self.summary.last_event_type = Some("task_complete".to_string());
+                    if !self.open_process_ids.is_empty() {
+                        self.summary.running_processes_finished +=
+                            self.open_process_ids.len() as u64;
+                    }
+                    self.active_call_process_ids.clear();
+                    self.open_process_ids.clear();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        if entry_type != "response_item" {
+            return false;
+        }
+        let Some(payload) = entry.get("payload") else {
+            return false;
+        };
+        match payload.get("type").and_then(Value::as_str) {
+            Some("function_call") => self.observe_function_call(payload),
+            Some("function_call_output") => self.observe_function_call_output(payload),
+            _ => false,
+        }
+    }
+
+    fn observe_function_call(&mut self, payload: &Value) -> bool {
+        let Some(name) = payload.get("name").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
+            return false;
+        };
+        if !matches!(name, "exec_command" | "write_stdin") {
+            return false;
+        }
+        self.summary.event_count += 1;
+        self.summary.function_calls += 1;
+        self.summary.last_event_type = Some(name.to_string());
+        if name == "write_stdin" {
+            if let Some(process_id) = codex_function_call_session_id(payload) {
+                self.active_call_process_ids
+                    .insert(call_id.to_string(), process_id.clone());
+                self.open_process_ids.insert(process_id);
+            }
+        }
+        true
+    }
+
+    fn observe_function_call_output(&mut self, payload: &Value) -> bool {
+        let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(output) = payload.get("output").and_then(Value::as_str) else {
+            return false;
+        };
+        self.summary.event_count += 1;
+        self.summary.function_outputs += 1;
+        self.summary.last_event_type = Some("function_call_output".to_string());
+        self.observe_function_output_pathology(output);
+        self.summary.cumulative_function_output_bytes = self
+            .summary
+            .cumulative_function_output_bytes
+            .saturating_add(output.len() as u64);
+        if (output.len() as u64) > DEFAULT_TOOL_OUTPUT_MAX_BYTES
+            || self.summary.cumulative_function_output_bytes
+                > DEFAULT_CUMULATIVE_TOOL_OUTPUT_MAX_BYTES
+        {
+            self.summary.unbounded_tool_outputs += 1;
+            self.summary.last_pathology = Some("tool_output_budget_exceeded".to_string());
+        }
+        if output.contains("aborted by user") {
+            self.summary.turn_aborted = true;
+            self.active_call_process_ids.clear();
+            self.open_process_ids.clear();
+            return true;
+        }
+        if let Some(process_id) = codex_running_process_id_from_output(output) {
+            self.active_call_process_ids
+                .insert(call_id.to_string(), process_id.clone());
+            if self.open_process_ids.insert(process_id) {
+                self.summary.running_processes_started += 1;
+            }
+            self.summary.running_process_outputs += 1;
+            return true;
+        }
+        if codex_output_is_terminal_process_result(output) {
+            if let Some(process_id) = self.active_call_process_ids.remove(call_id) {
+                if self.open_process_ids.remove(&process_id) {
+                    self.summary.running_processes_finished += 1;
+                }
+            } else if !self.open_process_ids.is_empty() {
+                self.summary.running_processes_finished += self.open_process_ids.len() as u64;
+                self.open_process_ids.clear();
+            }
+            return true;
+        }
+        true
+    }
+
+    fn observe_function_output_pathology(&mut self, output: &str) {
+        if output.contains(
+            "tool_output_budget_exceeded: output truncated by Chainworks safe-search guard",
+        ) {
+            self.summary.unbounded_tool_outputs += 1;
+            self.summary.last_pathology = Some("tool_output_budget_exceeded".to_string());
+        }
+        if output.contains("write_stdin failed: stdin is closed") {
+            self.summary.stdin_closed_control_failures += 1;
+            self.summary.last_pathology = Some("codex_tool_stdin_closed".to_string());
+        }
+        if let Some(count) = codex_metric_from_output(output, "Original token count:") {
+            self.summary.max_original_token_count = Some(
+                self.summary
+                    .max_original_token_count
+                    .map(|current| current.max(count))
+                    .unwrap_or(count),
+            );
+            if count > CODEX_UNBOUNDED_TOOL_OUTPUT_TOKEN_CAP {
+                self.summary.unbounded_tool_outputs += 1;
+                self.summary.last_pathology = Some("codex_unbounded_tool_output".to_string());
+            }
+        }
+        if let Some(count) = codex_metric_from_output(output, "Total output lines:") {
+            self.summary.max_total_output_lines = Some(
+                self.summary
+                    .max_total_output_lines
+                    .map(|current| current.max(count))
+                    .unwrap_or(count),
+            );
+            if count > CODEX_UNBOUNDED_TOOL_OUTPUT_LINE_CAP || count > DEFAULT_TOOL_OUTPUT_MAX_LINES
+            {
+                self.summary.unbounded_tool_outputs += 1;
+                self.summary.last_pathology = Some("codex_unbounded_tool_output".to_string());
+            }
+        }
+    }
+
+    fn has_open_local_activity(&self) -> bool {
+        !self.open_process_ids.is_empty()
+    }
+
+    fn open_process_count(&self) -> usize {
+        self.open_process_ids.len()
+    }
+
+    fn summary(&self) -> &CodexLocalActivitySummary {
+        &self.summary
+    }
+
+    fn summary_for_error(&self) -> String {
+        format!(
+            "local_event_count={}, function_calls={}, function_outputs={}, running_processes_started={}, running_process_outputs={}, running_processes_finished={}, open_processes={}, turn_aborted={}, turn_completed={}, stdin_closed_control_failures={}, unbounded_tool_outputs={}, max_original_token_count={}, max_total_output_lines={}, cumulative_function_output_bytes={}, session_store_bytes_read={}, codex_session_store_path_found={}, codex_session_store_search_limit_hit={}, codex_session_store_candidate_root_count={}, codex_session_store_visited_dirs={}, codex_session_store_visited_files={}, turn_aborted_after_open_process={}, last_pathology={}, last_event_type={}",
+            self.summary.event_count,
+            self.summary.function_calls,
+            self.summary.function_outputs,
+            self.summary.running_processes_started,
+            self.summary.running_process_outputs,
+            self.summary.running_processes_finished,
+            self.open_process_count(),
+            self.summary.turn_aborted,
+            self.summary.turn_completed,
+            self.summary.stdin_closed_control_failures,
+            self.summary.unbounded_tool_outputs,
+            self.summary
+                .max_original_token_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            self.summary
+                .max_total_output_lines
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            self.summary.cumulative_function_output_bytes,
+            self.summary.session_store_bytes_read,
+            self.summary.session_store_path_found,
+            self.summary.session_store_search_limit_hit,
+            self.summary.session_store_candidate_root_count,
+            self.summary.session_store_visited_dirs,
+            self.summary.session_store_visited_files,
+            self.summary.turn_aborted_after_open_process,
+            self.summary.last_pathology.as_deref().unwrap_or("none"),
+            self.summary.last_event_type.as_deref().unwrap_or("none"),
+        )
+    }
+
+    fn has_observed_activity(&self) -> bool {
+        self.summary.event_count > 0
+    }
 }
 
 #[derive(Debug)]
@@ -444,8 +958,9 @@ impl ClaudeLocalActivityMonitor {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(ClaudeLocalActivityObservation {
-                    should_extend_watchdog: self.has_open_local_activity(),
+                    should_extend_watchdog: self.has_watchdog_extending_local_activity(),
                     new_event_count: 0,
+                    has_open_local_activity: self.has_open_local_activity(),
                 });
             }
             Err(error) => {
@@ -494,8 +1009,10 @@ impl ClaudeLocalActivityMonitor {
         }
 
         Ok(ClaudeLocalActivityObservation {
-            should_extend_watchdog: new_event_count > 0 || self.has_open_local_activity(),
+            should_extend_watchdog: new_event_count > 0
+                || self.has_watchdog_extending_local_activity(),
             new_event_count,
+            has_open_local_activity: self.has_open_local_activity(),
         })
     }
 
@@ -515,6 +1032,29 @@ impl ClaudeLocalActivityMonitor {
             "assistant" => {
                 self.summary.assistant_messages += 1;
                 self.summary.last_event_type = Some("assistant".to_string());
+                self.summary.last_assistant_message_id = entry
+                    .get("message")
+                    .and_then(|message| message.get("id"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .or_else(|| {
+                        entry
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    });
+                let stop_reason = entry
+                    .get("message")
+                    .and_then(|message| message.get("stop_reason"))
+                    .or_else(|| entry.get("stop_reason"));
+                if let Some(stop_reason) = stop_reason {
+                    self.summary.last_assistant_stop_reason = Some(match stop_reason {
+                        Value::Null => "null".to_string(),
+                        Value::String(value) => value.clone(),
+                        other => other.to_string(),
+                    });
+                    self.summary.last_assistant_incomplete = stop_reason.is_null();
+                }
                 relevant = true;
             }
             "last-prompt" | "last_prompt" => {
@@ -585,6 +1125,18 @@ impl ClaudeLocalActivityMonitor {
         self.has_open_tool_use() || self.has_open_background_task()
     }
 
+    fn has_watchdog_extending_local_activity(&self) -> bool {
+        self.has_open_tool_use()
+            || (self.has_open_background_task() && !self.last_assistant_turn_completed())
+    }
+
+    fn last_assistant_turn_completed(&self) -> bool {
+        self.summary
+            .last_assistant_stop_reason
+            .as_deref()
+            .is_some_and(|stop_reason| stop_reason.eq_ignore_ascii_case("end_turn"))
+    }
+
     fn has_open_tool_use(&self) -> bool {
         !self.open_tool_use_ids.is_empty()
     }
@@ -607,7 +1159,7 @@ impl ClaudeLocalActivityMonitor {
 
     fn summary_for_error(&self) -> String {
         format!(
-            "local_event_count={}, assistant_messages={}, tool_uses={}, tool_results={}, background_tasks_started={}, background_tasks_finished={}, open_tool_uses={}, open_background_tasks={}, last_event_type={}",
+            "local_event_count={}, assistant_messages={}, tool_uses={}, tool_results={}, background_tasks_started={}, background_tasks_finished={}, open_tool_uses={}, open_background_tasks={}, last_event_type={}, last_assistant_message_id={}, last_assistant_stop_reason={}, last_assistant_incomplete={}",
             self.summary.event_count,
             self.summary.assistant_messages,
             self.summary.tool_uses,
@@ -616,15 +1168,25 @@ impl ClaudeLocalActivityMonitor {
             self.summary.background_tasks_finished,
             self.open_tool_use_count(),
             self.open_background_task_count(),
+            self.summary.last_event_type.as_deref().unwrap_or("none"),
             self.summary
-                .last_event_type
+                .last_assistant_message_id
                 .as_deref()
-                .unwrap_or("none")
+                .unwrap_or("none"),
+            self.summary
+                .last_assistant_stop_reason
+                .as_deref()
+                .unwrap_or("none"),
+            self.summary.last_assistant_incomplete
         )
     }
 
     fn has_observed_activity(&self) -> bool {
         self.summary.event_count > 0
+    }
+
+    fn latest_final_response_text(&self) -> Option<String> {
+        latest_claude_final_response_text_in_file(&self.transcript_path)
     }
 }
 
@@ -668,6 +1230,194 @@ fn claude_project_key(cwd: &str) -> String {
         .collect()
 }
 
+fn push_unique_codex_session_store_candidate(candidates: &mut Vec<PathBuf>, path: &Path) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    if !candidates.iter().any(|existing| existing == path) {
+        candidates.push(path.to_path_buf());
+    }
+}
+
+fn push_codex_runtime_root_candidate(candidates: &mut Vec<PathBuf>, base: &Path) {
+    if base.as_os_str().is_empty() {
+        return;
+    }
+    push_unique_codex_session_store_candidate(candidates, &base.join(".forge-codex-acp"));
+}
+
+#[derive(Debug, Default)]
+struct CodexSessionStoreSearchResult {
+    path: Option<PathBuf>,
+    limit_hit: bool,
+    candidate_root_count: usize,
+    visited_dirs: usize,
+    visited_files: usize,
+}
+
+fn find_codex_session_store(
+    candidate_roots: &[PathBuf],
+    session_id: &str,
+) -> CodexSessionStoreSearchResult {
+    const MAX_DIRS: usize = 512;
+    const MAX_FILES: usize = 2048;
+    let mut result = CodexSessionStoreSearchResult {
+        candidate_root_count: candidate_roots.len(),
+        ..CodexSessionStoreSearchResult::default()
+    };
+    for root in candidate_roots {
+        if !root.exists() {
+            continue;
+        }
+        let exact_runtime_home = root.join("config.toml").exists()
+            || root.join("bin").join("rg").exists()
+            || root
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == ".forge-codex-acp");
+        let mut stack = vec![root.clone()];
+        let mut visited_dirs = 0usize;
+        let mut visited_files = 0usize;
+        while let Some(dir) = stack.pop() {
+            visited_dirs += 1;
+            if visited_dirs > MAX_DIRS || visited_files > MAX_FILES {
+                result.limit_hit = true;
+                break;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() {
+                    stack.push(path);
+                } else if file_type.is_file() {
+                    visited_files += 1;
+                    let file_name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("");
+                    let is_session_store = file_name.ends_with(".jsonl")
+                        && (file_name.contains(session_id) || exact_runtime_home);
+                    if is_session_store {
+                        result.visited_dirs = result.visited_dirs.saturating_add(visited_dirs);
+                        result.visited_files = result.visited_files.saturating_add(visited_files);
+                        result.path = Some(path);
+                        return result;
+                    }
+                }
+            }
+        }
+        result.visited_dirs = result.visited_dirs.saturating_add(visited_dirs);
+        result.visited_files = result.visited_files.saturating_add(visited_files);
+    }
+    result
+}
+
+fn codex_session_store_credits_exhausted_failure(path: &Path) -> Option<ProviderFailureEvent> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines().map_while(Result::ok) {
+        if line.len() > PROVIDER_SESSION_STORE_LINE_CAP_BYTES {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let credits = value.pointer("/payload/rate_limits/credits")?;
+        if credits
+            .get("has_credits")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let limit_id = value
+            .pointer("/payload/rate_limits/limit_id")
+            .or_else(|| credits.get("limit_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let balance = credits
+            .get("balance")
+            .map(|value| match value {
+                Value::String(value) => value.clone(),
+                Value::Number(value) => value.to_string(),
+                _ => "unknown".to_string(),
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        let unlimited = credits
+            .get("unlimited")
+            .and_then(Value::as_bool)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let detail = format!(
+            "codex_credits_exhausted;limit_id={limit_id};balance={balance};unlimited={unlimited}"
+        );
+        return Some(ProviderFailureEvent {
+            failure_phase: "provider_quota",
+            message: format!(
+                "Codex credits exhausted: limit_id={limit_id}, balance={balance}, unlimited={unlimited}"
+            ),
+            detail,
+        });
+    }
+    None
+}
+
+fn codex_function_call_session_id(payload: &Value) -> Option<String> {
+    let arguments = payload.get("arguments").and_then(Value::as_str)?;
+    let parsed = serde_json::from_str::<Value>(arguments).ok()?;
+    let session_id = parsed.get("session_id")?;
+    match session_id {
+        Value::Number(number) => Some(number.to_string()),
+        Value::String(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        _ => None,
+    }
+}
+
+const CODEX_UNBOUNDED_TOOL_OUTPUT_TOKEN_CAP: u64 = 250_000;
+const CODEX_UNBOUNDED_TOOL_OUTPUT_LINE_CAP: u64 = 2_000;
+
+fn codex_metric_from_output(output: &str, marker: &str) -> Option<u64> {
+    let (_, after_marker) = output.split_once(marker)?;
+    let digits = after_marker
+        .trim_start()
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
+fn codex_running_process_id_from_output(output: &str) -> Option<String> {
+    let marker = "Process running with session ID ";
+    let (_, after_marker) = output.split_once(marker)?;
+    let id = after_marker
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+        .collect::<String>();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+fn codex_output_is_terminal_process_result(output: &str) -> bool {
+    let lowered = output.to_ascii_lowercase();
+    lowered.contains("process exited with code")
+        || lowered.contains("process completed")
+        || lowered.contains("process failed")
+        || lowered.contains("command failed")
+}
+
 fn collect_claude_tool_use_ids(value: &Value, ids: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
@@ -686,6 +1436,80 @@ fn collect_claude_tool_use_ids(value: &Value, ids: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+fn latest_claude_final_response_text_in_file(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut latest = None;
+    for line in reader.lines().map_while(Result::ok) {
+        if line.len() > PROVIDER_SESSION_STORE_LINE_CAP_BYTES || !line.contains("CHAINWORKS_OUTPUT")
+        {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if let Some(text) = claude_session_line_assistant_final_text(&value) {
+            latest = Some(text);
+        }
+    }
+    latest
+}
+
+fn claude_session_line_assistant_final_text(value: &Value) -> Option<String> {
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let message = value.get("message");
+    let stop_reason = message
+        .and_then(|message| message.get("stop_reason"))
+        .or_else(|| value.get("stop_reason"));
+    if !stop_reason
+        .and_then(Value::as_str)
+        .is_some_and(|reason| reason.eq_ignore_ascii_case("end_turn"))
+    {
+        return None;
+    }
+
+    let mut segments = Vec::new();
+    if let Some(message) = message {
+        collect_claude_final_text_segments(message, &mut segments);
+    }
+    collect_claude_final_text_segments(value, &mut segments);
+    segments.retain(|segment| segment.contains("CHAINWORKS_OUTPUT"));
+    (!segments.is_empty()).then(|| segments.join("\n"))
+}
+
+fn collect_claude_final_text_segments(value: &Value, segments: &mut Vec<String>) {
+    if let Some(text) = value.get("text").and_then(Value::as_str) {
+        segments.push(text.to_string());
+    }
+    if let Some(text) = value.get("output").and_then(Value::as_str) {
+        segments.push(text.to_string());
+    }
+    match value.get("content") {
+        Some(Value::String(text)) => segments.push(text.clone()),
+        Some(Value::Array(items)) => {
+            for item in items {
+                if item
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind == "text" || kind == "content")
+                    || item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.contains("CHAINWORKS_OUTPUT"))
+                {
+                    collect_claude_final_text_segments(item, segments);
+                }
+            }
+        }
+        _ => {}
+    }
+    if let Some(result) = value.get("result") {
+        collect_claude_final_text_segments(result, segments);
     }
 }
 
@@ -741,6 +1565,7 @@ fn collect_claude_background_task_observations(
             if let Some(id) = terminal_background_task_id_from_text(text) {
                 observations.push(ClaudeBackgroundTaskObservation { id, terminal: true });
             }
+            collect_xml_background_task_observations_from_text(text, observations);
         }
         _ => {}
     }
@@ -809,6 +1634,9 @@ fn background_task_start_id_from_text(text: &str) -> Option<String> {
 }
 
 fn terminal_background_task_id_from_text(text: &str) -> Option<String> {
+    if text.contains("<task-notification>") {
+        return None;
+    }
     let lower = text.to_ascii_lowercase();
     let terminal_word = [
         " completed",
@@ -829,6 +1657,38 @@ fn terminal_background_task_id_from_text(text: &str) -> Option<String> {
         return None;
     }
     task_id_token_from_text(text)
+}
+
+fn collect_xml_background_task_observations_from_text(
+    text: &str,
+    observations: &mut Vec<ClaudeBackgroundTaskObservation>,
+) {
+    let mut rest = text;
+    while let Some((_, after_start)) = rest.split_once("<task-notification>") {
+        let Some((notification, after_end)) = after_start.split_once("</task-notification>") else {
+            break;
+        };
+        if let Some(id) = xml_tag_text(notification, "task-id") {
+            let terminal = xml_tag_text(notification, "status")
+                .map(|status| background_task_status_is_terminal(&status))
+                .unwrap_or(false);
+            observations.push(ClaudeBackgroundTaskObservation { id, terminal });
+        }
+        rest = after_end;
+    }
+}
+
+fn xml_tag_text(text: &str, tag: &str) -> Option<String> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let (_, after_start) = text.split_once(&start_tag)?;
+    let (value, _) = after_start.split_once(&end_tag)?;
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 fn task_id_token_from_text(text: &str) -> Option<String> {
@@ -901,6 +1761,7 @@ pub(crate) fn signal_process_group(pid: u32, signal: libc::c_int) {
     }
 }
 
+#[cfg(test)]
 fn stderr_line_is_diagnostic_warning(line: &str) -> bool {
     line.contains("EPIPE") || line.contains("write EPIPE")
 }
@@ -1179,6 +2040,21 @@ fn classify_prompt_error_response(
     jsonrpc_error_code: Option<i64>,
     err_msg: &str,
 ) -> ProviderFailureEvent {
+    if provider.eq_ignore_ascii_case("claude")
+        && is_claude_long_context_credits_required_message(err_msg)
+    {
+        return ProviderFailureEvent {
+            failure_phase: "provider_quota",
+            message: "Claude long-context usage credits required".to_string(),
+            detail: format!(
+                "claude_long_context_credits_required;jsonrpc_error_code={};message={}",
+                jsonrpc_error_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                truncate_runtime_receipt_detail(err_msg)
+            ),
+        };
+    }
     if is_provider_quota_or_capacity_failure(provider, err_msg) {
         return ProviderFailureEvent {
             failure_phase: "provider_quota",
@@ -1203,6 +2079,11 @@ fn classify_prompt_error_response(
             truncate_runtime_receipt_detail(err_msg)
         ),
     }
+}
+
+fn is_claude_long_context_credits_required_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("usage credits") && lower.contains("required") && lower.contains("long context")
 }
 
 fn is_provider_quota_or_capacity_failure(provider: &str, message: &str) -> bool {
@@ -1300,6 +2181,7 @@ fn push_streamed_transcript_chunk(buffer: &mut String, chunk: &str, truncated: &
 struct CompletionTextCapture {
     terminal_final_response_seen: bool,
     terminal_final_response: Option<CapturedCompletionText>,
+    provider_session_store_final_response: Option<CapturedCompletionText>,
     streamed_update_tail: Option<CapturedCompletionText>,
 }
 
@@ -1320,6 +2202,7 @@ impl Default for CompletionTextCapture {
         Self {
             terminal_final_response_seen: false,
             terminal_final_response: None,
+            provider_session_store_final_response: None,
             streamed_update_tail: None,
         }
     }
@@ -1340,6 +2223,12 @@ impl CompletionTextCapture {
         self.terminal_final_response = bounded_completion_text(sanitized);
     }
 
+    fn set_provider_session_store_final_response(&mut self, text: &str) {
+        let sanitized = strip_ansi(text);
+        self.provider_session_store_final_response = bounded_completion_text(sanitized);
+    }
+
+    #[cfg(test)]
     fn select_extraction_input(&self) -> SelectedCompletionTextCapture {
         self.select_extraction_input_with_capped_stream(None, false)
     }
@@ -1353,6 +2242,15 @@ impl CompletionTextCapture {
             return selected_completion_text(
                 capture,
                 AcpCompletionCaptureSource::TerminalFinalResponse,
+            );
+        }
+
+        if let Some(capture) =
+            non_empty_capture(self.provider_session_store_final_response.as_ref())
+        {
+            return selected_completion_text(
+                capture,
+                AcpCompletionCaptureSource::ProviderSessionStoreFinalResponse,
             );
         }
 
@@ -1452,6 +2350,26 @@ fn selected_completion_text(
     }
 }
 
+pub(crate) fn recovered_completion_text_capture_metadata(
+    text: &str,
+    source: AcpCompletionCaptureSource,
+) -> AcpCompletionTextCaptureMetadata {
+    let Some(capture) = bounded_completion_text(strip_ansi(text)) else {
+        return AcpCompletionTextCaptureMetadata {
+            capture_status: AcpCompletionCaptureStatus::Absent,
+            capture_source: None,
+            captured_text: None,
+            raw_byte_limit: COMPLETION_CAPTURE_RAW_BYTE_LIMIT as u64,
+            captured_byte_count: 0,
+            completion_text_truncated: false,
+            extraction_input_truncated: false,
+            extraction_input_sha256: None,
+            absence_reason: Some(AcpCompletionAbsenceReason::EmptyAfterSanitization),
+        };
+    };
+    selected_completion_text(&capture, source).metadata
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -1546,7 +2464,7 @@ fn observe_mcp_actuals(
     })
 }
 
-fn extract_output_envelopes(
+pub(crate) fn extract_output_envelopes(
     stream_text: &str,
     expected_outputs: &[ExpectedOutputSpec],
 ) -> Vec<DiscoveredArtifact> {
@@ -1998,10 +2916,12 @@ pub(crate) async fn send_ndjson(stdin: &mut tokio::process::ChildStdin, msg: &Va
 // Notifications (no `id` field) are silently skipped.
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn await_response(
+async fn await_response_with_child_liveness(
     reader: &mut BufReader<tokio::process::ChildStdout>,
+    mut child: Option<&mut Child>,
     expected_id: &str,
     time_limit: Duration,
+    phase: &str,
 ) -> Result<Value> {
     let start = Instant::now();
     let mut line = String::new();
@@ -2012,10 +2932,11 @@ pub(crate) async fn await_response(
             bail!("ACP handshake timed out waiting for response id={expected_id}");
         }
         let remaining = time_limit - elapsed;
+        let read_wait = remaining.min(ACP_PROMPT_SUBPROCESS_EXIT_POLL_INTERVAL);
 
         line.clear();
         let n = match timeout(
-            remaining,
+            read_wait,
             read_capped_ndjson_line(
                 reader,
                 &mut line,
@@ -2028,8 +2949,33 @@ pub(crate) async fn await_response(
             Ok(Ok(n)) => n,
             Ok(Err(err)) => return Err(err).context("ACP handshake read_line error"),
             Err(_) => {
-                return diagnose_late_handshake_response(reader, expected_id, start, time_limit)
+                if let Some(child) = child.as_deref_mut() {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            bail!(
+                                "ACP subprocess exited during {phase} before responding to id={expected_id}: status={status}"
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!(
+                                    "ACP subprocess wait failed during {phase} before response id={expected_id}"
+                                )
+                            });
+                        }
+                    }
+                }
+                if start.elapsed() >= time_limit {
+                    return diagnose_late_handshake_response(
+                        reader,
+                        expected_id,
+                        start,
+                        time_limit,
+                    )
                     .await;
+                }
+                continue;
             }
         };
 
@@ -2193,9 +3139,15 @@ pub(crate) async fn probe_initialize_with_timeout(
     .await
     .context("ACP: send capability probe initialize")?;
 
-    let result = await_response(&mut reader, &request_id, handshake_timeout)
-        .await
-        .context("ACP: capability probe initialize handshake")?;
+    let result = await_response_with_child_liveness(
+        &mut reader,
+        Some(&mut child),
+        &request_id,
+        handshake_timeout,
+        "capability probe initialize handshake",
+    )
+    .await
+    .context("ACP: capability probe initialize handshake")?;
 
     let _ = AsyncWriteExt::shutdown(&mut stdin).await;
     drop(stdin);
@@ -2219,6 +3171,26 @@ pub(crate) async fn probe_initialize_with_timeout(
 // ---------------------------------------------------------------------------
 
 fn build_permission_grant(request_id: &Value, params: &Value) -> Option<Value> {
+    if let Some(denial) = permission_preflight_denial(params) {
+        return Some(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32096,
+                "message": denial.agent_error_text(),
+                "data": {
+                    "classification": denial.code,
+                    "preflightCode": denial.code,
+                    "matchedTool": denial.matched_tool,
+                    "command": denial.command,
+                    "policyVersion": TOOL_POLICY_VERSION,
+                    "guardVersion": TOOL_GUARD_VERSION,
+                    "generatedRootDenylist": GENERATED_ROOT_DENYLIST,
+                }
+            }
+        }));
+    }
+
     let options = permission_options(params);
     let option_id = permission_preferred_auto_grant_option(&options)?;
 
@@ -2232,6 +3204,55 @@ fn build_permission_grant(request_id: &Value, params: &Value) -> Option<Value> {
             }
         }
     }))
+}
+
+fn permission_preflight_denial(params: &Value) -> Option<domain::tool_policy::ToolPreflightDenial> {
+    let mut candidates = Vec::new();
+    collect_permission_strings(params, &mut candidates);
+    candidates.into_iter().find_map(|candidate| {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() || trimmed.len() > 4096 {
+            return None;
+        }
+        match preflight_shell_command(trimmed) {
+            ToolPreflightDecision::Allow => None,
+            ToolPreflightDecision::Deny(denial) => Some(denial),
+        }
+    })
+}
+
+fn collect_permission_strings(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) => out.push(s.clone()),
+        Value::Array(values) => {
+            for value in values {
+                collect_permission_strings(value, out);
+            }
+        }
+        Value::Object(map) => {
+            for (key, value) in map {
+                if matches!(
+                    key.as_str(),
+                    "command" | "cmd" | "title" | "description" | "arguments" | "input" | "name"
+                ) {
+                    collect_permission_strings(value, out);
+                } else if value.is_object() || value.is_array() {
+                    collect_permission_strings(value, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn prompt_with_safe_search_guidance(prompt: &str) -> String {
+    format!(
+        "{}
+
+{}",
+        prompt.trim_end(),
+        default_safe_search_guidance()
+    )
 }
 
 fn permission_options(params: &Value) -> Vec<&Value> {
@@ -2312,6 +3333,12 @@ fn summarize_permission_grant(grant: &Value) -> String {
         .get("id")
         .and_then(normalize_jsonrpc_id)
         .unwrap_or_else(|| Value::Null.to_string());
+    if let Some(message) = grant["error"]["message"].as_str() {
+        return format!(
+            "id={request_id};error={}",
+            truncate_runtime_receipt_detail(message)
+        );
+    }
     let option_id = grant["result"]["outcome"]["optionId"]
         .as_str()
         .unwrap_or("unknown");
@@ -2372,6 +3399,7 @@ pub struct AcpTransportSession {
     closed: bool,
     provider: String,
     model: Option<String>,
+    provider_runtime_home: Option<String>,
     permission_grant_debounce: Duration,
     xcode_shim_injected: bool,
     requires_xcode_host_execution: bool,
@@ -2700,6 +3728,8 @@ fn session_update_observation(parsed: &Value) -> (&'static str, bool, Option<Str
         "agent_thought_chunk"
     } else if type_markers.iter().any(|marker| marker == "plan") {
         "plan"
+    } else if type_markers.iter().any(|marker| marker == "usage_update") {
+        "usage_update"
     } else if has_text_progress {
         "text_chunk"
     } else if provider_activity_marker.is_some() {
@@ -2715,6 +3745,7 @@ fn session_update_observation(parsed: &Value) -> (&'static str, bool, Option<Str
             | "agent_thought_chunk"
             | "plan"
             | "provider_activity"
+            | "usage_update"
             | "text_chunk"
     );
     let detail = provider_activity_marker
@@ -2846,6 +3877,12 @@ fn collect_nested_type_markers(value: &Value, markers: &mut Vec<String>) {
                     markers.push(marker);
                 }
             }
+            if let Some(marker) = map.get("sessionUpdate").and_then(Value::as_str) {
+                let marker = marker.to_string();
+                if !markers.iter().any(|existing| existing == &marker) {
+                    markers.push(marker);
+                }
+            }
             for nested in map.values() {
                 collect_nested_type_markers(nested, markers);
             }
@@ -2953,7 +3990,9 @@ async fn poll_claude_local_activity_watchdog(
         Ok(observation) if observation.should_extend_watchdog => {
             let now = Instant::now();
             *last_provider_local_activity = Some(now);
-            *last_provider_local_progress = Some(now);
+            if observation.new_event_count > 0 {
+                *last_provider_local_progress = Some(now);
+            }
             if observation.new_event_count > 0 {
                 debug!(
                     session_id = %provider_session_id,
@@ -2965,9 +4004,10 @@ async fn poll_claude_local_activity_watchdog(
                     "Claude local activity observed while ACP stream is quiet"
                 );
             }
-            if last_prompt_progress_reported
-                .map(|reported_at| reported_at.elapsed() >= PROMPT_PROGRESS_REPORT_INTERVAL)
-                .unwrap_or(true)
+            if (observation.new_event_count > 0 || observation.has_open_local_activity)
+                && last_prompt_progress_reported
+                    .map(|reported_at| reported_at.elapsed() >= PROMPT_PROGRESS_REPORT_INTERVAL)
+                    .unwrap_or(true)
             {
                 record_prompt_progress_for_session(
                     req,
@@ -2990,12 +4030,119 @@ async fn poll_claude_local_activity_watchdog(
     }
 }
 
+async fn poll_codex_local_activity_watchdog(
+    monitor: Option<&mut CodexLocalActivityMonitor>,
+    req: &ExecutionRequest,
+    progress_sink: &Arc<dyn AcpPromptProgressSink>,
+    provider_session_id: &str,
+    last_provider_local_activity: &mut Option<Instant>,
+    last_provider_local_progress: &mut Option<Instant>,
+    last_prompt_progress_reported: &mut Option<Instant>,
+) {
+    let Some(monitor) = monitor else {
+        return;
+    };
+    match monitor.poll(Instant::now()) {
+        Ok(observation) if observation.should_extend_watchdog => {
+            let now = Instant::now();
+            *last_provider_local_activity = Some(now);
+            if observation.new_event_count > 0 {
+                *last_provider_local_progress = Some(now);
+            }
+            if observation.new_event_count > 0 {
+                debug!(
+                    session_id = %provider_session_id,
+                    local_event_count = monitor.summary().event_count,
+                    function_calls = monitor.summary().function_calls,
+                    function_outputs = monitor.summary().function_outputs,
+                    open_processes = monitor.open_process_count(),
+                    "Codex local activity observed while ACP stream is quiet"
+                );
+            }
+            if (observation.new_event_count > 0 || observation.has_open_local_activity)
+                && last_prompt_progress_reported
+                    .map(|reported_at| reported_at.elapsed() >= PROMPT_PROGRESS_REPORT_INTERVAL)
+                    .unwrap_or(true)
+            {
+                record_prompt_progress_for_session(
+                    req,
+                    progress_sink,
+                    provider_session_id,
+                    AcpPromptProgressKind::ProviderLocalActivity,
+                )
+                .await;
+                *last_prompt_progress_reported = Some(Instant::now());
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!(
+                session_id = %provider_session_id,
+                error = %error,
+                "Codex local activity monitor failed; falling back to ACP stream activity"
+            );
+        }
+    }
+}
+
 fn note_claude_local_activity_receipt_event(
     runtime_receipt: &mut RuntimeReceiptTracker,
     monitor: Option<&ClaudeLocalActivityMonitor>,
 ) -> Option<String> {
     let summary = monitor.map(ClaudeLocalActivityMonitor::summary_for_error)?;
     runtime_receipt.push_event("provider_local_activity_summary", Some(summary.clone()));
+    Some(summary)
+}
+
+fn note_codex_local_activity_receipt_event(
+    runtime_receipt: &mut RuntimeReceiptTracker,
+    monitor: Option<&CodexLocalActivityMonitor>,
+) -> Option<String> {
+    let summary = monitor.map(CodexLocalActivityMonitor::summary_for_error)?;
+    runtime_receipt.push_event("provider_local_activity_summary", Some(summary.clone()));
+    Some(summary)
+}
+
+fn provider_local_activity_summary(
+    runtime_receipt: &mut RuntimeReceiptTracker,
+    claude_monitor: Option<&ClaudeLocalActivityMonitor>,
+    codex_monitor: Option<&CodexLocalActivityMonitor>,
+) -> String {
+    note_claude_local_activity_receipt_event(runtime_receipt, claude_monitor)
+        .or_else(|| note_codex_local_activity_receipt_event(runtime_receipt, codex_monitor))
+        .unwrap_or_else(|| "provider_local_activity=unavailable".to_string())
+}
+
+fn provider_stream_silence_classification(
+    claude_monitor: Option<&ClaudeLocalActivityMonitor>,
+    codex_monitor: Option<&CodexLocalActivityMonitor>,
+) -> &'static str {
+    if claude_monitor.is_some_and(ClaudeLocalActivityMonitor::has_observed_activity)
+        || codex_monitor.is_some_and(CodexLocalActivityMonitor::has_observed_activity)
+    {
+        "provider_stream_silent_with_local_activity"
+    } else {
+        "provider_stream_silent_no_local_activity"
+    }
+}
+
+fn note_claude_silence_grace_receipt_event(
+    runtime_receipt: &mut RuntimeReceiptTracker,
+    monitor: Option<&ClaudeLocalActivityMonitor>,
+    phase: &str,
+    elapsed: Duration,
+) -> Option<String> {
+    let summary = note_claude_local_activity_receipt_event(runtime_receipt, monitor)?;
+    runtime_receipt.push_event(
+        "provider_local_activity_silence_grace_started",
+        Some(format!(
+            "phase={}, elapsed_s={}, grace_timeout_s={}, {}",
+            phase,
+            elapsed.as_secs(),
+            CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs(),
+            summary
+        )),
+    );
     Some(summary)
 }
 
@@ -3136,9 +4283,15 @@ impl AcpTransportSession {
         .await
         .context("ACP: send initialize")?;
 
-        await_response(&mut reader, &init_id, HANDSHAKE_TIMEOUT)
-            .await
-            .context("ACP: initialize handshake")?;
+        await_response_with_child_liveness(
+            &mut reader,
+            Some(&mut child),
+            &init_id,
+            HANDSHAKE_TIMEOUT,
+            "initialize handshake",
+        )
+        .await
+        .context("ACP: initialize handshake")?;
         startup_receipt.note_initialize_received(&init_id);
         let acp_initialize_latency_ms = initialize_started.elapsed().as_millis() as u64;
         info!(
@@ -3168,9 +4321,15 @@ impl AcpTransportSession {
             .context("ACP: send session/new")?;
         }
 
-        let sn_result = await_response(&mut reader, &sn_id, HANDSHAKE_TIMEOUT)
-            .await
-            .context("ACP: session/new handshake")?;
+        let sn_result = await_response_with_child_liveness(
+            &mut reader,
+            Some(&mut child),
+            &sn_id,
+            HANDSHAKE_TIMEOUT,
+            "session/new handshake",
+        )
+        .await
+        .context("ACP: session/new handshake")?;
         let acp_session_new_latency_ms = session_new_started.elapsed().as_millis() as u64;
         info!(
             run_id = %req.run_id,
@@ -3206,9 +4365,15 @@ impl AcpTransportSession {
             )
             .await
             .context("ACP: send session/set_mode")?;
-            await_response(&mut reader, &set_mode_id, HANDSHAKE_TIMEOUT)
-                .await
-                .context("ACP: session/set_mode handshake")?;
+            await_response_with_child_liveness(
+                &mut reader,
+                Some(&mut child),
+                &set_mode_id,
+                HANDSHAKE_TIMEOUT,
+                "session/set_mode handshake",
+            )
+            .await
+            .context("ACP: session/set_mode handshake")?;
         }
 
         for (config_id, value) in &config.config_options {
@@ -3238,7 +4403,15 @@ impl AcpTransportSession {
                 continue;
             }
 
-            match await_response(&mut reader, &sco_id, HANDSHAKE_TIMEOUT).await {
+            match await_response_with_child_liveness(
+                &mut reader,
+                Some(&mut child),
+                &sco_id,
+                HANDSHAKE_TIMEOUT,
+                "session/set_config_option handshake",
+            )
+            .await
+            {
                 Ok(_) => {
                     debug!(
                         session_id = %session_id,
@@ -3278,11 +4451,17 @@ impl AcpTransportSession {
             .await
             .with_context(|| format!("ACP: send required session/set_config_option {config_id}"))?;
 
-            await_response(&mut reader, &sco_id, HANDSHAKE_TIMEOUT)
-                .await
-                .with_context(|| {
-                    format!("ACP: required session/set_config_option rejected for {config_id}")
-                })?;
+            await_response_with_child_liveness(
+                &mut reader,
+                Some(&mut child),
+                &sco_id,
+                HANDSHAKE_TIMEOUT,
+                "required session/set_config_option handshake",
+            )
+            .await
+            .with_context(|| {
+                format!("ACP: required session/set_config_option rejected for {config_id}")
+            })?;
             debug!(
                 session_id = %session_id,
                 config_id = %config_id,
@@ -3319,6 +4498,7 @@ impl AcpTransportSession {
             closed: false,
             provider: req.provider.clone(),
             model: req.model.clone(),
+            provider_runtime_home: req.provider_runtime_home.clone(),
             permission_grant_debounce: config.permission_grant_debounce,
             xcode_shim_injected: req.xcode_shim_injection_signal,
             requires_xcode_host_execution: req.requires_xcode_host_execution,
@@ -3524,6 +4704,17 @@ impl AcpTransportSession {
         u64,
         Option<LegacyBroadDiscoverySnapshot>,
     )> {
+        let effective_req;
+        let req = if req.provider_runtime_home.is_none() && self.provider_runtime_home.is_some() {
+            effective_req = Some({
+                let mut req = req.clone();
+                req.provider_runtime_home = self.provider_runtime_home.clone();
+                req
+            });
+            effective_req.as_ref().expect("effective request just set")
+        } else {
+            req
+        };
         let startup_offset_ms = if req.reuse_existing_session {
             0
         } else {
@@ -3640,6 +4831,8 @@ impl AcpTransportSession {
         let prompt_started_at = SystemTime::now();
         let mut claude_local_activity =
             ClaudeLocalActivityMonitor::for_request(req, &self.session_id);
+        let mut codex_local_activity =
+            CodexLocalActivityMonitor::for_request(req, &self.session_id);
         if let Err(error) = send_ndjson(
             &mut self.stdin,
             &serde_json::json!({
@@ -3648,7 +4841,7 @@ impl AcpTransportSession {
                 "method": "session/prompt",
                 "params": {
                     "sessionId": self.session_id,
-                    "prompt": [{"type": "text", "text": req.prompt}]
+                    "prompt": [{"type": "text", "text": prompt_with_safe_search_guidance(&req.prompt)}]
                 }
             }),
         )
@@ -3694,10 +4887,21 @@ impl AcpTransportSession {
         let mut xcode_shim_warning_events = Vec::new();
         let mut seen_xcode_warning_keys = HashSet::new();
         let mut failure_phase: Option<String> = None;
+        let mut claude_local_activity_silence_warning_recorded = false;
 
         'streaming: loop {
             poll_claude_local_activity_watchdog(
                 claude_local_activity.as_mut(),
+                req,
+                &progress_sink,
+                &self.session_id,
+                &mut last_provider_local_activity,
+                &mut last_provider_local_progress,
+                &mut last_prompt_progress_reported,
+            )
+            .await;
+            poll_codex_local_activity_watchdog(
+                codex_local_activity.as_mut(),
                 req,
                 &progress_sink,
                 &self.session_id,
@@ -3711,96 +4915,171 @@ impl AcpTransportSession {
                 max_instant_option(last_acp_activity, last_provider_local_activity);
             let idle = effective_last_activity.elapsed();
             if idle >= IDLE_TIMEOUT {
-                let classification = claude_local_activity
+                let has_observed_claude_activity = claude_local_activity
                     .as_ref()
-                    .map(|monitor| {
-                        if monitor.has_observed_activity() {
-                            "provider_stream_silent_with_local_activity"
-                        } else {
-                            "provider_stream_silent_no_local_activity"
-                        }
-                    })
-                    .unwrap_or("idle_hang_before_first_progress");
-                failure_phase = Some("idle_timeout".to_string());
-                let local_summary = note_claude_local_activity_receipt_event(
-                    &mut runtime_receipt,
-                    claude_local_activity.as_ref(),
-                )
-                .unwrap_or_else(|| "provider_local_activity=unavailable".to_string());
-                self.last_runtime_receipt = Some(runtime_receipt.build(
-                    &self.provider,
-                    self.model.as_ref(),
-                    &self.session_id,
-                    req.session_generation_id.as_ref(),
-                    self.xcode_shim_injected,
-                    self.requires_xcode_host_execution,
-                    "failed",
-                    failure_phase.clone(),
-                ));
-                return Err(anyhow::anyhow!(
-                    "ACP session idle timeout: {classification}; no message for {}s (session={}, last_acp_activity_age_s={}, last_provider_local_activity_age_s={}, {local_summary})",
-                    IDLE_TIMEOUT.as_secs(),
-                    self.session_id,
-                    last_acp_activity.elapsed().as_secs(),
-                    last_provider_local_activity
-                        .map(|instant| instant.elapsed().as_secs().to_string())
-                        .unwrap_or_else(|| "none".to_string())
-                ));
+                    .is_some_and(|monitor| monitor.has_observed_activity());
+                match claude_silent_after_activity_timeout_decision(
+                    has_observed_claude_activity,
+                    idle,
+                    claude_local_activity_silence_warning_recorded,
+                ) {
+                    AcpSilenceDeadlineDecision::WarnGrace => {
+                        claude_local_activity_silence_warning_recorded = true;
+                        let local_summary = note_claude_silence_grace_receipt_event(
+                            &mut runtime_receipt,
+                            claude_local_activity.as_ref(),
+                            "idle_timeout",
+                            idle,
+                        )
+                        .unwrap_or_else(|| "provider_local_activity=unavailable".to_string());
+                        warn!(
+                            session_id = %self.session_id,
+                            elapsed_s = idle.as_secs(),
+                            grace_timeout_s = CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs(),
+                            local_summary = %local_summary,
+                            "Claude ACP stream silent after local activity; entering grace window"
+                        );
+                    }
+                    AcpSilenceDeadlineDecision::Continue => {}
+                    AcpSilenceDeadlineDecision::Timeout => {
+                        let classification = provider_stream_silence_classification(
+                            claude_local_activity.as_ref(),
+                            codex_local_activity.as_ref(),
+                        );
+                        failure_phase = Some("idle_timeout".to_string());
+                        let local_summary = provider_local_activity_summary(
+                            &mut runtime_receipt,
+                            claude_local_activity.as_ref(),
+                            codex_local_activity.as_ref(),
+                        );
+                        self.last_runtime_receipt = Some(runtime_receipt.build(
+                            &self.provider,
+                            self.model.as_ref(),
+                            &self.session_id,
+                            req.session_generation_id.as_ref(),
+                            self.xcode_shim_injected,
+                            self.requires_xcode_host_execution,
+                            "failed",
+                            failure_phase.clone(),
+                        ));
+                        return Err(anyhow::anyhow!(
+                            "ACP session idle timeout: {classification}; no message for {}s (session={}, last_acp_activity_age_s={}, last_provider_local_activity_age_s={}, {local_summary})",
+                            if has_observed_claude_activity {
+                                CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs()
+                            } else {
+                                IDLE_TIMEOUT.as_secs()
+                            },
+                            self.session_id,
+                            last_acp_activity.elapsed().as_secs(),
+                            last_provider_local_activity
+                                .map(|instant| instant.elapsed().as_secs().to_string())
+                                .unwrap_or_else(|| "none".to_string())
+                        ));
+                    }
+                }
             }
             let effective_last_progress =
                 max_instant_option(last_acp_progress, last_provider_local_progress);
             let progress_idle = effective_last_progress.elapsed();
             if progress_idle >= PROGRESS_TIMEOUT {
-                let classification = claude_local_activity
+                let has_observed_claude_activity = claude_local_activity
                     .as_ref()
-                    .map(|monitor| {
-                        if monitor.has_observed_activity() {
-                            "provider_stream_silent_with_local_activity"
-                        } else {
-                            "provider_stream_silent_no_local_activity"
-                        }
-                    })
-                    .unwrap_or("idle_hang_before_first_progress");
-                failure_phase = Some("progress_timeout".to_string());
-                let local_summary = note_claude_local_activity_receipt_event(
-                    &mut runtime_receipt,
-                    claude_local_activity.as_ref(),
-                )
-                .unwrap_or_else(|| "provider_local_activity=unavailable".to_string());
-                self.last_runtime_receipt = Some(runtime_receipt.build(
-                    &self.provider,
-                    self.model.as_ref(),
-                    &self.session_id,
-                    req.session_generation_id.as_ref(),
-                    self.xcode_shim_injected,
-                    self.requires_xcode_host_execution,
-                    "failed",
-                    failure_phase.clone(),
-                ));
-                return Err(anyhow::anyhow!(
-                    "ACP session progress timeout: {classification}; no meaningful progress for {}s (session={}, {local_summary})",
-                    PROGRESS_TIMEOUT.as_secs(),
-                    self.session_id
-                ));
+                    .is_some_and(|monitor| monitor.has_observed_activity());
+                match claude_silent_after_activity_timeout_decision(
+                    has_observed_claude_activity,
+                    progress_idle,
+                    claude_local_activity_silence_warning_recorded,
+                ) {
+                    AcpSilenceDeadlineDecision::WarnGrace => {
+                        claude_local_activity_silence_warning_recorded = true;
+                        let local_summary = note_claude_silence_grace_receipt_event(
+                            &mut runtime_receipt,
+                            claude_local_activity.as_ref(),
+                            "progress_timeout",
+                            progress_idle,
+                        )
+                        .unwrap_or_else(|| "provider_local_activity=unavailable".to_string());
+                        warn!(
+                            session_id = %self.session_id,
+                            elapsed_s = progress_idle.as_secs(),
+                            grace_timeout_s = CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs(),
+                            local_summary = %local_summary,
+                            "Claude ACP stream silent after local activity; entering grace window"
+                        );
+                    }
+                    AcpSilenceDeadlineDecision::Continue => {}
+                    AcpSilenceDeadlineDecision::Timeout => {
+                        let classification = provider_stream_silence_classification(
+                            claude_local_activity.as_ref(),
+                            codex_local_activity.as_ref(),
+                        );
+                        failure_phase = Some("progress_timeout".to_string());
+                        let local_summary = provider_local_activity_summary(
+                            &mut runtime_receipt,
+                            claude_local_activity.as_ref(),
+                            codex_local_activity.as_ref(),
+                        );
+                        self.last_runtime_receipt = Some(runtime_receipt.build(
+                            &self.provider,
+                            self.model.as_ref(),
+                            &self.session_id,
+                            req.session_generation_id.as_ref(),
+                            self.xcode_shim_injected,
+                            self.requires_xcode_host_execution,
+                            "failed",
+                            failure_phase.clone(),
+                        ));
+                        return Err(anyhow::anyhow!(
+                            "ACP session progress timeout: {classification}; no meaningful progress for {}s (session={}, {local_summary})",
+                            if has_observed_claude_activity {
+                                CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs()
+                            } else {
+                                PROGRESS_TIMEOUT.as_secs()
+                            },
+                            self.session_id
+                        ));
+                    }
+                }
             }
             let read_wait = if claude_local_activity.is_some() {
+                let deadline = if claude_local_activity
+                    .as_ref()
+                    .is_some_and(|monitor| monitor.has_observed_activity())
+                {
+                    CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT
+                } else {
+                    PROGRESS_TIMEOUT
+                };
+                let remaining_idle = deadline.saturating_sub(idle);
+                let remaining_progress = deadline.saturating_sub(progress_idle);
+                remaining_idle
+                    .min(remaining_progress)
+                    .min(CLAUDE_LOCAL_ACTIVITY_POLL_INTERVAL)
+                    .min(ACP_PROMPT_SUBPROCESS_EXIT_POLL_INTERVAL)
+            } else if codex_local_activity.is_some() {
                 let remaining_idle = IDLE_TIMEOUT.saturating_sub(idle);
                 let remaining_progress = PROGRESS_TIMEOUT.saturating_sub(progress_idle);
                 remaining_idle
                     .min(remaining_progress)
                     .min(CLAUDE_LOCAL_ACTIVITY_POLL_INTERVAL)
+                    .min(ACP_PROMPT_SUBPROCESS_EXIT_POLL_INTERVAL)
             } else {
                 let remaining_idle = IDLE_TIMEOUT.saturating_sub(idle);
                 let remaining_progress = PROGRESS_TIMEOUT.saturating_sub(progress_idle);
-                remaining_idle.min(remaining_progress)
+                remaining_idle
+                    .min(remaining_progress)
+                    .min(ACP_PROMPT_SUBPROCESS_EXIT_POLL_INTERVAL)
             };
 
             let mut close_requested = false;
             let n_result: Result<usize> = {
                 line.clear();
                 let session_id = self.session_id.clone();
+                let reader = &mut self.reader;
+                let child = &mut self.child;
+                let closed = &mut self.closed;
                 let read_line = read_capped_ndjson_line(
-                    &mut self.reader,
+                    reader,
                     &mut line,
                     ndjson_line_cap_bytes(&req.expected_outputs),
                     "ACP prompt stream read_line",
@@ -3841,13 +5120,36 @@ impl AcpTransportSession {
                         AcpPromptReadOutcome::Read(Err(error)) => {
                             break Err(error).context("ACP prompt stream read_line error");
                         }
-                        AcpPromptReadOutcome::PollElapsed if claude_local_activity.is_some() => {
+                        AcpPromptReadOutcome::PollElapsed
+                            if claude_local_activity.is_some()
+                                || codex_local_activity.is_some() =>
+                        {
                             debug!(
                                 session_id = %session_id,
-                                "ACP prompt stream read poll elapsed; checking Claude local activity"
+                                "ACP prompt stream read poll elapsed; checking provider local activity"
                             );
+                            if let Some(status) = provider_subprocess_exit_status_during_prompt(
+                                child,
+                                closed,
+                                &session_id,
+                            )? {
+                                failure_phase = Some("provider_subprocess_exited".to_string());
+                                break Err(anyhow::anyhow!(
+                                    "ACP provider subprocess exited during active prompt: status={status} (session={session_id})"
+                                ));
+                            }
                             poll_claude_local_activity_watchdog(
                                 claude_local_activity.as_mut(),
+                                req,
+                                &progress_sink,
+                                &session_id,
+                                &mut last_provider_local_activity,
+                                &mut last_provider_local_progress,
+                                &mut last_prompt_progress_reported,
+                            )
+                            .await;
+                            poll_codex_local_activity_watchdog(
+                                codex_local_activity.as_mut(),
                                 req,
                                 &progress_sink,
                                 &session_id,
@@ -3860,65 +5162,136 @@ impl AcpTransportSession {
                                 max_instant_option(last_acp_activity, last_provider_local_activity);
                             let idle = effective_last_activity.elapsed();
                             if idle >= IDLE_TIMEOUT {
-                                let classification = claude_local_activity
+                                let has_observed_claude_activity = claude_local_activity
                                     .as_ref()
-                                    .map(|monitor| {
-                                        if monitor.has_observed_activity() {
-                                            "provider_stream_silent_with_local_activity"
-                                        } else {
-                                            "provider_stream_silent_no_local_activity"
-                                        }
-                                    })
-                                    .unwrap_or("idle_hang_before_first_progress");
-                                failure_phase = Some("idle_timeout".to_string());
-                                let local_summary = note_claude_local_activity_receipt_event(
-                                    &mut runtime_receipt,
-                                    claude_local_activity.as_ref(),
-                                )
-                                .unwrap_or_else(|| {
-                                    "provider_local_activity=unavailable".to_string()
-                                });
-                                break Err(anyhow::anyhow!(
-                                    "ACP session idle timeout: {classification}; no message for {}s (session={}, last_acp_activity_age_s={}, last_provider_local_activity_age_s={}, {local_summary})",
-                                    IDLE_TIMEOUT.as_secs(),
-                                    session_id,
-                                    last_acp_activity.elapsed().as_secs(),
-                                    last_provider_local_activity
-                                        .map(|instant| instant.elapsed().as_secs().to_string())
-                                        .unwrap_or_else(|| "none".to_string())
-                                ));
+                                    .is_some_and(|monitor| monitor.has_observed_activity());
+                                match claude_silent_after_activity_timeout_decision(
+                                    has_observed_claude_activity,
+                                    idle,
+                                    claude_local_activity_silence_warning_recorded,
+                                ) {
+                                    AcpSilenceDeadlineDecision::WarnGrace => {
+                                        claude_local_activity_silence_warning_recorded = true;
+                                        let local_summary =
+                                            note_claude_silence_grace_receipt_event(
+                                                &mut runtime_receipt,
+                                                claude_local_activity.as_ref(),
+                                                "idle_timeout",
+                                                idle,
+                                            )
+                                            .unwrap_or_else(|| {
+                                                "provider_local_activity=unavailable".to_string()
+                                            });
+                                        warn!(
+                                            session_id = %session_id,
+                                            elapsed_s = idle.as_secs(),
+                                            grace_timeout_s = CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs(),
+                                            local_summary = %local_summary,
+                                            "Claude ACP stream silent after local activity; entering grace window"
+                                        );
+                                    }
+                                    AcpSilenceDeadlineDecision::Continue => {}
+                                    AcpSilenceDeadlineDecision::Timeout => {
+                                        let classification = provider_stream_silence_classification(
+                                            claude_local_activity.as_ref(),
+                                            codex_local_activity.as_ref(),
+                                        );
+                                        failure_phase = Some("idle_timeout".to_string());
+                                        let local_summary = provider_local_activity_summary(
+                                            &mut runtime_receipt,
+                                            claude_local_activity.as_ref(),
+                                            codex_local_activity.as_ref(),
+                                        );
+                                        break Err(anyhow::anyhow!(
+                                            "ACP session idle timeout: {classification}; no message for {}s (session={}, last_acp_activity_age_s={}, last_provider_local_activity_age_s={}, {local_summary})",
+                                            if has_observed_claude_activity {
+                                                CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT
+                                                    .as_secs()
+                                            } else {
+                                                IDLE_TIMEOUT.as_secs()
+                                            },
+                                            session_id,
+                                            last_acp_activity.elapsed().as_secs(),
+                                            last_provider_local_activity
+                                                .map(|instant| instant
+                                                    .elapsed()
+                                                    .as_secs()
+                                                    .to_string())
+                                                .unwrap_or_else(|| "none".to_string())
+                                        ));
+                                    }
+                                }
                             }
                             let effective_last_progress =
                                 max_instant_option(last_acp_progress, last_provider_local_progress);
                             let progress_idle = effective_last_progress.elapsed();
                             if progress_idle >= PROGRESS_TIMEOUT {
-                                let classification = claude_local_activity
+                                let has_observed_claude_activity = claude_local_activity
                                     .as_ref()
-                                    .map(|monitor| {
-                                        if monitor.has_observed_activity() {
-                                            "provider_stream_silent_with_local_activity"
-                                        } else {
-                                            "provider_stream_silent_no_local_activity"
-                                        }
-                                    })
-                                    .unwrap_or("idle_hang_before_first_progress");
-                                failure_phase = Some("progress_timeout".to_string());
-                                let local_summary = note_claude_local_activity_receipt_event(
-                                    &mut runtime_receipt,
-                                    claude_local_activity.as_ref(),
-                                )
-                                .unwrap_or_else(|| {
-                                    "provider_local_activity=unavailable".to_string()
-                                });
-                                break Err(anyhow::anyhow!(
-                                    "ACP session progress timeout: {classification}; no meaningful progress for {}s (session={}, {local_summary})",
-                                    PROGRESS_TIMEOUT.as_secs(),
-                                    session_id
-                                ));
+                                    .is_some_and(|monitor| monitor.has_observed_activity());
+                                match claude_silent_after_activity_timeout_decision(
+                                    has_observed_claude_activity,
+                                    progress_idle,
+                                    claude_local_activity_silence_warning_recorded,
+                                ) {
+                                    AcpSilenceDeadlineDecision::WarnGrace => {
+                                        claude_local_activity_silence_warning_recorded = true;
+                                        let local_summary =
+                                            note_claude_silence_grace_receipt_event(
+                                                &mut runtime_receipt,
+                                                claude_local_activity.as_ref(),
+                                                "progress_timeout",
+                                                progress_idle,
+                                            )
+                                            .unwrap_or_else(|| {
+                                                "provider_local_activity=unavailable".to_string()
+                                            });
+                                        warn!(
+                                            session_id = %session_id,
+                                            elapsed_s = progress_idle.as_secs(),
+                                            grace_timeout_s = CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs(),
+                                            local_summary = %local_summary,
+                                            "Claude ACP stream silent after local activity; entering grace window"
+                                        );
+                                    }
+                                    AcpSilenceDeadlineDecision::Continue => {}
+                                    AcpSilenceDeadlineDecision::Timeout => {
+                                        let classification = provider_stream_silence_classification(
+                                            claude_local_activity.as_ref(),
+                                            codex_local_activity.as_ref(),
+                                        );
+                                        failure_phase = Some("progress_timeout".to_string());
+                                        let local_summary = provider_local_activity_summary(
+                                            &mut runtime_receipt,
+                                            claude_local_activity.as_ref(),
+                                            codex_local_activity.as_ref(),
+                                        );
+                                        break Err(anyhow::anyhow!(
+                                            "ACP session progress timeout: {classification}; no meaningful progress for {}s (session={}, {local_summary})",
+                                            if has_observed_claude_activity {
+                                                CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT
+                                                    .as_secs()
+                                            } else {
+                                                PROGRESS_TIMEOUT.as_secs()
+                                            },
+                                            session_id
+                                        ));
+                                    }
+                                }
                             }
                             continue;
                         }
                         AcpPromptReadOutcome::PollElapsed => {
+                            if let Some(status) = provider_subprocess_exit_status_during_prompt(
+                                child,
+                                closed,
+                                &session_id,
+                            )? {
+                                failure_phase = Some("provider_subprocess_exited".to_string());
+                                break Err(anyhow::anyhow!(
+                                    "ACP provider subprocess exited during active prompt: status={status} (session={session_id})"
+                                ));
+                            }
                             let effective_last_activity =
                                 max_instant_option(last_acp_activity, last_provider_local_activity);
                             let idle = effective_last_activity.elapsed();
@@ -3957,6 +5330,64 @@ impl AcpTransportSession {
             let n = match n_result {
                 Ok(n) => n,
                 Err(error) => {
+                    if let Some(recovered_text) = claude_local_activity
+                        .as_ref()
+                        .and_then(|monitor| monitor.latest_final_response_text())
+                    {
+                        let original_failure_phase = failure_phase
+                            .clone()
+                            .unwrap_or_else(|| "prompt_stream_failed".to_string());
+                        completion_capture
+                            .set_provider_session_store_final_response(&recovered_text);
+                        push_streamed_transcript_chunk(
+                            &mut streamed_text,
+                            &recovered_text,
+                            &mut streamed_text_truncated,
+                        );
+                        runtime_receipt.push_event(
+                            "provider_session_store_final_response_recovered",
+                            Some(format!(
+                                "original_failure_phase={}; original_error={}",
+                                original_failure_phase,
+                                truncate_runtime_receipt_detail(&error.to_string())
+                            )),
+                        );
+                        runtime_receipt.note_terminal_response("completed");
+                        warn!(
+                            session_id = %self.session_id,
+                            original_failure_phase = %original_failure_phase,
+                            "Recovered Claude final response from provider session store after ACP stream error"
+                        );
+                        break 'streaming;
+                    }
+                    if let Some(provider_failure) = codex_local_activity.as_ref().and_then(
+                        CodexLocalActivityMonitor::provider_failure_event_from_local_activity,
+                    ) {
+                        runtime_receipt
+                            .push_event("provider_failure", Some(provider_failure.detail.clone()));
+                        runtime_receipt.note_terminal_response("failed");
+                        let receipt = runtime_receipt.build(
+                            &self.provider,
+                            self.model.as_ref(),
+                            &self.session_id,
+                            req.session_generation_id.as_ref(),
+                            self.xcode_shim_injected,
+                            self.requires_xcode_host_execution,
+                            "failed",
+                            Some(provider_failure.failure_phase.to_string()),
+                        );
+                        self.last_runtime_receipt = Some(receipt.clone());
+                        warn!(
+                            session_id = %self.session_id,
+                            provider = %self.provider,
+                            error = %provider_failure.message,
+                            "ACP provider local activity monitor classified Codex tool/session failure"
+                        );
+                        return Err(anyhow::Error::new(crate::AcpExecutionError::new(
+                            provider_failure.message,
+                            Some(receipt),
+                        )));
+                    }
                     self.last_runtime_receipt = Some(
                         runtime_receipt.build(
                             &self.provider,
@@ -4054,6 +5485,29 @@ impl AcpTransportSession {
                                 Some(request_summary.clone()),
                                 json_for_runtime_receipt(&params),
                             );
+                            if let Some(denial) = permission_preflight_denial(&params) {
+                                runtime_receipt.push_event(
+                                    "tool_preflight_denied",
+                                    Some(format!(
+                                        "code={}; tool={}; policy_version={}; guard_version={}; command={}",
+                                        denial.code,
+                                        denial.matched_tool,
+                                        TOOL_POLICY_VERSION,
+                                        TOOL_GUARD_VERSION,
+                                        truncate_runtime_receipt_detail(&denial.command)
+                                    )),
+                                );
+                                record_prompt_progress_detail_for_session(
+                                    req,
+                                    &progress_sink,
+                                    &self.session_id,
+                                    AcpPromptProgressKind::MeaningfulProgress,
+                                    Some("Tool preflight denied".to_string()),
+                                    Some(denial.agent_error_text()),
+                                    Some("tool_preflight_denied".to_string()),
+                                )
+                                .await;
+                            }
                             debug!(
                                 session_id = %self.session_id,
                                 request = %request_summary,
@@ -4084,9 +5538,17 @@ impl AcpTransportSession {
                                         &progress_sink,
                                         &self.session_id,
                                         AcpPromptProgressKind::MeaningfulProgress,
-                                        Some("Permission granted".to_string()),
+                                        Some(if grant.get("error").is_some() {
+                                            "Permission preflight denied".to_string()
+                                        } else {
+                                            "Permission granted".to_string()
+                                        }),
                                         Some(grant_summary.clone()),
-                                        Some("permission_grant".to_string()),
+                                        Some(if grant.get("error").is_some() {
+                                            "permission_preflight_denied".to_string()
+                                        } else {
+                                            "permission_grant".to_string()
+                                        }),
                                     )
                                     .await;
                                     debug!(
@@ -4236,11 +5698,21 @@ impl AcpTransportSession {
                     if parsed.get("error").is_some() {
                         let err_msg = parsed["error"]["message"].as_str().unwrap_or("ACP error");
                         let jsonrpc_error_code = parsed["error"]["code"].as_i64();
-                        let provider_failure = classify_prompt_error_response(
-                            &self.provider,
-                            jsonrpc_error_code,
-                            err_msg,
-                        );
+                        let provider_failure = codex_local_activity
+                            .as_mut()
+                            .and_then(|monitor| monitor.quota_failure_event_from_session_store())
+                            .or_else(|| {
+                                codex_local_activity.as_ref().and_then(
+                                    CodexLocalActivityMonitor::provider_failure_event_from_local_activity,
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                classify_prompt_error_response(
+                                    &self.provider,
+                                    jsonrpc_error_code,
+                                    err_msg,
+                                )
+                            });
                         runtime_receipt
                             .push_event("provider_failure", Some(provider_failure.detail.clone()));
                         runtime_receipt.note_terminal_response("failed");
@@ -4256,7 +5728,7 @@ impl AcpTransportSession {
                         );
                         receipt.jsonrpc_error_code = jsonrpc_error_code;
                         receipt.provider_error_message_redacted =
-                            Some(truncate_runtime_receipt_detail(err_msg));
+                            Some(truncate_runtime_receipt_detail(&provider_failure.message));
                         self.last_runtime_receipt = Some(receipt);
                         warn!(
                             session_id = %self.session_id,
@@ -4268,7 +5740,7 @@ impl AcpTransportSession {
                             vec![],
                             vec![],
                             pre_prompt_expected_outputs,
-                            transcript_with_prompt_error(streamed_text, err_msg),
+                            transcript_with_prompt_error(streamed_text, &provider_failure.message),
                             completion_capture
                                 .select_extraction_input_with_capped_stream(None, true)
                                 .metadata,
@@ -4774,6 +6246,41 @@ mod tests {
     }
 
     #[test]
+    fn permission_preflight_denies_broad_rg_with_typed_error() {
+        let params = serde_json::json!({
+            "toolCall": {
+                "title": "Run command",
+                "command": "rg prompt_stream_failed ."
+            },
+            "options": [
+                {"kind": "allow_once", "optionId": "allow_once"},
+                {"kind": "reject_once", "optionId": "reject_once"}
+            ]
+        });
+
+        let grant = build_permission_grant(&serde_json::json!(7), &params).expect("typed denial");
+
+        assert_eq!(grant["id"], serde_json::json!(7));
+        assert_eq!(
+            grant["error"]["data"]["preflightCode"],
+            "tool_output_budget_preflight_denied"
+        );
+        assert_eq!(
+            grant["error"]["data"]["classification"],
+            "tool_output_budget_preflight_denied"
+        );
+        assert!(grant["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Broad repository search must use bounded search"));
+        assert!(grant["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("rg prompt_stream_failed control-plane/crates/acp/src"));
+        assert!(summarize_permission_grant(&grant).contains("tool_output_budget_preflight_denied"));
+    }
+
+    #[test]
     fn permission_grant_keeps_allow_once_before_non_read_only_allow_always() {
         let params = serde_json::json!({
             "options": [
@@ -4938,6 +6445,54 @@ mod tests {
                     .as_deref()
                     .is_some_and(|detail| detail.contains("open_background_tasks=1"))
         }));
+    }
+
+    #[test]
+    fn claude_local_activity_summary_exposes_incomplete_assistant_turn() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tempdir.path().join("session.jsonl");
+        let mut file = std::fs::File::create(&transcript_path).expect("transcript");
+        let mut monitor = ClaudeLocalActivityMonitor::new_for_path(transcript_path);
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"id":"msg_1","stop_reason":null,"content":[{{"type":"text","text":"Now I'll write the proposal JSON."}}]}}}}"#
+        )
+        .expect("write assistant event");
+        file.flush().expect("flush assistant event");
+
+        monitor.poll(Instant::now()).expect("poll");
+
+        let summary = monitor.summary_for_error();
+        assert!(summary.contains("last_assistant_stop_reason=null"));
+        assert!(summary.contains("last_assistant_incomplete=true"));
+    }
+
+    #[test]
+    fn claude_observed_activity_timeout_policy_warns_before_grace_failure() {
+        assert_eq!(
+            claude_silent_after_activity_timeout_decision(true, PROGRESS_TIMEOUT, false,),
+            AcpSilenceDeadlineDecision::WarnGrace
+        );
+        assert_eq!(
+            claude_silent_after_activity_timeout_decision(
+                true,
+                PROGRESS_TIMEOUT + Duration::from_secs(1),
+                true,
+            ),
+            AcpSilenceDeadlineDecision::Continue
+        );
+        assert_eq!(
+            claude_silent_after_activity_timeout_decision(
+                true,
+                CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT,
+                true,
+            ),
+            AcpSilenceDeadlineDecision::Timeout
+        );
+        assert_eq!(
+            claude_silent_after_activity_timeout_decision(false, PROGRESS_TIMEOUT, false),
+            AcpSilenceDeadlineDecision::Timeout
+        );
     }
 
     #[test]
@@ -5153,6 +6708,93 @@ mod tests {
     }
 
     #[test]
+    fn claude_local_activity_clears_background_task_on_xml_task_notification() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tempdir.path().join("session.jsonl");
+        let mut file = std::fs::File::create(&transcript_path).expect("transcript");
+        let mut monitor = ClaudeLocalActivityMonitor::new_for_path(transcript_path.clone());
+        writeln!(
+            file,
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":"Command running in background with ID: bwozyscgm. Output is being written to: /tmp/tasks/bwozyscgm.output","is_error":false}}]}},"toolUseResult":{{"backgroundTaskId":"bwozyscgm"}}}}"#
+        )
+        .expect("write background task result");
+        file.flush().expect("flush background task");
+
+        assert!(
+            monitor
+                .poll(Instant::now())
+                .expect("poll")
+                .should_extend_watchdog
+        );
+        assert!(monitor
+            .summary_for_error()
+            .contains("open_background_tasks=1"));
+
+        writeln!(
+            file,
+            r#"{{"type":"queue-operation","operation":"enqueue","timestamp":"2026-06-05T00:30:07.093Z","sessionId":"session-1","content":"<task-notification>\n<task-id>bwozyscgm</task-id>\n<tool-use-id>toolu_1</tool-use-id>\n<output-file>/tmp/tasks/bwozyscgm.output</output-file>\n<status>completed</status>\n<summary>Background command completed (exit code 0)</summary>\n</task-notification>"}}"#
+        )
+        .expect("write xml task notification");
+        file.flush().expect("flush xml notification");
+
+        let observation = monitor.poll(Instant::now()).expect("poll");
+
+        assert!(observation.should_extend_watchdog);
+        assert!(monitor
+            .summary_for_error()
+            .contains("open_background_tasks=0"));
+
+        let observation = monitor.poll(Instant::now()).expect("poll");
+        assert!(
+            !observation.should_extend_watchdog,
+            "after terminal XML task notification and no new JSONL entries, Claude local activity no longer masks ACP silence"
+        );
+    }
+
+    #[test]
+    fn claude_local_activity_stale_background_task_after_end_turn_does_not_extend_watchdog() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tempdir.path().join("session.jsonl");
+        let mut file = std::fs::File::create(&transcript_path).expect("transcript");
+        let mut monitor = ClaudeLocalActivityMonitor::new_for_path(transcript_path.clone());
+        writeln!(
+            file,
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":"Command running in background with ID: b1vr6wylt. Output is being written to: /tmp/tasks/b1vr6wylt.output","is_error":false}}]}},"toolUseResult":{{"backgroundTaskId":"b1vr6wylt"}}}}"#
+        )
+        .expect("write background task result");
+        file.flush().expect("flush background task");
+
+        assert!(
+            monitor
+                .poll(Instant::now())
+                .expect("poll")
+                .should_extend_watchdog
+        );
+        assert!(monitor
+            .summary_for_error()
+            .contains("open_background_tasks=1"));
+
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"id":"msg_1","stop_reason":"end_turn","content":[{{"type":"text","text":"CHAINWORKS_OUTPUT={{}}"}}]}}}}"#
+        )
+        .expect("write assistant end_turn");
+        file.flush().expect("flush end_turn");
+
+        let observation = monitor.poll(Instant::now()).expect("poll");
+        assert!(observation.should_extend_watchdog);
+        assert!(monitor
+            .summary_for_error()
+            .contains("last_assistant_stop_reason=end_turn"));
+
+        let observation = monitor.poll(Instant::now()).expect("poll");
+        assert!(
+            !observation.should_extend_watchdog,
+            "a stale background task after assistant end_turn must not extend the Claude watchdog forever"
+        );
+    }
+
+    #[test]
     fn claude_local_activity_missing_or_still_jsonl_does_not_extend_watchdog() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let transcript_path = tempdir.path().join("missing-session.jsonl");
@@ -5163,6 +6805,285 @@ mod tests {
         assert!(!observation.should_extend_watchdog);
         assert_eq!(monitor.summary().event_count, 0);
         assert_eq!(monitor.open_tool_use_count(), 0);
+    }
+
+    #[test]
+    fn codex_local_activity_uses_exact_runtime_home_before_bounded_parent_walk() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let workspace_root = tempdir.path();
+        let codex_root = workspace_root.join(".forge-codex-acp");
+        for index in 0..700 {
+            std::fs::create_dir_all(codex_root.join(format!("noise-{index:04}/sessions")))
+                .expect("noise runtime home");
+        }
+        let runtime_home = codex_root.join("active-runtime");
+        let session_id = "019eb588-86bf-74a2-9ac1-73967b038637";
+        let session_path = runtime_home
+            .join("sessions/2026/06/11")
+            .join(format!("rollout-2026-06-11T10-14-44-{session_id}.jsonl"));
+        std::fs::create_dir_all(session_path.parent().expect("session parent"))
+            .expect("session parent dir");
+        std::fs::write(
+            &session_path,
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_gate","output":"Process running with session ID 91234\nOutput:\n   Compiling engine v0.1.0\n"}}"#,
+        )
+        .expect("session jsonl");
+
+        let req = ExecutionRequest {
+            run_id: domain::ids::RunId::new(),
+            stage_execution_id: None,
+            stage_id: "state_9_implementation_reviewed".into(),
+            attempt_number: 1,
+            agent_execution_id: None,
+            agent_id: "proposal_implementation_auditor".into(),
+            provider: "codex".into(),
+            model: Some("gpt-5.5".into()),
+            effort: None,
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            prompt: "audit".into(),
+            worktree_root: None,
+            worktree_write_enabled: false,
+            worktree_strategy: None,
+            expected_output_paths: Vec::new(),
+            expected_outputs: Vec::new(),
+            keep_session_alive: false,
+            reuse_existing_session: false,
+            session_generation_id: None,
+            provider_session_id: None,
+            provider_runtime_home: Some(runtime_home.to_string_lossy().into_owned()),
+            mcp_servers: Vec::new(),
+            chainworks_meta_root: None,
+            legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
+            owner_kind: "stage_execution".to_string(),
+            owner_id: None,
+            origin_stage_id: None,
+            origin_stage_execution_id: None,
+            mediation_record_id: None,
+            toolchain_home: None,
+            toolchain_go_scope_enabled: false,
+        };
+
+        let mut monitor =
+            CodexLocalActivityMonitor::for_request(&req, session_id).expect("codex monitor");
+        let observation = monitor.poll(Instant::now()).expect("poll");
+
+        assert!(observation.should_extend_watchdog);
+        assert_eq!(observation.new_event_count, 1);
+        assert_eq!(monitor.open_process_count(), 1);
+        let summary = monitor.summary_for_error();
+        assert!(summary.contains("codex_session_store_path_found=true"));
+        assert!(summary.contains("codex_session_store_search_limit_hit=false"));
+        assert!(
+            summary.contains("codex_session_store_candidate_root_count=2"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn codex_local_activity_tracks_running_process_output_and_abort() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let session_path = tempdir.path().join("rollout-session.jsonl");
+        let mut file = std::fs::File::create(&session_path).expect("session store");
+        let mut monitor = CodexLocalActivityMonitor::new_for_path(session_path.clone());
+
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-05T06:41:40.880Z","type":"response_item","payload":{{"type":"function_call","name":"exec_command","arguments":"{{\"cmd\":\"./scripts/test-gate.sh proposal-082\",\"yield_time_ms\":1000}}","call_id":"call_gate"}}}}"#
+        )
+        .expect("write exec call");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-05T06:41:42.041Z","type":"response_item","payload":{{"type":"function_call_output","call_id":"call_gate","output":"Chunk ID: 7c8402\nWall time: 1.0021 seconds\nProcess running with session ID 78043\nOutput:\n==> Proposal 082 gate\n"}}}}"#
+        )
+        .expect("write running output");
+        file.flush().expect("flush running output");
+
+        let observation = monitor.poll(Instant::now()).expect("poll");
+        assert!(observation.should_extend_watchdog);
+        assert_eq!(observation.new_event_count, 2);
+        assert_eq!(monitor.open_process_count(), 1);
+        assert!(monitor.summary_for_error().contains("open_processes=1"));
+
+        let observation = monitor.poll(Instant::now()).expect("poll no new events");
+        assert!(
+            observation.should_extend_watchdog,
+            "an open Codex process keeps the provider locally active while ACP is quiet"
+        );
+        assert_eq!(observation.new_event_count, 0);
+
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-05T06:46:16.109Z","type":"response_item","payload":{{"type":"function_call","name":"write_stdin","arguments":"{{\"session_id\":78043,\"chars\":\"\",\"yield_time_ms\":30000}}","call_id":"call_poll"}}}}"#
+        )
+        .expect("write poll call");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-05T06:46:14.011Z","type":"response_item","payload":{{"type":"function_call_output","call_id":"call_poll","output":"Chunk ID: 6c774b\nWall time: 30.0048 seconds\nProcess running with session ID 78043\nOutput:\n   Compiling engine v0.1.0\n"}}}}"#
+        )
+        .expect("write poll output");
+        file.flush().expect("flush poll output");
+
+        let observation = monitor.poll(Instant::now()).expect("poll fresh output");
+        assert!(observation.should_extend_watchdog);
+        assert_eq!(observation.new_event_count, 2);
+        assert_eq!(monitor.open_process_count(), 1);
+        assert!(monitor
+            .summary_for_error()
+            .contains("running_process_outputs=2"));
+
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-05T06:46:33.660Z","type":"event_msg","payload":{{"type":"turn_aborted","reason":"interrupted"}}}}"#
+        )
+        .expect("write turn aborted");
+        file.flush().expect("flush abort");
+
+        let observation = monitor.poll(Instant::now()).expect("poll abort");
+        assert!(observation.should_extend_watchdog);
+        assert_eq!(monitor.open_process_count(), 0);
+        assert!(monitor.summary_for_error().contains("turn_aborted=true"));
+
+        let observation = monitor.poll(Instant::now()).expect("poll after abort");
+        assert!(
+            !observation.should_extend_watchdog,
+            "after turn_aborted and no new JSONL entries, Codex local activity must not mask ACP silence"
+        );
+    }
+
+    #[test]
+    fn codex_local_activity_task_complete_clears_open_process() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let session_path = tempdir.path().join("rollout-session.jsonl");
+        let mut file = std::fs::File::create(&session_path).expect("session store");
+        let mut monitor = CodexLocalActivityMonitor::new_for_path(session_path.clone());
+
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-05T06:41:42.041Z","type":"response_item","payload":{{"type":"function_call_output","call_id":"call_gate","output":"Process running with session ID 78043\nOutput:\n==> Proposal 082 gate\n"}}}}"#
+        )
+        .expect("write running output");
+        file.flush().expect("flush running output");
+
+        assert!(
+            monitor
+                .poll(Instant::now())
+                .expect("poll running")
+                .should_extend_watchdog
+        );
+        assert_eq!(monitor.open_process_count(), 1);
+
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-05T06:50:00.000Z","type":"event_msg","payload":{{"type":"task_complete","turn_id":"turn-1","last_agent_message":"{{\"CHAINWORKS_OUTPUT\":{{}}}}","completed_at":1780642200,"duration_ms":600000}}}}"#
+        )
+        .expect("write task complete");
+        file.flush().expect("flush task complete");
+
+        let observation = monitor.poll(Instant::now()).expect("poll complete");
+        assert!(observation.should_extend_watchdog);
+        assert_eq!(monitor.open_process_count(), 0);
+        assert!(monitor.summary_for_error().contains("turn_completed=true"));
+
+        let observation = monitor.poll(Instant::now()).expect("poll after complete");
+        assert!(
+            !observation.should_extend_watchdog,
+            "after Codex task_complete and no new JSONL entries, local activity must not mask ACP silence"
+        );
+    }
+
+    #[test]
+    fn codex_local_activity_classifies_cumulative_tool_output_budget() {
+        let mut monitor =
+            CodexLocalActivityMonitor::new_for_path(PathBuf::from("/tmp/nonexistent.jsonl"));
+        let large_output = "x".repeat((DEFAULT_TOOL_OUTPUT_MAX_BYTES as usize) + 1);
+        let payload = serde_json::json!({
+            "type": "function_call_output",
+            "call_id": "call_rg",
+            "output": large_output,
+        });
+
+        assert!(monitor.observe_function_call_output(&payload));
+        let failure = monitor
+            .provider_failure_event_from_local_activity()
+            .expect("budget failure");
+        assert_eq!(failure.failure_phase, "tool_output_budget_exceeded");
+        assert!(failure.detail.contains("tool_output_budget_exceeded"));
+        assert!(monitor
+            .summary_for_error()
+            .contains("cumulative_function_output_bytes="));
+    }
+
+    #[test]
+    fn codex_local_activity_classifies_wrapper_truncation_marker_as_budget_exceeded() {
+        let mut monitor =
+            CodexLocalActivityMonitor::new_for_path(PathBuf::from("/tmp/nonexistent.jsonl"));
+        let payload = serde_json::json!({
+            "type": "function_call_output",
+            "call_id": "call_rg",
+            "output": "line-2000\ntool_output_budget_exceeded: output truncated by Chainworks safe-search guard\n",
+        });
+
+        assert!(monitor.observe_function_call_output(&payload));
+        let failure = monitor
+            .provider_failure_event_from_local_activity()
+            .expect("wrapper truncation marker should be budget evidence");
+        assert_eq!(failure.failure_phase, "tool_output_budget_exceeded");
+        assert!(failure.detail.contains("tool_output_budget_exceeded"));
+    }
+
+    #[test]
+    fn codex_local_activity_classifies_unbounded_output_and_stdin_closed_abort() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let session_path = tempdir.path().join("rollout-session.jsonl");
+        let mut file = std::fs::File::create(&session_path).expect("session store");
+        let mut monitor = CodexLocalActivityMonitor::new_for_path(session_path.clone());
+
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-08T04:51:00.000Z","type":"response_item","payload":{{"type":"function_call_output","call_id":"call_rg","output":"Chunk ID: p082\nWall time: 1.0000 seconds\nProcess running with session ID 44865\nOriginal token count: 2030856\nTotal output lines: 5532\nOutput:\nlarge search output\n"}}}}"#
+        )
+        .expect("write unbounded output");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-08T04:51:20.000Z","type":"response_item","payload":{{"type":"function_call","name":"write_stdin","arguments":"{{\"session_id\":44865,\"chars\":\"\\u0003\"}}","call_id":"call_interrupt"}}}}"#
+        )
+        .expect("write interrupt call");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-08T04:51:21.000Z","type":"response_item","payload":{{"type":"function_call_output","call_id":"call_interrupt","output":"write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open"}}}}"#
+        )
+        .expect("write stdin closed");
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-06-08T04:51:41.000Z","type":"event_msg","payload":{{"type":"turn_aborted","reason":"interrupted"}}}}"#
+        )
+        .expect("write turn aborted");
+        file.flush().expect("flush");
+
+        let observation = monitor.poll(Instant::now()).expect("poll");
+        assert!(observation.should_extend_watchdog);
+        assert_eq!(monitor.open_process_count(), 0);
+        let summary = monitor.summary_for_error();
+        assert!(summary.contains("stdin_closed_control_failures=1"));
+        assert!(summary.contains("unbounded_tool_outputs=2"));
+        assert!(summary.contains("max_original_token_count=2030856"));
+        assert!(summary.contains("max_total_output_lines=5532"));
+        assert!(summary.contains("turn_aborted_after_open_process=true"));
+        let failure = monitor
+            .provider_failure_event_from_local_activity()
+            .expect("pathological Codex tool session failure");
+        assert_eq!(failure.failure_phase, "codex_tool_session_control_failure");
+        assert!(failure
+            .detail
+            .contains("codex_turn_aborted_after_open_process"));
+
+        let observation = monitor.poll(Instant::now()).expect("poll after abort");
+        assert!(
+            !observation.should_extend_watchdog,
+            "turn_aborted after pathological tool control failure must not keep extending the watchdog"
+        );
     }
 
     #[test]
@@ -5222,6 +7143,7 @@ mod tests {
             reuse_existing_session: false,
             session_generation_id: Some("session-1".to_string()),
             provider_session_id: None,
+            provider_runtime_home: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: Some("/tmp/run".to_string()),
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -5420,6 +7342,69 @@ mod tests {
     }
 
     #[test]
+    fn codex_session_update_field_markers_are_classified_as_meaningful_progress() {
+        let tool_call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "codex-session",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_gate",
+                    "title": "./scripts/test-gate.sh proposal-082",
+                    "kind": "execute",
+                    "status": "in_progress"
+                }
+            }
+        });
+        let tool_call_update = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "codex-session",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call_gate",
+                    "status": "completed"
+                }
+            }
+        });
+        let usage_update = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "codex-session",
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": 172419,
+                    "size": 258400
+                }
+            }
+        });
+
+        assert_eq!(
+            session_update_observation(&tool_call),
+            ("tool_call", true, Some("tool_call".to_string()))
+        );
+        assert_eq!(
+            session_update_observation(&tool_call_update),
+            (
+                "tool_call_update",
+                true,
+                Some("tool_call_update".to_string())
+            )
+        );
+        assert_eq!(
+            session_update_observation(&usage_update),
+            ("usage_update", true, Some("usage_update".to_string()))
+        );
+        assert!(!session_update_refreshes_progress_deadline(
+            "usage_update",
+            true
+        ));
+    }
+
+    #[test]
     fn meaningful_session_updates_refresh_progress_deadline() {
         assert!(session_update_refreshes_progress_deadline(
             "provider_activity",
@@ -5529,6 +7514,40 @@ mod tests {
     }
 
     #[test]
+    fn codex_session_store_credits_exhausted_prompt_error_is_provider_quota() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let session_path = tempdir.path().join("rollout-session.jsonl");
+        std::fs::write(
+            &session_path,
+            r#"{"timestamp":"2026-06-05T21:58:47.252Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"premium","credits":{"has_credits":false,"unlimited":false,"balance":"0"}}}}"#,
+        )
+        .expect("write session store");
+
+        let failure = codex_session_store_credits_exhausted_failure(&session_path)
+            .expect("credits-exhausted failure expected");
+
+        assert_eq!(failure.failure_phase, "provider_quota");
+        assert!(failure.message.contains("Codex credits exhausted"));
+        assert!(failure.detail.contains("codex_credits_exhausted"));
+        assert!(failure.detail.contains("limit_id=premium"));
+        assert!(failure.detail.contains("balance=0"));
+    }
+
+    #[test]
+    fn claude_long_context_usage_credits_prompt_error_is_provider_quota() {
+        let failure = classify_prompt_error_response(
+            "claude",
+            Some(-32603),
+            "Usage credits are required for long context requests.",
+        );
+
+        assert_eq!(failure.failure_phase, "provider_quota");
+        assert!(failure
+            .detail
+            .contains("claude_long_context_credits_required"));
+    }
+
+    #[test]
     fn proposal_089_completion_capture_uses_agent_message_chunks_only() {
         let thought = serde_json::json!({
             "jsonrpc": "2.0",
@@ -5572,7 +7591,9 @@ mod tests {
         assert_eq!(extract_agent_message_chunk(&tool), None);
         assert_eq!(
             extract_agent_message_chunk(&message).as_deref(),
-            Some("{\"CHAINWORKS_OUTPUT\":{\"tests_result\":{\"status\":\"not_run\",\"commands\":[]}}}")
+            Some(
+                "{\"CHAINWORKS_OUTPUT\":{\"tests_result\":{\"status\":\"not_run\",\"commands\":[]}}}"
+            )
         );
     }
 
@@ -5611,6 +7632,26 @@ mod tests {
         assert_eq!(selected.metadata.extraction_input_truncated, false);
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].name, "implementation_progress");
+    }
+
+    #[test]
+    fn provider_session_store_final_response_is_distinct_completion_capture_source() {
+        let mut capture = CompletionTextCapture::default();
+        capture.push_streamed_update("working...");
+        capture.set_provider_session_store_final_response(
+            "{\"CHAINWORKS_OUTPUT\":{\"implementation_progress\":{\"status\":\"complete\"}}}",
+        );
+
+        let selected = capture.select_extraction_input();
+
+        assert_eq!(
+            selected.metadata.capture_source,
+            Some(crate::AcpCompletionCaptureSource::ProviderSessionStoreFinalResponse)
+        );
+        assert_eq!(
+            selected.text.as_deref(),
+            Some("{\"CHAINWORKS_OUTPUT\":{\"implementation_progress\":{\"status\":\"complete\"}}}")
+        );
     }
 
     #[test]
@@ -5811,6 +7852,95 @@ mod tests {
             artifacts[0].source_kind,
             DiscoveredArtifactSourceKind::ChainworksOutput
         );
+    }
+
+    #[test]
+    fn mixed_path_keyed_and_direct_file_chainworks_output_entries_are_extracted() {
+        let progress_path = "/Users/user/Documents/Chainworks Forge/.chainworks/runs/run-1/implementation/progress.md";
+        let self_assessment_path = "/Users/user/Documents/Chainworks Forge/.chainworks/runs/run-1/implementation/self-assessment.json";
+        let changed_files_path = "/Users/user/Documents/Chainworks Forge/.chainworks/runs/run-1/implementation/changed-files.json";
+        let tests_path = "/Users/user/Documents/Chainworks Forge/.chainworks/runs/run-1/implementation/tests.json";
+        let expected_outputs = vec![
+            ExpectedOutputSpec {
+                output_name: "implementation_progress".to_string(),
+                output_role: domain::discovery::ExpectedOutputRole::Machine,
+                target_path: progress_path.to_string(),
+                companion_of: None,
+                display_label: "Implementation progress".to_string(),
+                contract_id: Some("implementation_progress".to_string()),
+                required: true,
+                reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+                max_bytes: 16 * 1024,
+                aggregate_acceptance_cap_bytes: 128 * 1024,
+                authorized_roots: vec![],
+                source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+            },
+            ExpectedOutputSpec {
+                output_name: "implementation_self_assessment".to_string(),
+                output_role: domain::discovery::ExpectedOutputRole::Machine,
+                target_path: self_assessment_path.to_string(),
+                companion_of: None,
+                display_label: "Implementation self assessment".to_string(),
+                contract_id: Some("implementation_self_assessment_v2".to_string()),
+                required: true,
+                reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+                max_bytes: 64 * 1024,
+                aggregate_acceptance_cap_bytes: 128 * 1024,
+                authorized_roots: vec![],
+                source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+            },
+            ExpectedOutputSpec {
+                output_name: "changed_files_manifest".to_string(),
+                output_role: domain::discovery::ExpectedOutputRole::Machine,
+                target_path: changed_files_path.to_string(),
+                companion_of: None,
+                display_label: "Changed files".to_string(),
+                contract_id: Some("changed_files_manifest".to_string()),
+                required: true,
+                reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+                max_bytes: 64 * 1024,
+                aggregate_acceptance_cap_bytes: 128 * 1024,
+                authorized_roots: vec![],
+                source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+            },
+            ExpectedOutputSpec {
+                output_name: "tests_result".to_string(),
+                output_role: domain::discovery::ExpectedOutputRole::Machine,
+                target_path: tests_path.to_string(),
+                companion_of: None,
+                display_label: "Tests result".to_string(),
+                contract_id: Some("tests_result".to_string()),
+                required: true,
+                reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+                max_bytes: 16 * 1024,
+                aggregate_acceptance_cap_bytes: 128 * 1024,
+                authorized_roots: vec![],
+                source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+            },
+        ];
+        let stream = serde_json::json!({
+            "CHAINWORKS_OUTPUT": {
+                progress_path: {"status": "complete", "summary": "done"},
+                self_assessment_path: {"implementation_complete": true, "verification_green": true, "remaining_code_tasks": []},
+                changed_files_path: {"mode": "direct_file", "output_name": "changed_files_manifest", "path": changed_files_path, "digest": "sha256:abc", "size_bytes": 3},
+                tests_path: {"status": "complete", "summary": "tests passed"}
+            }
+        })
+        .to_string();
+
+        let artifacts = extract_output_envelopes(&format!("done {stream}"), &expected_outputs);
+
+        for expected in [
+            progress_path,
+            self_assessment_path,
+            changed_files_path,
+            tests_path,
+        ] {
+            assert!(
+                artifacts.iter().any(|artifact| artifact.name == expected),
+                "missing path-keyed output {expected}: {artifacts:?}"
+            );
+        }
     }
 
     #[test]

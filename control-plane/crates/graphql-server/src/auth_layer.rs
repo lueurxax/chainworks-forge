@@ -17,12 +17,26 @@ pub struct GraphqlTokenId(pub String);
 /// `async_graphql::Context::data::<auth::Principal>()` can retrieve it.
 /// On failure, returns HTTP 401 with a GraphQL-shaped error body.
 ///
-/// The `PrincipalTable` is passed as a parameter (not from request extensions)
-/// to avoid relying on extension injection from an outer layer.
 pub async fn require_auth(
-    mut request: Request,
+    request: Request,
     next: Next,
     principal_table: auth::PrincipalTable,
+) -> Response {
+    require_auth_with_live_source(
+        request,
+        next,
+        auth::LivePrincipalSource::new(principal_table),
+    )
+    .await
+}
+
+/// The live principal source is passed as a parameter (not from request
+/// extensions) so each HTTP request resolves the bearer against the current
+/// reloadable table instead of the startup snapshot.
+pub async fn require_auth_with_live_source(
+    mut request: Request,
+    next: Next,
+    principal_source: auth::LivePrincipalSource,
 ) -> Response {
     // Playground exemption: allow only the HTML playground shell when
     // CHAINWORKS_PLAYGROUND_AUTH=skip. GET requests carrying a query string
@@ -50,8 +64,12 @@ pub async fn require_auth(
 
     match auth_header {
         Some(header_value) => match auth::extract_bearer_token(&header_value) {
-            Ok(token) => match auth::resolve_bearer(token, &principal_table) {
+            Ok(token) => match principal_source.resolve_bearer(token) {
                 Ok(principal) => {
+                    if principal.has_explicit_surface_policies && principal.graphql_policy.is_none()
+                    {
+                        return forbidden_response();
+                    }
                     // SEC-P081-M002: derive token_id for audit correlation. The raw token
                     // is not stored; only the derived diagnostic identifier is propagated.
                     let token_id = auth::derive_token_id(token, &principal.id);
@@ -85,6 +103,24 @@ fn unauthorized_response() -> Response {
     });
     (
         StatusCode::UNAUTHORIZED,
+        [("content-type", "application/json")],
+        serde_json::to_string(&body).unwrap(),
+    )
+        .into_response()
+}
+
+fn forbidden_response() -> Response {
+    let body = serde_json::json!({
+        "errors": [{
+            "message": "forbidden",
+            "extensions": {
+                "code": "FORBIDDEN",
+                "reasonCode": "CAPABILITY_OUT_OF_SCOPE"
+            }
+        }]
+    });
+    (
+        StatusCode::FORBIDDEN,
         [("content-type", "application/json")],
         serde_json::to_string(&body).unwrap(),
     )

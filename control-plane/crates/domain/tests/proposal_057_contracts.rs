@@ -54,6 +54,35 @@ fn proposal_057_normalizes_live_review_blocker_statuses() {
 }
 
 #[test]
+fn proposal_094_normalizes_boundary_contract_statuses() {
+    let decomposition =
+        normalize_contract_status("proposal_decomposition_plan_v1", "split_required").unwrap();
+    assert_eq!(decomposition.canonical_status, "split_required");
+    assert!(decomposition.valid);
+
+    let boundary = normalize_contract_status(
+        "blocker_boundary_status_v1",
+        "awaiting_human_boundary_approval",
+    )
+    .unwrap();
+    assert_eq!(
+        boundary.canonical_status,
+        "awaiting_human_boundary_approval"
+    );
+    assert!(boundary.valid);
+
+    let accepted =
+        normalize_contract_status("blocker_boundary_human_decision_v1", "accept").unwrap();
+    assert_eq!(accepted.canonical_status, "granted");
+    assert!(accepted.valid);
+
+    let rejected =
+        normalize_contract_status("blocker_boundary_human_decision_v1", "reject").unwrap();
+    assert_eq!(rejected.canonical_status, "rejected");
+    assert!(rejected.valid);
+}
+
+#[test]
 fn proposal_057_degraded_policy_is_default_deny_and_explicit_allow_only() {
     let default_policy = DegradedOutputPolicy::default();
     assert_eq!(default_policy.mode, DegradedOutputPolicyMode::Deny);

@@ -11,6 +11,9 @@ pub enum RuntimeFailureObservation {
     ProviderTimeout {
         supervision_classification: Option<String>,
     },
+    ProviderToolSessionControlFailure,
+    ToolOutputBudgetPreflightDenied,
+    ToolOutputBudgetExceeded,
     ProviderInternalError,
     TransportEpipe,
     TransportProtocolError,
@@ -67,6 +70,27 @@ pub fn classify_observation(
             retry_after: None,
             transport_error_code: None,
             supervision_classification,
+        },
+        ProviderToolSessionControlFailure => RuntimeFailureClassification {
+            failure_kind: AgentFailureKind::ProviderInternalError,
+            operator_action_hint: OperatorActionHint::Retry,
+            retry_after: None,
+            transport_error_code: Some("CODEX_TOOL_SESSION_CONTROL_FAILURE".into()),
+            supervision_classification: Some("codex_tool_session_control_failure".into()),
+        },
+        ToolOutputBudgetPreflightDenied => RuntimeFailureClassification {
+            failure_kind: AgentFailureKind::ToolOutputBudgetPreflightDenied,
+            operator_action_hint: OperatorActionHint::InspectLogs,
+            retry_after: None,
+            transport_error_code: Some("TOOL_OUTPUT_BUDGET_PREFLIGHT_DENIED".into()),
+            supervision_classification: Some("tool_output_budget_preflight_denied".into()),
+        },
+        ToolOutputBudgetExceeded => RuntimeFailureClassification {
+            failure_kind: AgentFailureKind::ToolOutputBudgetExceeded,
+            operator_action_hint: OperatorActionHint::InspectLogs,
+            retry_after: None,
+            transport_error_code: Some("TOOL_OUTPUT_BUDGET_EXCEEDED".into()),
+            supervision_classification: Some("tool_output_budget_exceeded".into()),
         },
         ProviderInternalError => RuntimeFailureClassification {
             failure_kind: AgentFailureKind::ProviderInternalError,
@@ -149,19 +173,21 @@ pub fn classify_observation(
 }
 
 pub fn observation_from_acp_error_message(message: &str) -> RuntimeFailureObservation {
+    observation_from_acp_error_message_at(message, Utc::now())
+}
+
+pub fn observation_from_acp_error_message_at(
+    message: &str,
+    now: DateTime<Utc>,
+) -> RuntimeFailureObservation {
     if let Some(observation) = observation_from_typed_payload(message) {
         return observation;
     }
 
     let lower = message.to_ascii_lowercase();
-    if lower.contains("quota")
-        || lower.contains("limit")
-        || lower.contains("retry_after")
-        || lower.contains("exhausted your capacity")
-        || lower.contains("capacity on this model")
-    {
+    if is_explicit_provider_quota_message(&lower) {
         return RuntimeFailureObservation::ProviderQuota {
-            retry_after: extract_retry_after_from_message(message),
+            retry_after: extract_retry_after_from_message_at(message, now),
         };
     }
     if lower.contains("epipe") || lower.contains("broken pipe") {
@@ -176,6 +202,20 @@ pub fn observation_from_acp_error_message(message: &str) -> RuntimeFailureObserv
         return RuntimeFailureObservation::ProviderTimeout {
             supervision_classification: Some("provider_stream_silent_no_local_activity".into()),
         };
+    }
+    if lower.contains("tool_output_budget_preflight_denied") {
+        return RuntimeFailureObservation::ToolOutputBudgetPreflightDenied;
+    }
+    if lower.contains("tool_output_budget_exceeded")
+        || lower.contains("codex_unbounded_tool_output")
+    {
+        return RuntimeFailureObservation::ToolOutputBudgetExceeded;
+    }
+    if lower.contains("codex_tool_session_control_failure")
+        || lower.contains("codex_tool_stdin_closed")
+        || lower.contains("codex_turn_aborted_after_open_process")
+    {
+        return RuntimeFailureObservation::ProviderToolSessionControlFailure;
     }
     if lower.contains("idle") && lower.contains("timeout") {
         return RuntimeFailureObservation::ProviderTimeout {
@@ -215,6 +255,26 @@ pub fn observation_from_acp_error_message(message: &str) -> RuntimeFailureObserv
         return RuntimeFailureObservation::TransportClosed;
     }
     RuntimeFailureObservation::ProviderInternalError
+}
+
+fn is_explicit_provider_quota_message(lower: &str) -> bool {
+    lower.contains("provider_quota")
+        || lower.contains("provider quota")
+        || lower.contains("quota exceeded")
+        || lower.contains("quota exhausted")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("provider limit")
+        || lower.contains("usage limit")
+        || lower.contains("hit your limit")
+        || lower.contains("out of extra usage")
+        || lower.contains("out of usage")
+        || lower.contains("credits exhausted")
+        || lower.contains("exhausted your capacity")
+        || lower.contains("capacity on this model")
+        || (lower.contains("usage credits")
+            && lower.contains("required")
+            && lower.contains("long context"))
 }
 
 fn observation_from_typed_payload(message: &str) -> Option<RuntimeFailureObservation> {
@@ -263,10 +323,6 @@ fn observation_from_typed_payload(message: &str) -> Option<RuntimeFailureObserva
         }
         _ => None,
     }
-}
-
-fn extract_retry_after_from_message(message: &str) -> Option<DateTime<Utc>> {
-    extract_retry_after_from_message_at(message, Utc::now())
 }
 
 fn extract_retry_after_from_message_at(message: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
@@ -623,6 +679,48 @@ mod tests {
     }
 
     #[test]
+    fn bounded_tool_output_classifies_before_provider_internal_fallback() {
+        let preflight = observation_from_acp_error_message(
+            "tool_output_budget_preflight_denied: Broad repository search must use bounded search",
+        );
+        assert_eq!(
+            preflight,
+            RuntimeFailureObservation::ToolOutputBudgetPreflightDenied
+        );
+        let preflight_classification = classify_observation(preflight);
+        assert_eq!(
+            preflight_classification.failure_kind,
+            AgentFailureKind::ToolOutputBudgetPreflightDenied
+        );
+        assert_eq!(
+            preflight_classification
+                .supervision_classification
+                .as_deref(),
+            Some("tool_output_budget_preflight_denied")
+        );
+
+        for message in [
+            "Codex tool/session control failure: tool_output_budget_exceeded",
+            "Codex tool/session control failure: codex_unbounded_tool_output",
+        ] {
+            let observation = observation_from_acp_error_message(message);
+            assert_eq!(
+                observation,
+                RuntimeFailureObservation::ToolOutputBudgetExceeded
+            );
+            let classification = classify_observation(observation);
+            assert_eq!(
+                classification.failure_kind,
+                AgentFailureKind::ToolOutputBudgetExceeded
+            );
+            assert_eq!(
+                classification.supervision_classification.as_deref(),
+                Some("tool_output_budget_exceeded")
+            );
+        }
+    }
+
+    #[test]
     fn proposal_058_quota_retry_after_parses_local_provider_reset_message() {
         let now = DateTime::parse_from_rfc3339("2026-04-19T16:30:00Z")
             .unwrap()
@@ -664,6 +762,35 @@ mod tests {
                 retry_after: Some(_)
             }
         ));
+    }
+
+    #[test]
+    fn claude_long_context_usage_credits_message_is_provider_quota() {
+        assert!(matches!(
+            observation_from_acp_error_message(
+                "Usage credits are required for long context requests."
+            ),
+            RuntimeFailureObservation::ProviderQuota { retry_after: None }
+        ));
+    }
+
+    #[test]
+    fn codex_progress_timeout_with_search_limit_diagnostic_is_not_provider_quota() {
+        let message = concat!(
+            "ACP session progress timeout: provider_stream_silent_no_local_activity; ",
+            "no meaningful progress for 300s ",
+            "(session=019eb81b, local_event_count=0, function_calls=0, ",
+            "session_store_bytes_read=63706, codex_session_store_path_found=true, ",
+            "codex_session_store_search_limit_hit=false, ",
+            "codex_session_store_candidate_root_count=3)"
+        );
+
+        assert_eq!(
+            observation_from_acp_error_message(message),
+            RuntimeFailureObservation::ProviderTimeout {
+                supervision_classification: Some("provider_stream_silent_no_local_activity".into())
+            }
+        );
     }
 
     #[test]

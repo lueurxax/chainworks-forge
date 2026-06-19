@@ -6,6 +6,142 @@ use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{ArtifactId, IdeaId, RunId};
 use domain::run::{Run, RunStatus};
 
+#[test]
+fn proposal_094_required_metrics_inventory_and_emitters_are_wired() {
+    for metric in [
+        "quality_gate_blocker_assessments_total",
+        "quality_gate_blocker_validation_rejections_total",
+        "quality_gate_blocker_freshness_total",
+        "implementation_refine_loops_avoided_total",
+        "followup_proposal_seeds_created_total",
+        "external_blockers_accepted_total",
+        "invalid_blocker_claims_total",
+        "review_refresh_required_total",
+        "output_settlement_required_before_boundary_total",
+        "human_boundary_approval_latency_seconds",
+        "post_boundary_reopen_total",
+        "false_external_blocker_rate",
+        "repeated_blocker_no_progress_total",
+        "accepted_boundary_later_rejected_percent",
+    ] {
+        assert!(
+            db::metrics::P094_REQUIRED_METRICS.contains(&metric),
+            "P094 required metric missing from inventory: {metric}"
+        );
+    }
+
+    db::metrics::reset_for_tests();
+    db::metrics::record_p094_invalid_blocker_claim("missing_evidence");
+    db::metrics::record_p094_review_refresh_required("implementation_review");
+    db::metrics::record_p094_output_settlement_required_before_boundary("missing_output");
+    db::metrics::record_p094_repeated_blocker_no_progress("sig-1");
+    db::metrics::record_p094_implementation_refine_loop_avoided("P094");
+    db::metrics::record_p094_external_blocker_accepted("remote_environment_required");
+    db::metrics::record_p094_boundary_approval("granted");
+    db::metrics::record_p094_false_external_blocker_rate("operator_reopened");
+    db::metrics::record_p094_accepted_boundary_later_rejected("operator_rejected_boundary");
+    db::metrics::record_p094_human_boundary_approval_latency(std::time::Duration::from_secs(3));
+
+    assert_eq!(db::metrics::get_counter("invalid_blocker_claims_total"), 1);
+    assert_eq!(db::metrics::get_counter("review_refresh_required_total"), 1);
+    assert_eq!(
+        db::metrics::get_counter("output_settlement_required_before_boundary_total"),
+        1
+    );
+    assert_eq!(
+        db::metrics::get_counter("repeated_blocker_no_progress_total"),
+        1
+    );
+    assert_eq!(
+        db::metrics::get_counter_with_label(
+            "implementation_refine_loops_avoided_total",
+            "proposal_id=P094"
+        ),
+        1
+    );
+    assert_eq!(
+        db::metrics::get_gauge("false_external_blocker_rate"),
+        Some(100)
+    );
+    assert_eq!(
+        db::metrics::get_gauge("accepted_boundary_later_rejected_percent"),
+        Some(100)
+    );
+    assert_eq!(
+        db::metrics::get_hot_read_p95("human_boundary_approval_latency_seconds"),
+        Some(3)
+    );
+    let rollout_metrics = db::metrics::p094_rollout_metric_values_json();
+    assert_eq!(
+        rollout_metrics["implementation_refine_loops_avoided_total"]["value"],
+        1
+    );
+    assert_eq!(
+        rollout_metrics["false_external_blocker_rate"]["kind"],
+        "gauge"
+    );
+    assert_eq!(
+        rollout_metrics["accepted_boundary_later_rejected_percent"]["unit"],
+        "percent"
+    );
+}
+
+#[tokio::test]
+async fn proposal_094_followup_seed_generation_records_metric() {
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (run_id, _) =
+        seed_run_with_meta(&pool, Some(tmp.path().to_string_lossy().into_owned())).await;
+    let raw_path = tmp.path().join("followup-proposal-seed.json");
+    std::fs::write(
+        &raw_path,
+        serde_json::json!({
+            "schema_version": "followup_proposal_seed_v1",
+            "status": "seeded",
+            "tail_class": "followup_code_tail"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    db::metrics::reset_for_tests();
+    artifact_contracts::upsert_verified_generation_and_rebuild(
+        &pool,
+        ActiveArtifactGenerationInput {
+            run_id,
+            artifact_id: ArtifactId::new(),
+            contract_id: "followup_proposal_seed_v1".into(),
+            canonical_path: "quality-gate/followup-proposal-seed.json".into(),
+            raw_path: raw_path.to_string_lossy().into_owned(),
+            raw_status: "seeded".into(),
+            generation_id: "p094-followup-seed-1".into(),
+            source_agent_execution_id: Some("lead_orchestrator".into()),
+            source_stage_execution_id: Some("state_9_followup_proposal_seeded".into()),
+            source_session_generation_id: None,
+            source_work_item_id: None,
+            supersedes_generation_id: None,
+            output_settlement:
+                domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution,
+            partial: false,
+            warnings: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        db::metrics::get_counter("followup_proposal_seeds_created_total"),
+        1
+    );
+    assert_eq!(
+        db::metrics::get_counter_with_label(
+            "followup_proposal_seeds_created_total",
+            "tail_class=followup_code_tail"
+        ),
+        1
+    );
+}
+
 async fn test_pool() -> sqlx::SqlitePool {
     let pool = create_pool("sqlite::memory:").await.unwrap();
     let writer = std::sync::Arc::new(db::writer::DbWriter::new(pool.clone()));
@@ -770,4 +906,642 @@ async fn proposal_057_agent_written_run_state_is_advisory_and_superseded() {
         serde_json::from_slice(&std::fs::read(&raw_path).unwrap()).unwrap();
     assert_eq!(exported["active_index_owner"], "sqlite");
     assert_ne!(exported["schema_version"], "agent-authored");
+}
+
+#[tokio::test]
+async fn proposal_094_exposes_decomposition_plan_fields_as_canonical_truth() {
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (run_id, _) =
+        seed_run_with_meta(&pool, Some(tmp.path().to_string_lossy().into_owned())).await;
+    let raw_path = tmp.path().join("proposal/decomposition-plan.json");
+    std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &raw_path,
+        serde_json::json!({
+            "schema_version": "proposal_decomposition_plan_v1",
+            "requires_split": false,
+            "implementation_start_decision": "ready_with_declared_boundaries"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    artifact_contracts::upsert_generation_and_rebuild(
+        &pool,
+        ActiveArtifactGenerationInput {
+            run_id,
+            artifact_id: ArtifactId::new(),
+            contract_id: "proposal_decomposition_plan_v1".into(),
+            canonical_path: "proposal/decomposition-plan.json".into(),
+            raw_path: raw_path.to_string_lossy().into_owned(),
+            raw_status: "unknown".into(),
+            generation_id: "p094-decomposition-1".into(),
+            source_agent_execution_id: Some("agent-decomposition".into()),
+            source_stage_execution_id: None,
+            source_session_generation_id: None,
+            source_work_item_id: None,
+            supersedes_generation_id: None,
+            output_settlement:
+                domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution,
+            partial: false,
+            warnings: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        artifact_contracts::canonical_contract_field(
+            &pool,
+            run_id,
+            "proposal_decomposition_plan",
+            "status",
+        )
+        .await
+        .unwrap(),
+        Some(serde_json::json!("ready_with_declared_boundaries"))
+    );
+    assert_eq!(
+        artifact_contracts::canonical_contract_field(
+            &pool,
+            run_id,
+            "proposal_decomposition_plan",
+            "requires_split",
+        )
+        .await
+        .unwrap(),
+        Some(serde_json::json!(false))
+    );
+    assert_eq!(
+        artifact_contracts::canonical_contract_field(
+            &pool,
+            run_id,
+            "proposal_decomposition_plan",
+            "implementation_start_decision",
+        )
+        .await
+        .unwrap(),
+        Some(serde_json::json!("ready_with_declared_boundaries"))
+    );
+
+    let projection = artifact_contracts::find_run_state_projection(&pool, run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        projection.active_index_json["contracts"]["proposal_decomposition_plan_v1"]["status"],
+        "ready_with_declared_boundaries"
+    );
+    assert_eq!(
+        projection.active_index_json["contracts"]["proposal_decomposition_plan_v1"]
+            ["requires_split"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn proposal_094_decomposition_split_required_requires_blocking_split_candidate() {
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (run_id, _) =
+        seed_run_with_meta(&pool, Some(tmp.path().to_string_lossy().into_owned())).await;
+
+    let valid_path = tmp
+        .path()
+        .join("proposal/decomposition-split-required.json");
+    std::fs::create_dir_all(valid_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &valid_path,
+        serde_json::json!({
+            "schema_version": "proposal_decomposition_plan_v1",
+            "requires_split": true,
+            "implementation_start_decision": "split_required",
+            "split_candidates": [{
+                "candidate_id": "expanded_reliability_matrix",
+                "reason": "The reliability matrix exceeds the current proposal implementation slice.",
+                "recommended_followup_title": "Reliability Matrix Expansion"
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    artifact_contracts::upsert_generation_and_rebuild(
+        &pool,
+        ActiveArtifactGenerationInput {
+            run_id,
+            artifact_id: ArtifactId::new(),
+            contract_id: "proposal_decomposition_plan_v1".into(),
+            canonical_path: "proposal/decomposition-plan.json".into(),
+            raw_path: valid_path.to_string_lossy().into_owned(),
+            raw_status: "unknown".into(),
+            generation_id: "p094-decomposition-split-valid".into(),
+            source_agent_execution_id: Some("agent-decomposition".into()),
+            source_stage_execution_id: None,
+            source_session_generation_id: None,
+            source_work_item_id: None,
+            supersedes_generation_id: None,
+            output_settlement:
+                domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution,
+            partial: false,
+            warnings: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        artifact_contracts::canonical_contract_field(
+            &pool,
+            run_id,
+            "proposal_decomposition_plan",
+            "status",
+        )
+        .await
+        .unwrap(),
+        Some(serde_json::json!("split_required"))
+    );
+    assert_eq!(
+        artifact_contracts::canonical_contract_field(
+            &pool,
+            run_id,
+            "proposal_decomposition_plan",
+            "requires_split",
+        )
+        .await
+        .unwrap(),
+        Some(serde_json::json!(true))
+    );
+
+    let malformed_meta_root = tmp.path().join("malformed-run");
+    let (malformed_run_id, _) = seed_run_with_meta(
+        &pool,
+        Some(malformed_meta_root.to_string_lossy().into_owned()),
+    )
+    .await;
+
+    let malformed_path =
+        malformed_meta_root.join("proposal/decomposition-split-required-empty.json");
+    std::fs::create_dir_all(malformed_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &malformed_path,
+        serde_json::json!({
+            "schema_version": "proposal_decomposition_plan_v1",
+            "requires_split": true,
+            "implementation_start_decision": "ready_with_declared_boundaries",
+            "split_candidates": []
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    artifact_contracts::upsert_generation_and_rebuild(
+        &pool,
+        ActiveArtifactGenerationInput {
+            run_id: malformed_run_id,
+            artifact_id: ArtifactId::new(),
+            contract_id: "proposal_decomposition_plan_v1".into(),
+            canonical_path: "proposal/decomposition-plan.json".into(),
+            raw_path: malformed_path.to_string_lossy().into_owned(),
+            raw_status: "unknown".into(),
+            generation_id: "p094-decomposition-split-invalid".into(),
+            source_agent_execution_id: Some("agent-decomposition".into()),
+            source_stage_execution_id: None,
+            source_session_generation_id: None,
+            source_work_item_id: None,
+            supersedes_generation_id: None,
+            output_settlement:
+                domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution,
+            partial: false,
+            warnings: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        artifact_contracts::canonical_contract_field(
+            &pool,
+            malformed_run_id,
+            "proposal_decomposition_plan",
+            "requires_split",
+        )
+        .await
+        .unwrap(),
+        None,
+        "requires_split=true without a blocking split candidate must fail closed"
+    );
+    assert_eq!(
+        artifact_contracts::canonical_contract_field(
+            &pool,
+            malformed_run_id,
+            "proposal_decomposition_plan",
+            "implementation_start_decision",
+        )
+        .await
+        .unwrap(),
+        None,
+        "malformed split-required plans must not expose implementation approval routing"
+    );
+}
+
+#[tokio::test]
+async fn proposal_094_exposes_blocker_boundary_fields_as_canonical_truth() {
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (run_id, _) =
+        seed_run_with_meta(&pool, Some(tmp.path().to_string_lossy().into_owned())).await;
+    let raw_path = tmp.path().join("quality/blocker-boundary-status.json");
+    std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &raw_path,
+        serde_json::json!({
+            "schema_version": "blocker_boundary_status_v1",
+            "status": "awaiting_human_boundary_approval",
+            "followup_proposal_required": true,
+            "has_release_blocking_external_blockers": true,
+            "has_no_release_blocking_external_blockers": false,
+            "projection_integrity": "valid",
+            "primary_owner_class": "external",
+            "workflow_route_hint": "human_boundary_approval",
+            "blocker_freshness": "fresh",
+            "allowed_workflow_routes": ["state_9_blocker_boundary_approval"],
+            "blockers": [{
+                "id": "external-proof",
+                "summary": "external proof required",
+                "blocker_signature_id": "sig-external-proof",
+                "evidence_fingerprint": "fingerprint-external-proof",
+                "source_artifact_generation_id": "generation-external-proof",
+                "observed_after_stage_execution_id": "stage-exec-1",
+                "observed_after_agent_execution_id": "agent-exec-1",
+                "owner_class": "external_environment",
+                "class": "remote_host",
+                "evidence_freshness": "fresh",
+                "allowed_workflow_routes": ["state_9_blocker_boundary_approval"]
+            }],
+            "hard_blockers": [{
+                "id": "external-proof",
+                "blocker_signature_id": "sig-external-proof",
+                "evidence_fingerprint": "fingerprint-external-proof"
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    artifact_contracts::upsert_generation_and_rebuild(
+        &pool,
+        ActiveArtifactGenerationInput {
+            run_id,
+            artifact_id: ArtifactId::new(),
+            contract_id: "blocker_boundary_status_v1".into(),
+            canonical_path: "quality/blocker-boundary-status.json".into(),
+            raw_path: raw_path.to_string_lossy().into_owned(),
+            raw_status: "unknown".into(),
+            generation_id: "p094-boundary-status-1".into(),
+            source_agent_execution_id: Some("agent-boundary".into()),
+            source_stage_execution_id: None,
+            source_session_generation_id: None,
+            source_work_item_id: None,
+            supersedes_generation_id: None,
+            output_settlement:
+                domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution,
+            partial: false,
+            warnings: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    for (field_name, expected) in [
+        (
+            "status",
+            serde_json::json!("awaiting_human_boundary_approval"),
+        ),
+        ("followup_proposal_required", serde_json::json!(true)),
+        (
+            "has_release_blocking_external_blockers",
+            serde_json::json!(true),
+        ),
+        (
+            "has_no_release_blocking_external_blockers",
+            serde_json::json!(false),
+        ),
+        ("projection_integrity", serde_json::json!("valid")),
+        ("primary_owner_class", serde_json::json!("external")),
+        (
+            "workflow_route_hint",
+            serde_json::json!("human_boundary_approval"),
+        ),
+        ("blocker_freshness", serde_json::json!("fresh")),
+        (
+            "allowed_workflow_routes",
+            serde_json::json!(["state_9_blocker_boundary_approval"]),
+        ),
+    ] {
+        assert_eq!(
+            artifact_contracts::canonical_contract_field(
+                &pool,
+                run_id,
+                "blocker_boundary_status",
+                field_name,
+            )
+            .await
+            .unwrap(),
+            Some(expected),
+            "field {field_name} should be canonical transition truth"
+        );
+    }
+
+    assert_eq!(
+        artifact_contracts::canonical_contract_field(
+            &pool,
+            run_id,
+            "blocker_boundary_status",
+            "unextracted_future_field",
+        )
+        .await
+        .unwrap(),
+        None,
+        "unregistered P094 fields must fail closed instead of reading raw JSON ad hoc"
+    );
+
+    let readback = artifact_contracts::p094_readback_json(&pool, run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        readback["schema_version"],
+        serde_json::json!("p094_boundary_readback_v1")
+    );
+    assert_eq!(
+        readback["blocker_boundary_status"]["status"],
+        serde_json::json!("awaiting_human_boundary_approval")
+    );
+    assert_eq!(
+        readback["blocker_boundary_status"]["allowed_workflow_routes"],
+        serde_json::json!(["state_9_blocker_boundary_approval"])
+    );
+    assert_eq!(
+        readback["blocker_boundary_status"]["blockers"][0]["blocker_signature_id"],
+        serde_json::json!("sig-external-proof")
+    );
+    assert_eq!(
+        readback["blocker_boundary_status"]["hard_blockers"][0]["evidence_fingerprint"],
+        serde_json::json!("fingerprint-external-proof")
+    );
+    assert_eq!(
+        readback["followup_proposal_seeds"]
+            .as_array()
+            .expect("followup seeds lane should be an array")
+            .len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn proposal_094_readback_includes_boundary_approval_request_lane() {
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (run_id, _) =
+        seed_run_with_meta(&pool, Some(tmp.path().to_string_lossy().into_owned())).await;
+    let raw_path = tmp
+        .path()
+        .join("quality/blocker-boundary-approval-request.json");
+    std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &raw_path,
+        serde_json::json!({
+            "schema_version": "blocker_boundary_approval_request_v1",
+            "status": "requested",
+            "question": "Accept the server-evaluated boundary?",
+            "allowed_decisions": ["accept", "reject"],
+            "label_to_approval_state": {
+                "accept": "granted",
+                "reject": "rejected"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    artifact_contracts::upsert_generation_and_rebuild(
+        &pool,
+        ActiveArtifactGenerationInput {
+            run_id,
+            artifact_id: ArtifactId::new(),
+            contract_id: "blocker_boundary_approval_request_v1".into(),
+            canonical_path: "quality/blocker-boundary-approval-request.json".into(),
+            raw_path: raw_path.to_string_lossy().into_owned(),
+            raw_status: "requested".into(),
+            generation_id: "p094-approval-request-1".into(),
+            source_agent_execution_id: Some("system.quality_gate_boundary".into()),
+            source_stage_execution_id: Some("state_9_quality_gate_boundary_evaluated".into()),
+            source_session_generation_id: None,
+            source_work_item_id: None,
+            supersedes_generation_id: None,
+            output_settlement:
+                domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution,
+            partial: false,
+            warnings: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    let readback = artifact_contracts::p094_readback_json(&pool, run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        readback["blocker_boundary_approval_request"]["status"],
+        serde_json::json!("requested")
+    );
+    assert_eq!(
+        readback["blocker_boundary_approval_request"]["label_to_approval_state"]["reject"],
+        serde_json::json!("rejected")
+    );
+}
+
+#[tokio::test]
+async fn proposal_094_readback_rejects_raw_path_outside_run_root() {
+    let pool = test_pool().await;
+    let meta = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let (run_id, _) =
+        seed_run_with_meta(&pool, Some(meta.path().to_string_lossy().into_owned())).await;
+    let outside_path = outside
+        .path()
+        .join("blocker-boundary-approval-request.json");
+    std::fs::write(
+        &outside_path,
+        serde_json::json!({
+            "schema_version": "blocker_boundary_approval_request_v1",
+            "status": "requested",
+            "secret": "outside-root"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    artifact_contracts::upsert_generation_and_rebuild(
+        &pool,
+        ActiveArtifactGenerationInput {
+            run_id,
+            artifact_id: ArtifactId::new(),
+            contract_id: "blocker_boundary_approval_request_v1".into(),
+            canonical_path: "quality/blocker-boundary-approval-request.json".into(),
+            raw_path: outside_path.to_string_lossy().into_owned(),
+            raw_status: "requested".into(),
+            generation_id: "p094-approval-request-outside-root".into(),
+            source_agent_execution_id: Some("system.quality_gate_boundary".into()),
+            source_stage_execution_id: None,
+            source_session_generation_id: None,
+            source_work_item_id: None,
+            supersedes_generation_id: None,
+            output_settlement: domain::agent::AgentOutputSettlement::None,
+            partial: false,
+            warnings: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    let readback = artifact_contracts::p094_readback_json(&pool, run_id)
+        .await
+        .unwrap();
+    assert!(
+        readback["blocker_boundary_approval_request"]["secret"].is_null()
+            && readback["blocker_boundary_approval_request"]["status"].is_null(),
+        "P094 readback must not expose raw_path payload fields outside the run root"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn proposal_094_readback_rejects_symlinked_raw_path() {
+    let pool = test_pool().await;
+    let meta = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let (run_id, _) =
+        seed_run_with_meta(&pool, Some(meta.path().to_string_lossy().into_owned())).await;
+    let outside_path = outside.path().join("secret.json");
+    std::fs::write(
+        &outside_path,
+        serde_json::json!({
+            "schema_version": "blocker_boundary_approval_request_v1",
+            "status": "requested",
+            "secret": "symlink-target"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let link_path = meta
+        .path()
+        .join("quality/blocker-boundary-approval-request.json");
+    std::fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&outside_path, &link_path).unwrap();
+
+    artifact_contracts::upsert_generation_and_rebuild(
+        &pool,
+        ActiveArtifactGenerationInput {
+            run_id,
+            artifact_id: ArtifactId::new(),
+            contract_id: "blocker_boundary_approval_request_v1".into(),
+            canonical_path: "quality/blocker-boundary-approval-request.json".into(),
+            raw_path: link_path.to_string_lossy().into_owned(),
+            raw_status: "requested".into(),
+            generation_id: "p094-approval-request-symlink".into(),
+            source_agent_execution_id: Some("system.quality_gate_boundary".into()),
+            source_stage_execution_id: None,
+            source_session_generation_id: None,
+            source_work_item_id: None,
+            supersedes_generation_id: None,
+            output_settlement: domain::agent::AgentOutputSettlement::None,
+            partial: false,
+            warnings: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    let readback = artifact_contracts::p094_readback_json(&pool, run_id)
+        .await
+        .unwrap();
+    assert!(
+        readback["blocker_boundary_approval_request"]["secret"].is_null()
+            && readback["blocker_boundary_approval_request"]["status"].is_null(),
+        "P094 readback must not follow symlinks to expose raw_path payload fields"
+    );
+}
+
+#[tokio::test]
+async fn proposal_094_normalizes_human_decision_labels_to_durable_approval_state() {
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (run_id, _) =
+        seed_run_with_meta(&pool, Some(tmp.path().to_string_lossy().into_owned())).await;
+    let raw_path = tmp
+        .path()
+        .join("quality/blocker-boundary-human-decision.json");
+    std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &raw_path,
+        serde_json::json!({
+            "schema_version": "blocker_boundary_human_decision_v1",
+            "approval_id": "approval-p094-1",
+            "decision_label": "accept",
+            "canonical_approval_state": "granted",
+            "comment": "Accepted as external evidence tail.",
+            "decided_at": "2026-05-26T00:00:00Z",
+            "decided_by": "operator"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    artifact_contracts::upsert_generation_and_rebuild(
+        &pool,
+        ActiveArtifactGenerationInput {
+            run_id,
+            artifact_id: ArtifactId::new(),
+            contract_id: "blocker_boundary_human_decision_v1".into(),
+            canonical_path: "quality/blocker-boundary-human-decision.json".into(),
+            raw_path: raw_path.to_string_lossy().into_owned(),
+            raw_status: "unknown".into(),
+            generation_id: "p094-human-decision-1".into(),
+            source_agent_execution_id: Some("operator-boundary-approval".into()),
+            source_stage_execution_id: None,
+            source_session_generation_id: None,
+            source_work_item_id: None,
+            supersedes_generation_id: None,
+            output_settlement: domain::agent::AgentOutputSettlement::None,
+            partial: false,
+            warnings: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        artifact_contracts::canonical_contract_field(
+            &pool,
+            run_id,
+            "blocker_boundary_human_decision",
+            "status",
+        )
+        .await
+        .unwrap(),
+        Some(serde_json::json!("granted"))
+    );
+    let readback = artifact_contracts::p094_readback_json(&pool, run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        readback["blocker_boundary_human_decision"]["approval_id"],
+        serde_json::json!("approval-p094-1")
+    );
+    assert_eq!(
+        readback["blocker_boundary_human_decision"]["decided_by"],
+        serde_json::json!("operator")
+    );
 }

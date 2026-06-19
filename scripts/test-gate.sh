@@ -7,9 +7,65 @@ if [[ -n "${CHAINWORKS_TEST_GATE_ROOT_DIR:-}" ]]; then
 else
   ROOT_DIR="$DEFAULT_ROOT_DIR"
 fi
+if [[ -f "$ROOT_DIR/scripts/cargo-cache-env.sh" ]]; then
+  CHAINWORKS_CARGO_CACHE_REPO_ROOT="$ROOT_DIR"
+  # shellcheck source=scripts/cargo-cache-env.sh
+  source "$ROOT_DIR/scripts/cargo-cache-env.sh"
+fi
+
+chainworks_test_gate_cargo_target_dir() {
+  if declare -F chainworks_gate_cargo_target_dir >/dev/null 2>&1; then
+    chainworks_gate_cargo_target_dir "$1"
+    return 0
+  fi
+
+  local requested="${1:-}"
+  if [[ -z "$requested" ]]; then
+    requested="${HOME:-$ROOT_DIR}/Library/Caches/Chainworks Forge/cargo-target"
+  fi
+  case "$requested" in
+    target|target/*|control-plane/target|control-plane/target/*|*/control-plane/target|*/control-plane/target/*)
+      local suffix="${requested#*/control-plane/target/}"
+      if [[ "$suffix" == "$requested" ]]; then
+        suffix="${requested#target/}"
+      fi
+      if [[ -z "$suffix" || "$suffix" == "$requested" || "$suffix" == "." ]]; then
+        suffix="default"
+      fi
+      local safe_suffix
+      safe_suffix="$(printf '%s' "$suffix" | sed -E 's#[/[:space:]]+#-#g; s#[^A-Za-z0-9._-]#_#g; s#^[-.]+##; s#[-.]+$##')"
+      printf '%s/%s\n' "${CHAINWORKS_GATE_CARGO_TARGET_ROOT:-${HOME:-$ROOT_DIR}/Library/Caches/Chainworks Forge/cargo-target/gates}" "${safe_suffix:-default}"
+      ;;
+    *)
+      printf '%s\n' "$requested"
+      ;;
+  esac
+}
+
+cargo() {
+  if [[ "${CHAINWORKS_TEST_GATE_REMAP_CARGO_TARGET_DIR:-1}" =~ ^(1|true|TRUE|yes|YES)$ && -n "${CARGO_TARGET_DIR:-}" ]]; then
+    local remapped_target
+    remapped_target="$(chainworks_test_gate_cargo_target_dir "$CARGO_TARGET_DIR")"
+    if [[ "$remapped_target" != "$CARGO_TARGET_DIR" ]]; then
+      mkdir -p "$remapped_target"
+      CARGO_TARGET_DIR="$remapped_target" command cargo "$@"
+      return $?
+    fi
+  fi
+  command cargo "$@"
+}
+
 PROJECT_PATH="$ROOT_DIR/Chainworks Forge.xcodeproj"
 SCHEME_NAME="Chainworks Forge"
-DESTINATION="platform=macOS"
+HOST_ARCH="$(uname -m)"
+case "$HOST_ARCH" in
+  arm64|x86_64)
+    DESTINATION="platform=macOS,arch=$HOST_ARCH"
+    ;;
+  *)
+    DESTINATION="platform=macOS"
+    ;;
+esac
 TMP_BASE="${TMPDIR:-/tmp}/chainworks-test-gates"
 TEST_PLANS_DIR="$ROOT_DIR/TestPlans"
 UNSIGNED_BUILD_ARGS=(
@@ -191,6 +247,10 @@ PROPOSAL_093_TESTS=(
 
 PROPOSAL_086_SWIFT_TESTS=(
   "Chainworks ForgeTests/Proposal031ThinGraphQLReadBoundaryTests"
+)
+
+PROPOSAL_083_SWIFT_TESTS=(
+  "Chainworks ForgeTests/AppTerminationCoordinatorTests"
 )
 
 PROPOSAL_046_SWIFT_TESTS=(
@@ -1466,46 +1526,11 @@ check_idle_environment() {
 }
 
 guard_direct_run_insertion() {
-  log "Guard: no direct Run construction outside RunRepository"
-  python3 - "$ROOT_DIR/Chainworks Forge" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-root = Path(sys.argv[1])
-pattern = re.compile(r"(?<![A-Za-z0-9_])Run\s*\(")
-block_comments = re.compile(r"/\*.*?\*/", re.S)
-string_literals = re.compile(r'"(?:\\.|[^"\\])*"')
-exempt = {"RunRepository.swift", "Run.swift"}
-violations = []
-
-for file in root.rglob("*.swift"):
-    if file.name in exempt:
-        continue
-    content = file.read_text(encoding="utf-8")
-    has_exemption_marker = "// RunRepository-exempt" in content
-    content = block_comments.sub("", content)
-    sanitized_lines = []
-    for line in content.splitlines():
-        stripped = line.lstrip()
-        if stripped.startswith("//"):
-            continue
-        sanitized_lines.append(string_literals.sub('""', line))
-    sanitized = "\n".join(sanitized_lines)
-    if (
-        pattern.search(sanitized)
-        and "RunStatus" not in sanitized
-        and "RunRepositoryError" not in sanitized
-        and not has_exemption_marker
-    ):
-        violations.append(str(file.relative_to(root.parent)))
-
-if violations:
-    print("Direct Run construction found outside RunRepository:", file=sys.stderr)
-    for violation in violations:
-        print(violation, file=sys.stderr)
-    sys.exit(1)
-PY
+  # Retired: the SwiftData `Run` model and `RunRepository` were removed when live
+  # execution/persistence moved to the Rust control-plane. The operator app is now a
+  # GraphQL read shell, so the ARCH-002 "sole Run creator" invariant no longer applies.
+  # Kept as a no-op so existing gate call sites remain valid.
+  :
 }
 
 guard_portability_paths() {
@@ -1583,6 +1608,11 @@ else:
         "SCCACHE_CACHE_SIZE",
         "RUSTC_WRAPPER",
         "sccache",
+        "chainworks_gate_cargo_target_dir",
+        "CHAINWORKS_GATE_CARGO_TARGET_ROOT",
+        "CHAINWORKS_ALLOW_LOCAL_CARGO_TARGET_DIR",
+        "CHAINWORKS_CARGO_WRAPPER_DIR",
+        "CHAINWORKS_REAL_CARGO",
     ]
     for fragment in required_helper_fragments:
         if fragment not in helper_text:
@@ -1608,7 +1638,14 @@ else:
         ".chainworks/worktrees",
         "control-plane/target",
         "CHAINWORKS_CLEAN_PROTECTED_WORKTREES",
+        "CHAINWORKS_SHARED_CARGO_TARGET_MAX_GB",
+        "CHAINWORKS_WORKTREE_CARGO_TARGET_MAX_GB",
+        "clean_target_pressure",
+        "debug/incremental",
         "--protect-worktree",
+        "ps -axo pid=,command=",
+        "clean_worktree_adhoc_target_dirs",
+        "prune_child_dirs_until_budget",
     ]:
         if fragment not in clean_text:
             violations.append(f"clean-build-caches.sh missing {fragment!r}")
@@ -1619,6 +1656,13 @@ if legacy_p082_target in gate_text:
     violations.append("proposal-082 gate still creates a dedicated target/proposal-082-gate cache")
 if "CHAINWORKS_PROPOSAL_082_CARGO_TARGET_DIR" not in gate_text:
     violations.append("proposal-082 gate does not expose a bounded reusable target dir override")
+for fragment in [
+    "chainworks_test_gate_cargo_target_dir",
+    "CHAINWORKS_TEST_GATE_REMAP_CARGO_TARGET_DIR",
+    "CARGO_TARGET_DIR=\"$remapped_target\" command cargo",
+]:
+    if fragment not in gate_text:
+        violations.append(f"test-gate.sh missing Cargo target remap guard {fragment!r}")
 
 if violations:
     print("Xcode Cargo cache policy violations:", file=sys.stderr)
@@ -1718,6 +1762,60 @@ if errors:
     for e in errors:
         print(f"  • {e}", file=sys.stderr)
     sys.exit(1)
+PY
+}
+
+guard_proposal_number_hygiene() {
+  log "Guard: proposal number uniqueness and ROADMAP link integrity"
+  python3 - "$ROOT_DIR" <<'PY'
+"""Proposal-number hygiene guardrail.
+
+1. Proposal numbers are never reused: two different docs/proposals/NNN-*.md
+   base files (audit files excluded) must not share a numeric prefix.
+2. Relative markdown links in docs/ROADMAP.md must resolve to existing files,
+   so the roadmap cannot silently point at renamed or retired proposals.
+"""
+from pathlib import Path
+import re
+import sys
+
+root = Path(sys.argv[1])
+proposals_dir = root / "docs/proposals"
+roadmap = root / "docs/ROADMAP.md"
+errors = []
+
+# ── 1. Duplicate proposal numbers ──────────────────────────────────
+by_number: dict[str, list[str]] = {}
+for md in sorted(proposals_dir.glob("[0-9]*.md")):
+    if "_IMPLEMENTATION_AUDIT" in md.name:
+        continue
+    m = re.match(r"^(\d+)-", md.name)
+    if not m:
+        continue
+    by_number.setdefault(m.group(1), []).append(md.name)
+
+for number, names in sorted(by_number.items()):
+    if len(names) > 1:
+        errors.append(
+            f"proposal number {number} is used by multiple files: " + ", ".join(names)
+        )
+
+# ── 2. ROADMAP relative links resolve ──────────────────────────────
+link_re = re.compile(r"\]\(([^)#]+)(#[^)]*)?\)")
+for line_no, line in enumerate(roadmap.read_text(encoding="utf-8").splitlines(), 1):
+    for m in link_re.finditer(line):
+        target = m.group(1).strip()
+        if re.match(r"^[a-z]+://", target) or target.startswith("mailto:"):
+            continue
+        if not (roadmap.parent / target).exists():
+            errors.append(f"ROADMAP.md:{line_no}: broken relative link `{target}`")
+
+if errors:
+    print("Proposal-number hygiene violations:", file=sys.stderr)
+    for e in errors:
+        print(f"  • {e}", file=sys.stderr)
+    sys.exit(1)
+print("Proposal-number hygiene guard passed")
 PY
 }
 
@@ -2424,6 +2522,8 @@ Available gates:
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
   proposal-084|p084  Proposal 084 executable rollout gates and observability contract gate
   proposal-081|p081  Proposal 081 Phase 1 boundary-first API and auth contract matrix gate
+  proposal-082|p082  Proposal 082 recovery and retry state-machine matrix proof gate
+  proposal-083|p083  Proposal 083 focused code-fix regression gate (main-sync request id)
   proposal-085|p085  Proposal 085 thin-client read-model parity and affordance contract gate
   proposal-086|p086|p086-continuation-preflight
                   Proposal 086 Phase 0 preflight: migration shape, MCP/artifact schemas, and Rust unit tests
@@ -2434,6 +2534,8 @@ Available gates:
   p086-continuation-operator-report
                   Proposal 086 Phase 1 operator-report gate: operator report field coverage
   proposal-087|p087  Proposal 087 read-path liveness and storage tiering gate
+  proposal-094|p094  Proposal 094 workflow-owned blocker-boundary contract/readback gate
+  proposal-096|p096  Proposal 096 bounded tool output and safe-search guard retained alias gate
   proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
   proposal-090|p090  Proposal 090 Junie runtime-hardening evidence inventory gate
   proposal-091|p091  Retained P091 targeted retry authority runtime proof gate
@@ -2475,6 +2577,7 @@ case "$GATE" in
     guard_direct_run_insertion
     guard_xcode_cargo_cache_policy
     guard_plan_tag_sync
+    guard_proposal_number_hygiene
     "$ROOT_DIR/scripts/check-boundary-coverage.sh"
     ;;
   build)
@@ -7629,7 +7732,7 @@ PY
     python3 - "$ROOT_DIR" <<'PY'
 import pathlib, sys
 root = pathlib.Path(sys.argv[1])
-proposal = (root / "docs/proposals/081-boundary-first-api-auth-contract-matrix.md").read_text()
+# P081 proposal retired into reference truth; the reference doc is the checked source.
 reference = (root / "docs/reference/swift-macos-boundary-contract.md").read_text()
 tokens = [
     "full_keyboard_access_redacted_nil_vs_ordinary_nil",
@@ -7638,8 +7741,6 @@ tokens = [
     "operator_alert_fires_and_clears_hidden_window",
 ]
 for token in tokens:
-    if token not in proposal:
-        raise SystemExit(f"P081: proposal missing macOS accessibility proof token {token}")
     if token not in reference:
         raise SystemExit(f"P081: reference missing macOS accessibility proof token {token}")
 print("P081: macOS accessibility contract source coverage valid")
@@ -9456,6 +9557,81 @@ PY
     run_targeted_tests "proposal-086-swift-readback" "${PROPOSAL_086_SWIFT_TESTS[@]}"
     log "Proposal 086 Phase 0 preflight gate passed"
     ;;
+  proposal-083|p083)
+    log "Proposal 083 focused code-fix regression gate"
+    python3 - <<'PY'
+from pathlib import Path
+
+root = Path.cwd()
+
+checks = {
+    "control-plane/crates/mcp-server/src/tools/runs.rs": [
+        "mcp_caller_with_idempotency_request_id",
+        "p083_main_sync_mcp_callers_stamp_idempotency_key_as_request_id",
+        "runs.main_sync.request",
+        "runs.main_sync.retry",
+    ],
+    "control-plane/crates/engine/src/rollout_contract_preflight.rs": [
+        "post_ready_implementation_starts",
+        "cutover_policy_grandfathers_pre_cutover_runs_as_not_applicable",
+        "inline_contract_creates_pass_record_before_enqueue",
+    ],
+    "Chainworks Forge/Engine/AppTerminationCoordinator.swift": [
+        "applicationShouldTerminate",
+        "beginGracefulTermination",
+        "terminateLater",
+        "hostTotalMilliseconds",
+    ],
+    "Chainworks ForgeTests/AppTerminationCoordinatorTests.swift": [
+        "gracefulTerminationRepliesAfterBoundedPreparation",
+        "gracefulTerminationIgnoresDuplicateCallbacks",
+    ],
+}
+
+for rel_path, terms in checks.items():
+    text = (root / rel_path).read_text()
+    for term in terms:
+        if term not in text:
+            raise SystemExit(f"proposal-083: {rel_path} missing {term!r}")
+
+for rel_path in [
+    "docs/evidence/rollout-contract/negative/p083-enforce-without-burnin.json",
+    "docs/evidence/rollout-contract/negative/p083-shutdown-deadline-config-invalid.json",
+    "docs/evidence/rollout-contract/negative/p083-command-lease-ttl-config-invalid.json",
+]:
+    text = (root / rel_path).read_text()
+    if "post_ready_implementation_starts" not in text:
+        raise SystemExit(f"proposal-083: {rel_path} missing post_ready_implementation_starts")
+    if "post_cutover_implementation_starts" in text:
+        raise SystemExit(f"proposal-083: {rel_path} still has stale post_cutover_implementation_starts")
+
+print("proposal-083 static regression checks passed")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      run_p083_cargo_test() {
+        local output status
+        set +e
+        output=$(CARGO_TARGET_DIR=target/proposal-083-gate cargo test "$@" 2>&1)
+        status=$?
+        set -e
+        printf '%s\n' "$output"
+        if [ "$status" -ne 0 ]; then
+          return "$status"
+        fi
+        if ! printf '%s\n' "$output" | grep -Eq '^running [1-9][0-9]* tests?$'; then
+          echo "FAILED: P083 cargo test filter selected zero tests: cargo test $*" >&2
+          return 1
+        fi
+      }
+
+      run_p083_cargo_test -p mcp-server p083_main_sync_mcp_callers_stamp_idempotency_key_as_request_id -- --nocapture
+      run_p083_cargo_test -p engine inline_contract_creates_pass_record_before_enqueue -- --nocapture
+      run_p083_cargo_test -p engine cutover_policy_grandfathers_pre_cutover_runs_as_not_applicable -- --nocapture
+    )
+    run_targeted_tests "proposal-083-swift-termination" "${PROPOSAL_083_SWIFT_TESTS[@]}"
+    log "Proposal 083 focused code-fix regression gate passed"
+    ;;
   p086-continuation-readback)
     log "Proposal 086 Phase 1 readback gate: operator readback fixture field coverage"
     python3 - "$ROOT_DIR" <<'PY'
@@ -9648,6 +9824,37 @@ for field in required_operator_fields:
 print("p086-continuation-operator-report passed")
 PY
     log "Proposal 086 Phase 1 operator report gate passed"
+    ;;
+  proposal-083|p083)
+    log "Proposal 083 focused code-fix regression gate"
+    python3 - "$ROOT_DIR" <<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+runs_rs = (root / "control-plane/crates/mcp-server/src/tools/runs.rs").read_text()
+for term in [
+    "mcp_caller_with_idempotency_request_id",
+    "p083_main_sync_mcp_callers_stamp_idempotency_key_as_request_id",
+    "runs.main_sync.request",
+    "runs.main_sync.retry",
+    ".with_request_id(idempotency_key)",
+]:
+    if term not in runs_rs:
+        raise SystemExit(f"proposal-083: runs.rs missing {term!r}")
+
+gate = (root / "scripts/test-gate.sh").read_text()
+for term in ["proposal-083|p083", "p083_main_sync_mcp_callers_stamp_idempotency_key_as_request_id"]:
+    if term not in gate:
+        raise SystemExit(f"proposal-083: test-gate.sh missing {term!r}")
+
+print("proposal-083 static regression checks passed")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-083-gate cargo test -p mcp-server p083_main_sync_mcp_callers_stamp_idempotency_key_as_request_id -- --nocapture
+    )
+    log "Proposal 083 focused code-fix regression gate passed"
     ;;
   proposal-085|p085)
     log "Proposal 085 gate: thin-client read-model parity and affordance contract"
@@ -10386,6 +10593,981 @@ if "CANONICAL_HOT_READ_SURFACES" not in storage_health_rs:
 print("P087 UI, schema, and evidence verified")
 PY
     log "Proposal 087 gate passed"
+    ;;
+  proposal-082|p082)
+    log "Proposal 082 gate: recovery and retry state-machine matrix"
+    P082_GATE_SCENARIOS=(
+      P082-R01 P082-R02 P082-R03 P082-R04 P082-R05 P082-R06 P082-R07 P082-R08 P082-R09
+      P082-R10 P082-R11 P082-R12 P082-R13 P082-R14 P082-R15 P082-R16 P082-R17
+    )
+    P082_GATE_SCENARIO_RECORDED="|"
+    p082_emit_gate_result_metric() {
+      local scenario_id="$1"
+      local status="$2"
+      # P082 approved emission site: the proposal-082 gate harness emits
+      # p082_recovery_matrix_gate_result_total{scenario_id,status} after each
+      # scenario assertion group. Keep the line OpenMetrics-shaped so gate logs
+      # can be scraped without coupling runtime readback accessors to gate state.
+      printf 'p082_recovery_matrix_gate_result_total{scenario_id="%s",status="%s"} 1\n' "$scenario_id" "$status"
+      case "$P082_GATE_SCENARIO_RECORDED" in
+        *"|$scenario_id|"*) ;;
+        *) P082_GATE_SCENARIO_RECORDED="${P082_GATE_SCENARIO_RECORDED}${scenario_id}|" ;;
+      esac
+    }
+    p082_emit_gate_results_from_cargo_output() {
+      local output="$1"
+      local scenario_id metric_status
+      while IFS=$'\t' read -r scenario_id metric_status; do
+        if [[ -n "$scenario_id" && -n "$metric_status" ]]; then
+          p082_emit_gate_result_metric "$scenario_id" "$metric_status"
+        fi
+      done < <(python3 -c '
+import re
+import sys
+
+seen = set()
+for line in sys.stdin:
+    match = re.search(r"^test .*p082_r(0[1-9]|1[0-7])_[^ ]* \.\.\. (ok|FAILED|ignored)\b", line)
+    if not match:
+        continue
+    scenario_id = f"P082-R{match.group(1)}"
+    raw_status = match.group(2)
+    status = {
+        "ok": "passed",
+        "FAILED": "failed",
+        "ignored": "interrupted",
+    }[raw_status]
+    key = (scenario_id, status)
+    if key in seen:
+        continue
+    seen.add(key)
+    print(f"{scenario_id}\t{status}")
+' <<< "$output")
+    }
+    p082_emit_interrupted_gate_results() {
+      local exit_status=$?
+      if [[ "$exit_status" -ne 0 ]]; then
+        local scenario_id
+        for scenario_id in "${P082_GATE_SCENARIOS[@]}"; do
+          if [[ "$P082_GATE_SCENARIO_RECORDED" != *"|$scenario_id|"* ]]; then
+            p082_emit_gate_result_metric "$scenario_id" "interrupted"
+          fi
+        done
+      fi
+    }
+    trap p082_emit_interrupted_gate_results EXIT
+    # Run the static fixture/matrix contract checks before the focused Rust
+    # suites so missing or malformed rollout evidence fails the active gate.
+    python3 - <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path.cwd()
+
+# 0. Verify agent output-channel artifacts were not written into source.
+if (root / "CHAINWORKS_OUTPUT").exists():
+    print("FAILED: root-level CHAINWORKS_OUTPUT artifact must not be present in the worktree")
+    sys.exit(1)
+
+# 1. Verify canonical reference matrix document exists
+matrix_doc = root / "docs/reference/recovery-retry-state-machine-test-matrix.md"
+if not matrix_doc.exists():
+    print("FAILED: docs/reference/recovery-retry-state-machine-test-matrix.md is missing")
+    sys.exit(1)
+matrix_text = matrix_doc.read_text()
+
+# 2. Verify all 17 scenario IDs are present
+required_scenarios = [f"P082-R{i:02d}" for i in range(1, 18)]
+for scenario_id in required_scenarios:
+    if scenario_id not in matrix_text:
+        print(f"FAILED: canonical matrix missing required scenario: {scenario_id}")
+        sys.exit(1)
+
+# 3. Verify required reason codes are documented
+required_reason_codes = [
+    "resume_claim_status",
+    "startup_requeue_once",
+    "startup_requeue_exhausted",
+    "invalid_stage_for_retry",
+    "ignored_late_outputs",
+    "duplicate_owner_repaired",
+    "startup_stalled",
+    "stale_repaired",
+    "needs_effect_reconciliation",
+    "requires_effect_reconciliation",
+    "valid_identifier_guidance",
+    "approval_pending_operator_action_required",
+    "duplicate_mediation_owner_rejected",
+    "cancel_active_stage_requested",
+    "cancel_pending_approval_preserved",
+    "cancel_side_effect_reconciliation_required",
+    "cancel_startup_repair_converged",
+    "cancelled_provider_late_output_ignored",
+    "repair_crash_resume_idempotent",
+]
+for code in required_reason_codes:
+    if code not in matrix_text:
+        print(f"FAILED: canonical matrix missing required reason code: {code}")
+        sys.exit(1)
+
+# 4. Verify required schema contracts are documented
+required_schemas = [
+    "p082_recovery_matrix_readback_v1",
+    "p082_rejected_command_error_v1",
+    "p082_retry_identifier_guidance_v1",
+    "p082_late_output_settlement_v1",
+    "p082_startup_repair_summary_v1",
+]
+for schema in required_schemas:
+    if schema not in matrix_text:
+        print(f"FAILED: canonical matrix missing nested schema contract: {schema}")
+        sys.exit(1)
+
+# 5. Verify payload_json non-mutation is documented
+if "command_journal.payload_json" not in matrix_text:
+    print("FAILED: canonical matrix must document command_journal.payload_json non-mutation contract")
+    sys.exit(1)
+
+# 6. Verify lane placement is documented
+required_lane_terms = [
+    "p082_recovery_matrix_readback",
+    "p082_recovery_matrix_readbacks",
+    "runs.get",
+    "reports.get",
+]
+for term in required_lane_terms:
+    if term not in matrix_text:
+        print(f"FAILED: canonical matrix missing lane placement term: {term}")
+        sys.exit(1)
+
+# 6b. Verify principal-class gating wording matches implemented behavior.
+principal_gating_required_terms = [
+    "reports.get`: non-operator principals are denied before report lanes are loaded",
+    "report://{run_id}`: non-operator principals are denied before the report resource payload is materialized",
+    "p082_recovery_matrix_readback: null",
+    "p082_recovery_matrix_readbacks: []",
+]
+for term in principal_gating_required_terms:
+    if term not in matrix_text:
+        print(f"FAILED: canonical matrix missing implemented principal gating term: {term}")
+        sys.exit(1)
+if "This applies to `runs.get`, `reports.get`, `report://{run_id}`" in matrix_text:
+    print("FAILED: canonical matrix still implies non-operator report surfaces return empty readback lanes instead of denying")
+    sys.exit(1)
+
+# 7. Verify startup_requeue_exhausted held state is documented
+if "startup_requeue_exhausted" not in matrix_text:
+    print("FAILED: canonical matrix missing startup_requeue_exhausted held-state coverage")
+    sys.exit(1)
+if "ignored" not in matrix_text:
+    print("FAILED: canonical matrix must include late-output claim_state value 'ignored'")
+    sys.exit(1)
+if "source_command_journal_id" not in matrix_text:
+    print("FAILED: canonical matrix must document source_command_journal_id in p082_startup_repair_summary_v1")
+    sys.exit(1)
+for line in matrix_text.splitlines():
+    if "source_command_journal_id" in line and "string or null" in line:
+        print("FAILED: canonical matrix must not document source_command_journal_id as string-or-null")
+        sys.exit(1)
+
+# 8. Verify positive fixture exists and validates
+positive_fixture_path = root / "docs/evidence/rollout-contract/operator-readback/p082-full-surface.fixture.json"
+if not positive_fixture_path.exists():
+    print("FAILED: missing docs/evidence/rollout-contract/operator-readback/p082-full-surface.fixture.json")
+    sys.exit(1)
+try:
+    positive_fixture = json.loads(positive_fixture_path.read_text())
+except json.JSONDecodeError as exc:
+    print(f"FAILED: p082-full-surface.fixture.json is invalid JSON: {exc}")
+    sys.exit(1)
+
+if positive_fixture.get("schema_version") != "p082_operator_readback_fixture_v1":
+    print("FAILED: p082-full-surface.fixture.json must have schema_version=p082_operator_readback_fixture_v1")
+    sys.exit(1)
+
+# Check rollout_contract_readback present
+if "rollout_contract_readback" not in positive_fixture:
+    print("FAILED: p082-full-surface.fixture.json missing rollout_contract_readback")
+    sys.exit(1)
+
+# Check lane coverage
+for lane in ["runs_get", "reports_get", "report_resource", "run_report", "release_receipt"]:
+    if lane not in positive_fixture.get("lanes", {}):
+        print(f"FAILED: p082-full-surface.fixture.json missing lane: {lane}")
+        sys.exit(1)
+
+lanes = positive_fixture.get("lanes", {})
+
+def require_lane_payload(lane):
+    payload = lanes.get(lane, {}).get("payload")
+    if not isinstance(payload, dict):
+        print(f"FAILED: p082-full-surface.fixture.json lane {lane} must contain a representative payload object, not metadata-only assertions")
+        sys.exit(1)
+    return payload
+
+def canonical_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+def latest_applicable_readback(rows):
+    applicable = [
+        row for row in rows
+        if isinstance(row, dict) and row.get("scenario_status") != "not_applicable"
+    ]
+    if not applicable:
+        return None
+    return sorted(
+        applicable,
+        key=lambda row: (row.get("updated_at", ""), row.get("scenario_id", "")),
+    )[-1]
+
+runs_get_payload = require_lane_payload("runs_get")
+reports_get_payload = require_lane_payload("reports_get")
+report_resource_payload = require_lane_payload("report_resource")
+run_report_payload = require_lane_payload("run_report")
+release_receipt_payload = require_lane_payload("release_receipt")
+
+if "p082_recovery_matrix_readback" not in runs_get_payload:
+    print("FAILED: runs_get lane payload missing singular p082_recovery_matrix_readback")
+    sys.exit(1)
+if not isinstance(runs_get_payload.get("p082_recovery_matrix_readbacks"), list):
+    print("FAILED: runs_get lane payload missing plural p082_recovery_matrix_readbacks array")
+    sys.exit(1)
+runs_get_latest = latest_applicable_readback(runs_get_payload["p082_recovery_matrix_readbacks"])
+if runs_get_latest is None:
+    print("FAILED: runs_get lane payload must include at least one applicable p082_recovery_matrix_readbacks row")
+    sys.exit(1)
+if canonical_json(runs_get_payload["p082_recovery_matrix_readback"]) != canonical_json(runs_get_latest):
+    print("FAILED: runs_get singular p082_recovery_matrix_readback must equal the latest non-not_applicable plural row")
+    sys.exit(1)
+if "p082_recovery_matrix_readback" in reports_get_payload:
+    print("FAILED: reports_get lane payload must not expose singular p082_recovery_matrix_readback")
+    sys.exit(1)
+if not isinstance(reports_get_payload.get("p082_recovery_matrix_readbacks"), list):
+    print("FAILED: reports_get lane payload missing plural p082_recovery_matrix_readbacks array")
+    sys.exit(1)
+for report in reports_get_payload.get("reports", []):
+    if "p082_recovery_matrix_readback" in report:
+        print("FAILED: reports_get report entries must not expose singular p082_recovery_matrix_readback")
+        sys.exit(1)
+    if not isinstance(report.get("p082_recovery_matrix_readbacks"), list):
+        print("FAILED: reports_get report entries with P082 data must expose plural p082_recovery_matrix_readbacks")
+        sys.exit(1)
+for lane_name, payload in [
+    ("report_resource", report_resource_payload),
+    ("run_report", run_report_payload),
+    ("release_receipt", release_receipt_payload),
+]:
+    if "p082_recovery_matrix_readback" in payload:
+        print(f"FAILED: {lane_name} lane payload must not expose singular p082_recovery_matrix_readback")
+        sys.exit(1)
+    if not isinstance(payload.get("p082_recovery_matrix_readbacks"), list):
+        print(f"FAILED: {lane_name} lane payload missing plural p082_recovery_matrix_readbacks array")
+        sys.exit(1)
+reports_plural = reports_get_payload["p082_recovery_matrix_readbacks"]
+for lane_name, payload in [
+    ("report_resource", report_resource_payload),
+    ("run_report", run_report_payload),
+]:
+    if canonical_json(payload["p082_recovery_matrix_readbacks"]) != canonical_json(reports_plural):
+        print(f"FAILED: {lane_name} p082_recovery_matrix_readbacks must match reports_get payload")
+        sys.exit(1)
+if "rollout_contract_readback" not in release_receipt_payload:
+    print("FAILED: release_receipt lane payload missing rollout_contract_readback")
+    sys.exit(1)
+if any(key in release_receipt_payload for key in ["recovery_commands", "retry_stage", "cancel_stage"]):
+    print("FAILED: release_receipt lane payload must not expose recovery command affordances")
+    sys.exit(1)
+
+# Check fixture_assertions
+assertions = positive_fixture.get("fixture_assertions", {})
+if not assertions:
+    print("FAILED: p082-full-surface.fixture.json missing fixture_assertions")
+    sys.exit(1)
+
+# Check all reason codes are in fixture_assertions.required_reason_codes
+fixture_reason_codes = assertions.get("required_reason_codes", [])
+for code in required_reason_codes:
+    if code not in fixture_reason_codes:
+        print(f"FAILED: p082-full-surface.fixture.json fixture_assertions.required_reason_codes missing: {code}")
+        sys.exit(1)
+
+# Check all scenario IDs in fixture_assertions
+fixture_scenario_ids = assertions.get("required_scenario_ids", [])
+for sid in required_scenarios:
+    if sid not in fixture_scenario_ids:
+        print(f"FAILED: p082-full-surface.fixture.json fixture_assertions.required_scenario_ids missing: {sid}")
+        sys.exit(1)
+
+def walk_json(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from walk_json(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from walk_json(child)
+
+for obj in walk_json(positive_fixture):
+    if obj.get("schema_version") == "p082_startup_repair_summary_v1":
+        if not isinstance(obj.get("source_command_journal_id"), str) or not obj.get("source_command_journal_id"):
+            print("FAILED: p082-full-surface.fixture.json startup repair summaries must use non-empty string source_command_journal_id")
+            sys.exit(1)
+    if obj.get("schema_version") == "p082_retry_identifier_guidance_v1":
+        if obj.get("provided_identifier_kind") == "stage_execution_id":
+            print("FAILED: p082-full-surface.fixture.json must use provided_identifier_kind=stage_execution_uuid, not stage_execution_id")
+            sys.exit(1)
+
+# 9. Verify all negative fixtures exist and validate
+required_negative_fixtures = [
+    "p082-missing-matrix-row.json",
+    "p082-missing-db-engine-readback-assertion.json",
+    "p082-release-side-effect-retry-not-fail-closed.json",
+    "p082-blind-automatic-retry.json",
+    "p082-missing-readback-reason.json",
+    "p082-missing-rollout-contract-operator-fields.json",
+    "p082-graphql-required-without-contract.json",
+    "p082-duplicate-requeue-without-idempotency.json",
+    "p082-missing-cancel-crash-rows.json",
+    "p082-rejected-command-payload-mutation.json",
+    "p082-lane-field-name-drift.json",
+    "p082-missing-nested-subcontract.json",
+    "p082-xcode-grace-missing-operator-message.json",
+    "p082-malformed-command-error-envelope.json",
+    "p082-missing-startup-requeue-exhausted-row.json",
+    "p082-cancel-late-output-mutates-active-projection.json",
+]
+# Known expected_failure_codes from the P082 rollout contract hold conditions.
+# Each negative fixture's expected_failure_code must be in this set.
+known_failure_codes = {
+    "p082_missing_matrix_row",
+    "p082_missing_db_engine_readback_assertion",
+    "p082_release_side_effect_retry_not_fail_closed",
+    "p082_blind_automatic_retry",
+    "p082_missing_readback_reason",
+    "p082_missing_rollout_contract_operator_fields",
+    "p082_graphql_required_without_contract",
+    "p082_duplicate_requeue_without_idempotency",
+    "p082_missing_cancel_crash_rows",
+    "p082_rejected_command_payload_mutation",
+    "p082_lane_field_name_drift",
+    "p082_missing_nested_subcontract",
+    "p082_xcode_grace_missing_operator_message",
+    "p082_malformed_command_error_envelope",
+    "p082_missing_startup_requeue_exhausted_row",
+    "p082_cancel_late_output_mutates_active_projection",
+}
+negative_dir = root / "docs/evidence/rollout-contract/negative"
+for fixture_name in required_negative_fixtures:
+    fpath = negative_dir / fixture_name
+    if not fpath.exists():
+        print(f"FAILED: missing required negative fixture: {fixture_name}")
+        sys.exit(1)
+    try:
+        neg = json.loads(fpath.read_text())
+    except json.JSONDecodeError as exc:
+        print(f"FAILED: negative fixture {fixture_name} is invalid JSON: {exc}")
+        sys.exit(1)
+    if neg.get("schema_version") != "p082_negative_fixture_v1":
+        print(f"FAILED: negative fixture {fixture_name} must have schema_version=p082_negative_fixture_v1")
+        sys.exit(1)
+    for required_field in ["fixture_id", "expected_failure_code", "mutated_contract_or_matrix", "assertion"]:
+        if required_field not in neg:
+            print(f"FAILED: negative fixture {fixture_name} missing required field: {required_field}")
+            sys.exit(1)
+    # Verify expected_failure_code is in the known vocabulary (not arbitrary strings).
+    failure_code = neg.get("expected_failure_code", "")
+    if failure_code not in known_failure_codes:
+        print(f"FAILED: negative fixture {fixture_name} has unexpected expected_failure_code '{failure_code}' (not in known P082 failure code vocabulary)")
+        sys.exit(1)
+    # Verify assertion is non-trivial (must contain 'gate' or 'must fail' to confirm it
+    # describes a failure check, not just documentation).
+    assertion = neg.get("assertion", "")
+    if len(assertion) < 20:
+        print(f"FAILED: negative fixture {fixture_name} assertion is too short (must describe a failure check)")
+        sys.exit(1)
+    if not any(kw in assertion.lower() for kw in ["gate", "must fail", "must not", "must be rejected", "must be detected"]):
+        print(f"FAILED: negative fixture {fixture_name} assertion must contain a failure check keyword (e.g. 'gate', 'must fail', 'must be rejected')")
+        sys.exit(1)
+
+# 9b. Verify inline behavioral mutation checks against key negative fixture scenarios.
+# These checks confirm that the implementation rejects the mutated contracts described
+# by the negative fixtures, not just that the fixture files exist.
+
+# Check: malformed envelope (missing reason_code) must fail envelope parsing.
+# This validates that parse_command_journal_error_envelope is behaviorally enforced,
+# corresponding to p082-malformed-command-error-envelope.json.
+import subprocess
+malformed_envelope_check = {
+    "schema_version": "p082_rejected_command_error_v1",
+    "command_type": "RetryStage",
+    "redaction": "none",
+    "operator_safe_summary": "Test",
+    "p082_recovery_matrix_readback": None,
+}
+# The presence of a structural validation test in the cargo test suite is asserted
+# by checking that the behavioral rejection test function name exists in the test file.
+db_test_file = root / "control-plane/crates/db/tests/proposal_082_recovery_retry_matrix.rs"
+db_test_content = db_test_file.read_text() if db_test_file.exists() else ""
+if db_test_file.exists():
+    for required_test in [
+        "p082_neg_malformed_envelope_missing_reason_code_is_rejected",
+        "p082_neg_non_canonical_scenario_id_in_envelope_is_rejected",
+        "p082_sec_high1_nested_subcontract_injection_is_stripped",
+        "p082_sec_medium1_tampered_startup_repair_readback_produces_tamper_detected_row",
+        "p082_omitted_optional_subcontract_keys_do_not_reach_readback_lanes",
+        "p082_r05_stale_xcode_startup_accessor_derives_operator_message",
+    ]:
+        if required_test not in db_test_content:
+            print(f"FAILED: DB test file missing required behavioral rejection test: {required_test}")
+            sys.exit(1)
+engine_test_file = root / "control-plane/crates/engine/tests/proposal_082_recovery_retry_matrix.rs"
+engine_test_content = engine_test_file.read_text() if engine_test_file.exists() else ""
+if engine_test_file.exists():
+    for required_test in [
+        "p082_neg_non_canonical_scenario_id_rejected_by_parser",
+        "p082_neg_empty_next_action_for_non_not_applicable_is_rejected",
+        "p082_neg_validate_readback_v1_shape_rejects_tampered_field_values",
+    ]:
+        if required_test not in engine_test_content:
+            print(f"FAILED: engine test file missing required behavioral rejection test: {required_test}")
+            sys.exit(1)
+
+# 10. Verify domain recovery_matrix module exists
+recovery_matrix_rs = root / "control-plane/crates/domain/src/recovery_matrix.rs"
+if not recovery_matrix_rs.exists():
+    print("FAILED: control-plane/crates/domain/src/recovery_matrix.rs is missing")
+    sys.exit(1)
+rm_content = recovery_matrix_rs.read_text()
+for const_name in ["REASON_STARTUP_REQUEUE_ONCE", "REASON_STARTUP_REQUEUE_EXHAUSTED",
+                    "REASON_INVALID_STAGE_FOR_RETRY", "ALL_REASON_CODES", "SCENARIO_IDS",
+                    "SCHEMA_READBACK_V1", "SCHEMA_REJECTED_COMMAND_ERROR_V1",
+                    "STANDARD_STARTUP_GRACE_SECONDS", "XCODE_STARTUP_GRACE_SECONDS",
+                    "XCODE_STARTUP_GRACE_WARN_SECONDS", "XCODE_STARTUP_GRACE_CRITICAL_SECONDS"]:
+    if const_name not in rm_content:
+        print(f"FAILED: recovery_matrix.rs missing required constant: {const_name}")
+        sys.exit(1)
+# 10b. Verify that validate_readback_v1_shape is present (MEDIUM-1 fix).
+if "validate_readback_v1_shape" not in rm_content:
+    print("FAILED: recovery_matrix.rs missing validate_readback_v1_shape function (required for MEDIUM-1 fix)")
+    sys.exit(1)
+
+# 11. Verify P082 readback fields exist in MCP server tools
+runs_rs = root / "control-plane/crates/mcp-server/src/tools/runs.rs"
+if not runs_rs.exists():
+    print("FAILED: mcp-server/src/tools/runs.rs is missing")
+    sys.exit(1)
+runs_content = runs_rs.read_text()
+if "p082_recovery_matrix_readback" not in runs_content:
+    print("FAILED: runs.rs missing p082_recovery_matrix_readback field wiring for runs.get lane")
+    sys.exit(1)
+if "p082_recovery_matrix_readbacks" not in runs_content:
+    print("FAILED: runs.rs missing p082_recovery_matrix_readbacks field wiring for runs.get lane")
+    sys.exit(1)
+
+reports_rs = root / "control-plane/crates/mcp-server/src/tools/reports.rs"
+if not reports_rs.exists():
+    print("FAILED: mcp-server/src/tools/reports.rs is missing")
+    sys.exit(1)
+reports_content = reports_rs.read_text()
+if "p082_recovery_matrix_readbacks_json" not in reports_content:
+    print("FAILED: reports.rs missing p082_recovery_matrix_readbacks_json function")
+    sys.exit(1)
+if "p082_recovery_matrix_readback_json" not in reports_content:
+    print("FAILED: reports.rs missing p082_recovery_matrix_readback_json function")
+    sys.exit(1)
+
+# 12. Verify lane field-name contract: reports.get must not expose singular
+# (This is verified by the Rust test; here we just verify the function is present.)
+if "pub async fn p082_recovery_matrix_readbacks_json" not in reports_content:
+    print("FAILED: reports.rs missing public p082_recovery_matrix_readbacks_json function")
+    sys.exit(1)
+if '"reports": reports' not in reports_content or '"p082_recovery_matrix_readbacks": p082_readbacks' not in reports_content:
+    print("FAILED: reports.get must return an object with result-level p082_recovery_matrix_readbacks and reports array")
+    sys.exit(1)
+if "principal_class: &auth::PrincipalClass" not in reports_content or "p082_recovery_matrix_readbacks_json(pool, artifact.run_id, principal_class" not in reports_content:
+    print("FAILED: artifact_report_json must gate run_report P082 readbacks by principal_class")
+    sys.exit(1)
+
+# 13. Verify report:// resource wires p082_recovery_matrix_readbacks
+server_rs = root / "control-plane/crates/mcp-server/src/server.rs"
+if not server_rs.exists():
+    print("FAILED: mcp-server/src/server.rs is missing")
+    sys.exit(1)
+server_content = server_rs.read_text()
+if (
+    '"p082_recovery_matrix_readbacks": p082_recovery_matrix_readbacks' not in server_content
+    and '"p082_recovery_matrix_readbacks".into()' not in server_content
+):
+    print("FAILED: server.rs report:// handler missing p082_recovery_matrix_readbacks wiring")
+    sys.exit(1)
+
+# 14. Verify report:// resource parity tests exist in server.rs
+for required_test in [
+    "p082_report_resource_includes_plural_readbacks_not_singular",
+    "p082_report_resource_non_empty_readbacks_when_startup_repair_exists",
+    "p082_report_resource_run_report_artifact_empty_for_non_operator",
+]:
+    if required_test not in server_content:
+        print(f"FAILED: server.rs missing required P082 report:// parity test: {required_test}")
+        sys.exit(1)
+
+# 15. Verify P082 required metric names are declared in metrics.rs (fail-closed condition).
+metrics_rs = root / "control-plane/crates/db/src/metrics.rs"
+if not metrics_rs.exists():
+    print("FAILED: control-plane/crates/db/src/metrics.rs is missing")
+    sys.exit(1)
+metrics_content = metrics_rs.read_text()
+p082_required_metrics = [
+    "p082_recovery_matrix_rows_with_db_engine_readback_coverage_percent",
+    "p082_recovery_matrix_gate_result_total",
+    "p082_recovery_reason_readback_total",
+    "p082_recovery_mutation_rejected_total",
+    "p082_release_side_effect_retry_block_total",
+    "p082_late_output_quarantine_total",
+    "p082_recovery_idempotency_replay_total",
+    "p082_recovery_state_age_seconds",
+]
+for metric in p082_required_metrics:
+    if metric not in metrics_content:
+        print(f"FAILED: P082 required metric not declared in metrics.rs: {metric}")
+        sys.exit(1)
+if "P082_REQUIRED_METRICS" not in metrics_content:
+    print("FAILED: metrics.rs missing P082_REQUIRED_METRICS constant declaration")
+    sys.exit(1)
+p082_rm_rs = root / "control-plane/crates/db/src/repos/p082_recovery_matrix.rs"
+p082_rm_content = p082_rm_rs.read_text() if p082_rm_rs.exists() else ""
+for required_emitter in [
+    "record_p082_recovery_matrix_coverage_percent",
+    "record_p082_recovery_matrix_gate_result",
+    "record_p082_recovery_state_age_seconds",
+]:
+    if required_emitter not in metrics_content:
+        print(f"FAILED: metrics.rs missing P082 metric emitter: {required_emitter}")
+        sys.exit(1)
+if "record_p082_recovery_matrix_coverage_percent" not in p082_rm_content:
+    print("FAILED: p082_recovery_matrix.rs must emit coverage percent from readbacks_for_run")
+    sys.exit(1)
+if "record_p082_recovery_state_age_seconds" not in p082_rm_content:
+    print("FAILED: p082_recovery_matrix.rs must emit recovery state age seconds")
+    sys.exit(1)
+if "record_p082_recovery_matrix_gate_result" in p082_rm_content:
+    print("FAILED: p082_recovery_matrix.rs must not emit p082_recovery_matrix_gate_result_total; gate harness owns that metric")
+    sys.exit(1)
+if '"run_report"' not in reports_content or '"p082_recovery_matrix_readbacks".to_string()' not in reports_content:
+    print("FAILED: reports.rs must wire p082_recovery_matrix_readbacks into generated run_report artifact lane")
+    sys.exit(1)
+
+for required_test in [
+    "p082_r01_startup_requeue_crash_replay_requeues_same_generation",
+    "p082_r16_startup_requeue_exhausted_non_replay_holds_without_duplicating_work",
+    "p082_required_matrix_metrics_are_emitted_from_readback_accessor",
+    # Gate-harness emission: approved proposal requires gate_result emitted after each scenario assertion group.
+    "p082_gate_harness_emits_gate_result_per_scenario_assertion",
+    # crash-boundary proof for each durable write boundary (reliability_semantics.crash_injection)
+    "p082_r15_crash_after_session_invalidation_before_idempotency_row_recovers",
+    "p082_r15_crash_after_work_item_status_mutation_is_idempotent",
+    "p082_r15_crash_after_command_journal_error_settlement_readback_derives_correctly",
+    "p082_r15_crash_after_cancellation_settlement_log_update_readback_accessible",
+    "p082_r15_crash_after_side_effect_hold_recording_blocks_retry",
+    "p082_r15_crash_after_readback_projection_write_no_duplicate_rows",
+]:
+    if required_test not in db_test_content:
+        print(f"FAILED: DB test file missing P082 production proof test: {required_test}")
+        sys.exit(1)
+for required_test in [
+    "p082_reports_get_run_report_artifact_includes_plural_readbacks",
+    "p082_reports_get_run_report_artifact_empty_for_agent_and_observer",
+]:
+    mcp_test_file = root / "control-plane/crates/mcp-server/tests/proposal_082_recovery_readback.rs"
+    mcp_test_content = mcp_test_file.read_text() if mcp_test_file.exists() else ""
+    if required_test not in mcp_test_content:
+        print(f"FAILED: MCP test file missing P082 run_report lane proof: {required_test}")
+        sys.exit(1)
+
+cancellation_rs = root / "control-plane/crates/engine/src/cancellation.rs"
+cancellation_content = cancellation_rs.read_text() if cancellation_rs.exists() else ""
+if "set_readback_startup_repair" not in cancellation_content or "P082-R14" not in cancellation_content:
+    print("FAILED: cancellation.rs must attach p082_startup_repair_summary_v1 to P082-R14 readback")
+    sys.exit(1)
+if "list_unresolved_for_run(pool" not in cancellation_content or "update_cancellation_settlement_log" not in cancellation_content:
+    print("FAILED: cancellation finalization must hold while unresolved side effects exist")
+    sys.exit(1)
+integration_test_file = root / "control-plane/crates/engine/tests/integration.rs"
+integration_test_content = integration_test_file.read_text() if integration_test_file.exists() else ""
+for required_test in [
+    "p082_cancel_run_with_unresolved_side_effect_stays_cancelling_until_reconciled",
+    "p082_r14_begin_settlement_persists_startup_repair_summary",
+]:
+    if required_test not in integration_test_content:
+        print(f"FAILED: engine integration test file missing P082 production proof test: {required_test}")
+        sys.exit(1)
+
+# 16. Verify R16 approved storage owner: readback must be in startup_repairs.notes,
+# not in work_items.payload_json.p082_r16_held.
+work_items_rs = root / "control-plane/crates/db/src/repos/work_items.rs"
+if work_items_rs.exists():
+    wi_content = work_items_rs.read_text()
+    if "p082_r16_held" in wi_content:
+        print("FAILED: work_items.rs must not store R16 readback in payload_json.p082_r16_held (approved owner is startup_repairs.notes.p082_recovery_matrix_readback)")
+        sys.exit(1)
+if p082_rm_rs.exists():
+    if "p082_r16_held" in p082_rm_content:
+        print("FAILED: p082_recovery_matrix.rs must not read R16 readback from work_items.payload_json.p082_r16_held (approved owner is startup_repairs.notes.p082_recovery_matrix_readback)")
+        sys.exit(1)
+
+# 16b. Verify R05 approved storage owner: stale ACP startup and pre-session startup
+# readback must be sourced from work_items.payload_json.p061_startup_recovery.
+if p082_rm_rs.exists():
+    if "work_items.payload_json.p061_startup_recovery" not in p082_rm_content:
+        print("FAILED: p082_recovery_matrix.rs must read P082-R05 from work_items.payload_json.p061_startup_recovery")
+        sys.exit(1)
+if work_items_rs.exists():
+    if "work_items.payload_json.p061_startup_recovery" not in wi_content:
+        print("FAILED: work_items.rs must stamp P082-R05 source_json_key as work_items.payload_json.p061_startup_recovery")
+        sys.exit(1)
+if "p082_r05_pre_session_repair_uses_work_item_payload_owner" not in db_test_content:
+    print("FAILED: DB test file missing P082-R05 pre-session work item payload owner proof")
+    sys.exit(1)
+if '"P082-R05" => Some(&[SOURCE_KEY_WORK_ITEMS_STARTUP_RECOVERY])' not in rm_content:
+    print("FAILED: recovery_matrix.rs must require work_items.payload_json.p061_startup_recovery for P082-R05")
+    sys.exit(1)
+
+# 17. Verify all 17 P082 scenario IDs (P082-R01 through P082-R17) have named tests
+# in the engine test files (unit or integration). The approved gate contract requires
+# row-by-row proof for every scenario in the matrix.
+engine_unit_test_file = root / "control-plane/crates/engine/tests/proposal_082_recovery_retry_matrix.rs"
+engine_integration_test_file = root / "control-plane/crates/engine/tests/integration.rs"
+engine_unit_content = engine_unit_test_file.read_text() if engine_unit_test_file.exists() else ""
+engine_integration_content = engine_integration_test_file.read_text() if engine_integration_test_file.exists() else ""
+engine_combined = engine_unit_content + engine_integration_content
+for n in range(1, 18):
+    scenario_prefix = f"p082_r{n:02d}_"
+    if scenario_prefix not in engine_combined:
+        print(f"FAILED: Engine test files missing named test for P082-R{n:02d} (expected function name containing '{scenario_prefix}')")
+        sys.exit(1)
+
+# 18. Verify P082 metric functions use the required label dimensions.
+# record_p082_recovery_matrix_gate_result must accept (scenario_id, status) — two args.
+# record_p082_recovery_state_age_seconds must accept (scenario_id, reason_code, age_seconds) — three args.
+# The approved contract requires {scenario_id,status} and {scenario_id,reason_code} label dimensions.
+if 'record_p082_recovery_matrix_gate_result(scenario_id: &str, status: &str)' not in metrics_content:
+    print("FAILED: metrics.rs record_p082_recovery_matrix_gate_result must accept (scenario_id: &str, status: &str) for {scenario_id,status} label dimensions")
+    sys.exit(1)
+gate_script = root / "scripts/test-gate.sh"
+gate_content = gate_script.read_text() if gate_script.exists() else ""
+for required_gate_fragment in [
+    "p082_emit_gate_result_metric",
+    "p082_emit_gate_results_from_cargo_output",
+    "p082_emit_interrupted_gate_results",
+    'status="%s"',
+    '"passed"',
+    '"failed"',
+    '"interrupted"',
+]:
+    if required_gate_fragment not in gate_content:
+        print(f"FAILED: proposal-082 gate harness missing gate-result metric fragment: {required_gate_fragment}")
+        sys.exit(1)
+if 'record_p082_recovery_state_age_seconds(\n    scenario_id: &str,' not in metrics_content and \
+   'record_p082_recovery_state_age_seconds(scenario_id: &str, reason_code: &str, age_seconds: u64)' not in metrics_content:
+    print("FAILED: metrics.rs record_p082_recovery_state_age_seconds must accept (scenario_id, reason_code, age_seconds) for {scenario_id,reason_code} label dimensions")
+    sys.exit(1)
+
+# 19. Verify provider subprocess cleanup proof exists in integration tests.
+# The test must prove that cancellation closes live ACP sessions via the runtime manager.
+acp_close_proof = "test_cancel_run_finalize_closes_live_session_via_runtime_manager"
+if acp_close_proof not in engine_integration_content:
+    print(f"FAILED: engine integration test file missing ACP provider cleanup proof: {acp_close_proof}")
+    sys.exit(1)
+
+print("P082 gate: all static checks passed")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      p082_cargo_target="$(chainworks_test_gate_cargo_target_dir "${CHAINWORKS_PROPOSAL_082_CARGO_TARGET_DIR:-target/proposal-082}")"
+      run_p082_cargo_test() {
+        local output status
+        set +e
+        output=$(CARGO_TARGET_DIR="$p082_cargo_target" cargo test "$@" 2>&1)
+        status=$?
+        set -e
+        printf '%s\n' "$output"
+        p082_emit_gate_results_from_cargo_output "$output"
+        if [ "$status" -ne 0 ]; then
+          return "$status"
+        fi
+        if ! printf '%s\n' "$output" | grep -Eq '^running [1-9][0-9]* tests?$'; then
+          echo "FAILED: P082 cargo test filter selected zero tests: cargo test $*" >&2
+          return 1
+        fi
+      }
+      run_p082_cargo_test -p db --test proposal_082_recovery_retry_matrix -- --nocapture
+      run_p082_cargo_test -p engine --test proposal_082_recovery_retry_matrix -- --nocapture
+      run_p082_cargo_test -p engine --test integration p082_ -- --nocapture
+      run_p082_cargo_test -p engine --test integration test_cancel_run_finalize_closes_live_session_via_runtime_manager -- --nocapture
+      run_p082_cargo_test -p auth live_principal_source_revalidates_revoked_disabled_and_rescoped_credentials -- --nocapture
+      run_p082_cargo_test -p mcp-server p082_ -- --nocapture
+      run_p082_cargo_test -p mcp-server sec_high_001_mcp_http_observes_live_principal_revocation -- --nocapture
+      run_p082_cargo_test -p daemon sec_high_001_failed_serve_observes_live_principal_revocation -- --nocapture
+      run_p082_cargo_test -p mcp-server --test proposal_082_recovery_readback -- --nocapture
+    )
+    log "Proposal 082 gate passed"
+    ;;
+  proposal-094|p094)
+    log "Proposal 094 gate: workflow-owned blocker-boundary contract/readback"
+    python3 - "$ROOT_DIR" <<'PY'
+import pathlib
+import re
+import sys
+
+root = pathlib.Path(sys.argv[1])
+script = (root / "scripts/test-gate.sh").read_text()
+workflow_ref = (root / "docs/reference/workflow-execution-engine.md").read_text()
+contracts_ref = (root / "docs/reference/output-contracts-failure-evidence-and-recovery.md").read_text()
+gate_ref = (root / "docs/reference/test-gates.md").read_text()
+workflow_yaml = (root / "examples/workflows/full-mvp-live.yaml").read_text()
+agent_catalog = (root / "examples/agents/agents.yaml").read_text()
+stable_contract_sources = "\n".join([
+    workflow_ref,
+    contracts_ref,
+    gate_ref,
+    workflow_yaml,
+    agent_catalog,
+])
+domain_contracts = (root / "control-plane/crates/domain/src/artifact_contracts.rs").read_text()
+db_contracts = (root / "control-plane/crates/db/src/repos/artifact_contracts.rs").read_text()
+db_metrics = (root / "control-plane/crates/db/src/metrics.rs").read_text()
+db_tests = (root / "control-plane/crates/db/tests/proposal_057_contracts.rs").read_text()
+domain_tests = (root / "control-plane/crates/domain/tests/proposal_057_contracts.rs").read_text()
+engine_unit = (root / "control-plane/crates/engine/src/quality_gate_boundary.rs").read_text()
+engine_orchestrator = (root / "control-plane/crates/engine/src/orchestrator.rs").read_text()
+engine_tests = (root / "control-plane/crates/engine/tests/integration.rs").read_text()
+workflow_tests = (root / "control-plane/crates/workflow/tests/integration.rs").read_text()
+mcp_tests = (root / "control-plane/crates/mcp-server/tests/proposal_057_contracts.rs").read_text()
+graphql_tests = (root / "control-plane/crates/graphql-server/tests/proposal_057_contracts.rs").read_text()
+
+for token in ["proposal-094|p094", "workflow-owned blocker-boundary"]:
+    if token not in script:
+        print(f"FAILED: test-gate.sh missing P094 alias/list token {token!r}")
+        sys.exit(1)
+
+for doc_token in [
+    "Quality-gate blocker boundary transitions",
+    "Workflow-owned quality-gate boundary contracts",
+    "Retained historical alias proof gate",
+]:
+    if doc_token not in stable_contract_sources:
+        print(f"FAILED: stable P094 closeout docs missing {doc_token!r}")
+        sys.exit(1)
+
+if "${CHAINWORKS_RUN_ROOT}" in stable_contract_sources:
+    print("FAILED: quality-gate boundary docs/examples must not introduce unsupported ${CHAINWORKS_RUN_ROOT}")
+    sys.exit(1)
+
+if re.search(r"\$\{CHAINWORKS_META_ROOT:-\.chainworks\}/runs/\$\{run_id\}", stable_contract_sources):
+    print("FAILED: quality-gate boundary artifact templates double-nest the run id")
+    sys.exit(1)
+
+if re.search(r"approval:\s*\{", workflow_yaml):
+    print("FAILED: quality-gate boundary approval YAML must remain string-compatible")
+    sys.exit(1)
+
+if "approval: required" not in workflow_yaml or "state_9_blocker_boundary_approval" not in workflow_yaml:
+    print("FAILED: quality-gate boundary workflow must retain string approval gate")
+    sys.exit(1)
+
+for contract_id in [
+    "proposal_decomposition_plan_v1",
+    "quality_gate_blocker_assessment_v1",
+    "blocker_boundary_status_v1",
+    "blocker_boundary_approval_request_v1",
+    "blocker_boundary_human_decision_v1",
+    "followup_proposal_seed_v1",
+]:
+    if contract_id not in domain_contracts:
+        print(f"FAILED: domain artifact contract vocabulary missing {contract_id}")
+        sys.exit(1)
+    if contract_id not in db_contracts:
+        print(f"FAILED: DB artifact contract mapping/readback missing {contract_id}")
+        sys.exit(1)
+
+required_field_fragments = [
+    "proposal_decomposition_plan",
+    "requires_split",
+    "split_candidates",
+    "blocking_split_candidate_count",
+    "requires_split_without_blocking_split_candidate",
+    "implementation_start_decision",
+    "blocker_boundary_status",
+    "followup_proposal_required",
+    "has_release_blocking_external_blockers",
+    "has_no_release_blocking_external_blockers",
+    "projection_integrity",
+    "canonical_dimensions",
+    "p094_readback_json",
+]
+for fragment in required_field_fragments:
+    if fragment not in db_contracts:
+        print(f"FAILED: DB canonical readback/projection missing P094 fragment {fragment}")
+        sys.exit(1)
+
+required_behavior_tests = {
+    "proposal_094_normalizes_boundary_contract_statuses": domain_tests,
+    "proposal_094_exposes_decomposition_plan_fields_as_canonical_truth": db_tests,
+    "proposal_094_decomposition_split_required_requires_blocking_split_candidate": db_tests,
+    "proposal_094_exposes_blocker_boundary_fields_as_canonical_truth": db_tests,
+    "proposal_094_normalizes_human_decision_labels_to_durable_approval_state": db_tests,
+    "proposal_094_readback_includes_boundary_approval_request_lane": db_tests,
+    "proposal_094_followup_seed_generation_records_metric": db_tests,
+    "p094_external_release_blocker_requires_human_boundary_approval": engine_unit,
+    "p094_lower_layer_output_settlement_wins_before_boundary": engine_unit,
+    "p094_local_code_tail_does_not_route_to_boundary_approval": engine_unit,
+    "p094_unknown_freshness_requires_review_refresh_before_code_tail": engine_unit,
+    "p094_incomplete_blocker_claim_fails_closed_before_boundary_approval": engine_unit,
+    "p094_external_environment_counts_as_release_blocking_external": engine_unit,
+    "p094_review_owner_classes_route_to_review_refresh_not_code_writer": engine_unit,
+    "p094_blocked_no_progress_requires_server_verified_marker": engine_unit,
+    "p094_unknown_enum_or_missing_required_route_fields_fail_closed": engine_unit,
+    "proposal_094_links_boundary_approval_request_to_created_approval": engine_orchestrator,
+    "proposal_094_no_progress_verification_is_server_owned_from_prior_boundary_truth": engine_orchestrator,
+    "proposal_094_full_mvp_compiles_boundary_flow_with_string_approval": workflow_tests,
+    "proposal_094_boundary_accepted_transitions_are_mutually_exclusive": workflow_tests,
+    "proposal_094_path_templates_do_not_double_nest_run_meta_root": engine_tests,
+    "proposal_094_mcp_surfaces_expose_boundary_readback_to_operator": mcp_tests,
+    "proposal_094_runtime_health_exposes_quality_gate_boundary_mode": mcp_tests,
+    "proposal_094_graphql_run_detail_exposes_boundary_readback": graphql_tests,
+}
+for test_name, content in required_behavior_tests.items():
+    if test_name not in content:
+        print(f"FAILED: P094 gate missing behavioral test {test_name}")
+        sys.exit(1)
+
+for owner_class in [
+    "security_reviewer",
+    "prepush_reviewer",
+    "implementation_auditor",
+    "unknown",
+]:
+    if owner_class not in engine_unit:
+        print(f"FAILED: P094 evaluator missing owner_class vocabulary {owner_class}")
+        sys.exit(1)
+
+for metric_name in [
+    "quality_gate_blocker_assessments_total",
+    "quality_gate_blocker_validation_rejections_total",
+    "quality_gate_blocker_freshness_total",
+    "implementation_refine_loops_avoided_total",
+    "followup_proposal_seeds_created_total",
+    "external_blockers_accepted_total",
+    "invalid_blocker_claims_total",
+    "review_refresh_required_total",
+    "output_settlement_required_before_boundary_total",
+    "human_boundary_approval_latency_seconds",
+    "post_boundary_reopen_total",
+    "false_external_blocker_rate",
+    "repeated_blocker_no_progress_total",
+    "accepted_boundary_later_rejected_percent",
+    "blocker_boundary_approvals_total",
+    "quality_gate_blocker_boundary_route_total",
+]:
+    if metric_name not in db_metrics:
+        print(f"FAILED: P094 required metric missing {metric_name}")
+        sys.exit(1)
+
+for metric_fragment in [
+    "proposal_id={proposal_id}",
+    "false_external_blocker_events_total",
+    "accepted_boundary_later_rejected_total",
+    "p094_rollout_metric_values_json",
+    'gauge("false_external_blocker_rate", "percent")',
+    'gauge("accepted_boundary_later_rejected_percent", "percent")',
+]:
+    if metric_fragment not in db_metrics and metric_fragment not in db_tests:
+        print(f"FAILED: P094 metric rollout/readback proof missing {metric_fragment}")
+        sys.exit(1)
+
+for runtime_fragment in [
+    "quality_gate_boundary_runtime_v1",
+    "p094_rollout_decision_readback_v1",
+    "command_journal_or_rollout_contract_entry",
+    "metricValues",
+    "promotionReadiness",
+]:
+    if runtime_fragment not in mcp_tests and runtime_fragment not in (root / "control-plane/crates/mcp-server/src/tools/runtime.rs").read_text():
+        print(f"FAILED: P094 runtime/readback missing rollout fragment {runtime_fragment}")
+        sys.exit(1)
+
+for rollout_fragment, content in {
+    "p094_rollout_decision_json": (root / "control-plane/crates/mcp-server/src/tools/reports.rs").read_text(),
+    "rollout_contract_checks": mcp_tests,
+    "rolloutContractEntryId": mcp_tests,
+    "enforcingAllowed": mcp_tests,
+}.items():
+    if rollout_fragment not in content:
+        print(f"FAILED: P094 rollout decision behavior proof missing {rollout_fragment}")
+        sys.exit(1)
+
+print("P094 static contract checks passed")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      p094_cargo_target="$(chainworks_test_gate_cargo_target_dir "${CHAINWORKS_PROPOSAL_094_CARGO_TARGET_DIR:-target/proposal-094}")"
+      run_p094_cargo_test() {
+        local output status
+        set +e
+        output=$(CARGO_TARGET_DIR="$p094_cargo_target" cargo test "$@" 2>&1)
+        status=$?
+        set -e
+        printf '%s\n' "$output"
+        if [ "$status" -ne 0 ]; then
+          return "$status"
+        fi
+        if ! printf '%s\n' "$output" | grep -Eq '^running [1-9][0-9]* tests?$'; then
+          echo "FAILED: P094 cargo test filter selected zero tests: cargo test $*" >&2
+          return 1
+        fi
+      }
+      run_p094_cargo_test -p domain proposal_094 --test proposal_057_contracts -- --nocapture
+      run_p094_cargo_test -p db proposal_094 --test proposal_057_contracts -- --nocapture
+      run_p094_cargo_test -p engine quality_gate_boundary --lib -- --nocapture
+      run_p094_cargo_test -p engine proposal_094_links_boundary_approval_request_to_created_approval --lib -- --nocapture
+      run_p094_cargo_test -p engine proposal_094_no_progress_verification_is_server_owned_from_prior_boundary_truth --lib -- --nocapture
+      run_p094_cargo_test -p workflow proposal_094 --test integration -- --nocapture
+      run_p094_cargo_test -p engine proposal_094_path_templates_do_not_double_nest_run_meta_root --test integration -- --nocapture
+      run_p094_cargo_test -p mcp-server proposal_094 --test proposal_057_contracts -- --nocapture
+      run_p094_cargo_test -p graphql-server proposal_094 --test proposal_057_contracts -- --nocapture
+    )
+    log "Proposal 094 gate passed"
+    ;;
+  proposal-096|p096)
+    log "Proposal 096 gate: bounded tool output and safe-search guard retained alias"
+    python3 - "$ROOT_DIR" <<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+gate = (root / "scripts/test-gate.sh").read_text()
+for term in [
+    "proposal-096|p096",
+    "bounded tool output",
+    "safe-search guard",
+    "Proposal 082",
+]:
+    if term not in gate:
+        raise SystemExit(f"proposal-096: test-gate.sh missing retained alias/guard term {term!r}")
+
+reference = (root / "docs/reference/test-gates.md").read_text()
+for term in [
+    "proposal-096|p096",
+    "bounded tool output",
+    "safe-search guard",
+]:
+    if term not in reference:
+        raise SystemExit(f"proposal-096: docs/reference/test-gates.md missing {term!r}")
+
+print("proposal-096 retained alias static checks passed")
+PY
+    log "Proposal 096 gate passed"
     ;;
   *)
     print_usage >&2

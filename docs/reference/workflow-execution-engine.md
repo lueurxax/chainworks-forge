@@ -31,6 +31,7 @@ Related stable docs:
 - [skill-resolution-and-runtime-integration.md](skill-resolution-and-runtime-integration.md)
 - [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md)
 - [acp-runtime-transport.md](acp-runtime-transport.md)
+- [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md)
 
 ---
 
@@ -391,6 +392,54 @@ If the closeout decision is `return_to_code_refine`, the run moves to
 `state_10_implementation_refined`, provided the refine budget is not exhausted.
 If the budget is exhausted or a non-code decision is required, the run routes to
 `await_operator_decision` or `await_non_code_handoff`.
+
+#### Quality-gate blocker boundary transitions
+
+The full-MVP workflow contains a workflow-owned quality-gate blocker boundary
+between implementation review and release. After `quality_gate_blocker_assessment`
+exists, the orchestrator enters an in-process system task:
+`task_type: quality_gate_boundary_evaluator` with
+`executor_mode: system.quality_gate_boundary`. This task evaluates canonical
+artifact-contract truth and writes `blocker_boundary_status_v1`; it does not call
+a provider.
+
+The compiled graph owns every route from that status:
+
+| `blocker_boundary_status.status` | Workflow route |
+|---|---|
+| `output_settlement_required` | output-settlement recovery |
+| `side_effect_reconciliation_required` | side-effect reconciliation |
+| `runtime_recovery_required` | runtime recovery |
+| `review_refresh_required` | implementation review refresh |
+| `local_code_tail_present` | implementation refinement |
+| `invalid_claim` | implementation review refresh |
+| `blocked_no_progress` | manual boundary approval |
+| `awaiting_human_boundary_approval` | manual boundary approval |
+| `pass` | manual release |
+
+Lower-layer recovery wins before boundary approval. The evaluator routes
+unsettled outputs, unresolved side effects, and runtime recovery to their
+dedicated states before a human can accept a blocker boundary. Stale, unknown,
+or proposal-owned review evidence routes to review refresh. Fresh
+code-writer-owned work routes back to implementation refinement. Unknown enum
+values, missing required fields, or locally solvable blocker claims fail closed
+as invalid claims.
+
+The no-progress route is server-owned. A blocker may reach
+`blocked_no_progress` only when the engine can match it to prior boundary truth
+and a verified repeated no-progress signature; an agent-authored flag alone is
+not enough.
+
+The manual boundary gate preserves the normal approval model:
+`approval.granted == true` enters the boundary-accepted state and
+`approval.rejected == true` returns to implementation review refresh. The human
+decision records accept/reject of the server-evaluated boundary only. It cannot
+choose the next route.
+
+After an accepted boundary, the workflow still owns the tail:
+`followup_proposal_required` creates a follow-up proposal seed,
+release-blocking external evidence enters an external evidence hold, and the
+absence of release-blocking external blockers enters manual release.
 
 ---
 

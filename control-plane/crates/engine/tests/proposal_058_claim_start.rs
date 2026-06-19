@@ -2846,6 +2846,286 @@ async fn p058_high_001_claim_uses_payload_backend_profile_for_escalation() {
     );
 }
 
+#[tokio::test]
+async fn p058_claim_uses_quota_free_escalation_backend_before_provider_quota_wait() {
+    let pool = setup_memory_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let quota_stage_execution_id = StageExecutionId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    let workflow_json = r#"{
+        "initial_state": "impl_state",
+        "workflow": {"id": "test_workflow_p058_quota_escalation"},
+        "states": {
+            "impl_state": {
+                "label": "Impl",
+                "owner": "code_writer",
+                "type": "end"
+            }
+        }
+    }"#;
+
+    let catalog_json = r#"{
+        "backend_profiles": {
+            "claude_builder_high": {
+                "provider": "claude_acp",
+                "model": "sonnet",
+                "effort": "high",
+                "max_turns": 24
+            },
+            "codex_builder_high": {
+                "provider": "codex_acp",
+                "model": "gpt-5.5",
+                "effort": "high",
+                "max_turns": 24
+            },
+            "lead_profile": {"provider": "claude"}
+        },
+        "permission_profiles": {
+            "lead_perm": {}
+        },
+        "contracts": {
+            "lead_contract": {"format": "json"}
+        },
+        "agents": [
+            {"id": "code_writer", "backend_profile": "claude_builder_high"},
+            {
+                "id": "lead_agent",
+                "system_role": "lead",
+                "backend_profile": "lead_profile",
+                "permission_profile": "lead_perm",
+                "lead_resolution_contract": "lead_contract"
+            }
+        ],
+        "escalation_policies": [
+            {
+                "policy_id": "code_writer_quota_escalation",
+                "schema_version": "escalation_policy_v1",
+                "enabled_default": true,
+                "applies_to": {"backend_profile_id": "claude_builder_high"},
+                "max_chain_attempts": 3,
+                "max_chain_wall_clock_seconds": 1800,
+                "triggers": ["provider_quota_exhausted"],
+                "tiers": [
+                    {
+                        "tier_id": "claude_builder_same_backend",
+                        "kind": "backend_profile",
+                        "backend_profile_id": "claude_builder_high",
+                        "max_attempts": 1
+                    },
+                    {
+                        "tier_id": "codex_builder_fallback",
+                        "kind": "backend_profile",
+                        "backend_profile_id": "codex_builder_high",
+                        "max_attempts": 1
+                    },
+                    {"tier_id": "human_pause", "kind": "pause"}
+                ]
+            }
+        ]
+    }"#;
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P058 quota fallback".into(),
+            body: "quota-aware escalation before provider wait".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut run = make_run(run_id, idea_id);
+    run.workflow_snapshot_json = Some(workflow_json.into());
+    run.catalog_snapshot_json = Some(catalog_json.into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: quota_stage_execution_id,
+            run_id,
+            stage_id: "impl_state".into(),
+            label: "Impl quota source".into(),
+            status: StageStatus::Failed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: stage_execution_id,
+            run_id,
+            stage_id: "impl_state".into(),
+            label: "Impl".into(),
+            status: StageStatus::Running,
+            iteration: 2,
+            attempt_number: 2,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let quota_agent_execution_id = AgentExecutionId::new();
+    agent_executions::insert(
+        &pool,
+        &AgentExecution {
+            id: quota_agent_execution_id,
+            stage_execution_id: Some(quota_stage_execution_id),
+            agent_id: "code_writer".into(),
+            provider: "claude_acp".into(),
+            model: Some("sonnet".into()),
+            status: AgentStatus::Failed,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            owner_execution_lineage_id: Some(quota_stage_execution_id.to_string()),
+            session_lineage_id: None,
+            session_generation_id: None,
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: None,
+            session_reuse_scope: None,
+            session_family_id: None,
+            session_reuse_disposition: None,
+            session_reset_reason: None,
+            backend_profile_id: Some("claude_builder_high".into()),
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
+            mcp_session_startup_latency_ms: None,
+            owner_kind: None,
+            owner_id: None,
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    agent_retry_budget_ledger::upsert_quota_failure(
+        &pool,
+        run_id,
+        quota_stage_execution_id,
+        quota_agent_execution_id,
+        Some(Utc::now() + Duration::hours(1)),
+    )
+    .await
+    .unwrap();
+
+    let now = Utc::now();
+    work_items::enqueue(
+        &pool,
+        &WorkItem {
+            id: "quota-fallback-invoke-work-item".into(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "stage_id": "impl_state",
+                "stage_execution_id": stage_execution_id.to_string(),
+                "agent_id": "code_writer",
+                "provider": "claude_acp",
+                "backend_profile_id": "claude_builder_high",
+                "model": "sonnet",
+                "prompt": "implement",
+                "task_name": "impl",
+                "task_inputs": [],
+                "task_outputs": [],
+                "declared_outputs": [],
+                "requested_mcp_server_ids": [],
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "code_writer",
+                "worktree_write_enabled": false
+            })
+            .to_string(),
+            status: WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("impl_state".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
+        .await
+        .unwrap()
+        .expect("quota-aware escalation should choose a free fallback backend before waiting");
+
+    let execution = agent_executions::find_by_id(&pool, claimed.agent_execution_id)
+        .await
+        .unwrap()
+        .expect("claimed execution exists");
+    assert_eq!(execution.provider, "codex");
+    assert_eq!(execution.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(
+        execution.backend_profile_id.as_deref(),
+        Some("codex_builder_high")
+    );
+    assert_eq!(
+        execution.escalation_policy_id.as_deref(),
+        Some("code_writer_quota_escalation")
+    );
+    assert_eq!(
+        execution.escalation_tier_id.as_deref(),
+        Some("codex_builder_fallback")
+    );
+    assert_eq!(
+        execution.escalation_trigger_raw.as_deref(),
+        Some("provider_quota_exhausted")
+    );
+}
+
 /// P058 Phase 1: claim path writes escalation_execution_metadata row when a policy applies.
 /// Verifies the runtime metadata writer added in the refine pass: prior to this fix,
 /// insert_execution_metadata_tx was only called from db-layer tests, never from the executor.

@@ -58,8 +58,9 @@ final class NotificationService {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in
-                self?.cancelP058EscalationAttention()
+            guard let service = self else { return }
+            Task { @MainActor [service] in
+                service.cancelP058EscalationAttention()
             }
         }
     }
@@ -78,61 +79,6 @@ final class NotificationService {
         } catch {
             ForgeLogger.notification.error("Authorization request failed: \(error.localizedDescription)")
         }
-    }
-
-    // MARK: - Notification Events (§10)
-
-    func notifyApprovalRequired(run: Run, stageLabel: String) {
-        guard preferences.approvalRequired else { return }
-        let content = UNMutableNotificationContent()
-        content.title = "Approval Required"
-        content.body = "\(run.idea?.title ?? "Run") — \(stageLabel)"
-        content.sound = .default
-        content.categoryIdentifier = "APPROVAL_REQUIRED"
-        scheduleNotification(id: "approval_\(run.id.uuidString)", content: content)
-        incrementAttention()
-    }
-
-    func notifyRunBlocked(run: Run, reason: String) {
-        guard preferences.runBlocked else { return }
-        let content = UNMutableNotificationContent()
-        content.title = "Run Blocked"
-        content.body = "\(run.idea?.title ?? "Run") — \(reason)"
-        content.sound = .default
-        content.categoryIdentifier = "RUN_BLOCKED"
-        scheduleNotification(id: "blocked_\(run.id.uuidString)", content: content)
-        incrementAttention()
-    }
-
-    func notifyRunFailed(run: Run) {
-        guard preferences.runFailed else { return }
-        let content = UNMutableNotificationContent()
-        content.title = "Run Failed"
-        content.body = "\(run.idea?.title ?? "Run") — \(run.workflowTitle)"
-        content.sound = .default
-        content.categoryIdentifier = "RUN_FAILED"
-        scheduleNotification(id: "failed_\(run.id.uuidString)", content: content)
-        incrementAttention()
-    }
-
-    func notifyRunCompleted(run: Run) {
-        guard preferences.runCompleted else { return }
-        let content = UNMutableNotificationContent()
-        content.title = "Run Completed"
-        content.body = "\(run.idea?.title ?? "Run") — \(run.workflowTitle)"
-        content.sound = .default
-        content.categoryIdentifier = "RUN_COMPLETED"
-        scheduleNotification(id: "completed_\(run.id.uuidString)", content: content)
-    }
-
-    /// Proposal 011 — REQ-002: Notify when a run has been fully cancelled after settlement.
-    func notifyRunCancelled(run: Run) {
-        let content = UNMutableNotificationContent()
-        content.title = "Run Cancelled"
-        content.body = "\(run.idea?.title ?? "Run") — \(run.workflowTitle)"
-        content.sound = .default
-        content.categoryIdentifier = "RUN_CANCELLED"
-        scheduleNotification(id: "cancelled_\(run.id.uuidString)", content: content)
     }
 
     // MARK: - Dock Badge (§10)
