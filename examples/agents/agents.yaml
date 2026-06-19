@@ -55,6 +55,12 @@ artifacts:
   security_report: ${CHAINWORKS_META_ROOT:-.chainworks}/security/report.json
   prepush_review_report: ${CHAINWORKS_META_ROOT:-.chainworks}/review/prepush.json
   implementation_review_summary: ${CHAINWORKS_META_ROOT:-.chainworks}/review/implementation-summary.json
+  proposal_decomposition_plan: ${CHAINWORKS_META_ROOT:-.chainworks}/proposal/decomposition-plan.json
+  quality_gate_blocker_assessment: ${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/blocker-assessment.json
+  blocker_boundary_status: ${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/blocker-boundary-status.json
+  blocker_boundary_approval_request: ${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/blocker-boundary-approval-request.json
+  blocker_boundary_human_decision: ${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/blocker-boundary-human-decision.json
+  followup_proposal_seed: ${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/followup-proposal-seed.json
   docs_report: ${CHAINWORKS_META_ROOT:-.chainworks}/docs/report.json
   docs_delta: ${CHAINWORKS_META_ROOT:-.chainworks}/docs/changed-files.json
   run_state: ${CHAINWORKS_META_ROOT:-.chainworks}/state/run-state.json
@@ -343,6 +349,59 @@ contracts:
       - open_blockers
       - must_fix
       - recommended_next_step
+  proposal_decomposition_plan_v1:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - schema_version
+      - requires_split
+      - implementation_start_decision
+  quality_gate_blocker_assessment_v1:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - schema_version
+      - blockers
+  blocker_boundary_status_v1:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - schema_version
+      - status
+      - assessment_generation_id
+      - projection_integrity
+      - followup_proposal_required
+      - has_release_blocking_external_blockers
+      - has_no_release_blocking_external_blockers
+      - workflow_route_hint
+  blocker_boundary_approval_request_v1:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - schema_version
+      - question
+      - allowed_decisions
+      - label_to_approval_state
+  blocker_boundary_human_decision_v1:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - schema_version
+      - decision_label
+  followup_proposal_seed_v1:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - schema_version
+      - title
+      - problem
+      - proposed_scope
   docs_report_v1:
     format: json
     required_fields:
@@ -1507,6 +1566,12 @@ agents:
       - review_corpus_bundle_v2
       - approved_proposal
       - implementation_review_summary
+      - audit_report
+      - security_report
+      - prepush_review_report
+      - docs_report
+      - implementation_self_assessment
+      - blocker_boundary_status
       - run_state
     outputs:
       - proposal_review_summary
@@ -1519,6 +1584,10 @@ agents:
       - implementation_plan
       - implementation_backlog
       - implementation_review_summary
+      - proposal_decomposition_plan
+      - quality_gate_blocker_assessment
+      - blocker_boundary_approval_request
+      - followup_proposal_seed
       - run_state
       - orchestrator_summary
       - approval_request

@@ -16630,6 +16630,37 @@ fn test_resolve_path_template_does_not_consult_process_env_for_runs() {
     );
 }
 
+#[test]
+fn proposal_094_path_templates_do_not_double_nest_run_meta_root() {
+    let run_id = "run-p094";
+    let meta_root = format!(".chainworks/runs/{run_id}");
+    let templates = [
+        "${CHAINWORKS_META_ROOT:-.chainworks}/proposal/decomposition-plan.json",
+        "${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/blocker-assessment.json",
+        "${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/blocker-boundary-status.json",
+        "${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/blocker-boundary-approval-request.json",
+        "${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/blocker-boundary-human-decision.json",
+        "${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/followup-proposal-seed.json",
+    ];
+
+    for template in templates {
+        let resolved =
+            engine::orchestrator::resolve_path_template(template, "/project", Some(&meta_root));
+        assert!(
+            !resolved.contains(&format!(".chainworks/runs/{run_id}/runs/{run_id}")),
+            "P094 template double-nested run id: {resolved}"
+        );
+        assert!(
+            !resolved.contains("${run_id}"),
+            "P094 template left an unresolved run placeholder: {resolved}"
+        );
+        assert!(
+            resolved.starts_with(&format!("/project/.chainworks/runs/{run_id}/")),
+            "P094 template must resolve under the per-run meta root: {resolved}"
+        );
+    }
+}
+
 /// New run created via command_handler gets per-run chainworks_meta_root.
 /// Verified by P044 test pattern (uses make_command_handler + ApproveStage).
 /// Here we check directly via make_run and DB round-trip.

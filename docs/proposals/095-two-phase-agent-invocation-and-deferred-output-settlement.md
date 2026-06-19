@@ -5,8 +5,8 @@
 | Date | 2026-05-28 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | P079 contract-aware output repair and provider fallback, P086 agent work continuation and provider-session resumption, P088 code-writer completion contract and output freshness, P094 workflow-owned quality-gate blocker boundaries, implemented storage/evidence-spooling baseline |
-| Related | `docs/reference/acp-runtime-transport.md`, `docs/reference/rust-control-plane.md`, `docs/reference/output-contracts-failure-evidence-and-recovery.md`, `docs/reference/agent-work-continuation.md` |
+| Depends on | P079 contract-aware output repair and provider fallback, P086 agent work continuation and provider-session resumption, P088 code-writer completion contract and output freshness, implemented workflow-owned quality-gate boundary contract in [`workflow-execution-engine.md`](../reference/workflow-execution-engine.md#quality-gate-blocker-boundary-transitions) and [`output-contracts-failure-evidence-and-recovery.md`](../reference/output-contracts-failure-evidence-and-recovery.md#workflow-owned-quality-gate-boundary-contracts), implemented storage/evidence-spooling baseline |
+| Related | `docs/reference/acp-runtime-transport.md`, `docs/reference/rust-control-plane.md`, `docs/reference/workflow-execution-engine.md`, `docs/reference/output-contracts-failure-evidence-and-recovery.md`, `docs/reference/agent-work-continuation.md` |
 | Scope | Define the normal `code_writer` invocation lifecycle as a short work turn, server-owned deterministic readback, separate output collection turn, and strict settlement. |
 | Non-goal | No Rust/Swift implementation in this proposal, no loosening of output contracts, no new SwiftUI mutations, and no change to release/publish/git-push/upload side-effect safety. |
 
@@ -337,7 +337,7 @@ test results, and tool traces prove work happened; they do not prove output
 settled. Fresh output must come from the P095 output collection turn or a valid
 P079/P088 repair path. Stale artifacts from previous attempts remain invalid.
 
-### P094 Workflow-Owned Quality-Gate Blocker Boundaries
+### Workflow-Owned Quality-Gate Boundary Contract
 
 Missing output after a work turn should route through P095 output collection and
 P079 repair before blocker-boundary classification. Boundary assessment must
@@ -348,7 +348,10 @@ distinguish:
 - output collected but the gate still blocked.
 
 Workflow transitions remain workflow-owned, and human approval remains
-accept/reject only.
+accept/reject only. The stable behavior is owned by
+[`workflow-execution-engine.md`](../reference/workflow-execution-engine.md#quality-gate-blocker-boundary-transitions)
+and
+[`output-contracts-failure-evidence-and-recovery.md`](../reference/output-contracts-failure-evidence-and-recovery.md#workflow-owned-quality-gate-boundary-contracts).
 
 ## 11. Acceptance Criteria
 
@@ -376,7 +379,7 @@ P095 is implementation-ready only when a later implementation pass can prove:
 - Do not implement code changes in this proposal.
 - Do not change release side-effect safety.
 - Do not weaken output contracts.
-- Do not replace P079, P086, P088, or P094.
+- Do not replace P079, P086, P088, or the implemented workflow-owned quality-gate boundary contract.
 - Do not add SwiftUI mutations.
 - Do not require this mode for all agents.
 - Do not create a generic prompt-rule engine.

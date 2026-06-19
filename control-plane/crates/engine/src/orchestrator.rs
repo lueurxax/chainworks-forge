@@ -92,6 +92,93 @@ fn p058_force_primary_from_env() -> bool {
         .unwrap_or(false)
 }
 
+fn p094_assessment_blocker_items(assessment: &serde_json::Value) -> Vec<&serde_json::Value> {
+    [
+        "blockers",
+        "candidate_blockers",
+        "external_blockers",
+        "followup_code_tail",
+        "local_code_tail",
+    ]
+    .into_iter()
+    .filter_map(|field| assessment.get(field).and_then(|value| value.as_array()))
+    .flat_map(|items| items.iter())
+    .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct P094NoProgressProof {
+    signature: String,
+    no_progress_repeat_count: u64,
+    budget_source: String,
+    budget_remaining: u64,
+    last_progress_fingerprint: String,
+}
+
+fn p094_apply_server_no_progress_proofs(
+    assessment: &mut serde_json::Value,
+    proofs: &[P094NoProgressProof],
+) {
+    let proof_by_signature = proofs
+        .iter()
+        .map(|proof| (proof.signature.as_str(), proof))
+        .collect::<std::collections::HashMap<_, _>>();
+    for field_name in [
+        "blockers",
+        "candidate_blockers",
+        "external_blockers",
+        "followup_code_tail",
+        "local_code_tail",
+    ] {
+        let Some(items) = assessment
+            .get_mut(field_name)
+            .and_then(|value| value.as_array_mut())
+        else {
+            continue;
+        };
+        for item in items {
+            let Some(object) = item.as_object_mut() else {
+                continue;
+            };
+            let signature = object
+                .get("blocker_signature_id")
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned);
+            if let Some(proof) = signature
+                .as_deref()
+                .and_then(|signature| proof_by_signature.get(signature))
+            {
+                object.insert(
+                    "server_verified_no_progress".to_string(),
+                    serde_json::json!(true),
+                );
+                object.insert(
+                    "no_progress_repeat_count".to_string(),
+                    serde_json::json!(proof.no_progress_repeat_count),
+                );
+                object.insert(
+                    "budget_source".to_string(),
+                    serde_json::json!(proof.budget_source),
+                );
+                object.insert(
+                    "budget_remaining".to_string(),
+                    serde_json::json!(proof.budget_remaining),
+                );
+                object.insert(
+                    "last_progress_fingerprint".to_string(),
+                    serde_json::json!(proof.last_progress_fingerprint),
+                );
+            } else {
+                object.remove("server_verified_no_progress");
+                object.remove("no_progress_repeat_count");
+                object.remove("budget_source");
+                object.remove("budget_remaining");
+                object.remove("last_progress_fingerprint");
+            }
+        }
+    }
+}
+
 impl Orchestrator {
     pub fn new(pool: SqlitePool, events: EventSender, work_queue: WorkQueue) -> Self {
         let db_writer = Arc::new(DbWriter::new(pool.clone()));
@@ -672,7 +759,9 @@ impl Orchestrator {
                                     if let Some(ref s) = updated_stage {
                                         if matches!(
                                             s.status,
-                                            StageStatus::Failed | StageStatus::Blocked
+                                            StageStatus::Failed
+                                                | StageStatus::Blocked
+                                                | StageStatus::Completed
                                         ) {
                                             return Ok(());
                                         }
@@ -1132,6 +1221,8 @@ impl Orchestrator {
                                 expires_at: None,
                             };
                             approvals::insert(&self.pool, &approval).await?;
+                            self.link_p094_boundary_approval_request(&approval, stage.id)
+                                .await?;
 
                             let _ = self.events.send(DomainEvent::StageStatusChanged {
                                 run_id,
@@ -1224,6 +1315,8 @@ impl Orchestrator {
                 expires_at: None,
             };
             approvals::insert(&self.pool, &approval).await?;
+            self.link_p094_boundary_approval_request(&approval, stage.id)
+                .await?;
 
             let _ = self.events.send(DomainEvent::StageStatusChanged {
                 run_id,
@@ -1533,7 +1626,10 @@ impl Orchestrator {
                 .into_iter()
                 .find(|s| s.id == stage.id);
             if let Some(ref s) = updated_stage {
-                if matches!(s.status, StageStatus::Failed | StageStatus::Blocked) {
+                if matches!(
+                    s.status,
+                    StageStatus::Failed | StageStatus::Blocked | StageStatus::Completed
+                ) {
                     return Ok(());
                 }
             }
@@ -3831,6 +3927,23 @@ impl Orchestrator {
         stage: &StageExecution,
         plan: &workflow::plan::RunPlan,
     ) -> Result<bool> {
+        if let Some(system_task) = plan
+            .states
+            .get(&stage.stage_id)
+            .and_then(|state| state.system_task.as_ref())
+        {
+            if system_task.task_type == "quality_gate_boundary_evaluator" {
+                if system_task.executor_mode != "system.quality_gate_boundary" {
+                    anyhow::bail!(
+                        "P094 quality_gate_boundary_evaluator requires executor_mode=system.quality_gate_boundary"
+                    );
+                }
+                self.execute_quality_gate_boundary_evaluator(run_id, run, stage, plan)
+                    .await?;
+                return Ok(true);
+            }
+        }
+
         // Check if dynamic routing is requested.
         let routing_options: domain::routing::ReviewRoutingOptions = match &run.review_routing_json
         {
@@ -4176,6 +4289,551 @@ impl Orchestrator {
                 Ok(true)
             }
         }
+    }
+
+    async fn execute_quality_gate_boundary_evaluator(
+        &self,
+        run_id: RunId,
+        run: &domain::run::Run,
+        stage: &StageExecution,
+        plan: &workflow::plan::RunPlan,
+    ) -> Result<()> {
+        let active_assessment = artifact_contracts::find_active_generation_by_contract_id(
+            &self.pool,
+            run_id,
+            "quality_gate_blocker_assessment_v1",
+        )
+        .await?;
+        let (assessment_generation_id, assessment_json) = match active_assessment {
+            Some(row) => {
+                let bytes = std::fs::read(&row.raw_path).with_context(|| {
+                    format!(
+                        "read active quality_gate_blocker_assessment_v1 raw artifact {}",
+                        row.raw_path
+                    )
+                })?;
+                (
+                    row.generation_id,
+                    serde_json::from_slice::<serde_json::Value>(&bytes).with_context(|| {
+                        format!(
+                            "parse active quality_gate_blocker_assessment_v1 raw artifact {}",
+                            row.raw_path
+                        )
+                    })?,
+                )
+            }
+            None => (
+                "missing-active-quality-gate-blocker-assessment".to_string(),
+                serde_json::json!({
+                    "schema_version": "quality_gate_blocker_assessment_v1",
+                    "blockers": [{
+                        "id": "missing-active-assessment",
+                        "summary": "quality_gate_blocker_assessment_v1 is missing canonical DB truth",
+                        "blocker_signature_id": "missing-active-quality-gate-blocker-assessment",
+                        "evidence_fingerprint": "missing-active-quality-gate-blocker-assessment",
+                        "source_artifact_generation_id": "missing-active-quality-gate-blocker-assessment",
+                        "observed_after_stage_execution_id": stage.id.to_string(),
+                        "observed_after_agent_execution_id": "system.quality_gate_boundary",
+                        "owner_class": "output_settlement",
+                        "blocker_class": "missing_required_outputs",
+                        "evidence_freshness": "unknown",
+                        "severity": "hard",
+                        "release_blocking": true,
+                        "allowed_workflow_routes": ["output_settlement_recovery"],
+                        "forbidden_routes": ["human_boundary_approval"],
+                        "gate_command": "quality_gate_blocker_boundary",
+                        "evidence_refs": ["active_artifact_contracts.quality_gate_blocker_assessment_v1"]
+                    }]
+                }),
+            ),
+        };
+        let server_no_progress_proofs = self
+            .p094_server_no_progress_proofs(run_id, plan, &assessment_json)
+            .await?;
+        let mut server_assessment_json = assessment_json;
+        p094_apply_server_no_progress_proofs(
+            &mut server_assessment_json,
+            &server_no_progress_proofs,
+        );
+        let server_verified_no_progress_signatures = server_no_progress_proofs
+            .iter()
+            .map(|proof| proof.signature.clone())
+            .collect::<Vec<_>>();
+
+        let evaluation =
+            crate::quality_gate_boundary::evaluate_quality_gate_boundary_assessment_with_context(
+                crate::quality_gate_boundary::BoundaryEvaluationContext {
+                    run_id: run_id.to_string(),
+                    stage_execution_id: stage.id.to_string(),
+                    assessment_generation_id,
+                    updated_at: Utc::now().to_rfc3339(),
+                    server_verified_no_progress_signatures,
+                },
+                &server_assessment_json,
+            )?;
+        db::metrics::record_p094_blocker_assessment(
+            &evaluation.status,
+            &evaluation.primary_owner_class,
+        );
+        db::metrics::record_p094_blocker_freshness(
+            evaluation
+                .payload
+                .get("blockers")
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.first())
+                .and_then(|item| {
+                    item.get("evidence_freshness")
+                        .or_else(|| item.get("freshness"))
+                })
+                .and_then(|value| value.as_str())
+                .unwrap_or("none"),
+            &evaluation.primary_owner_class,
+        );
+        db::metrics::record_p094_boundary_route(
+            &evaluation.status,
+            &evaluation.workflow_route_hint,
+        );
+        if matches!(
+            evaluation.status.as_str(),
+            "blocked_no_progress" | "awaiting_human_boundary_approval" | "pass"
+        ) {
+            db::metrics::record_p094_implementation_refine_loop_avoided("P094");
+        }
+        if evaluation.status == "invalid_claim" {
+            db::metrics::record_p094_blocker_validation_rejection("invalid_claim");
+            db::metrics::record_p094_invalid_blocker_claim(&evaluation.primary_owner_class);
+        } else if evaluation.status == "review_refresh_required" {
+            db::metrics::record_p094_review_refresh_required("quality_gate_blocker_assessment");
+        } else if evaluation.status == "output_settlement_required" {
+            db::metrics::record_p094_output_settlement_required_before_boundary(
+                "quality_gate_blocker_assessment",
+            );
+        } else if evaluation.status == "blocked_no_progress" {
+            let signature = evaluation
+                .payload
+                .get("blockers")
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("blocker_signature_id"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            db::metrics::record_p094_repeated_blocker_no_progress(signature);
+        }
+
+        let target_path = plan
+            .artifact_paths
+            .get("blocker_boundary_status")
+            .map(|template| {
+                resolve_path_template(
+                    template,
+                    &run.workspace_root,
+                    run.chainworks_meta_root.as_deref(),
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "{}/quality-gate/blocker-boundary-status.json",
+                    run.artifact_root.trim_end_matches('/')
+                )
+            });
+        if let Some(parent) = std::path::Path::new(&target_path).parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "create blocker boundary status directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let bytes = serde_json::to_vec_pretty(&evaluation.payload)
+            .context("serialize blocker_boundary_status_v1")?;
+        std::fs::write(&target_path, &bytes)
+            .with_context(|| format!("write blocker boundary status {target_path}"))?;
+
+        let artifact_id = ArtifactId::new();
+        let generation_id = format!("{}-p094-boundary-status", stage.id);
+        artifact_contracts::upsert_verified_generation_and_rebuild(
+            &self.pool,
+            domain::artifact_contracts::ActiveArtifactGenerationInput {
+                run_id,
+                artifact_id,
+                contract_id: "blocker_boundary_status_v1".into(),
+                canonical_path: target_path.clone(),
+                raw_path: target_path.clone(),
+                raw_status: evaluation.status.clone(),
+                generation_id: generation_id.clone(),
+                source_agent_execution_id: None,
+                source_stage_execution_id: Some(stage.id.to_string()),
+                source_session_generation_id: None,
+                source_work_item_id: None,
+                supersedes_generation_id: None,
+                output_settlement: AgentOutputSettlement::ValidOutputsFromCompletedExecution,
+                partial: false,
+                warnings: vec![],
+            },
+        )
+        .await?;
+
+        artifacts::insert(
+            &self.pool,
+            &Artifact {
+                id: artifact_id,
+                run_id,
+                stage_id: stage.stage_id.clone(),
+                agent_id: "quality_gate_boundary_evaluator".to_string(),
+                name: "blocker_boundary_status".to_string(),
+                contract_id: "blocker_boundary_status_v1".to_string(),
+                format: ArtifactFormat::Json,
+                file_path: target_path,
+                checksum_sha256: Some(format!("{:x}", Sha256::digest(&bytes))),
+                size_bytes: Some(bytes.len() as i64),
+                provider: "system.quality_gate_boundary".to_string(),
+                model: None,
+                created_at: Utc::now(),
+                is_pinned: false,
+                report_kind: None,
+                report_version: None,
+                agent_execution_id: None,
+            },
+        )
+        .await?;
+
+        if matches!(
+            evaluation.status.as_str(),
+            "blocked_no_progress" | "awaiting_human_boundary_approval"
+        ) {
+            let request_path = plan
+                .artifact_paths
+                .get("blocker_boundary_approval_request")
+                .map(|template| {
+                    resolve_path_template(
+                        template,
+                        &run.workspace_root,
+                        run.chainworks_meta_root.as_deref(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "{}/quality-gate/blocker-boundary-approval-request.json",
+                        run.artifact_root.trim_end_matches('/')
+                    )
+                });
+            if let Some(parent) = std::path::Path::new(&request_path).parent() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "create blocker boundary approval request directory {}",
+                        parent.display()
+                    )
+                })?;
+            }
+            let request_payload = serde_json::json!({
+                "schema_version": "blocker_boundary_approval_request_v1",
+                "status": "requested",
+                "run_id": run_id,
+                "stage_execution_id": stage.id,
+                "question": "Accept the server-evaluated quality-gate blocker boundary for this run?",
+                "allowed_decisions": ["accept", "reject"],
+                "label_to_approval_state": {
+                    "accept": "granted",
+                    "reject": "rejected"
+                },
+                "blocker_boundary_status_artifact_id": artifact_id,
+                "blocker_boundary_status_generation_id": generation_id,
+                "blocker_boundary_status": evaluation.payload,
+                "summary": {
+                    "local_work_complete": evaluation.payload["local_work_complete"],
+                    "followup_proposal_required": evaluation.payload["followup_proposal_required"],
+                    "external_blocker_count": evaluation.payload["external_blocker_count"],
+                    "release_blocking_external_blocker_count": evaluation.payload["release_blocking_external_blocker_count"]
+                },
+                "workflow_route_hint": evaluation.workflow_route_hint,
+            });
+            let request_bytes = serde_json::to_vec_pretty(&request_payload)
+                .context("serialize blocker_boundary_approval_request_v1")?;
+            std::fs::write(&request_path, &request_bytes).with_context(|| {
+                format!("write blocker boundary approval request {request_path}")
+            })?;
+
+            let request_artifact_id = ArtifactId::new();
+            let request_generation_id = format!("{}-p094-boundary-approval-request", stage.id);
+            artifact_contracts::upsert_verified_generation_and_rebuild(
+                &self.pool,
+                domain::artifact_contracts::ActiveArtifactGenerationInput {
+                    run_id,
+                    artifact_id: request_artifact_id,
+                    contract_id: "blocker_boundary_approval_request_v1".into(),
+                    canonical_path: request_path.clone(),
+                    raw_path: request_path.clone(),
+                    raw_status: "requested".into(),
+                    generation_id: request_generation_id,
+                    source_agent_execution_id: None,
+                    source_stage_execution_id: Some(stage.id.to_string()),
+                    source_session_generation_id: None,
+                    source_work_item_id: None,
+                    supersedes_generation_id: None,
+                    output_settlement: AgentOutputSettlement::ValidOutputsFromCompletedExecution,
+                    partial: false,
+                    warnings: vec![],
+                },
+            )
+            .await?;
+
+            artifacts::insert(
+                &self.pool,
+                &Artifact {
+                    id: request_artifact_id,
+                    run_id,
+                    stage_id: stage.stage_id.clone(),
+                    agent_id: "quality_gate_boundary_evaluator".to_string(),
+                    name: "blocker_boundary_approval_request".to_string(),
+                    contract_id: "blocker_boundary_approval_request_v1".to_string(),
+                    format: ArtifactFormat::Json,
+                    file_path: request_path,
+                    checksum_sha256: Some(format!("{:x}", Sha256::digest(&request_bytes))),
+                    size_bytes: Some(request_bytes.len() as i64),
+                    provider: "system.quality_gate_boundary".to_string(),
+                    model: None,
+                    created_at: Utc::now(),
+                    is_pinned: false,
+                    report_kind: None,
+                    report_version: None,
+                    agent_execution_id: None,
+                },
+            )
+            .await?;
+        }
+
+        let now = Utc::now();
+        stages::settle(
+            &self.pool,
+            stage.id,
+            domain::stage::StageSettlementKind::Completed,
+            now,
+        )
+        .await?;
+        let _ = self.events.send(DomainEvent::StageStatusChanged {
+            run_id,
+            stage_execution_id: stage.id,
+            status: StageStatus::Completed,
+        });
+        Ok(())
+    }
+
+    async fn p094_server_no_progress_proofs(
+        &self,
+        run_id: RunId,
+        plan: &workflow::plan::RunPlan,
+        assessment_json: &serde_json::Value,
+    ) -> Result<Vec<P094NoProgressProof>> {
+        let Some(active_status) = artifact_contracts::find_active_generation_by_contract_id(
+            &self.pool,
+            run_id,
+            "blocker_boundary_status_v1",
+        )
+        .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let previous_status = std::fs::read(&active_status.raw_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let previous_pairs = previous_status
+            .get("blockers")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|blocker| {
+                Some((
+                    blocker.get("blocker_signature_id")?.as_str()?.to_string(),
+                    blocker.get("evidence_fingerprint")?.as_str()?.to_string(),
+                    blocker
+                        .get("no_progress_repeat_count")
+                        .and_then(|value| value.as_u64()),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let previous_pair_map = previous_pairs
+            .iter()
+            .map(|(signature, fingerprint, repeat_count)| {
+                ((signature.clone(), fingerprint.clone()), *repeat_count)
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let all_stages = stages::list_by_run(&self.pool, run_id).await?;
+        let completed_refine_count = all_stages
+            .iter()
+            .filter(|stage| {
+                stage.stage_id == "state_10_implementation_refined"
+                    && stage.status == StageStatus::Completed
+            })
+            .count() as u64;
+        let max_revision_cycles = plan
+            .variables
+            .get("max_implementation_revision_cycles")
+            .and_then(|value| value.as_u64())
+            .or_else(|| {
+                plan.states
+                    .get("state_10_implementation_refined")
+                    .and_then(|state| state.loop_config.as_ref())
+                    .map(|loop_config| loop_config.max)
+            });
+        let budget_remaining = max_revision_cycles
+            .map(|max| max.saturating_sub(completed_refine_count))
+            .unwrap_or(u64::MAX);
+        let budget_source = if max_revision_cycles.is_some() {
+            "workflow.vars.max_implementation_revision_cycles"
+        } else {
+            "stage_10_implementation_refined.completed_stage_count"
+        }
+        .to_string();
+
+        let mut verified = Vec::new();
+        for blocker in p094_assessment_blocker_items(assessment_json) {
+            let Some(signature) = blocker
+                .get("blocker_signature_id")
+                .and_then(|value| value.as_str())
+            else {
+                continue;
+            };
+            let Some(fingerprint) = blocker
+                .get("evidence_fingerprint")
+                .and_then(|value| value.as_str())
+            else {
+                continue;
+            };
+            let pair = (signature.to_string(), fingerprint.to_string());
+            let Some(previous_repeat_count) = previous_pair_map.get(&pair) else {
+                continue;
+            };
+            let repeat_count = previous_repeat_count.unwrap_or(1).saturating_add(1);
+            if repeat_count >= 2 || budget_remaining == 0 {
+                verified.push(P094NoProgressProof {
+                    signature: signature.to_string(),
+                    no_progress_repeat_count: repeat_count,
+                    budget_source: budget_source.clone(),
+                    budget_remaining,
+                    last_progress_fingerprint: format!("unchanged:{fingerprint}"),
+                });
+            }
+        }
+        verified.sort_by(|left, right| left.signature.cmp(&right.signature));
+        verified.dedup_by(|left, right| left.signature == right.signature);
+        Ok(verified)
+    }
+
+    async fn link_p094_boundary_approval_request(
+        &self,
+        approval: &Approval,
+        approval_stage_execution_id: StageExecutionId,
+    ) -> Result<()> {
+        if approval.stage_id != "state_9_blocker_boundary_approval" {
+            return Ok(());
+        }
+
+        let Some(active_request) = artifact_contracts::find_active_generation_by_contract_id(
+            &self.pool,
+            approval.run_id,
+            "blocker_boundary_approval_request_v1",
+        )
+        .await?
+        else {
+            warn!(
+                run_id = %approval.run_id,
+                approval_id = %approval.id,
+                "P094 boundary approval request is missing when manual approval was created"
+            );
+            return Ok(());
+        };
+
+        let request_path = active_request.raw_path.clone();
+        let mut request_payload = std::fs::read(&request_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        request_payload.insert("status".to_string(), serde_json::json!("requested"));
+        request_payload.insert("run_id".to_string(), serde_json::json!(approval.run_id));
+        request_payload.insert("approval_id".to_string(), serde_json::json!(approval.id));
+        request_payload.insert(
+            "approval_stage_id".to_string(),
+            serde_json::json!(approval.stage_id),
+        );
+        request_payload.insert(
+            "approval_stage_execution_id".to_string(),
+            serde_json::json!(approval_stage_execution_id),
+        );
+        request_payload.insert(
+            "stage_execution_id".to_string(),
+            serde_json::json!(approval_stage_execution_id),
+        );
+        request_payload.insert(
+            "approval_requested_at".to_string(),
+            serde_json::json!(approval.requested_at.to_rfc3339()),
+        );
+        request_payload.insert(
+            "approval_link_state".to_string(),
+            serde_json::json!("linked"),
+        );
+
+        let request_value = serde_json::Value::Object(request_payload);
+        let request_bytes = serde_json::to_vec_pretty(&request_value)
+            .context("serialize linked blocker_boundary_approval_request_v1")?;
+        std::fs::write(&request_path, &request_bytes).with_context(|| {
+            format!("write linked blocker boundary approval request {request_path}")
+        })?;
+
+        let artifact_id = ArtifactId::new();
+        artifact_contracts::upsert_verified_generation_and_rebuild(
+            &self.pool,
+            domain::artifact_contracts::ActiveArtifactGenerationInput {
+                run_id: approval.run_id,
+                artifact_id,
+                contract_id: "blocker_boundary_approval_request_v1".into(),
+                canonical_path: active_request.canonical_path.clone(),
+                raw_path: request_path.clone(),
+                raw_status: "requested".into(),
+                generation_id: format!(
+                    "{}-p094-boundary-approval-request-linked",
+                    approval_stage_execution_id
+                ),
+                source_agent_execution_id: None,
+                source_stage_execution_id: Some(approval_stage_execution_id.to_string()),
+                source_session_generation_id: None,
+                source_work_item_id: None,
+                supersedes_generation_id: Some(active_request.generation_id),
+                output_settlement: AgentOutputSettlement::ValidOutputsFromCompletedExecution,
+                partial: false,
+                warnings: vec![],
+            },
+        )
+        .await?;
+
+        artifacts::insert(
+            &self.pool,
+            &Artifact {
+                id: artifact_id,
+                run_id: approval.run_id,
+                stage_id: approval.stage_id.clone(),
+                agent_id: "quality_gate_boundary_evaluator".to_string(),
+                name: "blocker_boundary_approval_request".to_string(),
+                contract_id: "blocker_boundary_approval_request_v1".to_string(),
+                format: ArtifactFormat::Json,
+                file_path: request_path,
+                checksum_sha256: Some(format!("{:x}", Sha256::digest(&request_bytes))),
+                size_bytes: Some(request_bytes.len() as i64),
+                provider: "system.quality_gate_boundary".to_string(),
+                model: None,
+                created_at: Utc::now(),
+                is_pinned: false,
+                report_kind: None,
+                report_version: None,
+                agent_execution_id: None,
+            },
+        )
+        .await?;
+
+        db::metrics::record_p094_boundary_approval("requested");
+        Ok(())
     }
 
     /// P060: Build a ProposalFingerprint from the run context and plan metadata.
@@ -8877,6 +9535,251 @@ mod tests {
             closeout_readiness_mode: None,
             escalation_policies: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn proposal_094_links_boundary_approval_request_to_created_approval() {
+        let pool = test_pool().await;
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            crate::event_bus::new_bus(16),
+            WorkQueue::new(pool.clone()),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(tmp.path().to_string_lossy().into_owned());
+        run.artifact_root = tmp.path().join("artifacts").to_string_lossy().into_owned();
+        ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+
+        let request_path = tmp.path().join("quality-gate/approval-request.json");
+        std::fs::create_dir_all(request_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &request_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": "blocker_boundary_approval_request_v1",
+                "status": "requested",
+                "allowed_decisions": ["accept", "reject"],
+                "label_to_approval_state": {
+                    "accept": "granted",
+                    "reject": "rejected"
+                },
+                "blocker_boundary_status_generation_id": "boundary-status-before-approval",
+                "workflow_route_hint": "state_9_blocker_boundary_approval"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        db::repos::artifact_contracts::upsert_verified_generation_and_rebuild(
+            &pool,
+            domain::artifact_contracts::ActiveArtifactGenerationInput {
+                run_id,
+                artifact_id: ArtifactId::new(),
+                contract_id: "blocker_boundary_approval_request_v1".into(),
+                canonical_path: request_path.to_string_lossy().into_owned(),
+                raw_path: request_path.to_string_lossy().into_owned(),
+                raw_status: "requested".into(),
+                generation_id: "request-before-approval".into(),
+                source_agent_execution_id: None,
+                source_stage_execution_id: Some("boundary-evaluator-stage".into()),
+                source_session_generation_id: None,
+                source_work_item_id: None,
+                supersedes_generation_id: None,
+                output_settlement: AgentOutputSettlement::ValidOutputsFromCompletedExecution,
+                partial: false,
+                warnings: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+        let approval_stage_execution_id = StageExecutionId::new();
+        let approval = Approval {
+            id: ApprovalId::new(),
+            run_id,
+            stage_id: "state_9_blocker_boundary_approval".into(),
+            decision: ApprovalDecision::Requested,
+            requested_at: Utc::now(),
+            decided_at: None,
+            comment: None,
+            expires_at: None,
+        };
+        orchestrator
+            .link_p094_boundary_approval_request(&approval, approval_stage_execution_id)
+            .await
+            .unwrap();
+
+        let readback = db::repos::artifact_contracts::p094_readback_json(&pool, run_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            readback["blocker_boundary_approval_request"]["approval_id"],
+            serde_json::json!(approval.id.to_string())
+        );
+        assert_eq!(
+            readback["blocker_boundary_approval_request"]["approval_stage_execution_id"],
+            serde_json::json!(approval_stage_execution_id.to_string())
+        );
+        assert_eq!(
+            readback["blocker_boundary_approval_request"]["stage_execution_id"],
+            serde_json::json!(approval_stage_execution_id.to_string())
+        );
+        assert_eq!(
+            readback["blocker_boundary_approval_request"]["approval_link_state"],
+            serde_json::json!("linked")
+        );
+        assert_ne!(
+            readback["blocker_boundary_approval_request"]["generation_id"],
+            serde_json::json!("request-before-approval")
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_094_no_progress_verification_is_server_owned_from_prior_boundary_truth() {
+        let pool = test_pool().await;
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            crate::event_bus::new_bus(16),
+            WorkQueue::new(pool.clone()),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let run_id = RunId::new();
+        let run = test_run(run_id);
+        ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+        let mut plan = test_plan();
+        plan.variables.insert(
+            "max_implementation_revision_cycles".into(),
+            serde_json::json!(2),
+        );
+
+        let current_assessment = serde_json::json!({
+            "schema_version": "quality_gate_blocker_assessment_v1",
+            "blockers": [{
+                "id": "repeat",
+                "summary": "same blocker repeated",
+                "blocker_signature_id": "sig-repeat",
+                "evidence_fingerprint": "fingerprint-repeat",
+                "source_artifact_generation_id": "assessment-current",
+                "observed_after_stage_execution_id": "stage-current",
+                "observed_after_agent_execution_id": "agent-current",
+                "owner_class": "blocked_no_progress",
+                "blocker_class": "no_progress",
+                "evidence_freshness": "fresh",
+                "severity": "hard",
+                "release_blocking": true,
+                "server_verified_no_progress": true,
+                "no_progress_repeat_count": 2,
+                "budget_source": "workflow.vars.max_implementation_revision_cycles",
+                "budget_remaining": 0,
+                "last_progress_fingerprint": "agent-authored-value",
+                "allowed_workflow_routes": ["human_boundary_approval"],
+                "forbidden_routes": [],
+                "gate_command": "quality_gate_blocker_boundary",
+                "evidence_refs": ["artifact_contracts:current"]
+            }]
+        });
+        assert!(
+            orchestrator
+                .p094_server_no_progress_proofs(run_id, &plan, &current_assessment)
+                .await
+                .unwrap()
+                .is_empty(),
+            "agent-authored server_verified_no_progress is ignored without prior DB truth"
+        );
+
+        let status_path = tmp.path().join("blocker-boundary-status.json");
+        std::fs::write(
+            &status_path,
+            serde_json::json!({
+                "schema_version": "blocker_boundary_status_v1",
+                "status": "awaiting_human_boundary_approval",
+                "blockers": [{
+                    "blocker_signature_id": "sig-repeat",
+                    "evidence_fingerprint": "fingerprint-repeat",
+                    "no_progress_repeat_count": 1
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        artifact_contracts::upsert_verified_generation_and_rebuild(
+            &pool,
+            domain::artifact_contracts::ActiveArtifactGenerationInput {
+                run_id,
+                artifact_id: ArtifactId::new(),
+                contract_id: "blocker_boundary_status_v1".into(),
+                canonical_path: status_path.to_string_lossy().into_owned(),
+                raw_path: status_path.to_string_lossy().into_owned(),
+                raw_status: "awaiting_human_boundary_approval".into(),
+                generation_id: "prior-boundary-status".into(),
+                source_agent_execution_id: None,
+                source_stage_execution_id: Some("stage-prior".into()),
+                source_session_generation_id: None,
+                source_work_item_id: None,
+                supersedes_generation_id: None,
+                output_settlement: AgentOutputSettlement::ValidOutputsFromCompletedExecution,
+                partial: false,
+                warnings: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let mut refine_stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "state_10_implementation_refined".into(),
+            label: "Implementation refined".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        stages::insert(&pool, &refine_stage).await.unwrap();
+        refine_stage.id = StageExecutionId::new();
+        refine_stage.iteration = 2;
+        stages::insert(&pool, &refine_stage).await.unwrap();
+
+        let proofs = orchestrator
+            .p094_server_no_progress_proofs(run_id, &plan, &current_assessment)
+            .await
+            .unwrap();
+        assert_eq!(
+            proofs,
+            vec![P094NoProgressProof {
+                signature: "sig-repeat".to_string(),
+                no_progress_repeat_count: 2,
+                budget_source: "workflow.vars.max_implementation_revision_cycles".to_string(),
+                budget_remaining: 0,
+                last_progress_fingerprint: "unchanged:fingerprint-repeat".to_string(),
+            }]
+        );
+        let mut server_assessment = current_assessment.clone();
+        p094_apply_server_no_progress_proofs(&mut server_assessment, &proofs);
+        assert_eq!(
+            server_assessment["blockers"][0]["last_progress_fingerprint"],
+            serde_json::json!("unchanged:fingerprint-repeat"),
+            "server-derived no-progress proof must overwrite agent-authored values"
+        );
+        assert_eq!(
+            orchestrator
+                .p094_server_no_progress_proofs(run_id, &plan, &current_assessment)
+                .await
+                .unwrap(),
+            proofs
+        );
     }
 
     async fn test_pool() -> sqlx::SqlitePool {

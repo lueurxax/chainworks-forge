@@ -269,8 +269,80 @@ pub async fn execute(
             "maxOutputBytes": DEFAULT_TOOL_OUTPUT_MAX_BYTES,
             "maxOutputLines": DEFAULT_TOOL_OUTPUT_MAX_LINES,
             "maxCumulativeOutputBytes": DEFAULT_CUMULATIVE_TOOL_OUTPUT_MAX_BYTES
-        }
+        },
+        "qualityGateBoundary": p094_quality_gate_boundary_readback()
     }))
+}
+
+pub fn p094_quality_gate_boundary_readback() -> serde_json::Value {
+    json!({
+        "schemaVersion": "quality_gate_boundary_runtime_v1",
+        "proposalId": "P094",
+        "status": "available",
+        "mode": "approval_dry_run",
+        "source": "workflow_owned_quality_gate_boundary",
+        "allowedModes": ["disabled", "readback_only", "approval_dry_run", "enforcing", "held"],
+        "activeGateEvidence": "./scripts/test-gate.sh proposal-094",
+        "contracts": [
+            "proposal_decomposition_plan_v1",
+            "quality_gate_blocker_assessment_v1",
+            "blocker_boundary_status_v1",
+            "blocker_boundary_approval_request_v1",
+            "blocker_boundary_human_decision_v1",
+            "followup_proposal_seed_v1"
+        ],
+        "operatorAction": "use workflow approval gates; accept/reject only",
+        "rolloutDecision": {
+            "schemaVersion": "p094_rollout_decision_readback_v1",
+            "mode": "approval_dry_run",
+            "decisionState": "held_before_enforcement",
+            "modeSource": "retained_gate_default",
+            "sampleWindow": {
+                "source": "retained_gate",
+                "commands": ["./scripts/test-gate.sh proposal-094", "./scripts/test-gate.sh p094"]
+            },
+            "goCriteria": {
+                "accepted_boundary_later_rejected_percent_max": 5,
+                "post_boundary_reopen_local_code_tail_missed_max": 1,
+                "projection_integrity_required": "valid",
+                "release_blocking_external_evidence_not_satisfied_by_acceptance": true
+            },
+            "metricNames": [
+                "quality_gate_blocker_assessments_total",
+                "quality_gate_blocker_validation_rejections_total",
+                "quality_gate_blocker_freshness_total",
+                "implementation_refine_loops_avoided_total",
+                "followup_proposal_seeds_created_total",
+                "external_blockers_accepted_total",
+                "invalid_blocker_claims_total",
+                "review_refresh_required_total",
+                "output_settlement_required_before_boundary_total",
+                "human_boundary_approval_latency_seconds",
+                "post_boundary_reopen_total",
+                "false_external_blocker_rate",
+                "repeated_blocker_no_progress_total",
+                "accepted_boundary_later_rejected_percent",
+                "blocker_boundary_approvals_total",
+                "quality_gate_blocker_boundary_route_total"
+            ],
+            "metricValues": db::metrics::p094_rollout_metric_values_json(),
+            "ownerDecision": {
+                "state": "hold",
+                "reason": "P094 remains in approval dry-run until an operator-owned rollout-contract entry or command-journal-backed mode change promotes enforcement.",
+                "commandJournalEntryId": null,
+                "rolloutContractEntryId": null
+            },
+            "promotionReadiness": {
+                "enforcingAllowed": false,
+                "blockedReason": "missing_audited_owner_rollout_decision",
+                "requiresBeforeEnforcing": "non_null_command_journal_or_rollout_contract_entry"
+            },
+            "auditability": {
+                "status": "available",
+                "enforcementModeChangesRequire": "command_journal_or_rollout_contract_entry"
+            }
+        }
+    })
 }
 
 pub async fn execute_with_name(

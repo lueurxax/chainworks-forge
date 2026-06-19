@@ -1611,6 +1611,8 @@ else:
         "chainworks_gate_cargo_target_dir",
         "CHAINWORKS_GATE_CARGO_TARGET_ROOT",
         "CHAINWORKS_ALLOW_LOCAL_CARGO_TARGET_DIR",
+        "CHAINWORKS_CARGO_WRAPPER_DIR",
+        "CHAINWORKS_REAL_CARGO",
     ]
     for fragment in required_helper_fragments:
         if fragment not in helper_text:
@@ -1636,7 +1638,14 @@ else:
         ".chainworks/worktrees",
         "control-plane/target",
         "CHAINWORKS_CLEAN_PROTECTED_WORKTREES",
+        "CHAINWORKS_SHARED_CARGO_TARGET_MAX_GB",
+        "CHAINWORKS_WORKTREE_CARGO_TARGET_MAX_GB",
+        "clean_target_pressure",
+        "debug/incremental",
         "--protect-worktree",
+        "ps -axo pid=,command=",
+        "clean_worktree_adhoc_target_dirs",
+        "prune_child_dirs_until_budget",
     ]:
         if fragment not in clean_text:
             violations.append(f"clean-build-caches.sh missing {fragment!r}")
@@ -2525,6 +2534,7 @@ Available gates:
   p086-continuation-operator-report
                   Proposal 086 Phase 1 operator-report gate: operator report field coverage
   proposal-087|p087  Proposal 087 read-path liveness and storage tiering gate
+  proposal-094|p094  Proposal 094 workflow-owned blocker-boundary contract/readback gate
   proposal-096|p096  Proposal 096 bounded tool output and safe-search guard retained alias gate
   proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
   proposal-090|p090  Proposal 090 Junie runtime-hardening evidence inventory gate
@@ -11302,6 +11312,232 @@ PY
       run_p082_cargo_test -p mcp-server --test proposal_082_recovery_readback -- --nocapture
     )
     log "Proposal 082 gate passed"
+    ;;
+  proposal-094|p094)
+    log "Proposal 094 gate: workflow-owned blocker-boundary contract/readback"
+    python3 - "$ROOT_DIR" <<'PY'
+import pathlib
+import re
+import sys
+
+root = pathlib.Path(sys.argv[1])
+script = (root / "scripts/test-gate.sh").read_text()
+workflow_ref = (root / "docs/reference/workflow-execution-engine.md").read_text()
+contracts_ref = (root / "docs/reference/output-contracts-failure-evidence-and-recovery.md").read_text()
+gate_ref = (root / "docs/reference/test-gates.md").read_text()
+workflow_yaml = (root / "examples/workflows/full-mvp-live.yaml").read_text()
+agent_catalog = (root / "examples/agents/agents.yaml").read_text()
+stable_contract_sources = "\n".join([
+    workflow_ref,
+    contracts_ref,
+    gate_ref,
+    workflow_yaml,
+    agent_catalog,
+])
+domain_contracts = (root / "control-plane/crates/domain/src/artifact_contracts.rs").read_text()
+db_contracts = (root / "control-plane/crates/db/src/repos/artifact_contracts.rs").read_text()
+db_metrics = (root / "control-plane/crates/db/src/metrics.rs").read_text()
+db_tests = (root / "control-plane/crates/db/tests/proposal_057_contracts.rs").read_text()
+domain_tests = (root / "control-plane/crates/domain/tests/proposal_057_contracts.rs").read_text()
+engine_unit = (root / "control-plane/crates/engine/src/quality_gate_boundary.rs").read_text()
+engine_orchestrator = (root / "control-plane/crates/engine/src/orchestrator.rs").read_text()
+engine_tests = (root / "control-plane/crates/engine/tests/integration.rs").read_text()
+workflow_tests = (root / "control-plane/crates/workflow/tests/integration.rs").read_text()
+mcp_tests = (root / "control-plane/crates/mcp-server/tests/proposal_057_contracts.rs").read_text()
+graphql_tests = (root / "control-plane/crates/graphql-server/tests/proposal_057_contracts.rs").read_text()
+
+for token in ["proposal-094|p094", "workflow-owned blocker-boundary"]:
+    if token not in script:
+        print(f"FAILED: test-gate.sh missing P094 alias/list token {token!r}")
+        sys.exit(1)
+
+for doc_token in [
+    "Quality-gate blocker boundary transitions",
+    "Workflow-owned quality-gate boundary contracts",
+    "Retained historical alias proof gate",
+]:
+    if doc_token not in stable_contract_sources:
+        print(f"FAILED: stable P094 closeout docs missing {doc_token!r}")
+        sys.exit(1)
+
+if "${CHAINWORKS_RUN_ROOT}" in stable_contract_sources:
+    print("FAILED: quality-gate boundary docs/examples must not introduce unsupported ${CHAINWORKS_RUN_ROOT}")
+    sys.exit(1)
+
+if re.search(r"\$\{CHAINWORKS_META_ROOT:-\.chainworks\}/runs/\$\{run_id\}", stable_contract_sources):
+    print("FAILED: quality-gate boundary artifact templates double-nest the run id")
+    sys.exit(1)
+
+if re.search(r"approval:\s*\{", workflow_yaml):
+    print("FAILED: quality-gate boundary approval YAML must remain string-compatible")
+    sys.exit(1)
+
+if "approval: required" not in workflow_yaml or "state_9_blocker_boundary_approval" not in workflow_yaml:
+    print("FAILED: quality-gate boundary workflow must retain string approval gate")
+    sys.exit(1)
+
+for contract_id in [
+    "proposal_decomposition_plan_v1",
+    "quality_gate_blocker_assessment_v1",
+    "blocker_boundary_status_v1",
+    "blocker_boundary_approval_request_v1",
+    "blocker_boundary_human_decision_v1",
+    "followup_proposal_seed_v1",
+]:
+    if contract_id not in domain_contracts:
+        print(f"FAILED: domain artifact contract vocabulary missing {contract_id}")
+        sys.exit(1)
+    if contract_id not in db_contracts:
+        print(f"FAILED: DB artifact contract mapping/readback missing {contract_id}")
+        sys.exit(1)
+
+required_field_fragments = [
+    "proposal_decomposition_plan",
+    "requires_split",
+    "split_candidates",
+    "blocking_split_candidate_count",
+    "requires_split_without_blocking_split_candidate",
+    "implementation_start_decision",
+    "blocker_boundary_status",
+    "followup_proposal_required",
+    "has_release_blocking_external_blockers",
+    "has_no_release_blocking_external_blockers",
+    "projection_integrity",
+    "canonical_dimensions",
+    "p094_readback_json",
+]
+for fragment in required_field_fragments:
+    if fragment not in db_contracts:
+        print(f"FAILED: DB canonical readback/projection missing P094 fragment {fragment}")
+        sys.exit(1)
+
+required_behavior_tests = {
+    "proposal_094_normalizes_boundary_contract_statuses": domain_tests,
+    "proposal_094_exposes_decomposition_plan_fields_as_canonical_truth": db_tests,
+    "proposal_094_decomposition_split_required_requires_blocking_split_candidate": db_tests,
+    "proposal_094_exposes_blocker_boundary_fields_as_canonical_truth": db_tests,
+    "proposal_094_normalizes_human_decision_labels_to_durable_approval_state": db_tests,
+    "proposal_094_readback_includes_boundary_approval_request_lane": db_tests,
+    "proposal_094_followup_seed_generation_records_metric": db_tests,
+    "p094_external_release_blocker_requires_human_boundary_approval": engine_unit,
+    "p094_lower_layer_output_settlement_wins_before_boundary": engine_unit,
+    "p094_local_code_tail_does_not_route_to_boundary_approval": engine_unit,
+    "p094_unknown_freshness_requires_review_refresh_before_code_tail": engine_unit,
+    "p094_incomplete_blocker_claim_fails_closed_before_boundary_approval": engine_unit,
+    "p094_external_environment_counts_as_release_blocking_external": engine_unit,
+    "p094_review_owner_classes_route_to_review_refresh_not_code_writer": engine_unit,
+    "p094_blocked_no_progress_requires_server_verified_marker": engine_unit,
+    "p094_unknown_enum_or_missing_required_route_fields_fail_closed": engine_unit,
+    "proposal_094_links_boundary_approval_request_to_created_approval": engine_orchestrator,
+    "proposal_094_no_progress_verification_is_server_owned_from_prior_boundary_truth": engine_orchestrator,
+    "proposal_094_full_mvp_compiles_boundary_flow_with_string_approval": workflow_tests,
+    "proposal_094_boundary_accepted_transitions_are_mutually_exclusive": workflow_tests,
+    "proposal_094_path_templates_do_not_double_nest_run_meta_root": engine_tests,
+    "proposal_094_mcp_surfaces_expose_boundary_readback_to_operator": mcp_tests,
+    "proposal_094_runtime_health_exposes_quality_gate_boundary_mode": mcp_tests,
+    "proposal_094_graphql_run_detail_exposes_boundary_readback": graphql_tests,
+}
+for test_name, content in required_behavior_tests.items():
+    if test_name not in content:
+        print(f"FAILED: P094 gate missing behavioral test {test_name}")
+        sys.exit(1)
+
+for owner_class in [
+    "security_reviewer",
+    "prepush_reviewer",
+    "implementation_auditor",
+    "unknown",
+]:
+    if owner_class not in engine_unit:
+        print(f"FAILED: P094 evaluator missing owner_class vocabulary {owner_class}")
+        sys.exit(1)
+
+for metric_name in [
+    "quality_gate_blocker_assessments_total",
+    "quality_gate_blocker_validation_rejections_total",
+    "quality_gate_blocker_freshness_total",
+    "implementation_refine_loops_avoided_total",
+    "followup_proposal_seeds_created_total",
+    "external_blockers_accepted_total",
+    "invalid_blocker_claims_total",
+    "review_refresh_required_total",
+    "output_settlement_required_before_boundary_total",
+    "human_boundary_approval_latency_seconds",
+    "post_boundary_reopen_total",
+    "false_external_blocker_rate",
+    "repeated_blocker_no_progress_total",
+    "accepted_boundary_later_rejected_percent",
+    "blocker_boundary_approvals_total",
+    "quality_gate_blocker_boundary_route_total",
+]:
+    if metric_name not in db_metrics:
+        print(f"FAILED: P094 required metric missing {metric_name}")
+        sys.exit(1)
+
+for metric_fragment in [
+    "proposal_id={proposal_id}",
+    "false_external_blocker_events_total",
+    "accepted_boundary_later_rejected_total",
+    "p094_rollout_metric_values_json",
+    'gauge("false_external_blocker_rate", "percent")',
+    'gauge("accepted_boundary_later_rejected_percent", "percent")',
+]:
+    if metric_fragment not in db_metrics and metric_fragment not in db_tests:
+        print(f"FAILED: P094 metric rollout/readback proof missing {metric_fragment}")
+        sys.exit(1)
+
+for runtime_fragment in [
+    "quality_gate_boundary_runtime_v1",
+    "p094_rollout_decision_readback_v1",
+    "command_journal_or_rollout_contract_entry",
+    "metricValues",
+    "promotionReadiness",
+]:
+    if runtime_fragment not in mcp_tests and runtime_fragment not in (root / "control-plane/crates/mcp-server/src/tools/runtime.rs").read_text():
+        print(f"FAILED: P094 runtime/readback missing rollout fragment {runtime_fragment}")
+        sys.exit(1)
+
+for rollout_fragment, content in {
+    "p094_rollout_decision_json": (root / "control-plane/crates/mcp-server/src/tools/reports.rs").read_text(),
+    "rollout_contract_checks": mcp_tests,
+    "rolloutContractEntryId": mcp_tests,
+    "enforcingAllowed": mcp_tests,
+}.items():
+    if rollout_fragment not in content:
+        print(f"FAILED: P094 rollout decision behavior proof missing {rollout_fragment}")
+        sys.exit(1)
+
+print("P094 static contract checks passed")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      p094_cargo_target="$(chainworks_test_gate_cargo_target_dir "${CHAINWORKS_PROPOSAL_094_CARGO_TARGET_DIR:-target/proposal-094}")"
+      run_p094_cargo_test() {
+        local output status
+        set +e
+        output=$(CARGO_TARGET_DIR="$p094_cargo_target" cargo test "$@" 2>&1)
+        status=$?
+        set -e
+        printf '%s\n' "$output"
+        if [ "$status" -ne 0 ]; then
+          return "$status"
+        fi
+        if ! printf '%s\n' "$output" | grep -Eq '^running [1-9][0-9]* tests?$'; then
+          echo "FAILED: P094 cargo test filter selected zero tests: cargo test $*" >&2
+          return 1
+        fi
+      }
+      run_p094_cargo_test -p domain proposal_094 --test proposal_057_contracts -- --nocapture
+      run_p094_cargo_test -p db proposal_094 --test proposal_057_contracts -- --nocapture
+      run_p094_cargo_test -p engine quality_gate_boundary --lib -- --nocapture
+      run_p094_cargo_test -p engine proposal_094_links_boundary_approval_request_to_created_approval --lib -- --nocapture
+      run_p094_cargo_test -p engine proposal_094_no_progress_verification_is_server_owned_from_prior_boundary_truth --lib -- --nocapture
+      run_p094_cargo_test -p workflow proposal_094 --test integration -- --nocapture
+      run_p094_cargo_test -p engine proposal_094_path_templates_do_not_double_nest_run_meta_root --test integration -- --nocapture
+      run_p094_cargo_test -p mcp-server proposal_094 --test proposal_057_contracts -- --nocapture
+      run_p094_cargo_test -p graphql-server proposal_094 --test proposal_057_contracts -- --nocapture
+    )
+    log "Proposal 094 gate passed"
     ;;
   proposal-096|p096)
     log "Proposal 096 gate: bounded tool output and safe-search guard retained alias"

@@ -136,6 +136,14 @@ pub async fn execute(
                 p082_readbacks.clone(),
             );
             execution_truth.insert(
+                "p094_boundary_readback".into(),
+                db::repos::artifact_contracts::p094_readback_json(pool, run_id).await?,
+            );
+            execution_truth.insert(
+                "p094_rollout_decision".into(),
+                p094_rollout_decision_json(pool, run_id).await?,
+            );
+            execution_truth.insert(
                 "implementation_handoff_status".into(),
                 implementation_handoff_status_json(pool, run_id).await?,
             );
@@ -215,6 +223,7 @@ pub async fn execute(
                         "report_version": 1,
                         "active_index": projection.active_index_json,
                         "run_state_projection": projection.run_state_json,
+                        "p094_boundary_readback": db::repos::artifact_contracts::p094_readback_json(pool, run_id).await?,
                         "operator_overrides": overrides,
                         "legacy_discovery_overrides": legacy_discovery_overrides::list_by_run(pool, run_id).await?,
                     }));
@@ -1067,6 +1076,69 @@ pub(crate) async fn rollout_contract_readback_json(
     } else {
         Ok(base)
     }
+}
+
+pub(crate) async fn p094_rollout_decision_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let mut decision = crate::tools::runtime::p094_quality_gate_boundary_readback()
+        .get("rolloutDecision")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let Some(object) = decision.as_object_mut() else {
+        return Ok(decision);
+    };
+
+    object.insert(
+        "metricValues".to_string(),
+        db::metrics::p094_rollout_metric_values_json(),
+    );
+
+    let Some(check) =
+        rollout_contract_checks::find_terminal_rollout_contract_check_for_run(pool, run_id.inner())
+            .await?
+            .filter(|check| check.proposal_id == "P094")
+    else {
+        return Ok(decision);
+    };
+
+    let rollout_contract_entry_id = check.id.to_string();
+    let decision_state = check.decision.to_string();
+    let enforcing_allowed = check.decision
+        == rollout_contract_checks::RolloutContractDecision::Release
+        && check.status == rollout_contract_checks::RolloutContractStatus::Pass
+        && check.projection_integrity == rollout_contract_checks::ProjectionIntegrity::Valid;
+    object.insert(
+        "ownerDecision".to_string(),
+        serde_json::json!({
+            "state": decision_state,
+            "reason": "P094 rollout decision is backed by terminal rollout_contract_checks truth.",
+            "commandJournalEntryId": null,
+            "rolloutContractEntryId": rollout_contract_entry_id,
+            "source": "rollout_contract_checks",
+            "enteredAt": check.updated_at.to_rfc3339(),
+            "proposalRevisionId": check.proposal_revision_id,
+        }),
+    );
+    object.insert(
+        "promotionReadiness".to_string(),
+        serde_json::json!({
+            "enforcingAllowed": enforcing_allowed,
+            "blockedReason": if enforcing_allowed {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!("rollout_contract_decision_not_release")
+            },
+            "requiresBeforeEnforcing": "non_null_command_journal_or_rollout_contract_entry",
+            "rolloutContractEntryId": check.id.to_string(),
+        }),
+    );
+    object.insert(
+        "rolloutContractReadback".to_string(),
+        check.operator_readback_json_for_lane("run_report"),
+    );
+    Ok(decision)
 }
 
 /// P077: Serialize the active closeout readiness generation for MCP readback.

@@ -362,6 +362,7 @@ const PROGRESS_TIMEOUT: Duration = Duration::from_secs(300);
 const CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT: Duration = Duration::from_secs(900);
 const PROMPT_PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(15);
 const CLAUDE_LOCAL_ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const ACP_PROMPT_SUBPROCESS_EXIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const CLAUDE_LOCAL_ACTIVITY_MAX_READ_BYTES: u64 = 1024 * 1024;
 const PROVIDER_SESSION_STORE_LINE_CAP_BYTES: usize = 16 * 1024 * 1024;
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
@@ -371,6 +372,29 @@ enum AcpPromptReadOutcome {
     Read(Result<usize>),
     PollElapsed,
     CloseRequested,
+}
+
+fn provider_subprocess_exit_status_during_prompt(
+    child: &mut Child,
+    closed: &mut bool,
+    session_id: &str,
+) -> Result<Option<std::process::ExitStatus>> {
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            *closed = true;
+            warn!(
+                session_id = %session_id,
+                exit_status = ?status,
+                "ACP provider subprocess exited during active prompt"
+            );
+            Ok(Some(status))
+        }
+        Ok(None) => Ok(None),
+        Err(error) => {
+            *closed = true;
+            Err(error).context("ACP provider subprocess wait failed during active prompt")
+        }
+    }
 }
 
 const OUTPUT_START_MARKER: &str = "<<<CHAINWORKS_OUTPUT:";
@@ -2892,10 +2916,12 @@ pub(crate) async fn send_ndjson(stdin: &mut tokio::process::ChildStdin, msg: &Va
 // Notifications (no `id` field) are silently skipped.
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn await_response(
+async fn await_response_with_child_liveness(
     reader: &mut BufReader<tokio::process::ChildStdout>,
+    mut child: Option<&mut Child>,
     expected_id: &str,
     time_limit: Duration,
+    phase: &str,
 ) -> Result<Value> {
     let start = Instant::now();
     let mut line = String::new();
@@ -2906,10 +2932,11 @@ pub(crate) async fn await_response(
             bail!("ACP handshake timed out waiting for response id={expected_id}");
         }
         let remaining = time_limit - elapsed;
+        let read_wait = remaining.min(ACP_PROMPT_SUBPROCESS_EXIT_POLL_INTERVAL);
 
         line.clear();
         let n = match timeout(
-            remaining,
+            read_wait,
             read_capped_ndjson_line(
                 reader,
                 &mut line,
@@ -2922,8 +2949,33 @@ pub(crate) async fn await_response(
             Ok(Ok(n)) => n,
             Ok(Err(err)) => return Err(err).context("ACP handshake read_line error"),
             Err(_) => {
-                return diagnose_late_handshake_response(reader, expected_id, start, time_limit)
+                if let Some(child) = child.as_deref_mut() {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            bail!(
+                                "ACP subprocess exited during {phase} before responding to id={expected_id}: status={status}"
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!(
+                                    "ACP subprocess wait failed during {phase} before response id={expected_id}"
+                                )
+                            });
+                        }
+                    }
+                }
+                if start.elapsed() >= time_limit {
+                    return diagnose_late_handshake_response(
+                        reader,
+                        expected_id,
+                        start,
+                        time_limit,
+                    )
                     .await;
+                }
+                continue;
             }
         };
 
@@ -3087,9 +3139,15 @@ pub(crate) async fn probe_initialize_with_timeout(
     .await
     .context("ACP: send capability probe initialize")?;
 
-    let result = await_response(&mut reader, &request_id, handshake_timeout)
-        .await
-        .context("ACP: capability probe initialize handshake")?;
+    let result = await_response_with_child_liveness(
+        &mut reader,
+        Some(&mut child),
+        &request_id,
+        handshake_timeout,
+        "capability probe initialize handshake",
+    )
+    .await
+    .context("ACP: capability probe initialize handshake")?;
 
     let _ = AsyncWriteExt::shutdown(&mut stdin).await;
     drop(stdin);
@@ -4225,9 +4283,15 @@ impl AcpTransportSession {
         .await
         .context("ACP: send initialize")?;
 
-        await_response(&mut reader, &init_id, HANDSHAKE_TIMEOUT)
-            .await
-            .context("ACP: initialize handshake")?;
+        await_response_with_child_liveness(
+            &mut reader,
+            Some(&mut child),
+            &init_id,
+            HANDSHAKE_TIMEOUT,
+            "initialize handshake",
+        )
+        .await
+        .context("ACP: initialize handshake")?;
         startup_receipt.note_initialize_received(&init_id);
         let acp_initialize_latency_ms = initialize_started.elapsed().as_millis() as u64;
         info!(
@@ -4257,9 +4321,15 @@ impl AcpTransportSession {
             .context("ACP: send session/new")?;
         }
 
-        let sn_result = await_response(&mut reader, &sn_id, HANDSHAKE_TIMEOUT)
-            .await
-            .context("ACP: session/new handshake")?;
+        let sn_result = await_response_with_child_liveness(
+            &mut reader,
+            Some(&mut child),
+            &sn_id,
+            HANDSHAKE_TIMEOUT,
+            "session/new handshake",
+        )
+        .await
+        .context("ACP: session/new handshake")?;
         let acp_session_new_latency_ms = session_new_started.elapsed().as_millis() as u64;
         info!(
             run_id = %req.run_id,
@@ -4295,9 +4365,15 @@ impl AcpTransportSession {
             )
             .await
             .context("ACP: send session/set_mode")?;
-            await_response(&mut reader, &set_mode_id, HANDSHAKE_TIMEOUT)
-                .await
-                .context("ACP: session/set_mode handshake")?;
+            await_response_with_child_liveness(
+                &mut reader,
+                Some(&mut child),
+                &set_mode_id,
+                HANDSHAKE_TIMEOUT,
+                "session/set_mode handshake",
+            )
+            .await
+            .context("ACP: session/set_mode handshake")?;
         }
 
         for (config_id, value) in &config.config_options {
@@ -4327,7 +4403,15 @@ impl AcpTransportSession {
                 continue;
             }
 
-            match await_response(&mut reader, &sco_id, HANDSHAKE_TIMEOUT).await {
+            match await_response_with_child_liveness(
+                &mut reader,
+                Some(&mut child),
+                &sco_id,
+                HANDSHAKE_TIMEOUT,
+                "session/set_config_option handshake",
+            )
+            .await
+            {
                 Ok(_) => {
                     debug!(
                         session_id = %session_id,
@@ -4367,11 +4451,17 @@ impl AcpTransportSession {
             .await
             .with_context(|| format!("ACP: send required session/set_config_option {config_id}"))?;
 
-            await_response(&mut reader, &sco_id, HANDSHAKE_TIMEOUT)
-                .await
-                .with_context(|| {
-                    format!("ACP: required session/set_config_option rejected for {config_id}")
-                })?;
+            await_response_with_child_liveness(
+                &mut reader,
+                Some(&mut child),
+                &sco_id,
+                HANDSHAKE_TIMEOUT,
+                "required session/set_config_option handshake",
+            )
+            .await
+            .with_context(|| {
+                format!("ACP: required session/set_config_option rejected for {config_id}")
+            })?;
             debug!(
                 session_id = %session_id,
                 config_id = %config_id,
@@ -4965,24 +5055,31 @@ impl AcpTransportSession {
                 remaining_idle
                     .min(remaining_progress)
                     .min(CLAUDE_LOCAL_ACTIVITY_POLL_INTERVAL)
+                    .min(ACP_PROMPT_SUBPROCESS_EXIT_POLL_INTERVAL)
             } else if codex_local_activity.is_some() {
                 let remaining_idle = IDLE_TIMEOUT.saturating_sub(idle);
                 let remaining_progress = PROGRESS_TIMEOUT.saturating_sub(progress_idle);
                 remaining_idle
                     .min(remaining_progress)
                     .min(CLAUDE_LOCAL_ACTIVITY_POLL_INTERVAL)
+                    .min(ACP_PROMPT_SUBPROCESS_EXIT_POLL_INTERVAL)
             } else {
                 let remaining_idle = IDLE_TIMEOUT.saturating_sub(idle);
                 let remaining_progress = PROGRESS_TIMEOUT.saturating_sub(progress_idle);
-                remaining_idle.min(remaining_progress)
+                remaining_idle
+                    .min(remaining_progress)
+                    .min(ACP_PROMPT_SUBPROCESS_EXIT_POLL_INTERVAL)
             };
 
             let mut close_requested = false;
             let n_result: Result<usize> = {
                 line.clear();
                 let session_id = self.session_id.clone();
+                let reader = &mut self.reader;
+                let child = &mut self.child;
+                let closed = &mut self.closed;
                 let read_line = read_capped_ndjson_line(
-                    &mut self.reader,
+                    reader,
                     &mut line,
                     ndjson_line_cap_bytes(&req.expected_outputs),
                     "ACP prompt stream read_line",
@@ -5031,6 +5128,16 @@ impl AcpTransportSession {
                                 session_id = %session_id,
                                 "ACP prompt stream read poll elapsed; checking provider local activity"
                             );
+                            if let Some(status) = provider_subprocess_exit_status_during_prompt(
+                                child,
+                                closed,
+                                &session_id,
+                            )? {
+                                failure_phase = Some("provider_subprocess_exited".to_string());
+                                break Err(anyhow::anyhow!(
+                                    "ACP provider subprocess exited during active prompt: status={status} (session={session_id})"
+                                ));
+                            }
                             poll_claude_local_activity_watchdog(
                                 claude_local_activity.as_mut(),
                                 req,
@@ -5175,6 +5282,16 @@ impl AcpTransportSession {
                             continue;
                         }
                         AcpPromptReadOutcome::PollElapsed => {
+                            if let Some(status) = provider_subprocess_exit_status_during_prompt(
+                                child,
+                                closed,
+                                &session_id,
+                            )? {
+                                failure_phase = Some("provider_subprocess_exited".to_string());
+                                break Err(anyhow::anyhow!(
+                                    "ACP provider subprocess exited during active prompt: status={status} (session={session_id})"
+                                ));
+                            }
                             let effective_last_activity =
                                 max_instant_option(last_acp_activity, last_provider_local_activity);
                             let idle = effective_last_activity.elapsed();

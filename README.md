@@ -101,6 +101,7 @@ The repository is past the scaffold stage. The implemented system now includes:
 - Run Worktree Main Sync and Cross-Run Knowledge Transfer (Proposal 064 Phase 0 contract freeze)
 - implementation completeness and handoff contract with structured status and verification truth
 - bounded implementation closeout readiness gates ensuring proposal proof, audit coverage, evidence freshness, and handoff settlement before release
+- workflow-owned quality-gate blocker boundaries that route lower-layer recovery, review refresh, local code tails, no-progress holds, external evidence, and manual release through canonical contract truth
 - durable side-effect ledger, release settlement, and reconciliation
 - configurable escalation policies with durable tier advancement, GraphQL/MCP/report readback, governed macOS read surfaces, and documented proof-gate aliases
 - fail-closed server parity harness with generation-scoped storage and runtime publication

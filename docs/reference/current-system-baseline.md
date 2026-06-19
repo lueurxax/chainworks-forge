@@ -52,6 +52,7 @@ At the current baseline, the product includes:
 - worktree mutation barrier protecting concurrent read/write and orchestrated sync (Proposal 064),
 - run worktree main sync and cross-run knowledge capsules (Proposal 064 Phase 0 contract freeze),
 - implementation completeness and handoff contract with structured status and verification truth,
+- workflow-owned quality-gate blocker boundary routing with canonical contract readback,
 - fail-closed server parity harness with generation-scoped storage and runtime publication,
 - rejected implementation approval loopback to proposal refinement,
 - MVP benchmark/sign-off state and replayable `GO/HOLD` decision logic,
@@ -71,6 +72,7 @@ When implementation landed outside proposal closeout, the following code surface
 | Daemon lifecycle, endpoint publication, failed-serve mode, and audit checkpointing | `control-plane/crates/daemon/src/main.rs`, `Chainworks Forge/Views/DaemonLifecycleSurface.swift` | [local-daemon-lifecycle-supervision-and-packaging.md](local-daemon-lifecycle-supervision-and-packaging.md), [rust-control-plane.md](rust-control-plane.md) |
 | Storage health, hot-read guards, evidence spool, maintenance repair, and projection maintenance | `control-plane/crates/db/src/`, `control-plane/crates/mcp-server/src/tools/storage.rs`, `control-plane/crates/graphql-server/src/types/storage.rs` | [rust-control-plane.md](rust-control-plane.md), [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md) |
 | Agent continuation and lead-directed resumption | `control-plane/crates/mcp-server/src/tools/agents.rs`, `control-plane/crates/engine/src/` | [agent-work-continuation.md](agent-work-continuation.md) |
+| Quality-gate blocker boundary routing and readback | `control-plane/crates/engine/src/quality_gate_boundary.rs`, `control-plane/crates/engine/src/orchestrator.rs`, `control-plane/crates/db/src/repos/artifact_contracts.rs`, `control-plane/crates/mcp-server/src/tools/runtime.rs` | [workflow-execution-engine.md](workflow-execution-engine.md), [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md) |
 | Boundary policy, caller class, audit log, idempotency, and operator alerts | `control-plane/crates/auth/src/`, `control-plane/crates/db/src/repos/audit_log.rs`, `control-plane/crates/graphql-server/src/schema.rs`, `control-plane/crates/mcp-server/src/tools/runtime.rs` | [boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md), [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md), [ui-action-boundary.md](ui-action-boundary.md) |
 | Bounded tool-output and safe-search guard | `control-plane/crates/domain/src/tool_policy.rs`, `control-plane/crates/acp/src/transport.rs`, `control-plane/crates/acp/src/adapters/codex.rs`, `control-plane/crates/mcp-server/src/tools/runtime.rs` | [bounded-tool-output-and-safe-search-policy.md](bounded-tool-output-and-safe-search-policy.md), [acp-runtime-transport.md](acp-runtime-transport.md), [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md) |
 

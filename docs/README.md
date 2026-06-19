@@ -31,7 +31,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 ### Execution engine
 
-- [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — RunPlan compiler, orchestrator, executors, artifact management, resume, declarative workflow authority, durable side-effect ledger, and conflict resolution / lead mediation
+- [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — RunPlan compiler, orchestrator, executors, artifact management, resume, declarative workflow authority, quality-gate blocker boundary routing, durable side-effect ledger, and conflict resolution / lead mediation
 - [reference/artifact-discovery-and-settlement-optimization.md](reference/artifact-discovery-and-settlement-optimization.md) — Bounded discovery, settlement pipeline, and pre-prompt metadata
 - [reference/runtime-contract.md](reference/runtime-contract.md) — Frozen run snapshots, state machines, artifact model
 - [reference/execution-truth-and-recovery.md](reference/execution-truth-and-recovery.md) — Terminal outcomes, atomic transition settlement, cursor-driven resume, recovery precedence, host interruption, workflow conflict recovery, durable side-effect reconciliation, and startup recovery progress
@@ -57,7 +57,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 ### Outputs, contracts, and feedback
 
 - [reference/structured-output-envelope-and-contract-validation.md](reference/structured-output-envelope-and-contract-validation.md) — Named envelopes, contract binding, validation, Junie canary proof, failure substrate
-- [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, implementation self-assessment and handoff, failed-stage evidence, Junie code-writer completion-boundary subtypes, staged repair settlement, narrow recovery
+- [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, quality-gate blocker boundary contracts/readback, implementation self-assessment and handoff, failed-stage evidence, Junie code-writer completion-boundary subtypes, staged repair settlement, narrow recovery
 - [reference/implementation-closeout-readiness.md](reference/implementation-closeout-readiness.md) — Active closeout readiness authority, state-9 release routing, readback, rollout evidence, and retained gate aliases
 - [reference/proposal-loop-feedback-fidelity-and-rereview.md](reference/proposal-loop-feedback-fidelity-and-rereview.md) — Review-corpus fidelity, backlog carry-forward, targeted rereview
 - [reference/context-strategy-and-experiment-framework.md](reference/context-strategy-and-experiment-framework.md) — Strategy-profile freezing, handoff compilation, normalized telemetry

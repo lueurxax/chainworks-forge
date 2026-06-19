@@ -482,6 +482,11 @@ pub async fn execute(
                                 .await?,
                             );
                             obj.insert(
+                                "p094_boundary_readback".into(),
+                                db::repos::artifact_contracts::p094_readback_json(pool, run_id)
+                                    .await?,
+                            );
+                            obj.insert(
                                 "p082_recovery_matrix_readback".into(),
                                 crate::tools::reports::p082_recovery_matrix_readback_json(
                                     pool,
@@ -510,24 +515,8 @@ pub async fn execute(
                                 )
                             };
                         obj.insert("escalation_readback".into(), escalation_readback);
-                        if principal.class == auth::PrincipalClass::Operator {
-                            let p082_readbacks =
-                                db::repos::p082_recovery_matrix::readbacks_for_run(pool, run_id)
-                                    .await?;
-                            let p082_singular =
-                                db::repos::p082_recovery_matrix::latest_readback_from_readbacks(
-                                    &p082_readbacks,
-                                );
-                            db::repos::p082_recovery_matrix::emit_readback_lane_metrics(
-                                &p082_readbacks,
-                                "mcp",
-                            );
-                            obj.insert("p082_recovery_matrix_readback".into(), p082_singular);
-                            obj.insert(
-                                "p082_recovery_matrix_readbacks".into(),
-                                serde_json::Value::Array(p082_readbacks),
-                            );
-                        } else {
+                        if principal.class != auth::PrincipalClass::Operator {
+                            obj.insert("p094_boundary_readback".into(), serde_json::Value::Null);
                             obj.insert(
                                 "p082_recovery_matrix_readback".into(),
                                 serde_json::Value::Null,

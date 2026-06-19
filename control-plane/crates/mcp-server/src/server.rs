@@ -1541,6 +1541,15 @@ impl McpServer {
                     tools::reports::p091_orphan_repair_readback_json(&self.pool, run_id_parsed)
                         .await?,
                 );
+                response.insert(
+                    "p094_boundary_readback".into(),
+                    db::repos::artifact_contracts::p094_readback_json(&self.pool, run_id_parsed)
+                        .await?,
+                );
+                response.insert(
+                    "p094_rollout_decision".into(),
+                    tools::reports::p094_rollout_decision_json(&self.pool, run_id_parsed).await?,
+                );
                 response.insert("rollout_contract_readback".into(), mcp_rollout_readback);
             }
 

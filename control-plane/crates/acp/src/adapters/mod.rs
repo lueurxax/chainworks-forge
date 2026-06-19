@@ -6,6 +6,7 @@ pub mod junie;
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
@@ -198,6 +199,10 @@ impl AcpLaunchSpec {
         fingerprint
     }
 
+    fn has_recorded_capability_fingerprint(&self) -> bool {
+        self.expected_capability_fingerprint.is_some()
+    }
+
     pub fn apply_chainworks_meta_root_env(&mut self, req: &ExecutionRequest) {
         if let Some(meta_root) = chainworks_meta_root_env_value(req) {
             self.env.retain(|(name, _)| name != "CHAINWORKS_META_ROOT");
@@ -207,10 +212,17 @@ impl AcpLaunchSpec {
     }
 
     pub fn apply_chainworks_rust_cache_env(&mut self) {
+        let shared_target = chainworks_shared_cargo_target_dir();
+        upsert_env(&mut self.env, "CARGO_TARGET_DIR", shared_target.clone());
         upsert_env(
             &mut self.env,
-            "CARGO_TARGET_DIR",
-            chainworks_shared_cargo_target_dir(),
+            "CHAINWORKS_SHARED_CARGO_TARGET_DIR",
+            shared_target.clone(),
+        );
+        upsert_env(
+            &mut self.env,
+            "CHAINWORKS_GATE_CARGO_TARGET_ROOT",
+            chainworks_gate_cargo_target_root(&shared_target),
         );
         if !has_env(&self.env, "SCCACHE_DIR") {
             self.env
@@ -224,6 +236,12 @@ impl AcpLaunchSpec {
             if let Some(sccache) = find_sccache_binary() {
                 self.env.push(("RUSTC_WRAPPER".to_string(), sccache));
             }
+        }
+        if let Some(real_cargo) = find_cargo_binary() {
+            upsert_env(&mut self.env, "CHAINWORKS_REAL_CARGO", real_cargo);
+        }
+        if let Some(wrapper_dir) = ensure_chainworks_cargo_wrapper_dir() {
+            prepend_path_env(&mut self.env, &wrapper_dir);
         }
     }
 
@@ -533,22 +551,6 @@ fn strip_path_prefix(path_value: &str, prefix: Option<&str>) -> String {
         .strip_prefix(&format!("{prefix}:"))
         .unwrap_or(path_value)
         .to_string()
-}
-
-fn prepend_path_env(env: &mut Vec<(String, String)>, prefix: &str) {
-    let current = env
-        .iter()
-        .find(|(name, _)| name == "PATH")
-        .map(|(_, value)| value.clone())
-        .or_else(|| std::env::var("PATH").ok())
-        .unwrap_or_default();
-    env.retain(|(name, _)| name != "PATH");
-    let next = if current.is_empty() {
-        prefix.to_string()
-    } else {
-        format!("{prefix}:{current}")
-    };
-    env.push(("PATH".to_string(), next));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -927,8 +929,10 @@ pub trait AcpAdapter: Send + Sync {
             req
         };
         let mut command = Command::new(&launch_spec.binary_path);
-        launch_spec.apply_chainworks_meta_root_env(req);
-        launch_spec.apply_chainworks_rust_cache_env();
+        if !launch_spec.has_recorded_capability_fingerprint() {
+            launch_spec.apply_chainworks_meta_root_env(req);
+            launch_spec.apply_chainworks_rust_cache_env();
+        }
         ensure_chainworks_meta_root_launch_dir(req)?;
         self.preflight_launch(req, &mut launch_spec)?;
         if let Some(gate) = launch_spec.provider_launch_gate.as_ref() {
@@ -1234,6 +1238,14 @@ pub(crate) fn chainworks_sccache_dir() -> String {
         .into_owned()
 }
 
+fn chainworks_gate_cargo_target_root(shared_target: &str) -> String {
+    env_nonempty("CHAINWORKS_GATE_CARGO_TARGET_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(shared_target).join("gates"))
+        .to_string_lossy()
+        .into_owned()
+}
+
 pub(crate) fn find_sccache_binary() -> Option<String> {
     if matches!(
         env_nonempty("CHAINWORKS_CARGO_SCCACHE")
@@ -1271,6 +1283,126 @@ fn chainworks_cache_root() -> PathBuf {
         .map(|home| home.join("Library").join("Caches").join("Chainworks Forge"))
         .unwrap_or_else(|| std::env::temp_dir().join("chainworks-forge-cache"))
 }
+
+fn chainworks_cargo_wrapper_dir() -> PathBuf {
+    env_nonempty("CHAINWORKS_CARGO_WRAPPER_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| chainworks_cache_root().join("bin"))
+}
+
+fn find_cargo_binary() -> Option<String> {
+    if let Some(explicit) = env_nonempty("CHAINWORKS_REAL_CARGO") {
+        return Path::new(&explicit).is_file().then_some(explicit);
+    }
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|dir| dir.join("cargo"))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+}
+
+fn ensure_chainworks_cargo_wrapper_dir() -> Option<String> {
+    let wrapper_dir = chainworks_cargo_wrapper_dir();
+    if let Err(err) = fs::create_dir_all(&wrapper_dir) {
+        tracing::warn!(
+            path = %wrapper_dir.display(),
+            error = %err,
+            "failed to create Chainworks Cargo wrapper directory"
+        );
+        return None;
+    }
+    let wrapper_path = wrapper_dir.join("cargo");
+    if let Err(err) = fs::write(&wrapper_path, CHAINWORKS_CARGO_WRAPPER_SCRIPT) {
+        tracing::warn!(
+            path = %wrapper_path.display(),
+            error = %err,
+            "failed to write Chainworks Cargo wrapper"
+        );
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) = fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755)) {
+            tracing::warn!(
+                path = %wrapper_path.display(),
+                error = %err,
+                "failed to make Chainworks Cargo wrapper executable"
+            );
+            return None;
+        }
+    }
+    Some(wrapper_dir.to_string_lossy().into_owned())
+}
+
+fn prepend_path_env(env: &mut Vec<(String, String)>, path: &str) {
+    let existing = env
+        .iter()
+        .find(|(name, _)| name == "PATH")
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(default_provider_path_value);
+    let already_present = std::env::split_paths(&OsString::from(&existing))
+        .any(|candidate| candidate == Path::new(path));
+    if already_present {
+        upsert_env(env, "PATH", existing);
+    } else {
+        upsert_env(env, "PATH", format!("{path}:{existing}"));
+    }
+}
+
+const CHAINWORKS_CARGO_WRAPPER_SCRIPT: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+real_cargo="${CHAINWORKS_REAL_CARGO:-}"
+if [[ -z "$real_cargo" || ! -x "$real_cargo" ]]; then
+  echo "chainworks cargo wrapper: CHAINWORKS_REAL_CARGO is not executable" >&2
+  exit 127
+fi
+
+if [[ ! "${CHAINWORKS_ALLOW_LOCAL_CARGO_TARGET_DIR:-0}" =~ ^(1|true|TRUE|yes|YES)$ ]]; then
+  requested="${CARGO_TARGET_DIR:-}"
+  suffix=""
+  case "$requested" in
+    target)
+      suffix="default"
+      ;;
+    target/*)
+      suffix="${requested#target/}"
+      ;;
+    control-plane/target)
+      suffix="default"
+      ;;
+    control-plane/target/*)
+      suffix="${requested#control-plane/target/}"
+      ;;
+    */control-plane/target)
+      suffix="default"
+      ;;
+    */control-plane/target/*)
+      suffix="${requested#*/control-plane/target/}"
+      ;;
+  esac
+
+  if [[ -n "$suffix" ]]; then
+    if [[ -z "$suffix" || "$suffix" == "." ]]; then
+      suffix="default"
+    fi
+    safe_suffix="$(printf '%s' "$suffix" | sed -E 's#[/[:space:]]+#-#g; s#[^A-Za-z0-9._-]#_#g; s#^[-.]+##; s#[-.]+$##')"
+    if [[ -z "$safe_suffix" ]]; then
+      safe_suffix="default"
+    fi
+    gate_root="${CHAINWORKS_GATE_CARGO_TARGET_ROOT:-${CHAINWORKS_SHARED_CARGO_TARGET_DIR:-}/gates}"
+    if [[ "$gate_root" == "/gates" || -z "$gate_root" ]]; then
+      gate_root="${HOME:-/tmp}/Library/Caches/Chainworks Forge/cargo-target/gates"
+    fi
+    export CARGO_TARGET_DIR="${gate_root}/${safe_suffix}"
+    mkdir -p "$CARGO_TARGET_DIR"
+  fi
+fi
+
+exec "$real_cargo" "$@"
+"#;
 
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
@@ -1515,13 +1647,20 @@ mod tests {
     fn rust_cache_env_is_frozen_before_capability_fingerprint() {
         let tmp = tempfile::tempdir().unwrap();
         let target_dir = tmp.path().join("agent-target");
+        let wrapper_dir = tmp.path().join("wrapper-bin");
         let fake_sccache = tmp.path().join("sccache");
+        let fake_cargo = tmp.path().join("cargo");
         std::fs::write(&fake_sccache, "fixture").unwrap();
+        std::fs::write(&fake_cargo, "fixture").unwrap();
 
         let previous_target = std::env::var_os("CHAINWORKS_SHARED_CARGO_TARGET_DIR");
+        let previous_wrapper_dir = std::env::var_os("CHAINWORKS_CARGO_WRAPPER_DIR");
         let previous_sccache = std::env::var_os("CHAINWORKS_SCCACHE_BINARY");
+        let previous_cargo = std::env::var_os("CHAINWORKS_REAL_CARGO");
         std::env::set_var("CHAINWORKS_SHARED_CARGO_TARGET_DIR", &target_dir);
+        std::env::set_var("CHAINWORKS_CARGO_WRAPPER_DIR", &wrapper_dir);
         std::env::set_var("CHAINWORKS_SCCACHE_BINARY", &fake_sccache);
+        std::env::set_var("CHAINWORKS_REAL_CARGO", &fake_cargo);
 
         let mut spec = AcpLaunchSpec::new("provider-acp");
         spec.apply_chainworks_rust_cache_env();
@@ -1535,13 +1674,41 @@ mod tests {
             Some(value) => std::env::set_var("CHAINWORKS_SCCACHE_BINARY", value),
             None => std::env::remove_var("CHAINWORKS_SCCACHE_BINARY"),
         }
+        match previous_wrapper_dir {
+            Some(value) => std::env::set_var("CHAINWORKS_CARGO_WRAPPER_DIR", value),
+            None => std::env::remove_var("CHAINWORKS_CARGO_WRAPPER_DIR"),
+        }
+        match previous_cargo {
+            Some(value) => std::env::set_var("CHAINWORKS_REAL_CARGO", value),
+            None => std::env::remove_var("CHAINWORKS_REAL_CARGO"),
+        }
 
         let target_value = target_dir.to_string_lossy().into_owned();
         let sccache_value = fake_sccache.to_string_lossy().into_owned();
+        let cargo_value = fake_cargo.to_string_lossy().into_owned();
+        let wrapper_value = wrapper_dir.to_string_lossy().into_owned();
         assert!(spec
             .env
             .iter()
             .any(|(name, value)| name == "CARGO_TARGET_DIR" && value == &target_value));
+        assert!(spec
+            .env
+            .iter()
+            .any(|(name, value)| name == "CHAINWORKS_SHARED_CARGO_TARGET_DIR"
+                && value == &target_value));
+        assert!(spec
+            .env
+            .iter()
+            .any(|(name, value)| name == "CHAINWORKS_REAL_CARGO" && value == &cargo_value));
+        assert!(spec.env.iter().any(|(name, value)| {
+            name == "PATH"
+                && value
+                    .split(':')
+                    .next()
+                    .map(|first| first == wrapper_value)
+                    .unwrap_or(false)
+        }));
+        assert!(wrapper_dir.join("cargo").is_file());
         assert!(spec
             .env
             .iter()
@@ -1557,6 +1724,7 @@ mod tests {
     #[test]
     fn launch_preflight_creates_missing_chainworks_meta_root_directories() {
         let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().canonicalize().unwrap();
         let req = crate::ExecutionRequest {
             agent_execution_id: None,
             run_id: domain::ids::RunId::new(),
@@ -1567,7 +1735,7 @@ mod tests {
             provider: "gemini".to_string(),
             model: None,
             effort: None,
-            workspace_root: tmp.path().to_string_lossy().into_owned(),
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
             prompt: "prompt".to_string(),
             worktree_root: None,
             worktree_write_enabled: false,
@@ -1592,7 +1760,7 @@ mod tests {
             toolchain_home: None,
             toolchain_go_scope_enabled: false,
         };
-        let meta_root = tmp.path().join(".chainworks/run-meta");
+        let meta_root = workspace_root.join(".chainworks/run-meta");
 
         assert!(!meta_root.exists());
         ensure_chainworks_meta_root_launch_dir(&req).unwrap();
@@ -1642,6 +1810,7 @@ mod tests {
             reuse_existing_session: false,
             session_generation_id: None,
             provider_session_id: None,
+            provider_runtime_home: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: Some(".chainworks/run-meta".to_string()),
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,

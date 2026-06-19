@@ -186,7 +186,7 @@ fn test_parse_full_mvp_live_workflow() {
     let wf = workflow::definition::load(&wf_path).expect("should parse workflow YAML");
 
     assert_eq!(wf.initial_state, "state_1_idea_received");
-    assert_eq!(wf.states.len(), 12, "full-mvp-live has 12 states");
+    assert_eq!(wf.states.len(), 20, "full-mvp-live has 20 states");
 
     // Verify state types
     let s1 = &wf.states["state_1_idea_received"];
@@ -238,6 +238,150 @@ fn test_parse_full_mvp_live_workflow() {
     let s5 = &wf.states["state_5_proposal_refined"];
     let lc = s5.loop_config.as_ref().expect("state_5 has loop config");
     assert_eq!(lc.counter, "proposal_revision_count");
+}
+
+#[test]
+fn proposal_094_full_mvp_compiles_boundary_flow_with_string_approval() {
+    let wf_path = format!("{}/workflows/full-mvp-live.yaml", fixtures_dir());
+    let cat_path = format!("{}/agents/agents.yaml", fixtures_dir());
+    let plan = compiler::compile(&wf_path, &cat_path).expect("full-mvp-live should compile");
+
+    let decomposition = plan
+        .states
+        .get("state_5a_proposal_decomposition_reviewed")
+        .expect("P094 decomposition state should compile");
+    assert_eq!(
+        decomposition.tasks[0].outputs,
+        vec!["proposal_decomposition_plan".to_string()]
+    );
+
+    let boundary = plan
+        .states
+        .get("state_9_quality_gate_boundary_evaluated")
+        .expect("P094 system boundary evaluator state should compile");
+    let system_task = boundary
+        .system_task
+        .as_ref()
+        .expect("P094 boundary evaluator should be an in-process system task");
+    assert_eq!(system_task.task_type, "quality_gate_boundary_evaluator");
+    assert_eq!(system_task.executor_mode, "system.quality_gate_boundary");
+
+    let approval_def = workflow::definition::load(&wf_path)
+        .expect("workflow definition should load")
+        .states
+        .remove("state_9_blocker_boundary_approval")
+        .expect("P094 boundary approval state should exist");
+    assert_eq!(
+        approval_def.approval.as_deref(),
+        Some("required"),
+        "P094 must keep approval YAML string-compatible with current parsers"
+    );
+    let approval_transitions = approval_def
+        .transitions
+        .as_ref()
+        .expect("P094 boundary approval should declare transitions");
+    assert!(
+        approval_transitions.iter().any(|transition| {
+            transition.to == "state_9_implementation_reviewed"
+                && transition.when == "approval.rejected == true"
+        }),
+        "P094 rejection must route to implementation review refresh, not direct code refine"
+    );
+
+    let recovery = plan
+        .states
+        .get("state_9_quality_gate_boundary_evaluated")
+        .expect("P094 boundary evaluator state should compile");
+    for (status, target) in [
+        (
+            "blocker_boundary_status.status == 'output_settlement_required'",
+            "state_9_output_settlement_recovery",
+        ),
+        (
+            "blocker_boundary_status.status == 'side_effect_reconciliation_required'",
+            "state_9_side_effect_reconciliation",
+        ),
+        (
+            "blocker_boundary_status.status == 'runtime_recovery_required'",
+            "state_9_runtime_recovery",
+        ),
+        (
+            "blocker_boundary_status.status == 'invalid_claim'",
+            "state_9_implementation_reviewed",
+        ),
+    ] {
+        assert!(
+            recovery
+                .transitions
+                .iter()
+                .any(|transition| transition.condition == status && transition.to == target),
+            "P094 lower-layer status {status} should route to {target}"
+        );
+    }
+}
+
+#[test]
+fn proposal_094_boundary_accepted_transitions_are_mutually_exclusive() {
+    let wf_path = format!("{}/workflows/full-mvp-live.yaml", fixtures_dir());
+    let wf = workflow::definition::load(&wf_path).expect("workflow definition should load");
+    let accepted = wf
+        .states
+        .get("state_9_blocker_boundary_accepted")
+        .expect("P094 accepted boundary state should exist");
+    let transitions = accepted
+        .transitions
+        .as_ref()
+        .expect("accepted boundary state should declare transitions");
+    let accepted_run = accepted
+        .run
+        .as_ref()
+        .expect("accepted boundary state should have a run block");
+    let accepted_outputs = accepted_run
+        .sequence
+        .as_ref()
+        .and_then(|tasks| tasks.first())
+        .and_then(|task| task.outputs.as_ref())
+        .expect("accepted boundary task should declare outputs");
+    assert!(
+        !accepted_outputs
+            .iter()
+            .any(|output| output == "blocker_boundary_approval_request"),
+        "approval request must be system-produced before human approval, not after acceptance"
+    );
+
+    assert!(
+        transitions.iter().any(|transition| {
+            transition.to == "state_9_followup_proposal_seeded"
+                && transition
+                    .when
+                    .contains("followup_proposal_required == true")
+        }),
+        "follow-up seed transition should own the follow-up branch"
+    );
+    assert!(
+        transitions.iter().any(|transition| {
+            transition.to == "state_9_external_evidence_blocked"
+                && transition
+                    .when
+                    .contains("has_release_blocking_external_blockers == true")
+                && transition
+                    .when
+                    .contains("followup_proposal_required == false")
+        }),
+        "external evidence hold transition must be mutually exclusive with follow-up seeding"
+    );
+    assert!(
+        transitions.iter().any(|transition| {
+            transition.to == "state_11_manual_release"
+                && transition
+                    .when
+                    .contains("has_no_release_blocking_external_blockers == true")
+                && transition
+                    .when
+                    .contains("followup_proposal_required == false")
+        }),
+        "release transition must be mutually exclusive with follow-up seeding"
+    );
 }
 
 #[test]

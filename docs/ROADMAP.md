@@ -59,6 +59,9 @@ These are not active workstreams:
 - **P096** bounded tool output and safe search policy.
   - Implemented; proposal retired.
   - Operational truth lives in [bounded-tool-output-and-safe-search-policy.md](reference/bounded-tool-output-and-safe-search-policy.md); the `proposal-096|p096` gate alias is retained.
+- **P094** workflow-owned quality-gate blocker boundaries.
+  - Implemented; proposal retired.
+  - Operational truth lives in [workflow-execution-engine.md](reference/workflow-execution-engine.md#quality-gate-blocker-boundary-transitions) and [output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md#workflow-owned-quality-gate-boundary-contracts); the `proposal-094|p094` gate alias is retained.
 - **P036/P085** macOS operator navigation and thin-client affordance baseline.
   - Treat as implemented UI/read-model baseline unless a new delta proposal explicitly says otherwise.
 
@@ -102,9 +105,6 @@ Active stabilization and correctness work, in order:
 
 After the current recovery/output/ownership block stabilizes:
 
-- **P094** workflow-owned quality-gate blocker boundaries.
-  - Make quality-gate blocking a workflow-owned transition concern; approvals stay accept/reject only.
-  - Sequence after P082/P088 contracts stop moving and before broad P070 consolidation when P094 is needed to stop no-progress loops.
 - **P070** typed-boundary consolidation.
   - Refactor only after P082/P083/P088 stop moving the core contracts.
   - Includes residual legacy Swift engine cleanup (dead DSL/Engine code, orphaned fixtures, stale references) after the engine removal lands — see P070 G-9.

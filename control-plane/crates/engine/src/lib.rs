@@ -21,6 +21,7 @@ pub mod orchestrator;
 pub mod parity_control;
 pub mod preflight;
 pub mod proposal_review_router;
+pub mod quality_gate_boundary;
 pub mod recovery;
 pub mod release;
 pub mod rollout_contract_preflight;

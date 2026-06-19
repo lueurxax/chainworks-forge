@@ -1410,6 +1410,9 @@ async fn enrich_run_with_artifact_contracts(
             .await?
             .map(|check| Json(check.operator_readback_json_for_lane("graphql")));
     gql.side_effect_readback_json = Some(Json(side_effect_readback_json(pool, run_id).await?));
+    gql.p094_boundary_readback_json = Some(Json(
+        db::repos::artifact_contracts::p094_readback_json(pool, run_id).await?,
+    ));
     let code_writer_completion_readbacks =
         code_writer_completion_receipts::list_by_run(pool, run_id).await?;
     let canonical_code_writer_completion_readbacks =

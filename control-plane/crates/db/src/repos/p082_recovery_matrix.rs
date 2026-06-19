@@ -525,7 +525,7 @@ pub async fn readbacks_for_run(
     // for legacy plain-text or non-P082 JSON errors, per P082 backward-compat rule.
     // SQL-side LENGTH guard (SEC-P082-MEDIUM-2 fix).
     let rejected = sqlx::query(
-        r#"SELECT id, error, created_at
+        r#"SELECT id, command_type, caller_tool, error, created_at
            FROM command_journal
            WHERE run_id = ?1
              AND result_status IN ('failed', 'rejected')
@@ -547,6 +547,8 @@ pub async fn readbacks_for_run(
         let error_raw: Option<String> = row.try_get("error").unwrap_or(None);
         let journal_id: String = row.try_get("id").unwrap_or_default();
         let created_at: String = row.try_get("created_at").unwrap_or_default();
+        let command_type: String = row.try_get("command_type").unwrap_or_default();
+        let caller_tool: Option<String> = row.try_get("caller_tool").unwrap_or(None);
         if let Some(error_str) = error_raw {
             if error_str.len() > MAX_READBACK_ROW_BYTES {
                 continue;
@@ -564,7 +566,10 @@ pub async fn readbacks_for_run(
                         }
                     }
                 }
-            } else {
+            } else if command_journal_error_is_p082_retry_scope(
+                &command_type,
+                caller_tool.as_deref(),
+            ) {
                 // Legacy plain-text or non-P082 JSON: surface a safe fallback row with
                 // recovery_projection_integrity=unavailable. Raw error text is NOT exposed.
                 // scenario_id uses P082-R02 (rejected command context) as the closest
@@ -1215,6 +1220,24 @@ fn command_error_fallback_projection_integrity(error: &str) -> &'static str {
     } else {
         "unavailable"
     }
+}
+
+fn command_journal_error_is_p082_retry_scope(
+    command_type: &str,
+    caller_tool: Option<&str>,
+) -> bool {
+    matches!(
+        command_type,
+        "RetryStage"
+            | "StagesRetry"
+            | "WorkflowConflictsResolve"
+            | "ResolveWorkflowConflict"
+            | "CancelRun"
+            | "RunsCancel"
+    ) || matches!(
+        caller_tool,
+        Some("stages.retry" | "workflow_conflicts.resolve" | "runs.cancel")
+    )
 }
 
 fn p082_cancellation_action_identity_valid(

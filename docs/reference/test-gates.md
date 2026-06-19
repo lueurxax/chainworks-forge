@@ -2287,6 +2287,45 @@ Important:
 - Gate fails if Swift app-facing P082 consumption paths exist without tolerant decode and MainActor tests
 - No schema migration is permitted; if required readback cannot be stored in existing owners, P082 must be amended first
 
+### `proposal-094|p094` workflow-owned blocker-boundary contract/readback gate
+
+Retained historical alias proof gate for workflow-owned quality-gate blocker
+boundaries. The proposal artifact is retired; the gate validates stable
+reference docs, workflow/catalog examples, and focused Rust implementation
+suites.
+
+Scope:
+
+- Quality-gate artifact templates stay on `${CHAINWORKS_META_ROOT:-.chainworks}` and do not double-nest `.chainworks/runs/{id}/runs/{id}`
+- The engine resolver proves quality-gate templates resolve under the per-run meta root without unresolved `${run_id}` placeholders
+- Human approval examples remain compatible with the current string-valued `approval: required` DSL shape
+- Quality-gate boundary contract IDs are registered in the domain vocabulary and DB alias/readback layer
+- Workflow-consumed fields for `proposal_decomposition_plan`, `blocker_boundary_status`, and `blocker_boundary_approval_request` are canonical DB-extracted fields, exported through active-index/readback projection, and fail closed when unregistered
+- The bundled full-MVP workflow compiles with the P094 decomposition, boundary evaluator, lower-layer recovery, manual approval, accepted-boundary, follow-up seed, and external evidence hold states
+- The in-process quality-gate boundary evaluator routes lower-layer recovery, stale/unknown evidence refresh, fresh local code tail, `external_environment`/external blockers, server-verified no-progress, and pass states through explicit status/route-hint vocabulary
+- The evaluator accepts review owner classes (`security_reviewer`, `prepush_reviewer`, `implementation_auditor`) plus the `unknown` owner value, and routes them fail-closed to review refresh instead of implementation refinement
+- The evaluator fails closed for unknown blocker enum values and missing required route/gate fields, and `blocked_no_progress` requires server-owned prior boundary truth rather than an agent-authored flag alone
+- The server-generated `blocker_boundary_approval_request_v1` readback is linked to the concrete manual approval id created for the P094 boundary gate
+- GraphQL run detail and MCP operator surfaces expose the same full P094 boundary readback from canonical artifact-contract generations, including blocker details, hard blockers, and approval-request payloads
+- `proposal_decomposition_plan.requires_split = true` is accepted only when a non-empty blocking `split_candidates` entry is present; malformed split-required payloads fail closed before exposing workflow-consumed fields
+- `runtime.health` and operator report readback expose P094 `qualityGateBoundary` mode/readiness vocabulary plus a rollout decision object with go/hold criteria, current metric values, owner decision, promotion readiness, and the command-journal/rollout-contract auditability requirement for any enforcement-mode change
+- Quality-gate rollout/diagnostic metric names are retained in the DB metric inventory and covered by recorder tests, including `{proposal_id}` labeling for avoided refine loops and percent-valued guardrail readback
+- Human `accept` / `reject` labels normalize to durable `granted` / `rejected` approval states
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-094
+./scripts/test-gate.sh p094
+```
+
+Important:
+
+- `p094` is accepted as an alias
+- The gate runs static proposal/schema checks before focused Rust tests
+- The DB/API test slices must prove canonical readback for `status`, `requires_split`, `implementation_start_decision`, `followup_proposal_required`, `has_release_blocking_external_blockers`, `has_no_release_blocking_external_blockers`, `projection_integrity`, `primary_owner_class`, `workflow_route_hint`, freshness, allowed workflow routes, blocker fingerprints, hard blockers, and the approval-request lane
+- The gate fails if required P094 cargo filters select zero tests
+
 ### `proposal-096|p096` bounded tool output and safe-search guard
 
 Retained safe-search guard that keeps reviewer and auditor discovery bounded and verifies that the P096 alias remains available alongside proposal gates.

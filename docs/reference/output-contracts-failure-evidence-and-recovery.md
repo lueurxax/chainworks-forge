@@ -20,6 +20,7 @@ This reference covers:
 - catalog-backed output-contract authority,
 - strict proposal-review and aggregate summary contract enforcement,
 - Junie `code_writer` completion-boundary subtypes, engine-owned failure envelopes, and staged repair settlement,
+- workflow-owned quality-gate blocker boundary contracts and readback,
 - canonical validation-failure and failed-stage evidence,
 - same-run retry lineage and artifact namespace rules,
 - narrow recovery and report/export evidence references,
@@ -260,6 +261,12 @@ The current controlled contracts are:
 | `implementation_self_assessment_v2` | `implementation/self-assessment.json` | `complete`, `handoff_required`, `needs_code_fixes`, `blocked`, `unknown`, `invalid` |
 | `tests_result_v1` | `implementation/tests.json` | `green`, `red`, `blocked`, `unknown` |
 | `implementation_review_summary_v1` | `review/implementation-summary.json` | `code_complete`, `needs_code_fixes`, `release_evidence_blocked`, `invalid` |
+| `proposal_decomposition_plan_v1` | `proposal/decomposition-plan.json` | `ready_with_declared_boundaries`, `split_required`, `invalid`, `unknown` |
+| `quality_gate_blocker_assessment_v1` | `quality-gate/blocker-assessment.json` | `candidate`, `accepted`, `rejected`, `invalid`, `unknown` |
+| `blocker_boundary_status_v1` | `quality-gate/blocker-boundary-status.json` | `output_settlement_required`, `side_effect_reconciliation_required`, `runtime_recovery_required`, `review_refresh_required`, `local_code_tail_present`, `invalid_claim`, `blocked_no_progress`, `awaiting_human_boundary_approval`, `pass`, `invalid`, `unknown` |
+| `blocker_boundary_approval_request_v1` | `quality-gate/blocker-boundary-approval-request.json` | `requested`, `invalid`, `unknown` |
+| `blocker_boundary_human_decision_v1` | `quality-gate/blocker-boundary-human-decision.json` | `granted`, `rejected`, `invalid`, `unknown` |
+| `followup_proposal_seed_v1` | `quality-gate/followup-proposal-seed.json` | `created`, `invalid`, `unknown` |
 | `run_state_projection_v1` | `state/run-state.json` | generated only |
 
 Contract normalization is explicit and contract-specific:
@@ -271,6 +278,55 @@ Contract normalization is explicit and contract-specific:
 - `implementation_self_assessment_v2`: `implementation_complete`, `verification_green`, and blocking `remaining_code_tasks` are canonical dimensions. The workflow implementation loop reads `implementation_complete`, not legacy `seemingly_complete`.
 - `tests_result_v1`: status is the canonical test outcome; workflow guards read `tests_result_v1.status`, not legacy `tests_result.green`.
 - `implementation_review_summary_v1`: reviewer `changes_required`, `blocked`, and `block` normalize to `needs_code_fixes`; `release_evidence_blocked` remains separate so non-code release evidence can be routed without disguising source-code readiness.
+- `blocker_boundary_human_decision_v1`: human `accept` / `reject` labels normalize to durable approval states `granted` / `rejected`.
+
+### Workflow-owned quality-gate boundary contracts
+
+Quality-gate blocker routing is owned by canonical artifact contracts and the
+compiled workflow graph, not by lead-agent prose or ad hoc human route choices.
+The boundary path begins with a `quality_gate_blocker_assessment_v1` generation
+and an in-process `quality_gate_boundary_evaluator` system task. The evaluator
+normalizes that assessment into `blocker_boundary_status_v1`, records canonical
+dimensions, and exposes the same truth through GraphQL, MCP run detail, operator
+reports, and runtime health readback.
+
+Workflow-consumed fields for the boundary are SQLite-owned extracted fields. The
+runtime must fail closed rather than parse raw JSON when an unregistered field is
+used in `artifact.field` transitions. The controlled field set includes:
+
+- `proposal_decomposition_plan_v1.requires_split`,
+  `implementation_start_decision`, `split_candidates`, and
+  `blocking_split_candidate_count`;
+- `blocker_boundary_status_v1.status`, `projection_integrity`,
+  `primary_owner_class`, `workflow_route_hint`, `blocker_freshness`,
+  `allowed_workflow_routes`, blocker fingerprints, hard blockers,
+  `followup_proposal_required`,
+  `has_release_blocking_external_blockers`, and
+  `has_no_release_blocking_external_blockers`;
+- `blocker_boundary_approval_request_v1.status` and the approval id linked to
+  the concrete manual approval row created for the boundary gate.
+
+The evaluator gives lower-layer recovery precedence before any boundary
+approval. Output settlement, side-effect reconciliation, and runtime recovery
+route to their dedicated recovery states. Stale, superseded, unknown, or
+proposal-owned review evidence routes to review refresh. Fresh local
+code-writer-owned tails route back to implementation refinement. External,
+release-blocking, follow-up, and server-verified no-progress cases may create a
+manual boundary approval request. A pass status routes directly to manual
+release.
+
+Manual boundary approval remains accept/reject only. The human decision records
+whether the operator accepts the server-evaluated boundary; it does not select a
+route. Accepted boundaries use `blocker_boundary_status_v1` fields to choose
+follow-up seed generation, external evidence hold, or manual release. Rejected
+boundaries route back to review refresh for fresh evidence.
+
+`runtime.health` and operator reports expose the quality-gate boundary mode,
+readiness, current metric values, go/hold criteria, owner decision, and
+promotion readiness. Enforcement-mode changes require command-journal or
+rollout-contract evidence. The retained historical `proposal-094|p094` gate
+proves this contract against the stable workflow/catalog examples and focused
+Rust suites.
 
 ### Implementation self-assessment and handoff
 

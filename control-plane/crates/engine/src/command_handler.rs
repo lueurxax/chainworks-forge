@@ -2,6 +2,7 @@ use acp::AcpRuntimeManager;
 use anyhow::{anyhow, Context, Result};
 use auth;
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -14,7 +15,7 @@ use tracing::{info, warn};
 
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger,
-    approval_mutation_idempotency, approvals, artifact_contracts, audit_log, closeout,
+    approval_mutation_idempotency, approvals, artifact_contracts, artifacts, audit_log, closeout,
     code_writer_completion_receipts, command_journal, ideas, legacy_discovery_overrides,
     mcp_command_idempotency, projections, retry_operator_instructions,
     retry_stage_execution_authorities, runs, scheduler, sessions, stages, work_items,
@@ -27,6 +28,7 @@ use domain::agent::{
     AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement, AgentStatus,
 };
 use domain::approval::ApprovalDecision;
+use domain::artifact::{Artifact, ArtifactFormat};
 use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
 use domain::commands::{
     ApprovalResolutionDecision, CallerContext, Command, ConsumeProviderQuotaHoldCmd,
@@ -35,7 +37,7 @@ use domain::commands::{
 };
 use domain::discovery::{LegacyBroadDiscoveryPolicy, LegacyDiscoveryOverrideInput};
 use domain::events::DomainEvent;
-use domain::ids::{AgentExecutionId, ApprovalId, RunId, StageExecutionId};
+use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, RunId, StageExecutionId};
 use domain::proposal_gate_result::{
     ProposalGateFailureClassification, ProposalGateLineage, ProposalGateResult, ProposalGateStatus,
 };
@@ -52,7 +54,6 @@ use domain::workflow_conflict::{
     WorkflowTransitionCursorRecord,
 };
 use domain::PrincipalClass;
-use sha2::{Digest, Sha256};
 
 use crate::cancellation;
 use crate::closeout_fingerprint::{
@@ -2094,6 +2095,111 @@ impl CommandHandler {
         )
     }
 
+    async fn persist_p094_boundary_human_decision(
+        &self,
+        run_id: RunId,
+        stage_id: &str,
+        decision_label: &str,
+        canonical_approval_state: &str,
+        comment: Option<String>,
+        requested_at: DateTime<Utc>,
+        approval_id: ApprovalId,
+    ) -> Result<()> {
+        if stage_id != "state_9_blocker_boundary_approval" {
+            return Ok(());
+        }
+        let run = runs::find_by_id(&self.pool, run_id)
+            .await?
+            .context("P094 boundary approval run not found")?;
+        let target_path = crate::orchestrator::resolve_path_template(
+            "${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/blocker-boundary-human-decision.json",
+            &run.workspace_root,
+            run.chainworks_meta_root.as_deref(),
+        );
+        if let Some(parent) = std::path::Path::new(&target_path).parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "create P094 blocker boundary human decision directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let payload = serde_json::json!({
+            "schema_version": "blocker_boundary_human_decision_v1",
+            "approval_id": approval_id,
+            "decision_label": decision_label,
+            "canonical_approval_state": canonical_approval_state,
+            "comment": comment,
+            "decided_at": Utc::now().to_rfc3339(),
+            "decided_by": "operator",
+        });
+        let bytes = serde_json::to_vec_pretty(&payload)
+            .context("serialize blocker_boundary_human_decision_v1")?;
+        std::fs::write(&target_path, &bytes)
+            .with_context(|| format!("write P094 boundary human decision {target_path}"))?;
+
+        let artifact_id = ArtifactId::new();
+        let generation_id = format!("{stage_id}-p094-human-decision-{canonical_approval_state}");
+        artifact_contracts::upsert_verified_generation_and_rebuild(
+            &self.pool,
+            domain::artifact_contracts::ActiveArtifactGenerationInput {
+                run_id,
+                artifact_id,
+                contract_id: "blocker_boundary_human_decision_v1".into(),
+                canonical_path: target_path.clone(),
+                raw_path: target_path.clone(),
+                raw_status: canonical_approval_state.to_string(),
+                generation_id,
+                source_agent_execution_id: None,
+                source_stage_execution_id: None,
+                source_session_generation_id: None,
+                source_work_item_id: None,
+                supersedes_generation_id: None,
+                output_settlement: AgentOutputSettlement::ValidOutputsFromCompletedExecution,
+                partial: false,
+                warnings: vec![],
+            },
+        )
+        .await?;
+
+        artifacts::insert(
+            &self.pool,
+            &Artifact {
+                id: artifact_id,
+                run_id,
+                stage_id: stage_id.to_string(),
+                agent_id: "operator".to_string(),
+                name: "blocker_boundary_human_decision".to_string(),
+                contract_id: "blocker_boundary_human_decision_v1".to_string(),
+                format: ArtifactFormat::Json,
+                file_path: target_path,
+                checksum_sha256: Some(format!("{:x}", Sha256::digest(&bytes))),
+                size_bytes: Some(bytes.len() as i64),
+                provider: "operator.approval".to_string(),
+                model: None,
+                created_at: Utc::now(),
+                is_pinned: false,
+                report_kind: None,
+                report_version: None,
+                agent_execution_id: None,
+            },
+        )
+        .await?;
+        db::metrics::record_p094_boundary_approval(canonical_approval_state);
+        let latency = Utc::now()
+            .signed_duration_since(requested_at)
+            .to_std()
+            .unwrap_or_else(|_| Duration::from_secs(0));
+        db::metrics::record_p094_human_boundary_approval_latency(latency);
+        if canonical_approval_state == "granted" {
+            db::metrics::record_p094_external_blocker_accepted("quality_gate_boundary");
+        } else if canonical_approval_state == "rejected" {
+            db::metrics::record_p094_post_boundary_reopen("operator_rejected_boundary");
+            db::metrics::record_p094_accepted_boundary_later_rejected("operator_rejected_boundary");
+        }
+        Ok(())
+    }
+
     pub fn new_with_acp_and_capacity(
         pool: SqlitePool,
         events: EventSender,
@@ -2255,6 +2361,18 @@ impl CommandHandler {
             && caller.principal_class != PrincipalClass::Operator
         {
             anyhow::bail!("forbidden: ResolveApproval requires operator principal");
+        }
+        if let Command::ResolveApproval(ref c) = cmd {
+            if c.stage_id == "state_9_blocker_boundary_approval"
+                && c.decision == ApprovalResolutionDecision::Rejected
+                && c.rationale
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty()
+            {
+                anyhow::bail!("P094 blocker-boundary rejection requires a comment");
+            }
         }
         if matches!(&cmd, Command::SettleProposalGate(_))
             && caller.principal_class != PrincipalClass::Operator
@@ -2900,6 +3018,7 @@ impl CommandHandler {
 
             Command::ApproveStage(c) => {
                 let now = Utc::now();
+                let approval_comment = c.comment.clone();
                 let has_post_tasks = self
                     .check_has_post_approval_tasks(c.run_id, &c.stage_id)
                     .await;
@@ -3011,6 +3130,16 @@ impl CommandHandler {
                     decision: ApprovalDecision::Granted,
                 });
                 projections::rebuild_approval_inbox(&self.pool, c.run_id).await?;
+                self.persist_p094_boundary_human_decision(
+                    c.run_id,
+                    &c.stage_id,
+                    "accept",
+                    "granted",
+                    approval_comment,
+                    approval.requested_at,
+                    approval.id,
+                )
+                .await?;
 
                 Ok(CommandResult::StageApproved {
                     approval_id: approval.id,
@@ -3019,6 +3148,16 @@ impl CommandHandler {
 
             Command::RejectStage(c) => {
                 let now = Utc::now();
+                let rejection_comment = c.comment.clone();
+                if c.stage_id == "state_9_blocker_boundary_approval"
+                    && rejection_comment
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .is_empty()
+                {
+                    anyhow::bail!("P094 blocker-boundary rejection requires a comment");
+                }
                 let tx_started = Instant::now();
                 let mut tx = self
                     .begin_command_transaction("command.RejectStage", journal.id.clone())
@@ -3122,6 +3261,16 @@ impl CommandHandler {
                     decision: ApprovalDecision::Rejected,
                 });
                 projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
+                self.persist_p094_boundary_human_decision(
+                    c.run_id,
+                    &c.stage_id,
+                    "reject",
+                    "rejected",
+                    rejection_comment,
+                    approval.requested_at,
+                    approval.id,
+                )
+                .await?;
 
                 Ok(CommandResult::StageRejected {
                     approval_id: approval.id,
@@ -4750,6 +4899,7 @@ impl CommandHandler {
                     ApprovalResolutionDecision::Approved => "approve",
                     ApprovalResolutionDecision::Rejected => "reject",
                 };
+                let rationale = c.rationale.clone();
 
                 let has_post_tasks = if decision == ApprovalDecision::Granted {
                     self.check_has_post_approval_tasks(c.run_id, &c.stage_id)
@@ -5123,6 +5273,20 @@ impl CommandHandler {
                     decision,
                 });
                 projections::rebuild_all_for_run(&self.pool, authoritative_run_id).await?;
+                let (decision_label, canonical_approval_state) = match c.decision {
+                    ApprovalResolutionDecision::Approved => ("accept", "granted"),
+                    ApprovalResolutionDecision::Rejected => ("reject", "rejected"),
+                };
+                self.persist_p094_boundary_human_decision(
+                    authoritative_run_id,
+                    &authoritative_stage_id,
+                    decision_label,
+                    canonical_approval_state,
+                    rationale,
+                    approval.requested_at,
+                    approval.id,
+                )
+                .await?;
 
                 let result = match c.decision {
                     ApprovalResolutionDecision::Approved => CommandResult::StageApproved {

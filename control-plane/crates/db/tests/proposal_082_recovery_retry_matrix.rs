@@ -202,6 +202,51 @@ async fn p082_legacy_plain_text_command_journal_error_is_safe() {
     );
 }
 
+#[tokio::test]
+async fn p082_generic_failed_command_journal_error_does_not_create_r02_readback() {
+    let pool = setup_db().await;
+    let now = Utc::now();
+    let run_id = RunId::new();
+    let run_id_str = run_id.to_string();
+    insert_test_run(&pool, &run_id_str, &now.to_rfc3339()).await;
+    let journal_id = format!("generic-failed-command-{run_id_str}");
+
+    command_journal::record(
+        &pool,
+        &journal_id,
+        "RunsGet",
+        &format!(r#"{{"run_id":"{run_id_str}"}}"#),
+        Some(&run_id_str),
+        now,
+        Some("mcp"),
+        Some("operator-1"),
+        Some("operator"),
+        Some("runs.get"),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("record generic command journal entry");
+    command_journal::fail_entry(
+        &pool,
+        &journal_id,
+        now,
+        "generic readback failure unrelated to retry recovery",
+    )
+    .await
+    .expect("fail generic command journal entry");
+
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
+        .await
+        .expect("readbacks_for_run should ignore generic failed commands");
+    assert!(
+        readbacks.is_empty(),
+        "generic command_journal failures must not be over-classified as P082-R02 readbacks"
+    );
+}
+
 // ── P082: Malformed JSON envelope is safe ─────────────────────────────────
 
 #[tokio::test]
