@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -24,6 +25,15 @@ use domain::proposal_gate_result::PROPOSAL_GATE_RESULT_V1_CONTRACT_ID;
 use crate::pool::log_write_transaction;
 use crate::writer::begin_registered_immediate_transaction;
 
+const ARTIFACT_CONTRACT_READBACK_MAX_BYTES: u64 = 1024 * 1024;
+
+#[derive(Clone, Debug)]
+struct ArtifactReadRoots {
+    run_id: RunId,
+    chainworks_meta_root: Option<PathBuf>,
+    artifact_root: PathBuf,
+}
+
 #[derive(Clone, Debug)]
 pub struct RunStateProjectionRow {
     pub run_id: RunId,
@@ -32,6 +42,20 @@ pub struct RunStateProjectionRow {
     pub exported_active_index_path: Option<String>,
     pub exported_run_state_path: Option<String>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActiveArtifactContractGenerationRow {
+    pub generation_id: String,
+    pub contract_id: String,
+    pub canonical_path: String,
+    pub raw_path: String,
+    pub raw_status: String,
+    pub canonical_status: String,
+    pub output_settlement: String,
+    pub source_generation_verified: bool,
+    pub canonical_dimensions_json: serde_json::Value,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -54,11 +78,104 @@ pub async fn upsert_generation_and_rebuild(
     export_projection_files(pool, run_id).await
 }
 
+pub async fn upsert_verified_generation_and_rebuild(
+    pool: &SqlitePool,
+    input: ActiveArtifactGenerationInput,
+) -> Result<()> {
+    let run_id = input.run_id;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "artifact_contracts.upsert_verified_generation",
+    )
+    .await?;
+    let read_roots = artifact_read_roots_for_run_tx(&mut tx, input.run_id).await?;
+    record_p094_followup_seed_metric_if_needed(&input, &read_roots);
+    let raw_status = effective_raw_status_for_generation(
+        &read_roots,
+        &input.contract_id,
+        &input.raw_path,
+        &input.raw_status,
+    )?;
+    let normalized =
+        normalize_contract_status(&input.contract_id, &raw_status).map_err(anyhow::Error::msg)?;
+    let mut warnings = input.warnings.clone();
+    warnings.extend(normalized.warnings.clone());
+    let warnings_json = serde_json::to_string(&warnings)?;
+    let validation_errors_json = serde_json::to_string(&normalized.validation_errors)?;
+    let now = Utc::now().to_rfc3339();
+    let supersedes_generation_id = effective_supersedes_generation_id_tx(
+        &mut tx,
+        input.run_id,
+        &input.contract_id,
+        &input.generation_id,
+        input.supersedes_generation_id.clone(),
+        normalized.valid,
+    )
+    .await?;
+    let mut verified_input = input;
+    verified_input.supersedes_generation_id = supersedes_generation_id;
+    insert_generation_in_tx(
+        &mut tx,
+        &verified_input,
+        &normalized.canonical_status,
+        normalized.valid,
+        true,
+        &warnings_json,
+        &validation_errors_json,
+        &now,
+        verified_input.output_settlement.clone(),
+    )
+    .await?;
+    if normalized.valid {
+        sqlx::query(
+            r#"INSERT INTO active_artifact_contracts (run_id, contract_id, generation_id, updated_at)
+               VALUES (?1, ?2, ?3, ?4)
+               ON CONFLICT(run_id, contract_id) DO UPDATE SET
+                 generation_id = excluded.generation_id,
+                 updated_at = excluded.updated_at"#,
+        )
+        .bind(verified_input.run_id.to_string())
+        .bind(&verified_input.contract_id)
+        .bind(&verified_input.generation_id)
+        .bind(&now)
+        .execute(&mut **tx)
+        .await?;
+    }
+    rebuild_run_state_projection_tx(&mut tx, run_id).await?;
+    tx.commit().await?;
+    export_projection_files(pool, run_id).await
+}
+
+fn record_p094_followup_seed_metric_if_needed(
+    input: &ActiveArtifactGenerationInput,
+    roots: &ArtifactReadRoots,
+) {
+    if input.contract_id != "followup_proposal_seed_v1" {
+        return;
+    }
+    let tail_class = read_confined_artifact_bytes(roots, &input.raw_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("tail_class")
+                .or_else(|| value.get("class"))
+                .or_else(|| value.get("status"))
+                .and_then(|field| field.as_str())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "unspecified".to_string());
+    crate::metrics::record_p094_followup_seed_created(&tail_class);
+}
+
 pub async fn upsert_generation_and_rebuild_tx(
     tx: &mut Transaction<'_, Sqlite>,
     input: ActiveArtifactGenerationInput,
 ) -> Result<()> {
+    let read_roots = artifact_read_roots_for_run_tx(tx, input.run_id).await?;
+    record_p094_followup_seed_metric_if_needed(&input, &read_roots);
     let raw_status = effective_raw_status_for_generation(
+        &read_roots,
         &input.contract_id,
         &input.raw_path,
         &input.raw_status,
@@ -68,7 +185,7 @@ pub async fn upsert_generation_and_rebuild_tx(
     let mut warnings = input.warnings.clone();
     warnings.extend(normalized.warnings.clone());
     let canonical_dimensions_json =
-        canonical_dimensions_json_for_generation(&input.contract_id, &input.raw_path)?;
+        canonical_dimensions_json_for_generation(&read_roots, &input.contract_id, &input.raw_path)?;
     let supersedes_generation_id = effective_supersedes_generation_id_tx(
         tx,
         input.run_id,
@@ -156,6 +273,7 @@ pub async fn repair_contract_status_normalization_tx(
     run_id: RunId,
 ) -> Result<u64> {
     let run_id_str = run_id.to_string();
+    let read_roots = artifact_read_roots_for_run_tx(tx, run_id).await?;
     let rows = sqlx::query(
         r#"SELECT generation_id, contract_id, raw_path, raw_status, warnings_json,
                   source_generation_verified
@@ -188,7 +306,7 @@ pub async fn repair_contract_status_normalization_tx(
         let warnings_json = serde_json::to_string(&warnings)?;
         let validation_errors_json = serde_json::to_string(&normalized.validation_errors)?;
         let canonical_dimensions_json =
-            canonical_dimensions_json_for_generation(&contract_id, &raw_path)?;
+            canonical_dimensions_json_for_generation(&read_roots, &contract_id, &raw_path)?;
         let now = Utc::now().to_rfc3339();
 
         sqlx::query(
@@ -580,7 +698,9 @@ pub async fn import_generation_with_claim_cas_tx(
     source_session_generation_id: &str,
     input: ActiveArtifactGenerationInput,
 ) -> Result<SourceGenerationImportDecision> {
+    let read_roots = artifact_read_roots_for_run_tx(tx, input.run_id).await?;
     let raw_status = effective_raw_status_for_generation(
+        &read_roots,
         &input.contract_id,
         &input.raw_path,
         &input.raw_status,
@@ -689,8 +809,9 @@ async fn insert_generation_in_tx(
     now: &str,
     output_settlement: AgentOutputSettlement,
 ) -> Result<()> {
+    let read_roots = artifact_read_roots_for_run_tx(tx, input.run_id).await?;
     let canonical_dimensions_json =
-        canonical_dimensions_json_for_generation(&input.contract_id, &input.raw_path)?;
+        canonical_dimensions_json_for_generation(&read_roots, &input.contract_id, &input.raw_path)?;
     sqlx::query(
         r#"INSERT OR REPLACE INTO artifact_contract_generations
            (generation_id, run_id, artifact_id, contract_id, canonical_path, raw_path, raw_status,
@@ -895,6 +1016,85 @@ pub async fn find_run_state_projection(
     .transpose()
 }
 
+pub async fn p094_readback_json(pool: &SqlitePool, run_id: RunId) -> Result<serde_json::Value> {
+    let proposal_decomposition_plan =
+        p094_active_contract_readback_json(pool, run_id, "proposal_decomposition_plan_v1").await?;
+    let quality_gate_blocker_assessment =
+        p094_active_contract_readback_json(pool, run_id, "quality_gate_blocker_assessment_v1")
+            .await?;
+    let blocker_boundary_status =
+        p094_active_contract_readback_json(pool, run_id, "blocker_boundary_status_v1").await?;
+    let blocker_boundary_approval_request =
+        p094_active_contract_readback_json(pool, run_id, "blocker_boundary_approval_request_v1")
+            .await?;
+    let blocker_boundary_human_decision =
+        p094_active_contract_readback_json(pool, run_id, "blocker_boundary_human_decision_v1")
+            .await?;
+    let followup_proposal_seed =
+        p094_active_contract_readback_json(pool, run_id, "followup_proposal_seed_v1").await?;
+    Ok(serde_json::json!({
+        "schema_version": "p094_boundary_readback_v1",
+        "proposal_decomposition_plan": proposal_decomposition_plan,
+        "quality_gate_blocker_assessment": quality_gate_blocker_assessment,
+        "blocker_boundary_status": blocker_boundary_status,
+        "blocker_boundary_approval_request": blocker_boundary_approval_request,
+        "blocker_boundary_human_decision": blocker_boundary_human_decision,
+        "followup_proposal_seeds": match followup_proposal_seed {
+            serde_json::Value::Null => serde_json::json!([]),
+            value => serde_json::json!([value]),
+        },
+    }))
+}
+
+async fn p094_active_contract_readback_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+    contract_id: &str,
+) -> Result<serde_json::Value> {
+    let Some(row) = find_active_generation_by_contract_id(pool, run_id, contract_id).await? else {
+        return Ok(serde_json::Value::Null);
+    };
+    let roots = artifact_read_roots_for_run(pool, run_id).await?;
+    let payload = read_confined_artifact_bytes(&roots, &row.raw_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let mut object = match payload {
+        serde_json::Value::Object(object) => object,
+        value => {
+            let mut object = serde_json::Map::new();
+            object.insert("payload".to_string(), value);
+            object
+        }
+    };
+    object.insert(
+        "generation_id".to_string(),
+        serde_json::json!(row.generation_id),
+    );
+    object.insert(
+        "contract_id".to_string(),
+        serde_json::json!(row.contract_id),
+    );
+    object.insert(
+        "canonical_path".to_string(),
+        serde_json::json!(row.canonical_path),
+    );
+    object.insert(
+        "source_generation_verified".to_string(),
+        serde_json::json!(row.source_generation_verified),
+    );
+    object.insert(
+        "active_index_summary".to_string(),
+        serde_json::json!({
+            "status": row.canonical_status,
+            "output_settlement": row.output_settlement,
+            "canonical_dimensions": row.canonical_dimensions_json,
+            "created_at": row.created_at.to_rfc3339(),
+        }),
+    );
+    Ok(serde_json::Value::Object(object))
+}
+
 pub async fn canonical_contract_field(
     pool: &SqlitePool,
     run_id: RunId,
@@ -937,6 +1137,26 @@ pub async fn active_contract_exists_result(
             true,
         )))
     }
+}
+
+pub async fn find_active_generation_by_contract_id(
+    pool: &SqlitePool,
+    run_id: RunId,
+    contract_id: &str,
+) -> Result<Option<ActiveArtifactContractGenerationRow>> {
+    let row = sqlx::query(
+        r#"SELECT g.generation_id, g.contract_id, g.canonical_path, g.raw_path, g.raw_status,
+                  g.canonical_status, g.output_settlement, g.source_generation_verified,
+                  g.canonical_dimensions_json, g.created_at
+           FROM active_artifact_contracts a
+           JOIN artifact_contract_generations g ON g.generation_id = a.generation_id
+           WHERE a.run_id = ?1 AND a.contract_id = ?2"#,
+    )
+    .bind(run_id.to_string())
+    .bind(contract_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(parse_active_generation_row).transpose()
 }
 
 /// P077: Read a canonical field from closeout_gate_generations for
@@ -1031,6 +1251,34 @@ pub async fn canonical_contract_field_result(
         "status" | "implementation_status" => {
             CanonicalContractField::Resolved(serde_json::json!(status))
         }
+        "requires_split" if active_contract_id == "proposal_decomposition_plan_v1" => {
+            bool_dimension_field(&dimensions, contract_id, field_name)
+        }
+        "implementation_start_decision"
+            if active_contract_id == "proposal_decomposition_plan_v1" =>
+        {
+            string_dimension_field(&dimensions, contract_id, field_name)
+        }
+        "followup_proposal_required"
+        | "has_release_blocking_external_blockers"
+        | "has_no_release_blocking_external_blockers"
+            if active_contract_id == "blocker_boundary_status_v1" =>
+        {
+            bool_dimension_field(&dimensions, contract_id, field_name)
+        }
+        "projection_integrity" if active_contract_id == "blocker_boundary_status_v1" => {
+            string_dimension_field(&dimensions, contract_id, field_name)
+        }
+        "primary_owner_class" | "workflow_route_hint"
+            if active_contract_id == "blocker_boundary_status_v1" =>
+        {
+            string_dimension_field(&dimensions, contract_id, field_name)
+        }
+        "blocker_freshness" | "allowed_workflow_routes"
+            if active_contract_id == "blocker_boundary_status_v1" =>
+        {
+            json_dimension_field(&dimensions, contract_id, field_name)
+        }
         "release_evidence_status" if active_contract_id == "audit_report_v1" => {
             match dimensions
                 .get("release_evidence_status")
@@ -1068,6 +1316,45 @@ pub async fn canonical_contract_field_result(
             contract_id: contract_id.to_string(),
         },
     })
+}
+
+fn bool_dimension_field(
+    dimensions: &serde_json::Value,
+    contract_id: &str,
+    field_name: &str,
+) -> CanonicalContractField {
+    match dimensions.get(field_name).and_then(|value| value.as_bool()) {
+        Some(value) => CanonicalContractField::Resolved(serde_json::json!(value)),
+        None => CanonicalContractField::MissingControlled {
+            contract_id: contract_id.to_string(),
+        },
+    }
+}
+
+fn string_dimension_field(
+    dimensions: &serde_json::Value,
+    contract_id: &str,
+    field_name: &str,
+) -> CanonicalContractField {
+    match dimensions.get(field_name).and_then(|value| value.as_str()) {
+        Some(value) => CanonicalContractField::Resolved(serde_json::json!(value)),
+        None => CanonicalContractField::MissingControlled {
+            contract_id: contract_id.to_string(),
+        },
+    }
+}
+
+fn json_dimension_field(
+    dimensions: &serde_json::Value,
+    contract_id: &str,
+    field_name: &str,
+) -> CanonicalContractField {
+    match dimensions.get(field_name) {
+        Some(value) => CanonicalContractField::Resolved(value.clone()),
+        None => CanonicalContractField::MissingControlled {
+            contract_id: contract_id.to_string(),
+        },
+    }
 }
 
 pub async fn rebuild_run_state_projection(pool: &SqlitePool, run_id: RunId) -> Result<()> {
@@ -1151,17 +1438,23 @@ async fn effective_supersedes_generation_id_tx(
     Ok(previous.filter(|generation_id| generation_id != new_generation_id))
 }
 
-fn canonical_dimensions_json_for_generation(contract_id: &str, raw_path: &str) -> Result<String> {
+fn canonical_dimensions_json_for_generation(
+    roots: &ArtifactReadRoots,
+    contract_id: &str,
+    raw_path: &str,
+) -> Result<String> {
     let mut dimensions = serde_json::Map::new();
     if contract_id == "audit_report_v1" {
-        if let Some(raw_status) = audit_release_evidence_status_from_path(raw_path)? {
+        if let Some(raw_status) = audit_release_evidence_status_from_path(roots, raw_path)? {
             dimensions.insert(
                 "release_evidence_status".to_string(),
                 serde_json::json!(normalize_audit_release_evidence_status(&raw_status)?),
             );
         }
     } else if contract_id == "implementation_self_assessment_v2" {
-        if let Some(implementation) = implementation_self_assessment_summary_from_path(raw_path)? {
+        if let Some(implementation) =
+            implementation_self_assessment_summary_from_path(roots, raw_path)?
+        {
             dimensions.insert(
                 "implementation_complete".to_string(),
                 serde_json::json!(implementation.implementation_complete),
@@ -1183,6 +1476,136 @@ fn canonical_dimensions_json_for_generation(contract_id: &str, raw_path: &str) -
                 serde_json::json!(implementation.blocking_review_handoff_task_count),
             );
         }
+    } else if contract_id == "proposal_decomposition_plan_v1" {
+        if let Some(value) = p094_json_from_path(roots, raw_path)? {
+            let valid_blocking_split_candidate_count =
+                p094_valid_blocking_split_candidate_count(&value);
+            if let Some(requires_split) = value
+                .get("requires_split")
+                .and_then(|value| value.as_bool())
+            {
+                if !requires_split || valid_blocking_split_candidate_count > 0 {
+                    dimensions.insert(
+                        "requires_split".to_string(),
+                        serde_json::json!(requires_split),
+                    );
+                } else {
+                    dimensions.insert(
+                        "split_candidate_validation".to_string(),
+                        serde_json::json!("requires_split_without_blocking_split_candidate"),
+                    );
+                }
+            }
+            if let Some(split_candidates) = value
+                .get("split_candidates")
+                .and_then(|value| value.as_array())
+            {
+                dimensions.insert(
+                    "split_candidate_count".to_string(),
+                    serde_json::json!(split_candidates.len() as u64),
+                );
+                dimensions.insert(
+                    "blocking_split_candidate_count".to_string(),
+                    serde_json::json!(valid_blocking_split_candidate_count as u64),
+                );
+            }
+            if let Some(decision) = value
+                .get("implementation_start_decision")
+                .and_then(|value| value.as_str())
+            {
+                let requires_split = value
+                    .get("requires_split")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                if !requires_split || valid_blocking_split_candidate_count > 0 {
+                    dimensions.insert(
+                        "implementation_start_decision".to_string(),
+                        serde_json::json!(decision),
+                    );
+                }
+            }
+        }
+    } else if contract_id == "blocker_boundary_status_v1" {
+        if let Some(value) = p094_json_from_path(roots, raw_path)? {
+            for field_name in [
+                "followup_proposal_required",
+                "has_release_blocking_external_blockers",
+                "has_no_release_blocking_external_blockers",
+            ] {
+                if let Some(field_value) = value.get(field_name).and_then(|value| value.as_bool()) {
+                    dimensions.insert(field_name.to_string(), serde_json::json!(field_value));
+                }
+            }
+            if let Some(projection_integrity) = value
+                .get("projection_integrity")
+                .and_then(|value| value.as_str())
+            {
+                dimensions.insert(
+                    "projection_integrity".to_string(),
+                    serde_json::json!(projection_integrity),
+                );
+            }
+            if let Some(primary_owner_class) = value
+                .get("primary_owner_class")
+                .and_then(|value| value.as_str())
+            {
+                dimensions.insert(
+                    "primary_owner_class".to_string(),
+                    serde_json::json!(primary_owner_class),
+                );
+            }
+            if let Some(workflow_route_hint) = value
+                .get("workflow_route_hint")
+                .and_then(|value| value.as_str())
+            {
+                dimensions.insert(
+                    "workflow_route_hint".to_string(),
+                    serde_json::json!(workflow_route_hint),
+                );
+            }
+            if let Some(blocker_freshness) = value
+                .get("blocker_freshness")
+                .and_then(|value| value.as_str())
+            {
+                dimensions.insert(
+                    "blocker_freshness".to_string(),
+                    serde_json::json!(blocker_freshness),
+                );
+            }
+            let blocker_freshness_details = value
+                .get("blockers")
+                .and_then(|value| value.as_array())
+                .map(|blockers| {
+                    blockers
+                        .iter()
+                        .filter_map(|blocker| {
+                            Some(serde_json::json!({
+                                "id": blocker.get("id")?.as_str()?,
+                                "owner_class": blocker.get("owner_class")?.as_str()?,
+                                "evidence_freshness": blocker
+                                    .get("evidence_freshness")
+                                    .or_else(|| blocker.get("freshness"))?
+                                    .as_str()?,
+                                "allowed_workflow_routes": blocker
+                                    .get("allowed_workflow_routes")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!([])),
+                            }))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            dimensions.insert(
+                "blocker_freshness_details".to_string(),
+                serde_json::json!(blocker_freshness_details),
+            );
+            if let Some(allowed_workflow_routes) = value.get("allowed_workflow_routes") {
+                dimensions.insert(
+                    "allowed_workflow_routes".to_string(),
+                    allowed_workflow_routes.clone(),
+                );
+            }
+        }
     }
     Ok(serde_json::to_string(&serde_json::Value::Object(
         dimensions,
@@ -1190,22 +1613,231 @@ fn canonical_dimensions_json_for_generation(contract_id: &str, raw_path: &str) -
 }
 
 fn effective_raw_status_for_generation(
+    roots: &ArtifactReadRoots,
     contract_id: &str,
     raw_path: &str,
     fallback: &str,
 ) -> Result<String> {
     if contract_id == IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID {
-        if let Some(summary) = implementation_self_assessment_summary_from_path(raw_path)? {
+        if let Some(summary) = implementation_self_assessment_summary_from_path(roots, raw_path)? {
             return Ok(summary.status.to_string());
+        }
+    } else if contract_id == "proposal_decomposition_plan_v1" {
+        if let Some(value) = p094_json_from_path(roots, raw_path)? {
+            if value
+                .get("requires_split")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                if p094_valid_blocking_split_candidate_count(&value) > 0 {
+                    return Ok("split_required".to_string());
+                }
+                return Ok("invalid".to_string());
+            }
+            if let Some(decision) = value
+                .get("implementation_start_decision")
+                .and_then(|value| value.as_str())
+            {
+                return Ok(decision.to_string());
+            }
+        }
+    } else if contract_id == "blocker_boundary_status_v1" {
+        if let Some(value) = p094_json_from_path(roots, raw_path)? {
+            if let Some(status) = value.get("status").and_then(|value| value.as_str()) {
+                return Ok(status.to_string());
+            }
+        }
+    } else if contract_id == "blocker_boundary_human_decision_v1" {
+        if let Some(value) = p094_json_from_path(roots, raw_path)? {
+            if let Some(state) = value
+                .get("canonical_approval_state")
+                .and_then(|value| value.as_str())
+            {
+                return Ok(state.to_string());
+            }
+            if let Some(label) = value.get("decision_label").and_then(|value| value.as_str()) {
+                return Ok(label.to_string());
+            }
         }
     }
     Ok(fallback.to_string())
 }
 
+fn p094_valid_blocking_split_candidate_count(value: &serde_json::Value) -> usize {
+    value
+        .get("split_candidates")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    item.get("candidate_id")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|value| !value.trim().is_empty())
+                        && item
+                            .get("reason")
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|value| !value.trim().is_empty())
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+async fn artifact_read_roots_for_run(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<ArtifactReadRoots> {
+    let row = sqlx::query("SELECT artifact_root, chainworks_meta_root FROM runs WHERE id = ?1")
+        .bind(run_id.to_string())
+        .fetch_optional(pool)
+        .await?
+        .context("run not found for confined artifact read")?;
+    Ok(ArtifactReadRoots {
+        run_id,
+        chainworks_meta_root: row
+            .get::<Option<String>, _>("chainworks_meta_root")
+            .map(PathBuf::from),
+        artifact_root: PathBuf::from(row.get::<String, _>("artifact_root")),
+    })
+}
+
+async fn artifact_read_roots_for_run_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+) -> Result<ArtifactReadRoots> {
+    let row = sqlx::query("SELECT artifact_root, chainworks_meta_root FROM runs WHERE id = ?1")
+        .bind(run_id.to_string())
+        .fetch_optional(&mut **tx)
+        .await?
+        .context("run not found for confined artifact read")?;
+    Ok(ArtifactReadRoots {
+        run_id,
+        chainworks_meta_root: row
+            .get::<Option<String>, _>("chainworks_meta_root")
+            .map(PathBuf::from),
+        artifact_root: PathBuf::from(row.get::<String, _>("artifact_root")),
+    })
+}
+
+fn read_confined_artifact_bytes(roots: &ArtifactReadRoots, raw_path: &str) -> Result<Vec<u8>> {
+    let Some((root, candidate)) = confined_artifact_candidate(roots, raw_path) else {
+        anyhow::bail!(
+            "artifact raw_path is outside run artifact roots for run {}",
+            roots.run_id
+        );
+    };
+    let root_meta = std::fs::symlink_metadata(&root)
+        .with_context(|| format!("stat artifact root {}", root.display()))?;
+    if !root_meta.is_dir() || root_meta.file_type().is_symlink() {
+        anyhow::bail!("artifact root must be a real directory: {}", root.display());
+    }
+    let canonical_root = std::fs::canonicalize(&root)
+        .with_context(|| format!("canonicalize artifact root {}", root.display()))?;
+    if !candidate.starts_with(&root) {
+        anyhow::bail!("artifact raw_path does not lexically remain inside artifact root");
+    }
+    let canonical_candidate = std::fs::canonicalize(&candidate)
+        .with_context(|| format!("canonicalize artifact {}", candidate.display()))?;
+    if !canonical_candidate.starts_with(&canonical_root) {
+        anyhow::bail!("artifact raw_path canonical target escapes artifact root");
+    }
+    reject_symlink_components(&root, &candidate)?;
+
+    let metadata = std::fs::symlink_metadata(&candidate)
+        .with_context(|| format!("stat artifact {}", candidate.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("artifact raw_path must be a regular non-symlink file");
+    }
+    if metadata.len() > ARTIFACT_CONTRACT_READBACK_MAX_BYTES {
+        anyhow::bail!(
+            "artifact raw_path exceeds readback cap: {} > {}",
+            metadata.len(),
+            ARTIFACT_CONTRACT_READBACK_MAX_BYTES
+        );
+    }
+    let file = open_file_no_follow(&candidate)
+        .with_context(|| format!("open artifact {}", candidate.display()))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(ARTIFACT_CONTRACT_READBACK_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > ARTIFACT_CONTRACT_READBACK_MAX_BYTES {
+        anyhow::bail!(
+            "artifact raw_path exceeds readback cap while reading: {}",
+            candidate.display()
+        );
+    }
+    Ok(bytes)
+}
+
+fn confined_artifact_candidate(
+    roots: &ArtifactReadRoots,
+    raw_path: &str,
+) -> Option<(PathBuf, PathBuf)> {
+    let raw = Path::new(raw_path);
+    let candidate_roots = roots
+        .chainworks_meta_root
+        .iter()
+        .chain(std::iter::once(&roots.artifact_root));
+    for root in candidate_roots {
+        let candidate = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            root.join(raw)
+        };
+        if candidate.starts_with(root) {
+            return Some((root.clone(), candidate));
+        }
+    }
+    None
+}
+
+fn reject_symlink_components(root: &Path, candidate: &Path) -> Result<()> {
+    let relative = candidate
+        .strip_prefix(root)
+        .context("artifact path is not below canonical root")?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        let metadata = std::fs::symlink_metadata(&current)
+            .with_context(|| format!("stat artifact path component {}", current.display()))?;
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "artifact raw_path contains a symlink component: {}",
+                current.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_file_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_file_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+fn p094_json_from_path(roots: &ArtifactReadRoots, path: &str) -> Result<Option<serde_json::Value>> {
+    let bytes = match read_confined_artifact_bytes(roots, path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
 fn implementation_self_assessment_summary_from_path(
+    roots: &ArtifactReadRoots,
     path: &str,
 ) -> Result<Option<ImplementationSelfAssessmentSummary>> {
-    let bytes = match std::fs::read(path) {
+    let bytes = match read_confined_artifact_bytes(roots, path) {
         Ok(bytes) => bytes,
         Err(_) => return Ok(None),
     };
@@ -1234,8 +1866,11 @@ fn normalize_audit_release_evidence_status(raw: &str) -> Result<String> {
     Ok(normalized.to_string())
 }
 
-fn audit_release_evidence_status_from_path(path: &str) -> Result<Option<String>> {
-    let bytes = match std::fs::read(path) {
+fn audit_release_evidence_status_from_path(
+    roots: &ArtifactReadRoots,
+    path: &str,
+) -> Result<Option<String>> {
+    let bytes = match read_confined_artifact_bytes(roots, path) {
         Ok(bytes) => bytes,
         Err(_) => return Ok(None),
     };
@@ -1360,9 +1995,7 @@ pub async fn rebuild_run_state_projection_tx(
                 ov.override_id, ov.from_status, ov.to_status, ov.expires_at_stage
             ));
         }
-        contracts.insert(
-            contract_id.clone(),
-            serde_json::json!({
+        let mut contract_json = serde_json::json!({
                 "canonical_path": row.get::<String, _>("canonical_path"),
                 "raw_path": raw_path,
                 "raw_status": row.get::<String, _>("raw_status"),
@@ -1387,8 +2020,16 @@ pub async fn rebuild_run_state_projection_tx(
                 "warnings": effective_warnings,
                 "validation_errors": validation_errors,
                 "created_at": row.get::<String, _>("created_at"),
-            }),
-        );
+        });
+        if let Some(contract_object) = contract_json.as_object_mut() {
+            if let Some(dimensions_object) = dimensions.as_object() {
+                for (key, value) in dimensions_object {
+                    contract_object.insert(key.clone(), value.clone());
+                }
+            }
+            contract_object.insert("canonical_dimensions".to_string(), dimensions);
+        }
+        contracts.insert(contract_id.clone(), contract_json);
     }
 
     let overrides = list_overrides_in_tx(tx, &run_id_str).await?;
@@ -1710,6 +2351,26 @@ fn atomic_write_json(path: &Path, value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+fn parse_active_generation_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<ActiveArtifactContractGenerationRow> {
+    let created_at: String = row.get("created_at");
+    Ok(ActiveArtifactContractGenerationRow {
+        generation_id: row.get("generation_id"),
+        contract_id: row.get("contract_id"),
+        canonical_path: row.get("canonical_path"),
+        raw_path: row.get("raw_path"),
+        raw_status: row.get("raw_status"),
+        canonical_status: row.get("canonical_status"),
+        output_settlement: row.get("output_settlement"),
+        source_generation_verified: row.get::<i64, _>("source_generation_verified") != 0,
+        canonical_dimensions_json: serde_json::from_str(
+            &row.get::<String, _>("canonical_dimensions_json"),
+        )?,
+        created_at: DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
+    })
+}
+
 fn parse_override(row: sqlx::sqlite::SqliteRow) -> Result<ArtifactContractOverride> {
     let run_id: String = row.get("run_id");
     let created_at: String = row.get("created_at");
@@ -1787,6 +2448,12 @@ pub fn contract_id_for_alias(alias: &str) -> Option<&'static str> {
         // P077: closeout readiness artifacts stored in closeout_gate_generations.
         "implementation_closeout_readiness_v1" => Some("implementation_closeout_readiness_v1"),
         "proposal_gate_result_v1" => Some("proposal_gate_result_v1"),
+        "proposal_decomposition_plan" => Some("proposal_decomposition_plan_v1"),
+        "quality_gate_blocker_assessment" => Some("quality_gate_blocker_assessment_v1"),
+        "blocker_boundary_status" => Some("blocker_boundary_status_v1"),
+        "blocker_boundary_approval_request" => Some("blocker_boundary_approval_request_v1"),
+        "blocker_boundary_human_decision" => Some("blocker_boundary_human_decision_v1"),
+        "followup_proposal_seed" => Some("followup_proposal_seed_v1"),
         _ => None,
     }
 }

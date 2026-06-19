@@ -52,7 +52,10 @@ struct SystemMetrics {
     projection_backlog_rows: HashMap<String, u64>,
     projection_backlog_bytes: HashMap<String, u64>,
     counters: HashMap<String, u64>,
+    gauges: HashMap<String, u64>,
     p058_metric_samples: HashMap<String, Histogram>,
+    /// Keyed by "scenario_id:reason_code" to carry the {scenario_id,reason_code} label dimensions.
+    p082_recovery_state_age_seconds: HashMap<String, u64>,
     mcp_liveness_gate_last_recorded_at_ms: Option<i64>,
     mcp_hot_read_error_total_by_code: HashMap<String, u64>,
     p046_query_duration_ms: HashMap<String, Histogram>,
@@ -110,6 +113,39 @@ pub const P087_REQUIRED_METRICS: &[&str] = &[
     "maintenance_slot_release_cas_failed_total",
     "hot_read_circuit_would_open_total",
     "hot_read_circuit_open_total",
+];
+
+/// P082: Required metric names for the recovery/retry state-machine matrix proof gate.
+/// These names are checked by the test gate to confirm all required metrics are declared
+/// before emission wiring is added at the approved sites.
+pub const P082_REQUIRED_METRICS: &[&str] = &[
+    "p082_recovery_matrix_rows_with_db_engine_readback_coverage_percent",
+    "p082_recovery_matrix_gate_result_total",
+    "p082_recovery_reason_readback_total",
+    "p082_recovery_mutation_rejected_total",
+    "p082_release_side_effect_retry_block_total",
+    "p082_late_output_quarantine_total",
+    "p082_recovery_idempotency_replay_total",
+    "p082_recovery_state_age_seconds",
+];
+
+pub const P094_REQUIRED_METRICS: &[&str] = &[
+    "quality_gate_blocker_assessments_total",
+    "quality_gate_blocker_validation_rejections_total",
+    "quality_gate_blocker_freshness_total",
+    "implementation_refine_loops_avoided_total",
+    "followup_proposal_seeds_created_total",
+    "external_blockers_accepted_total",
+    "invalid_blocker_claims_total",
+    "review_refresh_required_total",
+    "output_settlement_required_before_boundary_total",
+    "human_boundary_approval_latency_seconds",
+    "post_boundary_reopen_total",
+    "false_external_blocker_rate",
+    "repeated_blocker_no_progress_total",
+    "accepted_boundary_later_rejected_percent",
+    "blocker_boundary_approvals_total",
+    "quality_gate_blocker_boundary_route_total",
 ];
 
 pub const P081_REQUIRED_METRICS: &[&str] = &[
@@ -228,6 +264,162 @@ pub fn record_p081_auth_ambiguous_caller_warn(
             "principal_class={principal_class},surface_policy_hash={surface_policy_hash},transport={transport}"
         ),
     );
+}
+
+pub fn record_p094_blocker_assessment(status: &str, class: &str) {
+    increment_counter("quality_gate_blocker_assessments_total");
+    increment_counter_with_label(
+        "quality_gate_blocker_assessments_total",
+        &format!("status={status},class={class}"),
+    );
+}
+
+pub fn record_p094_blocker_validation_rejection(reason: &str) {
+    increment_counter("quality_gate_blocker_validation_rejections_total");
+    increment_counter_with_label(
+        "quality_gate_blocker_validation_rejections_total",
+        &format!("reason={reason}"),
+    );
+}
+
+pub fn record_p094_invalid_blocker_claim(claim_class: &str) {
+    increment_counter("invalid_blocker_claims_total");
+    increment_counter_with_label(
+        "invalid_blocker_claims_total",
+        &format!("claim_class={claim_class}"),
+    );
+}
+
+pub fn record_p094_blocker_freshness(freshness: &str, owner_class: &str) {
+    increment_counter("quality_gate_blocker_freshness_total");
+    increment_counter_with_label(
+        "quality_gate_blocker_freshness_total",
+        &format!("freshness={freshness},owner_class={owner_class}"),
+    );
+}
+
+pub fn record_p094_boundary_approval(decision: &str) {
+    increment_counter("blocker_boundary_approvals_total");
+    increment_counter_with_label(
+        "blocker_boundary_approvals_total",
+        &format!("decision={decision}"),
+    );
+    recompute_p094_guardrail_gauges();
+}
+
+pub fn record_p094_implementation_refine_loop_avoided(proposal_id: &str) {
+    increment_counter("implementation_refine_loops_avoided_total");
+    increment_counter_with_label(
+        "implementation_refine_loops_avoided_total",
+        &format!("proposal_id={proposal_id}"),
+    );
+}
+
+pub fn record_p094_external_blocker_accepted(blocker_class: &str) {
+    increment_counter("external_blockers_accepted_total");
+    increment_counter_with_label(
+        "external_blockers_accepted_total",
+        &format!("blocker_class={blocker_class}"),
+    );
+    recompute_p094_guardrail_gauges();
+}
+
+pub fn record_p094_review_refresh_required(artifact_kind: &str) {
+    increment_counter("review_refresh_required_total");
+    increment_counter_with_label(
+        "review_refresh_required_total",
+        &format!("artifact_kind={artifact_kind}"),
+    );
+}
+
+pub fn record_p094_output_settlement_required_before_boundary(reason: &str) {
+    increment_counter("output_settlement_required_before_boundary_total");
+    increment_counter_with_label(
+        "output_settlement_required_before_boundary_total",
+        &format!("reason={reason}"),
+    );
+}
+
+pub fn record_p094_followup_seed_created(tail_class: &str) {
+    increment_counter("followup_proposal_seeds_created_total");
+    increment_counter_with_label(
+        "followup_proposal_seeds_created_total",
+        &format!("tail_class={tail_class}"),
+    );
+}
+
+pub fn record_p094_boundary_route(status: &str, route: &str) {
+    increment_counter("quality_gate_blocker_boundary_route_total");
+    increment_counter_with_label(
+        "quality_gate_blocker_boundary_route_total",
+        &format!("status={status},route={route}"),
+    );
+}
+
+pub fn record_p094_post_boundary_reopen(reason: &str) {
+    increment_counter("post_boundary_reopen_total");
+    increment_counter_with_label("post_boundary_reopen_total", &format!("reason={reason}"));
+}
+
+pub fn record_p094_repeated_blocker_no_progress(signature: &str) {
+    increment_counter("repeated_blocker_no_progress_total");
+    increment_counter_with_label(
+        "repeated_blocker_no_progress_total",
+        &format!("signature={signature}"),
+    );
+}
+
+pub fn record_p094_false_external_blocker_rate(reason: &str) {
+    increment_counter("false_external_blocker_events_total");
+    increment_counter_with_label(
+        "false_external_blocker_events_total",
+        &format!("reason={reason}"),
+    );
+    recompute_p094_guardrail_gauges();
+}
+
+pub fn record_p094_accepted_boundary_later_rejected(reason: &str) {
+    increment_counter("accepted_boundary_later_rejected_total");
+    increment_counter_with_label(
+        "accepted_boundary_later_rejected_total",
+        &format!("reason={reason}"),
+    );
+    recompute_p094_guardrail_gauges();
+}
+
+pub fn record_p094_human_boundary_approval_latency(latency: Duration) {
+    record_labeled_histogram(
+        "human_boundary_approval_latency_seconds",
+        &[],
+        latency.as_secs(),
+    );
+}
+
+fn recompute_p094_guardrail_gauges() {
+    let false_external_events = get_counter("false_external_blocker_events_total");
+    let external_blockers_accepted = get_counter("external_blockers_accepted_total");
+    let false_external_rate = percent_or_zero(false_external_events, external_blockers_accepted);
+    set_gauge("false_external_blocker_rate", false_external_rate);
+
+    let later_rejected = get_counter("accepted_boundary_later_rejected_total");
+    let boundary_approvals = get_counter("blocker_boundary_approvals_total");
+    let later_rejected_percent = percent_or_zero(later_rejected, boundary_approvals);
+    set_gauge(
+        "accepted_boundary_later_rejected_percent",
+        later_rejected_percent,
+    );
+}
+
+fn percent_or_zero(numerator: u64, denominator: u64) -> u64 {
+    if denominator == 0 {
+        if numerator == 0 {
+            0
+        } else {
+            100
+        }
+    } else {
+        numerator.saturating_mul(100) / denominator
+    }
 }
 
 pub fn record_p081_boundary_no_op_label(repo: &str, month: &str) {
@@ -568,6 +760,71 @@ pub fn get_counter(name: &str) -> u64 {
     m.counters.get(name).copied().unwrap_or(0)
 }
 
+pub fn get_counter_with_label(name: &str, label: &str) -> u64 {
+    let m = metrics().lock().unwrap();
+    let key = format!("{}:{}", name, label);
+    m.counters.get(&key).copied().unwrap_or(0)
+}
+
+pub fn set_gauge(name: &str, value: u64) {
+    let mut m = metrics().lock().unwrap();
+    m.gauges.insert(name.to_string(), value);
+}
+
+pub fn get_gauge(name: &str) -> Option<u64> {
+    let m = metrics().lock().unwrap();
+    m.gauges.get(name).copied()
+}
+
+pub fn record_p082_recovery_matrix_coverage_percent(rows_with_readback: usize, total_rows: usize) {
+    let percent = if total_rows == 0 {
+        0
+    } else {
+        ((rows_with_readback as u64) * 100) / (total_rows as u64)
+    };
+    set_gauge(
+        "p082_recovery_matrix_rows_with_db_engine_readback_coverage_percent",
+        percent,
+    );
+}
+
+/// Emit `p082_recovery_matrix_gate_result_total{scenario_id,status}`.
+/// The compound label `"scenario_id:status"` preserves the required two label dimensions.
+pub fn record_p082_recovery_matrix_gate_result(scenario_id: &str, status: &str) {
+    increment_counter_with_label(
+        "p082_recovery_matrix_gate_result_total",
+        &format!("{scenario_id}:{status}"),
+    );
+}
+
+/// Emit `p082_recovery_state_age_seconds{scenario_id,reason_code}`.
+/// Stores the latest age per compound key so callers can query by both dimensions.
+pub fn record_p082_recovery_state_age_seconds(
+    scenario_id: &str,
+    reason_code: &str,
+    age_seconds: u64,
+) {
+    let mut m = metrics().lock().unwrap();
+    let key = format!("{scenario_id}:{reason_code}");
+    m.p082_recovery_state_age_seconds.insert(key, age_seconds);
+}
+
+/// Returns the maximum age across all labeled scenario/reason entries, or `None` when empty.
+pub fn get_p082_recovery_state_age_seconds_latest() -> Option<u64> {
+    let m = metrics().lock().unwrap();
+    m.p082_recovery_state_age_seconds.values().copied().max()
+}
+
+/// Returns the age for a specific `{scenario_id,reason_code}` pair, or `None` if not recorded.
+pub fn get_p082_recovery_state_age_seconds_for(
+    scenario_id: &str,
+    reason_code: &str,
+) -> Option<u64> {
+    let m = metrics().lock().unwrap();
+    let key = format!("{scenario_id}:{reason_code}");
+    m.p082_recovery_state_age_seconds.get(&key).copied()
+}
+
 /// Returns the sum of all counters whose key starts with `prefix:`.
 /// Used in tests to verify that a labelled counter family was incremented
 /// without enumerating every possible label combination.
@@ -579,6 +836,53 @@ pub fn get_counter_prefix_sum(prefix: &str) -> u64 {
         .filter(|(k, _)| k.starts_with(&prefix_colon))
         .map(|(_, v)| v)
         .sum()
+}
+
+pub fn p094_rollout_metric_values_json() -> serde_json::Value {
+    let m = metrics().lock().unwrap();
+    let counter = |name: &str| {
+        serde_json::json!({
+            "kind": "counter",
+            "value": m.counters.get(name).copied().unwrap_or(0),
+            "unit": "count"
+        })
+    };
+    let gauge = |name: &str, unit: &str| {
+        serde_json::json!({
+            "kind": "gauge",
+            "value": m.gauges.get(name).copied().unwrap_or(0),
+            "unit": unit
+        })
+    };
+    let histogram = |name: &str, unit: &str| {
+        let histogram = m.hot_read_latency.get(name);
+        serde_json::json!({
+            "kind": "histogram",
+            "latest": histogram.and_then(Histogram::latest),
+            "p50": histogram.and_then(Histogram::p50),
+            "p95": histogram.and_then(Histogram::p95),
+            "sampleCount": histogram.map(Histogram::sample_count).unwrap_or(0),
+            "unit": unit
+        })
+    };
+    serde_json::json!({
+        "quality_gate_blocker_assessments_total": counter("quality_gate_blocker_assessments_total"),
+        "quality_gate_blocker_validation_rejections_total": counter("quality_gate_blocker_validation_rejections_total"),
+        "quality_gate_blocker_freshness_total": counter("quality_gate_blocker_freshness_total"),
+        "implementation_refine_loops_avoided_total": counter("implementation_refine_loops_avoided_total"),
+        "followup_proposal_seeds_created_total": counter("followup_proposal_seeds_created_total"),
+        "external_blockers_accepted_total": counter("external_blockers_accepted_total"),
+        "invalid_blocker_claims_total": counter("invalid_blocker_claims_total"),
+        "review_refresh_required_total": counter("review_refresh_required_total"),
+        "output_settlement_required_before_boundary_total": counter("output_settlement_required_before_boundary_total"),
+        "human_boundary_approval_latency_seconds": histogram("human_boundary_approval_latency_seconds", "seconds"),
+        "post_boundary_reopen_total": counter("post_boundary_reopen_total"),
+        "false_external_blocker_rate": gauge("false_external_blocker_rate", "percent"),
+        "repeated_blocker_no_progress_total": counter("repeated_blocker_no_progress_total"),
+        "accepted_boundary_later_rejected_percent": gauge("accepted_boundary_later_rejected_percent", "percent"),
+        "blocker_boundary_approvals_total": counter("blocker_boundary_approvals_total"),
+        "quality_gate_blocker_boundary_route_total": counter("quality_gate_blocker_boundary_route_total"),
+    })
 }
 
 /// Record P046 query resolver duration (session_graphql_query_duration_seconds).
@@ -896,7 +1200,9 @@ mod tests {
             get_p058_metric_sample_count("provider_session_kill_latency_seconds")
                 > kill_latency_samples_before
         );
-        assert!(get_counter("escalation_pause_total:provider_session_force_detached") > pause_before);
+        assert!(
+            get_counter("escalation_pause_total:provider_session_force_detached") > pause_before
+        );
         assert!(
             get_counter("chain_exhausted_total_by_terminal_tier_kind:same_backend_retry")
                 > exhausted_before
@@ -1039,5 +1345,24 @@ mod tests {
                 "operator_alert_native_delivery_total:severity=critical,surface=macos,result=delivered"
             ) > 0
         );
+    }
+
+    #[test]
+    fn proposal_082_required_metric_names_are_declared() {
+        for metric in [
+            "p082_recovery_matrix_rows_with_db_engine_readback_coverage_percent",
+            "p082_recovery_matrix_gate_result_total",
+            "p082_recovery_reason_readback_total",
+            "p082_recovery_mutation_rejected_total",
+            "p082_release_side_effect_retry_block_total",
+            "p082_late_output_quarantine_total",
+            "p082_recovery_idempotency_replay_total",
+            "p082_recovery_state_age_seconds",
+        ] {
+            assert!(
+                P082_REQUIRED_METRICS.contains(&metric),
+                "missing required P082 metric declaration: {metric}"
+            );
+        }
     }
 }

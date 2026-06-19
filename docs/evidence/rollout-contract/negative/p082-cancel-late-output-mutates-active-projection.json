@@ -1,39 +1,7 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
-  },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-082",
-    "p082"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:cancel_late_output_mutates_active_projection",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "schema_version": "p082_negative_fixture_v1",
+  "fixture_id": "p082-neg-016",
+  "expected_failure_code": "p082_cancel_late_output_mutates_active_projection",
+  "mutated_contract_or_matrix": "Cancelled provider late output updates active artifact_contract_generations or stage_executions projection",
+  "assertion": "Gate must fail because cancelled provider late output (P082-R17) must set active_projection_changed=false; any active projection mutation from a cancelled/superseded source generation is a contract violation"
 }

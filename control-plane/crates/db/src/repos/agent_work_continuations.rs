@@ -11,6 +11,8 @@ pub struct ContinuationEligibilityInfo {
     pub logical_stage_id: Option<String>,
     pub stage_type: Option<String>,
     pub agent_status: String,
+    pub provider: String,
+    pub provider_family: Option<String>,
     pub session_generation_id: Option<String>,
     pub provider_session_id: Option<String>,
     pub catalog_snapshot_json: Option<String>,
@@ -562,6 +564,8 @@ pub async fn check_eligibility(
         "SELECT ae.id AS agent_execution_id, ae.owner_id AS stage_execution_id,
                 se.run_id, se.stage_id AS logical_stage_id, se.stage_type,
                 ae.status AS agent_status,
+                ae.provider,
+                ae.provider_family,
                 ae.session_generation_id,
                 sg.provider_session_id,
                 r.catalog_snapshot_json
@@ -586,6 +590,8 @@ pub async fn check_eligibility(
         logical_stage_id: r.get("logical_stage_id"),
         stage_type: r.get("stage_type"),
         agent_status: r.get("agent_status"),
+        provider: r.get("provider"),
+        provider_family: r.get("provider_family"),
         session_generation_id: r.get("session_generation_id"),
         provider_session_id: r.get("provider_session_id"),
         catalog_snapshot_json: r.get("catalog_snapshot_json"),
@@ -623,7 +629,13 @@ pub async fn has_unresolved_side_effects_for_stage(
 pub async fn has_pending_approval_for_run(pool: &SqlitePool, run_id: &str) -> Result<bool> {
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM approvals
-         WHERE run_id = ? AND (decision = 'pending' OR decision = 'requested')",
+         WHERE run_id = ?
+           AND (decision = 'pending' OR decision = 'requested')
+           AND EXISTS (
+                 SELECT 1 FROM runs r
+                  WHERE r.id = approvals.run_id
+                    AND r.status NOT IN ('completed', 'failed', 'cancelled')
+               )",
     )
     .bind(run_id)
     .fetch_one(pool)

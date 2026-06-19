@@ -79,8 +79,10 @@ async fn test_failure_migration_failed_round_trips_through_health_and_status() {
     );
     // Failed-serve router exposes the same body under /graphql for the
     // daemonStatus passthrough.
-    let _router =
-        failed_serve::build_failed_serve_router(reporter, auth::PrincipalTable::test_fixture());
+    let _router = failed_serve::build_failed_serve_router(
+        reporter,
+        auth::LivePrincipalTable::new(auth::PrincipalTable::test_fixture()),
+    );
     // Router smoke-tested separately; here we assert the reporter side
     // of the contract.
 }

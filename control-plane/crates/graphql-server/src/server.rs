@@ -227,7 +227,7 @@ impl P081WsClose {
 
 async fn p081_connection_init_data(
     value: serde_json::Value,
-    table: auth::PrincipalTable,
+    principal_source: auth::LivePrincipalSource,
 ) -> std::result::Result<async_graphql::Data, P081WsClose> {
     // Strict bearer grammar via auth::extract_bearer_token (exactly "Bearer <token>",
     // one SP, no surrounding whitespace, visible ASCII, non-empty token).
@@ -237,9 +237,15 @@ async fn p081_connection_init_data(
         .unwrap_or("");
 
     match auth::extract_bearer_token(header) {
-        Ok(token) => match auth::resolve_bearer(token, &table) {
+        Ok(token) => match principal_source.resolve_bearer(token) {
             Ok(principal) => {
                 if auth::derive_caller_class(&principal) != auth::CallerClass::UiOperator {
+                    return Err(P081WsClose::FORBIDDEN);
+                }
+                if !matches!(
+                    auth::is_subscription_allowed_by_principal_surface_policy(&principal),
+                    Some(true)
+                ) {
                     return Err(P081WsClose::FORBIDDEN);
                 }
                 // SEC-P081-M002: derive token_id for WS subscription audit correlation.
@@ -259,11 +265,20 @@ async fn p081_connection_init_data(
     }
 }
 
-async fn connection_init_data(
+pub async fn connection_init_data(
     value: serde_json::Value,
     table: auth::PrincipalTable,
 ) -> std::result::Result<async_graphql::Data, async_graphql::Error> {
-    p081_connection_init_data(value, table)
+    p081_connection_init_data(value, auth::LivePrincipalSource::new(table))
+        .await
+        .map_err(|close| async_graphql::Error::new(close.reason))
+}
+
+pub async fn connection_init_data_with_live_source(
+    value: serde_json::Value,
+    principal_source: auth::LivePrincipalSource,
+) -> std::result::Result<async_graphql::Data, async_graphql::Error> {
+    p081_connection_init_data(value, principal_source)
         .await
         .map_err(|close| async_graphql::Error::new(close.reason))
 }
@@ -314,11 +329,11 @@ async fn graphql_ws_handler(
     ws: WebSocketUpgrade,
     protocol: GraphQLProtocol,
     Extension(schema): Extension<AppSchema>,
-    Extension(principal_table): Extension<auth::PrincipalTable>,
+    Extension(live_principal_source): Extension<auth::LivePrincipalSource>,
 ) -> impl IntoResponse {
     ws.protocols(ALL_WEBSOCKET_PROTOCOLS)
         .on_upgrade(move |stream| async move {
-            let table = principal_table;
+            let principal_source = live_principal_source;
             let (mut sink, mut stream) = stream.split();
             let first = match tokio::time::timeout(GRAPHQL_WS_INIT_TIMEOUT, stream.next()).await {
                 Ok(Some(Ok(message))) => message,
@@ -334,15 +349,15 @@ async fn graphql_ws_handler(
                     return;
                 }
             };
-            if let Err(close) = p081_connection_init_data(payload, table.clone()).await {
+            if let Err(close) = p081_connection_init_data(payload, principal_source.clone()).await {
                 send_p081_ws_close(&mut sink, close).await;
                 return;
             }
             let replay = futures_util::stream::once(async move { Ok(first) }).chain(stream);
             GraphQLWebSocket::new_with_pair(sink, replay, schema, protocol)
                 .on_connection_init(move |value: serde_json::Value| {
-                    let table = table;
-                    async move { connection_init_data(value, table).await }
+                    let source = principal_source.clone();
+                    async move { connection_init_data_with_live_source(value, source).await }
                 })
                 .serve()
                 .await
@@ -424,10 +439,53 @@ where
     Ok(())
 }
 
+pub async fn serve_with_listener_until_with_live_principal_source<F>(
+    schema: AppSchema,
+    listener: tokio::net::TcpListener,
+    extra: Router,
+    principal_table: auth::PrincipalTable,
+    live_principal_source: auth::LivePrincipalSource,
+    reporter: LifecycleReporter,
+    shutdown: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let app = build_router_with_live_principal_source(
+        schema,
+        extra,
+        principal_table,
+        live_principal_source,
+        reporter,
+    );
+    let local_addr = listener.local_addr().ok();
+    info!(addr = ?local_addr, "Server listening (GraphQL + MCP) — graceful shutdown armed");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
+    Ok(())
+}
+
 pub(crate) fn build_router(
     schema: AppSchema,
     extra: Router,
     principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
+) -> Router {
+    build_router_with_live_principal_source(
+        schema,
+        extra,
+        principal_table.clone(),
+        auth::LivePrincipalSource::new(principal_table),
+        reporter,
+    )
+}
+
+pub(crate) fn build_router_with_live_principal_source(
+    schema: AppSchema,
+    extra: Router,
+    principal_table: auth::PrincipalTable,
+    live_principal_source: auth::LivePrincipalSource,
     reporter: LifecycleReporter,
 ) -> Router {
     // SEC-003: Emit a one-time startup warning when the playground auth bypass
@@ -442,15 +500,15 @@ pub(crate) fn build_router(
              shell bypasses bearer authentication. Do not enable in production."
         );
     }
-    let pt = principal_table.clone();
+    let live_source = live_principal_source.clone();
     Router::new()
         .route(
             "/graphql",
             get(graphql_playground).post(graphql_http_handler),
         )
         .layer(middleware::from_fn(move |req, next| {
-            let table = pt.clone();
-            async move { crate::auth_layer::require_auth(req, next, table).await }
+            let source = live_source.clone();
+            async move { crate::auth_layer::require_auth_with_live_source(req, next, source).await }
         }))
         .route("/graphql/ws", get(graphql_ws_handler))
         // P042 §5.2: liveness/readiness are unauthenticated loopback probes.
@@ -460,6 +518,7 @@ pub(crate) fn build_router(
         .route("/ready", get(ready_handler))
         .layer(Extension(schema))
         .layer(Extension(principal_table))
+        .layer(Extension(live_principal_source))
         .layer(Extension(reporter))
         // P042 §9.3 / R13 API-003: merge `extra` (MCP HTTP routes,
         // diagnostic endpoints…) BEFORE the request-id layer so the
@@ -703,11 +762,240 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sec_high_001_graphql_http_observes_live_principal_updates() {
+        let token = "test-token-xxxxxxxxxxxxxxxxxxxxx";
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        stages::insert(&pool, &make_manual_gate_stage(run_id, "state_6"))
+            .await
+            .unwrap();
+        let approval = make_approval(run_id, "state_6");
+        approvals::insert(&pool, &approval).await.unwrap();
+
+        let principal_table = auth::PrincipalTable::test_fixture();
+        let live_source = auth::LivePrincipalSource::new(principal_table.clone());
+        let schema = crate::schema::build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            principal_table.clone(),
+            test_reporter(),
+        );
+        let app = build_router_with_live_principal_source(
+            schema,
+            Router::new(),
+            principal_table,
+            live_source.clone(),
+            test_reporter(),
+        );
+        let mutation = approve_approval_mutation(approval.id);
+
+        let body = serde_json::json!({ "query": mutation });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/graphql")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json.get("errors").is_none(),
+            "initial mutation failed: {json}"
+        );
+
+        live_source.update(auth::PrincipalTable::test_fixture_graphql_query_only(
+            token,
+            "test-operator",
+        ));
+        let second_approval = make_approval(run_id, "state_6");
+        approvals::insert(&pool, &second_approval).await.unwrap();
+        let body = serde_json::json!({ "query": approve_approval_mutation(second_approval.id) });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/graphql")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["errors"][0]["message"], "forbidden", "{json}");
+
+        live_source.update(auth::PrincipalTable::test_fixture_with_class(
+            token,
+            "test-operator",
+            auth::PrincipalClass::Observer,
+        ));
+        let third_approval = make_approval(run_id, "state_6");
+        approvals::insert(&pool, &third_approval).await.unwrap();
+        let body = serde_json::json!({ "query": approve_approval_mutation(third_approval.id) });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/graphql")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["errors"][0]["message"], "forbidden");
+
+        live_source.update(auth::PrincipalTable::test_fixture_disabled_token(
+            token,
+            "test-operator",
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/graphql")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"{ runs { id } }"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn sec_high_002_graphql_http_removed_graphql_policy_fails_closed() {
+        let token = "test-token-xxxxxxxxxxxxxxxxxxxxx";
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        stages::insert(&pool, &make_manual_gate_stage(run_id, "state_6"))
+            .await
+            .unwrap();
+        let approval = make_approval(run_id, "state_6");
+        approvals::insert(&pool, &approval).await.unwrap();
+
+        let principal_table = auth::PrincipalTable::test_fixture();
+        let live_source = auth::LivePrincipalSource::new(principal_table.clone());
+        let schema = crate::schema::build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            principal_table.clone(),
+            test_reporter(),
+        );
+        let app = build_router_with_live_principal_source(
+            schema,
+            Router::new(),
+            principal_table,
+            live_source.clone(),
+            test_reporter(),
+        );
+
+        let explicit_mcp_only = secure_principal_table(&format!(
+            r#"{{
+              "schema_version": 3,
+              "principals": [{{
+                "token": "{token}",
+                "id": "test-operator",
+                "class": "operator",
+                "surface_policies": {{
+                  "mcp": {{ "allowed_tools": ["runs.list"] }}
+                }}
+              }}]
+            }}"#
+        ));
+        let explicit_principal = auth::resolve_bearer(token, &explicit_mcp_only).unwrap();
+        assert_eq!(
+            auth::is_query_allowed_by_principal_surface_policy(&explicit_principal),
+            Some(false)
+        );
+        live_source.update(explicit_mcp_only);
+        let live_principal = live_source.resolve_bearer(token).unwrap();
+        assert_eq!(
+            auth::is_query_allowed_by_principal_surface_policy(&live_principal),
+            Some(false)
+        );
+
+        let query_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/graphql")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"{ runs { id } }"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(query_response.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(query_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["errors"][0]["message"], "forbidden");
+
+        let mutation_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/graphql")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "query": approve_approval_mutation(approval.id) })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mutation_response.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(mutation_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["errors"][0]["message"], "forbidden");
+    }
+
+    #[tokio::test]
     async fn test_graphql_ws_rejects_missing_connection_init_auth() {
-        let err =
-            p081_connection_init_data(serde_json::json!({}), auth::PrincipalTable::test_fixture())
-                .await
-                .expect_err("missing WS token must fail");
+        let err = p081_connection_init_data(
+            serde_json::json!({}),
+            auth::LivePrincipalSource::new(auth::PrincipalTable::test_fixture()),
+        )
+        .await
+        .expect_err("missing WS token must fail");
 
         assert_eq!(err, P081WsClose::UNAUTHORIZED);
         assert_eq!(GRAPHQL_WS_UNAUTHORIZED_CLOSE_CODE, 4401);
@@ -717,7 +1005,7 @@ mod tests {
     async fn test_graphql_ws_rejects_unknown_connection_init_token() {
         let err = p081_connection_init_data(
             serde_json::json!({"Authorization":"Bearer bad-token"}),
-            auth::PrincipalTable::test_fixture(),
+            auth::LivePrincipalSource::new(auth::PrincipalTable::test_fixture()),
         )
         .await
         .expect_err("unknown WS token must fail");
@@ -733,7 +1021,7 @@ mod tests {
         );
         let err = p081_connection_init_data(
             serde_json::json!({"Authorization":"Bearer observer-token-xxxxxxxxxxxxxxxxx"}),
-            principal_table,
+            auth::LivePrincipalSource::new(principal_table),
         )
         .await
         .expect_err("observer GraphQL WS subscription must fail before subscribe");
@@ -766,6 +1054,100 @@ mod tests {
             .unwrap();
 
         assert_eq!(principal.id, "test-operator");
+    }
+
+    #[tokio::test]
+    async fn test_graphql_ws_uses_live_principal_source_after_reload() {
+        let token = "test-token-xxxxxxxxxxxxxxxxxxxxx";
+        let initial = auth::PrincipalTable::test_fixture();
+        let live_source = auth::LivePrincipalSource::new(initial);
+
+        let data = connection_init_data_with_live_source(
+            serde_json::json!({"Authorization": format!("Bearer {token}")}),
+            live_source.clone(),
+        )
+        .await
+        .expect("initial live token must be accepted");
+        let principal = data
+            .get(&std::any::TypeId::of::<auth::Principal>())
+            .and_then(|boxed| boxed.downcast_ref::<auth::Principal>())
+            .unwrap();
+        assert_eq!(principal.id, "test-operator");
+
+        live_source.update(auth::PrincipalTable::test_fixture_disabled_token(
+            token,
+            "test-operator",
+        ));
+        let err = connection_init_data_with_live_source(
+            serde_json::json!({"Authorization": format!("Bearer {token}")}),
+            live_source.clone(),
+        )
+        .await
+        .expect_err("disabled live token must be rejected");
+        assert_eq!(err.message, "UNAUTHORIZED");
+
+        live_source.update(auth::PrincipalTable::test_fixture_with_class(
+            token,
+            "test-operator",
+            auth::PrincipalClass::Observer,
+        ));
+        let err = connection_init_data_with_live_source(
+            serde_json::json!({"Authorization": format!("Bearer {token}")}),
+            live_source,
+        )
+        .await
+        .expect_err("downgraded live token must be rejected");
+        assert_eq!(err.message, "FORBIDDEN");
+    }
+
+    #[tokio::test]
+    async fn test_graphql_ws_rejects_removed_or_disabled_subscription_policy() {
+        let token = "test-token-xxxxxxxxxxxxxxxxxxxxx";
+        let no_graphql = secure_principal_table(&format!(
+            r#"{{
+              "schema_version": 3,
+              "principals": [{{
+                "token": "{token}",
+                "id": "test-operator",
+                "class": "operator",
+                "surface_policies": {{
+                  "mcp": {{ "allowed_tools": ["runs.list"] }}
+                }}
+              }}]
+            }}"#
+        ));
+        let err = p081_connection_init_data(
+            serde_json::json!({"Authorization": format!("Bearer {token}")}),
+            auth::LivePrincipalSource::new(no_graphql),
+        )
+        .await
+        .expect_err("explicit no-GraphQL policy must not inherit startup WS grants");
+        assert_eq!(err, P081WsClose::FORBIDDEN);
+
+        let subscriptions_disabled = secure_principal_table(&format!(
+            r#"{{
+              "schema_version": 3,
+              "principals": [{{
+                "token": "{token}",
+                "id": "test-operator",
+                "class": "operator",
+                "surface_policies": {{
+                  "graphql": {{
+                    "allow_queries": true,
+                    "allow_subscriptions": false,
+                    "allowed_mutations": ["approveApproval", "rejectApproval"]
+                  }}
+                }}
+              }}]
+            }}"#
+        ));
+        let err = p081_connection_init_data(
+            serde_json::json!({"Authorization": format!("Bearer {token}")}),
+            auth::LivePrincipalSource::new(subscriptions_disabled),
+        )
+        .await
+        .expect_err("allow_subscriptions=false must be rejected at WS connection_init");
+        assert_eq!(err, P081WsClose::FORBIDDEN);
     }
 
     #[test]

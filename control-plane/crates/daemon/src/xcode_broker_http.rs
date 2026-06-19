@@ -548,6 +548,7 @@ mod tests {
             worktree_root: None,
             worktree_write_enabled: false,
             worktree_strategy: None,
+            provider_runtime_home: None,
             expected_output_paths: Vec::new(),
             expected_outputs: Vec::new(),
             keep_session_alive: false,

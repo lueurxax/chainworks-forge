@@ -40,6 +40,33 @@ pub fn contract_status_allowed_values(contract_id: &str) -> Option<&'static [&'s
             "invalid",
         ]),
         "tests_result_v1" => Some(&["green", "red", "blocked", "unknown"]),
+        "proposal_decomposition_plan_v1" => Some(&[
+            "ready_with_declared_boundaries",
+            "split_required",
+            "invalid",
+            "unknown",
+        ]),
+        "quality_gate_blocker_assessment_v1" => {
+            Some(&["candidate", "accepted", "rejected", "invalid", "unknown"])
+        }
+        "blocker_boundary_status_v1" => Some(&[
+            "output_settlement_required",
+            "side_effect_reconciliation_required",
+            "runtime_recovery_required",
+            "review_refresh_required",
+            "local_code_tail_present",
+            "invalid_claim",
+            "blocked_no_progress",
+            "awaiting_human_boundary_approval",
+            "pass",
+            "invalid",
+            "unknown",
+        ]),
+        "blocker_boundary_approval_request_v1" => Some(&["requested", "invalid", "unknown"]),
+        "blocker_boundary_human_decision_v1" => {
+            Some(&["granted", "rejected", "invalid", "unknown"])
+        }
+        "followup_proposal_seed_v1" => Some(&["created", "invalid", "unknown"]),
         _ => None,
     }
 }
@@ -105,6 +132,45 @@ pub fn normalize_contract_status(
             "green" | "red" | "blocked" | "unknown" => Some(raw),
             _ => None,
         },
+        "proposal_decomposition_plan_v1" => match raw {
+            "ready_with_declared_boundaries" | "split_required" | "invalid" | "unknown" => {
+                Some(raw)
+            }
+            _ => None,
+        },
+        "quality_gate_blocker_assessment_v1" => match raw {
+            "candidate" | "accepted" | "rejected" | "invalid" | "unknown" => Some(raw),
+            _ => None,
+        },
+        "blocker_boundary_status_v1" => match raw {
+            "output_settlement_required"
+            | "side_effect_reconciliation_required"
+            | "runtime_recovery_required"
+            | "review_refresh_required"
+            | "local_code_tail_present"
+            | "invalid_claim"
+            | "blocked_no_progress"
+            | "awaiting_human_boundary_approval"
+            | "pass"
+            | "invalid"
+            | "unknown" => Some(raw),
+            _ => None,
+        },
+        "blocker_boundary_approval_request_v1" => match raw {
+            "requested" | "invalid" | "unknown" => Some(raw),
+            _ => None,
+        },
+        "blocker_boundary_human_decision_v1" => match raw {
+            "accept" | "granted" => Some("granted"),
+            "reject" | "rejected" => Some("rejected"),
+            "invalid" => Some("invalid"),
+            "unknown" => Some("unknown"),
+            _ => None,
+        },
+        "followup_proposal_seed_v1" => match raw {
+            "created" | "invalid" | "unknown" => Some(raw),
+            _ => None,
+        },
         _ => match raw {
             "pass" | "block" | "invalid" | "unknown" => Some(raw),
             _ => None,
@@ -147,6 +213,12 @@ pub fn known_contract_id(contract_id: &str) -> bool {
             | "implementation_self_assessment_v2"
             | "tests_result_v1"
             | "implementation_review_summary_v1"
+            | "proposal_decomposition_plan_v1"
+            | "quality_gate_blocker_assessment_v1"
+            | "blocker_boundary_status_v1"
+            | "blocker_boundary_approval_request_v1"
+            | "blocker_boundary_human_decision_v1"
+            | "followup_proposal_seed_v1"
             | "run_state_projection_v1"
     )
 }

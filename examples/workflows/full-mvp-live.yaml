@@ -122,8 +122,27 @@ states:
     transitions:
       - to: state_5_proposal_refined
         when: proposal_review_summary.average_score < vars.proposal_score_target or proposal_review_summary.min_individual_score < vars.min_individual_proposal_score or proposal_review_summary.blocker_count > 0
-      - to: state_6_implementation_approval
+      - to: state_5a_proposal_decomposition_reviewed
         when: proposal_review_summary.average_score >= vars.proposal_score_target and proposal_review_summary.min_individual_score >= vars.min_individual_proposal_score and proposal_review_summary.blocker_count == 0
+
+  state_5a_proposal_decomposition_reviewed:
+    label: Proposal decomposition reviewed
+    owner: lead_orchestrator
+    run:
+      sequence:
+        - agent: lead_orchestrator
+          task: decompose_proposal_before_implementation
+          inputs:
+            - proposal_current
+            - proposal_review_summary
+            - run_state
+          outputs:
+            - proposal_decomposition_plan
+    transitions:
+      - to: state_5_proposal_refined
+        when: proposal_decomposition_plan.requires_split == true
+      - to: state_6_implementation_approval
+        when: proposal_decomposition_plan.implementation_start_decision == 'ready_with_declared_boundaries'
 
   state_5_proposal_refined:
     label: Proposal refined
@@ -277,8 +296,173 @@ states:
     transitions:
       - to: state_11_manual_release
         when: implementation_closeout_readiness_v1.decision == 'enter_manual_release'
-      - to: state_10_implementation_refined
+      - to: state_9_quality_gate_blocker_assessed
         when: implementation_closeout_readiness_v1.decision == 'return_to_code_refine'
+
+  state_9_quality_gate_blocker_assessed:
+    label: Quality-gate blocker assessment
+    owner: lead_orchestrator
+    run:
+      sequence:
+        - agent: lead_orchestrator
+          task: assess_quality_gate_blockers
+          inputs:
+            - approved_proposal
+            - implementation_self_assessment
+            - implementation_review_summary
+            - audit_report
+            - security_report
+            - prepush_review_report
+            - docs_report
+            - changed_files_manifest
+            - tests_result
+          outputs:
+            - quality_gate_blocker_assessment
+    transitions:
+      - to: state_9_quality_gate_boundary_evaluated
+        when: exists('quality_gate_blocker_assessment')
+
+  state_9_quality_gate_boundary_evaluated:
+    label: Quality-gate blocker boundary evaluated
+    owner: lead_orchestrator
+    run:
+      system_task:
+        task_type: quality_gate_boundary_evaluator
+        executor_mode: system.quality_gate_boundary
+    transitions:
+      - to: state_9_output_settlement_recovery
+        when: blocker_boundary_status.status == 'output_settlement_required'
+      - to: state_9_side_effect_reconciliation
+        when: blocker_boundary_status.status == 'side_effect_reconciliation_required'
+      - to: state_9_runtime_recovery
+        when: blocker_boundary_status.status == 'runtime_recovery_required'
+      - to: state_9_implementation_reviewed
+        when: blocker_boundary_status.status == 'review_refresh_required'
+      - to: state_10_implementation_refined
+        when: blocker_boundary_status.status == 'local_code_tail_present'
+      - to: state_9_implementation_reviewed
+        when: blocker_boundary_status.status == 'invalid_claim'
+      - to: state_9_blocker_boundary_approval
+        when: blocker_boundary_status.status == 'blocked_no_progress'
+      - to: state_9_blocker_boundary_approval
+        when: blocker_boundary_status.status == 'awaiting_human_boundary_approval'
+      - to: state_11_manual_release
+        when: blocker_boundary_status.status == 'pass'
+
+  state_9_blocker_boundary_approval:
+    label: "Human approval: blocker boundary assessment"
+    type: manual_gate
+    owner: lead_orchestrator
+    approval: required
+    transitions:
+      - to: state_9_blocker_boundary_accepted
+        when: approval.granted == true
+      - to: state_9_implementation_reviewed
+        when: approval.rejected == true
+
+  state_9_output_settlement_recovery:
+    label: Output settlement recovery
+    owner: lead_orchestrator
+    run:
+      sequence:
+        - agent: lead_orchestrator
+          task: recover_quality_gate_output_settlement
+          inputs:
+            - blocker_boundary_status
+            - implementation_review_summary
+          outputs:
+            - orchestrator_summary
+            - run_state
+    transitions:
+      - to: state_9_implementation_reviewed
+        when: exists('orchestrator_summary')
+
+  state_9_side_effect_reconciliation:
+    label: Side-effect reconciliation
+    owner: lead_orchestrator
+    run:
+      sequence:
+        - agent: lead_orchestrator
+          task: reconcile_quality_gate_side_effects
+          inputs:
+            - blocker_boundary_status
+            - implementation_review_summary
+          outputs:
+            - orchestrator_summary
+            - run_state
+    transitions:
+      - to: state_9_implementation_reviewed
+        when: exists('orchestrator_summary')
+
+  state_9_runtime_recovery:
+    label: Runtime recovery
+    owner: lead_orchestrator
+    run:
+      sequence:
+        - agent: lead_orchestrator
+          task: recover_quality_gate_runtime
+          inputs:
+            - blocker_boundary_status
+            - implementation_review_summary
+          outputs:
+            - orchestrator_summary
+            - run_state
+    transitions:
+      - to: state_9_implementation_reviewed
+        when: exists('orchestrator_summary')
+
+  state_9_blocker_boundary_accepted:
+    label: Blocker boundary accepted
+    owner: lead_orchestrator
+    run:
+      sequence:
+        - agent: lead_orchestrator
+          task: emit_blocker_boundary_closeout
+          inputs:
+            - blocker_boundary_status
+            - implementation_review_summary
+          outputs:
+            - orchestrator_summary
+    transitions:
+      - to: state_9_followup_proposal_seeded
+        when: blocker_boundary_status.followup_proposal_required == true
+      - to: state_9_external_evidence_blocked
+        when: blocker_boundary_status.has_release_blocking_external_blockers == true and blocker_boundary_status.followup_proposal_required == false
+      - to: state_11_manual_release
+        when: blocker_boundary_status.has_no_release_blocking_external_blockers == true and blocker_boundary_status.followup_proposal_required == false
+
+  state_9_followup_proposal_seeded:
+    label: Follow-up proposal seed generated
+    owner: lead_orchestrator
+    run:
+      sequence:
+        - agent: lead_orchestrator
+          task: generate_followup_proposal_seed
+          inputs:
+            - blocker_boundary_status
+            - approved_proposal
+          outputs:
+            - followup_proposal_seed
+    transitions:
+      - to: state_9_external_evidence_blocked
+        when: exists('followup_proposal_seed')
+
+  state_9_external_evidence_blocked:
+    label: External evidence blocked
+    owner: lead_orchestrator
+    run:
+      sequence:
+        - agent: lead_orchestrator
+          task: record_external_evidence_hold
+          inputs:
+            - blocker_boundary_status
+            - followup_proposal_seed
+          outputs:
+            - orchestrator_summary
+            - run_state
+    transitions:
+      - to: state_9_external_evidence_blocked
+        when: "false"
 
   state_10_implementation_refined:
     label: Implementation refined

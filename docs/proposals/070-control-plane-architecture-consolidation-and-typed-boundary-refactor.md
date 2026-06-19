@@ -248,6 +248,7 @@ Docs do not need to describe every module, but they must describe the architectu
 - **G-6. Consolidate capability registry.** Tool/resource/mutation capability mapping and principal policy have one source of truth.
 - **G-7. Reorganize tests around behavior ownership.** Proposal-era tests either become stable behavior suites or remain as short compatibility/golden tests.
 - **G-8. Add enforceable architecture gates.** Dependency rules, typed boundary tests, and parity checks prevent the same drift from returning.
+- **G-9. Clean residual legacy Swift engine remains.** Dead DSL/Engine code, orphaned fixtures, and stale references left behind after the Swift engine removal are deleted as part of consolidation, not preserved as inert compatibility surface.
 
 ---
 

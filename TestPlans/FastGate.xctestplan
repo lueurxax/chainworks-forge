@@ -18,16 +18,14 @@
   "testTargets" : [
     {
       "selectedTests" : [
-        "AppPerformanceContractTests",
-        "ArtifactContentRendererTests",
-        "ArtifactManagerTests",
         "ArtifactPathClipboardTests",
-        "BenchmarkExportStampingTests",
-        "OrchestratorTests",
-        "PersistentStoreRepairTests",
+        "ForgeGlassTests",
         "ProcessSupportTests",
+        "Proposal046Tests",
         "Proposal024RunSurfaceTests",
         "Proposal031ThinGraphQLReadBoundaryTests",
+        "Proposal081ApprovalActionAttemptStoreTests",
+        "Proposal081GraphQLRedactionTests",
         "Proposal078OperatorReadbackTests",
         "Proposal085Tests",
         "Proposal088OperatorReadbackTests",

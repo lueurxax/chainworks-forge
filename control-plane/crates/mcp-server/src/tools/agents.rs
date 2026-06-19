@@ -790,12 +790,26 @@ fn forbidden_stage_kind(
     None
 }
 
+fn provider_session_resurrection_adapter_supported(provider: Option<&str>) -> bool {
+    let Some(provider) = provider else {
+        return false;
+    };
+    match provider {
+        // Adapter support is intentionally fail-closed until the provider can
+        // prove requested-session attachment before prompt send.
+        "claude" | "claude_acp" | "claude_code" | "codex" | "gemini" | "auggie" | "junie" => false,
+        _ => false,
+    }
+}
+
 fn continuation_capability_rejection(
     agent_execution_id: &str,
     catalog_snapshot_json: Option<&str>,
     mode: &str,
     trigger_kind: &str,
     live_session_present: bool,
+    provider_session_id_present: bool,
+    provider_session_resurrection_supported: bool,
 ) -> Result<Option<serde_json::Value>> {
     let Some(raw_catalog) = catalog_snapshot_json else {
         return Ok(Some(serde_json::json!({
@@ -903,6 +917,70 @@ fn continuation_capability_rejection(
                     "data": {
                         "agent_execution_id": agent_execution_id,
                         "failure_reason": "live_session_required"
+                    }
+                }
+            })));
+        }
+    }
+    if mode == "provider_session_resurrection" {
+        let resurrection = &capability["provider_session_resurrection"];
+        let resurrection_enabled = resurrection["enabled"].as_bool() == Some(true);
+        if !resurrection_enabled {
+            return Ok(Some(serde_json::json!({
+                "outcome": "rejected",
+                "error": {
+                    "code": -32033,
+                    "message": "provider_session_resurrection is disabled by code_writer continuation_capability",
+                    "data": {
+                        "agent_execution_id": agent_execution_id,
+                        "failure_reason": "provider_session_resurrection_disabled"
+                    }
+                }
+            })));
+        }
+        let resurrection_trigger_allowed = resurrection["allowed_triggers"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(trigger_kind)));
+        if !resurrection_trigger_allowed {
+            return Ok(Some(serde_json::json!({
+                "outcome": "rejected",
+                "error": {
+                    "code": -32033,
+                    "message": "trigger_kind is not allowed by provider_session_resurrection capability",
+                    "data": {
+                        "agent_execution_id": agent_execution_id,
+                        "trigger_kind": trigger_kind,
+                        "failure_reason": "provider_session_resurrection_trigger_not_allowed"
+                    }
+                }
+            })));
+        }
+        let require_recorded_provider_session_id = resurrection
+            ["require_recorded_provider_session_id"]
+            .as_bool()
+            .unwrap_or(true);
+        if require_recorded_provider_session_id && !provider_session_id_present {
+            return Ok(Some(serde_json::json!({
+                "outcome": "rejected",
+                "error": {
+                    "code": -32034,
+                    "message": "provider_session_resurrection requires a recorded provider_session_id",
+                    "data": {
+                        "agent_execution_id": agent_execution_id,
+                        "failure_reason": "provider_session_id_required"
+                    }
+                }
+            })));
+        }
+        if !provider_session_resurrection_supported {
+            return Ok(Some(serde_json::json!({
+                "outcome": "rejected",
+                "error": {
+                    "code": -32010,
+                    "message": "provider_session_resurrection is not supported by the target provider adapter",
+                    "data": {
+                        "agent_execution_id": agent_execution_id,
+                        "failure_reason": "provider_session_resurrection_unsupported"
                     }
                 }
             })));
@@ -1253,36 +1331,6 @@ async fn handle_continue_work(
         }));
     }
 
-    // provider_session_resurrection is Phase 4 (per-adapter enablement only).
-    if mode == "provider_session_resurrection" {
-        let _ = db::repos::agent_work_continuations::record_p086_continuation_metric_event(
-            pool,
-            None,
-            None,
-            Some(agent_execution_id),
-            None,
-            "continuation_resurrection_total",
-            serde_json::json!({
-                "mode": mode,
-                "trigger_kind": trigger_kind,
-                "resurrection_status": "unsupported"
-            }),
-            1,
-        )
-        .await;
-        return Ok(serde_json::json!({
-            "outcome": "rejected",
-            "error": {
-                "code": -32010,
-                "message": "provider_session_resurrection is not yet supported; enable per adapter after Phase 4 fixtures pass",
-                "data": {
-                    "agent_execution_id": agent_execution_id,
-                    "failure_reason": "provider_session_resurrection_unsupported"
-                }
-            }
-        }));
-    }
-
     // P086-SEC-MED-001: operator_mcp requests must not carry lead_auto-only fields.
     // Persisting these fields on non-lead_auto rows alters idempotency semantics and
     // creates storage/response amplification with caller-controlled metadata.
@@ -1564,7 +1612,33 @@ async fn handle_continue_work(
         mode,
         trigger_kind,
         info.session_generation_id.is_some() && info.provider_session_id.is_some(),
+        info.provider_session_id.is_some(),
+        provider_session_resurrection_adapter_supported(
+            info.provider_family
+                .as_deref()
+                .or(Some(info.provider.as_str())),
+        ),
     )? {
+        if mode == "provider_session_resurrection"
+            && rejection["error"]["data"]["failure_reason"].as_str()
+                == Some("provider_session_resurrection_unsupported")
+        {
+            let _ = db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+                pool,
+                Some(&info.run_id),
+                Some(&info.stage_execution_id),
+                Some(agent_execution_id),
+                None,
+                "continuation_resurrection_total",
+                serde_json::json!({
+                    "mode": mode,
+                    "trigger_kind": trigger_kind,
+                    "resurrection_status": "unsupported"
+                }),
+                1,
+            )
+            .await;
+        }
         return Ok(rejection);
     }
 
@@ -2282,6 +2356,8 @@ mod tests {
                 "live_handle_continuation",
                 "operator_mcp",
                 true,
+                true,
+                false,
             )
             .expect("capability check should parse")
             .is_none(),
@@ -2294,6 +2370,8 @@ mod tests {
             "live_handle_continuation",
             "operator_mcp",
             true,
+            true,
+            false,
         )
         .expect("missing catalog should produce typed rejection")
         .expect("missing catalog must reject");
@@ -2308,6 +2386,8 @@ mod tests {
             "live_handle_continuation",
             "operator_mcp",
             false,
+            true,
+            false,
         )
         .expect("live session guard should produce typed rejection")
         .expect("missing live session must reject");
@@ -2315,6 +2395,120 @@ mod tests {
             no_live["error"]["data"]["failure_reason"],
             "live_session_required"
         );
+    }
+
+    #[test]
+    fn continuation_capability_gates_provider_session_resurrection() {
+        let catalog = serde_json::json!({
+            "agents": [{
+                "id": "code_writer",
+                "continuation_capability": {
+                    "enabled": true,
+                    "allowed_triggers": ["operator_mcp", "lead_auto"],
+                    "live_handle_continuation": {
+                        "enabled": true,
+                        "require_live_session": true
+                    },
+                    "provider_session_resurrection": {
+                        "enabled": true,
+                        "allowed_triggers": ["operator_mcp"],
+                        "require_recorded_provider_session_id": true,
+                        "fail_closed_when_unsupported": true
+                    }
+                }
+            }]
+        })
+        .to_string();
+
+        let accepted = continuation_capability_rejection(
+            "ae-id",
+            Some(&catalog),
+            "provider_session_resurrection",
+            "operator_mcp",
+            false,
+            true,
+            true,
+        )
+        .expect("resurrection capability check should parse");
+        assert!(
+            accepted.is_none(),
+            "catalog + provider_session_id + adapter support must pass admission"
+        );
+
+        let no_provider_session = continuation_capability_rejection(
+            "ae-id",
+            Some(&catalog),
+            "provider_session_resurrection",
+            "operator_mcp",
+            false,
+            false,
+            true,
+        )
+        .expect("missing provider session should produce typed rejection")
+        .expect("missing provider_session_id must reject");
+        assert_eq!(
+            no_provider_session["error"]["data"]["failure_reason"],
+            "provider_session_id_required"
+        );
+
+        let unsupported = continuation_capability_rejection(
+            "ae-id",
+            Some(&catalog),
+            "provider_session_resurrection",
+            "operator_mcp",
+            false,
+            true,
+            false,
+        )
+        .expect("unsupported adapter should produce typed rejection")
+        .expect("unsupported adapter must reject");
+        assert_eq!(
+            unsupported["error"]["data"]["failure_reason"],
+            "provider_session_resurrection_unsupported"
+        );
+
+        let disabled_catalog = serde_json::json!({
+            "agents": [{
+                "id": "code_writer",
+                "continuation_capability": {
+                    "enabled": true,
+                    "allowed_triggers": ["operator_mcp"],
+                    "provider_session_resurrection": {
+                        "enabled": false
+                    }
+                }
+            }]
+        })
+        .to_string();
+        let disabled = continuation_capability_rejection(
+            "ae-id",
+            Some(&disabled_catalog),
+            "provider_session_resurrection",
+            "operator_mcp",
+            false,
+            true,
+            true,
+        )
+        .expect("disabled catalog should produce typed rejection")
+        .expect("disabled resurrection must reject");
+        assert_eq!(
+            disabled["error"]["data"]["failure_reason"],
+            "provider_session_resurrection_disabled"
+        );
+    }
+
+    #[test]
+    fn provider_session_resurrection_adapter_support_fails_closed_until_attach_is_proven() {
+        for provider in ["claude", "claude_acp", "codex", "gemini", "auggie", "junie"] {
+            assert!(
+                !provider_session_resurrection_adapter_supported(Some(provider)),
+                "{provider} must remain disabled until requested-session attach is proven before prompt send"
+            );
+        }
+        assert!(!provider_session_resurrection_adapter_supported(None));
+        assert!(!provider_session_resurrection_adapter_supported(Some(
+            "unknown"
+        )));
     }
 
     #[test]

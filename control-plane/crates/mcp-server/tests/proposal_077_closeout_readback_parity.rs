@@ -273,7 +273,7 @@ async fn reports_get_exposes_p077_documented_and_legacy_closeout_summary_names()
     )
     .await
     .unwrap();
-    let mcp_truth = payload
+    let mcp_truth = payload["reports"]
         .as_array()
         .unwrap()
         .iter()

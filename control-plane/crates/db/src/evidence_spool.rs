@@ -289,10 +289,10 @@ pub async fn sweep_evidence_orphans(
         .await
         .context("canonicalize artifact_root for orphan sweep")?;
 
-    let root = canonical_artifact_root.join("evidence").join("runs");
+    let runs_root = canonical_artifact_root.join("evidence").join("runs");
 
     // Use symlink_metadata (no-follow) to check existence without following symlinks (H-002).
-    match std::fs::symlink_metadata(&root) {
+    match std::fs::symlink_metadata(&runs_root) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(OrphanSweepReport::default());
         }
@@ -309,6 +309,32 @@ pub async fn sweep_evidence_orphans(
         }
         Ok(_) => {}
     }
+
+    let root = if let Some(run_id) = run_id {
+        let scoped_root = runs_root.join(run_id);
+        match std::fs::symlink_metadata(&scoped_root) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(OrphanSweepReport::default());
+            }
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context("stat scoped evidence/run for sweep"))
+            }
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(anyhow::anyhow!(
+                    "evidence/runs/{run_id} is a symlink; refusing sweep traversal (P075-SEC-H002)"
+                ));
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(anyhow::anyhow!(
+                    "evidence/runs/{run_id} exists but is not a directory"
+                ));
+            }
+            Ok(_) => {}
+        }
+        scoped_root
+    } else {
+        runs_root
+    };
 
     let mut report = OrphanSweepReport::default();
     let mut stack = vec![root];

@@ -14,6 +14,13 @@
 #     CARGO_TARGET_DIRs from proposal gates, including the same pattern
 #     under `.chainworks/worktrees/*/control-plane/target`, unless cargo
 #     is actively building/testing.
+#   * Shared gate CARGO_TARGET_DIRs under
+#     `~/Library/Caches/Chainworks Forge/cargo-target/gates/*`, also only
+#     when cargo is not actively building/testing.
+#   * Shared/worktree Cargo `debug/incremental` directories when their target
+#     roots exceed the configured pressure budget. This keeps the common cache
+#     useful while preventing long-lived agent targets from growing without
+#     bound.
 #   * `$TMPDIR/chainworks-test-gates` DerivedData, xcresult, and target
 #     residuals not referenced by currently running xcodebuild commands.
 #   * All but the most recently modified
@@ -59,6 +66,15 @@ done
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_BASE="${TMPDIR:-/tmp}/chainworks-test-gates"
 WORKTREE_ROOT="$ROOT_DIR/.chainworks/worktrees"
+if [[ -f "$ROOT_DIR/scripts/cargo-cache-env.sh" ]]; then
+    CHAINWORKS_CARGO_CACHE_REPO_ROOT="$ROOT_DIR"
+    # shellcheck source=scripts/cargo-cache-env.sh
+    source "$ROOT_DIR/scripts/cargo-cache-env.sh"
+fi
+SHARED_CARGO_TARGET_DIR="${CHAINWORKS_SHARED_CARGO_TARGET_DIR:-$(chainworks_default_cargo_target_dir)}"
+SHARED_GATE_TARGET_ROOT="${CHAINWORKS_GATE_CARGO_TARGET_ROOT:-$SHARED_CARGO_TARGET_DIR/gates}"
+SHARED_TARGET_MAX_GB="${CHAINWORKS_SHARED_CARGO_TARGET_MAX_GB:-32}"
+WORKTREE_TARGET_MAX_GB="${CHAINWORKS_WORKTREE_CARGO_TARGET_MAX_GB:-8}"
 
 if [[ -n "${CHAINWORKS_CLEAN_PROTECTED_WORKTREES:-}" ]]; then
     IFS=' :' read -r -a _env_protected_worktrees <<< "${CHAINWORKS_CLEAN_PROTECTED_WORKTREES}"
@@ -81,11 +97,28 @@ delete() {
     fi
 }
 
-is_cargo_running() {
-    if pgrep -lf 'cargo test|cargo build' >/dev/null 2>&1; then
+du_kib() {
+    local path="$1"
+    [[ -e "$path" ]] || {
+        echo 0
         return 0
-    fi
-    return 1
+    }
+    du -sk "$path" 2>/dev/null | awk '{print $1}'
+}
+
+gb_to_kib() {
+    local gb="$1"
+    awk -v gb="$gb" 'BEGIN { printf "%.0f\n", gb * 1024 * 1024 }'
+}
+
+is_cargo_running() {
+    ps -axo pid=,command= |
+        awk -v self="$$" '
+            $1 == self { next }
+            /(^|[[:space:]])cargo (test|build)([[:space:]]|$)/ { found = 1; exit }
+            /(^|[[:space:]])rustc([[:space:]]|$)/ { found = 1; exit }
+            END { exit(found ? 0 : 1) }
+        '
 }
 
 load_active_tmp_paths() {
@@ -129,6 +162,64 @@ is_protected_worktree() {
     return 1
 }
 
+clean_incremental_under() {
+    local target_root="$1"
+    [[ -d "$target_root" ]] || return 0
+
+    local incremental
+    while IFS= read -r incremental; do
+        [[ -d "$incremental" ]] || continue
+        say "removing Cargo incremental cache $incremental"
+        delete "$incremental"
+    done < <(find "$target_root" -path '*/debug/incremental' -type d -prune 2>/dev/null)
+}
+
+clean_target_pressure() {
+    local target_root="$1"
+    local max_gb="$2"
+    local label="$3"
+    [[ -d "$target_root" ]] || return 0
+
+    local size_kib max_kib
+    size_kib="$(du_kib "$target_root")"
+    max_kib="$(gb_to_kib "$max_gb")"
+    if [[ "$size_kib" -le "$max_kib" ]]; then
+        return 0
+    fi
+
+    say "$label Cargo target is above pressure budget (${size_kib} KiB > ${max_kib} KiB); cleaning incremental caches"
+    clean_incremental_under "$target_root"
+}
+
+target_root_over_budget() {
+    local target_root="$1"
+    local max_gb="$2"
+    [[ -d "$target_root" ]] || return 1
+
+    local size_kib max_kib
+    size_kib="$(du_kib "$target_root")"
+    max_kib="$(gb_to_kib "$max_gb")"
+    [[ "$size_kib" -gt "$max_kib" ]]
+}
+
+prune_child_dirs_until_budget() {
+    local budget_root="$1"
+    local child_root="$2"
+    local max_gb="$3"
+    local label="$4"
+    [[ -d "$budget_root" && -d "$child_root" ]] || return 0
+
+    local child
+    while target_root_over_budget "$budget_root" "$max_gb"; do
+        child="$(find "$child_root" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null |
+            xargs -0 ls -dtr 2>/dev/null |
+            head -n 1 || true)"
+        [[ -n "$child" && -d "$child" ]] || break
+        say "$label is above pressure budget; removing oldest reusable Cargo target $child"
+        delete "$child"
+    done
+}
+
 clean_orphan_target_dirs() {
     local target_root="$1"
     [[ -d "$target_root" ]] || return 0
@@ -147,12 +238,30 @@ clean_orphan_target_dirs() {
     done
 }
 
+clean_worktree_adhoc_target_dirs() {
+    local worktree="$1"
+    [[ -d "$worktree" ]] || return 0
+
+    local entry name
+    for entry in "$worktree"/target-* "$worktree"/control-plane/target-*; do
+        [[ -d "$entry" ]] || continue
+        name="$(basename "$entry")"
+        case "$name" in
+            target-debug|target-release) continue ;;
+        esac
+        say "removing worktree ad-hoc target dir $entry"
+        delete "$entry"
+    done
+}
+
 # ── 1. Orphan per-proposal target dirs ───────────────────────────────
 TARGET_ROOT="$ROOT_DIR/control-plane/target"
 if is_cargo_running; then
     say "cargo build/test is running; skipping Cargo target cleanup"
 else
     clean_orphan_target_dirs "$TARGET_ROOT"
+    clean_target_pressure "$SHARED_CARGO_TARGET_DIR" "$SHARED_TARGET_MAX_GB" "shared"
+    prune_child_dirs_until_budget "$SHARED_CARGO_TARGET_DIR" "$SHARED_GATE_TARGET_ROOT" "$SHARED_TARGET_MAX_GB" "shared Cargo target"
 
     if [[ -d "$WORKTREE_ROOT" ]]; then
         for worktree in "$WORKTREE_ROOT"/*; do
@@ -162,7 +271,9 @@ else
                 say "keeping protected worktree target caches $worktree_name"
                 continue
             fi
+            clean_worktree_adhoc_target_dirs "$worktree"
             clean_orphan_target_dirs "$worktree/control-plane/target"
+            clean_target_pressure "$worktree/control-plane/target" "$WORKTREE_TARGET_MAX_GB" "worktree $worktree_name"
         done
     fi
 fi
@@ -218,6 +329,14 @@ if [[ -d "$TARGET_ROOT" ]]; then
     echo ""
     echo "control-plane/target final size:"
     du -sh "$TARGET_ROOT" 2>/dev/null || true
+fi
+if [[ -d "$SHARED_CARGO_TARGET_DIR" ]]; then
+    echo "shared Cargo target final size:"
+    du -sh "$SHARED_CARGO_TARGET_DIR" 2>/dev/null || true
+fi
+if [[ -d "$SHARED_GATE_TARGET_ROOT" ]]; then
+    echo "shared gate Cargo targets final size:"
+    du -sh "$SHARED_GATE_TARGET_ROOT" 2>/dev/null || true
 fi
 if [[ -d "$TMP_BASE" ]]; then
     echo "chainworks-test-gates final size:"

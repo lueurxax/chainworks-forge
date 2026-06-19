@@ -46,10 +46,10 @@ Gate exits cleanly after the pass marker. 63 focused tests plus the full workspa
 The gate supports these claims:
 
 - principal table auto-bootstraps at `~/.chainworks/auth/principals.json` on first start with owner-only (`0o600`) file mode on Unix,
-- the bootstrap token is logged at `info` level exactly once (on the start that created the file); subsequent starts log only the path,
+- the bootstrap token is written only to `principals.json`; startup logs the file path with a redacted note and never emits the raw bearer token,
 - a zero-principal or unparseable principals file fails the daemon closed,
 - MCP HTTP rejects missing and unknown bearer tokens with JSON-RPC `-32000 "unauthorized"`,
-- MCP stdio rejects first-frame non-`initialize` with `-32002`, rejects `initialize` without or with an unknown `principal_token` with `-32000`, binds the resolved principal for session lifetime, and rejects mid-session reinitialize,
+- MCP stdio rejects first-frame non-`initialize` with `-32002`, rejects `initialize` without or with an unknown `principal_token` with `-32000`, binds the resolved principal for the session lifetime, and rejects mid-session reinitialize,
 - GraphQL HTTP rejects missing or unknown bearer tokens with HTTP 401 and a GraphQL-shaped error body,
 - GraphQL WebSocket rejects missing or unknown `connection_init` tokens and accepts valid ones via `on_connection_init`,
 - P046 GraphQL resolvers enforce operator-read authorization, scoping access to data for the owning run, and ID-based resolvers implement not-found-or-not-visible behavior for unauthorized lineage/generation ownership,
@@ -67,9 +67,9 @@ The gate supports these claims:
 
 Readiness sits at `Ready with Risks` rather than fully frictionless `Ready` because:
 
-- token rotation, revocation, and delegation are deferred; the principal table is read once at daemon startup and rotation requires a restart,
+- token rotation, revocation, and delegation are deferred; the principal table consumed by MCP transports is loaded at daemon startup and rotation requires a restart,
 - the `structuredContent` typed-output channel is not used yet; `journal_id` flows only inside `content[0].text` because the server still advertises `protocolVersion: "2024-11-05"`,
-- per-subscription GraphQL WebSocket capability filtering is permissive (all authenticated principals can subscribe to all subscriptions),
+- per-subscription GraphQL WebSocket capability filtering remains coarse after the subscription surface is allowed (there is not yet a per-subscription allowlist),
 - no `CallerSurface::Internal` variant is defined because no internal caller currently routes through `CommandHandler`; executor and recovery continue to drive work directly.
 
 None of these is a behavioral defect in the landed surface; they are scoped-out extensions whose own owning slices will close them.

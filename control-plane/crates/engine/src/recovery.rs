@@ -8,7 +8,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use acp::AcpRuntimeManager;
 use db::repos::{
@@ -32,7 +32,8 @@ use domain::code_writer_completion::{
 use domain::escalation::EscalationEvent;
 use domain::provider::InvokeAgentCapacityConfig;
 use domain::retry_authority::{RetryAuthorityState, RetryPayloadRecoveryEvent};
-use domain::run::Run;
+use domain::run::{Run, RunStatus};
+use domain::session::{SessionEvent, SessionEventType, SessionGenerationStatus};
 use domain::stage::{StageSettlementKind, StageStatus};
 use sqlx::Row;
 
@@ -292,6 +293,13 @@ fn p092_recovery_reason_code(stale_fields: &[&'static str]) -> &'static str {
     } else {
         "valid_retry_invoke_completion_recovered"
     }
+}
+
+fn p088_startup_receipt_recovery_max_files() -> usize {
+    std::env::var("CHAINWORKS_P088_STARTUP_RECEIPT_RECOVERY_MAX_FILES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(256)
 }
 
 #[cfg(test)]
@@ -724,9 +732,17 @@ impl RecoveryService {
     }
 
     pub async fn run_startup_repair(&self) -> Result<RecoverySummary> {
+        let cancelled_terminal_invariant_repairs =
+            self.repair_cancelled_run_terminal_invariants().await?;
+        if cancelled_terminal_invariant_repairs > 0 {
+            warn!(
+                repaired = cancelled_terminal_invariant_repairs,
+                "Startup recovery restored cancelled run terminal invariants"
+            );
+        }
         let active_runs = runs::list_active(&self.pool).await?;
         let runs_inspected = active_runs.len();
-        let mut runs_repaired = 0usize;
+        let mut runs_repaired = cancelled_terminal_invariant_repairs as usize;
         let mut work_items_requeued = 0usize;
         let now = Utc::now();
         for run in &active_runs {
@@ -770,6 +786,15 @@ impl RecoveryService {
                 "Startup recovery released stale P086 continuation workers"
             );
         }
+        let p082_duplicate_session_owner_repairs =
+            self.repair_p082_duplicate_active_session_owners().await?;
+        if p082_duplicate_session_owner_repairs > 0 {
+            warn!(
+                repaired = p082_duplicate_session_owner_repairs,
+                "Startup recovery repaired duplicate active session owners"
+            );
+        }
+        runs_repaired += p082_duplicate_session_owner_repairs;
         let mut p092_recovered = 0usize;
         for run in &active_runs {
             match self
@@ -890,6 +915,19 @@ impl RecoveryService {
             warn!(
                 completed = completed_invoke_agents,
                 "Startup recovery completed InvokeAgent work items whose agent executions already had valid outputs"
+            );
+        }
+        let failed_invoke_agents =
+            work_items::fail_running_invoke_agents_with_terminal_failed_outputs_on_startup(
+                &self.pool,
+                "startup_repair_terminal_agent_missing_outputs",
+            )
+            .await?;
+        if failed_invoke_agents > 0 {
+            work_items_requeued += failed_invoke_agents as usize;
+            warn!(
+                failed = failed_invoke_agents,
+                "Startup recovery failed InvokeAgent work items whose agent executions were already terminal without valid outputs"
             );
         }
         let requeued_invoke_agents = work_items::requeue_running_invoke_agent_on_startup(
@@ -1095,6 +1133,268 @@ impl RecoveryService {
         })
     }
 
+    async fn repair_cancelled_run_terminal_invariants(&self) -> Result<u64> {
+        let rows = sqlx::query(
+            r#"
+            SELECT r.id
+            FROM runs r
+            LEFT JOIN run_state_projections rsp ON rsp.run_id = r.id
+            WHERE r.cancellation_settled_at IS NOT NULL
+              AND (
+                    r.status <> 'cancelled'
+                 OR COALESCE(json_extract(rsp.run_state_json, '$.status'), '') <> 'cancelled'
+                 OR EXISTS (
+                        SELECT 1
+                          FROM retry_stage_execution_authorities rsa
+                         WHERE rsa.run_id = r.id
+                           AND rsa.authority_state = 'active'
+                    )
+                 OR EXISTS (
+                        SELECT 1
+                          FROM work_items wi
+                         WHERE wi.run_id = r.id
+                           AND wi.status IN ('pending', 'running')
+                    )
+                 OR EXISTS (
+                        SELECT 1
+                          FROM stage_executions se
+                         WHERE se.run_id = r.id
+                           AND se.status IN ('pending', 'running')
+                    )
+                 OR EXISTS (
+                        SELECT 1
+                          FROM agent_executions ae
+                          JOIN stage_executions se ON se.id = ae.stage_execution_id
+                         WHERE se.run_id = r.id
+                           AND ae.status = 'running'
+                    )
+                 OR EXISTS (
+                        SELECT 1
+                          FROM approvals a
+                         WHERE a.run_id = r.id
+                           AND a.decision IN ('pending', 'requested')
+                    )
+              )
+            ORDER BY r.started_at ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("load cancelled run terminal invariant repair candidates")?;
+
+        let mut repaired = 0_u64;
+        for row in rows {
+            let run_id_raw: String = row.get("id");
+            let run_id: domain::ids::RunId = run_id_raw
+                .parse()
+                .map_err(|e| anyhow!("invalid run id {run_id_raw}: {e}"))?;
+            let now = Utc::now();
+            let mut tx = self
+                .begin_transaction(
+                    "startup_repair.cancelled_run_terminal_invariant",
+                    format!("cancelled-run-terminal-invariant:{run_id}"),
+                )
+                .await?;
+
+            let Some(run) = runs::find_by_id_tx(&mut tx, run_id).await? else {
+                tx.commit().await?;
+                continue;
+            };
+            if run.cancellation_settled_at.is_none() {
+                tx.commit().await?;
+                continue;
+            }
+
+            runs::update_status_tx(&mut tx, run_id, RunStatus::Cancelled).await?;
+            agent_executions::cancel_running_by_run_tx(&mut tx, run_id, now).await?;
+            sqlx::query(
+                r#"
+                UPDATE work_items
+                   SET status = ?1,
+                       completed_at = COALESCE(completed_at, ?2),
+                       last_error = COALESCE(last_error, ?3)
+                 WHERE run_id = ?4
+                   AND status IN (?5, ?6)
+                "#,
+            )
+            .bind(WorkItemStatus::Cancelled.to_string())
+            .bind(now.to_rfc3339())
+            .bind("startup_repair_cancelled_run_terminal_invariant")
+            .bind(run_id.to_string())
+            .bind(WorkItemStatus::Pending.to_string())
+            .bind(WorkItemStatus::Running.to_string())
+            .execute(&mut **tx)
+            .await
+            .context("cancel pending/running work items for cancelled run")?;
+            sqlx::query(
+                r#"
+                UPDATE stage_executions
+                   SET status = ?1,
+                       settlement_kind = COALESCE(settlement_kind, ?2),
+                       completed_at = COALESCE(completed_at, ?3)
+                 WHERE run_id = ?4
+                   AND status IN (?5, ?6)
+                "#,
+            )
+            .bind(StageStatus::Skipped.to_string())
+            .bind(StageSettlementKind::Skipped.to_string())
+            .bind(now.to_rfc3339())
+            .bind(run_id.to_string())
+            .bind(StageStatus::Pending.to_string())
+            .bind(StageStatus::Running.to_string())
+            .execute(&mut **tx)
+            .await
+            .context("settle pending/running stages for cancelled run")?;
+            sqlx::query(
+                r#"
+                UPDATE retry_stage_execution_authorities
+                   SET authority_state = ?1,
+                       terminal_reason = COALESCE(terminal_reason, ?2),
+                       updated_at = ?3
+                 WHERE run_id = ?4
+                   AND authority_state = ?5
+                "#,
+            )
+            .bind(RetryAuthorityState::Terminalized.to_string())
+            .bind("cancelled_run_terminal_invariant_repair")
+            .bind(now.to_rfc3339())
+            .bind(run_id.to_string())
+            .bind(RetryAuthorityState::Active.to_string())
+            .execute(&mut **tx)
+            .await
+            .context("terminalize retry authorities for cancelled run")?;
+            let expired_approvals = approvals::expire_pending_by_run_tx(
+                &mut tx,
+                run_id,
+                now,
+                Some("startup_repair_cancelled_run_terminal_invariant".into()),
+            )
+            .await?;
+            if expired_approvals > 0 {
+                info!(
+                    run_id = %run_id,
+                    expired_approvals = expired_approvals,
+                    "Expired pending approvals while repairing cancelled run terminal invariant"
+                );
+            }
+
+            tx.commit().await?;
+            projections::rebuild_all_for_run(&self.pool, run_id).await?;
+            repaired += 1;
+        }
+
+        Ok(repaired)
+    }
+
+    async fn repair_p082_duplicate_active_session_owners(&self) -> Result<usize> {
+        let rows = sqlx::query(
+            r#"SELECT sl.run_id,
+                      sg.id AS generation_id,
+                      sg.lineage_id,
+                      sg.invocation_owner_key,
+                      sg.created_at
+               FROM session_generations sg
+               INNER JOIN session_lineages sl ON sl.id = sg.lineage_id
+               WHERE sg.status = 'active'
+                 AND sg.invocation_owner_key IN (
+                     SELECT invocation_owner_key
+                     FROM session_generations
+                     WHERE status = 'active'
+                     GROUP BY invocation_owner_key
+                     HAVING COUNT(*) > 1
+                 )
+               ORDER BY sl.run_id ASC,
+                        sg.invocation_owner_key ASC,
+                        sg.created_at DESC,
+                        sg.id DESC"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("load duplicate active session owner candidates")?;
+
+        let mut repaired = 0usize;
+        let mut current_owner: Option<(String, String)> = None;
+        let mut kept_generation_id: Option<String> = None;
+        for row in rows {
+            let run_id: String = row.get("run_id");
+            let owner_key: String = row.get("invocation_owner_key");
+            let generation_id: String = row.get("generation_id");
+            let lineage_id: String = row.get("lineage_id");
+            let owner = (run_id.clone(), owner_key.clone());
+            if current_owner.as_ref() != Some(&owner) {
+                current_owner = Some(owner);
+                kept_generation_id = Some(generation_id);
+                continue;
+            }
+
+            let kept_generation_id = kept_generation_id.clone().unwrap_or_default();
+            let now = Utc::now();
+            let event_id = format!("p082-r04-duplicate-owner-repair:{generation_id}");
+            let readback = domain::recovery_matrix::build_readback_v1(
+                "P082-R04",
+                "repaired",
+                "inspect_duplicate_owner",
+                domain::recovery_matrix::REASON_DUPLICATE_OWNER_REPAIRED,
+                "Duplicate active session owner repaired; one active generation remains.",
+                "session_events",
+                "session_lineages, session_generations, session_events, work_items",
+                &event_id,
+                Some("session_events.details_json.p082_recovery_matrix_readback"),
+                "valid",
+                &now.to_rfc3339(),
+            );
+            let details = serde_json::json!({
+                "schema_version": "p082_duplicate_session_owner_repair_v1",
+                "run_id": run_id,
+                "invocation_owner_key": owner_key,
+                "surviving_generation_id": kept_generation_id,
+                "invalidated_generation_id": generation_id,
+                "p082_recovery_matrix_readback": readback,
+            });
+
+            let mut tx = self
+                .begin_transaction(
+                    "recovery.p082_duplicate_session_owner_repair",
+                    format!("recovery.p082_duplicate_session_owner_repair:{generation_id}"),
+                )
+                .await?;
+            sessions::end_generation_tx(
+                &mut tx,
+                &generation_id,
+                SessionGenerationStatus::Invalidated,
+                "p082_duplicate_owner_repaired",
+                now,
+            )
+            .await?;
+            sqlx::query(
+                r#"UPDATE session_lineages
+                   SET active_generation_id = NULL
+                   WHERE id = ?1 AND active_generation_id = ?2"#,
+            )
+            .bind(&lineage_id)
+            .bind(&generation_id)
+            .execute(&mut **tx)
+            .await
+            .context("clear duplicate session lineage active generation")?;
+            sessions::insert_event_tx(
+                &mut tx,
+                &SessionEvent {
+                    id: event_id,
+                    lineage_id,
+                    generation_id,
+                    event_type: SessionEventType::Invalidated,
+                    recorded_at: now,
+                    details_json: Some(details.to_string()),
+                },
+            )
+            .await?;
+            tx.commit().await?;
+            repaired += 1;
+        }
+
+        Ok(repaired)
+    }
+
     async fn repair_p086_stale_continuation_workers(&self) -> Result<usize> {
         let current_generation = format!("daemon-{}", std::process::id());
         let stale_before = (Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
@@ -1287,13 +1587,33 @@ impl RecoveryService {
     }
 
     async fn recover_p088_completion_receipt_artifacts(&self, run: &Run) -> Result<usize> {
+        let max_files = p088_startup_receipt_recovery_max_files();
+        if max_files == 0 {
+            debug!(
+                run_id = %run.id,
+                "P088 startup completion receipt artifact recovery disabled by max-files=0"
+            );
+            return Ok(0);
+        }
+
         let p088_root = Path::new(&run.artifact_root).join("evidence").join("p088");
         if !p088_root.exists() {
             return Ok(0);
         }
 
         let mut recovered = 0usize;
+        let mut inspected = 0usize;
         for entry in std::fs::read_dir(&p088_root)? {
+            if inspected >= max_files {
+                warn!(
+                    run_id = %run.id,
+                    root = %p088_root.display(),
+                    inspected = inspected,
+                    max_files = max_files,
+                    "P088 startup completion receipt artifact recovery truncated to keep daemon startup bounded"
+                );
+                break;
+            }
             let Ok(entry) = entry else {
                 continue;
             };
@@ -1301,6 +1621,7 @@ impl RecoveryService {
             if !path.exists() {
                 continue;
             }
+            inspected += 1;
             let raw = match std::fs::read_to_string(&path) {
                 Ok(raw) => raw,
                 Err(e) => {
@@ -1319,7 +1640,7 @@ impl RecoveryService {
                 continue;
             }
             if artifact.receipt.run_id != run.id {
-                warn!(
+                debug!(
                     run_id = %run.id,
                     artifact_run_id = %artifact.receipt.run_id,
                     path = %path.display(),
@@ -2299,6 +2620,35 @@ impl RecoveryService {
                 continue;
             }
 
+            if executions
+                .iter()
+                .all(|execution| execution.status != AgentStatus::Running)
+            {
+                if !stage_has_pending_or_running_advance_work(&self.pool, run.id, stage.id).await? {
+                    info!(
+                        run_id = %run.id,
+                        stage_id = %stage.stage_id,
+                        stage_execution_id = %stage.id,
+                        "Startup repair kickstarting terminal running stage without blocking"
+                    );
+                    self.work_queue
+                        .enqueue(
+                            WorkItemKind::AdvanceRun,
+                            Some(run.id),
+                            None,
+                            serde_json::json!({
+                                "run_id": run.id.to_string(),
+                                "reason": "startup_terminal_running_stage_kickstart",
+                                "stage_execution_id": stage.id.to_string(),
+                                "stage_id": stage.stage_id,
+                            }),
+                        )
+                        .await?;
+                    requeued += 1;
+                }
+                continue;
+            }
+
             let provenance_suffix = self
                 .latest_execution_provenance_suffix(stage.id)
                 .await
@@ -2365,6 +2715,13 @@ impl RecoveryService {
                 .await?;
             requeued += 1;
         } else {
+            let blocked_stage_catchups = self
+                .recover_blocked_stages_with_terminal_work(run, &run_stages)
+                .await?;
+            if blocked_stage_catchups > 0 {
+                return Ok(requeued + blocked_stage_catchups);
+            }
+
             if self.transition_cursor_blocks_startup_catchup(run).await? {
                 let cancelled = work_items::cancel_pending_or_running_advance_by_run(
                     &self.pool,
@@ -2381,6 +2738,21 @@ impl RecoveryService {
                     );
                 }
                 return Ok(requeued);
+            }
+
+            let completed_targeted_advance =
+                work_items::complete_targeted_advance_runs_with_existing_invokes(
+                    &self.pool,
+                    now,
+                    "startup_repair_targeted_advance_existing_invoke",
+                )
+                .await?;
+            if completed_targeted_advance > 0 {
+                info!(
+                    run_id = %run.id,
+                    completed = %completed_targeted_advance,
+                    "Startup recovery completed targeted AdvanceRun work items whose InvokeAgent already exists"
+                );
             }
 
             let mut requeued_targeted_advance = 0_u64;
@@ -2468,6 +2840,92 @@ impl RecoveryService {
                     .await?;
                 requeued += 1;
             }
+        }
+
+        Ok(requeued)
+    }
+
+    async fn recover_blocked_stages_with_terminal_work(
+        &self,
+        run: &Run,
+        run_stages: &[domain::stage::StageExecution],
+    ) -> Result<usize> {
+        if run_has_pending_or_running_work(&self.pool, run.id).await? {
+            return Ok(0);
+        }
+        let Some(current_state) = run.current_state.as_deref() else {
+            return Ok(0);
+        };
+
+        let mut requeued = 0usize;
+        let now = Utc::now();
+        for stage in run_stages.iter().filter(|stage| {
+            stage.status == StageStatus::Blocked
+                && stage.stage_id == current_state
+                && stage.validation_failure_json.is_none()
+        }) {
+            let latest_attempt = run_stages
+                .iter()
+                .filter(|candidate| candidate.stage_id == stage.stage_id)
+                .map(|candidate| candidate.attempt_number)
+                .max()
+                .unwrap_or(stage.attempt_number);
+            if stage.attempt_number < latest_attempt {
+                continue;
+            }
+            if stage_has_pending_or_running_invoke_work(&self.pool, run.id, stage.id).await?
+                || stage_has_pending_or_running_advance_work(&self.pool, run.id, stage.id).await?
+            {
+                continue;
+            }
+
+            let executions = agent_executions::find_by_stage(&self.pool, stage.id).await?;
+            if executions.is_empty()
+                || executions
+                    .iter()
+                    .any(|execution| execution.status == AgentStatus::Running)
+                || !executions
+                    .iter()
+                    .any(|execution| execution.status == AgentStatus::Completed)
+            {
+                continue;
+            }
+
+            info!(
+                run_id = %run.id,
+                stage_id = %stage.stage_id,
+                stage_execution_id = %stage.id,
+                execution_count = %executions.len(),
+                "Startup recovery scheduling blocked-stage catchup for terminal agent work"
+            );
+            self.work_queue
+                .enqueue(
+                    WorkItemKind::AdvanceRun,
+                    Some(run.id),
+                    Some(stage.stage_id.clone()),
+                    serde_json::json!({
+                        "run_id": run.id.to_string(),
+                        "reason": "startup_blocked_stage_catchup",
+                        "stage_execution_id": stage.id.to_string(),
+                        "target_stage_execution_id": stage.id.to_string(),
+                        "stage_id": stage.stage_id.clone(),
+                    }),
+                )
+                .await?;
+            let repair_id = uuid::Uuid::new_v4().to_string();
+            let _ = startup_repairs::record(
+                &self.pool,
+                &repair_id,
+                &run.id.to_string(),
+                "blocked_stage_catchup",
+                now,
+                Some(&format!(
+                    "Blocked stage '{}' has terminal agent work and no live work; enqueued targeted AdvanceRun",
+                    stage.stage_id
+                )),
+            )
+            .await;
+            requeued += 1;
         }
 
         Ok(requeued)

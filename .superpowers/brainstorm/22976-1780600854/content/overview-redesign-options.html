@@ -1,0 +1,197 @@
+<style>
+  .cw-screen { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", sans-serif; color: #e9edf4; }
+  .cw-grid { display: grid; grid-template-columns: repeat(3, minmax(320px, 1fr)); gap: 18px; align-items: start; }
+  .cw-option { border: 1px solid rgba(148,163,184,.24); border-radius: 18px; background: #15171c; overflow: hidden; cursor: pointer; }
+  .cw-option:hover { border-color: rgba(96,165,250,.72); }
+  .cw-option.selected { outline: 3px solid #3b82f6; }
+  .cw-top { padding: 18px 18px 12px; border-bottom: 1px solid rgba(148,163,184,.16); }
+  .cw-title { font-size: 18px; font-weight: 800; margin: 0 0 4px; }
+  .cw-sub { color: #9ca3af; font-size: 13px; line-height: 1.35; }
+  .cw-mock { padding: 14px; background: #101216; min-height: 760px; }
+  .cw-run-head { border-radius: 14px; background: #20242b; padding: 14px; margin-bottom: 12px; }
+  .cw-run-title { font-size: 16px; font-weight: 800; margin-bottom: 8px; }
+  .cw-pillrow { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .cw-pill { font-size: 11px; font-weight: 800; padding: 5px 8px; border-radius: 999px; background: #2f3540; color: #cbd5e1; }
+  .cw-green { background: rgba(34,197,94,.18); color: #86efac; }
+  .cw-blue { background: rgba(59,130,246,.2); color: #93c5fd; }
+  .cw-amber { background: rgba(245,158,11,.18); color: #facc15; }
+  .cw-red { background: rgba(239,68,68,.16); color: #fca5a5; }
+  .cw-card { border: 1px solid rgba(148,163,184,.18); border-radius: 14px; padding: 14px; background: #191c22; margin-bottom: 12px; }
+  .cw-card.primary { border-color: rgba(59,130,246,.9); box-shadow: inset 0 0 0 1px rgba(59,130,246,.35); background: linear-gradient(180deg, rgba(30,64,175,.18), #191c22); }
+  .cw-card h4 { margin: 0 0 8px; font-size: 13px; color: #a8b0bd; letter-spacing: .08em; text-transform: uppercase; }
+  .cw-card h3 { margin: 0 0 8px; font-size: 18px; line-height: 1.15; }
+  .cw-line { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px solid rgba(148,163,184,.09); font-size: 12px; color: #cbd5e1; }
+  .cw-line:last-child { border-bottom: 0; }
+  .cw-label { color: #8b949e; }
+  .cw-value { text-align: right; font-weight: 700; }
+  .cw-agent { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 8px; border-radius: 10px; background: #242832; margin-top: 8px; }
+  .cw-agent strong { font-size: 13px; }
+  .cw-agent span { color: #a7afbc; font-size: 12px; }
+  .cw-mini-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .cw-artifact { display: flex; justify-content: space-between; gap: 8px; padding: 8px 0; border-bottom: 1px solid rgba(148,163,184,.12); font-size: 12px; }
+  .cw-artifact:last-child { border-bottom: 0; }
+  .cw-arrow { text-align: center; color: #60a5fa; font-weight: 900; font-size: 20px; margin: 4px 0 8px; }
+  .cw-flow { display: grid; grid-template-columns: 1fr; gap: 10px; }
+  .cw-compact-stage { border: 1px solid rgba(148,163,184,.18); border-radius: 12px; padding: 10px; background: #1d2027; }
+  .cw-compact-stage.current { border-color: rgba(59,130,246,.8); background: rgba(30,64,175,.18); }
+  .cw-meter { height: 7px; border-radius: 999px; background: #2a2f38; overflow: hidden; margin: 10px 0; }
+  .cw-meter > div { height: 100%; background: linear-gradient(90deg, #3b82f6, #22c55e); width: 68%; }
+</style>
+
+<div class="cw-screen">
+  <h2>Overview redesign direction</h2>
+  <p class="subtitle">Three ways to replace the duplicated lower Overview sections with run-at-a-glance information. Click one if a direction feels right.</p>
+
+  <div class="cw-grid">
+    <div class="cw-option option" data-choice="a-current-stage-command" onclick="toggleSelect(this)">
+      <div class="cw-top">
+        <div class="cw-title">A. Current Stage Command Center</div>
+        <div class="cw-sub">Recommended. Overview becomes “what is happening now”, with previous/next context and last completed artifacts.</div>
+      </div>
+      <div class="cw-mock">
+        <div class="cw-run-head">
+          <div class="cw-run-title">Implement Proposal 082: Recovery and Retry State-Machine Test Matrix</div>
+          <div class="cw-pillrow">
+            <span class="cw-pill cw-blue">Running</span>
+            <span class="cw-pill">Run a09a1…</span>
+            <span class="cw-pill cw-amber">Closeout: Not Ready</span>
+          </div>
+        </div>
+
+        <div class="cw-card">
+          <h4>Closeout Readiness</h4>
+          <div class="cw-line"><span class="cw-label">Decision</span><span class="cw-value">Return to code refine</span></div>
+          <div class="cw-line"><span class="cw-label">Gate</span><span class="cw-value">proposal-082 passed</span></div>
+          <div class="cw-line"><span class="cw-label">Remaining</span><span class="cw-value">2 review fixes</span></div>
+        </div>
+
+        <div class="cw-mini-grid">
+          <div class="cw-card">
+            <h4>Previous Stage</h4>
+            <h3>Implementation reviewed</h3>
+            <div class="cw-pillrow"><span class="cw-pill cw-red">Not Ready</span><span class="cw-pill">08:31</span></div>
+            <div class="cw-line"><span class="cw-label">Result</span><span class="cw-value">code_fixes</span></div>
+            <div class="cw-line"><span class="cw-label">Findings</span><span class="cw-value">SEC + OPS</span></div>
+          </div>
+          <div class="cw-card">
+            <h4>Next Stage</h4>
+            <h3>Review or release</h3>
+            <div class="cw-pillrow"><span class="cw-pill cw-blue">if gate green</span><span class="cw-pill cw-amber">manual release</span></div>
+            <div class="cw-line"><span class="cw-label">Likely route</span><span class="cw-value">review</span></div>
+            <div class="cw-line"><span class="cw-label">Fallback</span><span class="cw-value">refine loop</span></div>
+          </div>
+        </div>
+
+        <div class="cw-card primary">
+          <h4>Current Stage</h4>
+          <h3>Implementation refined</h3>
+          <div class="cw-pillrow"><span class="cw-pill cw-blue">Running</span><span class="cw-pill">Attempt 4</span><span class="cw-pill">Iteration 12</span></div>
+          <div class="cw-agent"><div><strong>Code Writer</strong><br><span>refine_implementation · active · claude sonnet</span></div><span class="cw-pill cw-blue">live</span></div>
+          <div class="cw-agent"><div><strong>Docs Guardian</strong><br><span>sync_docs_after_refinement · pending</span></div><span class="cw-pill">queued</span></div>
+          <div class="cw-meter"><div></div></div>
+          <div class="cw-line"><span class="cw-label">Current objective</span><span class="cw-value">fix R3 blockers</span></div>
+          <div class="cw-line"><span class="cw-label">Last signal</span><span class="cw-value">gate passed</span></div>
+        </div>
+
+        <div class="cw-card">
+          <h4>Artifacts from last completed stage</h4>
+          <div class="cw-artifact"><span>implementation audit R3</span><strong>review</strong></div>
+          <div class="cw-artifact"><span>security report</span><strong>latest</strong></div>
+          <div class="cw-artifact"><span>prepush summary</span><strong>latest</strong></div>
+        </div>
+
+        <div class="cw-card">
+          <h4>Recovery Evidence</h4>
+          <div class="cw-line"><span class="cw-label">Startup repair</span><span class="cw-value">none active</span></div>
+          <div class="cw-line"><span class="cw-label">Retry authority</span><span class="cw-value">valid</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="cw-option option" data-choice="b-flow-strip" onclick="toggleSelect(this)">
+      <div class="cw-top">
+        <div class="cw-title">B. Previous → Current → Next Flow</div>
+        <div class="cw-sub">More narrative. Best if you want Overview to explain why the run is moving, not just what is active.</div>
+      </div>
+      <div class="cw-mock">
+        <div class="cw-run-head">
+          <div class="cw-run-title">Implement Proposal 082</div>
+          <div class="cw-pillrow"><span class="cw-pill cw-blue">Running</span><span class="cw-pill">Run a09a1…</span></div>
+        </div>
+        <div class="cw-card">
+          <h4>Closeout Readiness</h4>
+          <h3>Not ready: review fixes required</h3>
+          <div class="cw-line"><span class="cw-label">Primary unblock</span><span class="cw-value">fix code issues</span></div>
+        </div>
+        <div class="cw-flow">
+          <div class="cw-compact-stage">
+            <h4>Previous</h4>
+            <h3>Implementation reviewed</h3>
+            <div class="cw-pillrow"><span class="cw-pill cw-red">Not Ready</span><span class="cw-pill">4 findings</span><span class="cw-pill">08:31</span></div>
+          </div>
+          <div class="cw-arrow">↓</div>
+          <div class="cw-compact-stage current">
+            <h4>Now</h4>
+            <h3>Implementation refined</h3>
+            <div class="cw-pillrow"><span class="cw-pill cw-blue">Code Writer active</span><span class="cw-pill">Attempt 4</span></div>
+            <div class="cw-line"><span class="cw-label">Fixing</span><span class="cw-value">SEC, OPS, READY, REL</span></div>
+            <div class="cw-line"><span class="cw-label">Latest</span><span class="cw-value">focused tests green</span></div>
+          </div>
+          <div class="cw-arrow">↓</div>
+          <div class="cw-compact-stage">
+            <h4>Next</h4>
+            <h3>Review retry</h3>
+            <div class="cw-pillrow"><span class="cw-pill cw-blue">if green</span><span class="cw-pill cw-amber">manual if ready</span></div>
+          </div>
+        </div>
+        <div class="cw-card">
+          <h4>Latest completed-stage artifacts</h4>
+          <div class="cw-artifact"><span>audit R3</span><strong>1 min</strong></div>
+          <div class="cw-artifact"><span>security report</span><strong>latest</strong></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="cw-option option" data-choice="c-evidence-first" onclick="toggleSelect(this)">
+      <div class="cw-top">
+        <div class="cw-title">C. Evidence-First Overview</div>
+        <div class="cw-sub">Best for blocked runs. Emphasizes what evidence changed and what operator should trust right now.</div>
+      </div>
+      <div class="cw-mock">
+        <div class="cw-run-head">
+          <div class="cw-run-title">Implement Proposal 082</div>
+          <div class="cw-pillrow"><span class="cw-pill cw-blue">Running</span><span class="cw-pill">Run a09a1…</span></div>
+        </div>
+        <div class="cw-card primary">
+          <h4>Current Stage</h4>
+          <h3>Implementation refined</h3>
+          <div class="cw-agent"><div><strong>Code Writer</strong><br><span>attempt 4 · iteration 12 · active</span></div><span class="cw-pill cw-blue">live</span></div>
+          <div class="cw-line"><span class="cw-label">Working on</span><span class="cw-value">R3 blockers</span></div>
+        </div>
+        <div class="cw-card">
+          <h4>What changed most recently</h4>
+          <div class="cw-line"><span class="cw-label">Previous result</span><span class="cw-value">audit found 5 blockers</span></div>
+          <div class="cw-line"><span class="cw-label">Current proof</span><span class="cw-value">proposal gate green</span></div>
+          <div class="cw-line"><span class="cw-label">Risk</span><span class="cw-value">waiting for review</span></div>
+        </div>
+        <div class="cw-card">
+          <h4>Latest completed-stage artifacts</h4>
+          <div class="cw-artifact"><span>R3 audit report</span><strong>open</strong></div>
+          <div class="cw-artifact"><span>review summary</span><strong>open</strong></div>
+          <div class="cw-artifact"><span>security report</span><strong>open</strong></div>
+        </div>
+        <div class="cw-card">
+          <h4>Next decisions</h4>
+          <div class="cw-line"><span class="cw-label">If review passes</span><span class="cw-value">manual release</span></div>
+          <div class="cw-line"><span class="cw-label">If review fails</span><span class="cw-value">refine again</span></div>
+          <div class="cw-line"><span class="cw-label">Human action</span><span class="cw-value">none now</span></div>
+        </div>
+        <div class="cw-card">
+          <h4>Recovery Evidence</h4>
+          <div class="cw-line"><span class="cw-label">Readback</span><span class="cw-value">available</span></div>
+          <div class="cw-line"><span class="cw-label">Warnings</span><span class="cw-value">none</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

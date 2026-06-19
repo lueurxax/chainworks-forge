@@ -55,6 +55,12 @@ artifacts:
   security_report: ${CHAINWORKS_META_ROOT:-.chainworks}/security/report.json
   prepush_review_report: ${CHAINWORKS_META_ROOT:-.chainworks}/review/prepush.json
   implementation_review_summary: ${CHAINWORKS_META_ROOT:-.chainworks}/review/implementation-summary.json
+  proposal_decomposition_plan: ${CHAINWORKS_META_ROOT:-.chainworks}/proposal/decomposition-plan.json
+  quality_gate_blocker_assessment: ${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/blocker-assessment.json
+  blocker_boundary_status: ${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/blocker-boundary-status.json
+  blocker_boundary_approval_request: ${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/blocker-boundary-approval-request.json
+  blocker_boundary_human_decision: ${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/blocker-boundary-human-decision.json
+  followup_proposal_seed: ${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/followup-proposal-seed.json
   docs_report: ${CHAINWORKS_META_ROOT:-.chainworks}/docs/report.json
   docs_delta: ${CHAINWORKS_META_ROOT:-.chainworks}/docs/changed-files.json
   run_state: ${CHAINWORKS_META_ROOT:-.chainworks}/state/run-state.json
@@ -343,6 +349,59 @@ contracts:
       - open_blockers
       - must_fix
       - recommended_next_step
+  proposal_decomposition_plan_v1:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - schema_version
+      - requires_split
+      - implementation_start_decision
+  quality_gate_blocker_assessment_v1:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - schema_version
+      - blockers
+  blocker_boundary_status_v1:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - schema_version
+      - status
+      - assessment_generation_id
+      - projection_integrity
+      - followup_proposal_required
+      - has_release_blocking_external_blockers
+      - has_no_release_blocking_external_blockers
+      - workflow_route_hint
+  blocker_boundary_approval_request_v1:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - schema_version
+      - question
+      - allowed_decisions
+      - label_to_approval_state
+  blocker_boundary_human_decision_v1:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - schema_version
+      - decision_label
+  followup_proposal_seed_v1:
+    format: json
+    machine_format: json
+    validation_mode: strict_structured
+    required_fields:
+      - schema_version
+      - title
+      - problem
+      - proposed_scope
   docs_report_v1:
     format: json
     required_fields:
@@ -1194,6 +1253,300 @@ permission_profiles:
     mcp:
       legacy_allow: []
       runtime_authority: false
+escalation_policies:
+  - policy_id: lead_implementation_start_quota_escalation
+    schema_version: escalation_policy_v1
+    enabled_default: true
+    applies_to:
+      stage_id: state_7_implementation_started
+    max_chain_attempts: 3
+    max_chain_wall_clock_seconds: 7200
+    triggers:
+      - provider_quota_exhausted
+      - transport_failure
+      - contract_output_failure
+      - stale_no_output
+    tiers:
+      - tier_id: codex_orchestrator
+        kind: backend_profile
+        backend_profile_id: codex_orchestrator_high
+        max_attempts: 1
+      - tier_id: claude_opus_orchestrator
+        kind: backend_profile
+        backend_profile_id: claude_orchestrator_high
+        max_attempts: 1
+      - tier_id: human_pause
+        kind: pause
+  - policy_id: code_writer_quota_escalation
+    schema_version: escalation_policy_v1
+    enabled_default: true
+    applies_to:
+      backend_profile_id: claude_builder_high
+    max_chain_attempts: 3
+    max_chain_wall_clock_seconds: 7200
+    triggers:
+      - provider_quota_exhausted
+      - transport_failure
+      - contract_output_failure
+      - stale_no_output
+    tiers:
+      - tier_id: codex_builder_fallback
+        kind: backend_profile
+        backend_profile_id: codex_builder_high
+        max_attempts: 1
+      - tier_id: claude_builder_same_backend
+        kind: backend_profile
+        backend_profile_id: claude_builder_high
+        max_attempts: 1
+      - tier_id: gemini_reasoning_fallback
+        kind: backend_profile
+        backend_profile_id: gemini_reasoning_pro_high
+        max_attempts: 1
+      - tier_id: human_pause
+        kind: pause
+  - policy_id: implementation_refinement_codex_quota_escalation
+    schema_version: escalation_policy_v1
+    enabled_default: true
+    applies_to:
+      stage_id: state_10_implementation_refined
+    max_chain_attempts: 3
+    max_chain_wall_clock_seconds: 7200
+    triggers:
+      - provider_quota_exhausted
+      - transport_failure
+      - contract_output_failure
+      - stale_no_output
+    tiers:
+      - tier_id: codex_builder_fallback
+        kind: backend_profile
+        backend_profile_id: codex_builder_high
+        max_attempts: 1
+      - tier_id: claude_builder_same_backend
+        kind: backend_profile
+        backend_profile_id: claude_builder_high
+        max_attempts: 1
+      - tier_id: gemini_reasoning_fallback
+        kind: backend_profile
+        backend_profile_id: gemini_reasoning_pro_high
+        max_attempts: 1
+      - tier_id: human_pause
+        kind: pause
+  - policy_id: proposal_writer_quota_escalation
+    schema_version: escalation_policy_v1
+    enabled_default: true
+    applies_to:
+      backend_profile_id: codex_writer_high
+    max_chain_attempts: 3
+    max_chain_wall_clock_seconds: 7200
+    triggers:
+      - provider_quota_exhausted
+      - transport_failure
+      - contract_output_failure
+      - stale_no_output
+    tiers:
+      - tier_id: codex_writer_same_backend
+        kind: backend_profile
+        backend_profile_id: codex_writer_high
+        max_attempts: 1
+      - tier_id: claude_writer_fallback
+        kind: backend_profile
+        backend_profile_id: claude_writer_high
+        max_attempts: 1
+      - tier_id: gemini_reasoning_fallback
+        kind: backend_profile
+        backend_profile_id: gemini_reasoning_pro_high
+        max_attempts: 1
+      - tier_id: human_pause
+        kind: pause
+  - policy_id: gemini_reviewer_quota_escalation
+    schema_version: escalation_policy_v1
+    enabled_default: true
+    applies_to:
+      backend_profile_id: gemini_review_pro
+    max_chain_attempts: 3
+    max_chain_wall_clock_seconds: 7200
+    triggers:
+      - provider_quota_exhausted
+      - transport_failure
+      - contract_output_failure
+      - stale_no_output
+    tiers:
+      - tier_id: gemini_review_same_backend
+        kind: backend_profile
+        backend_profile_id: gemini_review_pro
+        max_attempts: 1
+      - tier_id: codex_architect_fallback
+        kind: backend_profile
+        backend_profile_id: codex_architect_high
+        max_attempts: 1
+      - tier_id: claude_product_fallback
+        kind: backend_profile
+        backend_profile_id: claude_product_high
+        max_attempts: 1
+      - tier_id: human_pause
+        kind: pause
+  - policy_id: claude_reviewer_quota_escalation
+    schema_version: escalation_policy_v1
+    enabled_default: true
+    applies_to:
+      backend_profile_id: claude_product_high
+    max_chain_attempts: 3
+    max_chain_wall_clock_seconds: 7200
+    triggers:
+      - provider_quota_exhausted
+      - transport_failure
+      - contract_output_failure
+      - stale_no_output
+    tiers:
+      - tier_id: claude_product_same_backend
+        kind: backend_profile
+        backend_profile_id: claude_product_high
+        max_attempts: 1
+      - tier_id: codex_architect_fallback
+        kind: backend_profile
+        backend_profile_id: codex_architect_high
+        max_attempts: 1
+      - tier_id: gemini_review_fallback
+        kind: backend_profile
+        backend_profile_id: gemini_review_pro
+        max_attempts: 1
+      - tier_id: human_pause
+        kind: pause
+  - policy_id: codex_reviewer_quota_escalation
+    schema_version: escalation_policy_v1
+    enabled_default: true
+    applies_to:
+      backend_profile_id: codex_architect_high
+    max_chain_attempts: 3
+    max_chain_wall_clock_seconds: 7200
+    triggers:
+      - provider_quota_exhausted
+      - transport_failure
+      - contract_output_failure
+      - stale_no_output
+    tiers:
+      - tier_id: codex_architect_same_backend
+        kind: backend_profile
+        backend_profile_id: codex_architect_high
+        max_attempts: 1
+      - tier_id: claude_product_fallback
+        kind: backend_profile
+        backend_profile_id: claude_product_high
+        max_attempts: 1
+      - tier_id: gemini_review_fallback
+        kind: backend_profile
+        backend_profile_id: gemini_review_pro
+        max_attempts: 1
+      - tier_id: human_pause
+        kind: pause
+  - policy_id: implementation_auditor_quota_escalation
+    schema_version: escalation_policy_v1
+    enabled_default: true
+    applies_to:
+      backend_profile_id: codex_audit_high
+    max_chain_attempts: 3
+    max_chain_wall_clock_seconds: 7200
+    triggers:
+      - provider_quota_exhausted
+      - transport_failure
+      - contract_output_failure
+      - stale_no_output
+    tiers:
+      - tier_id: codex_audit_same_backend
+        kind: backend_profile
+        backend_profile_id: codex_audit_high
+        max_attempts: 1
+      - tier_id: claude_auditor_fallback
+        kind: backend_profile
+        backend_profile_id: claude_auditor_medium
+        max_attempts: 1
+      - tier_id: gemini_reasoning_fallback
+        kind: backend_profile
+        backend_profile_id: gemini_reasoning_pro_high
+        max_attempts: 1
+      - tier_id: human_pause
+        kind: pause
+  - policy_id: security_checker_quota_escalation
+    schema_version: escalation_policy_v1
+    enabled_default: true
+    applies_to:
+      backend_profile_id: claude_security_high
+    max_chain_attempts: 3
+    max_chain_wall_clock_seconds: 7200
+    triggers:
+      - provider_quota_exhausted
+      - transport_failure
+      - contract_output_failure
+      - stale_no_output
+    tiers:
+      - tier_id: claude_security_same_backend
+        kind: backend_profile
+        backend_profile_id: claude_security_high
+        max_attempts: 1
+      - tier_id: codex_architect_fallback
+        kind: backend_profile
+        backend_profile_id: codex_architect_high
+        max_attempts: 1
+      - tier_id: gemini_review_fallback
+        kind: backend_profile
+        backend_profile_id: gemini_review_pro
+        max_attempts: 1
+      - tier_id: human_pause
+        kind: pause
+  - policy_id: prepush_reviewer_quota_escalation
+    schema_version: escalation_policy_v1
+    enabled_default: true
+    applies_to:
+      backend_profile_id: claude_prepush_medium
+    max_chain_attempts: 3
+    max_chain_wall_clock_seconds: 7200
+    triggers:
+      - provider_quota_exhausted
+      - transport_failure
+      - contract_output_failure
+      - stale_no_output
+    tiers:
+      - tier_id: claude_prepush_same_backend
+        kind: backend_profile
+        backend_profile_id: claude_prepush_medium
+        max_attempts: 1
+      - tier_id: codex_audit_fallback
+        kind: backend_profile
+        backend_profile_id: codex_audit_high
+        max_attempts: 1
+      - tier_id: gemini_review_fallback
+        kind: backend_profile
+        backend_profile_id: gemini_review_pro
+        max_attempts: 1
+      - tier_id: human_pause
+        kind: pause
+  - policy_id: docs_guardian_quota_escalation
+    schema_version: escalation_policy_v1
+    enabled_default: true
+    applies_to:
+      backend_profile_id: gemini_docs_flash
+    max_chain_attempts: 3
+    max_chain_wall_clock_seconds: 7200
+    triggers:
+      - provider_quota_exhausted
+      - transport_failure
+      - contract_output_failure
+      - stale_no_output
+    tiers:
+      - tier_id: gemini_docs_same_backend
+        kind: backend_profile
+        backend_profile_id: gemini_docs_flash
+        max_attempts: 1
+      - tier_id: claude_docs_fallback
+        kind: backend_profile
+        backend_profile_id: claude_docs_medium
+        max_attempts: 1
+      - tier_id: codex_audit_fallback
+        kind: backend_profile
+        backend_profile_id: codex_audit_high
+        max_attempts: 1
+      - tier_id: human_pause
+        kind: pause
 agents:
   - id: lead_orchestrator
     title: Lead / Orchestrator
@@ -1213,6 +1566,12 @@ agents:
       - review_corpus_bundle_v2
       - approved_proposal
       - implementation_review_summary
+      - audit_report
+      - security_report
+      - prepush_review_report
+      - docs_report
+      - implementation_self_assessment
+      - blocker_boundary_status
       - run_state
     outputs:
       - proposal_review_summary
@@ -1225,6 +1584,10 @@ agents:
       - implementation_plan
       - implementation_backlog
       - implementation_review_summary
+      - proposal_decomposition_plan
+      - quality_gate_blocker_assessment
+      - blocker_boundary_approval_request
+      - followup_proposal_seed
       - run_state
       - orchestrator_summary
       - approval_request
@@ -1818,6 +2181,8 @@ agents:
 
       Be exact and evidence-based.
 
+      Keep discovery bounded: inspect changed files, proposal-relevant paths, and test evidence first; do not run broad rg/find over repo or worktree roots unless generated/build roots are excluded and output is capped.
+
       Output only the audit contract and set status to implemented only when the implementation truly matches the approved proposal."
   - id: security_checker
     title: Security Checker
@@ -1905,6 +2270,8 @@ agents:
       Focus on correctness, readability, maintainability, surprising side effects, regression risk, and missing tests.
 
       Do not propose gold-plating; prioritize issues that would make the release unsafe or expensive to maintain.
+
+      Keep discovery bounded: inspect changed files and implicated paths first; do not run broad rg/find over repo or worktree roots unless generated/build roots are excluded and output is capped.
 
       Output only the structured pre-push review contract."
   - id: build_archive_and_push_connect
@@ -2018,6 +2385,8 @@ agents:
       Challenge the current explanation and test whether the evidence really supports it.
 
       Be adversarial toward weak reasoning, not toward people.
+
+      Keep discovery bounded: inspect implicated run dossiers and cited files first; do not run broad rg/find over repo or worktree roots unless generated/build roots are excluded and output is capped.
 
       Keep criticism concrete and evidence-linked."
   - id: agent_retrospective_interviewer

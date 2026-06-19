@@ -86,6 +86,59 @@ pub async fn upsert_tx(
     Ok(())
 }
 
+pub async fn update_session_reuse_reason(
+    pool: &SqlitePool,
+    agent_execution_id: AgentExecutionId,
+    session_reuse_reason: &str,
+    updated_at: DateTime<Utc>,
+) -> Result<()> {
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "agent_execution_runtime_facts.update_session_reuse_reason",
+    )
+    .await?;
+    update_session_reuse_reason_tx(
+        &mut tx,
+        agent_execution_id,
+        session_reuse_reason,
+        updated_at,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn update_session_reuse_reason_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    agent_execution_id: AgentExecutionId,
+    session_reuse_reason: &str,
+    updated_at: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO agent_execution_runtime_facts
+           (agent_execution_id, failure_kind, failure_kind_raw_debug, failure_kind_version,
+            failure_message_redacted, failure_message_redaction_version, retry_after,
+            operator_action_hint, provider_exit_status, transport_error_code,
+            supervision_classification, output_settlement, valid_required_outputs,
+            late_output_count, ignored_late_output_count, session_reuse_reason,
+            quota_ledger_id, runtime_preflight_phase, runtime_preflight_attempt_count,
+            runtime_preflight_remediation, runtime_preflight_provider_launched,
+            runtime_preflight_json, created_at, updated_at)
+           VALUES (?1, NULL, NULL, 1, NULL, 1, NULL, NULL, NULL, NULL, NULL,
+                   ?2, 0, 0, 0, ?3, NULL, NULL, NULL, NULL, NULL, NULL, ?4, ?4)
+           ON CONFLICT(agent_execution_id) DO UPDATE SET
+             session_reuse_reason = excluded.session_reuse_reason,
+             updated_at = excluded.updated_at"#,
+    )
+    .bind(agent_execution_id.to_string())
+    .bind(AgentOutputSettlement::None.to_string())
+    .bind(session_reuse_reason)
+    .bind(updated_at.to_rfc3339())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub async fn find_by_execution_id(
     pool: &SqlitePool,
     agent_execution_id: AgentExecutionId,

@@ -18,10 +18,7 @@
   "testTargets" : [
     {
       "selectedTests" : [
-        "Proposal024RunSurfaceTests",
-        "ProviderBindingTruthTests",
-        "ProviderPlatformTests",
-        "WorkflowMapProjectionTests"
+
       ],
       "target" : {
         "containerPath" : "container:Chainworks Forge.xcodeproj",

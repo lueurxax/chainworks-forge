@@ -3,6 +3,7 @@ import Foundation
 @testable import Chainworks_Forge
 
 @Suite("Project Root Policy")
+@MainActor
 struct ProjectRootPolicyTests {
     @Test("Effective project root prefers linked workspace root")
     func effectiveProjectRootPrefersWorkspaceRoot() {

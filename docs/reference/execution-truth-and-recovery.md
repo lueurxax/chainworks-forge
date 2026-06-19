@@ -2,7 +2,7 @@
 
 Stable reference for the execution-truth, settlement, and recovery contract.
 
-P058 layers a chain-level escalation contract on top of agent-level execution truth: tier advancement, trigger classification, ledger persistence, and recovery semantics are owned by the Rust control plane. See [escalation-policies.md](escalation-policies.md) for policy schema, pause-reason catalog, and rollout phasing. The escalation-specific invariants relevant to recovery readers are pinned in *Escalation chain invariants* below.
+Configurable escalation policies layer a chain-level contract on top of agent-level execution truth: tier advancement, trigger classification, ledger persistence, and recovery semantics are owned by the Rust control plane. See [escalation-policies.md](escalation-policies.md) for policy schema, pause-reason catalog, and rollout state. The escalation-specific invariants relevant to recovery readers are pinned in *Escalation chain invariants* below.
 
 ## Purpose
 
@@ -459,7 +459,7 @@ High-signal proof owners include:
 - `ResumeManagerTests` for interrupted-run classification and approval restore behavior,
 - `RecoveryCoordinatorTests` for narrow recovery action ownership,
 - failed-stage evidence and report/recovery fallback suites,
-- `./scripts/test-gate.sh proposal-058` for Rust ACP runtime facts, claim/start ownership,
+- retained escalation proof gate for Rust ACP runtime facts, claim/start ownership,
   source-generation artifact ownership, GraphQL/MCP readback parity, and provider-quota
   retry ledger behavior.
 
@@ -471,4 +471,5 @@ Use:
 - [workflow-execution-engine.md](workflow-execution-engine.md) for orchestrator topology,
 - [run-control.md](run-control.md) for cancellation settlement and operator-visible cancel truth,
 - [provider-binding-truth.md](provider-binding-truth.md) for historical binding provenance,
-- [operator-experience.md](operator-experience.md) for shell/report/recovery presentation contracts.
+- [operator-experience.md](operator-experience.md) for shell/report/recovery presentation contracts,
+- [recovery-retry-state-machine-test-matrix.md](recovery-retry-state-machine-test-matrix.md) for the canonical P082 scenario matrix, reason-code vocabulary, readback schemas, and proof gate that recovery behavior changes must extend.

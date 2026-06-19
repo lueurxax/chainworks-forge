@@ -3,6 +3,7 @@ import AppKit
 @testable import Chainworks_Forge
 
 @Suite("ArtifactPathClipboard", .serialized, .tags(.fast))
+@MainActor
 struct ArtifactPathClipboardTests {
     @Test("Copy path writes the canonical string to the general pasteboard")
     func copyPathWritesToPasteboard() {

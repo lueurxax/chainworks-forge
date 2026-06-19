@@ -78,7 +78,7 @@ enum ToolchainMappingReadAdapter {
     // MARK: - Frozen-snapshot compatibility gate
 
     /// P066 format version value.
-    static let p066FormatVersion: Int = 1
+    nonisolated static let p066FormatVersion: Int = 1
 
     /// Validate a frozen catalog snapshot format version.
     ///
