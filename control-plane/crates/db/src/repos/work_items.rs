@@ -3124,7 +3124,7 @@ async fn validate_running_invoke_completion_has_valid_outputs_tx(
             AND claim.claim_state IN (?7, ?8)
            JOIN agent_execution_runtime_facts facts
              ON facts.agent_execution_id = ae.id
-            AND facts.output_settlement IN (?5, ?6)
+            AND facts.output_settlement IN (?5, ?6, ?12)
            WHERE wi.id = ?2
              AND wi.run_id = ?4
              AND (
@@ -3136,7 +3136,7 @@ async fn validate_running_invoke_completion_has_valid_outputs_tx(
                    AND gen.source_stage_execution_id = se.id
                    AND gen.source_agent_execution_id = ae.id
                    AND gen.source_work_item_id = wi.id
-                   AND gen.output_settlement IN (?5, ?6)
+                   AND gen.output_settlement IN (?5, ?6, ?12)
                    AND gen.valid = 1
                    AND gen.source_generation_verified = 1
                )
@@ -3153,6 +3153,7 @@ async fn validate_running_invoke_completion_has_valid_outputs_tx(
     .bind(AgentStatus::Running.to_string())
     .bind(AgentStatus::Completed.to_string())
     .bind(AgentStatus::Failed.to_string())
+    .bind(domain::agent::AgentOutputSettlement::ValidOutputsFromRepair.to_string())
     .fetch_one(&mut **tx)
     .await
     .with_context(|| {
@@ -3180,7 +3181,7 @@ async fn validate_running_invoke_completion_has_valid_outputs_tx(
                 AND gen.source_stage_execution_id = se.id
                 AND gen.source_agent_execution_id = ?1
                 AND gen.source_work_item_id = wi.id
-                AND gen.output_settlement IN (?5, ?6)
+                AND gen.output_settlement IN (?5, ?6, ?8)
                 AND gen.valid = 1
                 AND gen.source_generation_verified = 1
                WHERE wi.id = ?3
@@ -3194,6 +3195,7 @@ async fn validate_running_invoke_completion_has_valid_outputs_tx(
     .bind(domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution.to_string())
     .bind(domain::agent::AgentOutputSettlement::ValidOutputsFromFailedExecution.to_string())
     .bind(payload_run_id)
+    .bind(domain::agent::AgentOutputSettlement::ValidOutputsFromRepair.to_string())
     .execute(&mut **tx)
     .await
     .with_context(|| {

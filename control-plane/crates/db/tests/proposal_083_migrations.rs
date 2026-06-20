@@ -304,6 +304,41 @@ async fn shutdown_signal_side_effects_unique_generation_per_session_epoch_kind()
     );
 }
 
+#[tokio::test]
+async fn shutdown_signal_side_effects_preserve_baseline_sample_id() {
+    use db::repos::shutdown_receipts;
+    let pool = test_pool().await;
+    sqlx::query(
+        "INSERT INTO durable_monotonic_clock_samples (sample_id,boot_id,baseline_generation,sample_state,monotonic_ms,observed_at_wall_clock,wall_clock_iso8601,clock_skew_ms,created_at) VALUES ('baseline-signal-1','boot-signal',1,'baseline',0,'2026-06-01T00:00:00Z','2026-06-01T00:00:00Z',0,'2026-06-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    shutdown_receipts::insert_signal_planned(
+        &pool,
+        "sig-baseline",
+        "sess-baseline",
+        1,
+        12345,
+        "hash-baseline",
+        "graceful",
+        1,
+        Some("baseline-signal-1"),
+    )
+    .await
+    .unwrap();
+
+    let signal = shutdown_receipts::find_active_signal(&pool, "sess-baseline", 1, "graceful", 1)
+        .await
+        .unwrap()
+        .expect("signal should be readable");
+    assert_eq!(
+        signal.baseline_sample_id.as_deref(),
+        Some("baseline-signal-1")
+    );
+}
+
 // ── cancel_late_output_overflow ─────────────────────────────────────────────
 
 #[tokio::test]
@@ -411,6 +446,30 @@ async fn p083_enforcement_transition_journal_transitioning_no_commit_marker() {
     );
 }
 
+#[tokio::test]
+async fn p083_rollback_audit_requires_valid_target_enforcement_mode() {
+    let pool = test_pool().await;
+    let valid = sqlx::query(
+        "INSERT INTO p083_rollback_audit (audit_id,action,status,target_enforcement_mode,reason,principal_id,request_id,audited_at) VALUES ('audit-valid','enforce_to_permissive','pass','permissive','operator rollback','operator','req-1','2026-06-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        valid.is_ok(),
+        "valid rollback audit target should be accepted: {valid:?}"
+    );
+
+    let invalid = sqlx::query(
+        "INSERT INTO p083_rollback_audit (audit_id,action,status,target_enforcement_mode,reason,principal_id,request_id,audited_at) VALUES ('audit-invalid','enforce_to_permissive','pass','enforce','operator rollback','operator','req-2','2026-06-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        invalid.is_err(),
+        "invalid rollback audit target must be rejected"
+    );
+}
+
 // ── durable_monotonic_clock ──────────────────────────────────────────────────
 
 #[tokio::test]
@@ -429,7 +488,7 @@ async fn durable_monotonic_clock_samples_table_exists() {
 async fn durable_monotonic_clock_invalid_sample_state_rejected() {
     let pool = test_pool().await;
     let result = sqlx::query(
-        "INSERT INTO durable_monotonic_clock_samples (sample_id,boot_id,sample_state,monotonic_ms,observed_at_wall_clock,created_at) VALUES ('smp-1','boot-1','invalid_state',12345,'2026-06-01T00:00:00Z','2026-06-01T00:00:00Z')",
+        "INSERT INTO durable_monotonic_clock_samples (sample_id,boot_id,baseline_generation,sample_state,monotonic_ms,observed_at_wall_clock,wall_clock_iso8601,created_at) VALUES ('smp-1','boot-1',1,'invalid_state',12345,'2026-06-01T00:00:00Z','2026-06-01T00:00:00Z','2026-06-01T00:00:00Z')",
     )
     .execute(&pool)
     .await;
@@ -440,13 +499,34 @@ async fn durable_monotonic_clock_invalid_sample_state_rejected() {
 async fn durable_monotonic_clock_baseline_sample_accepted() {
     let pool = test_pool().await;
     let result = sqlx::query(
-        "INSERT INTO durable_monotonic_clock_samples (sample_id,boot_id,sample_state,monotonic_ms,observed_at_wall_clock,created_at) VALUES ('smp-2','boot-1','baseline',0,'2026-06-01T00:00:00Z','2026-06-01T00:00:00Z')",
+        "INSERT INTO durable_monotonic_clock_samples (sample_id,boot_id,baseline_generation,sample_state,monotonic_ms,observed_at_wall_clock,wall_clock_iso8601,clock_skew_ms,created_at) VALUES ('smp-2','boot-1',1,'baseline',0,'2026-06-01T00:00:00Z','2026-06-01T00:00:00Z',0,'2026-06-01T00:00:00Z')",
     )
     .execute(&pool)
     .await;
     assert!(
         result.is_ok(),
         "baseline sample should be accepted: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn durable_monotonic_clock_baseline_generation_unique_per_boot() {
+    let pool = test_pool().await;
+    sqlx::query(
+        "INSERT INTO durable_monotonic_clock_samples (sample_id,boot_id,baseline_generation,sample_state,monotonic_ms,observed_at_wall_clock,wall_clock_iso8601,clock_skew_ms,created_at) VALUES ('smp-gen-1','boot-uniq',1,'baseline',0,'2026-06-01T00:00:00Z','2026-06-01T00:00:00Z',0,'2026-06-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let duplicate = sqlx::query(
+        "INSERT INTO durable_monotonic_clock_samples (sample_id,boot_id,baseline_generation,sample_state,monotonic_ms,observed_at_wall_clock,wall_clock_iso8601,clock_skew_ms,created_at) VALUES ('smp-gen-2','boot-uniq',1,'baseline',1,'2026-06-01T00:00:01Z','2026-06-01T00:00:01Z',0,'2026-06-01T00:00:01Z')",
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        duplicate.is_err(),
+        "baseline_generation must be unique per boot_id"
     );
 }
 
@@ -534,6 +614,38 @@ async fn provider_cancellation_intents_held_state_accepted() {
     assert!(
         result.is_ok(),
         "held state with valid reason should succeed: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn provider_cancellation_intents_preserve_baseline_sample_id() {
+    use db::repos::provider_sessions;
+    let pool = test_pool().await;
+    sqlx::query(
+        "INSERT INTO durable_monotonic_clock_samples (sample_id,boot_id,baseline_generation,sample_state,monotonic_ms,observed_at_wall_clock,wall_clock_iso8601,clock_skew_ms,created_at) VALUES ('baseline-cancel-1','boot-cancel',1,'baseline',0,'2026-06-01T00:00:00Z','2026-06-01T00:00:00Z',0,'2026-06-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    provider_sessions::insert_cancellation_intent(
+        &pool,
+        "sess-baseline",
+        1,
+        "operator_cancel",
+        1000,
+        Some("baseline-cancel-1"),
+    )
+    .await
+    .unwrap();
+
+    let intent = provider_sessions::find_active_cancellation_intent(&pool, "sess-baseline")
+        .await
+        .unwrap()
+        .expect("intent should be readable");
+    assert_eq!(
+        intent.baseline_sample_id.as_deref(),
+        Some("baseline-cancel-1")
     );
 }
 
@@ -790,9 +902,16 @@ async fn provider_sessions_update_process_fate_identity_ambiguous() {
     provider_sessions::insert(&pool, "psess-repo2", "run-repo2", None, "claude")
         .await
         .unwrap();
-    provider_sessions::insert_cancellation_intent(&pool, "psess-repo2", 1, "operator_cancel", 1000)
-        .await
-        .unwrap();
+    provider_sessions::insert_cancellation_intent(
+        &pool,
+        "psess-repo2",
+        1,
+        "operator_cancel",
+        1000,
+        None,
+    )
+    .await
+    .unwrap();
 
     let held = provider_sessions::hold_identity_ambiguous(&pool, "psess-repo2", 1)
         .await
@@ -818,9 +937,16 @@ async fn provider_cancellation_intent_state_transitions() {
     use db::repos::provider_sessions;
     let pool = test_pool().await;
 
-    provider_sessions::insert_cancellation_intent(&pool, "sess-t1", 1, "backpressure_cutoff", 2000)
-        .await
-        .unwrap();
+    provider_sessions::insert_cancellation_intent(
+        &pool,
+        "sess-t1",
+        1,
+        "backpressure_cutoff",
+        2000,
+        None,
+    )
+    .await
+    .unwrap();
 
     // Transition to shutdown_started with a shutdown_epoch.
     let updated = provider_sessions::update_cancellation_intent_state(
@@ -929,7 +1055,7 @@ async fn shutdown_signal_side_effects_planned_to_issued_to_observed() {
     let pool = test_pool().await;
 
     shutdown_receipts::insert_signal_planned(
-        &pool, "sig-1", "sess-sg1", 1, 12345, "boot-abc", "graceful", 1,
+        &pool, "sig-1", "sess-sg1", 1, 12345, "boot-abc", "graceful", 1, None,
     )
     .await
     .unwrap();
@@ -994,6 +1120,7 @@ async fn shutdown_signal_dispatching_skipped_by_recovery() {
         "boot-rec",
         "graceful",
         1,
+        None,
     )
     .await
     .unwrap();
@@ -1031,7 +1158,7 @@ async fn shutdown_signal_identity_mismatch_transition() {
     let pool = test_pool().await;
 
     shutdown_receipts::insert_signal_planned(
-        &pool, "sig-2", "sess-sg2", 1, 9999, "boot-xyz", "kill", 1,
+        &pool, "sig-2", "sess-sg2", 1, 9999, "boot-xyz", "kill", 1, None,
     )
     .await
     .unwrap();

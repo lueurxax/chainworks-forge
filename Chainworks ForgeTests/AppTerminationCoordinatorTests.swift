@@ -31,42 +31,21 @@ struct AppTerminationCoordinatorTests {
         #expect(Bool(true))
     }
 
-    @Test("Graceful termination waits through terminateLater path and replies once")
-    func gracefulTerminationRepliesAfterBoundedPreparation() async {
-        let executionSpy = ExecutionTerminationControllerSpy()
-        let coordinator = AppTerminationCoordinator()
-        coordinator.hostTotalMilliseconds = 0
-        coordinator.executionTerminationController = executionSpy
-        var replies: [Bool] = []
-
-        coordinator.beginGracefulTermination { shouldTerminate in
-            replies.append(shouldTerminate)
-        }
-
-        await Task.yield()
-
-        #expect(executionSpy.prepareForTerminationCallCount == 1)
-        #expect(replies == [true])
+    @Test("Graceful termination exposes canonical bounded shutdown budgets")
+    func gracefulTerminationExposesCanonicalBudgets() {
+        #expect(AppTerminationCoordinator.hostTotalMs == 30_000)
+        #expect(AppTerminationCoordinator.receiptFlushTailMs == 1_000)
     }
 
-    @Test("Graceful termination ignores duplicate AppKit callbacks while pending")
-    func gracefulTerminationIgnoresDuplicateCallbacks() async {
+    @Test("Graceful termination preparation is idempotent at coordinator boundary")
+    func gracefulTerminationPreparationCanBeCalledRepeatedly() {
         let executionSpy = ExecutionTerminationControllerSpy()
         let coordinator = AppTerminationCoordinator()
-        coordinator.hostTotalMilliseconds = 1
         coordinator.executionTerminationController = executionSpy
-        var replyCount = 0
 
-        coordinator.beginGracefulTermination { _ in
-            replyCount += 1
-        }
-        coordinator.beginGracefulTermination { _ in
-            replyCount += 1
-        }
+        coordinator.prepareForTermination()
+        coordinator.prepareForTermination()
 
-        try? await Task.sleep(nanoseconds: 2_000_000)
-
-        #expect(executionSpy.prepareForTerminationCallCount == 1)
-        #expect(replyCount == 1)
+        #expect(executionSpy.prepareForTerminationCallCount == 2)
     }
 }

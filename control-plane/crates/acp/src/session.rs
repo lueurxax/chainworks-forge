@@ -1441,6 +1441,7 @@ mod tests {
             session_generation_id: None,
             provider_session_id: None,
             provider_runtime_home: None,
+            p079_repair_canonical_paths: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: None,
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,

@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS p083_rollback_audit (
     'manual_process_identity_check'
   )),
   status TEXT NOT NULL,
+  target_enforcement_mode TEXT NOT NULL CHECK(target_enforcement_mode IN ('permissive','disabled')),
   reason TEXT,
   principal_id TEXT NOT NULL,
   request_id TEXT NOT NULL,

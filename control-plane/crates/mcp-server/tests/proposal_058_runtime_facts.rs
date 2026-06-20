@@ -1015,7 +1015,8 @@ async fn p079_sec_mcp001_runtime_receipt_sanitized_for_non_operator() {
     .await
     .unwrap();
     let operator_exec = operator_payload
-        .as_array()
+        .get("reports")
+        .and_then(|reports| reports.as_array())
         .unwrap()
         .iter()
         .find(|item| item["report_kind"] == "mcp_execution_truth")
@@ -1110,7 +1111,8 @@ async fn p079_sec_mcp_001_non_operator_reports_get_hides_invocation_owner_key() 
     .await
     .unwrap();
     let operator_canonical = operator_payload
-        .as_array()
+        .get("reports")
+        .and_then(|reports| reports.as_array())
         .unwrap()
         .iter()
         .find(|item| item["report_kind"] == serde_json::json!("mcp_execution_truth"))

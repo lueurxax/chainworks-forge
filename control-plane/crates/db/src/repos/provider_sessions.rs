@@ -34,6 +34,7 @@ pub struct ProviderCancellationIntent {
     pub reason: String,
     pub requested_at_monotonic_ms: i64,
     pub requested_at_wall_clock: String,
+    pub baseline_sample_id: Option<String>,
     pub shutdown_epoch: Option<i64>,
     pub shutdown_epoch_assigned_at: Option<String>,
 }
@@ -62,6 +63,7 @@ fn map_intent(r: sqlx::sqlite::SqliteRow) -> ProviderCancellationIntent {
         reason: r.get("reason"),
         requested_at_monotonic_ms: r.get("requested_at_monotonic_ms"),
         requested_at_wall_clock: r.get("requested_at_wall_clock"),
+        baseline_sample_id: r.get("baseline_sample_id"),
         shutdown_epoch: r.get("shutdown_epoch"),
         shutdown_epoch_assigned_at: r.get("shutdown_epoch_assigned_at"),
     }
@@ -74,7 +76,7 @@ const SESSION_SELECT: &str = r#"SELECT provider_session_id, run_id, agent_execut
 
 const INTENT_SELECT: &str = r#"SELECT provider_session_id, cancellation_epoch,
        intent_state, reason, requested_at_monotonic_ms, requested_at_wall_clock,
-       shutdown_epoch, shutdown_epoch_assigned_at
+       baseline_sample_id, shutdown_epoch, shutdown_epoch_assigned_at
   FROM provider_cancellation_intents"#;
 
 // ── provider_sessions ────────────────────────────────────────────────────────
@@ -266,19 +268,21 @@ pub async fn insert_cancellation_intent(
     cancellation_epoch: i64,
     reason: &str,
     requested_at_monotonic_ms: i64,
+    baseline_sample_id: Option<&str>,
 ) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         r#"INSERT INTO provider_cancellation_intents
            (provider_session_id, cancellation_epoch, intent_state, reason,
-            requested_at_monotonic_ms, requested_at_wall_clock)
-           VALUES (?1, ?2, 'requested', ?3, ?4, ?5)"#,
+            requested_at_monotonic_ms, requested_at_wall_clock, baseline_sample_id)
+           VALUES (?1, ?2, 'requested', ?3, ?4, ?5, ?6)"#,
     )
     .bind(provider_session_id)
     .bind(cancellation_epoch)
     .bind(reason)
     .bind(requested_at_monotonic_ms)
     .bind(&now)
+    .bind(baseline_sample_id)
     .execute(pool)
     .await
     .context("provider_cancellation_intents: insert")?;

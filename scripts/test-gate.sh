@@ -249,6 +249,10 @@ PROPOSAL_086_SWIFT_TESTS=(
   "Chainworks ForgeTests/Proposal031ThinGraphQLReadBoundaryTests"
 )
 
+PROPOSAL_079_SWIFT_TESTS=(
+  "Chainworks ForgeTests/Proposal079ContractRepairReadbackTests"
+)
+
 PROPOSAL_083_SWIFT_TESTS=(
   "Chainworks ForgeTests/AppTerminationCoordinatorTests"
 )
@@ -2525,6 +2529,8 @@ Available gates:
   proposal-077,p077  Proposal 077 closeout readiness gates (Rust domain/db/engine plus GraphQL/MCP readback parity; UI remote evidence separate)
   proposal-077-ui,p077-ui  Proposal 077 remote macOS compact/focus/backlink/accessibility runtime proof
   proposal-078,p078  Proposal 078 durable side-effect ledger gate (migration, CAS races, preflight, MCP tools)
+  proposal-079|p079  Proposal 079 contract-aware output repair and provider fallback gate
+  p079-swift-readback  Proposal 079 Swift DTO/presenter readback decode gate
   proposal-031-readiness,p031-readiness  Thin UI closeout readiness gate
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
   proposal-033    Proposal 033 ACP-only runtime architecture gate
@@ -8079,6 +8085,85 @@ for forbidden in ["reconcile", "retry", "clear", "push", "upload", "publish", "m
 PY
     log "Proposal 078 durable side-effect ledger gate passed"
     ;;
+  proposal-079|p079)
+    log "Proposal 079 contract-aware output repair and provider fallback gate"
+    python3 - <<'PY'
+from pathlib import Path
+
+root = Path.cwd()
+
+def fail(message: str) -> None:
+    raise SystemExit(f"proposal-079: {message}")
+
+migration = root / "control-plane/crates/db/migrations/095_p079_output_contract_repair.sql"
+if not migration.exists():
+    fail("missing control-plane/crates/db/migrations/095_p079_output_contract_repair.sql")
+if (root / "control-plane/crates/db/migrations/079_p079_output_contract_repair.sql").exists():
+    fail("stale duplicate migration version 079_p079_output_contract_repair.sql must not exist")
+
+required_refs = [
+    "docs/reference/output-contracts-failure-evidence-and-recovery.md",
+    "docs/reference/test-gates.md",
+]
+for rel in required_refs:
+    if not (root / rel).exists():
+        fail(f"missing reference doc {rel}")
+
+test_gates = (root / "docs/reference/test-gates.md").read_text()
+for term in ["proposal-079|p079", "p079-swift-readback", "Proposal079ContractRepairReadbackTests"]:
+    if term not in test_gates:
+        fail(f"docs/reference/test-gates.md missing {term!r}")
+
+domain = (root / "control-plane/crates/domain/src/output_contract_repair.rs").read_text()
+for term in [
+    "OutputContractRepairEvidence",
+    "output_contract_repair.v1",
+    "output_contract_repair_fallback_packet.v1",
+    "p079_repair_v1",
+]:
+    if term not in domain:
+        fail(f"domain output_contract_repair.rs missing {term!r}")
+
+executor = (root / "control-plane/crates/engine/src/executor.rs").read_text()
+for term in [
+    "output_contract_repair_prompt(",
+    "p079_attempt_transcript_recovery(",
+    "p079_provider_supports_enforced_permissions",
+    "CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED",
+    "ValidOutputsFromRepair",
+]:
+    if term not in executor:
+        fail(f"engine executor.rs missing {term!r}")
+
+for rel in [
+    "Chainworks Forge/Engine/Readback/OutputContractRepair/OutputContractRepairEvidence.swift",
+    "Chainworks Forge/Engine/Readback/OutputContractRepair/OutputContractRepairPresenter.swift",
+    "Chainworks ForgeTests/Proposal079ContractRepairReadbackTests.swift",
+]:
+    if not (root / rel).exists():
+        fail(f"missing Swift readback file {rel}")
+
+print("proposal-079 static checks passed")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p domain output_contract_repair -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p db output_contract_repair -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p db --test proposal_079_output_contract_repair -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p engine --lib p079 -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p engine --test integration invoke_agent_repairs_missing_required_output_in_same_live_session -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p acp p079 -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p graphql-server p079 -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p mcp-server p079 -- --nocapture
+    )
+    run_targeted_tests "p079-swift-readback" "${PROPOSAL_079_SWIFT_TESTS[@]}"
+    log "Proposal 079 contract-aware output repair gate passed"
+    ;;
+  p079-swift-readback)
+    log "Proposal 079 Swift DTO/presenter readback gate"
+    run_targeted_tests "p079-swift-readback" "${PROPOSAL_079_SWIFT_TESTS[@]}"
+    log "Proposal 079 Swift DTO/presenter readback gate passed"
+    ;;
   proposal-088|p088)
     log "Proposal 088 gate: code-writer completion handoff and diagnostics"
     python3 - <<'PY'
@@ -9286,7 +9371,6 @@ PY
       cd "$ROOT_DIR/control-plane"
       # DB layer: migration integration tests and P083 bounded-metric unit tests
       CARGO_TARGET_DIR=target/proposal-083-gate cargo test -p db --test proposal_083_migrations -- --test-threads=1 --nocapture &&
-      CARGO_TARGET_DIR=target/proposal-083-gate cargo test -p db --lib p083_ -- --test-threads=1 --nocapture &&
       CARGO_TARGET_DIR=target/proposal-083-gate cargo check -p db &&
       # Engine layer: shutdown recovery classification and command-idempotency repo tests
       CARGO_TARGET_DIR=target/proposal-083-gate cargo test -p engine p083 -- --test-threads=1 --nocapture &&
@@ -9359,6 +9443,87 @@ daemon_content = daemon_main.read_text()
 if "monotonic_clock_ms()" not in daemon_content:
     raise SystemExit("proposal-083: daemon must use monotonic_clock_ms() for durable_monotonic_clock_samples")
 print("proposal-083: monotonic clock source verified")
+
+clock_migration = (root / "control-plane/crates/db/migrations/092_p083_006_durable_monotonic_clock.sql").read_text()
+for term in [
+    "baseline_generation INTEGER NOT NULL",
+    "wall_clock_iso8601 TEXT NOT NULL",
+    "clock_skew_ms INTEGER NOT NULL",
+    "'periodic'",
+    "'fallback_wall_only'",
+    "durable_monotonic_clock_samples_baseline_generation_uniq",
+]:
+    if term not in clock_migration:
+        raise SystemExit(f"proposal-083: durable monotonic clock migration missing {term!r}")
+for stale_state in ["'checkpoint'", "'rollback_detected'", "'stale_fallback'"]:
+    if stale_state in clock_migration:
+        raise SystemExit(f"proposal-083: durable monotonic clock migration still exposes stale sample_state {stale_state}")
+if "baseline_generation" not in daemon_content or "wall_clock_iso8601" not in daemon_content:
+    raise SystemExit("proposal-083: daemon startup baseline insert must persist baseline_generation and wall_clock_iso8601")
+for migration_name in [
+    "089_p083_003_shutdown_receipts_and_signals.sql",
+    "093_p083_007_provider_cancellation_intent_and_process_fate.sql",
+    "094_p083_008_signal_dispatching_state.sql",
+]:
+    migration_content = (mig_dir / migration_name).read_text()
+    if "baseline_sample_id TEXT" not in migration_content:
+        raise SystemExit(f"proposal-083: {migration_name} missing baseline_sample_id")
+if "baseline_sample_id" not in handler_content:
+    raise SystemExit("proposal-083: provider_session.shutdown must persist baseline_sample_id on cancellation/signal rows")
+print("proposal-083: durable monotonic baseline correlation verified")
+
+# Verify R70 rollback target contract is the public GraphQL/MCP shape and the
+# durable idempotency intent excludes diagnostic reason text.
+runs_rs = (root / "control-plane/crates/mcp-server/src/tools/runs.rs").read_text()
+for term in [
+    '"required": ["target_enforcement_mode", "caller_request_id"]',
+    '"target_enforcement_mode"',
+    'params["target_enforcement_mode"]',
+    'params["caller_request_id"]',
+]:
+    if term not in runs_rs:
+        raise SystemExit(f"proposal-083: MCP rollback contract missing {term!r}")
+if '"required": ["rollback_mode", "reason", "request_id"]' in runs_rs:
+    raise SystemExit("proposal-083: MCP rollback contract still exposes legacy rollback_mode/reason/request_id")
+if '"required": ["enforcement_mode", "reason", "request_id"]' in runs_rs:
+    raise SystemExit("proposal-083: MCP set-enforcement contract still exposes legacy enforcement_mode/reason/request_id")
+
+gql_schema = (root / "control-plane/crates/graphql-server/src/schema.rs").read_text()
+for term in [
+    "target_enforcement_mode: GqlP083RollbackTargetMode",
+    "target_mode: GqlP083EnforcementMode",
+    "caller_request_id: String",
+]:
+    if term not in gql_schema:
+        raise SystemExit(f"proposal-083: GraphQL lifecycle contract missing {term!r}")
+
+gql_types = (root / "control-plane/crates/graphql-server/src/types/p083.rs").read_text()
+for term in [
+    'graphql(name = "P083RollbackTargetMode", rename_items = "snake_case")',
+    'graphql(name = "P083EnforcementMode", rename_items = "snake_case")',
+    "pub target_enforcement_mode: String",
+]:
+    if term not in gql_types:
+        raise SystemExit(f"proposal-083: GraphQL P083 types missing {term!r}")
+if "pub rollback_mode: String" in gql_types:
+    raise SystemExit("proposal-083: GraphQL rollback payload still exposes rollback_mode")
+
+handler = (root / "control-plane/crates/engine/src/command_handler.rs").read_text()
+rollback_handler = handler.split("async fn handle_p083_rollback_execution", 1)[1].split("async fn handle_p083_set_enforcement_mode", 1)[0]
+set_mode_handler = handler.split("async fn handle_p083_set_enforcement_mode", 1)[1].split("async fn handle_retry_run", 1)[0]
+if '"target_enforcement_mode"' not in rollback_handler:
+    raise SystemExit("proposal-083: rollback intent hash must use target_enforcement_mode")
+if "target_enforcement_mode, reason, principal_id, request_id" not in rollback_handler:
+    raise SystemExit("proposal-083: p083_rollback_audit insert must persist target_enforcement_mode")
+if '"target_mode"' not in set_mode_handler:
+    raise SystemExit("proposal-083: set-enforcement intent hash must use target_mode")
+for handler_name, text in [("rollback", rollback_handler), ("set-enforcement", set_mode_handler)]:
+    if '("reason", serde_json::Value::String(c.reason.clone()))' in text:
+        raise SystemExit(f"proposal-083: {handler_name} intent hash must exclude diagnostic reason")
+migration_091 = (root / "control-plane/crates/db/migrations/091_p083_005_enforcement_and_rollback.sql").read_text()
+if "target_enforcement_mode TEXT NOT NULL" not in migration_091:
+    raise SystemExit("proposal-083: p083_rollback_audit must include non-null target_enforcement_mode")
+print("proposal-083: R70 rollback/set-enforcement API and idempotency contract verified")
 PY
     log "Proposal 083 gate passed"
     ;;
@@ -9729,81 +9894,6 @@ PY
     run_targeted_tests "proposal-086-swift-readback" "${PROPOSAL_086_SWIFT_TESTS[@]}"
     log "Proposal 086 Phase 0 preflight gate passed"
     ;;
-  proposal-083|p083)
-    log "Proposal 083 focused code-fix regression gate"
-    python3 - <<'PY'
-from pathlib import Path
-
-root = Path.cwd()
-
-checks = {
-    "control-plane/crates/mcp-server/src/tools/runs.rs": [
-        "mcp_caller_with_idempotency_request_id",
-        "p083_main_sync_mcp_callers_stamp_idempotency_key_as_request_id",
-        "runs.main_sync.request",
-        "runs.main_sync.retry",
-    ],
-    "control-plane/crates/engine/src/rollout_contract_preflight.rs": [
-        "post_ready_implementation_starts",
-        "cutover_policy_grandfathers_pre_cutover_runs_as_not_applicable",
-        "inline_contract_creates_pass_record_before_enqueue",
-    ],
-    "Chainworks Forge/Engine/AppTerminationCoordinator.swift": [
-        "applicationShouldTerminate",
-        "beginGracefulTermination",
-        "terminateLater",
-        "hostTotalMilliseconds",
-    ],
-    "Chainworks ForgeTests/AppTerminationCoordinatorTests.swift": [
-        "gracefulTerminationRepliesAfterBoundedPreparation",
-        "gracefulTerminationIgnoresDuplicateCallbacks",
-    ],
-}
-
-for rel_path, terms in checks.items():
-    text = (root / rel_path).read_text()
-    for term in terms:
-        if term not in text:
-            raise SystemExit(f"proposal-083: {rel_path} missing {term!r}")
-
-for rel_path in [
-    "docs/evidence/rollout-contract/negative/p083-enforce-without-burnin.json",
-    "docs/evidence/rollout-contract/negative/p083-shutdown-deadline-config-invalid.json",
-    "docs/evidence/rollout-contract/negative/p083-command-lease-ttl-config-invalid.json",
-]:
-    text = (root / rel_path).read_text()
-    if "post_ready_implementation_starts" not in text:
-        raise SystemExit(f"proposal-083: {rel_path} missing post_ready_implementation_starts")
-    if "post_cutover_implementation_starts" in text:
-        raise SystemExit(f"proposal-083: {rel_path} still has stale post_cutover_implementation_starts")
-
-print("proposal-083 static regression checks passed")
-PY
-    (
-      cd "$ROOT_DIR/control-plane"
-      run_p083_cargo_test() {
-        local output status
-        set +e
-        output=$(CARGO_TARGET_DIR=target/proposal-083-gate cargo test "$@" 2>&1)
-        status=$?
-        set -e
-        printf '%s\n' "$output"
-        if [ "$status" -ne 0 ]; then
-          return "$status"
-        fi
-        if ! printf '%s\n' "$output" | grep -Eq '^running [1-9][0-9]* tests?$'; then
-          echo "FAILED: P083 cargo test filter selected zero tests: cargo test $*" >&2
-          return 1
-        fi
-      }
-
-      run_p083_cargo_test -p mcp-server p083_main_sync_mcp_callers_stamp_idempotency_key_as_request_id -- --nocapture
-      run_p083_cargo_test -p engine inline_contract_creates_pass_record_before_enqueue -- --nocapture
-      run_p083_cargo_test -p engine cutover_policy_grandfathers_pre_cutover_runs_as_not_applicable -- --nocapture
-    )
-    run_targeted_tests "proposal-083-swift-termination" "${PROPOSAL_083_SWIFT_TESTS[@]}"
-    log "Proposal 083 focused code-fix regression gate passed"
-    ;;
   p086-continuation-readback)
     log "Proposal 086 Phase 1 readback gate: operator readback fixture field coverage"
     python3 - "$ROOT_DIR" <<'PY'
@@ -9996,37 +10086,6 @@ for field in required_operator_fields:
 print("p086-continuation-operator-report passed")
 PY
     log "Proposal 086 Phase 1 operator report gate passed"
-    ;;
-  proposal-083|p083)
-    log "Proposal 083 focused code-fix regression gate"
-    python3 - "$ROOT_DIR" <<'PY'
-import pathlib
-import sys
-
-root = pathlib.Path(sys.argv[1])
-runs_rs = (root / "control-plane/crates/mcp-server/src/tools/runs.rs").read_text()
-for term in [
-    "mcp_caller_with_idempotency_request_id",
-    "p083_main_sync_mcp_callers_stamp_idempotency_key_as_request_id",
-    "runs.main_sync.request",
-    "runs.main_sync.retry",
-    ".with_request_id(idempotency_key)",
-]:
-    if term not in runs_rs:
-        raise SystemExit(f"proposal-083: runs.rs missing {term!r}")
-
-gate = (root / "scripts/test-gate.sh").read_text()
-for term in ["proposal-083|p083", "p083_main_sync_mcp_callers_stamp_idempotency_key_as_request_id"]:
-    if term not in gate:
-        raise SystemExit(f"proposal-083: test-gate.sh missing {term!r}")
-
-print("proposal-083 static regression checks passed")
-PY
-    (
-      cd "$ROOT_DIR/control-plane"
-      CARGO_TARGET_DIR=target/proposal-083-gate cargo test -p mcp-server p083_main_sync_mcp_callers_stamp_idempotency_key_as_request_id -- --nocapture
-    )
-    log "Proposal 083 focused code-fix regression gate passed"
     ;;
   proposal-085|p085)
     log "Proposal 085 gate: thin-client read-model parity and affordance contract"

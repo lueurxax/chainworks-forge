@@ -6749,6 +6749,8 @@ mod tests {
             reuse_existing_session: false,
             session_generation_id: Some("session-1".to_string()),
             provider_session_id: None,
+            provider_runtime_home: None,
+            p079_repair_canonical_paths: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: Some("/tmp/run".to_string()),
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -6761,7 +6763,6 @@ mod tests {
             mediation_record_id: None,
             toolchain_home: None,
             toolchain_go_scope_enabled: false,
-            p079_repair_canonical_paths: None,
         };
 
         let captured = capture_pre_prompt_expected_outputs(&fake, &req, &context);

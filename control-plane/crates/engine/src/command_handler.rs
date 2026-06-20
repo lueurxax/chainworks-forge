@@ -7675,6 +7675,14 @@ impl CommandHandler {
             }
         }
 
+        let baseline_sample_id: Option<String> = sqlx::query_scalar(
+            "SELECT sample_id FROM durable_monotonic_clock_samples \
+             WHERE sample_state = 'baseline' \
+             ORDER BY baseline_generation DESC, created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&mut **tx)
+        .await?;
+
         // Record the cancellation intent (planned/requested state).
         // SEC-P083-002: After INSERT OR IGNORE, check rows_affected. If 0, a concurrent request
         // already holds a row for this (provider_session_id, cancellation_epoch) — timestamp
@@ -7683,13 +7691,14 @@ impl CommandHandler {
         let insert_result = sqlx::query(
             r#"INSERT OR IGNORE INTO provider_cancellation_intents
                (provider_session_id, cancellation_epoch, intent_state, reason,
-                requested_at_monotonic_ms, requested_at_wall_clock)
-               VALUES (?1, ?2, 'requested', 'operator_cancel', ?3, ?4)"#,
+                requested_at_monotonic_ms, requested_at_wall_clock, baseline_sample_id)
+               VALUES (?1, ?2, 'requested', 'operator_cancel', ?3, ?4, ?5)"#,
         )
         .bind(&c.provider_session_id)
         .bind(cancellation_epoch)
         .bind(monotonic_ms)
         .bind(now.to_rfc3339())
+        .bind(baseline_sample_id.as_deref())
         .execute(&mut **tx)
         .await;
 
@@ -7771,26 +7780,22 @@ impl CommandHandler {
         // Non-positive PIDs target process groups, not individual processes — treat as absent.
         let session_process_id = session_process_id.filter(|&pid| pid > 0);
 
-        // Track whether we inserted planned signal rows so we can dispatch
-        // immediately after commit (see below). If no process_id is recorded on the session, we
-        // skip inserting planned rows; dispatch will happen via startup recovery instead.
-        let mut had_process_id = false;
-
         if let (Some(pid), Some(ref psi)) = (session_process_id, session_process_start_identity) {
-            had_process_id = true;
             let signal_id_graceful = uuid::Uuid::new_v4().to_string();
             let signal_id_kill = uuid::Uuid::new_v4().to_string();
             if let Err(e) = sqlx::query(
                 r#"INSERT OR IGNORE INTO shutdown_signal_side_effects
                    (signal_effect_id, provider_session_id, shutdown_epoch,
-                    process_id, process_start_identity, signal_kind, generation, intent_state)
-                   VALUES (?1, ?2, ?3, ?4, ?5, 'graceful', 1, 'planned')"#,
+                    process_id, process_start_identity, signal_kind, generation, intent_state,
+                    baseline_sample_id)
+                   VALUES (?1, ?2, ?3, ?4, ?5, 'graceful', 1, 'planned', ?6)"#,
             )
             .bind(&signal_id_graceful)
             .bind(&c.provider_session_id)
             .bind(cancellation_epoch)
             .bind(pid)
             .bind(psi.as_str())
+            .bind(baseline_sample_id.as_deref())
             .execute(&mut **tx)
             .await
             {
@@ -7812,14 +7817,16 @@ impl CommandHandler {
             if let Err(e) = sqlx::query(
                 r#"INSERT OR IGNORE INTO shutdown_signal_side_effects
                    (signal_effect_id, provider_session_id, shutdown_epoch,
-                    process_id, process_start_identity, signal_kind, generation, intent_state)
-                   VALUES (?1, ?2, ?3, ?4, ?5, 'kill', 1, 'planned')"#,
+                    process_id, process_start_identity, signal_kind, generation, intent_state,
+                    baseline_sample_id)
+                   VALUES (?1, ?2, ?3, ?4, ?5, 'kill', 1, 'planned', ?6)"#,
             )
             .bind(&signal_id_kill)
             .bind(&c.provider_session_id)
             .bind(cancellation_epoch)
             .bind(pid)
             .bind(psi.as_str())
+            .bind(baseline_sample_id.as_deref())
             .execute(&mut **tx)
             .await
             {
@@ -7978,7 +7985,7 @@ impl CommandHandler {
         }
 
         // Commit idempotency lease atomically with side effects and journal.
-        // Reached only when had_process_id is true (planned signal rows inserted above).
+        // Reached only when planned signal rows were inserted above.
         let outcome = serde_json::json!({
             "provider_session_id": c.provider_session_id,
             "cancellation_epoch": cancellation_epoch,
@@ -8043,7 +8050,7 @@ impl CommandHandler {
         // SEC-P083-HIGH-002: Use the scoped dispatch to avoid signaling unrelated sessions
         // that also happen to have planned rows committed by concurrent commands.
         // Dispatch errors are non-fatal — durable intent rows remain and startup recovery retries.
-        let dispatched_count = if had_process_id {
+        let dispatched_count =
             match crate::shutdown_service::dispatch_planned_shutdown_signals_scoped(
                 &self.pool,
                 &c.provider_session_id,
@@ -8069,10 +8076,7 @@ impl CommandHandler {
                     );
                     0
                 }
-            }
-        } else {
-            0
-        };
+            };
 
         Ok(CommandResult::ProviderSessionShutdownRecorded {
             provider_session_id: c.provider_session_id,
@@ -8095,8 +8099,11 @@ impl CommandHandler {
         validate_p083_reason(&c.reason, 2048)?;
         let principal_id = &caller.principal_id;
 
-        if !matches!(c.rollback_mode.as_str(), "permissive" | "disabled") {
-            anyhow::bail!("rollback_mode must be 'permissive' or 'disabled'");
+        if !matches!(
+            c.target_enforcement_mode.as_str(),
+            "permissive" | "disabled"
+        ) {
+            anyhow::bail!("target_enforcement_mode must be 'permissive' or 'disabled'");
         }
 
         let intent_hash = canonical_intent_hash(&[
@@ -8104,10 +8111,9 @@ impl CommandHandler {
                 "command",
                 serde_json::Value::String("p083.rollback_execution".into()),
             ),
-            ("reason", serde_json::Value::String(c.reason.clone())),
             (
-                "rollback_mode",
-                serde_json::Value::String(c.rollback_mode.clone()),
+                "target_enforcement_mode",
+                serde_json::Value::String(c.target_enforcement_mode.clone()),
             ),
         ]);
 
@@ -8149,10 +8155,11 @@ impl CommandHandler {
                     )
                 })?;
                 let rollback_mode = outcome_v
-                    .get("rollback_mode")
+                    .get("target_enforcement_mode")
+                    .or_else(|| outcome_v.get("rollback_mode"))
                     .and_then(|m| m.as_str())
                     .ok_or_else(|| anyhow::anyhow!(
-                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} missing rollback_mode",
+                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} missing target_enforcement_mode",
                         c.request_id
                     ))?
                     .to_string();
@@ -8228,10 +8235,11 @@ impl CommandHandler {
                         )
                     })?;
                 let rollback_mode = outcome_v
-                    .get("rollback_mode")
+                    .get("target_enforcement_mode")
+                    .or_else(|| outcome_v.get("rollback_mode"))
                     .and_then(|m| m.as_str())
                     .ok_or_else(|| anyhow::anyhow!(
-                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} missing rollback_mode",
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} missing target_enforcement_mode",
                         intent_hash
                     ))?
                     .to_string();
@@ -8262,7 +8270,7 @@ impl CommandHandler {
         let now = Utc::now();
         let tx_started = Instant::now();
         let audit_id = uuid::Uuid::new_v4().to_string();
-        let action = match c.rollback_mode.as_str() {
+        let action = match c.target_enforcement_mode.as_str() {
             "disabled" => "rollback_disable",
             _ => "enforce_to_permissive",
         };
@@ -8317,7 +8325,7 @@ impl CommandHandler {
                    effective_at = excluded.effective_at,
                    updated_at = excluded.updated_at"#,
         )
-        .bind(&c.rollback_mode)
+        .bind(&c.target_enforcement_mode)
         .bind(&c.reason)
         .bind(now.to_rfc3339())
         .execute(&mut **tx)
@@ -8343,12 +8351,13 @@ impl CommandHandler {
         // Insert audit row with terminal status 'pass' (written atomically on success only).
         let insert_result = sqlx::query(
             r#"INSERT INTO p083_rollback_audit
-               (audit_id, action, status, reason, principal_id, request_id,
+               (audit_id, action, status, target_enforcement_mode, reason, principal_id, request_id,
                 ttl_expires_at, audited_at)
-               VALUES (?1, ?2, 'pass', ?3, ?4, ?5, NULL, ?6)"#,
+               VALUES (?1, ?2, 'pass', ?3, ?4, ?5, ?6, NULL, ?7)"#,
         )
         .bind(&audit_id)
         .bind(action)
+        .bind(&c.target_enforcement_mode)
         .bind(&c.reason)
         .bind(principal_id)
         .bind(&c.request_id)
@@ -8375,7 +8384,7 @@ impl CommandHandler {
 
         // Commit idempotency lease atomically with side effects and journal.
         let outcome = serde_json::json!({
-            "rollback_mode": c.rollback_mode,
+            "target_enforcement_mode": c.target_enforcement_mode,
             "request_id": c.request_id,
             "audit_id": audit_id,
             "journal_id": journal.id
@@ -8430,7 +8439,7 @@ impl CommandHandler {
         db::metrics::record_p083_rollback_execution(action, "pass", "gate_failed");
 
         Ok(CommandResult::P083RollbackExecutionScheduled {
-            rollback_mode: c.rollback_mode,
+            rollback_mode: c.target_enforcement_mode,
             journal_id: journal.id.clone(),
             idempotency_request_id: c.request_id,
         })
@@ -8449,10 +8458,10 @@ impl CommandHandler {
         let principal_id = &caller.principal_id;
 
         if !matches!(
-            c.enforcement_mode.as_str(),
+            c.target_mode.as_str(),
             "disabled" | "permissive" | "enforce"
         ) {
-            anyhow::bail!("enforcement_mode must be 'disabled', 'permissive', or 'enforce'");
+            anyhow::bail!("target_mode must be 'disabled', 'permissive', or 'enforce'");
         }
 
         let intent_hash = canonical_intent_hash(&[
@@ -8461,10 +8470,9 @@ impl CommandHandler {
                 serde_json::Value::String("p083.set_enforcement_mode".into()),
             ),
             (
-                "enforcement_mode",
-                serde_json::Value::String(c.enforcement_mode.clone()),
+                "target_mode",
+                serde_json::Value::String(c.target_mode.clone()),
             ),
-            ("reason", serde_json::Value::String(c.reason.clone())),
         ]);
 
         if let Some(existing) =
@@ -8506,10 +8514,11 @@ impl CommandHandler {
                     )
                 })?;
                 let enforcement_mode = outcome_v
-                    .get("enforcement_mode")
+                    .get("target_mode")
+                    .or_else(|| outcome_v.get("enforcement_mode"))
                     .and_then(|m| m.as_str())
                     .ok_or_else(|| anyhow::anyhow!(
-                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} missing enforcement_mode",
+                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} missing target_mode",
                         c.request_id
                     ))?
                     .to_string();
@@ -8585,10 +8594,11 @@ impl CommandHandler {
                         )
                     })?;
                 let enforcement_mode = outcome_v
-                    .get("enforcement_mode")
+                    .get("target_mode")
+                    .or_else(|| outcome_v.get("enforcement_mode"))
                     .and_then(|m| m.as_str())
                     .ok_or_else(|| anyhow::anyhow!(
-                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} missing enforcement_mode",
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} missing target_mode",
                         intent_hash
                     ))?
                     .to_string();
@@ -8669,7 +8679,7 @@ impl CommandHandler {
 
         // Per rollout_contract_v1: disabled→enforce is not a valid transition.
         // Enforcement mode must go through permissive first.
-        if current_mode == "disabled" && c.enforcement_mode == "enforce" {
+        if current_mode == "disabled" && c.target_mode == "enforce" {
             let transition_label = "disabled_to_enforce_denied";
             db::metrics::record_p083_enforcement_mode_transition(transition_label, &current_mode);
             command_idempotency::fail_lease_tx(
@@ -8704,7 +8714,7 @@ impl CommandHandler {
         )
         .bind(&journal_id_inner)
         .bind(&current_mode)
-        .bind(&c.enforcement_mode)
+        .bind(&c.target_mode)
         .bind(principal_id)
         .bind(&c.request_id)
         .bind(now.to_rfc3339())
@@ -8739,7 +8749,7 @@ impl CommandHandler {
                    effective_at = excluded.effective_at,
                    updated_at = excluded.updated_at"#,
         )
-        .bind(&c.enforcement_mode)
+        .bind(&c.target_mode)
         .bind(&c.reason)
         .bind(now.to_rfc3339())
         .execute(&mut **tx)
@@ -8760,7 +8770,7 @@ impl CommandHandler {
 
         // Commit idempotency lease atomically with side effects and journal.
         let outcome = serde_json::json!({
-            "enforcement_mode": c.enforcement_mode,
+            "target_mode": c.target_mode,
             "request_id": c.request_id,
             "transition_journal_id": journal_id_inner,
             "journal_id": journal.id
@@ -8811,14 +8821,11 @@ impl CommandHandler {
         tx.commit().await?;
         db::pool::log_write_transaction("command.P083SetEnforcementMode", tx_started);
 
-        let transition_label = format!("{current_mode}_to_{}", c.enforcement_mode);
-        db::metrics::record_p083_enforcement_mode_transition(
-            &transition_label,
-            &c.enforcement_mode,
-        );
+        let transition_label = format!("{current_mode}_to_{}", c.target_mode);
+        db::metrics::record_p083_enforcement_mode_transition(&transition_label, &c.target_mode);
 
         Ok(CommandResult::P083EnforcementModeSet {
-            enforcement_mode: c.enforcement_mode,
+            enforcement_mode: c.target_mode,
             journal_id: journal.id.clone(),
             idempotency_request_id: c.request_id,
         })
@@ -10852,22 +10859,20 @@ reviewer_override:
                 "command",
                 serde_json::Value::String("p083.rollback_execution".into()),
             ),
-            ("reason", serde_json::Value::String("test".into())),
             (
-                "rollback_mode",
+                "target_enforcement_mode",
                 serde_json::Value::String("permissive".into()),
             ),
         ]);
         let h2 = canonical_intent_hash(&[
             (
-                "rollback_mode",
+                "target_enforcement_mode",
                 serde_json::Value::String("permissive".into()),
             ),
             (
                 "command",
                 serde_json::Value::String("p083.rollback_execution".into()),
             ),
-            ("reason", serde_json::Value::String("test".into())),
         ]);
         assert_eq!(
             h1, h2,
@@ -10902,12 +10907,12 @@ reviewer_override:
             }),
             Command::P083RollbackExecution(P083RollbackExecutionCmd {
                 request_id: "550e8400-e29b-41d4-a716-446655440001".into(),
-                rollback_mode: "permissive".into(),
+                target_enforcement_mode: "permissive".into(),
                 reason: "test".into(),
             }),
             Command::P083SetEnforcementMode(P083SetEnforcementModeCmd {
                 request_id: "550e8400-e29b-41d4-a716-446655440002".into(),
-                enforcement_mode: "permissive".into(),
+                target_mode: "permissive".into(),
                 reason: "test".into(),
             }),
             Command::RetryRun(RetryRunCmd {

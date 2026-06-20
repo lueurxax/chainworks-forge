@@ -12,8 +12,8 @@ use domain::commands::{
     MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision, MainSyncRepairStateCmd,
     MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd, MainSyncTriggerReason,
     MarkProviderSessionProcessAbsentCmd, P083RollbackExecutionCmd, P083SetEnforcementModeCmd,
-    ProposalGateSettlementAction, RetryRunCmd, SettleProposalGateCmd, ShutdownProviderSessionCmd,
-    StartRunCmd,
+    ProposalGateSettlementAction, RetrofitCatalogSnapshotCmd, RetryRunCmd, SettleProposalGateCmd,
+    ShutdownProviderSessionCmd, StartRunCmd,
 };
 use domain::ids::{IdeaId, RunId};
 use domain::risk_lineage::RiskAcceptanceLineage;
@@ -210,6 +210,64 @@ pub fn tool_specs() -> Vec<McpTool> {
             output_schema: None,
         },
         McpTool {
+            name: "runs.retrofit_catalog_snapshot".to_string(),
+            description: "P097: Operator-only emergency retrofit of a blocked run's frozen \
+                agent catalog snapshot. The command is guarded by current catalog hash, \
+                workflow hash stability, escalation-policy-only drift validation, command \
+                journal idempotency, and audit logging."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["run_id", "expected_catalog_snapshot_hash", "reason", "request_id"],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "expected_catalog_snapshot_hash": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256,
+                        "description": "Frozen catalog snapshot hash observed by the operator before mutation"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1024,
+                        "description": "Operator audit reason for the emergency retrofit"
+                    },
+                    "request_id": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "description": "CallerRequestId: lowercase UUIDv4 for command_idempotency_contract_v1"
+                    }
+                }
+            }),
+            output_schema: Some(serde_json::json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "retrofitted", "run_id", "previous_catalog_snapshot_hash",
+                    "new_catalog_snapshot_hash", "applied_policy_ids", "journal_id", "request_id"
+                ],
+                "properties": {
+                    "retrofitted": { "type": "boolean" },
+                    "run_id": { "type": "string" },
+                    "previous_catalog_snapshot_hash": { "type": "string" },
+                    "new_catalog_snapshot_hash": { "type": "string" },
+                    "applied_policy_ids": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "journal_id": { "type": "string" },
+                    "request_id": { "type": "string" },
+                    "denied": { "type": "boolean" },
+                    "denial_code": { "type": "string" },
+                    "message": { "type": "string" }
+                }
+            })),
+        },
+        McpTool {
             name: "runs.settle_proposal_gate".to_string(),
             description: "P077: Execute, import, or waive a proposal gate settlement result. \
                 Requires operator principal. The principal field is bound from the authenticated \
@@ -322,19 +380,14 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "type": "object",
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "additionalProperties": false,
-                "required": ["rollback_mode", "reason", "request_id"],
+                "required": ["target_enforcement_mode", "caller_request_id"],
                 "properties": {
-                    "rollback_mode": {
+                    "target_enforcement_mode": {
                         "type": "string",
                         "enum": ["permissive", "disabled"],
                         "description": "Target rollback enforcement mode"
                     },
-                    "reason": {
-                        "type": "string",
-                        "maxLength": 2048,
-                        "description": "Operator-supplied rationale recorded in rollback audit"
-                    },
-                    "request_id": {
+                    "caller_request_id": {
                         "type": "string",
                         "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                         "description": "CallerRequestId: lowercase UUIDv4 for command_idempotency_contract_v1"
@@ -348,9 +401,9 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "required": ["committed"],
                 "properties": {
                     "committed": { "type": "boolean", "description": "true when rollback was durably committed; false on denial" },
-                    "rollback_mode": { "type": "string", "enum": ["permissive", "disabled"] },
+                    "target_enforcement_mode": { "type": "string", "enum": ["permissive", "disabled"] },
                     "journal_id": { "type": "string" },
-                    "request_id": { "type": "string" },
+                    "caller_request_id": { "type": "string" },
                     "denied": { "type": "boolean" },
                     "denial_code": { "type": "string", "enum": ["malformed_request_id","request_intent_mismatch","idempotency_in_flight","idempotency_replayed","idempotency_expired_reacquired","idempotency_replay_corrupt","idempotency_terminal_failure","operator_required","p083_operator_required","provider_session_not_found","run_not_found","stage_not_retryable","approval_not_actionable","side_effect_not_reconcilable","enforcement_mode_transition_denied","identity_ambiguous","internal"] },
                     "message": { "type": "string", "description": "Human-readable denial message" }
@@ -367,19 +420,14 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "type": "object",
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "additionalProperties": false,
-                "required": ["enforcement_mode", "reason", "request_id"],
+                "required": ["target_mode", "caller_request_id"],
                 "properties": {
-                    "enforcement_mode": {
+                    "target_mode": {
                         "type": "string",
                         "enum": ["disabled", "permissive", "enforce"],
                         "description": "Target enforcement mode"
                     },
-                    "reason": {
-                        "type": "string",
-                        "maxLength": 2048,
-                        "description": "Operator-supplied rationale recorded in enforcement mode audit"
-                    },
-                    "request_id": {
+                    "caller_request_id": {
                         "type": "string",
                         "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                         "description": "CallerRequestId: lowercase UUIDv4 for command_idempotency_contract_v1"
@@ -395,7 +443,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "committed": { "type": "boolean", "description": "true when mode change was durably committed; false on denial" },
                     "enforcement_mode": { "type": "string", "enum": ["disabled", "permissive", "enforce"] },
                     "journal_id": { "type": "string" },
-                    "request_id": { "type": "string" },
+                    "caller_request_id": { "type": "string" },
                     "denied": { "type": "boolean" },
                     "denial_code": { "type": "string", "enum": ["malformed_request_id","request_intent_mismatch","idempotency_in_flight","idempotency_replayed","idempotency_expired_reacquired","idempotency_replay_corrupt","idempotency_terminal_failure","operator_required","p083_operator_required","provider_session_not_found","run_not_found","stage_not_retryable","approval_not_actionable","side_effect_not_reconcilable","enforcement_mode_transition_denied","identity_ambiguous","internal"] },
                     "message": { "type": "string", "description": "Human-readable denial message" }
@@ -935,6 +983,63 @@ pub async fn execute(
             );
         }
 
+        "runs.retrofit_catalog_snapshot" => {
+            if !matches!(principal.class, auth::PrincipalClass::Operator) {
+                return Ok(serde_json::json!({
+                    "retrofitted": false,
+                    "denied": true,
+                    "denial_code": "operator_required",
+                    "message": "runs.retrofit_catalog_snapshot requires operator principal class"
+                }));
+            }
+            let run_id = parse_run_id(&params)?;
+            let expected_catalog_snapshot_hash = params["expected_catalog_snapshot_hash"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'expected_catalog_snapshot_hash'"))?
+                .to_string();
+            let reason = params["reason"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
+                .to_string();
+            let request_id = params["request_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'request_id'"))?
+                .to_string();
+            validate_caller_request_id(&request_id)?;
+            let caller = mcp_caller(&principal, "runs.retrofit_catalog_snapshot")
+                .with_request_id(request_id.clone());
+            let commanded = cmd_handler
+                .handle(
+                    Command::RetrofitCatalogSnapshot(RetrofitCatalogSnapshotCmd {
+                        run_id,
+                        expected_catalog_snapshot_hash,
+                        reason,
+                        scope: Default::default(),
+                    }),
+                    caller,
+                )
+                .await?;
+            match commanded.result {
+                engine::command_handler::CommandResult::CatalogSnapshotRetrofitted {
+                    run_id: result_run_id,
+                    previous_catalog_snapshot_hash,
+                    new_catalog_snapshot_hash,
+                    applied_policy_ids,
+                } => Ok(serde_json::json!({
+                    "retrofitted": true,
+                    "run_id": result_run_id.to_string(),
+                    "previous_catalog_snapshot_hash": previous_catalog_snapshot_hash,
+                    "new_catalog_snapshot_hash": new_catalog_snapshot_hash,
+                    "applied_policy_ids": applied_policy_ids,
+                    "journal_id": commanded.journal_id,
+                    "request_id": request_id,
+                })),
+                _ => Err(anyhow::anyhow!(
+                    "Unexpected result from RetrofitCatalogSnapshot"
+                )),
+            }
+        }
+
         "runs.settle_proposal_gate" => {
             let run_id = parse_run_id(&params)?;
             let proposal_id = params["proposal_id"]
@@ -1216,23 +1321,18 @@ pub async fn execute(
                     "message": "p083.rollback_execution requires operator principal class"
                 }));
             }
-            let request_id = params["request_id"]
+            let request_id = params["caller_request_id"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'request_id'"))?
+                .ok_or_else(|| anyhow::anyhow!("Missing 'caller_request_id'"))?
                 .to_string();
             validate_caller_request_id(&request_id)?;
-            let rollback_mode = params["rollback_mode"]
+            let target_enforcement_mode = params["target_enforcement_mode"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'rollback_mode'"))?
+                .ok_or_else(|| anyhow::anyhow!("Missing 'target_enforcement_mode'"))?
                 .to_string();
-            if !matches!(rollback_mode.as_str(), "permissive" | "disabled") {
-                anyhow::bail!("rollback_mode must be 'permissive' or 'disabled'");
+            if !matches!(target_enforcement_mode.as_str(), "permissive" | "disabled") {
+                anyhow::bail!("target_enforcement_mode must be 'permissive' or 'disabled'");
             }
-            let reason = params["reason"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
-                .to_string();
-            validate_p083_reason(&reason, 2048)?;
             // SEC-P083-MED-003: stamp the validated CallerRequestId into CallerContext.
             let caller = mcp_caller(&principal, "p083.rollback_execution")
                 .with_request_id(request_id.clone());
@@ -1240,8 +1340,8 @@ pub async fn execute(
                 .handle(
                     Command::P083RollbackExecution(P083RollbackExecutionCmd {
                         request_id: request_id.clone(),
-                        rollback_mode: rollback_mode.clone(),
-                        reason,
+                        target_enforcement_mode: target_enforcement_mode.clone(),
+                        reason: "operator_requested_p083_rollback".to_string(),
                     }),
                     caller,
                 )
@@ -1253,9 +1353,9 @@ pub async fn execute(
                     idempotency_request_id,
                 } => Ok(serde_json::json!({
                     "committed": true,
-                    "rollback_mode": rm,
+                    "target_enforcement_mode": rm,
                     "journal_id": journal_id,
-                    "request_id": idempotency_request_id
+                    "caller_request_id": idempotency_request_id
                 })),
                 _ => Err(anyhow::anyhow!(
                     "Unexpected result from P083RollbackExecution"
@@ -1272,26 +1372,18 @@ pub async fn execute(
                     "message": "p083.set_enforcement_mode requires operator principal class"
                 }));
             }
-            let request_id = params["request_id"]
+            let request_id = params["caller_request_id"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'request_id'"))?
+                .ok_or_else(|| anyhow::anyhow!("Missing 'caller_request_id'"))?
                 .to_string();
             validate_caller_request_id(&request_id)?;
-            let enforcement_mode = params["enforcement_mode"]
+            let target_mode = params["target_mode"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'enforcement_mode'"))?
+                .ok_or_else(|| anyhow::anyhow!("Missing 'target_mode'"))?
                 .to_string();
-            if !matches!(
-                enforcement_mode.as_str(),
-                "disabled" | "permissive" | "enforce"
-            ) {
-                anyhow::bail!("enforcement_mode must be 'disabled', 'permissive', or 'enforce'");
+            if !matches!(target_mode.as_str(), "disabled" | "permissive" | "enforce") {
+                anyhow::bail!("target_mode must be 'disabled', 'permissive', or 'enforce'");
             }
-            let reason = params["reason"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
-                .to_string();
-            validate_p083_reason(&reason, 2048)?;
             // SEC-P083-MED-003: stamp the validated CallerRequestId into CallerContext.
             let caller = mcp_caller(&principal, "p083.set_enforcement_mode")
                 .with_request_id(request_id.clone());
@@ -1299,8 +1391,8 @@ pub async fn execute(
                 .handle(
                     Command::P083SetEnforcementMode(P083SetEnforcementModeCmd {
                         request_id: request_id.clone(),
-                        enforcement_mode: enforcement_mode.clone(),
-                        reason,
+                        target_mode: target_mode.clone(),
+                        reason: "operator_requested_p083_enforcement_mode_change".to_string(),
                     }),
                     caller,
                 )
@@ -1314,7 +1406,7 @@ pub async fn execute(
                     "committed": true,
                     "enforcement_mode": em,
                     "journal_id": journal_id,
-                    "request_id": idempotency_request_id
+                    "caller_request_id": idempotency_request_id
                 })),
                 _ => Err(anyhow::anyhow!(
                     "Unexpected result from P083SetEnforcementMode"

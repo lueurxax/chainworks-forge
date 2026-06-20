@@ -515,26 +515,26 @@ pub struct ShutdownProviderSessionCmd {
 }
 
 /// P083: Roll back enforcement mode to permissive or disabled.
-/// rollback_mode must be "permissive" or "disabled".
+/// target_enforcement_mode must be "permissive" or "disabled".
 /// Principal is bound from CallerContext, not this struct.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct P083RollbackExecutionCmd {
     /// CallerRequestId (UUIDv4) for command_idempotency_contract_v1.
     pub request_id: String,
     /// "permissive" or "disabled"
-    pub rollback_mode: String,
+    pub target_enforcement_mode: String,
     pub reason: String,
 }
 
 /// P083: Set enforcement mode (disabled/permissive/enforce).
-/// enforcement_mode must be one of the three allowed values.
+/// target_mode must be one of the three allowed values.
 /// Principal is bound from CallerContext, not this struct.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct P083SetEnforcementModeCmd {
     /// CallerRequestId (UUIDv4) for command_idempotency_contract_v1.
     pub request_id: String,
     /// "disabled", "permissive", or "enforce"
-    pub enforcement_mode: String,
+    pub target_mode: String,
     pub reason: String,
 }
 

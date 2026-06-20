@@ -27,6 +27,7 @@ CREATE TABLE shutdown_signal_side_effects_new (
   issued_at_monotonic_ms INTEGER,
   issued_at_wall_clock TEXT,
   observed_exit_at_monotonic_ms INTEGER,
+  baseline_sample_id TEXT,
   error_code TEXT,
   UNIQUE(provider_session_id, shutdown_epoch, signal_kind, generation)
 );
@@ -35,7 +36,7 @@ INSERT INTO shutdown_signal_side_effects_new
   SELECT signal_effect_id, provider_session_id, shutdown_epoch,
          process_id, process_start_identity, signal_kind, generation,
          intent_state, issued_at_monotonic_ms, issued_at_wall_clock,
-         observed_exit_at_monotonic_ms, error_code
+         observed_exit_at_monotonic_ms, baseline_sample_id, error_code
     FROM shutdown_signal_side_effects;
 
 DROP TABLE shutdown_signal_side_effects;

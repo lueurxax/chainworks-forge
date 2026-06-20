@@ -44,9 +44,9 @@ use crate::types::p031::{
     GqlMutationConflictResultCode, GqlPayloadAvailabilityState, GqlPayloadUnavailableReasonCode,
 };
 use crate::types::p083::{
-    GqlP083IdentityHoldSession, GqlP083MarkProcessAbsentPayload,
-    GqlP083ProviderSessionShutdownPayload, GqlP083RollbackExecutionPayload,
-    GqlP083SetEnforcementModePayload, GqlRetryRunPayload,
+    GqlP083EnforcementMode, GqlP083MarkProcessAbsentPayload, GqlP083ProviderSessionShutdownPayload,
+    GqlP083RollbackExecutionPayload, GqlP083RollbackTargetMode, GqlP083SetEnforcementModePayload,
+    GqlRetryRunPayload,
 };
 use crate::types::run::GqlRun;
 use crate::types::scheduler::{GqlStartupRecoverySummary, GqlToolchainCacheHousekeepingSummary};
@@ -3236,13 +3236,13 @@ impl QueryRoot {
         &self,
         ctx: &Context<'_>,
         continuation_id: ID,
-        run_id: Option<ID>,
+        run_id: ID,
     ) -> Result<serde_json::Value> {
         use db::repos::p086_resurrection_raw_receipts;
         let pool = ctx.data::<SqlitePool>()?;
         let principal = ctx.data::<auth::Principal>()?;
         let cont_id = continuation_id.as_str();
-        let req_run_id: Option<&str> = run_id.as_ref().map(|id| id.as_str());
+        let req_run_id = run_id.as_str();
 
         match &principal.class {
             auth::PrincipalClass::Operator => {
@@ -3250,9 +3250,7 @@ impl QueryRoot {
                 let actual_run = p086_resurrection_raw_receipts::continuation_run_id(pool, cont_id)
                     .await
                     .map_err(|e| Error::new(e.to_string()))?;
-                let authorized = req_run_id
-                    .map(|r| actual_run.as_deref() == Some(r))
-                    .unwrap_or(actual_run.is_some());
+                let authorized = actual_run.as_deref() == Some(req_run_id);
                 if !authorized {
                     let audit_id = uuid::Uuid::new_v4().to_string();
                     let now = chrono::Utc::now().to_rfc3339();
@@ -3263,7 +3261,7 @@ impl QueryRoot {
                             principal_id: principal.id.clone(),
                             principal_class: "operator".to_string(),
                             continuation_id: cont_id.to_string(),
-                            run_id: req_run_id.unwrap_or("").to_string(),
+                            run_id: req_run_id.to_string(),
                             requested_at: now,
                             source_channel: "graphql".to_string(),
                             outcome: "denied".to_string(),
@@ -3328,7 +3326,7 @@ impl QueryRoot {
                         principal_id: principal.id.clone(),
                         principal_class: "observer".to_string(),
                         continuation_id: cont_id.to_string(),
-                        run_id: req_run_id.unwrap_or("").to_string(),
+                        run_id: req_run_id.to_string(),
                         requested_at: now,
                         source_channel: "graphql".to_string(),
                         outcome: "reviewer_projection".to_string(),
@@ -5795,9 +5793,8 @@ impl MutationRoot {
     async fn p083_rollback_execution(
         &self,
         ctx: &Context<'_>,
-        rollback_mode: String,
-        reason: String,
-        request_id: String,
+        target_enforcement_mode: GqlP083RollbackTargetMode,
+        caller_request_id: String,
     ) -> Result<GqlP083RollbackExecutionPayload> {
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
 
@@ -5808,21 +5805,14 @@ impl MutationRoot {
 
         mutation_allowed(ctx, &principal, MutationName::P083RollbackExecution).await?;
 
-        validate_caller_request_id_graphql(&request_id)?;
-        validate_p083_reason_graphql(&reason, 2048)?;
+        validate_caller_request_id_graphql(&caller_request_id)?;
 
-        if !matches!(rollback_mode.as_str(), "permissive" | "disabled") {
-            return Err(Error::new(
-                "P083_INVALID_ARG: rollbackMode must be 'permissive' or 'disabled'",
-            ));
-        }
-
-        let caller =
-            graphql_caller(&ctx, &principal, "p083RollbackExecution").with_request_id(&request_id);
+        let caller = graphql_caller(&ctx, &principal, "p083RollbackExecution")
+            .with_request_id(&caller_request_id);
         let cmd = Command::P083RollbackExecution(P083RollbackExecutionCmd {
-            request_id: request_id.clone(),
-            rollback_mode: rollback_mode.clone(),
-            reason,
+            request_id: caller_request_id.clone(),
+            target_enforcement_mode: target_enforcement_mode.as_str().to_string(),
+            reason: "operator_requested_p083_rollback".to_string(),
         });
 
         let commanded = cmd_handler.handle(cmd, caller).await.map_err(|e| {
@@ -5837,7 +5827,7 @@ impl MutationRoot {
                 idempotency_request_id,
             } => Ok(GqlP083RollbackExecutionPayload {
                 committed: true,
-                rollback_mode: mode,
+                target_enforcement_mode: mode,
                 journal_id,
                 request_id: idempotency_request_id,
             }),
@@ -5850,9 +5840,8 @@ impl MutationRoot {
     async fn p083_set_enforcement_mode(
         &self,
         ctx: &Context<'_>,
-        enforcement_mode: String,
-        reason: String,
-        request_id: String,
+        target_mode: GqlP083EnforcementMode,
+        caller_request_id: String,
     ) -> Result<GqlP083SetEnforcementModePayload> {
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
 
@@ -5863,24 +5852,14 @@ impl MutationRoot {
 
         mutation_allowed(ctx, &principal, MutationName::P083SetEnforcementMode).await?;
 
-        validate_caller_request_id_graphql(&request_id)?;
-        validate_p083_reason_graphql(&reason, 2048)?;
+        validate_caller_request_id_graphql(&caller_request_id)?;
 
-        if !matches!(
-            enforcement_mode.as_str(),
-            "disabled" | "permissive" | "enforce"
-        ) {
-            return Err(Error::new(
-                "P083_INVALID_ARG: enforcementMode must be 'disabled', 'permissive', or 'enforce'",
-            ));
-        }
-
-        let caller =
-            graphql_caller(&ctx, &principal, "p083SetEnforcementMode").with_request_id(&request_id);
+        let caller = graphql_caller(&ctx, &principal, "p083SetEnforcementMode")
+            .with_request_id(&caller_request_id);
         let cmd = Command::P083SetEnforcementMode(P083SetEnforcementModeCmd {
-            request_id: request_id.clone(),
-            enforcement_mode: enforcement_mode.clone(),
-            reason,
+            request_id: caller_request_id.clone(),
+            target_mode: target_mode.as_str().to_string(),
+            reason: "operator_requested_p083_enforcement_mode_change".to_string(),
         });
 
         let commanded = cmd_handler.handle(cmd, caller).await.map_err(|e| {
@@ -13476,6 +13455,7 @@ mod tests {
             auth::PrincipalClass::Operator => "operator",
             auth::PrincipalClass::Agent => "agent",
             auth::PrincipalClass::Observer => "observer",
+            auth::PrincipalClass::ReadOnlyOperator => "read_only_operator",
         };
         let dir = tempfile::tempdir().unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();

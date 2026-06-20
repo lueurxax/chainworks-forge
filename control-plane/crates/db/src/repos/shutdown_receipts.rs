@@ -43,6 +43,7 @@ pub struct ShutdownSignalSideEffect {
     pub issued_at_monotonic_ms: Option<i64>,
     pub issued_at_wall_clock: Option<String>,
     pub observed_exit_at_monotonic_ms: Option<i64>,
+    pub baseline_sample_id: Option<String>,
     pub error_code: Option<String>,
 }
 
@@ -72,6 +73,7 @@ fn map_signal(r: sqlx::sqlite::SqliteRow) -> ShutdownSignalSideEffect {
         issued_at_monotonic_ms: r.get("issued_at_monotonic_ms"),
         issued_at_wall_clock: r.get("issued_at_wall_clock"),
         observed_exit_at_monotonic_ms: r.get("observed_exit_at_monotonic_ms"),
+        baseline_sample_id: r.get("baseline_sample_id"),
         error_code: r.get("error_code"),
     }
 }
@@ -82,7 +84,8 @@ const RECEIPT_SELECT: &str = r#"SELECT receipt_id, provider_session_id, shutdown
 
 const SIGNAL_SELECT: &str = r#"SELECT signal_effect_id, provider_session_id, shutdown_epoch,
        process_id, process_start_identity, signal_kind, generation, intent_state,
-       issued_at_monotonic_ms, issued_at_wall_clock, observed_exit_at_monotonic_ms, error_code
+       issued_at_monotonic_ms, issued_at_wall_clock, observed_exit_at_monotonic_ms,
+       baseline_sample_id, error_code
   FROM shutdown_signal_side_effects"#;
 
 // ── shutdown_interrupted_receipts ────────────────────────────────────────────
@@ -185,12 +188,14 @@ pub async fn insert_signal_planned(
     process_start_identity: &str,
     signal_kind: &str,
     generation: i64,
+    baseline_sample_id: Option<&str>,
 ) -> Result<()> {
     sqlx::query(
         r#"INSERT OR IGNORE INTO shutdown_signal_side_effects
            (signal_effect_id, provider_session_id, shutdown_epoch,
-            process_id, process_start_identity, signal_kind, generation, intent_state)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'planned')"#,
+            process_id, process_start_identity, signal_kind, generation, intent_state,
+            baseline_sample_id)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'planned', ?8)"#,
     )
     .bind(signal_effect_id)
     .bind(provider_session_id)
@@ -199,6 +204,7 @@ pub async fn insert_signal_planned(
     .bind(process_start_identity)
     .bind(signal_kind)
     .bind(generation)
+    .bind(baseline_sample_id)
     .execute(pool)
     .await
     .context("shutdown_signal_side_effects: insert_planned")?;

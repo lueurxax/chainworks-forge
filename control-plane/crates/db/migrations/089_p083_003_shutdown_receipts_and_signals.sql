@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS shutdown_signal_side_effects (
   issued_at_monotonic_ms INTEGER,
   issued_at_wall_clock TEXT,
   observed_exit_at_monotonic_ms INTEGER,
+  baseline_sample_id TEXT,
   error_code TEXT,
   UNIQUE(provider_session_id, shutdown_epoch, signal_kind, generation)
 );

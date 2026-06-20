@@ -596,3 +596,46 @@ async fn p086_graphql_continuation_readback_exposes_terminal_fields_without_muta
         "artifact:p086:response"
     );
 }
+
+#[tokio::test]
+async fn p086_graphql_attach_receipt_requires_run_id_for_raw_readback_scope() {
+    let pool = test_pool().await;
+    let events = event_bus::new_bus(16);
+    let handler = Arc::new(CommandHandler::new(
+        pool.clone(),
+        events.clone(),
+        WorkQueue::new(pool.clone()),
+    ));
+    let schema = build_schema(
+        pool,
+        handler,
+        events.clone(),
+        auth::PrincipalTable::test_fixture(),
+        LifecycleReporter::new(15, "test-build", events.clone()),
+    );
+
+    let sdl = schema.sdl();
+    assert!(
+        sdl.contains("providerSessionAttachReceipt(continuationId: ID!, runId: ID!)"),
+        "P086 SEC-001: providerSessionAttachReceipt must require runId for run-scoped raw receipt access"
+    );
+
+    let response = schema
+        .execute(
+            Request::new(
+                r#"{
+                  providerSessionAttachReceipt(continuationId: "p086-continuation-readback")
+                }"#,
+            )
+            .data(auth::Principal::new(
+                "operator",
+                auth::PrincipalClass::Operator,
+            )),
+        )
+        .await;
+
+    assert!(
+        !response.errors.is_empty(),
+        "GraphQL must reject attach receipt readback when runId is omitted"
+    );
+}

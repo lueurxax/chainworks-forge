@@ -382,6 +382,14 @@ impl PrincipalTable {
         table
     }
 
+    pub fn test_fixture_with_token(token: impl Into<String>) -> Self {
+        let mut table = Self::test_fixture();
+        if let Some(entry) = table.entries.first_mut() {
+            entry.token = token.into();
+        }
+        table
+    }
+
     pub fn test_fixture_with_class(
         token: impl Into<String>,
         id: impl Into<String>,
@@ -393,6 +401,28 @@ impl PrincipalTable {
                 id: id.into(),
                 class,
                 surface_policies: None,
+                ..Default::default()
+            }],
+        }
+    }
+
+    pub fn test_fixture_graphql_query_only(
+        token: impl Into<String>,
+        id: impl Into<String>,
+    ) -> Self {
+        PrincipalTable {
+            entries: vec![PrincipalEntry {
+                token: token.into(),
+                id: id.into(),
+                class: PrincipalClass::Operator,
+                surface_policies: Some(SurfacePolicies {
+                    graphql: Some(GraphqlPolicy {
+                        allow_queries: true,
+                        allow_subscriptions: true,
+                        allowed_mutations: vec![],
+                    }),
+                    mcp: None,
+                }),
                 ..Default::default()
             }],
         }

@@ -1758,6 +1758,7 @@ fn brokered_xcode_request(tmp: &tempfile::TempDir, provider: &str) -> acp::Execu
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: vec![acp::AcpMcpServerPayload {
             id: "xcode-broker".into(),
             extension_id: "xcode".into(),
@@ -1786,8 +1787,6 @@ fn brokered_xcode_request(tmp: &tempfile::TempDir, provider: &str) -> acp::Execu
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     }
 }
 
@@ -1834,6 +1833,7 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -1846,8 +1846,6 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1917,6 +1915,7 @@ async fn test_claude_adapter_legacy_broad_discovery_ignores_preexisting_files_on
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -1929,8 +1928,6 @@ async fn test_claude_adapter_legacy_broad_discovery_ignores_preexisting_files_on
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1985,6 +1982,7 @@ async fn test_claude_adapter_keeps_legacy_broad_discovery_disabled_by_default() 
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -1997,8 +1995,6 @@ async fn test_claude_adapter_keeps_legacy_broad_discovery_disabled_by_default() 
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -2053,6 +2049,7 @@ async fn p053_manual_reference_workspace_pre_initialize_latency() {
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -2065,8 +2062,6 @@ async fn p053_manual_reference_workspace_pre_initialize_latency() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -2118,6 +2113,7 @@ async fn mcp_servers_session_new_serialization_tests() {
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: vec![AcpMcpServerPayload {
             id: "fs-runtime".into(),
             extension_id: "filesystem".into(),
@@ -2140,8 +2136,6 @@ async fn mcp_servers_session_new_serialization_tests() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let captured = build_session_new_params(&req, &AcpSessionConfig::default()).unwrap();
@@ -2187,6 +2181,7 @@ async fn http_mcp_servers_session_new_serialization_tests() {
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: vec![AcpMcpServerPayload {
             id: "xcode-broker".into(),
             extension_id: "xcode".into(),
@@ -2208,8 +2203,6 @@ async fn http_mcp_servers_session_new_serialization_tests() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let captured = build_session_new_params(&req, &AcpSessionConfig::default()).unwrap();
@@ -2262,6 +2255,7 @@ async fn transport_sends_set_mode_after_session_new_when_configured() {
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -2274,8 +2268,6 @@ async fn transport_sends_set_mode_after_session_new_when_configured() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
     let config = AcpSessionConfig {
         set_mode_after_session_new: true,
@@ -2333,6 +2325,7 @@ async fn transport_fails_when_required_config_option_is_rejected() {
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -2345,8 +2338,6 @@ async fn transport_fails_when_required_config_option_is_rejected() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
     let config = AcpSessionConfig {
         required_config_options: vec![("model".to_string(), "haiku".to_string())],
@@ -2403,6 +2394,7 @@ async fn transport_resolves_required_model_alias_from_session_config_options() {
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -2415,8 +2407,6 @@ async fn transport_resolves_required_model_alias_from_session_config_options() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
     let config = AcpSessionConfig {
         required_config_options: vec![("model".to_string(), "opus".to_string())],
@@ -2461,6 +2451,7 @@ async fn adapter_launch_and_session_specs_are_prepared_separately() {
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -2473,8 +2464,6 @@ async fn adapter_launch_and_session_specs_are_prepared_separately() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let codex = CodexAdapter::new_with_binary("/bin/codex-fixture");
@@ -2568,6 +2557,7 @@ async fn launch_resources_are_cleaned_when_spawn_fails() {
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -2580,8 +2570,6 @@ async fn launch_resources_are_cleaned_when_spawn_fails() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let adapter = CodexAdapter::new_with_binary(missing_binary.to_string_lossy().into_owned());
@@ -5592,6 +5580,7 @@ async fn test_claude_adapter_returns_failed_on_session_error() {
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5604,8 +5593,6 @@ async fn test_claude_adapter_returns_failed_on_session_error() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5656,6 +5643,7 @@ async fn adapter_execute_closes_session_after_prompt_transport_error() {
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5668,8 +5656,6 @@ async fn adapter_execute_closes_session_after_prompt_transport_error() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let error = adapter
@@ -5742,6 +5728,7 @@ async fn test_gemini_adapter_executes_subprocess_and_returns_artifacts() {
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5754,8 +5741,6 @@ async fn test_gemini_adapter_executes_subprocess_and_returns_artifacts() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5802,6 +5787,7 @@ async fn test_claude_adapter_reports_expected_output_paths_when_overwriting_exis
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5814,8 +5800,6 @@ async fn test_claude_adapter_reports_expected_output_paths_when_overwriting_exis
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5867,6 +5851,7 @@ async fn test_claude_adapter_does_not_report_unchanged_expected_output_path() {
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5879,8 +5864,6 @@ async fn test_claude_adapter_does_not_report_unchanged_expected_output_path() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5955,6 +5938,7 @@ async fn test_claude_adapter_prefers_typed_expected_outputs_for_baseline_capture
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5967,8 +5951,6 @@ async fn test_claude_adapter_prefers_typed_expected_outputs_for_baseline_capture
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -6045,6 +6027,7 @@ async fn test_claude_adapter_excludes_initialize_created_file_from_prompt_artifa
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -6057,8 +6040,6 @@ async fn test_claude_adapter_excludes_initialize_created_file_from_prompt_artifa
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -6115,6 +6096,7 @@ async fn test_claude_adapter_extracts_chainworks_output_envelopes_without_filesy
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -6127,8 +6109,6 @@ async fn test_claude_adapter_extracts_chainworks_output_envelopes_without_filesy
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -6181,6 +6161,7 @@ async fn test_claude_adapter_extracts_chainworks_output_from_terminal_result_out
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -6193,8 +6174,6 @@ async fn test_claude_adapter_extracts_chainworks_output_from_terminal_result_out
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -6306,6 +6285,7 @@ async fn p084_like_stringified_terminal_output_materializes_required_outputs() {
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -6318,8 +6298,6 @@ async fn p084_like_stringified_terminal_output_materializes_required_outputs() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -6377,6 +6355,7 @@ async fn test_claude_adapter_extracts_json_object_chainworks_output_envelope() {
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -6389,8 +6368,6 @@ async fn test_claude_adapter_extracts_json_object_chainworks_output_envelope() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -6474,6 +6451,7 @@ async fn codex_task_complete_session_store_recovers_missing_acp_terminal_respons
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -6545,6 +6523,7 @@ async fn codex_prompt_error_uses_session_store_credits_signal_as_provider_quota(
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -6624,6 +6603,7 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         session_generation_id: Some("generation-1".into()),
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -6636,8 +6616,6 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let first_result = manager.execute(first_req).await.unwrap();
@@ -6676,6 +6654,7 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         session_generation_id: Some(session_generation_id.clone()),
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -6688,8 +6667,6 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let second_result = manager.execute(second_req).await.unwrap();
@@ -6772,6 +6749,7 @@ async fn runtime_manager_reports_prompt_progress_before_terminal_response() {
         session_generation_id: Some("generation-progress".into()),
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -6784,8 +6762,6 @@ async fn runtime_manager_reports_prompt_progress_before_terminal_response() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let manager_for_task = Arc::clone(&manager);
@@ -6873,6 +6849,7 @@ async fn test_runtime_manager_closes_inflight_one_shot_session_by_generation_id(
         session_generation_id: Some(generation_id.into()),
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: Default::default(),
@@ -6885,8 +6862,6 @@ async fn test_runtime_manager_closes_inflight_one_shot_session_by_generation_id(
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let execution = {
@@ -6960,6 +6935,7 @@ async fn adapter_execute_detects_provider_parent_exit_with_stdout_held_open() {
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -7030,6 +7006,7 @@ async fn adapter_execute_detects_provider_parent_exit_during_initialize_with_std
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -7098,6 +7075,7 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         session_generation_id: Some("generation-1".into()),
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -7110,8 +7088,6 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let first_result = manager.execute(first_req).await.unwrap();
@@ -7151,6 +7127,7 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         session_generation_id: Some(session_generation_id),
         provider_session_id,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -7163,8 +7140,6 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let error = manager.execute(reuse_req).await.unwrap_err();
@@ -7211,6 +7186,7 @@ async fn test_claude_adapter_surfaces_usage_snapshot_from_stream_updates() {
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -7223,8 +7199,6 @@ async fn test_claude_adapter_surfaces_usage_snapshot_from_stream_updates() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -7322,6 +7296,7 @@ sys.exit(0)
         session_generation_id: None,
         provider_session_id: None,
         provider_runtime_home: None,
+        p079_repair_canonical_paths: None,
         mcp_servers: vec![],
         chainworks_meta_root: Some(".chainworks/runs/env-test-run".into()),
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -7334,8 +7309,6 @@ sys.exit(0)
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
-
-        p079_repair_canonical_paths: None,
     };
 
     adapter

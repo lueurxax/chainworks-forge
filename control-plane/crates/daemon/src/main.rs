@@ -1672,15 +1672,24 @@ async fn insert_durable_monotonic_clock_baseline(pool: &SqlitePool) -> anyhow::R
 
     let boot_id = read_platform_boot_id();
     let sample_id = uuid::Uuid::new_v4().to_string();
+    let baseline_generation: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(baseline_generation), 0) + 1 \
+         FROM durable_monotonic_clock_samples WHERE boot_id = ?1",
+    )
+    .bind(&boot_id)
+    .fetch_one(pool)
+    .await
+    .context("P083: allocate durable_monotonic_clock_samples baseline_generation")?;
 
     sqlx::query(
         r#"INSERT INTO durable_monotonic_clock_samples
-               (sample_id, boot_id, sample_state, monotonic_ms,
-                observed_at_wall_clock, created_at)
-               VALUES (?1, ?2, 'baseline', ?3, ?4, ?4)"#,
+               (sample_id, boot_id, baseline_generation, sample_state, monotonic_ms,
+                observed_at_wall_clock, wall_clock_iso8601, clock_skew_ms, created_at)
+               VALUES (?1, ?2, ?3, 'baseline', ?4, ?5, ?5, 0, ?5)"#,
     )
     .bind(&sample_id)
     .bind(&boot_id)
+    .bind(baseline_generation)
     .bind(monotonic_ms)
     .bind(&observed_at_wall_clock)
     .execute(pool)
@@ -1689,7 +1698,10 @@ async fn insert_durable_monotonic_clock_baseline(pool: &SqlitePool) -> anyhow::R
 
     info!(
         boot_id,
-        sample_id, monotonic_ms, "P083 durable monotonic clock baseline recorded"
+        baseline_generation,
+        sample_id,
+        monotonic_ms,
+        "P083 durable monotonic clock baseline recorded"
     );
     Ok(())
 }

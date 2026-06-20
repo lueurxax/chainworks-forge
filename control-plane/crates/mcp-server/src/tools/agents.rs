@@ -79,7 +79,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                         "maxLength": 200
                     }
                 },
-                "required": ["continuation_id"],
+                "required": ["continuation_id", "run_id"],
                 "additionalProperties": false
             }),
             output_schema: None,
@@ -421,7 +421,16 @@ async fn handle_attach_receipt_get(
     let continuation_id = params["continuation_id"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing continuation_id"))?;
-    let requested_run_id = params["run_id"].as_str();
+    let Some(requested_run_id) = params["run_id"].as_str() else {
+        return Ok(serde_json::json!({
+            "outcome": "rejected",
+            "error": {
+                "code": -32001,
+                "message": "auth_failure: run_id is required for provider session attach receipt access",
+                "data": { "failure_reason": "auth_failure" }
+            }
+        }));
+    };
     let now = chrono::Utc::now().to_rfc3339();
     let audit_id = uuid::Uuid::new_v4().to_string();
 
@@ -437,7 +446,7 @@ async fn handle_attach_receipt_get(
                 principal_id: principal.id.clone(),
                 principal_class: "agent".to_string(),
                 continuation_id: continuation_id.to_string(),
-                run_id: requested_run_id.unwrap_or("").to_string(),
+                run_id: requested_run_id.to_string(),
                 requested_at: now,
                 source_channel: "mcp".to_string(),
                 outcome: "denied".to_string(),
@@ -460,36 +469,34 @@ async fn handle_attach_receipt_get(
 
     // Operator principals: verify run scope. Wrong-run returns auth_failure (no existence oracle).
     if matches!(principal.class, auth::PrincipalClass::Operator) {
-        if let Some(req_run) = requested_run_id {
-            let matches = actual_run_id
-                .as_deref()
-                .map(|actual| actual == req_run)
-                .unwrap_or(false);
-            if !matches {
-                let _ = db::repos::p086_resurrection_raw_receipts::record_access_audit(
-                    pool,
-                    &db::repos::p086_resurrection_raw_receipts::ReceiptAccessAuditRow {
-                        id: audit_id,
-                        principal_id: principal.id.clone(),
-                        principal_class: "operator".to_string(),
-                        continuation_id: continuation_id.to_string(),
-                        run_id: req_run.to_string(),
-                        requested_at: now,
-                        source_channel: "mcp".to_string(),
-                        outcome: "denied".to_string(),
-                        denial_reason: Some("wrong_run_or_not_found".to_string()),
-                    },
-                )
-                .await;
-                return Ok(serde_json::json!({
-                    "outcome": "rejected",
-                    "error": {
-                        "code": -32001,
-                        "message": "auth_failure: run_id does not match or continuation not found",
-                        "data": { "failure_reason": "auth_failure" }
-                    }
-                }));
-            }
+        let matches = actual_run_id
+            .as_deref()
+            .map(|actual| actual == requested_run_id)
+            .unwrap_or(false);
+        if !matches {
+            let _ = db::repos::p086_resurrection_raw_receipts::record_access_audit(
+                pool,
+                &db::repos::p086_resurrection_raw_receipts::ReceiptAccessAuditRow {
+                    id: audit_id,
+                    principal_id: principal.id.clone(),
+                    principal_class: "operator".to_string(),
+                    continuation_id: continuation_id.to_string(),
+                    run_id: requested_run_id.to_string(),
+                    requested_at: now,
+                    source_channel: "mcp".to_string(),
+                    outcome: "denied".to_string(),
+                    denial_reason: Some("wrong_run_or_not_found".to_string()),
+                },
+            )
+            .await;
+            return Ok(serde_json::json!({
+                "outcome": "rejected",
+                "error": {
+                    "code": -32001,
+                    "message": "auth_failure: run_id does not match or continuation not found",
+                    "data": { "failure_reason": "auth_failure" }
+                }
+            }));
         }
 
         // Operator with matching run_id → return full raw receipt.
@@ -2444,7 +2451,56 @@ mod tests {
         let names: Vec<&str> = specs.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"agents.continuation_status"));
         assert!(names.contains(&"agents.continuation_candidates"));
+        assert!(names.contains(&"agents.attach_receipt.get"));
         assert!(names.contains(&"agents.continue_work"));
+    }
+
+    #[test]
+    fn attach_receipt_get_schema_requires_run_id() {
+        let specs = tool_specs();
+        let tool = specs
+            .iter()
+            .find(|t| t.name == "agents.attach_receipt.get")
+            .expect("attach receipt tool must be registered");
+        let required = tool.input_schema["required"]
+            .as_array()
+            .expect("required must be an array");
+        assert!(
+            required
+                .iter()
+                .any(|value| value.as_str() == Some("continuation_id")),
+            "continuation_id must be required"
+        );
+        assert!(
+            required
+                .iter()
+                .any(|value| value.as_str() == Some("run_id")),
+            "run_id must be required for run-scoped raw attach receipt access"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_receipt_get_rejects_operator_without_run_id_before_lookup() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let principal = auth::Principal::new("operator", auth::PrincipalClass::Operator);
+        let result = execute(
+            "agents.attach_receipt.get",
+            serde_json::json!({ "continuation_id": "known-continuation-id" }),
+            &pool,
+            &principal,
+        )
+        .await
+        .expect("runtime rejection should be a structured tool response");
+
+        assert_eq!(result["outcome"], "rejected");
+        assert_eq!(result["error"]["data"]["failure_reason"], "auth_failure");
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("run_id is required"),
+            "missing run_id must be explicit in the denial: {result:?}"
+        );
     }
 
     #[test]

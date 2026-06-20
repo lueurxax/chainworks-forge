@@ -128,6 +128,7 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "storage.reconcile_evidence_orphans" => {
             Some(CapabilityToolId::StorageReconcileEvidenceOrphans)
         }
+        "runs.settle_proposal_gate" => Some(CapabilityToolId::ProposalGateSettle),
         "effects.list" => Some(CapabilityToolId::EffectsList),
         "effects.inspect" => Some(CapabilityToolId::EffectsInspect),
         "effects.reconcile" => Some(CapabilityToolId::EffectsReconcile),
@@ -469,6 +470,18 @@ mod tests {
             "workflow_loop_budget.extend"
         );
         assert_eq!(super::capability_id_for("missing.tool"), None);
+    }
+
+    #[test]
+    fn all_capability_tool_ids_resolve_to_registered_tool_specs() {
+        for tool_id in super::all_capability_tool_ids() {
+            let tool = super::mcp_tool_for(tool_id);
+            assert!(
+                super::capability_id_for(&tool.name).is_some(),
+                "registered tool {} must map back to a capability id",
+                tool.name
+            );
+        }
     }
 
     #[test]

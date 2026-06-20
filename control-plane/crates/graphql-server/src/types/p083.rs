@@ -6,7 +6,7 @@
 //! the inline rollout_contract_v1 rollback_disposition object does not carry it.
 
 use async_graphql::{
-    InputValueError, InputValueResult, Json, Scalar, ScalarType, SimpleObject, Value,
+    Enum, InputValueError, InputValueResult, Json, Scalar, ScalarType, SimpleObject, Value,
 };
 use serde::{Deserialize, Serialize};
 
@@ -755,12 +755,47 @@ pub struct GqlP083ProviderSessionShutdownPayload {
 }
 
 /// P083: GraphQL payload returned by the p083RollbackExecution mutation.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+#[graphql(name = "P083RollbackTargetMode", rename_items = "snake_case")]
+pub enum GqlP083RollbackTargetMode {
+    Permissive,
+    Disabled,
+}
+
+impl GqlP083RollbackTargetMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Permissive => "permissive",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+#[graphql(name = "P083EnforcementMode", rename_items = "snake_case")]
+pub enum GqlP083EnforcementMode {
+    Disabled,
+    Permissive,
+    Enforce,
+}
+
+impl GqlP083EnforcementMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Permissive => "permissive",
+            Self::Enforce => "enforce",
+        }
+    }
+}
+
+/// P083: GraphQL payload returned by the p083RollbackExecution mutation.
 #[derive(SimpleObject, Clone, Debug)]
 pub struct GqlP083RollbackExecutionPayload {
     /// true when the rollback was durably committed to the audit table.
     pub committed: bool,
     /// The rollback target mode: permissive or disabled.
-    pub rollback_mode: String,
+    pub target_enforcement_mode: String,
     /// Command journal entry ID for auditability.
     pub journal_id: String,
     /// Replayed CallerRequestId confirming idempotency lease.

@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS provider_cancellation_intents (
   )),
   requested_at_monotonic_ms INTEGER NOT NULL,
   requested_at_wall_clock TEXT NOT NULL,
+  baseline_sample_id TEXT,
   shutdown_epoch INTEGER NULL,
   shutdown_epoch_assigned_at TEXT NULL,
   PRIMARY KEY(provider_session_id, cancellation_epoch)

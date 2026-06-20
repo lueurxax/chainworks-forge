@@ -1600,6 +1600,7 @@ mod tests {
             session_generation_id: None,
             provider_session_id: None,
             provider_runtime_home: None,
+            p079_repair_canonical_paths: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: Some(".chainworks/run-meta".to_string()),
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -1612,8 +1613,6 @@ mod tests {
             mediation_record_id: None,
             toolchain_home: None,
             toolchain_go_scope_enabled: false,
-
-            p079_repair_canonical_paths: None,
         };
 
         let mut spec = AcpLaunchSpec::new(binary.to_string_lossy());
@@ -1749,6 +1748,7 @@ mod tests {
             session_generation_id: None,
             provider_session_id: None,
             provider_runtime_home: None,
+            p079_repair_canonical_paths: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: Some(".chainworks/run-meta".to_string()),
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -1761,8 +1761,6 @@ mod tests {
             mediation_record_id: None,
             toolchain_home: None,
             toolchain_go_scope_enabled: false,
-
-            p079_repair_canonical_paths: None,
         };
         let meta_root = workspace_root.join(".chainworks/run-meta");
 
@@ -1815,6 +1813,7 @@ mod tests {
             session_generation_id: None,
             provider_session_id: None,
             provider_runtime_home: None,
+            p079_repair_canonical_paths: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: Some(".chainworks/run-meta".to_string()),
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -1863,6 +1862,7 @@ mod tests {
             session_generation_id: None,
             provider_session_id: None,
             provider_runtime_home: None,
+            p079_repair_canonical_paths: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: None,
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -1875,8 +1875,6 @@ mod tests {
             mediation_record_id: None,
             toolchain_home: None,
             toolchain_go_scope_enabled: false,
-
-            p079_repair_canonical_paths: None,
         };
 
         assert_eq!(provider_execution_root(&req), worktree);
