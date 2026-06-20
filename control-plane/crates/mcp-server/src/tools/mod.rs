@@ -15,7 +15,7 @@ pub mod storage;
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
 
-pub fn all_capability_tool_ids() -> [CapabilityToolId; 47] {
+pub fn all_capability_tool_ids() -> [CapabilityToolId; 54] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -28,6 +28,7 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 47] {
         CapabilityToolId::RunsMainSyncRepairState,
         CapabilityToolId::RunsMainSyncRecordRecoveryDecision,
         CapabilityToolId::RunsKnowledgeCapsuleIgnore,
+        CapabilityToolId::RunsRetrofitCatalogSnapshot,
         CapabilityToolId::RunsCancel,
         CapabilityToolId::ApprovalsList,
         CapabilityToolId::ApprovalsResolve,
@@ -64,6 +65,12 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 47] {
         CapabilityToolId::P080DiagnosticsGet,
         CapabilityToolId::P080ReconcileRequest,
         CapabilityToolId::P080ClearPermanentHold,
+        CapabilityToolId::ProviderSessionShutdown,
+        CapabilityToolId::P083RollbackExecution,
+        CapabilityToolId::P083SetEnforcementMode,
+        CapabilityToolId::RetryRun,
+        CapabilityToolId::SideEffectsForceReconcile,
+        CapabilityToolId::ProviderSessionMarkProcessAbsent,
     ]
 }
 
@@ -96,6 +103,7 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
             Some(CapabilityToolId::RunsMainSyncRecordRecoveryDecision)
         }
         "runs.knowledge_capsule.ignore" => Some(CapabilityToolId::RunsKnowledgeCapsuleIgnore),
+        "runs.retrofit_catalog_snapshot" => Some(CapabilityToolId::RunsRetrofitCatalogSnapshot),
         "runs.cancel" => Some(CapabilityToolId::RunsCancel),
         "approvals.list" => Some(CapabilityToolId::ApprovalsList),
         "approvals.resolve" => Some(CapabilityToolId::ApprovalsResolve),
@@ -140,6 +148,14 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "p080.diagnostics.get.v1" => Some(CapabilityToolId::P080DiagnosticsGet),
         "p080.reconcile.request.v1" => Some(CapabilityToolId::P080ReconcileRequest),
         "p080.clear_permanent_hold.v1" => Some(CapabilityToolId::P080ClearPermanentHold),
+        "provider_session.shutdown" => Some(CapabilityToolId::ProviderSessionShutdown),
+        "provider_session.mark_process_absent" => {
+            Some(CapabilityToolId::ProviderSessionMarkProcessAbsent)
+        }
+        "p083.rollback_execution" => Some(CapabilityToolId::P083RollbackExecution),
+        "p083.set_enforcement_mode" => Some(CapabilityToolId::P083SetEnforcementMode),
+        "runs.retry" => Some(CapabilityToolId::RetryRun),
+        "side_effects.force_reconcile" => Some(CapabilityToolId::SideEffectsForceReconcile),
         _ => None,
     }
 }
@@ -193,6 +209,12 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "p080_diagnostics_get_v1" => "p080.diagnostics.get.v1",
         "p080_reconcile_request_v1" => "p080.reconcile.request.v1",
         "p080_clear_permanent_hold_v1" => "p080.clear_permanent_hold.v1",
+        "provider_session_shutdown" => "provider_session.shutdown",
+        "provider_session_mark_process_absent" => "provider_session.mark_process_absent",
+        "p083_rollback_execution" => "p083.rollback_execution",
+        "p083_set_enforcement_mode" => "p083.set_enforcement_mode",
+        "runs_retry" => "runs.retry",
+        "side_effects_force_reconcile" => "side_effects.force_reconcile",
         _ => tool_name,
     }
 }
@@ -331,6 +353,22 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
         }
         CapabilityToolId::P080ClearPermanentHold => {
             tool_spec_by_name(p080::tool_specs(), "p080.clear_permanent_hold.v1")
+        }
+        CapabilityToolId::ProviderSessionShutdown => {
+            tool_spec_by_name(runs::tool_specs(), "provider_session.shutdown")
+        }
+        CapabilityToolId::ProviderSessionMarkProcessAbsent => {
+            tool_spec_by_name(runs::tool_specs(), "provider_session.mark_process_absent")
+        }
+        CapabilityToolId::P083RollbackExecution => {
+            tool_spec_by_name(runs::tool_specs(), "p083.rollback_execution")
+        }
+        CapabilityToolId::P083SetEnforcementMode => {
+            tool_spec_by_name(runs::tool_specs(), "p083.set_enforcement_mode")
+        }
+        CapabilityToolId::RetryRun => tool_spec_by_name(runs::tool_specs(), "runs.retry"),
+        CapabilityToolId::SideEffectsForceReconcile => {
+            tool_spec_by_name(runs::tool_specs(), "side_effects.force_reconcile")
         }
     }
 }

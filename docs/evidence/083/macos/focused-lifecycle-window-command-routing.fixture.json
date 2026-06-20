@@ -1,0 +1,29 @@
+{
+  "fixture_id": "focused-lifecycle-window-command-routing",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "macos_command_routing_contract_v1",
+  "description": "When the lifecycle window is key and focused, lifecycle commands route correctly through it and are enabled in the menu and toolbar.",
+  "preconditions": {
+    "lifecycle_window_state": "key_and_focused",
+    "commands_available": ["CancelRun", "RetryStage", "ResolveApproval"]
+  },
+  "action": {
+    "event": "CommandRouteCheck",
+    "window_state": "key_and_focused",
+    "command": "CancelRun"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "CancelRun command enabled in menu bar when lifecycle window is key",
+    "command routes to lifecycle window's command handler",
+    "toolbar button for CancelRun enabled and interactive",
+    "keyboard shortcut activates command through lifecycle window",
+    "command not double-routed to other windows"
+  ],
+  "window_type": "lifecycle",
+  "command_routing": {
+    "target_window": "lifecycle",
+    "enabled_when": "key_and_focused"
+  }
+}

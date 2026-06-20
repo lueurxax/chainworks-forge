@@ -1,0 +1,33 @@
+{
+  "fixture_id": "many-session-queue-rank-stored",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "execution_queue_contract_v1",
+  "description": "When many agent sessions are queued concurrently, all queue_rank values are stored durably with no gaps or duplicates.",
+  "preconditions": {
+    "concurrent_queued_sessions": 10,
+    "queue_entries": [
+      {"execution_id": "ae-101", "queue_rank": 1},
+      {"execution_id": "ae-102", "queue_rank": 2},
+      {"execution_id": "ae-103", "queue_rank": 3},
+      {"execution_id": "ae-104", "queue_rank": 4},
+      {"execution_id": "ae-105", "queue_rank": 5},
+      {"execution_id": "ae-106", "queue_rank": 6},
+      {"execution_id": "ae-107", "queue_rank": 7},
+      {"execution_id": "ae-108", "queue_rank": 8},
+      {"execution_id": "ae-109", "queue_rank": 9},
+      {"execution_id": "ae-110", "queue_rank": 10}
+    ]
+  },
+  "action": {
+    "query": "SELECT execution_id, queue_rank FROM agent_executions WHERE state='queued' ORDER BY queue_rank"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "10 rows returned with sequential ranks 1-10",
+    "no rank gaps in sequence",
+    "no duplicate ranks",
+    "all ranks durably persisted to SQLite",
+    "rank assignment uses atomic DB sequence"
+  ]
+}

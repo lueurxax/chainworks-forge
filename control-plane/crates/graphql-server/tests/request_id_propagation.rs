@@ -204,10 +204,10 @@ async fn build_app(pool: SqlitePool) -> Router {
 }
 
 fn approve_approval_mutation(approval_id: ApprovalId) -> String {
-    let key = uuid::Uuid::now_v7();
+    let key = uuid::Uuid::new_v4();
     format!(
         r#"mutation {{
-          approveApproval(approvalId: "{approval_id}", idempotencyKey: "{key}") {{
+          approveApproval(approvalId: "{approval_id}", requestId: "{key}") {{
             approval {{ id }}
             journalId
           }}

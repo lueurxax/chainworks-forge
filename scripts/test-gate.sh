@@ -9280,6 +9280,88 @@ PY
     )
     log "Proposal 092 retained gate passed"
     ;;
+  proposal-083|p083)
+    log "Proposal 083 gate: execution-truth ownership — migrations, repos, metrics, engine, and rollback-disposition validation"
+    (
+      cd "$ROOT_DIR/control-plane"
+      # DB layer: migration integration tests and P083 bounded-metric unit tests
+      CARGO_TARGET_DIR=target/proposal-083-gate cargo test -p db --test proposal_083_migrations -- --test-threads=1 --nocapture &&
+      CARGO_TARGET_DIR=target/proposal-083-gate cargo test -p db --lib p083_ -- --test-threads=1 --nocapture &&
+      CARGO_TARGET_DIR=target/proposal-083-gate cargo check -p db &&
+      # Engine layer: shutdown recovery classification and command-idempotency repo tests
+      CARGO_TARGET_DIR=target/proposal-083-gate cargo test -p engine p083 -- --test-threads=1 --nocapture &&
+      CARGO_TARGET_DIR=target/proposal-083-gate cargo test -p engine shutdown -- --test-threads=1 --nocapture &&
+      # Daemon layer: monotonic clock baseline logic
+      CARGO_TARGET_DIR=target/proposal-083-gate cargo check -p daemon &&
+      # GraphQL/MCP layer: rollback disposition validation and schema compile check
+      CARGO_TARGET_DIR=target/proposal-083-gate cargo check -p graphql-server &&
+      CARGO_TARGET_DIR=target/proposal-083-gate cargo check -p mcp-server
+    )
+    "$ROOT_DIR/scripts/lint-rollout-contract" "$ROOT_DIR/docs/evidence/083/rollout-contract-v1.json"
+    python3 - "$ROOT_DIR" <<'PY'
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+
+# Physical migration files use sequential sqlx prefix (079-085); canonical approved names
+# are exposed only in readback descriptors (rollout_contract_checks.rs P083_MIGRATIONS.filename).
+physical_migrations = [
+    "087_p083_001_artifact_lineage_report_kind.sql",
+    "088_p083_002_command_idempotency_generations.sql",
+    "089_p083_003_shutdown_receipts_and_signals.sql",
+    "090_p083_004_cancel_late_output_overflow.sql",
+    "091_p083_005_enforcement_and_rollback.sql",
+    "092_p083_006_durable_monotonic_clock.sql",
+    "093_p083_007_provider_cancellation_intent_and_process_fate.sql",
+    "094_p083_008_signal_dispatching_state.sql",
+]
+mig_dir = root / "control-plane/crates/db/migrations"
+for f in physical_migrations:
+    if not (mig_dir / f).exists():
+        raise SystemExit(f"proposal-083: missing migration {f}")
+print("proposal-083: all 8 P083 physical migration files present")
+
+# Verify readback descriptors use the physical 079-086 filenames (migration_file_bytes sha256 source).
+canonical_names = [
+    "087_p083_001_artifact_lineage_report_kind.sql",
+    "088_p083_002_command_idempotency_generations.sql",
+    "089_p083_003_shutdown_receipts_and_signals.sql",
+    "090_p083_004_cancel_late_output_overflow.sql",
+    "091_p083_005_enforcement_and_rollback.sql",
+    "092_p083_006_durable_monotonic_clock.sql",
+    "093_p083_007_provider_cancellation_intent_and_process_fate.sql",
+    "094_p083_008_signal_dispatching_state.sql",
+]
+rcc_path = root / "control-plane/crates/db/src/repos/rollout_contract_checks.rs"
+rcc_content = rcc_path.read_text()
+for name in canonical_names:
+    if name not in rcc_content:
+        raise SystemExit(f"proposal-083: physical migration filename '{name}' missing from P083_MIGRATIONS readback descriptors")
+print("proposal-083: all 8 P083 physical migration filenames present in readback descriptors")
+
+# Verify rollback-disposition validation is wired (to_value() must call validate_rollback_disposition_v1)
+gql_p083 = root / "control-plane/crates/graphql-server/src/types/p083.rs"
+content = gql_p083.read_text()
+if "validate_rollback_disposition_v1" not in content or "to_value" not in content:
+    raise SystemExit("proposal-083: RollbackDispositionJSON to_value() must call validate_rollback_disposition_v1")
+print("proposal-083: RollbackDispositionJSON output validation wired")
+
+# Verify atomic idempotency transaction: acquire_tx must be used in command handlers
+cmd_handler = root / "control-plane/crates/engine/src/command_handler.rs"
+handler_content = cmd_handler.read_text()
+if handler_content.count("acquire_tx") < 3:
+    raise SystemExit("proposal-083: all 3 P083 handlers must use acquire_tx for atomic idempotency")
+print("proposal-083: atomic idempotency acquire_tx verified in command handlers")
+
+# Verify monotonic clock fix: monotonic_clock_ms must be used (not wall_clock_ms for monotonic_ms)
+daemon_main = root / "control-plane/crates/daemon/src/main.rs"
+daemon_content = daemon_main.read_text()
+if "monotonic_clock_ms()" not in daemon_content:
+    raise SystemExit("proposal-083: daemon must use monotonic_clock_ms() for durable_monotonic_clock_samples")
+print("proposal-083: monotonic clock source verified")
+PY
+    log "Proposal 083 gate passed"
+    ;;
   proposal-086|p086|p086-continuation-preflight)
     log "Proposal 086 Phase 0 preflight: migration shape, MCP/artifact schemas, and Rust unit tests"
     python3 - "$ROOT_DIR" <<'PY'

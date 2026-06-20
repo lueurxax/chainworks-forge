@@ -1,0 +1,25 @@
+{
+  "fixture_id": "restart-alone-does-not-increment-generation",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "shutdown_signal_generation_contract_v1",
+  "description": "A plain process restart without a new signal wave does not increment the signal generation counter.",
+  "preconditions": {
+    "session_id": "session-restart-001",
+    "last_committed_generation": 2,
+    "in_flight_signals": []
+  },
+  "action": {
+    "event": "process_restart",
+    "recovery_phase": "generation_integrity_check",
+    "new_signal_wave_requested": false
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "generation remains at 2 after restart",
+    "no phantom generation increment recorded",
+    "generation counter is idempotent across restarts",
+    "next wave will correctly start at generation=3",
+    "restart audit log does not show generation change"
+  ]
+}

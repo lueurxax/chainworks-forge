@@ -4,4 +4,4 @@
 
 **Phase:** `runtime`
 
-**Operator Action Hint:** Use v1 cancellation unstick; marker records originating trigger.
+**Operator Action Hint:** Use v1 cancellation unstick; marker records originating trigger. If `identity_ambiguous` provider sessions are present, resolve provider identity before retrying.

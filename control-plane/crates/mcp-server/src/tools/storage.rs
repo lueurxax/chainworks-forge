@@ -133,6 +133,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
+            output_schema: None,
         },
         McpTool {
             name: "storage.write_pressure".to_string(),
@@ -152,6 +153,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
+            output_schema: None,
         },
         McpTool {
             name: "storage.evidence_spool_summary".to_string(),
@@ -168,6 +170,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
+            output_schema: None,
         },
         McpTool {
             name: "storage.reconcile_evidence_orphans".to_string(),
@@ -191,6 +194,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
+            output_schema: None,
         },
         McpTool {
             name: "storage.maintenance.repair_slot".to_string(),
@@ -213,6 +217,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                 },
                 "required": ["operationId", "slotGeneration", "idempotencyKey"]
             }),
+            output_schema: None,
         },
         McpTool {
             name: "storage.projections.clear_backlog".to_string(),
@@ -235,6 +240,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                 },
                 "required": ["projectionName", "sourceName", "idempotency_key"]
             }),
+            output_schema: None,
         },
         McpTool {
             name: "storage.projections.clear_poison".to_string(),
@@ -257,6 +263,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                 },
                 "required": ["projectionName", "sourceName", "idempotency_key"]
             }),
+            output_schema: None,
         },
     ]
 }

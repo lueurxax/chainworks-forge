@@ -36,6 +36,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                 },
                 "required": ["agent_execution_id"]
             }),
+            output_schema: None,
         },
         McpTool {
             name: "agents.continuation_candidates".to_string(),
@@ -52,6 +53,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                 },
                 "required": ["run_id"]
             }),
+            output_schema: None,
         },
         McpTool {
             name: "agents.attach_receipt.get".to_string(),
@@ -80,6 +82,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "required": ["continuation_id"],
                 "additionalProperties": false
             }),
+            output_schema: None,
         },
         McpTool {
             name: "agents.continue_work".to_string(),
@@ -186,6 +189,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                 ],
                 "additionalProperties": false
             }),
+            output_schema: None,
         },
     ]
 }

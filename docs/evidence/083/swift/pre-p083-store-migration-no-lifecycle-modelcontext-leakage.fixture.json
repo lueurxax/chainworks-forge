@@ -1,0 +1,27 @@
+{
+  "fixture_id": "pre-p083-store-migration-no-lifecycle-modelcontext-leakage",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "swift_swiftdata_lifecycle_contract_v1",
+  "description": "Store migration completes without leaking a lifecycle-scoped ModelContext into the SwiftUI environment or view hierarchy.",
+  "preconditions": {
+    "migration_state": "in_progress",
+    "model_container_type": "projection_only",
+    "lifecycle_modelcontext_in_environment": false
+  },
+  "action": {
+    "event": "schema_migration",
+    "from_version": "V1",
+    "to_version": "V2"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "migration completes without injecting lifecycle ModelContext into environment",
+    "no .modelContext modifier used with lifecycle-scoped context during migration",
+    "post-migration container remains projection_only type",
+    "view hierarchy not updated with lifecycle context at any migration step",
+    "migration audit log records no lifecycle context leakage events"
+  ],
+  "model_container_type": "projection_only",
+  "lifecycle_access_allowed": false
+}

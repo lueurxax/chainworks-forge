@@ -95,6 +95,7 @@ The repository is past the scaffold stage. The implemented system now includes:
 - declarative workflow authority, typed workflow conflicts, and advisory rejection history
 - operator-facing run, approval, report, recovery, and comparison surfaces
 - provider configuration, remediation, ACP-backed execution slices, and legacy Goose compatibility paths
+- durable storage as the execution-truth authority for runs, stages, agents, approvals, artifacts, side effects, provider sessions, command idempotency, shutdown receipts, rollout state, and operator readback (P083: Execution-Truth Ownership and Invariant Model)
 - local Rust daemon lifecycle, supervision, packaged-mode health/readiness, diagnostics, and release-host packaging proof lanes
 - repo-backed delivery, release gating, benchmark/sign-off, and export flows
 - provider toolchain cache mapping ensuring isolated writable roots for Xcode and Go
@@ -277,6 +278,7 @@ Implemented-system references:
 - [`docs/reference/test-gates.md`](docs/reference/test-gates.md)
 - [`docs/reference/agent-work-continuation.md`](docs/reference/agent-work-continuation.md)
 - [`docs/reference/boundary-first-api-auth-contract.md`](docs/reference/boundary-first-api-auth-contract.md)
+- [`docs/proposals/083-execution-truth-ownership-invariant-model.md`](docs/proposals/083-execution-truth-ownership-invariant-model.md)
 
 Examples:
 

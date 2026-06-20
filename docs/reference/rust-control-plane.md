@@ -88,9 +88,9 @@ The daemon is a single Rust binary built from a 9-crate workspace at `control-pl
 | `auth` | `crates/auth/src/lib.rs` | Bearer principals, principal-table loading, caller-class derivation, and shared boundary authorization helpers. |
 | `workflow` | `crates/workflow/src/lib.rs` | YAML workflow definition parsing, agent catalog loading, `RunPlan` compilation, and `PhaseBLeadResolver` compatibility mapping. |
 | `acp` | `crates/acp/src/lib.rs` | ACP runtime manager, per-provider adapters, JSON-RPC 2.0 stdio transport. |
-| `engine` | `crates/engine/src/lib.rs` | Orchestrator, command handler, background executor, work queue, recovery service, event bus, mediation settlement, and run-start rollout-contract preflight. |
-| `graphql-server` | `crates/graphql-server/src/lib.rs` | async-graphql schema (queries, mutations, subscriptions) served over axum. |
-| `mcp-server` | `crates/mcp-server/src/lib.rs` | MCP JSON-RPC server with tool dispatch, resource reads, stdio and HTTP transports. |
+| `engine` | `crates/engine/src/lib.rs` | Orchestrator, command handler, background executor, work queue, recovery service, event bus, mediation settlement, and run-start rollout-contract preflight. P083 adds the shutdown recovery classifier used at daemon startup for unresolved signal side effects and identity-ambiguous provider sessions. |
+| `graphql-server` | `crates/graphql-server/src/lib.rs` | async-graphql schema (queries, mutations, subscriptions) served over axum. P083 adds `Run.p083RolloutContractReadback` and `RollbackDispositionJSON` output validation. |
+| `mcp-server` | `crates/mcp-server/src/lib.rs` | MCP JSON-RPC server with tool dispatch, resource reads, stdio and HTTP transports. P083 enriches `runs.get` rollout readback and registers operator-only command tools for provider-session shutdown, process-absent confirmation, rollback execution, enforcement-mode changes, run retry, and side-effect force-reconcile; those tools validate caller request ids and dispatch through durable command-idempotency handlers. |
 | `daemon` | `crates/daemon/src/main.rs` | Binary entry point. Wires all crates, runs startup recovery, enters mode dispatch. |
 
 Escalation policy resolution, trigger classification, ledger/event/metadata persistence, and Phase 2+ scheduler behavior are owned by the control plane. Schema, contracts, invariants, and rollout phasing are pinned in [escalation-policies.md](escalation-policies.md).
@@ -138,12 +138,16 @@ A dedicated `runEscalationReadback` query exposes ledger chains, events, and exe
 **Targeted retry authority readback:**
 The `Run` type includes `retryAuthorityJson`, `retryAuthorityHistoryJson`, and `p091OrphanRepairReadbackJson`. Stage summaries expose `terminalReason`, `retryAuthorityId`, `isRetryAuthoritative`, and `retryAuthorityState` from the projection layer.
 
-Mutations: `approveApproval`, `rejectApproval`.
+**P083 Rollout Contract Readback and Operator Mutations:**
+`GqlRun.p083RolloutContractReadback` exposes the validated rollout-contract readback object. Rollback disposition values use the `RollbackDispositionJSON` output scalar, which validates `schema_version`, `mode`, and `data_loss_risk` before serialization per `rollback_disposition_json_v1`. The `p083IdentityHoldSessions` query drives the manual identity-check banner from backend readback.
+
+Mutations: `approveApproval`, `rejectApproval`, plus P083 operator lifecycle mutations `providerSessionShutdown`, `p083MarkProviderSessionProcessAbsent`, `p083RollbackExecution`, `p083SetEnforcementMode`, and `runsRetry`. The governed SwiftUI boundary remains read/subscription plus approval-only mutation; P083 GraphQL lifecycle mutations are operator-only command surface for explicitly authorized non-UI callers.
 
 GraphQL is the macOS UI read/subscription surface plus the approval-gate
-settlement surface. Non-approval operator commands such as starting runs,
-retrying stages, cancelling runs, resolving workflow conflicts, and recovery
-actions are MCP-only.
+settlement surface. It also exposes the P083 operator lifecycle mutations named
+above for authorized non-UI callers. Other non-approval operator commands such
+as starting runs, retrying stages, cancelling runs, resolving workflow conflicts,
+and recovery actions are MCP-only.
 
 Subscriptions: `runStatusChanged`, `stageStatusChanged`, `approvalRequested`, `approvalResolved`, `runtimeStatusChanged`, `p080DiagnosticsUpdates`.
 
@@ -811,7 +815,7 @@ The scheduler ensures that no single run or provider family starves others:
 
 ## Command handler
 
-The command handler at `crates/engine/src/command_handler.rs` processes eleven command types. Every command is recorded in the `command_journal` table before execution and marked completed or failed afterward.
+The command handler at `crates/engine/src/command_handler.rs` processes the domain command enum. Command-handler mutations are recorded in the `command_journal` table before execution and marked completed or failed afterward; the table below summarizes the primary operator/runtime command families.
 
 | Command | Effect |
 |---|---|
@@ -832,6 +836,11 @@ The command handler at `crates/engine/src/command_handler.rs` processes eleven c
 | `MainSyncRepairState` | P064: Reconcile sync state after failure (Phase 0 contract only). |
 | `MainSyncRecordRecoveryDecision` | P064: Record operator recovery decision (Phase 0 contract only). |
 | `KnowledgeCapsuleIgnore` | P064: Mark a capsule as ignored for the current run (Phase 0 contract only). |
+| `ShutdownProviderSession` | P083: Records provider-cancellation intent and planned shutdown signal rows through command idempotency. |
+| `P083RollbackExecution` | P083: Rolls enforcement mode back to permissive or disabled and writes rollback audit/idempotency rows. |
+| `P083SetEnforcementMode` | P083: Changes the enforcement mode with transition journal, audit, and command-idempotency rows. |
+| `RetryRun` | P083: Re-queues an `AdvanceRun` work item for a stalled or failed run through command idempotency. |
+| `ForceReconcileSideEffect` | P083: Force-reconciles a side effect to reconciled status with the operator decision through command idempotency. |
 
 ## Recovery service
 
@@ -960,7 +969,7 @@ These decisions are fixed for the baseline and are not under reconsideration. Ac
 
 3. **Application-owned orchestration.** The workflow engine is product-owned, not delegated to Temporal or any other external workflow platform. This trades platform power for direct control over semantics and simpler local deployment.
 
-4. **SQLite as source of truth.** Both canonical domain state and materialized projections live in the same SQLite database. No separate event store.
+4. **SQLite as source of truth.** Both canonical domain state and materialized projections live in the same SQLite database. P083 reinforces this by defining the Execution-Truth Ownership and Invariant Model. No separate event store.
 
 5. **Artifact contents on local filesystem.** SQLite stores metadata (paths, checksums, provenance). File contents remain on disk.
 
@@ -968,7 +977,7 @@ These decisions are fixed for the baseline and are not under reconsideration. Ac
 
 7. **Client remained canonical during parity.** The SwiftUI app owned user-visible behavior during parity. The implemented thin-client boundary now consumes daemon-owned GraphQL projections for governed workflow truth.
 
-8. **WAL mode for concurrent access.** Enables concurrent readers with one writer, with a 30-second busy timeout. The daemon keeps SQLite as the source of truth and uses explicit write serialization plus executor backpressure instead of relying on more writer concurrency.
+8. **WAL mode for concurrent access.** Enables concurrent readers with one writer, with a 30-second busy timeout. The daemon keeps SQLite as the source of truth and uses explicit write serialization plus executor backpressure instead of relying on more writer concurrency. P083 further refines the durability and consistency of this approach.
 
 9. **Bounded local concurrency target.** The local daemon target is 5 active runs stable, 10 active runs only with bounded scheduling, and up to 20 active agent executions. Excess work should queue visibly instead of starting every fan-out task immediately.
 

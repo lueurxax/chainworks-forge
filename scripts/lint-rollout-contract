@@ -46,7 +46,7 @@ ALLOWED_DECISION_VOCABULARY = {
     "waive",
 }
 ALLOWED_ENFORCEMENT_MODES = {"enforce", "permissive", "disabled"}
-ALLOWED_CUTOVER_APPLICABLE_TO = {"post_cutover_implementation_starts"}
+ALLOWED_CUTOVER_APPLICABLE_TO = {"post_cutover_implementation_starts", "post_ready_implementation_starts"}
 ALLOWED_READBACK_LANES = {"run_report", "mcp", "release_receipt", "graphql"}
 SHELL_METACHARACTERS = frozenset("|&;$`><(){}")
 ALLOWED_FIXTURE_ROOTS = (

@@ -1,0 +1,26 @@
+{
+  "fixture_id": "queue-rank-null-except-queued-no-signal",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "execution_queue_contract_v1",
+  "description": "queue_rank is NULL for all agent execution rows except those in 'queued' state with no active signal, enforcing the sparse rank invariant.",
+  "preconditions": {
+    "agent_executions": [
+      {"execution_id": "ae-001", "state": "running", "queue_rank": null},
+      {"execution_id": "ae-002", "state": "completed", "queue_rank": null},
+      {"execution_id": "ae-003", "state": "failed", "queue_rank": null},
+      {"execution_id": "ae-004", "state": "queued", "signal_state": null, "queue_rank": 1}
+    ]
+  },
+  "action": {
+    "query": "SELECT * FROM agent_executions WHERE queue_rank IS NOT NULL"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "only rows with state='queued' AND signal_state IS NULL have non-null queue_rank",
+    "running/completed/failed rows always have queue_rank=NULL",
+    "queued rows with an active signal have queue_rank=NULL",
+    "sparse rank invariant holds across restart",
+    "DB CHECK constraint rejects queue_rank on non-queued rows"
+  ]
+}

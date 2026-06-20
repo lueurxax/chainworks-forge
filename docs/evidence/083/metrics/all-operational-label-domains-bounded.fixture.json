@@ -1,0 +1,35 @@
+{
+  "fixture_id": "all-operational-label-domains-bounded",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "metrics_label_bounds_contract_v1",
+  "description": "All operational metrics emit labels drawn exclusively from pre-declared bounded enumerations; no unbounded or dynamic label values are permitted.",
+  "preconditions": {
+    "metrics_enforcement_mode": "strict",
+    "declared_label_domains": {
+      "command": ["CancelRun", "RetryStage", "ResolveApproval", "ExecuteStage", "SetEnforcementMode", "ForceReconcileSideEffect"],
+      "status": ["committed", "rejected", "replayed", "aliased"],
+      "provider": ["claude", "codex", "gemini", "auggie", "junie"],
+      "termination_class": ["graceful_appkit", "logout_system_shutdown", "force_quit", "sigkill", "crash"]
+    }
+  },
+  "action": {
+    "event": "MetricsLabelAudit",
+    "scope": "all_operational_metrics"
+  },
+  "expected_outcome": "pass",
+  "metric_name": "command_journal_writes_total",
+  "assertions": [
+    "all emitted 'command' label values are in declared_label_domains.command",
+    "all emitted 'status' label values are in declared_label_domains.status",
+    "all emitted 'provider' label values are in declared_label_domains.provider",
+    "all emitted 'termination_class' label values are in declared_label_domains.termination_class",
+    "label cardinality for each dimension is bounded at declared set size"
+  ],
+  "label_domains": {
+    "command": "bounded_enum",
+    "status": "bounded_enum",
+    "provider": "bounded_enum",
+    "termination_class": "bounded_enum"
+  }
+}

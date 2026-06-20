@@ -26,8 +26,8 @@ use db::repos::{
     agent_execution_runtime_receipts, agent_executions, agent_retry_budget_ledger,
     artifact_contracts, artifacts, code_writer_completion_receipts, escalation as escalation_repo,
     evidence_spool_refs, ideas, legacy_discovery_overrides, output_contract_repair as ocr_repo,
-    p080, projections, rollout_contract_checks, runs, scheduler, sessions, stages, storage_health,
-    validation, work_items, workflow_conflicts,
+    p080, projections, provider_sessions, rollout_contract_checks, runs, scheduler, sessions,
+    stages, storage_health, validation, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use db::write_class::{WriteLane, WriteResult};
@@ -325,7 +325,9 @@ struct DeclaredContractImportResult {
 #[derive(Debug)]
 enum PreparedDeclaredContractImport {
     RunStateAdvisory(ActiveArtifactGenerationInput),
-    ContractGeneration(ActiveArtifactGenerationInput),
+    /// ContractGeneration carries the generation input and the byte count of the
+    /// captured output (for late-output byte cap enforcement per P083).
+    ContractGeneration(ActiveArtifactGenerationInput, i64),
 }
 
 impl InvokeAgentCapacityConfig {
@@ -360,14 +362,7 @@ async fn resolve_escalation_chain_candidate(
     stage_id: &str,
     agent_id: &str,
     backend_profile_id_override: Option<&str>,
-) -> Result<
-    Option<(
-        domain::escalation::EscalationLedger,
-        String,
-        String,
-        Option<EscalationBackendProfileOverride>,
-    )>,
-> {
+) -> Result<Option<(domain::escalation::EscalationLedger, String, String)>> {
     let Some(run) = db::repos::runs::find_by_id(pool, run_id).await? else {
         return Ok(None);
     };
@@ -447,16 +442,6 @@ async fn resolve_escalation_chain_candidate(
         )
     };
 
-    let tier_snapshot = policy_snapshot
-        .tiers
-        .iter()
-        .find(|tier| tier.tier_id == resolved_tier_id);
-    let backend_override = tier_snapshot
-        .filter(|tier| tier.kind == "backend_profile")
-        .map(|tier| resolve_escalation_backend_profile_override(&run, tier))
-        .transpose()?
-        .flatten();
-
     let now = chrono::Utc::now();
     let ledger_candidate = domain::escalation::EscalationLedger {
         id: uuid::Uuid::new_v4().to_string(),
@@ -481,7 +466,6 @@ async fn resolve_escalation_chain_candidate(
         ledger_candidate,
         resolved_tier_id,
         resolved_tier_kind_raw,
-        backend_override,
     )))
 }
 
@@ -824,14 +808,14 @@ async fn invoke_item_has_start_capacity(
             return Ok(false);
         }
     }
-    let mut provider_family =
+    let provider_family =
         ProviderFamily::canonicalize_known_alias(provider).unwrap_or_else(|| provider.to_string());
     let model = payload.get("model").and_then(|value| value.as_str());
     let model_owned = model.map(String::from);
     let model_ref = model_owned.as_deref();
     let now = chrono::Utc::now();
     if let Some(wait) =
-        provider_quota_retry_wait_active(pool, &provider_family, model_ref, now).await?
+        provider_quota_retry_wait_active(pool, &provider_family, model, chrono::Utc::now()).await?
     {
         let stage_execution_id = payload
             .get("stage_execution_id")
@@ -843,8 +827,8 @@ async fn invoke_item_has_start_capacity(
                     pool,
                     stage_execution_id,
                     &provider_family,
-                    model_ref,
-                    now,
+                    model,
+                    chrono::Utc::now(),
                 )
                 .await?
             {
@@ -857,65 +841,9 @@ async fn invoke_item_has_start_capacity(
                     "Operator retry consumed active provider-family quota wait"
                 );
             } else {
-                match resolve_provider_quota_escalation_candidate(
-                    pool,
-                    item.run_id
-                        .ok_or_else(|| anyhow::anyhow!("InvokeAgent work item missing run_id"))?,
-                    payload
-                        .get("stage_id")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or_default(),
-                    payload
-                        .get("agent_id")
-                        .and_then(|value| value.as_str())
-                        .or_else(|| payload.get("stage_id").and_then(|value| value.as_str()))
-                        .unwrap_or_default(),
-                    payload
-                        .get("backend_profile_id")
-                        .and_then(|value| value.as_str()),
-                    now,
-                )
-                .await?
-                {
-                    ProviderQuotaEscalationResolution::Available(candidate) => {
-                        if let Some(backend_override) = candidate.3.as_ref() {
-                            provider_family = ProviderFamily::canonicalize_known_alias(
-                                &backend_override.provider,
-                            )
-                            .unwrap_or_else(|| backend_override.provider.clone());
-                            info!(
-                                work_item_id = %item.id,
-                                blocked_provider_family = %provider,
-                                selected_provider_family = %provider_family,
-                                selected_backend_profile_id = %backend_override.backend_profile_id,
-                                "Provider quota wait bypassed by escalation backend"
-                            );
-                        }
-                    }
-                    ProviderQuotaEscalationResolution::FallbackQuotaWait {
-                        provider_family,
-                        wait,
-                    } => {
-                        record_provider_quota_wait_on_pending_item(
-                            pool,
-                            item,
-                            &provider_family,
-                            &wait,
-                        )
-                        .await?;
-                        return Ok(false);
-                    }
-                    ProviderQuotaEscalationResolution::None => {
-                        record_provider_quota_wait_on_pending_item(
-                            pool,
-                            item,
-                            &provider_family,
-                            &wait,
-                        )
-                        .await?;
-                        return Ok(false);
-                    }
-                }
+                record_provider_quota_wait_on_pending_item(pool, item, &provider_family, &wait)
+                    .await?;
+                return Ok(false);
             }
         } else {
             record_provider_quota_wait_on_pending_item(pool, item, &provider_family, &wait).await?;
@@ -1192,12 +1120,12 @@ async fn claim_invoke_agent_work_item_with_start(
         .and_then(|value| value.as_str())
         .unwrap_or(&stage_id)
         .to_string();
-    let mut provider = payload
+    let provider = payload
         .get("provider")
         .and_then(|value| value.as_str())
         .ok_or_else(|| anyhow::anyhow!("InvokeAgent payload missing provider"))?
         .to_string();
-    let mut model = payload
+    let model = payload
         .get("model")
         .and_then(|value| value.as_str())
         .map(String::from);
@@ -1206,7 +1134,7 @@ async fn claim_invoke_agent_work_item_with_start(
         .and_then(|value| value.as_str())
         .unwrap_or(&stage_id)
         .to_string();
-    let mut payload_backend_profile_id = payload
+    let payload_backend_profile_id = payload
         .get("backend_profile_id")
         .and_then(|value| value.as_str())
         .map(String::from);
@@ -1224,56 +1152,17 @@ async fn claim_invoke_agent_work_item_with_start(
         owner_execution_lineage_id: &owner_execution_lineage_id,
     });
 
-    let provider_family =
-        ProviderFamily::canonicalize_known_alias(&provider).unwrap_or_else(|| provider.clone());
-    let quota_candidate =
-        if provider_quota_retry_wait_active(pool, &provider_family, model.as_deref(), now)
-            .await?
-            .is_some()
-        {
-            match resolve_provider_quota_escalation_candidate(
-                pool,
-                run_id,
-                &stage_id,
-                &agent_id,
-                payload_backend_profile_id.as_deref(),
-                now,
-            )
-            .await?
-            {
-                ProviderQuotaEscalationResolution::Available(candidate) => Some(candidate),
-                ProviderQuotaEscalationResolution::FallbackQuotaWait { .. }
-                | ProviderQuotaEscalationResolution::None => None,
-            }
-        } else {
-            None
-        };
-
-    let esc_candidate = match quota_candidate {
-        Some(candidate) => Some(candidate),
-        None => resolve_escalation_chain_candidate(
-            pool,
-            run_id,
-            &stage_id,
-            &agent_id,
-            payload_backend_profile_id.as_deref(),
-        )
-        .await
-        .with_context(|| {
-            format!("P058 escalation chain resolution failed for run={run_id} stage={stage_id}")
-        })?,
-    };
-
-    if let Some(backend_override) = esc_candidate
-        .as_ref()
-        .and_then(|candidate| candidate.3.as_ref())
-    {
-        let (override_provider, override_model, override_backend_profile_id) =
-            apply_escalation_backend_override(&mut payload, backend_override);
-        provider = override_provider;
-        model = override_model;
-        payload_backend_profile_id = Some(override_backend_profile_id);
-    }
+    let esc_candidate = resolve_escalation_chain_candidate(
+        pool,
+        run_id,
+        &stage_id,
+        &agent_id,
+        payload_backend_profile_id.as_deref(),
+    )
+    .await
+    .with_context(|| {
+        format!("P058 escalation chain resolution failed for run={run_id} stage={stage_id}")
+    })?;
 
     let artifact_claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
         run_id,
@@ -12090,6 +11979,26 @@ You are continuing the same Chainworks agent execution through an existing live 
                         Some(&decision.generation.id),
                     )
                     .await?;
+                    // P083: ensure the provider_sessions authority row exists so that
+                    // ShutdownProviderSession and process-identity commands can locate it.
+                    // INSERT OR IGNORE is idempotent across multi-turn reused sessions.
+                    let run_id_str = run_id.to_string();
+                    if let Err(e) = provider_sessions::insert_or_ignore(
+                        &self.pool,
+                        provider_session_id,
+                        &run_id_str,
+                        Some(&result.agent_execution_id.to_string()),
+                        &provider,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            provider_session_id,
+                            run_id = %run_id,
+                            error = %e,
+                            "P083: provider_sessions::insert_or_ignore failed (non-fatal)"
+                        );
+                    }
                 }
 
                 // Runtime event: session finished (completed or failed)
@@ -13302,7 +13211,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         )
                         .await?;
                     artifacts::insert_tx(&mut tx, &manifest_artifact).await?;
-                    let _settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &commit_lease.effect_id,
                         owner_instance_id: &commit_lease.owner_instance_id,
                         settlement_attempt_id: &commit_lease.attempt_id,
@@ -13370,7 +13279,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let _fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
                         effect_id: &commit_lease.effect_id,
                         owner_instance_id: &commit_lease.owner_instance_id,
                         attempt_id: &commit_lease.attempt_id,
@@ -13393,6 +13302,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         now,
                     )
                     .await?;
+                    db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?;
                     tx.commit().await?;
                     if let Some(artifact) = delivery_artifact {
                         let _ = self
@@ -13527,7 +13437,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         )
                         .await?;
                     artifacts::insert_tx(&mut tx, &receipt_artifact).await?;
-                    let _settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &push_lease.effect_id,
                         owner_instance_id: &push_lease.owner_instance_id,
                         settlement_attempt_id: &push_lease.attempt_id,
@@ -13552,6 +13462,8 @@ You are continuing the same Chainworks agent execution through an existing live 
                     )
                     .await?;
                     work_items::enqueue_tx(&mut tx, &advance_run).await?;
+                    db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                        .await?;
                     tx.commit().await?;
                     let _ = self
                         .events
@@ -13613,7 +13525,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let _fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
                         effect_id: &push_lease.effect_id,
                         owner_instance_id: &push_lease.owner_instance_id,
                         attempt_id: &push_lease.attempt_id,
@@ -13636,6 +13548,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         now,
                     )
                     .await?;
+                    db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?;
                     tx.commit().await?;
                     if let Some(artifact) = delivery_artifact {
                         let _ = self
@@ -13782,7 +13695,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         )
                         .await?;
                     artifacts::insert_tx(&mut tx, &bundle_artifact).await?;
-                    let _settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &build_lease.effect_id,
                         owner_instance_id: &build_lease.owner_instance_id,
                         settlement_attempt_id: &build_lease.attempt_id,
@@ -13850,7 +13763,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let _fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
                         effect_id: &build_lease.effect_id,
                         owner_instance_id: &build_lease.owner_instance_id,
                         attempt_id: &build_lease.attempt_id,
@@ -13873,6 +13786,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         now,
                     )
                     .await?;
+                    db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?;
                     tx.commit().await?;
                     if let Some(artifact) = delivery_artifact {
                         let _ = self
@@ -14047,7 +13961,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let _settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &connect_lease.effect_id,
                         owner_instance_id: &connect_lease.owner_instance_id,
                         settlement_attempt_id: &connect_lease.attempt_id,
@@ -14079,6 +13993,8 @@ You are continuing the same Chainworks agent execution through an existing live 
                     )
                     .await?;
                     work_items::enqueue_tx(&mut tx, &advance_run).await?;
+                    db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                        .await?;
                     tx.commit().await?;
                     let _ = self
                         .events
@@ -14154,7 +14070,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let _fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
                         effect_id: &connect_lease.effect_id,
                         owner_instance_id: &connect_lease.owner_instance_id,
                         attempt_id: &connect_lease.attempt_id,
@@ -14177,6 +14093,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         now,
                     )
                     .await?;
+                    db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?;
                     tx.commit().await?;
                     if let Some(artifact) = delivery_artifact {
                         let _ = self
@@ -14511,8 +14428,17 @@ You are continuing the same Chainworks agent execution through an existing live 
                     == AgentOutputSettlement::ValidOutputsFromFailedExecution,
                 warnings,
             };
+            let captured_bytes = captured_outputs
+                .iter()
+                .find(|o| {
+                    o.declared.output_name == generation_input.canonical_path
+                        || o.declared.target_path == generation_input.raw_path
+                })
+                .and_then(|o| o.machine_bytes.as_ref().map(|b| b.len() as i64))
+                .unwrap_or(0);
             prepared_imports.push(PreparedDeclaredContractImport::ContractGeneration(
                 generation_input,
+                captured_bytes,
             ));
         }
 
@@ -14539,15 +14465,21 @@ You are continuing the same Chainworks agent execution through an existing live 
             artifacts::insert_tx(&mut tx, artifact).await?;
         }
         let mut projection_dirty = false;
+        // P083: track late-output overflow for cancel_late_output_overflow latch.
+        let mut late_outputs_ignored: i64 = 0;
+        let mut late_output_bytes: i64 = 0;
         for prepared_import in prepared_imports {
-            let decision = match prepared_import {
+            let (decision, output_bytes_if_late) = match prepared_import {
                 PreparedDeclaredContractImport::RunStateAdvisory(generation_input) => {
                     artifact_contracts::record_run_state_advisory_tx(&mut tx, generation_input)
                         .await?;
-                    SourceGenerationImportDecision::Activated
+                    (SourceGenerationImportDecision::Activated, 0i64)
                 }
-                PreparedDeclaredContractImport::ContractGeneration(generation_input) => {
-                    if session_generation_id.is_some() {
+                PreparedDeclaredContractImport::ContractGeneration(
+                    generation_input,
+                    output_bytes,
+                ) => {
+                    let d = if session_generation_id.is_some() {
                         artifact_contracts::import_generation_with_claim_cas_tx(
                             &mut tx,
                             artifact_claim_key,
@@ -14562,15 +14494,22 @@ You are continuing the same Chainworks agent execution through an existing live 
                         )
                         .await?;
                         SourceGenerationImportDecision::Activated
-                    }
+                    };
+                    (d, output_bytes)
                 }
             };
-            projection_dirty = true;
             if decision == SourceGenerationImportDecision::IgnoredLateOutputs {
                 runtime_facts.output_settlement = AgentOutputSettlement::IgnoredLateOutputs;
                 runtime_facts.late_output_count += 1;
                 runtime_facts.ignored_late_output_count += 1;
                 runtime_facts.valid_required_outputs = false;
+                // P083 post_cancel_late_output_contract_v1: ignored late outputs MUST NOT
+                // dirty the active projection. The latch is written inside this tx below
+                // so active-projection mutations are strictly rejected as an invariant.
+                late_outputs_ignored += 1;
+                late_output_bytes += output_bytes_if_late;
+            } else {
+                projection_dirty = true;
             }
         }
         if let Some(discovery_diagnostics) = discovery_diagnostics {
@@ -14619,6 +14558,7 @@ You are continuing the same Chainworks agent execution through an existing live 
         artifact_contracts::close_source_generation_claim_tx(&mut tx, artifact_claim_key).await?;
         tx.commit().await?;
         db::pool::log_write_transaction("executor.import_declared_outputs", tx_started);
+
         if invalidated_session_after_missing_outputs {
             if let Some(session_generation_id) = session_generation_id {
                 let _ = self.acp.close_session(session_generation_id).await;
@@ -15846,6 +15786,36 @@ You are continuing the same Chainworks agent execution through an existing live 
                                 merged.insert(k.clone(), v.clone());
                             }
                         }
+                        // P083 post_cancel_late_output_contract_v1: include overflow readback in
+                        // release_receipt lane per rollout_readback_api_parity_v1.
+                        let run_id_str = run.id.to_string();
+                        let overflow_rows = db::repos::cancel_late_output_overflow::find_by_run_id(
+                            &self.pool,
+                            &run_id_str,
+                        )
+                        .await
+                        .unwrap_or_default();
+                        let overflow_json: Vec<serde_json::Value> = overflow_rows
+                            .iter()
+                            .map(|r| {
+                                serde_json::json!({
+                                    "scope": r.scope,
+                                    "normalized_run_id": r.normalized_run_id,
+                                    "normalized_provider_session_id": r.normalized_provider_session_id,
+                                    "cancellation_epoch": r.cancellation_epoch,
+                                    "overflow_kind": r.overflow_kind,
+                                    "dropped_message_count": r.dropped_message_count,
+                                    "dropped_byte_count": r.dropped_byte_count,
+                                    "quarantine_uri": r.quarantine_uri,
+                                    "reservation_release_state": r.reservation_release_state,
+                                    "projection_mutation_blocked": r.projection_mutation_blocked,
+                                })
+                            })
+                            .collect();
+                        merged.insert(
+                            "p083_cancel_late_output_overflow".to_string(),
+                            serde_json::Value::Array(overflow_json),
+                        );
                         Some(serde_json::Value::Object(merged))
                     } else {
                         Some(base_val)

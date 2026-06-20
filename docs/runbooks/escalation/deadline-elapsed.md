@@ -4,4 +4,4 @@
 
 **Phase:** `runtime`
 
-**Operator Action Hint:** Extend wall-clock budget or accept pause.
+**Operator Action Hint:** Extend wall-clock budget or accept pause. If shutdown recovery is involved, inspect the persisted shutdown receipts/readback before retrying.

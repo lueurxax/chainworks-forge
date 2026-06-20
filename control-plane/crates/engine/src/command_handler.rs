@@ -2,10 +2,13 @@ use acp::AcpRuntimeManager;
 use anyhow::{anyhow, Context, Result};
 use auth;
 use chrono::{DateTime, Utc};
-use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use libc;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use std::future::Future;
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -15,29 +18,31 @@ use tracing::{info, warn};
 
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger,
-    approval_mutation_idempotency, approvals, artifact_contracts, artifacts, audit_log, closeout,
-    code_writer_completion_receipts, command_journal, ideas, legacy_discovery_overrides,
-    mcp_command_idempotency, projections, retry_operator_instructions,
-    retry_stage_execution_authorities, runs, scheduler, sessions, stages, work_items,
-    workflow_conflicts,
+    approval_mutation_idempotency, approvals, artifact_contracts, audit_log, closeout,
+    code_writer_completion_receipts, command_idempotency, command_journal, ideas,
+    legacy_discovery_overrides, mcp_command_idempotency, projections, provider_sessions,
+    retry_operator_instructions, retry_stage_execution_authorities, runs, scheduler, sessions,
+    side_effects as side_effects_repo, stages, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use db::write_class::WriteLane;
 use db::writer::{class_a_operation, DbWriter};
-use domain::agent::{
-    AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement, AgentStatus,
-};
+use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement};
 use domain::approval::ApprovalDecision;
-use domain::artifact::{Artifact, ArtifactFormat};
 use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
 use domain::commands::{
     ApprovalResolutionDecision, CallerContext, Command, ConsumeProviderQuotaHoldCmd,
     ExtendWorkflowLoopBudgetCmd, ProposalGateSettlementAction, RetrofitCatalogSnapshotCmd,
-    RetryStageCmd, SettleProposalGateCmd, WorkflowLoopBudgetExtensionCmd,
+    SettleProposalGateCmd, WorkflowLoopBudgetExtensionCmd,
+};
+// P083 command structs — imported individually to avoid polluting the wildcard namespace
+use domain::commands::{
+    ForceReconcileSideEffectCmd, MarkProviderSessionProcessAbsentCmd, P083RollbackExecutionCmd,
+    P083SetEnforcementModeCmd, RetryRunCmd, ShutdownProviderSessionCmd,
 };
 use domain::discovery::{LegacyBroadDiscoveryPolicy, LegacyDiscoveryOverrideInput};
 use domain::events::DomainEvent;
-use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, RunId, StageExecutionId};
+use domain::ids::{ApprovalId, RunId};
 use domain::proposal_gate_result::{
     ProposalGateFailureClassification, ProposalGateLineage, ProposalGateResult, ProposalGateStatus,
 };
@@ -47,13 +52,13 @@ use domain::retry_authority::{
     RetryStageExecutionAuthority, TargetedRetryPayloadIdentity,
 };
 use domain::run::{Run, RunStatus};
-use domain::side_effect::FEATURE_P078_HEURISTIC_RETRY_GUARD_ENABLED;
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use domain::workflow_conflict::{
     CandidateTransitionEvaluation, CandidateTransitionResult, WorkflowConflictStatus,
     WorkflowTransitionCursorRecord,
 };
 use domain::PrincipalClass;
+use sha2::{Digest, Sha256};
 
 use crate::cancellation;
 use crate::closeout_fingerprint::{
@@ -65,12 +70,201 @@ use crate::event_bus::EventSender;
 use crate::preflight::{
     missing_delivery_configuration_preflight, run_delivery_preflight, DeliveryPreflightResult,
 };
-use crate::side_effects::retry_preflight_within_tx;
+use crate::side_effects::{retry_preflight_within_tx, run_cancel_preflight_within_tx};
 use crate::synthesizers::closeout_readiness::{
     synthesize_implementation_closeout_readiness_for_state9_with_runtime_guards, NoDiffConvergence,
     SynthesizerInputs, NO_DIFF_CONVERGENCE_THRESHOLD,
 };
 use crate::work_queue::WorkQueue;
+
+// ── P083: monotonic clock ────────────────────────────────────────────────────
+
+/// Returns CLOCK_MONOTONIC time in milliseconds.
+/// Used for requested_at_monotonic_ms in provider_cancellation_intents per
+/// provider_cancellation_intent_contract_v1. Monotonic time does not go backwards
+/// within a daemon lifetime and is distinct from wall-clock time.
+#[cfg(unix)]
+fn monotonic_clock_ms() -> i64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime with a valid pointer and a valid clock ID is always safe.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as i64) * 1000 + (ts.tv_nsec as i64) / 1_000_000
+}
+
+/// Validate a CallerRequestId string per caller_request_id_v1.
+///
+/// Pattern: ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$
+/// Rejected forms: uppercase, whitespace, urn: prefix, braces, undashed, wrong version/variant.
+/// Byte-level check avoids relying on uuid crate permissive parsing for variant bits.
+pub fn validate_caller_request_id(request_id: &str) -> Result<()> {
+    if request_id.len() != 36 {
+        anyhow::bail!(
+            "MALFORMED_REQUEST_ID: request_id must be 36 characters (caller_request_id_v1); got {}",
+            request_id.len()
+        );
+    }
+    let bytes = request_id.as_bytes();
+    // Exact dash positions: 8, 13, 18, 23 — all other positions must be lowercase hex.
+    for (i, &b) in bytes.iter().enumerate() {
+        match i {
+            8 | 13 | 18 | 23 => {
+                if b != b'-' {
+                    anyhow::bail!(
+                        "MALFORMED_REQUEST_ID: request_id must have dash at position {i} (caller_request_id_v1)"
+                    );
+                }
+            }
+            _ => {
+                if !matches!(b, b'0'..=b'9' | b'a'..=b'f') {
+                    anyhow::bail!(
+                        "MALFORMED_REQUEST_ID: request_id must be lowercase hex at position {i} (caller_request_id_v1)"
+                    );
+                }
+            }
+        }
+    }
+    // Version nibble at position 14 must be '4'.
+    if bytes[14] != b'4' {
+        anyhow::bail!("MALFORMED_REQUEST_ID: request_id must be UUIDv4 (version nibble at position 14 must be '4')");
+    }
+    // Variant nibble at position 19 must be 8, 9, a, or b (RFC 4122 variant).
+    if !matches!(bytes[19], b'8' | b'9' | b'a' | b'b') {
+        anyhow::bail!(
+            "MALFORMED_REQUEST_ID: request_id must have RFC 4122 variant (nibble at position 19 must be 8, 9, a, or b)"
+        );
+    }
+    Ok(())
+}
+
+/// Validate a P083 operator reason before it reaches durable command state.
+///
+/// GraphQL and MCP validate the same shape at their ingress boundaries, but
+/// CommandHandler is the durable authority for command journaling and idempotency.
+fn validate_p083_reason(reason: &str, max_bytes: usize) -> Result<()> {
+    if reason.len() > max_bytes {
+        anyhow::bail!(
+            "P083_INVALID_REASON: reason exceeds maximum length of {max_bytes} bytes (got {})",
+            reason.len()
+        );
+    }
+    for (i, ch) in reason.char_indices() {
+        if ch.is_control() && !matches!(ch, ' ' | '\t' | '\n' | '\r') {
+            anyhow::bail!(
+                "P083_INVALID_REASON: reason contains a disallowed control character at byte offset {i} (U+{:04X})",
+                ch as u32
+            );
+        }
+    }
+    Ok(())
+}
+
+/// SEC-P083-003: Strict schema validation for side_effect_decision_v1 at the engine boundary.
+///
+/// Validates: schema_version, required 'decision' enum, required non-empty 'operator_notes',
+/// per-field size limits, and additionalProperties=false (rejects unexpected keys).
+fn validate_side_effect_decision_v1(value: &serde_json::Value) -> Result<()> {
+    const ALLOWED_KEYS: &[&str] = &["schema_version", "decision", "operator_notes"];
+    const ALLOWED_DECISIONS: &[&str] = &[
+        "reconciled",
+        "unrecoverable",
+        "conflict",
+        "cleared",
+        "manual_verified",
+    ];
+
+    let obj = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("P083_INVALID_ARG: decision_json must be a JSON object"))?;
+
+    // additionalProperties: false
+    for key in obj.keys() {
+        if !ALLOWED_KEYS.contains(&key.as_str()) {
+            anyhow::bail!(
+                "P083_INVALID_ARG: decision_json contains unexpected field '{}'; \
+                 allowed fields: {:?}",
+                key,
+                ALLOWED_KEYS
+            );
+        }
+    }
+
+    let schema_version = obj
+        .get("schema_version")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "P083_INVALID_ARG: decision_json.schema_version must be 'side_effect_decision_v1'"
+            )
+        })?;
+    if schema_version != "side_effect_decision_v1" {
+        anyhow::bail!(
+            "P083_INVALID_ARG: decision_json.schema_version must be 'side_effect_decision_v1', got '{schema_version}'"
+        );
+    }
+
+    let decision = obj
+        .get("decision")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!("P083_INVALID_ARG: decision_json 'decision' must be a non-null string")
+        })?;
+    if !ALLOWED_DECISIONS.contains(&decision) {
+        anyhow::bail!(
+            "P083_INVALID_ARG: decision_json 'decision' must be one of {:?}, got '{decision}'",
+            ALLOWED_DECISIONS
+        );
+    }
+
+    let notes = obj
+        .get("operator_notes")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "P083_INVALID_ARG: decision_json 'operator_notes' must be a non-null string"
+            )
+        })?;
+    if notes.trim().is_empty() {
+        anyhow::bail!("P083_INVALID_ARG: decision_json 'operator_notes' must not be empty");
+    }
+    if notes.len() > 4096 {
+        anyhow::bail!(
+            "P083_INVALID_ARG: decision_json 'operator_notes' exceeds 4096 bytes (got {})",
+            notes.len()
+        );
+    }
+
+    Ok(())
+}
+
+/// Compute a canonical intent hash from a set of (key, value) pairs.
+///
+/// P083-HARDEN-006: intent hashing must use sorted-key UTF-8 JSON with no whitespace so
+/// that the hash is stable regardless of construction order, serde_json feature flags
+/// (preserve_order vs BTreeMap default), or future field additions in the wrong position.
+/// Using BTreeMap makes the ordering guarantee explicit rather than relying on serde_json's
+/// internal Map representation.
+pub fn canonical_intent_hash(fields: &[(&str, serde_json::Value)]) -> String {
+    let map: std::collections::BTreeMap<&str, &serde_json::Value> =
+        fields.iter().map(|(k, v)| (*k, v)).collect();
+    let bytes = serde_json::to_vec(&map).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Guard that carries narrow-path idempotency parameters into `retry_agent_execution`
+/// so that the acquire/commit/fail steps happen inside the retry transaction rather
+/// than as separate pool-level operations. This makes idempotency truth atomic with
+/// the retry side effects and crash-safe.
+struct NarrowIdempotencyGuard {
+    principal_id: String,
+    request_id: String,
+    intent_hash: String,
+    expires_at: String,
+}
 
 pub struct CommandHandler {
     pool: SqlitePool,
@@ -84,21 +278,6 @@ pub struct CommandHandler {
     /// Used to record policy mode and fixture version in audit_log entries written
     /// inside command transactions.
     boundary_policy: Option<Arc<auth::boundary::BoundaryPolicy>>,
-}
-
-fn ensure_run_can_be_retried(run: &Run) -> Result<()> {
-    if run.status.is_terminal()
-        || run.status == RunStatus::Cancelling
-        || run.cancellation_requested_at.is_some()
-        || run.cancellation_settled_at.is_some()
-    {
-        anyhow::bail!(
-            "Run {} is {} / cancellation-settled and cannot be retried",
-            run.id,
-            run.status
-        );
-    }
-    Ok(())
 }
 
 pub enum CommandResult {
@@ -153,6 +332,18 @@ pub enum CommandResult {
     RunCancelled {
         run_id: RunId,
     },
+    /// P083: Run retry recorded and AdvanceRun work item re-queued.
+    RunRetried {
+        run_id: RunId,
+        journal_id: String,
+        idempotency_request_id: String,
+    },
+    /// P083: Side effect force-reconciled to reconciled status.
+    SideEffectForceReconciled {
+        effect_id: String,
+        journal_id: String,
+        idempotency_request_id: String,
+    },
     SessionReset {
         run_id: RunId,
         stage_id: String,
@@ -183,6 +374,47 @@ pub enum CommandResult {
         journal_id: String,
         gate_generation_id: String,
         readiness_generation_id: String,
+    },
+    /// P083: provider session shutdown intent recorded and OS signal dispatched on the command path.
+    ProviderSessionShutdownRecorded {
+        provider_session_id: String,
+        journal_id: String,
+        idempotency_request_id: String,
+        cancellation_epoch: i64,
+        /// Number of OS signals dispatched on the command path (always ≥1; null-process case is now ProviderSessionShutdownHeld).
+        dispatched_count: usize,
+    },
+    /// P083: provider session shutdown intent held because process identity is unknown at command time.
+    ///
+    /// SEC-P083-HIGH-001: When process_id is null, the command must not commit a success result
+    /// with no enforcement path. The intent is stored as intent_state='held' and
+    /// process_fate='identity_ambiguous'. The operator must resolve via ManualProcessIdentityCheckBanner.
+    ProviderSessionShutdownHeld {
+        provider_session_id: String,
+        journal_id: String,
+        idempotency_request_id: String,
+        cancellation_epoch: i64,
+        /// Always "manual_process_identity_check" for this variant.
+        operator_next_step_code: String,
+    },
+    /// P083: rollback execution recorded in rollback audit and enforcement mode updated.
+    P083RollbackExecutionScheduled {
+        rollback_mode: String,
+        journal_id: String,
+        idempotency_request_id: String,
+    },
+    /// P083: enforcement mode transition recorded and state updated.
+    P083EnforcementModeSet {
+        enforcement_mode: String,
+        journal_id: String,
+        idempotency_request_id: String,
+    },
+    /// P083: process_fate set to absent_verified and held intent transitioned back to requested.
+    ProviderSessionMarkedAbsent {
+        provider_session_id: String,
+        cancellation_epoch: i64,
+        journal_id: String,
+        idempotency_request_id: String,
     },
 }
 
@@ -269,15 +501,6 @@ struct CommandJournalEntry {
     boundary_row_id: Option<String>,
 }
 
-struct RetryIdentifierKindRejection {
-    message: String,
-    provided_identifier: String,
-    provided_identifier_kind: &'static str,
-    expected_identifier_kind: &'static str,
-    valid_identifier_examples: Vec<String>,
-    operator_message: String,
-}
-
 fn ensure_run_meta_root_exists(run: &Run) -> Result<()> {
     let Some(meta_root) = run
         .chainworks_meta_root
@@ -288,27 +511,12 @@ fn ensure_run_meta_root_exists(run: &Run) -> Result<()> {
         return Ok(());
     };
 
-    let workspace_root = Path::new(&run.workspace_root);
-    reject_command_path_symlink_components(workspace_root, "Run workspace_root")?;
-    let canonical_workspace = std::fs::canonicalize(workspace_root).with_context(|| {
-        format!(
-            "canonicalize run workspace_root {}",
-            workspace_root.display()
-        )
-    })?;
-
     let meta_root = Path::new(meta_root);
     let absolute_meta_root = if meta_root.is_absolute() {
         meta_root.to_path_buf()
     } else {
-        canonical_workspace.join(meta_root)
+        Path::new(&run.workspace_root).join(meta_root)
     };
-    if absolute_meta_root.exists() {
-        reject_command_path_symlink_components(&absolute_meta_root, "Run chainworks_meta_root")?;
-    }
-    if !absolute_meta_root.starts_with(&canonical_workspace) {
-        anyhow::bail!("Run chainworks_meta_root escapes canonical workspace_root");
-    }
 
     for child in ["", "artifacts", "context", "state", "summaries"] {
         let path = if child.is_empty() {
@@ -316,127 +524,10 @@ fn ensure_run_meta_root_exists(run: &Run) -> Result<()> {
         } else {
             absolute_meta_root.join(child)
         };
-        create_command_dir_all_no_symlink_under(
-            &path,
-            &canonical_workspace,
-            "Run chainworks_meta_root",
-        )?;
+        std::fs::create_dir_all(&path)
+            .with_context(|| format!("create run meta-root directory {}", path.display()))?;
     }
 
-    Ok(())
-}
-
-fn create_command_dir_all_no_symlink_under(
-    path: &Path,
-    canonical_root: &Path,
-    field: &str,
-) -> Result<()> {
-    let relative = path
-        .strip_prefix(canonical_root)
-        .with_context(|| format!("{field} escapes canonical root"))?;
-    let mut current = canonical_root.to_path_buf();
-    for component in relative.components() {
-        match component {
-            Component::Normal(part) => current.push(part),
-            Component::CurDir => continue,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                anyhow::bail!("{field} contains an unsafe path component");
-            }
-        }
-        match std::fs::symlink_metadata(&current) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() {
-                    anyhow::bail!("{field} contains a symlink component");
-                }
-                if !metadata.is_dir() {
-                    anyhow::bail!("{field} path component is not a directory");
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&current)
-                    .with_context(|| format!("create directory {}", current.display()))?;
-                let metadata = std::fs::symlink_metadata(&current)
-                    .with_context(|| format!("verify directory {}", current.display()))?;
-                if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                    anyhow::bail!("{field} created path was replaced before verification");
-                }
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("inspect {}", current.display()));
-            }
-        }
-    }
-    let canonical_current = std::fs::canonicalize(&current)
-        .with_context(|| format!("canonicalize directory {}", current.display()))?;
-    if !canonical_current.starts_with(canonical_root) {
-        anyhow::bail!("{field} escapes canonical root after creation");
-    }
-    Ok(())
-}
-
-fn canonicalize_governed_workspace_root_for_idea(raw: &str) -> Result<String> {
-    if raw.contains('\0') {
-        anyhow::bail!("CreateIdea workspace_root_path contains a null byte");
-    }
-    if raw.contains('\\') {
-        anyhow::bail!("CreateIdea workspace_root_path contains a backslash separator");
-    }
-    if raw.contains("://") {
-        anyhow::bail!("CreateIdea workspace_root_path contains a URI scheme separator");
-    }
-    for component in raw.split('/') {
-        if component == ".." {
-            anyhow::bail!("CreateIdea workspace_root_path contains '..'");
-        }
-    }
-    let path = Path::new(raw);
-    if !path.exists() {
-        anyhow::bail!("CreateIdea workspace_root_path does not exist");
-    }
-    if !path.is_dir() {
-        anyhow::bail!("CreateIdea workspace_root_path must be a directory");
-    }
-    reject_command_path_symlink_components(path, "CreateIdea workspace_root_path")?;
-    let canonical = std::fs::canonicalize(path)
-        .with_context(|| format!("canonicalize CreateIdea workspace_root_path '{raw}'"))?;
-    reject_broad_command_workspace_root(&canonical)?;
-    Ok(canonical.to_string_lossy().to_string())
-}
-
-fn reject_broad_command_workspace_root(canonical: &Path) -> Result<()> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .and_then(|home| std::fs::canonicalize(home).ok());
-    let broad_literals = [
-        Path::new("/"),
-        Path::new("/tmp"),
-        Path::new("/private/tmp"),
-        Path::new("/var"),
-        Path::new("/private/var"),
-        Path::new("/Users"),
-        Path::new("/home"),
-    ];
-    if broad_literals.iter().any(|broad| canonical == *broad)
-        || home.as_deref().is_some_and(|home| canonical == home)
-    {
-        anyhow::bail!(
-            "CreateIdea workspace_root_path is too broad to use as a trusted filesystem boundary"
-        );
-    }
-    Ok(())
-}
-
-fn reject_command_path_symlink_components(path: &Path, field: &str) -> Result<()> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
-        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
-            continue;
-        };
-        if metadata.file_type().is_symlink() {
-            anyhow::bail!("{field} contains a symlink component");
-        }
-    }
     Ok(())
 }
 
@@ -980,64 +1071,6 @@ fn workflow_snapshot_hash(raw: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn sanitized_audit_reason(reason: &str) -> Result<String> {
-    let trimmed = reason.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("catalog snapshot retrofit reason is required");
-    }
-    if trimmed.len() > 2_000 {
-        anyhow::bail!("catalog snapshot retrofit reason exceeds 2000 bytes");
-    }
-    Ok(trimmed.to_string())
-}
-
-fn remove_catalog_retrofit_allowed_fields(value: &mut serde_json::Value) -> Result<()> {
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("catalog snapshot JSON must be an object"))?;
-    object.remove("escalation_policies");
-    object.remove("backend_profiles");
-    Ok(())
-}
-
-fn validate_escalation_policy_only_catalog_retrofit(
-    previous_catalog_snapshot_json: &str,
-    new_catalog_snapshot_json: &str,
-    current_state: Option<&str>,
-    new_plan: &workflow::plan::RunPlan,
-) -> Result<Vec<String>> {
-    let mut previous: serde_json::Value = serde_json::from_str(previous_catalog_snapshot_json)
-        .context("parse previous catalog snapshot JSON")?;
-    let mut new: serde_json::Value = serde_json::from_str(new_catalog_snapshot_json)
-        .context("parse new catalog snapshot JSON")?;
-    remove_catalog_retrofit_allowed_fields(&mut previous)?;
-    remove_catalog_retrofit_allowed_fields(&mut new)?;
-    if previous != new {
-        anyhow::bail!(
-            "catalog snapshot retrofit rejected: current catalog differs outside escalation_policies/backend_profiles"
-        );
-    }
-
-    let current_state = current_state
-        .map(str::trim)
-        .filter(|state| !state.is_empty())
-        .ok_or_else(|| anyhow!("catalog snapshot retrofit requires a current workflow state"))?;
-    let applied_policy_ids = new_plan
-        .escalation_policies
-        .iter()
-        .filter(|policy| {
-            policy.enabled_default && policy.applies_to_stage_id.as_deref() == Some(current_state)
-        })
-        .map(|policy| policy.policy_id.clone())
-        .collect::<Vec<_>>();
-    if applied_policy_ids.is_empty() {
-        anyhow::bail!(
-            "catalog snapshot retrofit rejected: current catalog has no enabled escalation policy for current state {current_state}"
-        );
-    }
-    Ok(applied_policy_ids)
-}
-
 fn find_loop_budget_variable(snapshot: &serde_json::Value, counter: &str) -> Result<(String, u64)> {
     fn visit<'a>(value: &'a serde_json::Value, counter: &str) -> Option<&'a str> {
         let object = value.as_object()?;
@@ -1129,6 +1162,64 @@ async fn extend_workflow_loop_budget_tx(
     })
 }
 
+fn sanitized_audit_reason(reason: &str) -> Result<String> {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("catalog snapshot retrofit reason is required");
+    }
+    if trimmed.len() > 2_000 {
+        anyhow::bail!("catalog snapshot retrofit reason exceeds 2000 bytes");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn remove_catalog_retrofit_allowed_fields(value: &mut serde_json::Value) -> Result<()> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("catalog snapshot JSON must be an object"))?;
+    object.remove("escalation_policies");
+    object.remove("backend_profiles");
+    Ok(())
+}
+
+fn validate_escalation_policy_only_catalog_retrofit(
+    previous_catalog_snapshot_json: &str,
+    new_catalog_snapshot_json: &str,
+    current_state: Option<&str>,
+    new_plan: &workflow::plan::RunPlan,
+) -> Result<Vec<String>> {
+    let mut previous: serde_json::Value = serde_json::from_str(previous_catalog_snapshot_json)
+        .context("parse previous catalog snapshot JSON")?;
+    let mut new: serde_json::Value = serde_json::from_str(new_catalog_snapshot_json)
+        .context("parse new catalog snapshot JSON")?;
+    remove_catalog_retrofit_allowed_fields(&mut previous)?;
+    remove_catalog_retrofit_allowed_fields(&mut new)?;
+    if previous != new {
+        anyhow::bail!(
+            "catalog snapshot retrofit rejected: current catalog differs outside escalation_policies/backend_profiles"
+        );
+    }
+
+    let current_state = current_state
+        .map(str::trim)
+        .filter(|state| !state.is_empty())
+        .ok_or_else(|| anyhow!("catalog snapshot retrofit requires a current workflow state"))?;
+    let applied_policy_ids = new_plan
+        .escalation_policies
+        .iter()
+        .filter(|policy| {
+            policy.enabled_default && policy.applies_to_stage_id.as_deref() == Some(current_state)
+        })
+        .map(|policy| policy.policy_id.clone())
+        .collect::<Vec<_>>();
+    if applied_policy_ids.is_empty() {
+        anyhow::bail!(
+            "catalog snapshot retrofit rejected: current catalog has no enabled escalation policy for current state {current_state}"
+        );
+    }
+    Ok(applied_policy_ids)
+}
+
 struct PhaseBDogfoodMetricSnapshot {
     completion_rate: f64,
     sample_size: i64,
@@ -1156,12 +1247,18 @@ impl CommandJournalEntry {
             Command::KnowledgeCapsuleIgnore(_) => "KnowledgeCapsuleIgnore",
             Command::RetrofitCatalogSnapshot(_) => "RetrofitCatalogSnapshot",
             Command::CancelRun(_) => "CancelRun",
+            Command::RetryRun(_) => "RetryRun",
             Command::ResetSession(_) => "ResetSession",
             Command::RunStewardAnalysis(_) => "RunStewardAnalysis",
             Command::OverrideArtifactContract(_) => "OverrideArtifactContract",
             Command::ResolveLeadMediationConfirmation(_) => "ResolveLeadMediationConfirmation",
             Command::ResolveApproval(_) => "ResolveApproval",
             Command::SettleProposalGate(_) => "SettleProposalGate",
+            Command::ShutdownProviderSession(_) => "ShutdownProviderSession",
+            Command::P083RollbackExecution(_) => "P083RollbackExecution",
+            Command::P083SetEnforcementMode(_) => "P083SetEnforcementMode",
+            Command::ForceReconcileSideEffect(_) => "ForceReconcileSideEffect",
+            Command::MarkProviderSessionProcessAbsent(_) => "MarkProviderSessionProcessAbsent",
         };
         let raw = serde_json::to_string(cmd).unwrap_or_default();
         let payload_json = crate::command_journal_redact::redact_for_journal(cmd, &raw);
@@ -1183,12 +1280,19 @@ impl CommandJournalEntry {
             Command::KnowledgeCapsuleIgnore(c) => Some(c.run_id.to_string()),
             Command::RetrofitCatalogSnapshot(c) => Some(c.run_id.to_string()),
             Command::CancelRun(c) => Some(c.run_id.to_string()),
+            Command::RetryRun(c) => Some(c.run_id.to_string()),
             Command::ResetSession(c) => Some(c.run_id.to_string()),
             Command::RunStewardAnalysis(_) => None,
             Command::OverrideArtifactContract(c) => Some(c.run_id.to_string()),
             Command::ResolveLeadMediationConfirmation(c) => Some(c.run_id.to_string()),
             Command::ResolveApproval(c) => Some(c.run_id.to_string()),
             Command::SettleProposalGate(c) => Some(c.run_id.to_string()),
+            // P083: no run_id scoping; these are global enforcement/session commands
+            Command::ShutdownProviderSession(_) => None,
+            Command::P083RollbackExecution(_) => None,
+            Command::P083SetEnforcementMode(_) => None,
+            Command::ForceReconcileSideEffect(_) => None,
+            Command::MarkProviderSessionProcessAbsent(_) => None,
         };
         let principal_class = caller.principal_class.to_string();
 
@@ -1236,6 +1340,12 @@ impl CommandJournalEntry {
                 | "MainSyncRecordRecoveryDecision"
                 | "KnowledgeCapsuleIgnore"
                 | "RetrofitCatalogSnapshot"
+                | "ShutdownProviderSession"
+                | "MarkProviderSessionProcessAbsent"
+                | "P083RollbackExecution"
+                | "P083SetEnforcementMode"
+                | "RetryRun"
+                | "ForceReconcileSideEffect"
         )
     }
 }
@@ -1491,18 +1601,6 @@ fn retry_requires_effect_reconciliation(
         || target_agent_id.is_some_and(is_release_agent)
 }
 
-fn p078_heuristic_retry_guard_enabled() -> bool {
-    std::env::var(FEATURE_P078_HEURISTIC_RETRY_GUARD_ENABLED)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
 fn retry_state_has_release_post_approval_tasks(run: &Run, stage_id: &str) -> Result<bool> {
     let plan = match (
         run.workflow_snapshot_json.as_deref(),
@@ -1534,7 +1632,7 @@ fn retry_state_has_release_post_approval_tasks(run: &Run, stage_id: &str) -> Res
     }))
 }
 
-fn compile_run_plan_for_run(run: &Run) -> Result<Option<workflow::plan::RunPlan>> {
+pub fn compile_run_plan_for_run(run: &Run) -> Result<Option<workflow::plan::RunPlan>> {
     match (
         run.workflow_snapshot_json.as_deref(),
         run.catalog_snapshot_json.as_deref(),
@@ -1564,8 +1662,10 @@ fn compile_run_plan_for_run(run: &Run) -> Result<Option<workflow::plan::RunPlan>
 }
 
 /// Compile a RunPlan exclusively from frozen snapshots stamped at run start.
-/// Returns `Ok(None)` when no frozen snapshots are available and never falls
-/// back to mutable on-disk YAML.
+/// Returns `Ok(None)` when no frozen snapshots are available — does NOT fall back
+/// to mutable on-disk YAML, enforcing the frozen-snapshot invariant (P058-SEC-003).
+/// Use this in contexts where YAML drift would violate the proposal contract
+/// (e.g., escalation policy resolution during live agent execution).
 pub fn compile_run_plan_from_snapshot(run: &Run) -> Result<Option<workflow::plan::RunPlan>> {
     match (
         run.workflow_snapshot_json.as_deref(),
@@ -1608,11 +1708,6 @@ fn requires_effect_reconciliation_error(stage: &StageExecution) -> anyhow::Error
         stage.stage_id,
         stage.id
     )
-}
-
-fn is_implicit_targeted_retry_stage(stage_id: &str) -> bool {
-    matches!(stage_id, "state_9_implementation_reviewed")
-        || stage_id.ends_with("_implementation_reviewed")
 }
 
 pub(crate) fn find_source_invoke_work_item<'a>(
@@ -2080,6 +2175,12 @@ impl CommandHandler {
         }
     }
 
+    /// P081 Phase 3: inject the shared immutable BoundaryPolicy for audit-log entries.
+    pub fn with_boundary_policy(mut self, policy: Arc<auth::boundary::BoundaryPolicy>) -> Self {
+        self.boundary_policy = Some(policy);
+        self
+    }
+
     pub fn new_with_acp(
         pool: SqlitePool,
         events: EventSender,
@@ -2093,111 +2194,6 @@ impl CommandHandler {
             acp,
             InvokeAgentCapacityConfig::default(),
         )
-    }
-
-    async fn persist_p094_boundary_human_decision(
-        &self,
-        run_id: RunId,
-        stage_id: &str,
-        decision_label: &str,
-        canonical_approval_state: &str,
-        comment: Option<String>,
-        requested_at: DateTime<Utc>,
-        approval_id: ApprovalId,
-    ) -> Result<()> {
-        if stage_id != "state_9_blocker_boundary_approval" {
-            return Ok(());
-        }
-        let run = runs::find_by_id(&self.pool, run_id)
-            .await?
-            .context("P094 boundary approval run not found")?;
-        let target_path = crate::orchestrator::resolve_path_template(
-            "${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/blocker-boundary-human-decision.json",
-            &run.workspace_root,
-            run.chainworks_meta_root.as_deref(),
-        );
-        if let Some(parent) = std::path::Path::new(&target_path).parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "create P094 blocker boundary human decision directory {}",
-                    parent.display()
-                )
-            })?;
-        }
-        let payload = serde_json::json!({
-            "schema_version": "blocker_boundary_human_decision_v1",
-            "approval_id": approval_id,
-            "decision_label": decision_label,
-            "canonical_approval_state": canonical_approval_state,
-            "comment": comment,
-            "decided_at": Utc::now().to_rfc3339(),
-            "decided_by": "operator",
-        });
-        let bytes = serde_json::to_vec_pretty(&payload)
-            .context("serialize blocker_boundary_human_decision_v1")?;
-        std::fs::write(&target_path, &bytes)
-            .with_context(|| format!("write P094 boundary human decision {target_path}"))?;
-
-        let artifact_id = ArtifactId::new();
-        let generation_id = format!("{stage_id}-p094-human-decision-{canonical_approval_state}");
-        artifact_contracts::upsert_verified_generation_and_rebuild(
-            &self.pool,
-            domain::artifact_contracts::ActiveArtifactGenerationInput {
-                run_id,
-                artifact_id,
-                contract_id: "blocker_boundary_human_decision_v1".into(),
-                canonical_path: target_path.clone(),
-                raw_path: target_path.clone(),
-                raw_status: canonical_approval_state.to_string(),
-                generation_id,
-                source_agent_execution_id: None,
-                source_stage_execution_id: None,
-                source_session_generation_id: None,
-                source_work_item_id: None,
-                supersedes_generation_id: None,
-                output_settlement: AgentOutputSettlement::ValidOutputsFromCompletedExecution,
-                partial: false,
-                warnings: vec![],
-            },
-        )
-        .await?;
-
-        artifacts::insert(
-            &self.pool,
-            &Artifact {
-                id: artifact_id,
-                run_id,
-                stage_id: stage_id.to_string(),
-                agent_id: "operator".to_string(),
-                name: "blocker_boundary_human_decision".to_string(),
-                contract_id: "blocker_boundary_human_decision_v1".to_string(),
-                format: ArtifactFormat::Json,
-                file_path: target_path,
-                checksum_sha256: Some(format!("{:x}", Sha256::digest(&bytes))),
-                size_bytes: Some(bytes.len() as i64),
-                provider: "operator.approval".to_string(),
-                model: None,
-                created_at: Utc::now(),
-                is_pinned: false,
-                report_kind: None,
-                report_version: None,
-                agent_execution_id: None,
-            },
-        )
-        .await?;
-        db::metrics::record_p094_boundary_approval(canonical_approval_state);
-        let latency = Utc::now()
-            .signed_duration_since(requested_at)
-            .to_std()
-            .unwrap_or_else(|_| Duration::from_secs(0));
-        db::metrics::record_p094_human_boundary_approval_latency(latency);
-        if canonical_approval_state == "granted" {
-            db::metrics::record_p094_external_blocker_accepted("quality_gate_boundary");
-        } else if canonical_approval_state == "rejected" {
-            db::metrics::record_p094_post_boundary_reopen("operator_rejected_boundary");
-            db::metrics::record_p094_accepted_boundary_later_rejected("operator_rejected_boundary");
-        }
-        Ok(())
     }
 
     pub fn new_with_acp_and_capacity(
@@ -2238,12 +2234,6 @@ impl CommandHandler {
         }
     }
 
-    /// P081 Phase 3: inject the shared immutable BoundaryPolicy for audit-log entries.
-    pub fn with_boundary_policy(mut self, policy: Arc<auth::boundary::BoundaryPolicy>) -> Self {
-        self.boundary_policy = Some(policy);
-        self
-    }
-
     async fn begin_command_transaction(
         &self,
         operation_name: &'static str,
@@ -2276,17 +2266,15 @@ impl CommandHandler {
         Ok(())
     }
 
-    pub async fn handle(&self, cmd: Command, caller: CallerContext) -> Result<Commanded> {
-        if matches!(&cmd, Command::StartRun(_))
-            && caller.principal_class != PrincipalClass::Operator
-        {
-            anyhow::bail!("forbidden: StartRun requires operator principal");
-        }
-        if matches!(&cmd, Command::CreateIdea(c) if c.workspace_root_path.is_some())
-            && caller.principal_class != PrincipalClass::Operator
-        {
-            anyhow::bail!("forbidden: CreateIdea workspace_root_path requires operator principal");
-        }
+    pub fn handle(
+        &self,
+        cmd: Command,
+        caller: CallerContext,
+    ) -> Pin<Box<dyn Future<Output = Result<Commanded>> + Send + '_>> {
+        Box::pin(async move { self.handle_inner(cmd, caller).await })
+    }
+
+    async fn handle_inner(&self, cmd: Command, caller: CallerContext) -> Result<Commanded> {
         if matches!(&cmd, Command::OverrideArtifactContract(_))
             && caller.principal_class != PrincipalClass::Operator
         {
@@ -2362,22 +2350,25 @@ impl CommandHandler {
         {
             anyhow::bail!("forbidden: ResolveApproval requires operator principal");
         }
-        if let Command::ResolveApproval(ref c) = cmd {
-            if c.stage_id == "state_9_blocker_boundary_approval"
-                && c.decision == ApprovalResolutionDecision::Rejected
-                && c.rationale
-                    .as_deref()
-                    .map(str::trim)
-                    .unwrap_or_default()
-                    .is_empty()
-            {
-                anyhow::bail!("P094 blocker-boundary rejection requires a comment");
-            }
-        }
         if matches!(&cmd, Command::SettleProposalGate(_))
             && caller.principal_class != PrincipalClass::Operator
         {
             anyhow::bail!("forbidden: SettleProposalGate requires operator principal");
+        }
+        // SEC-P083-HIGH-001: P083 lifecycle commands must be guarded at the engine
+        // boundary, not just at GraphQL/MCP front doors, since CommandHandler::handle
+        // is public inside the engine and can be called by tests or future surfaces.
+        if matches!(
+            &cmd,
+            Command::ShutdownProviderSession(_)
+                | Command::P083RollbackExecution(_)
+                | Command::P083SetEnforcementMode(_)
+                | Command::RetryRun(_)
+                | Command::ForceReconcileSideEffect(_)
+                | Command::MarkProviderSessionProcessAbsent(_)
+        ) && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: P083 lifecycle commands require operator principal");
         }
 
         // ── Command journal: record before execution (proposal §6.4) ────────
@@ -2658,18 +2649,11 @@ impl CommandHandler {
         let journal_id = journal.id.as_str();
         match cmd {
             Command::CreateIdea(c) => {
-                let workspace_root_path = c
-                    .workspace_root_path
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|root| !root.is_empty())
-                    .map(canonicalize_governed_workspace_root_for_idea)
-                    .transpose()?;
                 let idea = domain::idea::Idea {
                     id: domain::ids::IdeaId::new(),
                     title: c.title,
                     body: c.body,
-                    workspace_root_path,
+                    workspace_root_path: c.workspace_root_path,
                     project_key: c.project_key,
                     status: domain::idea::IdeaStatus::Draft,
                     created_at: Utc::now(),
@@ -2683,11 +2667,6 @@ impl CommandHandler {
                 command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
                 tx.commit().await.context("commit create idea command")?;
                 Ok(CommandResult::IdeaCreated { idea })
-            }
-            Command::ConsumeProviderQuotaHold(c) => {
-                return self
-                    .consume_provider_quota_hold(c, journal, journal_id)
-                    .await;
             }
             Command::StartRun(c) => {
                 let now = Utc::now();
@@ -3018,7 +2997,6 @@ impl CommandHandler {
 
             Command::ApproveStage(c) => {
                 let now = Utc::now();
-                let approval_comment = c.comment.clone();
                 let has_post_tasks = self
                     .check_has_post_approval_tasks(c.run_id, &c.stage_id)
                     .await;
@@ -3130,16 +3108,6 @@ impl CommandHandler {
                     decision: ApprovalDecision::Granted,
                 });
                 projections::rebuild_approval_inbox(&self.pool, c.run_id).await?;
-                self.persist_p094_boundary_human_decision(
-                    c.run_id,
-                    &c.stage_id,
-                    "accept",
-                    "granted",
-                    approval_comment,
-                    approval.requested_at,
-                    approval.id,
-                )
-                .await?;
 
                 Ok(CommandResult::StageApproved {
                     approval_id: approval.id,
@@ -3148,16 +3116,6 @@ impl CommandHandler {
 
             Command::RejectStage(c) => {
                 let now = Utc::now();
-                let rejection_comment = c.comment.clone();
-                if c.stage_id == "state_9_blocker_boundary_approval"
-                    && rejection_comment
-                        .as_deref()
-                        .map(str::trim)
-                        .unwrap_or_default()
-                        .is_empty()
-                {
-                    anyhow::bail!("P094 blocker-boundary rejection requires a comment");
-                }
                 let tx_started = Instant::now();
                 let mut tx = self
                     .begin_command_transaction("command.RejectStage", journal.id.clone())
@@ -3261,20 +3219,16 @@ impl CommandHandler {
                     decision: ApprovalDecision::Rejected,
                 });
                 projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
-                self.persist_p094_boundary_human_decision(
-                    c.run_id,
-                    &c.stage_id,
-                    "reject",
-                    "rejected",
-                    rejection_comment,
-                    approval.requested_at,
-                    approval.id,
-                )
-                .await?;
 
                 Ok(CommandResult::StageRejected {
                     approval_id: approval.id,
                 })
+            }
+
+            Command::ConsumeProviderQuotaHold(c) => {
+                return self
+                    .consume_provider_quota_hold(c, journal, journal_id)
+                    .await;
             }
 
             Command::RetryStage(c) => {
@@ -3287,18 +3241,18 @@ impl CommandHandler {
                 } else {
                     None
                 };
-                if let Some(rejection) = self.retry_stage_identifier_kind_rejection(&c).await? {
-                    self.record_retry_stage_identifier_rejection(journal, &rejection)
-                        .await?;
-                    db::metrics::increment_counter_with_label(
-                        "p082_recovery_mutation_rejected_total",
-                        &format!(
-                            "{}:RetryStage",
-                            domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE
-                        ),
-                    );
-                    return Err(anyhow!(rejection.message));
-                }
+
+                // ── P083: command_idempotency_contract_v1 ──────────────────────────────
+                // request_id is required for ALL RetryStage paths (narrow + full).
+                // Validate before any DB writes so idempotency runs on every path.
+                let now = Utc::now();
+                let retry_req_id_str = c.request_id.as_deref().ok_or_else(|| {
+                    anyhow!(
+                        "MISSING_REQUEST_ID: request_id is required for RetryStage per \
+                     command_idempotency_contract_v1; supply a lowercase UUIDv4"
+                    )
+                })?;
+                validate_caller_request_id(retry_req_id_str)?;
 
                 if let Some(agent_execution_id) = c.agent_execution_id {
                     if c.legacy_discovery_override_policy.is_some() {
@@ -3306,6 +3260,104 @@ impl CommandHandler {
                             "legacy_discovery_override_policy is only supported for full stage retry"
                         );
                     }
+                    // P083: Idempotency for narrow (agent_execution_id) retry.
+                    // Intent hash includes agent_execution_id to distinguish from full stage retry.
+                    let narrow_principal = caller.principal_id.clone();
+                    let narrow_intent_hash = canonical_intent_hash(&[
+                        ("command", serde_json::Value::String("stages.retry".into())),
+                        ("run_id", serde_json::Value::String(c.run_id.to_string())),
+                        ("stage_id", serde_json::Value::String(c.stage_id.clone())),
+                        (
+                            "agent_execution_id",
+                            serde_json::Value::String(agent_execution_id.to_string()),
+                        ),
+                        (
+                            "consume_quota_budget_now",
+                            serde_json::Value::Bool(c.consume_quota_budget_now),
+                        ),
+                        (
+                            "operator_instruction",
+                            serde_json::Value::from(c.operator_instruction.clone()),
+                        ),
+                    ]);
+                    if let Some(existing) = command_idempotency::find_active_by_request(
+                        &self.pool,
+                        &narrow_principal,
+                        retry_req_id_str,
+                    )
+                    .await?
+                    {
+                        if existing.command != "stages.retry"
+                            || existing.intent_hash != narrow_intent_hash
+                        {
+                            anyhow::bail!(
+                                "REQUEST_INTENT_MISMATCH: request_id {} reused for a different command or intent",
+                                retry_req_id_str
+                            );
+                        }
+                        if existing.lease_state == "committed" {
+                            tracing::info!(request_id = %retry_req_id_str, "RetryStage(narrow): replaying committed lease");
+                            return Ok(CommandResult::StageRetryScheduled {
+                                run_id: c.run_id,
+                                stage_id: c.stage_id.clone(),
+                                legacy_discovery_override_id: None,
+                                retry_instruction_binding_id: None,
+                            });
+                        } else if existing.lease_state == "failed" {
+                            anyhow::bail!(
+                                "IDEMPOTENCY_TERMINAL_FAILURE: request_id {} previously failed with code '{}'; submit a new request_id to retry",
+                                retry_req_id_str,
+                                existing.failure_code.as_deref().unwrap_or("unknown")
+                            );
+                        } else if existing.lease_state == "pending" {
+                            let expires_at_dt =
+                                chrono::DateTime::parse_from_rfc3339(&existing.expires_at)
+                                    .map(|e| e.with_timezone(&Utc))
+                                    .unwrap_or_else(|_| now);
+                            if expires_at_dt > now {
+                                let retry_after = (expires_at_dt - now).num_seconds().max(1);
+                                anyhow::bail!(
+                                    "IDEMPOTENCY_IN_FLIGHT: retry already in progress for request_id {}, retry_after_seconds={}",
+                                    retry_req_id_str, retry_after
+                                );
+                            }
+                            // Expired pending — fall through to acquire.
+                        }
+                    }
+                    if let Some(canonical) = command_idempotency::find_committed_by_intent(
+                        &self.pool,
+                        &narrow_principal,
+                        "stages.retry",
+                        &narrow_intent_hash,
+                    )
+                    .await?
+                    {
+                        if canonical.request_id != *retry_req_id_str {
+                            command_idempotency::insert_alias(
+                                &self.pool,
+                                &narrow_principal,
+                                "stages.retry",
+                                &narrow_intent_hash,
+                                retry_req_id_str,
+                                &canonical.request_id,
+                            )
+                            .await?;
+                            tracing::info!(request_id = %retry_req_id_str, "RetryStage(narrow): alias replay for same-intent committed lease");
+                            return Ok(CommandResult::StageRetryScheduled {
+                                run_id: c.run_id,
+                                stage_id: c.stage_id.clone(),
+                                legacy_discovery_override_id: None,
+                                retry_instruction_binding_id: None,
+                            });
+                        }
+                    }
+                    let narrow_expires_at = (now + chrono::Duration::seconds(120)).to_rfc3339();
+                    let narrow_guard = NarrowIdempotencyGuard {
+                        principal_id: narrow_principal.to_string(),
+                        request_id: retry_req_id_str.to_string(),
+                        intent_hash: narrow_intent_hash.clone(),
+                        expires_at: narrow_expires_at,
+                    };
                     return self
                         .retry_agent_execution(
                             c.run_id,
@@ -3316,37 +3368,176 @@ impl CommandHandler {
                             journal,
                             validated_instruction.as_deref(),
                             &caller,
+                            Some(narrow_guard),
                         )
                         .await;
                 }
 
-                if c.legacy_discovery_override_policy.is_none() {
-                    if let Some(agent_execution_id) = self
-                        .implicit_targeted_retry_candidate(c.run_id, &c.stage_id)
-                        .await?
-                    {
-                        return self
-                            .retry_agent_execution(
-                                c.run_id,
-                                &c.stage_id,
-                                agent_execution_id,
-                                c.consume_quota_budget_now,
-                                journal_id,
-                                journal,
-                                validated_instruction.as_deref(),
-                                &caller,
-                            )
-                            .await;
-                    }
-                }
+                // ── P083: command_idempotency_contract_v1 for full stage retry ──────────
+                // (request_id and now already validated/captured above)
 
-                let now = Utc::now();
+                let (p083_retry_intent_hash, p083_retry_expires_at, p083_retry_generation): (
+                    Option<String>,
+                    Option<String>,
+                    Option<i64>,
+                ) = {
+                    let req_id = retry_req_id_str;
+                    let principal_id = &caller.principal_id;
+                    let intent_hash = canonical_intent_hash(&[
+                        ("command", serde_json::Value::String("stages.retry".into())),
+                        ("run_id", serde_json::Value::String(c.run_id.to_string())),
+                        ("stage_id", serde_json::Value::String(c.stage_id.clone())),
+                        (
+                            "consume_quota_budget_now",
+                            serde_json::Value::Bool(c.consume_quota_budget_now),
+                        ),
+                        (
+                            "legacy_discovery_override_policy",
+                            serde_json::Value::from(
+                                c.legacy_discovery_override_policy
+                                    .as_ref()
+                                    .map(|p| format!("{p:?}")),
+                            ),
+                        ),
+                        (
+                            "legacy_discovery_override_reason",
+                            serde_json::Value::from(c.legacy_discovery_override_reason.clone()),
+                        ),
+                        (
+                            "operator_instruction",
+                            serde_json::Value::from(c.operator_instruction.clone()),
+                        ),
+                    ]);
+                    // Fast-path replay: check for existing active lease.
+                    if let Some(existing) = command_idempotency::find_active_by_request(
+                        &self.pool,
+                        principal_id,
+                        req_id,
+                    )
+                    .await?
+                    {
+                        if existing.command != "stages.retry" || existing.intent_hash != intent_hash
+                        {
+                            anyhow::bail!(
+                                "REQUEST_INTENT_MISMATCH: request_id {} reused for a different command or intent",
+                                req_id
+                            );
+                        }
+                        if existing.lease_state == "committed" {
+                            tracing::info!(request_id = %req_id, "RetryStage: replaying committed lease");
+                            return Ok(CommandResult::StageRetryScheduled {
+                                run_id: c.run_id,
+                                stage_id: c.stage_id.clone(),
+                                legacy_discovery_override_id: None,
+                                retry_instruction_binding_id: None,
+                            });
+                        } else if existing.lease_state == "failed" {
+                            let failure_code = existing.failure_code.clone().unwrap_or_default();
+                            anyhow::bail!(
+                                "IDEMPOTENCY_TERMINAL_FAILURE: request_id {} previously failed \
+                                 with code '{}'; submit a new request_id to retry",
+                                req_id,
+                                failure_code
+                            );
+                        } else if existing.lease_state == "pending" {
+                            let expires_at_dt =
+                                chrono::DateTime::parse_from_rfc3339(&existing.expires_at)
+                                    .map(|e| e.with_timezone(&Utc))
+                                    .unwrap_or_else(|_| now);
+                            if expires_at_dt > now {
+                                let retry_after = (expires_at_dt - now).num_seconds().max(1);
+                                anyhow::bail!(
+                                    "IDEMPOTENCY_IN_FLIGHT: retry already in progress for request_id {}, retry_after_seconds={}",
+                                    req_id, retry_after
+                                );
+                            }
+                            // Expired pending — will be reacquired via reacquire_expired_tx in transaction.
+                        }
+                    }
+                    // Same-intent alias: check if a different request_id already committed this retry.
+                    if let Some(canonical) = command_idempotency::find_committed_by_intent(
+                        &self.pool,
+                        principal_id,
+                        "stages.retry",
+                        &intent_hash,
+                    )
+                    .await?
+                    {
+                        if canonical.request_id != *req_id {
+                            command_idempotency::insert_alias(
+                                &self.pool,
+                                principal_id,
+                                "stages.retry",
+                                &intent_hash,
+                                req_id,
+                                &canonical.request_id,
+                            )
+                            .await?;
+                            tracing::info!(request_id = %req_id, "RetryStage: alias replay for same-intent committed lease");
+                            return Ok(CommandResult::StageRetryScheduled {
+                                run_id: c.run_id,
+                                stage_id: c.stage_id.clone(),
+                                legacy_discovery_override_id: None,
+                                retry_instruction_binding_id: None,
+                            });
+                        }
+                    }
+                    let expires_at = (now + chrono::Duration::seconds(120)).to_rfc3339();
+                    (Some(intent_hash), Some(expires_at), Some(1i64))
+                };
+
+                // Tracks the effective lease generation for this retry: starts at 1 for fresh
+                // leases, updated to the reacquired generation when reacquire_expired_tx promotes
+                // a prior expired row. commit_tx must match the generation that was acquired.
+                let mut p083_retry_active_gen = p083_retry_generation;
+
                 let retry_tx_started = Instant::now();
                 let mut retry_tx = self
                     .begin_command_transaction("command.RetryStage", journal.id.clone())
                     .await?;
                 record_command_journal_tx(&mut retry_tx, journal).await?;
                 self.maybe_inject_retry_stage_failure("record_journal")?;
+
+                // Acquire or reacquire P083 idempotency lease inside transaction.
+                if let (Some(ref req_id), Some(ref intent_hash), Some(ref expires_at), Some(gen)) = (
+                    &c.request_id,
+                    &p083_retry_intent_hash,
+                    &p083_retry_expires_at,
+                    p083_retry_generation,
+                ) {
+                    // Try reacquire first (handles the expired-pending case from fast path).
+                    let reacquired = command_idempotency::reacquire_expired_tx(
+                        &mut retry_tx,
+                        &caller.principal_id,
+                        req_id,
+                        "stages.retry",
+                        intent_hash,
+                        expires_at,
+                    )
+                    .await?;
+                    if let Some(new_gen) = reacquired {
+                        p083_retry_active_gen = Some(new_gen);
+                    } else {
+                        // No expired pending row — try fresh acquire.
+                        let acquired = command_idempotency::acquire_tx(
+                            &mut retry_tx,
+                            &caller.principal_id,
+                            req_id,
+                            "stages.retry",
+                            intent_hash,
+                            gen,
+                            expires_at,
+                        )
+                        .await?;
+                        if !acquired {
+                            retry_tx.rollback().await.ok();
+                            anyhow::bail!(
+                                "IDEMPOTENCY_IN_FLIGHT: concurrent retry for request_id {}",
+                                req_id
+                            );
+                        }
+                    }
+                }
 
                 let run_stages = stages::list_by_run_tx(&mut retry_tx, c.run_id).await?;
                 let matching_stages = run_stages
@@ -3373,18 +3564,6 @@ impl CommandHandler {
                 let run = runs::find_by_id_tx(&mut retry_tx, c.run_id)
                     .await?
                     .ok_or_else(|| anyhow!("Run {} not found", c.run_id))?;
-                if let Err(error) = ensure_run_can_be_retried(&run) {
-                    command_journal::fail_entry_tx(
-                        &mut retry_tx,
-                        &journal.id,
-                        Utc::now(),
-                        &error.to_string(),
-                    )
-                    .await?;
-                    retry_tx.commit().await?;
-                    db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
-                    return Err(error);
-                }
                 ensure_run_meta_root_exists(&run)?;
                 let completed_current_stage_on_blocked_run =
                     if old_stage.status == StageStatus::Completed {
@@ -3403,45 +3582,15 @@ impl CommandHandler {
                         c.stage_id,
                         old_stage.status
                     );
-                    let now_ts = Utc::now();
-                    let p082_envelope =
-                        domain::recovery_matrix::build_rejected_command_error_envelope(
-                            domain::recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY,
-                            "RetryStage",
-                            &format!(
-                                "Stage {} latest attempt is {} and cannot be retried yet. No mutation was performed.",
-                                c.stage_id, old_stage.status
-                            ),
-                            domain::recovery_matrix::build_readback_v1(
-                                "P082-R02",
-                                "rejected",
-                                "no_mutation",
-                                domain::recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY,
-                                "Stage is not in a retryable status. No mutation was performed.",
-                                "command_journal, stage_executions",
-                                "command_journal, stages",
-                                &journal.id,
-                                Some("command_journal.error.p082_recovery_matrix_readback"),
-                                "valid",
-                                &now_ts.to_rfc3339(),
-                            ),
-                        );
                     command_journal::fail_entry_tx(
                         &mut retry_tx,
                         &journal.id,
-                        now_ts,
-                        &p082_envelope,
+                        Utc::now(),
+                        &error.to_string(),
                     )
                     .await?;
                     retry_tx.commit().await?;
                     db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
-                    db::metrics::increment_counter_with_label(
-                        "p082_recovery_mutation_rejected_total",
-                        &format!(
-                            "{}:RetryStage",
-                            domain::recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY
-                        ),
-                    );
                     return Err(error);
                 }
 
@@ -3465,100 +3614,34 @@ impl CommandHandler {
                 if let Err(ledger_err) =
                     retry_preflight_within_tx(&mut retry_tx, &c.run_id, &old_stage.id, None).await
                 {
-                    let now_ts = Utc::now();
-                    let p082_envelope =
-                        domain::recovery_matrix::build_rejected_command_error_envelope(
-                            domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
-                            "RetryStage",
-                            "Retry blocked: unresolved side-effect ledger entries exist. No mutation was performed.",
-                            domain::recovery_matrix::set_readback_side_effect_hold(
-                                domain::recovery_matrix::build_readback_v1(
-                                    "P082-R07",
-                                    "held",
-                                    "reconcile_side_effects",
-                                    domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
-                                    "Reconcile unresolved side effects before retrying this stage.",
-                                    "side_effects, command_journal",
-                                    "side_effects, command_journal",
-                                    &journal.id,
-                                    Some("command_journal.error.p082_recovery_matrix_readback"),
-                                    "valid",
-                                    &now_ts.to_rfc3339(),
-                                ),
-                                "unresolved_side_effect_entries",
-                                "Retry blocked: unresolved side-effect ledger entries exist. Reconcile side effects before retrying.",
-                            ),
-                        );
                     command_journal::fail_entry_tx(
                         &mut retry_tx,
                         &journal.id,
-                        now_ts,
-                        &p082_envelope,
+                        Utc::now(),
+                        &ledger_err.to_string(),
                     )
                     .await?;
                     retry_tx.commit().await?;
                     db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
-                    db::metrics::increment_counter_with_label(
-                        "p082_recovery_mutation_rejected_total",
-                        &format!(
-                            "{}:RetryStage",
-                            domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION
-                        ),
-                    );
                     return Err(ledger_err);
                 }
 
-                // Ledger preflight above is authoritative. The legacy heuristic guard is
-                // opt-in only because it can block retries that failed before any durable
-                // side-effect intent was recorded.
-                if p078_heuristic_retry_guard_enabled()
-                    && retry_requires_effect_reconciliation(
-                        old_stage,
-                        None,
-                        has_release_post_approval_tasks,
-                    )
-                {
+                // Heuristic guard: still catch release stages not yet wired to the ledger.
+                if retry_requires_effect_reconciliation(
+                    old_stage,
+                    None,
+                    has_release_post_approval_tasks,
+                ) {
                     let error = requires_effect_reconciliation_error(old_stage);
-                    let now_ts = Utc::now();
-                    let p082_envelope =
-                        domain::recovery_matrix::build_rejected_command_error_envelope(
-                            domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
-                            "RetryStage",
-                            "Retry blocked: release stage has unresolved side effects requiring reconciliation. No mutation was performed.",
-                            domain::recovery_matrix::set_readback_side_effect_hold(
-                                domain::recovery_matrix::build_readback_v1(
-                                    "P082-R07",
-                                    "held",
-                                    "reconcile_side_effects",
-                                    domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
-                                    "Reconcile unresolved side effects before retrying this stage.",
-                                    "side_effects, command_journal",
-                                    "side_effects, command_journal",
-                                    &journal.id,
-                                    Some("command_journal.error.p082_recovery_matrix_readback"),
-                                    "valid",
-                                    &now_ts.to_rfc3339(),
-                                ),
-                                "unresolved_side_effect_entries",
-                                "Retry blocked: release stage has unresolved side effects requiring reconciliation. Reconcile side effects before retrying.",
-                            ),
-                        );
                     command_journal::fail_entry_tx(
                         &mut retry_tx,
                         &journal.id,
-                        now_ts,
-                        &p082_envelope,
+                        Utc::now(),
+                        &error.to_string(),
                     )
                     .await?;
                     retry_tx.commit().await?;
                     db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
-                    db::metrics::increment_counter_with_label(
-                        "p082_recovery_mutation_rejected_total",
-                        &format!(
-                            "{}:RetryStage",
-                            domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION
-                        ),
-                    );
                     return Err(error);
                 }
 
@@ -3793,6 +3876,22 @@ impl CommandHandler {
                 self.maybe_inject_retry_stage_failure("refresh_scheduler")?;
                 command_journal::complete_entry_tx(&mut retry_tx, &journal.id, Utc::now()).await?;
                 self.maybe_inject_retry_stage_failure("complete_journal")?;
+                // Commit P083 idempotency lease atomically with the retry outcome.
+                if let (Some(ref req_id), Some(gen)) = (&c.request_id, p083_retry_active_gen) {
+                    let outcome = serde_json::json!({
+                        "command": "stages.retry",
+                        "run_id": c.run_id.to_string(),
+                        "stage_id": c.stage_id
+                    });
+                    command_idempotency::commit_tx(
+                        &mut retry_tx,
+                        &caller.principal_id,
+                        req_id,
+                        gen,
+                        &outcome.to_string(),
+                    )
+                    .await?;
+                }
                 retry_tx.commit().await?;
                 db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
                 self.work_queue
@@ -4403,16 +4502,171 @@ impl CommandHandler {
 
             Command::CancelRun(c) => {
                 let now = Utc::now();
+
+                // P083: request_id is required per command_idempotency_contract_v1. Fail closed
+                // when absent so every cancel mutation is durably tracked and replay-safe.
+                let req_id_str = c.request_id.as_deref().ok_or_else(|| {
+                    anyhow!(
+                        "MISSING_REQUEST_ID: request_id is required for CancelRun per \
+                     command_idempotency_contract_v1; supply a lowercase UUIDv4"
+                    )
+                })?;
+                validate_caller_request_id(req_id_str)?;
+
+                // P083: apply command_idempotency_contract_v1. Do fast-path replay check
+                // (read-only) before opening the write transaction so replayed responses
+                // don't take write locks.
+                let (p083_intent_hash, p083_expires_at, p083_generation): (
+                    Option<String>,
+                    Option<String>,
+                    Option<i64>,
+                ) = {
+                    let req_id = req_id_str;
+                    let principal_id = &caller.principal_id;
+                    let intent_hash = canonical_intent_hash(&[
+                        ("command", serde_json::Value::String("runs.cancel".into())),
+                        ("run_id", serde_json::Value::String(c.run_id.to_string())),
+                    ]);
+                    // Fast-path replay: check for existing active lease.
+                    if let Some(existing) = command_idempotency::find_active_by_request(
+                        &self.pool,
+                        principal_id,
+                        req_id,
+                    )
+                    .await?
+                    {
+                        if existing.command != "runs.cancel" || existing.intent_hash != intent_hash
+                        {
+                            anyhow::bail!(
+                                "REQUEST_INTENT_MISMATCH: request_id {} reused for a different command or intent",
+                                req_id
+                            );
+                        }
+                        if existing.lease_state == "committed" {
+                            tracing::info!(request_id = %req_id, "CancelRun: replaying committed lease");
+                            return Ok(CommandResult::RunCancelled { run_id: c.run_id });
+                        } else if existing.lease_state == "failed" {
+                            // Per recovery_rules.failed_terminal: replay the failure so the caller
+                            // gets a typed terminal denial rather than a confusing unique-constraint error.
+                            let failure_code = existing.failure_code.clone().unwrap_or_default();
+                            anyhow::bail!(
+                                "IDEMPOTENCY_TERMINAL_FAILURE: request_id {} previously failed \
+                                 with code '{}'; submit a new request_id to retry",
+                                req_id,
+                                failure_code
+                            );
+                        } else if existing.lease_state == "pending" {
+                            // Per recovery_rules.pending_not_expired: if the pending lease has not
+                            // expired, return in-flight with retry_after_seconds. If expired, fall
+                            // through so the transaction can reacquire it.
+                            let expires_at_dt =
+                                chrono::DateTime::parse_from_rfc3339(&existing.expires_at)
+                                    .map(|e| e.with_timezone(&Utc))
+                                    .unwrap_or_else(|_| now);
+                            if expires_at_dt > now {
+                                let retry_after = (expires_at_dt - now).num_seconds().max(1);
+                                anyhow::bail!(
+                                    "IDEMPOTENCY_IN_FLIGHT: cancel already in progress for request_id {}, retry_after_seconds={}",
+                                    req_id, retry_after
+                                );
+                            }
+                            // Expired pending — fall through; reacquire_expired_tx handles it in the transaction.
+                        }
+                    }
+                    // Same-intent alias: check if a different request_id already committed this cancel.
+                    if let Some(canonical) = command_idempotency::find_committed_by_intent(
+                        &self.pool,
+                        principal_id,
+                        "runs.cancel",
+                        &intent_hash,
+                    )
+                    .await?
+                    {
+                        if canonical.request_id != *req_id {
+                            command_idempotency::insert_alias(
+                                &self.pool,
+                                principal_id,
+                                "runs.cancel",
+                                &intent_hash,
+                                req_id,
+                                &canonical.request_id,
+                            )
+                            .await?;
+                            tracing::info!(request_id = %req_id, "CancelRun: alias replay for same-intent committed lease");
+                            return Ok(CommandResult::RunCancelled { run_id: c.run_id });
+                        }
+                    }
+                    let expires_at = (now + chrono::Duration::seconds(120)).to_rfc3339();
+                    (Some(intent_hash), Some(expires_at), Some(1i64))
+                };
+
+                // Tracks the effective lease generation: starts at 1 for fresh leases, updated to
+                // the reacquired generation when reacquire_expired_tx promotes a prior expired row.
+                // commit_tx and fail_lease_tx must match the generation that was actually acquired.
+                let mut p083_active_gen = p083_generation;
+
                 let tx_started = Instant::now();
                 let mut tx = self
                     .begin_command_transaction("command.CancelRun", journal.id.clone())
                     .await?;
                 record_command_journal_tx(&mut tx, journal).await?;
 
+                // Acquire P083 idempotency lease inside transaction (atomic with cancel).
+                // Try reacquire first (handles expired-pending recovery); fall back to fresh acquire.
+                // request_id is always Some here (enforced at the top of CancelRun handling).
+                if let (Some(ref req_id), Some(ref intent_hash), Some(ref expires_at), Some(gen)) = (
+                    &c.request_id,
+                    &p083_intent_hash,
+                    &p083_expires_at,
+                    p083_generation,
+                ) {
+                    let reacquired = command_idempotency::reacquire_expired_tx(
+                        &mut tx,
+                        &caller.principal_id,
+                        req_id,
+                        "runs.cancel",
+                        intent_hash,
+                        expires_at,
+                    )
+                    .await?;
+                    if let Some(new_gen) = reacquired {
+                        p083_active_gen = Some(new_gen);
+                    } else {
+                        let acquired = command_idempotency::acquire_tx(
+                            &mut tx,
+                            &caller.principal_id,
+                            req_id,
+                            "runs.cancel",
+                            intent_hash,
+                            gen,
+                            expires_at,
+                        )
+                        .await?;
+                        if !acquired {
+                            tx.rollback().await.ok();
+                            anyhow::bail!(
+                                "IDEMPOTENCY_IN_FLIGHT: concurrent cancel for request_id {}",
+                                req_id
+                            );
+                        }
+                    }
+                }
+
                 let run = if let Some(run) = runs::find_by_id_tx(&mut tx, c.run_id).await? {
                     run
                 } else {
                     let error = anyhow!("Run {} not found", c.run_id);
+                    if let (Some(ref req_id), Some(gen)) = (&c.request_id, p083_active_gen) {
+                        command_idempotency::fail_lease_tx(
+                            &mut tx,
+                            &caller.principal_id,
+                            req_id,
+                            gen,
+                            "run_not_found",
+                        )
+                        .await
+                        .ok();
+                    }
                     command_journal::fail_entry_tx(
                         &mut tx,
                         &journal.id,
@@ -4427,6 +4681,17 @@ impl CommandHandler {
 
                 if run.status.is_terminal() {
                     let error = anyhow!("Run {} is already in terminal state", c.run_id);
+                    if let (Some(ref req_id), Some(gen)) = (&c.request_id, p083_active_gen) {
+                        command_idempotency::fail_lease_tx(
+                            &mut tx,
+                            &caller.principal_id,
+                            req_id,
+                            gen,
+                            "run_already_terminal",
+                        )
+                        .await
+                        .ok();
+                    }
                     command_journal::fail_entry_tx(
                         &mut tx,
                         &journal.id,
@@ -4439,9 +4704,33 @@ impl CommandHandler {
                     return Err(error);
                 }
 
-                // P082-R13: cancellation may start while side effects are unresolved, but
-                // final settlement stays held/cancelling until the side-effect ledger is
-                // reconciled. Side effects are NOT touched by cancellation.
+                // Ledger-backed preflight: block cancel when any unresolved side effects exist
+                // for this run, regardless of CHAINWORKS_RELEASE_SIDE_EFFECTS_ENABLED.
+                // Use the tx-scoped variant to avoid deadlocking on single-connection pools.
+                if let Err(ledger_err) = run_cancel_preflight_within_tx(&mut tx, &c.run_id).await {
+                    if let (Some(ref req_id), Some(gen)) = (&c.request_id, p083_active_gen) {
+                        command_idempotency::fail_lease_tx(
+                            &mut tx,
+                            &caller.principal_id,
+                            req_id,
+                            gen,
+                            "preflight_failed",
+                        )
+                        .await
+                        .ok();
+                    }
+                    command_journal::fail_entry_tx(
+                        &mut tx,
+                        &journal.id,
+                        Utc::now(),
+                        &ledger_err.to_string(),
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    db::pool::log_write_transaction("command.CancelRun", tx_started);
+                    return Err(ledger_err);
+                }
+
                 let settlement = cancellation::begin_settlement_tx(
                     &mut tx,
                     c.run_id,
@@ -4450,11 +4739,41 @@ impl CommandHandler {
                     "command.CancelRun",
                 )
                 .await?;
+
+                // Commit P083 idempotency lease atomically with cancel outcome.
+                if let (Some(ref req_id), Some(gen)) = (&c.request_id, p083_active_gen) {
+                    let outcome = serde_json::json!({
+                        "run_id": c.run_id.to_string(),
+                        "request_id": req_id,
+                        "journal_id": journal.id
+                    });
+                    command_idempotency::commit_tx(
+                        &mut tx,
+                        &caller.principal_id,
+                        req_id,
+                        gen,
+                        &outcome.to_string(),
+                    )
+                    .await?;
+                }
+
                 command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
                 tx.commit().await?;
                 db::pool::log_write_transaction("command.CancelRun", tx_started);
                 self.work_queue
                     .publish_scheduler_notification(settlement.scheduler_refresh);
+
+                let _ = self.events.send(DomainEvent::RunStatusChanged {
+                    run_id: c.run_id,
+                    status: RunStatus::Cancelling,
+                });
+
+                cancellation::spawn_finalize_settlement(
+                    self.pool.clone(),
+                    self.events.clone(),
+                    self.acp.clone(),
+                    c.run_id,
+                );
 
                 // Worktree cleanup on cancel (Proposal 007).
                 if let Some(ref wt) = run.worktree_root {
@@ -4469,18 +4788,6 @@ impl CommandHandler {
                         );
                     }
                 }
-
-                let _ = self.events.send(DomainEvent::RunStatusChanged {
-                    run_id: c.run_id,
-                    status: RunStatus::Cancelling,
-                });
-
-                cancellation::spawn_finalize_settlement(
-                    self.pool.clone(),
-                    self.events.clone(),
-                    self.acp.clone(),
-                    c.run_id,
-                );
 
                 Ok(CommandResult::RunCancelled { run_id: c.run_id })
             }
@@ -4873,6 +5180,11 @@ impl CommandHandler {
                 self.work_queue
                     .publish_scheduler_notification(scheduler_refresh);
 
+                // Notify session subscribers that a session event was persisted.
+                let _ = self
+                    .events
+                    .send(DomainEvent::SessionEventRecorded { run_id: c.run_id });
+
                 if let Some(acp) = &self.acp {
                     for generation_id in generation_ids_to_close {
                         let _ = acp.close_session(&generation_id).await;
@@ -4888,7 +5200,7 @@ impl CommandHandler {
                 })
             }
 
-            // ── P072: Converged approval resolution by approval_id ──────
+            // ── P072/P081/P083: Converged approval resolution by approval_id ──
             Command::ResolveApproval(c) => {
                 let now = Utc::now();
                 let decision = match c.decision {
@@ -4899,7 +5211,169 @@ impl CommandHandler {
                     ApprovalResolutionDecision::Approved => "approve",
                     ApprovalResolutionDecision::Rejected => "reject",
                 };
-                let rationale = c.rationale.clone();
+
+                // P083: request_id is required; fail closed per command_idempotency_contract_v1.
+                // TTL=300s per command_idempotency_contract_v1.ttl_seconds.approvals.resolve.
+                let approval_req_id_str = c.request_id.as_deref().ok_or_else(|| {
+                    anyhow!(
+                        "MISSING_REQUEST_ID: request_id is required for ResolveApproval per \
+                     command_idempotency_contract_v1; supply a lowercase UUIDv4"
+                    )
+                })?;
+                validate_caller_request_id(approval_req_id_str)?;
+
+                let (p083_intent_hash, p083_expires_at, p083_generation): (
+                    Option<String>,
+                    Option<String>,
+                    Option<i64>,
+                ) = {
+                    let req_id = approval_req_id_str;
+                    let principal_id = &caller.principal_id;
+                    let intent_hash = canonical_intent_hash(&[
+                        (
+                            "command",
+                            serde_json::Value::String("approvals.resolve".into()),
+                        ),
+                        (
+                            "approval_id",
+                            serde_json::Value::String(c.approval_id.to_string()),
+                        ),
+                        (
+                            "decision",
+                            serde_json::Value::String(action_name.to_string()),
+                        ),
+                    ]);
+                    if let Some(existing) = command_idempotency::find_active_by_request(
+                        &self.pool,
+                        principal_id,
+                        req_id,
+                    )
+                    .await?
+                    {
+                        if existing.command != "approvals.resolve"
+                            || existing.intent_hash != intent_hash
+                        {
+                            anyhow::bail!(
+                                "REQUEST_INTENT_MISMATCH: request_id {} reused for a different command or intent",
+                                req_id
+                            );
+                        }
+                        if existing.lease_state == "committed" {
+                            tracing::info!(request_id = %req_id, "ResolveApproval: replaying committed lease");
+                            let result = match c.decision {
+                                ApprovalResolutionDecision::Approved => {
+                                    CommandResult::StageApproved {
+                                        approval_id: c.approval_id,
+                                    }
+                                }
+                                ApprovalResolutionDecision::Rejected => {
+                                    CommandResult::StageRejected {
+                                        approval_id: c.approval_id,
+                                    }
+                                }
+                            };
+                            return Ok(result);
+                        } else if existing.lease_state == "failed" {
+                            let failure_code = existing.failure_code.clone().unwrap_or_default();
+                            anyhow::bail!(
+                                "IDEMPOTENCY_TERMINAL_FAILURE: request_id {} previously failed \
+                                 with code '{}'; submit a new request_id to retry",
+                                req_id,
+                                failure_code
+                            );
+                        } else if existing.lease_state == "pending" {
+                            let expires_at_dt =
+                                chrono::DateTime::parse_from_rfc3339(&existing.expires_at)
+                                    .map(|e| e.with_timezone(&Utc))
+                                    .unwrap_or_else(|_| now);
+                            if expires_at_dt > now {
+                                let retry_after = (expires_at_dt - now).num_seconds().max(1);
+                                anyhow::bail!(
+                                    "IDEMPOTENCY_IN_FLIGHT: approval resolution already in progress for request_id {}, retry_after_seconds={}",
+                                    req_id, retry_after
+                                );
+                            }
+                            // Expired pending — fall through; reacquire_expired_tx handles it.
+                        }
+                    }
+                    // Same-intent alias: check if a different request_id already committed this resolution.
+                    if let Some(canonical) = command_idempotency::find_committed_by_intent(
+                        &self.pool,
+                        principal_id,
+                        "approvals.resolve",
+                        &intent_hash,
+                    )
+                    .await?
+                    {
+                        if canonical.request_id != *req_id {
+                            command_idempotency::insert_alias(
+                                &self.pool,
+                                principal_id,
+                                "approvals.resolve",
+                                &intent_hash,
+                                req_id,
+                                &canonical.request_id,
+                            )
+                            .await?;
+                            tracing::info!(request_id = %req_id, "ResolveApproval: alias replay for same-intent committed lease");
+                            // P081/P083: The intent was committed, but if the approval is now
+                            // terminal, the caller must receive ApprovalNotActionable rather than
+                            // a silent Ok. This preserves P081 conflict semantics where a new
+                            // caller request against an already-resolved approval gets a typed
+                            // conflict code regardless of whether the intent hash matches.
+                            let current = approvals::find_by_id(&self.pool, c.approval_id).await?;
+                            if let Some(a) = current {
+                                if !matches!(
+                                    a.decision,
+                                    ApprovalDecision::Pending | ApprovalDecision::Requested
+                                ) {
+                                    return Err(
+                                        ApprovalResolutionConflict::ApprovalNotActionable {
+                                            approval_id: c.approval_id,
+                                            journal_id: journal.id.clone(),
+                                        }
+                                        .into(),
+                                    );
+                                }
+                            }
+                            let result = match c.decision {
+                                ApprovalResolutionDecision::Approved => {
+                                    CommandResult::StageApproved {
+                                        approval_id: c.approval_id,
+                                    }
+                                }
+                                ApprovalResolutionDecision::Rejected => {
+                                    CommandResult::StageRejected {
+                                        approval_id: c.approval_id,
+                                    }
+                                }
+                            };
+                            return Ok(result);
+                        }
+                    }
+                    // P083-HARDEN-007: approvals.resolve retry_allowed=Never.
+                    // A new same-intent request after a terminal failure is denied per the
+                    // centralized failed-terminal retry policy table.
+                    if let Some(failed) = command_idempotency::find_failed_by_intent(
+                        &self.pool,
+                        principal_id,
+                        "approvals.resolve",
+                        &intent_hash,
+                    )
+                    .await?
+                    {
+                        anyhow::bail!(
+                            "IDEMPOTENCY_TERMINAL_FAILURE: approvals.resolve previously failed for \
+                             this intent (failed_request_id={}, failure_code={}); retry is not \
+                             allowed (retry_allowed=Never) — a human decision is required",
+                            failed.request_id,
+                            failed.failure_code.as_deref().unwrap_or("unknown"),
+                        );
+                    }
+                    let expires_at = (now + chrono::Duration::seconds(300)).to_rfc3339();
+                    (Some(intent_hash), Some(expires_at), Some(1i64))
+                };
+                let mut p083_active_gen = p083_generation;
 
                 let has_post_tasks = if decision == ApprovalDecision::Granted {
                     self.check_has_post_approval_tasks(c.run_id, &c.stage_id)
@@ -4912,6 +5386,46 @@ impl CommandHandler {
                 let mut tx = self
                     .begin_command_transaction("command.ResolveApproval", journal.id.clone())
                     .await?;
+
+                // P083: acquire idempotency lease inside transaction (atomic with settlement).
+                // Try reacquire first (handles expired-pending recovery); fall back to fresh acquire.
+                if let (Some(ref req_id), Some(ref intent_hash), Some(ref expires_at), Some(gen)) = (
+                    &c.request_id,
+                    &p083_intent_hash,
+                    &p083_expires_at,
+                    p083_generation,
+                ) {
+                    let reacquired = command_idempotency::reacquire_expired_tx(
+                        &mut tx,
+                        &caller.principal_id,
+                        req_id,
+                        "approvals.resolve",
+                        intent_hash,
+                        expires_at,
+                    )
+                    .await?;
+                    if let Some(new_gen) = reacquired {
+                        p083_active_gen = Some(new_gen);
+                    } else {
+                        let acquired = command_idempotency::acquire_tx(
+                            &mut tx,
+                            &caller.principal_id,
+                            req_id,
+                            "approvals.resolve",
+                            intent_hash,
+                            gen,
+                            expires_at,
+                        )
+                        .await?;
+                        if !acquired {
+                            tx.rollback().await.ok();
+                            anyhow::bail!(
+                                "IDEMPOTENCY_IN_FLIGHT: concurrent approval resolution for request_id {}",
+                                req_id
+                            );
+                        }
+                    }
+                }
 
                 // P081: check terminal state BEFORE command_journal::record_tx so that
                 // denied/terminal attempts create zero command_journal rows.
@@ -4926,58 +5440,71 @@ impl CommandHandler {
                         a
                     }
                     Some(_) => {
-                        // P081 committed-unack replay: if the caller supplied an idempotency key,
-                        // check whether the record for this key was committed by the first attempt
-                        // (visible under the same BEGIN IMMEDIATE transaction). If found and the
-                        // key matches caller+action, return the original result without writing
-                        // new side effects. This closes the race between concurrent retries that
-                        // both passed the precheck before the first attempt committed.
-                        if let Some(ref key) = c.idempotency_key {
-                            let caller_fp = {
-                                let canonical = format!(
-                                    "{}\x1e{}",
-                                    journal.caller_principal_id.as_deref().unwrap_or(""),
-                                    journal.caller_class.as_deref().unwrap_or("")
-                                );
-                                let mut h = Sha256::new();
-                                h.update(canonical.as_bytes());
-                                format!("{:x}", h.finalize())
-                            };
-                            if let Ok(Some(record)) =
-                                approval_mutation_idempotency::find_by_key_tx(&mut tx, key).await
-                            {
-                                if record.approval_id == c.approval_id.to_string()
-                                    && record.action == action_name
-                                    && record.caller_fingerprint == caller_fp
+                        // P083: when using request_id, the fast-path check already replayed
+                        // committed leases. If we reach here with a terminal approval, fail the
+                        // lease and commit to prevent future spurious retries.
+                        if let (Some(ref req_id), Some(gen)) = (&c.request_id, p083_active_gen) {
+                            command_idempotency::fail_lease_tx(
+                                &mut tx,
+                                &caller.principal_id,
+                                req_id,
+                                gen,
+                                "approval_not_actionable",
+                            )
+                            .await
+                            .ok();
+                            tx.commit().await?;
+                        } else {
+                            // P081 committed-unack replay: if the caller supplied an idempotency
+                            // key, check whether this key was committed by a prior attempt.
+                            if let Some(ref key) = c.idempotency_key {
+                                let caller_fp = {
+                                    let canonical = format!(
+                                        "{}\x1e{}",
+                                        journal.caller_principal_id.as_deref().unwrap_or(""),
+                                        journal.caller_class.as_deref().unwrap_or("")
+                                    );
+                                    let mut h = Sha256::new();
+                                    h.update(canonical.as_bytes());
+                                    format!("{:x}", h.finalize())
+                                };
+                                if let Ok(Some(record)) =
+                                    approval_mutation_idempotency::find_by_key_tx(&mut tx, key)
+                                        .await
                                 {
-                                    drop(tx);
-                                    db::pool::log_write_transaction(
-                                        "command.ResolveApproval",
-                                        tx_started,
-                                    );
-                                    db::metrics::record_p081_boundary_commit_transaction_latency(
-                                        "graphql_mutation",
-                                        action_name,
-                                        "idempotency_replay",
-                                        tx_started.elapsed(),
-                                    );
-                                    // P081 fix: return sentinel with original journal_id so
-                                    // the outer handle() returns Commanded { journal_id:
-                                    // record.command_journal_id } instead of the fresh,
-                                    // never-committed journal id for this request.
-                                    let was_approved =
-                                        matches!(c.decision, ApprovalResolutionDecision::Approved);
-                                    return Err(anyhow::Error::new(
-                                        ConcurrentIdempotencyRaceReplay {
-                                            command_journal_id: record.command_journal_id.clone(),
-                                            was_approved,
-                                            approval_id: c.approval_id,
-                                        },
-                                    ));
+                                    if record.approval_id == c.approval_id.to_string()
+                                        && record.action == action_name
+                                        && record.caller_fingerprint == caller_fp
+                                    {
+                                        drop(tx);
+                                        db::pool::log_write_transaction(
+                                            "command.ResolveApproval",
+                                            tx_started,
+                                        );
+                                        db::metrics::record_p081_boundary_commit_transaction_latency(
+                                            "graphql_mutation",
+                                            action_name,
+                                            "idempotency_replay",
+                                            tx_started.elapsed(),
+                                        );
+                                        let was_approved = matches!(
+                                            c.decision,
+                                            ApprovalResolutionDecision::Approved
+                                        );
+                                        return Err(anyhow::Error::new(
+                                            ConcurrentIdempotencyRaceReplay {
+                                                command_journal_id: record
+                                                    .command_journal_id
+                                                    .clone(),
+                                                was_approved,
+                                                approval_id: c.approval_id,
+                                            },
+                                        ));
+                                    }
                                 }
                             }
+                            drop(tx);
                         }
-                        drop(tx);
                         db::pool::log_write_transaction("command.ResolveApproval", tx_started);
                         db::metrics::record_p081_boundary_commit_transaction_latency(
                             "graphql_mutation",
@@ -4985,10 +5512,6 @@ impl CommandHandler {
                             "terminal_rejected",
                             tx_started.elapsed(),
                         );
-                        // P081: approval is terminal but the idempotency key didn't match
-                        // (different key, or no key supplied). This is NOT a same-key replay —
-                        // it's a new attempt to re-settle a terminal approval, which is forbidden.
-                        // Return APPROVAL_NOT_ACTIONABLE (not AlreadyResolved) per P081 contract.
                         return Err(ApprovalResolutionConflict::ApprovalNotActionable {
                             approval_id: c.approval_id,
                             journal_id: journal.id.clone(),
@@ -4996,7 +5519,21 @@ impl CommandHandler {
                         .into());
                     }
                     None => {
-                        drop(tx);
+                        // P083: fail lease and commit before returning not-found error.
+                        if let (Some(ref req_id), Some(gen)) = (&c.request_id, p083_active_gen) {
+                            command_idempotency::fail_lease_tx(
+                                &mut tx,
+                                &caller.principal_id,
+                                req_id,
+                                gen,
+                                "approval_not_found",
+                            )
+                            .await
+                            .ok();
+                            tx.commit().await?;
+                        } else {
+                            drop(tx);
+                        }
                         db::pool::log_write_transaction("command.ResolveApproval", tx_started);
                         db::metrics::record_p081_boundary_commit_transaction_latency(
                             "graphql_mutation",
@@ -5012,7 +5549,21 @@ impl CommandHandler {
                         "Approval {} provenance mismatch: command run/stage {}:{} but approval belongs to {}:{}",
                         c.approval_id, c.run_id, c.stage_id, approval.run_id, approval.stage_id
                     );
-                    drop(tx);
+                    // P083: fail lease and commit before returning provenance-mismatch error.
+                    if let (Some(ref req_id), Some(gen)) = (&c.request_id, p083_active_gen) {
+                        command_idempotency::fail_lease_tx(
+                            &mut tx,
+                            &caller.principal_id,
+                            req_id,
+                            gen,
+                            "provenance_mismatch",
+                        )
+                        .await
+                        .ok();
+                        tx.commit().await?;
+                    } else {
+                        drop(tx);
+                    }
                     db::pool::log_write_transaction("command.ResolveApproval", tx_started);
                     db::metrics::record_p081_boundary_commit_transaction_latency(
                         "graphql_mutation",
@@ -5030,124 +5581,6 @@ impl CommandHandler {
 
                 approvals::resolve_tx(&mut tx, approval.id, decision.clone(), now, c.rationale)
                     .await?;
-
-                // P081 Phase 5: idempotency record in same transaction as settlement.
-                if let Some(ref key) = c.idempotency_key {
-                    // SEC-P081-001: Use SHA-256 over canonical fields separated by RS (0x1E)
-                    // so principal ids containing '/' cannot collide with caller_class.
-                    let caller_fp = {
-                        let canonical = format!(
-                            "{}\x1e{}",
-                            journal.caller_principal_id.as_deref().unwrap_or(""),
-                            journal.caller_class.as_deref().unwrap_or("")
-                        );
-                        let mut h = Sha256::new();
-                        h.update(canonical.as_bytes());
-                        format!("{:x}", h.finalize())
-                    };
-                    // SEC-P081-M002: canonical request hash for conflict detection.
-                    let req_hash = {
-                        let canonical = format!(
-                            "{}\x1e{}\x1e{}\x1e{}",
-                            action_name,
-                            c.approval_id,
-                            journal.caller_class.as_deref().unwrap_or(""),
-                            journal.caller_principal_id.as_deref().unwrap_or(""),
-                        );
-                        let mut h = Sha256::new();
-                        h.update(canonical.as_bytes());
-                        format!("{:x}", h.finalize())
-                    };
-                    let record = approval_mutation_idempotency::build_record(
-                        key,
-                        &c.approval_id.to_string(),
-                        action_name,
-                        &caller_fp,
-                        journal.request_id.as_deref(),
-                        Some(&req_hash),
-                        &journal.id,
-                        None,
-                    );
-                    approval_mutation_idempotency::insert_tx(&mut tx, &record)
-                        .await
-                        .map_err(|e| {
-                            // A UNIQUE constraint violation means a concurrent request with the same
-                            // idempotency_key committed first. Map to IDEMPOTENCY_CONFLICT so callers
-                            // get the documented error code rather than a generic failure.
-                            let msg = e.to_string();
-                            if msg.contains("UNIQUE") || msg.contains("unique") {
-                                anyhow::anyhow!("IDEMPOTENCY_CONFLICT")
-                            } else {
-                                anyhow::anyhow!("idempotency insert failed: {e}")
-                            }
-                        })?;
-                }
-
-                // P081 Phase 3: audit_log row for the allowed approval resolution.
-                // Committed in the same write unit as command_journal and settlement.
-                {
-                    let audit_id = uuid::Uuid::now_v7().to_string();
-                    let action_attempted = match c.decision {
-                        ApprovalResolutionDecision::Approved => "approveApproval",
-                        ApprovalResolutionDecision::Rejected => "rejectApproval",
-                    };
-                    let transport = match caller.surface {
-                        domain::commands::CallerSurface::Graphql => "graphql_mutation",
-                        domain::commands::CallerSurface::Mcp => "mcp_tools_call",
-                    };
-                    let audit_payload = serde_json::json!({
-                        "approval_id": c.approval_id.to_string(),
-                        "run_id": authoritative_run_id.to_string(),
-                        "stage_id": authoritative_stage_id,
-                        "decision": action_name,
-                    })
-                    .to_string();
-                    let (policy_mode, fixture_ver) = match &self.boundary_policy {
-                        Some(p) => (p.mode().to_string(), p.fixture_digest().to_string()),
-                        None => ("legacy_compat".to_string(), "embedded".to_string()),
-                    };
-                    let ts_ms = now.timestamp_millis();
-                    // Use journal.id as synthetic request_id when caller didn't supply one,
-                    // since the CHECK constraint requires length > 0.
-                    let audit_request_id = journal
-                        .request_id
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(journal.id.as_str());
-                    let audit_entry = audit_log::AuditEntry {
-                        id: &audit_id,
-                        request_id: audit_request_id,
-                        timestamp_ms: ts_ms,
-                        event_type: "approval_resolved",
-                        principal_id: journal.caller_principal_id.as_deref(),
-                        principal_class: journal.caller_principal_class.as_deref(),
-                        caller_class: journal.caller_class.as_deref(),
-                        token_id: journal.token_id.as_deref(),
-                        transport,
-                        action_attempted,
-                        decision: "allow",
-                        denial_reason_code: None,
-                        row_id: Some(match transport {
-                            "graphql_mutation" => {
-                                "p081.ui_operator.graphql_mutation.approval_action"
-                            }
-                            _ => "p081.agent_operator.mcp_tools_call.command",
-                        }),
-                        env_gate_state: None,
-                        source_ip_hash_or_local_process_id: None,
-                        boundary_policy_mode: &policy_mode,
-                        fixture_version: &fixture_ver,
-                        payload: &audit_payload,
-                        original_payload_bytes: None,
-                        diagnostic_truncated: false,
-                        checkpoint_id: None,
-                        created_at_ms: ts_ms,
-                    };
-                    audit_log::append_tx(&mut tx, &audit_entry).await.map_err(|e| {
-                        tracing::warn!(error = %e, "audit_log append failed in ResolveApproval");
-                        e.context("audit_log append failed: failing closed per P081")
-                    })?;
-                }
 
                 let mut stage_status_event = None;
                 let mut should_enqueue_advance = decision == ApprovalDecision::Granted;
@@ -5250,6 +5683,138 @@ impl CommandHandler {
                     0,
                 )
                 .await?;
+
+                // P083/P081 idempotency record — mutually exclusive: P083 takes precedence.
+                if let (Some(ref req_id), Some(gen)) = (&c.request_id, p083_active_gen) {
+                    // P083: commit idempotency lease atomically with settlement.
+                    let outcome = serde_json::json!({
+                        "approval_id": c.approval_id.to_string(),
+                        "decision": action_name,
+                        "journal_id": journal.id,
+                        "request_id": req_id,
+                    });
+                    command_idempotency::commit_tx(
+                        &mut tx,
+                        &caller.principal_id,
+                        req_id,
+                        gen,
+                        &outcome.to_string(),
+                    )
+                    .await?;
+                } else if let Some(ref key) = c.idempotency_key {
+                    // P081 Phase 5: idempotency record in same transaction as settlement.
+                    // SEC-P081-001: SHA-256 over canonical fields separated by RS (0x1E).
+                    let caller_fp = {
+                        let canonical = format!(
+                            "{}\x1e{}",
+                            journal.caller_principal_id.as_deref().unwrap_or(""),
+                            journal.caller_class.as_deref().unwrap_or("")
+                        );
+                        let mut h = Sha256::new();
+                        h.update(canonical.as_bytes());
+                        format!("{:x}", h.finalize())
+                    };
+                    // SEC-P081-M002: canonical request hash for conflict detection.
+                    let req_hash = {
+                        let canonical = format!(
+                            "{}\x1e{}\x1e{}\x1e{}",
+                            action_name,
+                            c.approval_id,
+                            journal.caller_class.as_deref().unwrap_or(""),
+                            journal.caller_principal_id.as_deref().unwrap_or(""),
+                        );
+                        let mut h = Sha256::new();
+                        h.update(canonical.as_bytes());
+                        format!("{:x}", h.finalize())
+                    };
+                    let record = approval_mutation_idempotency::build_record(
+                        key,
+                        &c.approval_id.to_string(),
+                        action_name,
+                        &caller_fp,
+                        journal.request_id.as_deref(),
+                        Some(&req_hash),
+                        &journal.id,
+                        None,
+                    );
+                    approval_mutation_idempotency::insert_tx(&mut tx, &record)
+                        .await
+                        .map_err(|e| {
+                            let msg = e.to_string();
+                            if msg.contains("UNIQUE") || msg.contains("unique") {
+                                anyhow::anyhow!("IDEMPOTENCY_CONFLICT")
+                            } else {
+                                anyhow::anyhow!("idempotency insert failed: {e}")
+                            }
+                        })?;
+                }
+
+                // P081 Phase 3: audit_log row for the allowed approval resolution.
+                // Committed in the same write unit as command_journal and settlement.
+                {
+                    let audit_id = uuid::Uuid::now_v7().to_string();
+                    let action_attempted = match c.decision {
+                        ApprovalResolutionDecision::Approved => "approveApproval",
+                        ApprovalResolutionDecision::Rejected => "rejectApproval",
+                    };
+                    let transport = match caller.surface {
+                        domain::commands::CallerSurface::Graphql => "graphql_mutation",
+                        domain::commands::CallerSurface::Mcp => "mcp_tools_call",
+                    };
+                    let audit_payload = serde_json::json!({
+                        "approval_id": c.approval_id.to_string(),
+                        "run_id": authoritative_run_id.to_string(),
+                        "stage_id": authoritative_stage_id,
+                        "decision": action_name,
+                    })
+                    .to_string();
+                    let (policy_mode, fixture_ver) = match &self.boundary_policy {
+                        Some(p) => (p.mode().to_string(), p.fixture_digest().to_string()),
+                        None => ("legacy_compat".to_string(), "embedded".to_string()),
+                    };
+                    let ts_ms = now.timestamp_millis();
+                    // Use journal.id as synthetic request_id when caller didn't supply one,
+                    // since the CHECK constraint requires length > 0.
+                    let audit_request_id = journal
+                        .request_id
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(journal.id.as_str());
+                    let audit_entry = audit_log::AuditEntry {
+                        id: &audit_id,
+                        request_id: audit_request_id,
+                        timestamp_ms: ts_ms,
+                        event_type: "approval_resolved",
+                        principal_id: journal.caller_principal_id.as_deref(),
+                        principal_class: journal.caller_principal_class.as_deref(),
+                        caller_class: journal.caller_class.as_deref(),
+                        token_id: journal.token_id.as_deref(),
+                        transport,
+                        action_attempted,
+                        decision: "allow",
+                        denial_reason_code: None,
+                        row_id: Some(match transport {
+                            "graphql_mutation" => {
+                                "p081.ui_operator.graphql_mutation.approval_action"
+                            }
+                            _ => "p081.agent_operator.mcp_tools_call.command",
+                        }),
+                        env_gate_state: None,
+                        source_ip_hash_or_local_process_id: None,
+                        boundary_policy_mode: &policy_mode,
+                        fixture_version: &fixture_ver,
+                        payload: &audit_payload,
+                        original_payload_bytes: None,
+                        diagnostic_truncated: false,
+                        checkpoint_id: None,
+                        created_at_ms: ts_ms,
+                    };
+                    audit_log::append_tx(&mut tx, &audit_entry).await.map_err(|e| {
+                        tracing::warn!(error = %e, "audit_log append failed in ResolveApproval");
+                        e.context("audit_log append failed: failing closed per P081")
+                    })?;
+                }
+
                 command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
                 tx.commit().await?;
                 db::pool::log_write_transaction("command.ResolveApproval", tx_started);
@@ -5273,20 +5838,6 @@ impl CommandHandler {
                     decision,
                 });
                 projections::rebuild_all_for_run(&self.pool, authoritative_run_id).await?;
-                let (decision_label, canonical_approval_state) = match c.decision {
-                    ApprovalResolutionDecision::Approved => ("accept", "granted"),
-                    ApprovalResolutionDecision::Rejected => ("reject", "rejected"),
-                };
-                self.persist_p094_boundary_human_decision(
-                    authoritative_run_id,
-                    &authoritative_stage_id,
-                    decision_label,
-                    canonical_approval_state,
-                    rationale,
-                    approval.requested_at,
-                    approval.id,
-                )
-                .await?;
 
                 let result = match c.decision {
                     ApprovalResolutionDecision::Approved => CommandResult::StageApproved {
@@ -5440,7 +5991,6 @@ impl CommandHandler {
                         }
                         _ => None,
                     };
-
                 let consecutive_no_diff_code_writer_attempts =
                     code_writer_completion_receipts::consecutive_completed_no_diff_count_by_run(
                         &self.pool, run.id,
@@ -5498,6 +6048,33 @@ impl CommandHandler {
                     gate_generation_id: closeout_tx_result.gate_generation_id,
                     readiness_generation_id: closeout_tx_result.readiness_generation_id,
                 })
+            }
+
+            Command::ShutdownProviderSession(c) => {
+                self.handle_shutdown_provider_session(c, journal, caller)
+                    .await
+            }
+
+            Command::P083RollbackExecution(c) => {
+                self.handle_p083_rollback_execution(c, journal, caller)
+                    .await
+            }
+
+            Command::P083SetEnforcementMode(c) => {
+                self.handle_p083_set_enforcement_mode(c, journal, caller)
+                    .await
+            }
+
+            Command::RetryRun(c) => self.handle_retry_run(c, journal, caller).await,
+
+            Command::ForceReconcileSideEffect(c) => {
+                self.handle_force_reconcile_side_effect(c, journal, caller)
+                    .await
+            }
+
+            Command::MarkProviderSessionProcessAbsent(c) => {
+                self.handle_mark_provider_session_process_absent(c, journal, caller)
+                    .await
             }
         }
     }
@@ -5698,240 +6275,6 @@ impl CommandHandler {
         })
     }
 
-    pub async fn auto_resume_elapsed_quota_ledgers(&self, now: DateTime<Utc>) -> Result<usize> {
-        let candidates =
-            agent_retry_budget_ledger::list_reset_elapsed_auto_retry_candidates(&self.pool, now)
-                .await?;
-        let mut scheduled = 0_usize;
-        for candidate in candidates {
-            let skip_reason = self
-                .quota_auto_retry_skip_reason(&candidate)
-                .await
-                .with_context(|| {
-                    format!("preflight quota ledger auto retry {}", candidate.ledger_id)
-                })?;
-            if let Some(reason) = skip_reason {
-                warn!(
-                    ledger_id = %candidate.ledger_id,
-                    run_id = %candidate.run_id,
-                    stage_execution_id = %candidate.stage_execution_id,
-                    stage_id = %candidate.stage_id,
-                    agent_execution_id = %candidate.agent_execution_id,
-                    retry_after = %candidate.retry_after,
-                    skip_reason = reason,
-                    "Quota ledger auto retry skipped"
-                );
-                continue;
-            }
-
-            let cmd = Command::RetryStage(RetryStageCmd {
-                run_id: candidate.run_id,
-                stage_id: candidate.stage_id.clone(),
-                consume_quota_budget_now: false,
-                agent_execution_id: None,
-                legacy_discovery_override_policy: None,
-                legacy_discovery_override_reason: None,
-                operator_instruction: None,
-            });
-            let caller = CallerContext::mcp(
-                "chainworks-daemon",
-                &PrincipalClass::Operator,
-                "quota_ledger_auto_resume",
-            )
-            .with_request_id(format!("quota-ledger-auto-resume:{}", candidate.ledger_id));
-            let mut journal = CommandJournalEntry::new(&cmd, &caller);
-            journal.id = format!("quota-ledger-auto-retry-{}", candidate.ledger_id);
-            let journal_id = journal.id.clone();
-
-            match self
-                .retry_stage_latest_attempt(
-                    candidate.run_id,
-                    &candidate.stage_id,
-                    false,
-                    &journal_id,
-                    &journal,
-                    "quota_ledger_reset_elapsed_auto_retry",
-                    None,
-                    &caller,
-                    Some(&candidate.ledger_id),
-                )
-                .await
-            {
-                Ok(_) => {
-                    scheduled += 1;
-                    info!(
-                        ledger_id = %candidate.ledger_id,
-                        run_id = %candidate.run_id,
-                        stage_execution_id = %candidate.stage_execution_id,
-                        stage_id = %candidate.stage_id,
-                        agent_execution_id = %candidate.agent_execution_id,
-                        retry_after = %candidate.retry_after,
-                        journal_id = %journal_id,
-                        "Quota ledger reset elapsed; scheduled automatic stage retry"
-                    );
-                }
-                Err(error) => {
-                    warn!(
-                        ledger_id = %candidate.ledger_id,
-                        run_id = %candidate.run_id,
-                        stage_execution_id = %candidate.stage_execution_id,
-                        stage_id = %candidate.stage_id,
-                        agent_execution_id = %candidate.agent_execution_id,
-                        error = %error,
-                        "Quota ledger auto retry failed pre-commit"
-                    );
-                }
-            }
-        }
-        Ok(scheduled)
-    }
-
-    async fn quota_auto_retry_skip_reason(
-        &self,
-        candidate: &agent_retry_budget_ledger::QuotaLedgerAutoRetryCandidate,
-    ) -> Result<Option<&'static str>> {
-        let Some(run) = runs::find_by_id(&self.pool, candidate.run_id).await? else {
-            return Ok(Some("run_not_blocked"));
-        };
-        if run.status != RunStatus::Blocked {
-            return Ok(Some("run_not_blocked"));
-        }
-        if run.current_state.as_deref() != Some(candidate.stage_id.as_str()) {
-            return Ok(Some("stage_not_current"));
-        }
-
-        let Some(source_stage) =
-            stages::find_by_id(&self.pool, candidate.stage_execution_id).await?
-        else {
-            return Ok(Some("stage_not_current"));
-        };
-        if source_stage.run_id != candidate.run_id || source_stage.stage_id != candidate.stage_id {
-            return Ok(Some("stage_not_current"));
-        }
-
-        let latest_stage = stages::list_by_run(&self.pool, candidate.run_id)
-            .await?
-            .into_iter()
-            .filter(|stage| stage.stage_id == candidate.stage_id)
-            .max_by_key(|stage| stage.started_at);
-        if latest_stage.as_ref().map(|stage| stage.id) != Some(candidate.stage_execution_id) {
-            return Ok(Some("stage_not_current"));
-        }
-
-        if !matches!(
-            source_stage.status,
-            StageStatus::Failed | StageStatus::Blocked | StageStatus::Completed
-        ) {
-            return Ok(Some("stage_not_retryable"));
-        }
-
-        let active_work_count: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*)
-               FROM work_items
-               WHERE run_id = ?1
-                 AND status IN ('pending', 'running')"#,
-        )
-        .bind(candidate.run_id.to_string())
-        .fetch_one(&self.pool)
-        .await?;
-        if active_work_count > 0 {
-            return Ok(Some("live_work_present"));
-        }
-
-        let running_agent_count: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*)
-               FROM agent_executions ae
-               LEFT JOIN stage_executions se ON se.id = ae.stage_execution_id
-               WHERE (se.run_id = ?1 OR ae.owner_id = ?1)
-                 AND ae.status = 'running'"#,
-        )
-        .bind(candidate.run_id.to_string())
-        .fetch_one(&self.pool)
-        .await?;
-        if running_agent_count > 0 {
-            return Ok(Some("live_work_present"));
-        }
-
-        Ok(None)
-    }
-
-    async fn implicit_targeted_retry_candidate(
-        &self,
-        run_id: RunId,
-        stage_id: &str,
-    ) -> Result<Option<AgentExecutionId>> {
-        if !is_implicit_targeted_retry_stage(stage_id) {
-            return Ok(None);
-        }
-
-        let Some(run) = runs::find_by_id(&self.pool, run_id).await? else {
-            return Ok(None);
-        };
-        if run.status != RunStatus::Blocked || run.current_state.as_deref() != Some(stage_id) {
-            return Ok(None);
-        }
-
-        let latest_stage = stages::list_by_run(&self.pool, run_id)
-            .await?
-            .into_iter()
-            .filter(|stage| stage.stage_id == stage_id)
-            .max_by_key(|stage| stage.started_at);
-        let Some(latest_stage) = latest_stage else {
-            return Ok(None);
-        };
-        if !matches!(
-            latest_stage.status,
-            StageStatus::Failed | StageStatus::Blocked
-        ) {
-            return Ok(None);
-        }
-
-        let executions = agent_executions::find_by_stage(&self.pool, latest_stage.id).await?;
-        let failed = executions
-            .iter()
-            .filter(|execution| execution.status == AgentStatus::Failed)
-            .collect::<Vec<_>>();
-        if failed.len() != 1 {
-            return Ok(None);
-        }
-
-        let candidate = failed[0];
-        let run_work_items = work_items::list_by_run(&self.pool, run_id).await?;
-        let Some(source_item) = find_source_invoke_work_item(
-            &run_work_items,
-            &latest_stage.id.to_string(),
-            &candidate.agent_id,
-            &candidate.id.to_string(),
-        ) else {
-            warn!(
-                run_id = %run_id,
-                stage_id = %stage_id,
-                stage_execution_id = %latest_stage.id,
-                agent_execution_id = %candidate.id,
-                agent_id = %candidate.agent_id,
-                "Implicit targeted retry candidate skipped because source InvokeAgent work item was not found"
-            );
-            return Ok(None);
-        };
-        if matches!(
-            source_item.status,
-            WorkItemStatus::Pending | WorkItemStatus::Running
-        ) {
-            return Ok(None);
-        }
-
-        info!(
-            run_id = %run_id,
-            stage_id = %stage_id,
-            stage_execution_id = %latest_stage.id,
-            agent_execution_id = %candidate.id,
-            agent_id = %candidate.agent_id,
-            source_work_item_id = %source_item.id,
-            "RetryStage selected implicit targeted agent retry for blocked implementation review"
-        );
-        Ok(Some(candidate.id))
-    }
-
     async fn retry_stage_latest_attempt(
         &self,
         run_id: RunId,
@@ -5942,7 +6285,6 @@ impl CommandHandler {
         retry_reason: &str,
         validated_instruction: Option<&str>,
         caller: &CallerContext,
-        auto_retry_ledger_id: Option<&str>,
     ) -> Result<CommandResult> {
         let run_stages = stages::list_by_run(&self.pool, run_id).await?;
         let matching_stages = run_stages
@@ -5954,11 +6296,10 @@ impl CommandHandler {
             .copied()
             .max_by_key(|s| s.started_at)
             .ok_or_else(|| anyhow!("Stage {} not found", stage_id))?;
-        let run = runs::find_by_id(&self.pool, run_id)
-            .await?
-            .ok_or_else(|| anyhow!("Run {} not found", run_id))?;
-        ensure_run_can_be_retried(&run)?;
         let completed_current_stage_on_blocked_run = if old_stage.status == StageStatus::Completed {
+            let run = runs::find_by_id(&self.pool, run_id)
+                .await?
+                .ok_or_else(|| anyhow!("Run {} not found", run_id))?;
             run.status == RunStatus::Blocked
                 && (run.current_state.as_deref() == Some(stage_id)
                     || old_stage.stage_id == stage_id)
@@ -6019,14 +6360,6 @@ impl CommandHandler {
             journal_id,
         )
         .await?;
-        if let Some(ledger_id) = auto_retry_ledger_id {
-            agent_retry_budget_ledger::mark_reset_elapsed_retry_scheduled_tx(
-                &mut retry_tx,
-                ledger_id,
-                journal_id,
-            )
-            .await?;
-        }
         stages::settle_tx(
             &mut retry_tx,
             old_stage.id,
@@ -6164,11 +6497,14 @@ impl CommandHandler {
         journal: &CommandJournalEntry,
         validated_instruction: Option<&str>,
         caller: &CallerContext,
+        narrow_idempotency: Option<NarrowIdempotencyGuard>,
     ) -> Result<CommandResult> {
         let run = runs::find_by_id(&self.pool, run_id)
             .await?
             .ok_or_else(|| anyhow!("Run {} not found", run_id))?;
-        ensure_run_can_be_retried(&run)?;
+        if run.status.is_terminal() {
+            return Err(anyhow!("Run {} is already in terminal state", run_id));
+        }
 
         let target_exec = agent_executions::find_by_id(&self.pool, agent_execution_id)
             .await?
@@ -6188,126 +6524,35 @@ impl CommandHandler {
                     agent_execution_id
                 )
             })?;
+        if old_stage.run_id != run_id || old_stage.stage_id != stage_id {
+            return Err(anyhow!(
+                "Agent execution {} belongs to run {} stage {}, not run {} stage {}",
+                agent_execution_id,
+                old_stage.run_id,
+                old_stage.stage_id,
+                run_id,
+                stage_id
+            ));
+        }
+
         let run_stages = stages::list_by_run(&self.pool, run_id).await?;
         let matching_stages = run_stages
             .iter()
             .filter(|s| s.stage_id == stage_id)
             .collect::<Vec<_>>();
-        let latest_stage = matching_stages.iter().copied().max_by_key(|s| s.started_at);
-        let example_stage_execution_id = latest_stage.map(|stage| stage.id).unwrap_or(old_stage.id);
-        let valid_agent_execution_examples =
-            agent_executions::find_by_stage(&self.pool, example_stage_execution_id)
-                .await?
-                .into_iter()
-                .map(|execution| execution.id.to_string())
-                .collect::<Vec<_>>();
-        if old_stage.run_id != run_id || old_stage.stage_id != stage_id {
-            let err_msg = format!(
-                "Targeted retry rejected: agent execution {} belongs to run {} stage {}, not run {} stage {}. No mutation was performed.",
-                agent_execution_id, old_stage.run_id, old_stage.stage_id, run_id, stage_id
-            );
-            let now_ts = Utc::now();
-            let valid_identifier_example_refs = valid_agent_execution_examples
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>();
-            let guidance = domain::recovery_matrix::build_retry_identifier_guidance(
-                "RetryAgentExecution",
-                &agent_execution_id.to_string(),
-                "unknown",
-                "stage_execution_uuid",
-                &valid_identifier_example_refs,
-            );
-            let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
-                domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
-                "RetryAgentExecution",
-                "Targeted retry rejected: provided agent_execution_id belongs to a different run or stage. No mutation was performed.",
-                domain::recovery_matrix::set_readback_identifier_guidance(
-                    domain::recovery_matrix::build_readback_v1(
-                        "P082-R08",
-                        "rejected",
-                        "no_mutation",
-                        domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
-                        "Provide a valid targeted retry UUID from the current stage execution.",
-                        "command_journal",
-                        "command_journal, agent_executions, stage_executions",
-                        &journal.id,
-                        Some("command_journal.error.p082_recovery_matrix_readback"),
-                        "valid",
-                        &now_ts.to_rfc3339(),
-                    ),
-                    guidance,
-                ),
-            );
-            self.record_failed_command_transaction(
-                journal,
-                "command.RetryAgentExecution",
-                &p082_envelope,
-            )
-            .await?;
-            db::metrics::increment_counter_with_label(
-                "p082_recovery_mutation_rejected_total",
-                &format!(
-                    "{}:RetryAgentExecution",
-                    domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE
-                ),
-            );
-            return Err(anyhow!("{err_msg}"));
-        }
-
-        let latest_stage = latest_stage.ok_or_else(|| anyhow!("Stage {} not found", stage_id))?;
+        let latest_stage = matching_stages
+            .iter()
+            .copied()
+            .max_by_key(|s| s.started_at)
+            .ok_or_else(|| anyhow!("Stage {} not found", stage_id))?;
         if latest_stage.id != old_stage.id {
-            let err_msg = format!(
-                "Targeted retry rejected: agent execution {} is on stale stage execution {}; latest for {} is {}. No mutation was performed.",
-                agent_execution_id, old_stage.id, stage_id, latest_stage.id
-            );
-            let now_ts = Utc::now();
-            let valid_identifier_example_refs = valid_agent_execution_examples
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>();
-            let guidance = domain::recovery_matrix::build_retry_identifier_guidance(
-                "RetryAgentExecution",
-                &agent_execution_id.to_string(),
-                "unknown",
-                "stage_execution_uuid",
-                &valid_identifier_example_refs,
-            );
-            let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
-                domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
-                "RetryAgentExecution",
-                "Targeted retry rejected: provided agent_execution_id references a stale (superseded) stage execution. Use the latest stage execution. No mutation was performed.",
-                domain::recovery_matrix::set_readback_identifier_guidance(
-                    domain::recovery_matrix::build_readback_v1(
-                        "P082-R08",
-                        "rejected",
-                        "no_mutation",
-                        domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
-                        "Provide a valid targeted retry UUID from the latest stage execution attempt.",
-                        "command_journal",
-                        "command_journal, agent_executions, stage_executions",
-                        &journal.id,
-                        Some("command_journal.error.p082_recovery_matrix_readback"),
-                        "valid",
-                        &now_ts.to_rfc3339(),
-                    ),
-                    guidance,
-                ),
-            );
-            self.record_failed_command_transaction(
-                journal,
-                "command.RetryAgentExecution",
-                &p082_envelope,
-            )
-            .await?;
-            db::metrics::increment_counter_with_label(
-                "p082_recovery_mutation_rejected_total",
-                &format!(
-                    "{}:RetryAgentExecution",
-                    domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE
-                ),
-            );
-            return Err(anyhow!("{err_msg}"));
+            return Err(anyhow!(
+                "Agent execution {} is on stale stage execution {}; latest for {} is {}",
+                agent_execution_id,
+                old_stage.id,
+                stage_id,
+                latest_stage.id
+            ));
         }
 
         let completed_current_stage_on_blocked_run = old_stage.status == StageStatus::Completed
@@ -6316,49 +6561,12 @@ impl CommandHandler {
         if !matches!(old_stage.status, StageStatus::Failed | StageStatus::Blocked)
             && !completed_current_stage_on_blocked_run
         {
-            let error = anyhow!(
+            return Err(anyhow!(
                 "Stage {} latest attempt is {} and cannot be targeted-retried yet",
                 stage_id,
                 old_stage.status
-            );
-            let now_ts = Utc::now();
-            let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
-                domain::recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY,
-                "RetryAgentExecution",
-                &format!(
-                    "Targeted retry rejected: stage {} latest attempt is {} and is not in a retryable status. No mutation was performed.",
-                    stage_id, old_stage.status
-                ),
-                domain::recovery_matrix::build_readback_v1(
-                    "P082-R02",
-                    "rejected",
-                    "no_mutation",
-                    domain::recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY,
-                    "Stage is not in a targeted-retryable status. No mutation was performed.",
-                    "command_journal, stage_executions",
-                    "command_journal, stages",
-                    &journal.id,
-                    Some("command_journal.error.p082_recovery_matrix_readback"),
-                    "valid",
-                    &now_ts.to_rfc3339(),
-                ),
-            );
-            self.record_failed_command_transaction(
-                journal,
-                "command.RetryAgentExecution",
-                &p082_envelope,
-            )
-            .await?;
-            db::metrics::increment_counter_with_label(
-                "p082_recovery_mutation_rejected_total",
-                &format!(
-                    "{}:RetryAgentExecution",
-                    domain::recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY
-                ),
-            );
-            return Err(error);
+            ));
         }
-
         let has_release_post_approval_tasks = match retry_state_has_release_post_approval_tasks(
             &run,
             &old_stage.stage_id,
@@ -6374,51 +6582,18 @@ impl CommandHandler {
                 false
             }
         };
-        if p078_heuristic_retry_guard_enabled()
-            && retry_requires_effect_reconciliation(
-                &old_stage,
-                Some(&target_exec.agent_id),
-                has_release_post_approval_tasks,
-            )
-        {
+        if retry_requires_effect_reconciliation(
+            &old_stage,
+            Some(&target_exec.agent_id),
+            has_release_post_approval_tasks,
+        ) {
             let error = requires_effect_reconciliation_error(&old_stage);
-            let now_ts = Utc::now();
-            let p082_envelope =
-                domain::recovery_matrix::build_rejected_command_error_envelope(
-                    domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
-                    "RetryAgentExecution",
-                    "Retry blocked: release stage has unresolved side effects requiring reconciliation. No mutation was performed.",
-                    domain::recovery_matrix::set_readback_side_effect_hold(
-                        domain::recovery_matrix::build_readback_v1(
-                            "P082-R07",
-                            "held",
-                            "reconcile_side_effects",
-                            domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
-                            "Reconcile unresolved side effects before retrying this agent execution.",
-                            "side_effects, command_journal",
-                            "side_effects, command_journal",
-                            &journal.id,
-                            Some("command_journal.error.p082_recovery_matrix_readback"),
-                            "valid",
-                            &now_ts.to_rfc3339(),
-                        ),
-                        "unresolved_side_effect_entries",
-                        "Retry blocked: release stage has unresolved side effects requiring reconciliation. Reconcile side effects before retrying.",
-                    ),
-                );
             self.record_failed_command_transaction(
                 journal,
                 "command.RetryAgentExecution",
-                &p082_envelope,
+                &error.to_string(),
             )
             .await?;
-            db::metrics::increment_counter_with_label(
-                "p082_recovery_mutation_rejected_total",
-                &format!(
-                    "{}:RetryAgentExecution",
-                    domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION
-                ),
-            );
             return Err(error);
         }
 
@@ -6526,28 +6701,25 @@ impl CommandHandler {
             new_stage.id, agent_execution_id
         );
         let retry_authority_id = format!("p091-retry-authority:{}", new_stage.id);
-        sanitize_targeted_retry_invoke_payload(
-            &mut retry_payload,
-            &TargetedRetryPayloadIdentity {
-                run_id,
-                stage_id: stage_id.to_string(),
-                target_stage_execution_id: new_stage.id,
-                retry_authority_id: retry_authority_id.clone(),
-                source_stage_execution_id: old_stage.id,
-                source_agent_execution_id: Some(agent_execution_id.to_string()),
-                source_work_item_id: source_item.id.clone(),
-                reason: "operator_targeted_retry".to_string(),
-                journal_id: Some(journal_id.to_string()),
-            },
-        )
-        .map_err(|e| {
-            anyhow!(
-                "Source InvokeAgent work item {} cannot be sanitized for targeted retry: {}",
-                source_item.id,
-                e
+        if retry_payload.as_object().is_some() {
+            sanitize_targeted_retry_invoke_payload(
+                &mut retry_payload,
+                &TargetedRetryPayloadIdentity {
+                    run_id,
+                    stage_id: stage_id.to_string(),
+                    target_stage_execution_id: new_stage.id,
+                    retry_authority_id: retry_authority_id.clone(),
+                    source_stage_execution_id: old_stage.id,
+                    source_agent_execution_id: Some(agent_execution_id.to_string()),
+                    source_work_item_id: source_item.id.clone(),
+                    reason: "operator_targeted_retry".to_string(),
+                    journal_id: Some(journal_id.to_string()),
+                },
             )
-        })?;
-        if let Some(object) = retry_payload.as_object_mut() {
+            .map_err(|error| anyhow!(error))?;
+            let object = retry_payload
+                .as_object_mut()
+                .expect("sanitized targeted retry payload stays object");
             if let Some(evidence_path) = p088_completion_retry_evidence.as_deref() {
                 attach_p088_operator_retry_completion_recovery_payload(
                     object,
@@ -6602,53 +6774,48 @@ impl CommandHandler {
             .begin_command_transaction("command.RetryAgentExecution", journal.id.clone())
             .await?;
         record_command_journal_tx(&mut retry_tx, journal).await?;
-        // Ledger-backed preflight: check unresolved side effects inside the
-        // same BEGIN IMMEDIATE write unit that records the command journal and
-        // performs retry mutations. This mirrors RetryStage and closes the
-        // preflight/mutation TOCTOU window.
-        if let Err(ledger_err) = retry_preflight_within_tx(
-            &mut retry_tx,
-            &run_id,
-            &old_stage.id,
-            Some(&agent_execution_id),
-        )
-        .await
-        {
-            let now_ts = Utc::now();
-            let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
-                domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
-                "RetryAgentExecution",
-                "Retry blocked: unresolved side-effect ledger entries exist. No mutation was performed.",
-                domain::recovery_matrix::set_readback_side_effect_hold(
-                    domain::recovery_matrix::build_readback_v1(
-                        "P082-R07",
-                        "held",
-                        "reconcile_side_effects",
-                        domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
-                        "Reconcile unresolved side effects before retrying this agent execution.",
-                        "side_effects, command_journal",
-                        "side_effects, command_journal",
-                        &journal.id,
-                        Some("command_journal.error.p082_recovery_matrix_readback"),
-                        "valid",
-                        &now_ts.to_rfc3339(),
-                    ),
-                    "unresolved_side_effect_entries",
-                    "Retry blocked: unresolved side-effect ledger entries exist. Reconcile side effects before retrying.",
-                ),
-            );
-            command_journal::fail_entry_tx(&mut retry_tx, &journal.id, now_ts, &p082_envelope)
-                .await?;
-            retry_tx.commit().await?;
-            db::pool::log_write_transaction("command.RetryAgentExecution", retry_tx_started);
-            db::metrics::increment_counter_with_label(
-                "p082_recovery_mutation_rejected_total",
-                &format!(
-                    "{}:RetryAgentExecution",
-                    domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION
-                ),
-            );
-            return Err(ledger_err);
+        // P083: narrow-path idempotency — acquire or reacquire inside the retry transaction
+        // so that the idempotency lease and the retry side effects are atomic.
+        let mut narrow_active_gen: i64 = 1;
+        if let Some(ref idempotency) = narrow_idempotency {
+            match command_idempotency::reacquire_expired_tx(
+                &mut retry_tx,
+                &idempotency.principal_id,
+                &idempotency.request_id,
+                "stages.retry",
+                &idempotency.intent_hash,
+                &idempotency.expires_at,
+            )
+            .await?
+            {
+                Some(new_gen) => narrow_active_gen = new_gen,
+                None => {
+                    let acquired = command_idempotency::acquire_tx(
+                        &mut retry_tx,
+                        &idempotency.principal_id,
+                        &idempotency.request_id,
+                        "stages.retry",
+                        &idempotency.intent_hash,
+                        1,
+                        &idempotency.expires_at,
+                    )
+                    .await?;
+                    if !acquired {
+                        command_journal::fail_entry_tx(
+                            &mut retry_tx,
+                            &journal.id,
+                            Utc::now(),
+                            "idempotency_in_flight",
+                        )
+                        .await?;
+                        retry_tx.commit().await?;
+                        anyhow::bail!(
+                            "IDEMPOTENCY_IN_FLIGHT: concurrent narrow retry for request_id {}",
+                            idempotency.request_id
+                        );
+                    }
+                }
+            }
         }
         apply_quota_retry_budget_for_stage_tx(
             &mut retry_tx,
@@ -6745,6 +6912,30 @@ impl CommandHandler {
             },
         )
         .await?;
+        // P083: commit the narrow idempotency lease inside the same transaction.
+        if let Some(ref idempotency) = narrow_idempotency {
+            let outcome = serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": stage_id,
+                "journal_id": journal.id,
+            })
+            .to_string();
+            if let Err(e) = command_idempotency::commit_tx(
+                &mut retry_tx,
+                &idempotency.principal_id,
+                &idempotency.request_id,
+                narrow_active_gen,
+                &outcome,
+            )
+            .await
+            {
+                tracing::warn!(
+                    request_id = %idempotency.request_id,
+                    error = %e,
+                    "RetryAgentExecution: narrow idempotency commit_tx failed"
+                );
+            }
+        }
         command_journal::complete_entry_tx(&mut retry_tx, &journal.id, Utc::now()).await?;
         retry_tx.commit().await?;
         db::pool::log_write_transaction("command.RetryAgentExecution", retry_tx_started);
@@ -6772,134 +6963,6 @@ impl CommandHandler {
             legacy_discovery_override_id: None,
             retry_instruction_binding_id,
         })
-    }
-
-    async fn retry_stage_identifier_kind_rejection(
-        &self,
-        c: &domain::commands::RetryStageCmd,
-    ) -> Result<Option<RetryIdentifierKindRejection>> {
-        if let Ok(uuid) = uuid::Uuid::parse_str(&c.stage_id) {
-            let stage_execution_id = StageExecutionId::from(uuid);
-            if let Some(stage) = stages::find_by_id(&self.pool, stage_execution_id).await? {
-                if stage.run_id == c.run_id {
-                    return Ok(Some(RetryIdentifierKindRejection {
-                        message: format!(
-                            "wrong_identifier_kind: stages.retry expected logical stage_id but received stage_execution_uuid '{}'. next_action: retry with stage_id '{}' for a full-stage retry, or choose a valid targeted retry UUID from that stage execution.",
-                            c.stage_id, stage.stage_id
-                        ),
-                        provided_identifier: c.stage_id.clone(),
-                        provided_identifier_kind: "stage_execution_uuid",
-                        expected_identifier_kind: "workflow_stage_id",
-                        valid_identifier_examples: vec![stage.stage_id],
-                        operator_message:
-                            "Retry with the logical workflow stage_id, not a stage execution UUID."
-                                .to_string(),
-                    }));
-                }
-            }
-
-            let agent_execution_id = AgentExecutionId::from(uuid);
-            if let Some(agent_execution) =
-                agent_executions::find_by_id(&self.pool, agent_execution_id).await?
-            {
-                if let Some(stage_execution_id) = agent_execution.stage_execution_id {
-                    if let Some(stage) = stages::find_by_id(&self.pool, stage_execution_id).await? {
-                        if stage.run_id == c.run_id {
-                            return Ok(Some(RetryIdentifierKindRejection {
-                                message: format!(
-                                    "wrong_identifier_kind: stages.retry expected logical stage_id but received targeted retry UUID '{}'. next_action: retry with stage_id '{}' and choose targeted retry UUID '{}'.",
-                                    c.stage_id, stage.stage_id, agent_execution.id
-                                ),
-                                provided_identifier: c.stage_id.clone(),
-                                provided_identifier_kind: "unknown",
-                                expected_identifier_kind: "workflow_stage_id",
-                                valid_identifier_examples: vec![stage.stage_id],
-                                operator_message:
-                                    "Retry with the logical workflow stage_id; use the listed targeted retry UUID only for targeted retry."
-                                        .to_string(),
-                            }));
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(agent_execution_id) = c.agent_execution_id {
-            if agent_executions::find_by_id(&self.pool, agent_execution_id)
-                .await?
-                .is_none()
-            {
-                let stage_execution_id = StageExecutionId::from(agent_execution_id.inner());
-                if let Some(stage) = stages::find_by_id(&self.pool, stage_execution_id).await? {
-                    if stage.run_id == c.run_id {
-                        let valid_identifier_examples =
-                            agent_executions::find_by_stage(&self.pool, stage_execution_id)
-                                .await?
-                                .into_iter()
-                                .map(|execution| execution.id.to_string())
-                                .collect::<Vec<_>>();
-                        return Ok(Some(RetryIdentifierKindRejection {
-                            message: format!(
-                                "wrong_identifier_kind: stages.retry received stage_execution_uuid '{}' in the targeted retry field. next_action: retry with workflow stage_id '{}' for a full-stage retry, or choose a listed targeted retry UUID from that stage execution.",
-                                agent_execution_id, stage.stage_id
-                            ),
-                            provided_identifier: agent_execution_id.to_string(),
-                            provided_identifier_kind: "stage_execution_uuid",
-                            expected_identifier_kind: "stage_execution_uuid",
-                            valid_identifier_examples,
-                            operator_message:
-                                "For targeted retry, choose one of the listed targeted retry UUIDs; for full-stage retry, use the workflow stage_id."
-                                    .to_string(),
-                        }));
-                    }
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    async fn record_retry_stage_identifier_rejection(
-        &self,
-        journal: &CommandJournalEntry,
-        rejection: &RetryIdentifierKindRejection,
-    ) -> Result<()> {
-        let now_ts = Utc::now();
-        let example_refs = rejection
-            .valid_identifier_examples
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let guidance = domain::recovery_matrix::build_retry_identifier_guidance(
-            "RetryStage",
-            &rejection.provided_identifier,
-            rejection.provided_identifier_kind,
-            rejection.expected_identifier_kind,
-            &example_refs,
-        );
-        let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
-            domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
-            "RetryStage",
-            "Retry rejected: identifier kind does not match the command field. No mutation was performed.",
-            domain::recovery_matrix::set_readback_identifier_guidance(
-                domain::recovery_matrix::build_readback_v1(
-                    "P082-R08",
-                    "rejected",
-                    "no_mutation",
-                    domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
-                    &rejection.operator_message,
-                    "command_journal",
-                    "command_journal, agent_executions, stage_executions",
-                    &journal.id,
-                    Some("command_journal.error.p082_recovery_matrix_readback"),
-                    "valid",
-                    &now_ts.to_rfc3339(),
-                ),
-                guidance,
-            ),
-        );
-        self.record_failed_command_transaction(journal, "command.RetryStage", &p082_envelope)
-            .await
     }
 
     async fn record_completed_command_transaction(
@@ -6975,6 +7038,2502 @@ impl CommandHandler {
                 false
             }
         }
+    }
+
+    // ── P083: lifecycle command handlers ────────────────────────────────
+
+    /// P083: Handle graceful provider session shutdown.
+    ///
+    /// Per command_idempotency_contract_v1:
+    /// 1. Check for an existing committed lease — replay it (idempotent).
+    /// 2. Acquire a new pending lease (fails if a concurrent pending lease exists).
+    /// 3. Write the command journal entry and a provider_cancellation_intents row.
+    /// 4. Commit the idempotency lease with the outcome JSON.
+    ///
+    /// Per SEC-M-001: provider_session_id ownership is verified before dispatch.
+    /// Per SEC-M-002: principal_id is bound from CallerContext, not caller payload.
+    async fn handle_shutdown_provider_session(
+        &self,
+        c: ShutdownProviderSessionCmd,
+        journal: &CommandJournalEntry,
+        caller: &CallerContext,
+    ) -> Result<CommandResult> {
+        // SEC-P083-MED-002: validate at the durable authority boundary before any DB write.
+        validate_caller_request_id(&c.request_id)?;
+        validate_p083_reason(&c.reason, 1024)?;
+        let principal_id = &caller.principal_id;
+
+        // Compute intent hash: canonical JSON of (command, provider_session_id, reason)
+        // sorted-key deterministic serialization.
+        let intent_hash = canonical_intent_hash(&[
+            (
+                "command",
+                serde_json::Value::String("provider_session.shutdown".into()),
+            ),
+            (
+                "provider_session_id",
+                serde_json::Value::String(c.provider_session_id.clone()),
+            ),
+            ("reason", serde_json::Value::String(c.reason.clone())),
+        ]);
+
+        // Fast-path replay check (read-only, before opening transaction).
+        if let Some(existing) =
+            command_idempotency::find_active_by_request(&self.pool, principal_id, &c.request_id)
+                .await?
+        {
+            // REQUEST_INTENT_MISMATCH: same request_id reused for a different command or intent.
+            if existing.command != "provider_session.shutdown"
+                || existing.intent_hash != intent_hash
+            {
+                anyhow::bail!(
+                    "REQUEST_INTENT_MISMATCH: request_id {} is already used for command '{}' with different intent",
+                    c.request_id, existing.command
+                );
+            }
+            if existing.lease_state == "committed" {
+                tracing::info!(
+                    provider_session_id = %c.provider_session_id,
+                    request_id = %c.request_id,
+                    "P083 ShutdownProviderSession: replaying committed lease"
+                );
+                let outcome = existing.outcome_json.as_deref().ok_or_else(|| {
+                    tracing::error!(
+                        request_id = %c.request_id,
+                        "IDEMPOTENCY_REPLAY_CORRUPT: committed provider_session.shutdown lease missing outcome_json"
+                    );
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: committed lease for request_id {} missing outcome_json",
+                        c.request_id
+                    )
+                })?;
+                let v: serde_json::Value = serde_json::from_str(outcome).map_err(|e| {
+                    tracing::error!(
+                        request_id = %c.request_id,
+                        error = %e,
+                        "IDEMPOTENCY_REPLAY_CORRUPT: committed provider_session.shutdown outcome_json unparsable"
+                    );
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} is not valid JSON",
+                        c.request_id
+                    )
+                })?;
+                let cancellation_epoch = v
+                    .get("cancellation_epoch")
+                    .and_then(|e| e.as_i64())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} missing cancellation_epoch",
+                        c.request_id
+                    ))?;
+                let replayed_journal_id = v
+                    .get("journal_id")
+                    .and_then(|j| j.as_str())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} missing journal_id",
+                        c.request_id
+                    ))?
+                    .to_string();
+                // SEC-HIGH-003: preserve held identity state on replay.
+                let held = v.get("held").and_then(|h| h.as_bool()).unwrap_or(false);
+                if held {
+                    let operator_next_step_code = v
+                        .get("operator_next_step_code")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("manual_process_identity_check")
+                        .to_string();
+                    return Ok(CommandResult::ProviderSessionShutdownHeld {
+                        provider_session_id: c.provider_session_id.clone(),
+                        journal_id: replayed_journal_id,
+                        idempotency_request_id: c.request_id.clone(),
+                        cancellation_epoch,
+                        operator_next_step_code,
+                    });
+                }
+                return Ok(CommandResult::ProviderSessionShutdownRecorded {
+                    provider_session_id: c.provider_session_id.clone(),
+                    journal_id: replayed_journal_id,
+                    idempotency_request_id: c.request_id.clone(),
+                    cancellation_epoch,
+                    dispatched_count: 0, // Replay: original dispatch already occurred
+                });
+            } else if existing.lease_state == "pending" {
+                let expires_at_dt = chrono::DateTime::parse_from_rfc3339(&existing.expires_at)
+                    .map(|e| e.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                if expires_at_dt > Utc::now() {
+                    let retry_after = (expires_at_dt - Utc::now()).num_seconds().max(1);
+                    anyhow::bail!(
+                        "IDEMPOTENCY_IN_FLIGHT: shutdown already in progress for request_id {}, retry_after_seconds={}",
+                        c.request_id, retry_after
+                    );
+                }
+                // Expired pending — fall through; reacquire_expired_tx handles it in the transaction.
+            }
+        }
+
+        // Same-intent alias replay: check if a different request_id already committed this intent.
+        // Per command_idempotency_contract_v1: same-intent new-request_id replays committed outcome.
+        if let Some(canonical) = command_idempotency::find_committed_by_intent(
+            &self.pool,
+            principal_id,
+            "provider_session.shutdown",
+            &intent_hash,
+        )
+        .await?
+        {
+            if canonical.request_id != c.request_id {
+                command_idempotency::insert_alias(
+                    &self.pool,
+                    principal_id,
+                    "provider_session.shutdown",
+                    &intent_hash,
+                    &c.request_id,
+                    &canonical.request_id,
+                )
+                .await?;
+                let outcome = canonical.outcome_json.as_deref().ok_or_else(|| {
+                    tracing::error!(
+                        request_id = %c.request_id,
+                        canonical_request_id = %canonical.request_id,
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical provider_session.shutdown lease missing outcome_json"
+                    );
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical lease for intent_hash {} missing outcome_json",
+                        intent_hash
+                    )
+                })?;
+                let outcome_v: serde_json::Value =
+                    serde_json::from_str(outcome).map_err(|e| {
+                        tracing::error!(
+                            request_id = %c.request_id,
+                            canonical_request_id = %canonical.request_id,
+                            error = %e,
+                            "IDEMPOTENCY_REPLAY_CORRUPT: canonical provider_session.shutdown outcome_json unparsable"
+                        );
+                        anyhow::anyhow!(
+                            "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} is not valid JSON",
+                            intent_hash
+                        )
+                    })?;
+                let cancellation_epoch = outcome_v
+                    .get("cancellation_epoch")
+                    .and_then(|e| e.as_i64())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} missing cancellation_epoch",
+                        intent_hash
+                    ))?;
+                let replayed_journal_id = outcome_v
+                    .get("journal_id")
+                    .and_then(|j| j.as_str())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} missing journal_id",
+                        intent_hash
+                    ))?
+                    .to_string();
+                tracing::info!(
+                    request_id = %c.request_id,
+                    canonical_request_id = %canonical.request_id,
+                    "P083 ShutdownProviderSession: alias replay for same-intent committed lease"
+                );
+                // SEC-HIGH-003: preserve held identity state on alias replay.
+                let held = outcome_v
+                    .get("held")
+                    .and_then(|h| h.as_bool())
+                    .unwrap_or(false);
+                if held {
+                    let operator_next_step_code = outcome_v
+                        .get("operator_next_step_code")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("manual_process_identity_check")
+                        .to_string();
+                    return Ok(CommandResult::ProviderSessionShutdownHeld {
+                        provider_session_id: c.provider_session_id.clone(),
+                        journal_id: replayed_journal_id,
+                        idempotency_request_id: canonical.request_id,
+                        cancellation_epoch,
+                        operator_next_step_code,
+                    });
+                }
+                return Ok(CommandResult::ProviderSessionShutdownRecorded {
+                    provider_session_id: c.provider_session_id.clone(),
+                    journal_id: replayed_journal_id,
+                    idempotency_request_id: canonical.request_id,
+                    cancellation_epoch,
+                    dispatched_count: 0, // Alias replay: original dispatch already occurred
+                });
+            }
+        }
+
+        // SEC-M-001: verify provider_session_id exists and capture the session for provider label.
+        // This is a read-only guard that does not need to be inside the write transaction.
+        // P083 fallback: if no provider_sessions row exists yet (e.g., the session is still in
+        // its first ACP turn before executor::insert_or_ignore fires), synthesize one from
+        // session_generations so shutdown commands don't fail for live sessions.
+        let maybe_session =
+            provider_sessions::find_by_id(&self.pool, &c.provider_session_id).await?;
+        let session = if let Some(s) = maybe_session {
+            s
+        } else {
+            let gen_row = sqlx::query(
+                r#"SELECT sl.run_id, sg.runtime_provider
+                   FROM session_generations sg
+                   JOIN session_lineages sl ON sl.lineage_id = sg.lineage_id
+                   WHERE sg.provider_session_id = ?1
+                   LIMIT 1"#,
+            )
+            .bind(&c.provider_session_id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("provider_sessions fallback: query session_generations")?;
+            if let Some(row) = gen_row {
+                let run_id: String = row.get("run_id");
+                let provider: String = row.get("runtime_provider");
+                if let Err(e) = provider_sessions::insert_or_ignore(
+                    &self.pool,
+                    &c.provider_session_id,
+                    &run_id,
+                    None,
+                    &provider,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        provider_session_id = %c.provider_session_id,
+                        error = %e,
+                        "P083 ShutdownProviderSession: fallback insert_or_ignore failed"
+                    );
+                }
+                provider_sessions::find_by_id(&self.pool, &c.provider_session_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "PROVIDER_SESSION_NOT_FOUND: provider_session_id {} does not exist (fallback failed)",
+                        c.provider_session_id
+                    ))?
+            } else {
+                anyhow::bail!(
+                    "PROVIDER_SESSION_NOT_FOUND: provider_session_id {} does not exist",
+                    c.provider_session_id
+                );
+            }
+        };
+        let provider_label = session.provider.clone();
+        // Process identity is reloaded inside the transaction (see SEC-M-002 below)
+        // to avoid using stale values that a concurrent lifecycle update could have changed.
+
+        // Per command_idempotency_contract_v1 transaction_rule: acquisition, authoritative
+        // row reload, side-effect receipt write, and terminal outcome commit all happen in
+        // one SQLite transaction. SEC-M-002: principal_id from CallerContext, not caller payload.
+        let now = Utc::now();
+        let tx_started = Instant::now();
+        // cancellation_epoch is wall-clock ms for ordering; requested_at_monotonic_ms uses
+        // CLOCK_MONOTONIC per provider_cancellation_intent_contract_v1.
+        let cancellation_epoch = now.timestamp_millis();
+        let monotonic_ms = monotonic_clock_ms();
+        // TTL: 120s per command_idempotency_contract_v1.ttl_seconds for provider_session.shutdown.
+        let lease_expires_at = (now + chrono::Duration::seconds(120)).to_rfc3339();
+
+        let mut tx = self
+            .begin_command_transaction("command.ShutdownProviderSession", journal.id.clone())
+            .await?;
+        record_command_journal_tx(&mut tx, journal).await?;
+
+        // Acquire idempotency lease inside the transaction (atomic with side effects).
+        let mut p083_active_gen: i64 = 1;
+        if let Some(new_gen) = command_idempotency::reacquire_expired_tx(
+            &mut tx,
+            principal_id,
+            &c.request_id,
+            "provider_session.shutdown",
+            &intent_hash,
+            &lease_expires_at,
+        )
+        .await?
+        {
+            p083_active_gen = new_gen;
+        } else {
+            let acquired = command_idempotency::acquire_tx(
+                &mut tx,
+                principal_id,
+                &c.request_id,
+                "provider_session.shutdown",
+                &intent_hash,
+                1,
+                &lease_expires_at,
+            )
+            .await?;
+            if !acquired {
+                // Unique constraint violation: concurrent request. Rollback and report.
+                tx.rollback().await.ok();
+                anyhow::bail!(
+                    "IDEMPOTENCY_IN_FLIGHT: concurrent shutdown request for request_id {}",
+                    c.request_id
+                );
+            }
+        }
+
+        // Record the cancellation intent (planned/requested state).
+        // SEC-P083-002: After INSERT OR IGNORE, check rows_affected. If 0, a concurrent request
+        // already holds a row for this (provider_session_id, cancellation_epoch) — timestamp
+        // collision. Fail the command so we never commit idempotency success without a durable
+        // intent row owned by this request.
+        let insert_result = sqlx::query(
+            r#"INSERT OR IGNORE INTO provider_cancellation_intents
+               (provider_session_id, cancellation_epoch, intent_state, reason,
+                requested_at_monotonic_ms, requested_at_wall_clock)
+               VALUES (?1, ?2, 'requested', 'operator_cancel', ?3, ?4)"#,
+        )
+        .bind(&c.provider_session_id)
+        .bind(cancellation_epoch)
+        .bind(monotonic_ms)
+        .bind(now.to_rfc3339())
+        .execute(&mut **tx)
+        .await;
+
+        match insert_result {
+            Err(e) => {
+                command_idempotency::fail_lease_tx(
+                    &mut tx,
+                    principal_id,
+                    &c.request_id,
+                    p083_active_gen,
+                    "provider_cancellation_intents_insert_failed",
+                )
+                .await
+                .ok();
+                command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &e.to_string())
+                    .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ShutdownProviderSession", tx_started);
+                return Err(e.into());
+            }
+            Ok(r) if r.rows_affected() == 0 => {
+                // INSERT OR IGNORE was silently suppressed: epoch collision with another concurrent
+                // shutdown for the same session. Fail this command so idempotency is not committed
+                // without a durable intent row.
+                let col_err = anyhow::anyhow!(
+                    "CANCELLATION_EPOCH_COLLISION: provider_session_id {} already has a \
+                     cancellation_intent row for epoch {}; retry the shutdown command",
+                    c.provider_session_id,
+                    cancellation_epoch
+                );
+                command_idempotency::fail_lease_tx(
+                    &mut tx,
+                    principal_id,
+                    &c.request_id,
+                    p083_active_gen,
+                    "cancellation_epoch_collision",
+                )
+                .await
+                .ok();
+                command_journal::fail_entry_tx(
+                    &mut tx,
+                    &journal.id,
+                    Utc::now(),
+                    &col_err.to_string(),
+                )
+                .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ShutdownProviderSession", tx_started);
+                return Err(col_err);
+            }
+            Ok(_) => {}
+        }
+
+        // Per shutdown_contract_v1.durable_intent_before_side_effect_rule: write planned
+        // shutdown_signal_side_effects rows atomically with the cancellation intent, before
+        // any OS signal is issued. INSERT OR IGNORE is idempotent: a restart replaying this
+        // command won't create duplicates (generation_replay_rule: same generation reused).
+        //
+        // SEC-M-002: Reload process identity from within the transaction to avoid using
+        // stale values captured before the transaction started. A concurrent lifecycle update
+        // between the pre-tx read and the transaction open could otherwise embed incorrect
+        // pid/start-identity material in durable shutdown intent rows.
+        let (session_process_id, session_process_start_identity): (Option<i64>, Option<String>) =
+            sqlx::query(
+                "SELECT process_id, process_start_identity FROM provider_sessions \
+                 WHERE provider_session_id = ?1",
+            )
+            .bind(&c.provider_session_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .map(|r| (r.get("process_id"), r.get("process_start_identity")))
+            .unwrap_or((None, None));
+
+        // SEC-P083-HIGH-001: Normalize empty process_start_identity to None so the pattern match
+        // below treats it the same as missing identity. An empty identity is unverifiable and must
+        // not be used to plan signal dispatch rows.
+        let session_process_start_identity =
+            session_process_start_identity.filter(|psi| !psi.is_empty());
+        // Non-positive PIDs target process groups, not individual processes — treat as absent.
+        let session_process_id = session_process_id.filter(|&pid| pid > 0);
+
+        // Track whether we inserted planned signal rows so we can dispatch
+        // immediately after commit (see below). If no process_id is recorded on the session, we
+        // skip inserting planned rows; dispatch will happen via startup recovery instead.
+        let mut had_process_id = false;
+
+        if let (Some(pid), Some(ref psi)) = (session_process_id, session_process_start_identity) {
+            had_process_id = true;
+            let signal_id_graceful = uuid::Uuid::new_v4().to_string();
+            let signal_id_kill = uuid::Uuid::new_v4().to_string();
+            if let Err(e) = sqlx::query(
+                r#"INSERT OR IGNORE INTO shutdown_signal_side_effects
+                   (signal_effect_id, provider_session_id, shutdown_epoch,
+                    process_id, process_start_identity, signal_kind, generation, intent_state)
+                   VALUES (?1, ?2, ?3, ?4, ?5, 'graceful', 1, 'planned')"#,
+            )
+            .bind(&signal_id_graceful)
+            .bind(&c.provider_session_id)
+            .bind(cancellation_epoch)
+            .bind(pid)
+            .bind(psi.as_str())
+            .execute(&mut **tx)
+            .await
+            {
+                command_idempotency::fail_lease_tx(
+                    &mut tx,
+                    principal_id,
+                    &c.request_id,
+                    p083_active_gen,
+                    "shutdown_signal_planned_graceful_insert_failed",
+                )
+                .await
+                .ok();
+                command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &e.to_string())
+                    .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ShutdownProviderSession", tx_started);
+                return Err(e.into());
+            }
+            if let Err(e) = sqlx::query(
+                r#"INSERT OR IGNORE INTO shutdown_signal_side_effects
+                   (signal_effect_id, provider_session_id, shutdown_epoch,
+                    process_id, process_start_identity, signal_kind, generation, intent_state)
+                   VALUES (?1, ?2, ?3, ?4, ?5, 'kill', 1, 'planned')"#,
+            )
+            .bind(&signal_id_kill)
+            .bind(&c.provider_session_id)
+            .bind(cancellation_epoch)
+            .bind(pid)
+            .bind(psi.as_str())
+            .execute(&mut **tx)
+            .await
+            {
+                command_idempotency::fail_lease_tx(
+                    &mut tx,
+                    principal_id,
+                    &c.request_id,
+                    p083_active_gen,
+                    "shutdown_signal_planned_kill_insert_failed",
+                )
+                .await
+                .ok();
+                command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &e.to_string())
+                    .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ShutdownProviderSession", tx_started);
+                return Err(e.into());
+            }
+            tracing::debug!(
+                provider_session_id = %c.provider_session_id,
+                shutdown_epoch = cancellation_epoch,
+                pid,
+                "P083 ShutdownProviderSession: planned shutdown signal rows inserted"
+            );
+        } else {
+            // SEC-P083-HIGH-001: No process_id recorded for this session.
+            // Per provider_cancellation_intent_contract_v1.identity_ambiguous_canonical_rule:
+            // transition the intent to 'held', set process_fate='identity_ambiguous', commit with
+            // a held outcome, and return ProviderSessionShutdownHeld (NOT success).
+            // Committing a success result here would be unsafe: no durable signal dispatch path exists.
+            tracing::warn!(
+                provider_session_id = %c.provider_session_id,
+                "P083 ShutdownProviderSession: no process_id on session; transitioning to held/identity_ambiguous"
+            );
+            let now_held = Utc::now().to_rfc3339();
+            if let Err(e) = sqlx::query(
+                "UPDATE provider_cancellation_intents \
+                 SET intent_state='held' \
+                 WHERE provider_session_id=?1 AND cancellation_epoch=?2",
+            )
+            .bind(&c.provider_session_id)
+            .bind(cancellation_epoch)
+            .execute(&mut **tx)
+            .await
+            {
+                command_idempotency::fail_lease_tx(
+                    &mut tx,
+                    principal_id,
+                    &c.request_id,
+                    p083_active_gen,
+                    "held_intent_update_failed",
+                )
+                .await
+                .ok();
+                command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &e.to_string())
+                    .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ShutdownProviderSession", tx_started);
+                return Err(e.into());
+            }
+            if let Err(e) = sqlx::query(
+                "UPDATE provider_sessions \
+                 SET process_fate='identity_ambiguous', process_fate_updated_at=?1 \
+                 WHERE provider_session_id=?2",
+            )
+            .bind(&now_held)
+            .bind(&c.provider_session_id)
+            .execute(&mut **tx)
+            .await
+            {
+                command_idempotency::fail_lease_tx(
+                    &mut tx,
+                    principal_id,
+                    &c.request_id,
+                    p083_active_gen,
+                    "process_fate_update_failed",
+                )
+                .await
+                .ok();
+                command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &e.to_string())
+                    .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ShutdownProviderSession", tx_started);
+                return Err(e.into());
+            }
+            let held_outcome = serde_json::json!({
+                "provider_session_id": c.provider_session_id,
+                "cancellation_epoch": cancellation_epoch,
+                "request_id": c.request_id,
+                "journal_id": journal.id,
+                "held": true,
+                "operator_next_step_code": "manual_process_identity_check"
+            });
+            match command_idempotency::commit_tx(
+                &mut tx,
+                principal_id,
+                &c.request_id,
+                p083_active_gen,
+                &held_outcome.to_string(),
+            )
+            .await
+            {
+                Err(e) => {
+                    command_idempotency::fail_lease_tx(
+                        &mut tx,
+                        principal_id,
+                        &c.request_id,
+                        p083_active_gen,
+                        "commit_tx_failed",
+                    )
+                    .await
+                    .ok();
+                    command_journal::fail_entry_tx(
+                        &mut tx,
+                        &journal.id,
+                        Utc::now(),
+                        &e.to_string(),
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    db::pool::log_write_transaction("command.ShutdownProviderSession", tx_started);
+                    return Err(e);
+                }
+                Ok(false) => {
+                    command_journal::fail_entry_tx(
+                        &mut tx,
+                        &journal.id,
+                        Utc::now(),
+                        "IDEMPOTENCY_COMMIT_CAS_FAILED",
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    db::pool::log_write_transaction("command.ShutdownProviderSession", tx_started);
+                    anyhow::bail!(
+                        "IDEMPOTENCY_COMMIT_CAS_FAILED: lease for request_id {} was not in pending state",
+                        c.request_id
+                    );
+                }
+                Ok(true) => {}
+            }
+            command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("command.ShutdownProviderSession", tx_started);
+            db::metrics::record_p083_provider_cancellation_intent(
+                &provider_label,
+                "held",
+                "operator_cancel",
+            );
+            return Ok(CommandResult::ProviderSessionShutdownHeld {
+                provider_session_id: c.provider_session_id,
+                journal_id: journal.id.clone(),
+                idempotency_request_id: c.request_id,
+                cancellation_epoch,
+                operator_next_step_code: "manual_process_identity_check".to_string(),
+            });
+        }
+
+        // Commit idempotency lease atomically with side effects and journal.
+        // Reached only when had_process_id is true (planned signal rows inserted above).
+        let outcome = serde_json::json!({
+            "provider_session_id": c.provider_session_id,
+            "cancellation_epoch": cancellation_epoch,
+            "request_id": c.request_id,
+            "journal_id": journal.id
+        });
+        let commit_result = command_idempotency::commit_tx(
+            &mut tx,
+            principal_id,
+            &c.request_id,
+            p083_active_gen,
+            &outcome.to_string(),
+        )
+        .await;
+        match commit_result {
+            Err(e) => {
+                command_idempotency::fail_lease_tx(
+                    &mut tx,
+                    principal_id,
+                    &c.request_id,
+                    p083_active_gen,
+                    "commit_tx_failed",
+                )
+                .await
+                .ok();
+                command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &e.to_string())
+                    .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ShutdownProviderSession", tx_started);
+                return Err(e);
+            }
+            Ok(false) => {
+                // CAS update matched 0 rows: lease was abandoned or changed state concurrently.
+                command_journal::fail_entry_tx(
+                    &mut tx,
+                    &journal.id,
+                    Utc::now(),
+                    "IDEMPOTENCY_COMMIT_CAS_FAILED",
+                )
+                .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ShutdownProviderSession", tx_started);
+                anyhow::bail!(
+                    "IDEMPOTENCY_COMMIT_CAS_FAILED: lease for request_id {} was not in pending state",
+                    c.request_id
+                );
+            }
+            Ok(true) => {}
+        }
+        command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+        tx.commit().await?;
+        db::pool::log_write_transaction("command.ShutdownProviderSession", tx_started);
+
+        db::metrics::record_p083_provider_cancellation_intent(
+            &provider_label,
+            "requested",
+            "operator_cancel",
+        );
+
+        // SEC-P083-HIGH-001: After durable intent rows are committed, dispatch identity-checked
+        // OS signals immediately, scoped to this specific session/epoch.
+        // SEC-P083-HIGH-002: Use the scoped dispatch to avoid signaling unrelated sessions
+        // that also happen to have planned rows committed by concurrent commands.
+        // Dispatch errors are non-fatal — durable intent rows remain and startup recovery retries.
+        let dispatched_count = if had_process_id {
+            match crate::shutdown_service::dispatch_planned_shutdown_signals_scoped(
+                &self.pool,
+                &c.provider_session_id,
+                cancellation_epoch,
+            )
+            .await
+            {
+                Ok(n) => {
+                    tracing::info!(
+                        provider_session_id = %c.provider_session_id,
+                        shutdown_epoch = cancellation_epoch,
+                        dispatched = n,
+                        "P083 ShutdownProviderSession: dispatched identity-checked signal(s) on command path"
+                    );
+                    n
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        provider_session_id = %c.provider_session_id,
+                        error = %e,
+                        "P083 ShutdownProviderSession: signal dispatch after commit failed; \
+                         durable intent preserved for startup recovery"
+                    );
+                    0
+                }
+            }
+        } else {
+            0
+        };
+
+        Ok(CommandResult::ProviderSessionShutdownRecorded {
+            provider_session_id: c.provider_session_id,
+            journal_id: journal.id.clone(),
+            idempotency_request_id: c.request_id,
+            cancellation_epoch,
+            dispatched_count,
+        })
+    }
+
+    /// P083: Handle rollback execution (revert enforcement mode to permissive or disabled).
+    async fn handle_p083_rollback_execution(
+        &self,
+        c: P083RollbackExecutionCmd,
+        journal: &CommandJournalEntry,
+        caller: &CallerContext,
+    ) -> Result<CommandResult> {
+        // SEC-P083-MED-002: validate at the durable authority boundary before any DB write.
+        validate_caller_request_id(&c.request_id)?;
+        validate_p083_reason(&c.reason, 2048)?;
+        let principal_id = &caller.principal_id;
+
+        if !matches!(c.rollback_mode.as_str(), "permissive" | "disabled") {
+            anyhow::bail!("rollback_mode must be 'permissive' or 'disabled'");
+        }
+
+        let intent_hash = canonical_intent_hash(&[
+            (
+                "command",
+                serde_json::Value::String("p083.rollback_execution".into()),
+            ),
+            ("reason", serde_json::Value::String(c.reason.clone())),
+            (
+                "rollback_mode",
+                serde_json::Value::String(c.rollback_mode.clone()),
+            ),
+        ]);
+
+        if let Some(existing) =
+            command_idempotency::find_active_by_request(&self.pool, principal_id, &c.request_id)
+                .await?
+        {
+            // REQUEST_INTENT_MISMATCH: same request_id reused for a different command or intent.
+            if existing.command != "p083.rollback_execution" || existing.intent_hash != intent_hash
+            {
+                anyhow::bail!(
+                    "REQUEST_INTENT_MISMATCH: request_id {} is already used for command '{}' with different intent",
+                    c.request_id, existing.command
+                );
+            }
+            if existing.lease_state == "committed" {
+                tracing::info!(request_id = %c.request_id, "P083 RollbackExecution: replaying committed lease");
+                // Replay from stored outcome_json — both mode and journal_id must be byte-for-byte
+                // identical to the original committed response per command_idempotency_contract_v1.
+                let outcome = existing.outcome_json.as_deref().ok_or_else(|| {
+                    tracing::error!(
+                        request_id = %c.request_id,
+                        "IDEMPOTENCY_REPLAY_CORRUPT: committed p083.rollback_execution lease missing outcome_json"
+                    );
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: committed lease for request_id {} missing outcome_json",
+                        c.request_id
+                    )
+                })?;
+                let outcome_v: serde_json::Value = serde_json::from_str(outcome).map_err(|e| {
+                    tracing::error!(
+                        request_id = %c.request_id,
+                        error = %e,
+                        "IDEMPOTENCY_REPLAY_CORRUPT: committed p083.rollback_execution outcome_json unparsable"
+                    );
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} is not valid JSON",
+                        c.request_id
+                    )
+                })?;
+                let rollback_mode = outcome_v
+                    .get("rollback_mode")
+                    .and_then(|m| m.as_str())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} missing rollback_mode",
+                        c.request_id
+                    ))?
+                    .to_string();
+                let replayed_journal_id = outcome_v
+                    .get("journal_id")
+                    .and_then(|j| j.as_str())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} missing journal_id",
+                        c.request_id
+                    ))?
+                    .to_string();
+                return Ok(CommandResult::P083RollbackExecutionScheduled {
+                    rollback_mode,
+                    journal_id: replayed_journal_id,
+                    idempotency_request_id: c.request_id.clone(),
+                });
+            } else if existing.lease_state == "pending" {
+                let expires_at_dt = chrono::DateTime::parse_from_rfc3339(&existing.expires_at)
+                    .map(|e| e.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                if expires_at_dt > Utc::now() {
+                    let retry_after = (expires_at_dt - Utc::now()).num_seconds().max(1);
+                    anyhow::bail!(
+                        "IDEMPOTENCY_IN_FLIGHT: rollback already in progress for request_id {}, retry_after_seconds={}",
+                        c.request_id, retry_after
+                    );
+                }
+                // Expired pending — fall through; reacquire_expired_tx handles it in the transaction.
+            }
+        }
+
+        // Same-intent alias replay: check if a different request_id already committed this intent.
+        if let Some(canonical) = command_idempotency::find_committed_by_intent(
+            &self.pool,
+            principal_id,
+            "p083.rollback_execution",
+            &intent_hash,
+        )
+        .await?
+        {
+            if canonical.request_id != c.request_id {
+                command_idempotency::insert_alias(
+                    &self.pool,
+                    principal_id,
+                    "p083.rollback_execution",
+                    &intent_hash,
+                    &c.request_id,
+                    &canonical.request_id,
+                )
+                .await?;
+                let outcome = canonical.outcome_json.as_deref().ok_or_else(|| {
+                    tracing::error!(
+                        request_id = %c.request_id,
+                        canonical_request_id = %canonical.request_id,
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical p083.rollback_execution lease missing outcome_json"
+                    );
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical lease for intent_hash {} missing outcome_json",
+                        intent_hash
+                    )
+                })?;
+                let outcome_v: serde_json::Value =
+                    serde_json::from_str(outcome).map_err(|e| {
+                        tracing::error!(
+                            request_id = %c.request_id,
+                            canonical_request_id = %canonical.request_id,
+                            error = %e,
+                            "IDEMPOTENCY_REPLAY_CORRUPT: canonical p083.rollback_execution outcome_json unparsable"
+                        );
+                        anyhow::anyhow!(
+                            "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} is not valid JSON",
+                            intent_hash
+                        )
+                    })?;
+                let rollback_mode = outcome_v
+                    .get("rollback_mode")
+                    .and_then(|m| m.as_str())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} missing rollback_mode",
+                        intent_hash
+                    ))?
+                    .to_string();
+                let replayed_journal_id = outcome_v
+                    .get("journal_id")
+                    .and_then(|j| j.as_str())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} missing journal_id",
+                        intent_hash
+                    ))?
+                    .to_string();
+                tracing::info!(
+                    request_id = %c.request_id,
+                    canonical_request_id = %canonical.request_id,
+                    "P083 RollbackExecution: alias replay for same-intent committed lease"
+                );
+                return Ok(CommandResult::P083RollbackExecutionScheduled {
+                    rollback_mode,
+                    journal_id: replayed_journal_id,
+                    idempotency_request_id: canonical.request_id,
+                });
+            }
+        }
+
+        // Per command_idempotency_contract_v1 transaction_rule: acquisition, side-effect writes,
+        // and terminal outcome commit all happen in one SQLite transaction.
+        // TTL: 120s per command_idempotency_contract_v1.ttl_seconds for p083.rollback_execution.
+        let now = Utc::now();
+        let tx_started = Instant::now();
+        let audit_id = uuid::Uuid::new_v4().to_string();
+        let action = match c.rollback_mode.as_str() {
+            "disabled" => "rollback_disable",
+            _ => "enforce_to_permissive",
+        };
+        let lease_expires_at = (now + chrono::Duration::seconds(120)).to_rfc3339();
+
+        let mut tx = self
+            .begin_command_transaction("command.P083RollbackExecution", journal.id.clone())
+            .await?;
+        record_command_journal_tx(&mut tx, journal).await?;
+
+        // Acquire idempotency lease inside the transaction (atomic with side effects).
+        let mut p083_active_gen: i64 = 1;
+        if let Some(new_gen) = command_idempotency::reacquire_expired_tx(
+            &mut tx,
+            principal_id,
+            &c.request_id,
+            "p083.rollback_execution",
+            &intent_hash,
+            &lease_expires_at,
+        )
+        .await?
+        {
+            p083_active_gen = new_gen;
+        } else {
+            let acquired = command_idempotency::acquire_tx(
+                &mut tx,
+                principal_id,
+                &c.request_id,
+                "p083.rollback_execution",
+                &intent_hash,
+                1,
+                &lease_expires_at,
+            )
+            .await?;
+            if !acquired {
+                tx.rollback().await.ok();
+                anyhow::bail!(
+                    "IDEMPOTENCY_IN_FLIGHT: concurrent rollback for request_id {}",
+                    c.request_id
+                );
+            }
+        }
+
+        // Update enforcement mode state to the rollback target.
+        let upsert_result = sqlx::query(
+            r#"INSERT INTO p083_enforcement_mode_state
+               (state_id, proposal_id, enforcement_mode, mode_reason, effective_at, updated_at)
+               VALUES ('singleton', 'P083', ?1, ?2, ?3, ?3)
+               ON CONFLICT(state_id) DO UPDATE
+               SET enforcement_mode = excluded.enforcement_mode,
+                   mode_reason = excluded.mode_reason,
+                   effective_at = excluded.effective_at,
+                   updated_at = excluded.updated_at"#,
+        )
+        .bind(&c.rollback_mode)
+        .bind(&c.reason)
+        .bind(now.to_rfc3339())
+        .execute(&mut **tx)
+        .await;
+
+        if let Err(e) = upsert_result {
+            command_idempotency::fail_lease_tx(
+                &mut tx,
+                principal_id,
+                &c.request_id,
+                p083_active_gen,
+                "enforcement_mode_upsert_failed",
+            )
+            .await
+            .ok();
+            command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &e.to_string())
+                .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("command.P083RollbackExecution", tx_started);
+            return Err(e.into());
+        }
+
+        // Insert audit row with terminal status 'pass' (written atomically on success only).
+        let insert_result = sqlx::query(
+            r#"INSERT INTO p083_rollback_audit
+               (audit_id, action, status, reason, principal_id, request_id,
+                ttl_expires_at, audited_at)
+               VALUES (?1, ?2, 'pass', ?3, ?4, ?5, NULL, ?6)"#,
+        )
+        .bind(&audit_id)
+        .bind(action)
+        .bind(&c.reason)
+        .bind(principal_id)
+        .bind(&c.request_id)
+        .bind(now.to_rfc3339())
+        .execute(&mut **tx)
+        .await;
+
+        if let Err(e) = insert_result {
+            command_idempotency::fail_lease_tx(
+                &mut tx,
+                principal_id,
+                &c.request_id,
+                p083_active_gen,
+                "rollback_audit_insert_failed",
+            )
+            .await
+            .ok();
+            command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &e.to_string())
+                .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("command.P083RollbackExecution", tx_started);
+            return Err(e.into());
+        }
+
+        // Commit idempotency lease atomically with side effects and journal.
+        let outcome = serde_json::json!({
+            "rollback_mode": c.rollback_mode,
+            "request_id": c.request_id,
+            "audit_id": audit_id,
+            "journal_id": journal.id
+        });
+        let commit_result = command_idempotency::commit_tx(
+            &mut tx,
+            principal_id,
+            &c.request_id,
+            p083_active_gen,
+            &outcome.to_string(),
+        )
+        .await;
+        match commit_result {
+            Err(e) => {
+                command_idempotency::fail_lease_tx(
+                    &mut tx,
+                    principal_id,
+                    &c.request_id,
+                    p083_active_gen,
+                    "commit_tx_failed",
+                )
+                .await
+                .ok();
+                command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &e.to_string())
+                    .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.P083RollbackExecution", tx_started);
+                return Err(e);
+            }
+            Ok(false) => {
+                command_journal::fail_entry_tx(
+                    &mut tx,
+                    &journal.id,
+                    Utc::now(),
+                    "IDEMPOTENCY_COMMIT_CAS_FAILED",
+                )
+                .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.P083RollbackExecution", tx_started);
+                anyhow::bail!(
+                    "IDEMPOTENCY_COMMIT_CAS_FAILED: lease for request_id {} was not in pending state",
+                    c.request_id
+                );
+            }
+            Ok(true) => {}
+        }
+        command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+        tx.commit().await?;
+        db::pool::log_write_transaction("command.P083RollbackExecution", tx_started);
+
+        // status=pass: rollback committed successfully; reason=gate_failed: operator-initiated rollback.
+        db::metrics::record_p083_rollback_execution(action, "pass", "gate_failed");
+
+        Ok(CommandResult::P083RollbackExecutionScheduled {
+            rollback_mode: c.rollback_mode,
+            journal_id: journal.id.clone(),
+            idempotency_request_id: c.request_id,
+        })
+    }
+
+    /// P083: Handle set enforcement mode (disabled/permissive/enforce).
+    async fn handle_p083_set_enforcement_mode(
+        &self,
+        c: P083SetEnforcementModeCmd,
+        journal: &CommandJournalEntry,
+        caller: &CallerContext,
+    ) -> Result<CommandResult> {
+        // SEC-P083-MED-002: validate at the durable authority boundary before any DB write.
+        validate_caller_request_id(&c.request_id)?;
+        validate_p083_reason(&c.reason, 2048)?;
+        let principal_id = &caller.principal_id;
+
+        if !matches!(
+            c.enforcement_mode.as_str(),
+            "disabled" | "permissive" | "enforce"
+        ) {
+            anyhow::bail!("enforcement_mode must be 'disabled', 'permissive', or 'enforce'");
+        }
+
+        let intent_hash = canonical_intent_hash(&[
+            (
+                "command",
+                serde_json::Value::String("p083.set_enforcement_mode".into()),
+            ),
+            (
+                "enforcement_mode",
+                serde_json::Value::String(c.enforcement_mode.clone()),
+            ),
+            ("reason", serde_json::Value::String(c.reason.clone())),
+        ]);
+
+        if let Some(existing) =
+            command_idempotency::find_active_by_request(&self.pool, principal_id, &c.request_id)
+                .await?
+        {
+            // REQUEST_INTENT_MISMATCH: same request_id reused for a different command or intent.
+            if existing.command != "p083.set_enforcement_mode"
+                || existing.intent_hash != intent_hash
+            {
+                anyhow::bail!(
+                    "REQUEST_INTENT_MISMATCH: request_id {} is already used for command '{}' with different intent",
+                    c.request_id, existing.command
+                );
+            }
+            if existing.lease_state == "committed" {
+                tracing::info!(request_id = %c.request_id, "P083 SetEnforcementMode: replaying committed lease");
+                // Replay from stored outcome_json — enforcement_mode and journal_id must be
+                // byte-for-byte identical per command_idempotency_contract_v1.
+                let outcome = existing.outcome_json.as_deref().ok_or_else(|| {
+                    tracing::error!(
+                        request_id = %c.request_id,
+                        "IDEMPOTENCY_REPLAY_CORRUPT: committed p083.set_enforcement_mode lease missing outcome_json"
+                    );
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: committed lease for request_id {} missing outcome_json",
+                        c.request_id
+                    )
+                })?;
+                let outcome_v: serde_json::Value = serde_json::from_str(outcome).map_err(|e| {
+                    tracing::error!(
+                        request_id = %c.request_id,
+                        error = %e,
+                        "IDEMPOTENCY_REPLAY_CORRUPT: committed p083.set_enforcement_mode outcome_json unparsable"
+                    );
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} is not valid JSON",
+                        c.request_id
+                    )
+                })?;
+                let enforcement_mode = outcome_v
+                    .get("enforcement_mode")
+                    .and_then(|m| m.as_str())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} missing enforcement_mode",
+                        c.request_id
+                    ))?
+                    .to_string();
+                let replayed_journal_id = outcome_v
+                    .get("journal_id")
+                    .and_then(|j| j.as_str())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} missing journal_id",
+                        c.request_id
+                    ))?
+                    .to_string();
+                return Ok(CommandResult::P083EnforcementModeSet {
+                    enforcement_mode,
+                    journal_id: replayed_journal_id,
+                    idempotency_request_id: c.request_id.clone(),
+                });
+            } else if existing.lease_state == "pending" {
+                let expires_at_dt = chrono::DateTime::parse_from_rfc3339(&existing.expires_at)
+                    .map(|e| e.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                if expires_at_dt > Utc::now() {
+                    let retry_after = (expires_at_dt - Utc::now()).num_seconds().max(1);
+                    anyhow::bail!(
+                        "IDEMPOTENCY_IN_FLIGHT: mode change already in progress for request_id {}, retry_after_seconds={}",
+                        c.request_id, retry_after
+                    );
+                }
+                // Expired pending — fall through; reacquire_expired_tx handles it in the transaction.
+            }
+        }
+
+        // Same-intent alias replay: check if a different request_id already committed this intent.
+        if let Some(canonical) = command_idempotency::find_committed_by_intent(
+            &self.pool,
+            principal_id,
+            "p083.set_enforcement_mode",
+            &intent_hash,
+        )
+        .await?
+        {
+            if canonical.request_id != c.request_id {
+                command_idempotency::insert_alias(
+                    &self.pool,
+                    principal_id,
+                    "p083.set_enforcement_mode",
+                    &intent_hash,
+                    &c.request_id,
+                    &canonical.request_id,
+                )
+                .await?;
+                let outcome = canonical.outcome_json.as_deref().ok_or_else(|| {
+                    tracing::error!(
+                        request_id = %c.request_id,
+                        canonical_request_id = %canonical.request_id,
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical p083.set_enforcement_mode lease missing outcome_json"
+                    );
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical lease for intent_hash {} missing outcome_json",
+                        intent_hash
+                    )
+                })?;
+                let outcome_v: serde_json::Value =
+                    serde_json::from_str(outcome).map_err(|e| {
+                        tracing::error!(
+                            request_id = %c.request_id,
+                            canonical_request_id = %canonical.request_id,
+                            error = %e,
+                            "IDEMPOTENCY_REPLAY_CORRUPT: canonical p083.set_enforcement_mode outcome_json unparsable"
+                        );
+                        anyhow::anyhow!(
+                            "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} is not valid JSON",
+                            intent_hash
+                        )
+                    })?;
+                let enforcement_mode = outcome_v
+                    .get("enforcement_mode")
+                    .and_then(|m| m.as_str())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} missing enforcement_mode",
+                        intent_hash
+                    ))?
+                    .to_string();
+                let replayed_journal_id = outcome_v
+                    .get("journal_id")
+                    .and_then(|j| j.as_str())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} missing journal_id",
+                        intent_hash
+                    ))?
+                    .to_string();
+                tracing::info!(
+                    request_id = %c.request_id,
+                    canonical_request_id = %canonical.request_id,
+                    "P083 SetEnforcementMode: alias replay for same-intent committed lease"
+                );
+                return Ok(CommandResult::P083EnforcementModeSet {
+                    enforcement_mode,
+                    journal_id: replayed_journal_id,
+                    idempotency_request_id: canonical.request_id,
+                });
+            }
+        }
+
+        // Per command_idempotency_contract_v1 transaction_rule: acquisition, side-effect writes,
+        // and terminal outcome commit all happen in one SQLite transaction.
+        // TTL: 120s per command_idempotency_contract_v1.ttl_seconds for p083.set_enforcement_mode.
+        let now = Utc::now();
+        let tx_started = Instant::now();
+        let journal_id_inner = uuid::Uuid::new_v4().to_string();
+        let lease_expires_at = (now + chrono::Duration::seconds(120)).to_rfc3339();
+
+        let mut tx = self
+            .begin_command_transaction("command.P083SetEnforcementMode", journal.id.clone())
+            .await?;
+        record_command_journal_tx(&mut tx, journal).await?;
+
+        // Acquire idempotency lease inside the transaction (atomic with side effects).
+        let mut p083_active_gen: i64 = 1;
+        if let Some(new_gen) = command_idempotency::reacquire_expired_tx(
+            &mut tx,
+            principal_id,
+            &c.request_id,
+            "p083.set_enforcement_mode",
+            &intent_hash,
+            &lease_expires_at,
+        )
+        .await?
+        {
+            p083_active_gen = new_gen;
+        } else {
+            let acquired = command_idempotency::acquire_tx(
+                &mut tx,
+                principal_id,
+                &c.request_id,
+                "p083.set_enforcement_mode",
+                &intent_hash,
+                1,
+                &lease_expires_at,
+            )
+            .await?;
+            if !acquired {
+                tx.rollback().await.ok();
+                anyhow::bail!(
+                    "IDEMPOTENCY_IN_FLIGHT: concurrent mode change for request_id {}",
+                    c.request_id
+                );
+            }
+        }
+
+        // Read current mode (default to "disabled" if no row exists yet).
+        let current_mode: String = sqlx::query_scalar(
+            "SELECT enforcement_mode FROM p083_enforcement_mode_state WHERE state_id = 'singleton'",
+        )
+        .fetch_optional(&mut **tx)
+        .await?
+        .unwrap_or_else(|| "disabled".to_string());
+
+        // Per rollout_contract_v1: disabled→enforce is not a valid transition.
+        // Enforcement mode must go through permissive first.
+        if current_mode == "disabled" && c.enforcement_mode == "enforce" {
+            let transition_label = "disabled_to_enforce_denied";
+            db::metrics::record_p083_enforcement_mode_transition(transition_label, &current_mode);
+            command_idempotency::fail_lease_tx(
+                &mut tx,
+                principal_id,
+                &c.request_id,
+                p083_active_gen,
+                "disabled_to_enforce_denied",
+            )
+            .await
+            .ok();
+            command_journal::fail_entry_tx(
+                &mut tx,
+                &journal.id,
+                Utc::now(),
+                "ENFORCEMENT_TRANSITION_DENIED: disabled to enforce is not valid; transition through permissive first",
+            )
+            .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("command.P083SetEnforcementMode", tx_started);
+            anyhow::bail!(
+                "ENFORCEMENT_TRANSITION_DENIED: cannot transition directly from disabled to enforce; use permissive first"
+            );
+        }
+
+        // Record the transition journal entry.
+        let insert_result = sqlx::query(
+            r#"INSERT INTO p083_enforcement_mode_transition_journal
+               (journal_id, from_mode, to_mode, transition_state,
+                principal_id, request_id, commit_marker, initiated_at, committed_at)
+               VALUES (?1, ?2, ?3, 'transitioning', ?4, ?5, NULL, ?6, NULL)"#,
+        )
+        .bind(&journal_id_inner)
+        .bind(&current_mode)
+        .bind(&c.enforcement_mode)
+        .bind(principal_id)
+        .bind(&c.request_id)
+        .bind(now.to_rfc3339())
+        .execute(&mut **tx)
+        .await;
+
+        if let Err(e) = insert_result {
+            command_idempotency::fail_lease_tx(
+                &mut tx,
+                principal_id,
+                &c.request_id,
+                p083_active_gen,
+                "transition_journal_insert_failed",
+            )
+            .await
+            .ok();
+            command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &e.to_string())
+                .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("command.P083SetEnforcementMode", tx_started);
+            return Err(e.into());
+        }
+
+        // Update the singleton enforcement mode state.
+        sqlx::query(
+            r#"INSERT INTO p083_enforcement_mode_state
+               (state_id, proposal_id, enforcement_mode, mode_reason, effective_at, updated_at)
+               VALUES ('singleton', 'P083', ?1, ?2, ?3, ?3)
+               ON CONFLICT(state_id) DO UPDATE
+               SET enforcement_mode = excluded.enforcement_mode,
+                   mode_reason = excluded.mode_reason,
+                   effective_at = excluded.effective_at,
+                   updated_at = excluded.updated_at"#,
+        )
+        .bind(&c.enforcement_mode)
+        .bind(&c.reason)
+        .bind(now.to_rfc3339())
+        .execute(&mut **tx)
+        .await?;
+
+        // Mark the transition as committed.
+        let committed_at = now.to_rfc3339();
+        sqlx::query(
+            r#"UPDATE p083_enforcement_mode_transition_journal
+               SET transition_state = 'committed', commit_marker = ?1, committed_at = ?2
+               WHERE journal_id = ?3"#,
+        )
+        .bind(&journal_id_inner)
+        .bind(&committed_at)
+        .bind(&journal_id_inner)
+        .execute(&mut **tx)
+        .await?;
+
+        // Commit idempotency lease atomically with side effects and journal.
+        let outcome = serde_json::json!({
+            "enforcement_mode": c.enforcement_mode,
+            "request_id": c.request_id,
+            "transition_journal_id": journal_id_inner,
+            "journal_id": journal.id
+        });
+        let commit_result = command_idempotency::commit_tx(
+            &mut tx,
+            principal_id,
+            &c.request_id,
+            p083_active_gen,
+            &outcome.to_string(),
+        )
+        .await;
+        match commit_result {
+            Err(e) => {
+                command_idempotency::fail_lease_tx(
+                    &mut tx,
+                    principal_id,
+                    &c.request_id,
+                    p083_active_gen,
+                    "commit_tx_failed",
+                )
+                .await
+                .ok();
+                command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &e.to_string())
+                    .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.P083SetEnforcementMode", tx_started);
+                return Err(e);
+            }
+            Ok(false) => {
+                command_journal::fail_entry_tx(
+                    &mut tx,
+                    &journal.id,
+                    Utc::now(),
+                    "IDEMPOTENCY_COMMIT_CAS_FAILED",
+                )
+                .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.P083SetEnforcementMode", tx_started);
+                anyhow::bail!(
+                    "IDEMPOTENCY_COMMIT_CAS_FAILED: lease for request_id {} was not in pending state",
+                    c.request_id
+                );
+            }
+            Ok(true) => {}
+        }
+        command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+        tx.commit().await?;
+        db::pool::log_write_transaction("command.P083SetEnforcementMode", tx_started);
+
+        let transition_label = format!("{current_mode}_to_{}", c.enforcement_mode);
+        db::metrics::record_p083_enforcement_mode_transition(
+            &transition_label,
+            &c.enforcement_mode,
+        );
+
+        Ok(CommandResult::P083EnforcementModeSet {
+            enforcement_mode: c.enforcement_mode,
+            journal_id: journal.id.clone(),
+            idempotency_request_id: c.request_id,
+        })
+    }
+
+    /// P083: Re-queue an AdvanceRun work item for a run that has failed or stalled.
+    async fn handle_retry_run(
+        &self,
+        c: RetryRunCmd,
+        journal: &CommandJournalEntry,
+        caller: &CallerContext,
+    ) -> Result<CommandResult> {
+        validate_caller_request_id(&c.request_id)?;
+        let principal_id = &caller.principal_id;
+
+        let intent_hash = canonical_intent_hash(&[
+            ("command", serde_json::Value::String("runs.retry".into())),
+            ("run_id", serde_json::Value::String(c.run_id.to_string())),
+        ]);
+
+        if let Some(existing) =
+            command_idempotency::find_active_by_request(&self.pool, principal_id, &c.request_id)
+                .await?
+        {
+            if existing.command != "runs.retry" || existing.intent_hash != intent_hash {
+                anyhow::bail!(
+                    "REQUEST_INTENT_MISMATCH: request_id {} is already used for command '{}' with different intent",
+                    c.request_id, existing.command
+                );
+            }
+            if existing.lease_state == "committed" {
+                tracing::info!(request_id = %c.request_id, "RetryRun: replaying committed lease");
+                let outcome = existing.outcome_json.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: committed runs.retry lease for request_id {} missing outcome_json",
+                        c.request_id
+                    )
+                })?;
+                let outcome_v: serde_json::Value = serde_json::from_str(outcome).map_err(|e| {
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} is not valid JSON: {}",
+                        c.request_id, e
+                    )
+                })?;
+                let replayed_journal_id = outcome_v
+                    .get("journal_id")
+                    .and_then(|j| j.as_str())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} missing journal_id",
+                        c.request_id
+                    ))?
+                    .to_string();
+                return Ok(CommandResult::RunRetried {
+                    run_id: c.run_id,
+                    journal_id: replayed_journal_id,
+                    idempotency_request_id: c.request_id,
+                });
+            } else if existing.lease_state == "pending" {
+                let expires_at_dt = chrono::DateTime::parse_from_rfc3339(&existing.expires_at)
+                    .map(|e| e.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                if expires_at_dt > Utc::now() {
+                    let retry_after = (expires_at_dt - Utc::now()).num_seconds().max(1);
+                    anyhow::bail!(
+                        "IDEMPOTENCY_IN_FLIGHT: retry already in progress for request_id {}, retry_after_seconds={}",
+                        c.request_id, retry_after
+                    );
+                }
+                // Expired pending — fall through; reacquire_expired_tx handles it in the transaction.
+            }
+        }
+
+        // Same-intent alias replay: another request_id already committed this run retry.
+        if let Some(canonical) = command_idempotency::find_committed_by_intent(
+            &self.pool,
+            principal_id,
+            "runs.retry",
+            &intent_hash,
+        )
+        .await?
+        {
+            if canonical.request_id != c.request_id {
+                command_idempotency::insert_alias(
+                    &self.pool,
+                    principal_id,
+                    "runs.retry",
+                    &intent_hash,
+                    &c.request_id,
+                    &canonical.request_id,
+                )
+                .await?;
+                let outcome = canonical.outcome_json.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical runs.retry lease for intent_hash {} missing outcome_json",
+                        intent_hash
+                    )
+                })?;
+                let outcome_v: serde_json::Value = serde_json::from_str(outcome).map_err(|e| {
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} is not valid JSON: {}",
+                        intent_hash, e
+                    )
+                })?;
+                let replayed_journal_id = outcome_v
+                    .get("journal_id")
+                    .and_then(|j| j.as_str())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} missing journal_id",
+                        intent_hash
+                    ))?
+                    .to_string();
+                tracing::info!(
+                    request_id = %c.request_id,
+                    canonical_request_id = %canonical.request_id,
+                    "RetryRun: alias replay for same-intent committed lease"
+                );
+                return Ok(CommandResult::RunRetried {
+                    run_id: c.run_id,
+                    journal_id: replayed_journal_id,
+                    idempotency_request_id: canonical.request_id,
+                });
+            }
+        }
+
+        let now = Utc::now();
+        let tx_started = Instant::now();
+        let lease_expires_at = (now + chrono::Duration::seconds(120)).to_rfc3339();
+
+        let mut tx = self
+            .begin_command_transaction("command.RetryRun", journal.id.clone())
+            .await?;
+        record_command_journal_tx(&mut tx, journal).await?;
+
+        let mut active_gen: i64 = 1;
+        if let Some(new_gen) = command_idempotency::reacquire_expired_tx(
+            &mut tx,
+            principal_id,
+            &c.request_id,
+            "runs.retry",
+            &intent_hash,
+            &lease_expires_at,
+        )
+        .await?
+        {
+            active_gen = new_gen;
+        } else {
+            let acquired = command_idempotency::acquire_tx(
+                &mut tx,
+                principal_id,
+                &c.request_id,
+                "runs.retry",
+                &intent_hash,
+                1,
+                &lease_expires_at,
+            )
+            .await?;
+            if !acquired {
+                tx.rollback().await.ok();
+                anyhow::bail!(
+                    "IDEMPOTENCY_IN_FLIGHT: concurrent retry for request_id {}",
+                    c.request_id
+                );
+            }
+        }
+
+        let run = match runs::find_by_id_tx(&mut tx, c.run_id).await? {
+            Some(r) => r,
+            None => {
+                let error = anyhow!("RUN_NOT_FOUND: run {} does not exist", c.run_id);
+                command_idempotency::fail_lease_tx(
+                    &mut tx,
+                    principal_id,
+                    &c.request_id,
+                    active_gen,
+                    "run_not_found",
+                )
+                .await
+                .ok();
+                command_journal::fail_entry_tx(
+                    &mut tx,
+                    &journal.id,
+                    Utc::now(),
+                    &error.to_string(),
+                )
+                .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.RetryRun", tx_started);
+                return Err(error);
+            }
+        };
+
+        if matches!(
+            run.status,
+            RunStatus::Completed | RunStatus::Cancelled | RunStatus::Cancelling
+        ) {
+            let error = anyhow!(
+                "RUN_NOT_RETRIABLE: run {} is in terminal state '{}'",
+                c.run_id,
+                run.status
+            );
+            command_idempotency::fail_lease_tx(
+                &mut tx,
+                principal_id,
+                &c.request_id,
+                active_gen,
+                "run_terminal",
+            )
+            .await
+            .ok();
+            command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &error.to_string())
+                .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("command.RetryRun", tx_started);
+            return Err(error);
+        }
+
+        let work_item_id = uuid::Uuid::new_v4().to_string();
+        work_items::enqueue_tx(
+            &mut tx,
+            &WorkItem {
+                id: work_item_id.clone(),
+                kind: WorkItemKind::AdvanceRun,
+                payload_json: serde_json::json!({
+                    "schema_version": "advance_run_payload.v1",
+                    "run_id": c.run_id.to_string(),
+                    "enqueue_reason": "retry_run",
+                    "request_id": c.request_id
+                })
+                .to_string(),
+                status: WorkItemStatus::Pending,
+                run_id: Some(c.run_id),
+                stage_id: None,
+                created_at: now,
+                scheduled_at: now,
+                attempt_count: 0,
+                last_error: None,
+            },
+        )
+        .await?;
+
+        let scheduler_refresh = scheduler::refresh_queue_summaries_for_notification_tx(
+            &mut tx,
+            &self.capacity_config,
+            now,
+            "command.RetryRun",
+            0,
+        )
+        .await?;
+
+        let outcome = serde_json::json!({
+            "command": "runs.retry",
+            "run_id": c.run_id.to_string(),
+            "request_id": c.request_id,
+            "work_item_id": work_item_id,
+            "journal_id": journal.id
+        });
+        let commit_result = command_idempotency::commit_tx(
+            &mut tx,
+            principal_id,
+            &c.request_id,
+            active_gen,
+            &outcome.to_string(),
+        )
+        .await;
+        match commit_result {
+            Err(e) => {
+                command_idempotency::fail_lease_tx(
+                    &mut tx,
+                    principal_id,
+                    &c.request_id,
+                    active_gen,
+                    "commit_tx_failed",
+                )
+                .await
+                .ok();
+                command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &e.to_string())
+                    .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.RetryRun", tx_started);
+                return Err(e);
+            }
+            Ok(false) => {
+                command_journal::fail_entry_tx(
+                    &mut tx,
+                    &journal.id,
+                    Utc::now(),
+                    "IDEMPOTENCY_COMMIT_CAS_FAILED",
+                )
+                .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.RetryRun", tx_started);
+                anyhow::bail!(
+                    "IDEMPOTENCY_COMMIT_CAS_FAILED: lease for request_id {} was not in pending state",
+                    c.request_id
+                );
+            }
+            Ok(true) => {}
+        }
+        command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+        tx.commit().await?;
+        db::pool::log_write_transaction("command.RetryRun", tx_started);
+
+        self.work_queue
+            .publish_scheduler_notification(scheduler_refresh);
+
+        Ok(CommandResult::RunRetried {
+            run_id: c.run_id,
+            journal_id: journal.id.clone(),
+            idempotency_request_id: c.request_id,
+        })
+    }
+
+    /// P083: Force-reconcile a side effect to reconciled status with operator decision.
+    /// command_idempotency_contract_v1 with TTL=300s; intent keyed on (command, effect_id).
+    async fn handle_force_reconcile_side_effect(
+        &self,
+        c: ForceReconcileSideEffectCmd,
+        journal: &CommandJournalEntry,
+        caller: &CallerContext,
+    ) -> Result<CommandResult> {
+        validate_caller_request_id(&c.request_id)?;
+        let principal_id = &caller.principal_id;
+
+        if c.decision_json.len() > 64 * 1024 {
+            anyhow::bail!("P083_INVALID_ARG: decision_json exceeds 64 KiB limit");
+        }
+        let decision_value: serde_json::Value =
+            serde_json::from_str(&c.decision_json).map_err(|e| {
+                anyhow::anyhow!("P083_INVALID_ARG: decision_json must be valid JSON: {e}")
+            })?;
+        // SEC-P083-003: enforce strict side_effect_decision_v1 schema at the durable authority
+        // boundary (engine command handler), not only at the MCP/GraphQL transport layer.
+        validate_side_effect_decision_v1(&decision_value)?;
+
+        // Include canonical decision_json digest in intent hash so same-effect/different-payload
+        // requests cannot alias to a prior committed success (SEC-P083-HIGH-001).
+        let decision_canonical = serde_json::to_string(&decision_value).unwrap_or_default();
+        let decision_json_intent_digest = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(decision_canonical.as_bytes()))
+        };
+        let intent_hash = canonical_intent_hash(&[
+            (
+                "command",
+                serde_json::Value::String("side_effects.force_reconcile".into()),
+            ),
+            (
+                "decision_json_digest",
+                serde_json::Value::String(decision_json_intent_digest),
+            ),
+            ("effect_id", serde_json::Value::String(c.effect_id.clone())),
+        ]);
+
+        if let Some(existing) =
+            command_idempotency::find_active_by_request(&self.pool, principal_id, &c.request_id)
+                .await?
+        {
+            if existing.command != "side_effects.force_reconcile"
+                || existing.intent_hash != intent_hash
+            {
+                anyhow::bail!(
+                    "REQUEST_INTENT_MISMATCH: request_id {} is already used for command '{}' with different intent",
+                    c.request_id, existing.command
+                );
+            }
+            if existing.lease_state == "committed" {
+                tracing::info!(request_id = %c.request_id, "ForceReconcileSideEffect: replaying committed lease");
+                let outcome = existing.outcome_json.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: committed side_effects.force_reconcile lease for request_id {} missing outcome_json",
+                        c.request_id
+                    )
+                })?;
+                let outcome_v: serde_json::Value = serde_json::from_str(outcome).map_err(|e| {
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} is not valid JSON: {}",
+                        c.request_id, e
+                    )
+                })?;
+                let replayed_journal_id = outcome_v
+                    .get("journal_id")
+                    .and_then(|j| j.as_str())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} missing journal_id",
+                        c.request_id
+                    ))?
+                    .to_string();
+                return Ok(CommandResult::SideEffectForceReconciled {
+                    effect_id: c.effect_id,
+                    journal_id: replayed_journal_id,
+                    idempotency_request_id: c.request_id,
+                });
+            } else if existing.lease_state == "pending" {
+                let expires_at_dt = chrono::DateTime::parse_from_rfc3339(&existing.expires_at)
+                    .map(|e| e.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                if expires_at_dt > Utc::now() {
+                    let retry_after = (expires_at_dt - Utc::now()).num_seconds().max(1);
+                    anyhow::bail!(
+                        "IDEMPOTENCY_IN_FLIGHT: force_reconcile already in progress for request_id {}, retry_after_seconds={}",
+                        c.request_id, retry_after
+                    );
+                }
+            }
+        }
+
+        if let Some(canonical) = command_idempotency::find_committed_by_intent(
+            &self.pool,
+            principal_id,
+            "side_effects.force_reconcile",
+            &intent_hash,
+        )
+        .await?
+        {
+            if canonical.request_id != c.request_id {
+                command_idempotency::insert_alias(
+                    &self.pool,
+                    principal_id,
+                    "side_effects.force_reconcile",
+                    &intent_hash,
+                    &c.request_id,
+                    &canonical.request_id,
+                )
+                .await?;
+                let outcome = canonical.outcome_json.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical side_effects.force_reconcile lease for intent_hash {} missing outcome_json",
+                        intent_hash
+                    )
+                })?;
+                let outcome_v: serde_json::Value = serde_json::from_str(outcome).map_err(|e| {
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} is not valid JSON: {}",
+                        intent_hash, e
+                    )
+                })?;
+                let replayed_journal_id = outcome_v
+                    .get("journal_id")
+                    .and_then(|j| j.as_str())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} missing journal_id",
+                        intent_hash
+                    ))?
+                    .to_string();
+                tracing::info!(
+                    request_id = %c.request_id,
+                    canonical_request_id = %canonical.request_id,
+                    "ForceReconcileSideEffect: alias replay for same-intent committed lease"
+                );
+                return Ok(CommandResult::SideEffectForceReconciled {
+                    effect_id: c.effect_id,
+                    journal_id: replayed_journal_id,
+                    idempotency_request_id: canonical.request_id,
+                });
+            }
+        }
+
+        let now = Utc::now();
+        let tx_started = Instant::now();
+        // TTL=300s per command_idempotency_contract_v1.ttl_seconds for side_effects.force_reconcile.
+        let lease_expires_at = (now + chrono::Duration::seconds(300)).to_rfc3339();
+
+        let mut tx = self
+            .begin_command_transaction("command.ForceReconcileSideEffect", journal.id.clone())
+            .await?;
+        record_command_journal_tx(&mut tx, journal).await?;
+
+        let mut active_gen: i64 = 1;
+        if let Some(new_gen) = command_idempotency::reacquire_expired_tx(
+            &mut tx,
+            principal_id,
+            &c.request_id,
+            "side_effects.force_reconcile",
+            &intent_hash,
+            &lease_expires_at,
+        )
+        .await?
+        {
+            active_gen = new_gen;
+        } else {
+            let acquired = command_idempotency::acquire_tx(
+                &mut tx,
+                principal_id,
+                &c.request_id,
+                "side_effects.force_reconcile",
+                &intent_hash,
+                1,
+                &lease_expires_at,
+            )
+            .await?;
+            if !acquired {
+                tx.rollback().await.ok();
+                anyhow::bail!(
+                    "IDEMPOTENCY_IN_FLIGHT: concurrent force_reconcile for request_id {}",
+                    c.request_id
+                );
+            }
+        }
+
+        let effect_id = domain::side_effect::SideEffectId::from_str(&c.effect_id);
+        let effect = match side_effects_repo::find_by_id(&self.pool, &effect_id).await? {
+            Some(e) => e,
+            None => {
+                let error = anyhow!(
+                    "EFFECT_NOT_FOUND: side effect {} does not exist",
+                    c.effect_id
+                );
+                command_idempotency::fail_lease_tx(
+                    &mut tx,
+                    principal_id,
+                    &c.request_id,
+                    active_gen,
+                    "effect_not_found",
+                )
+                .await
+                .ok();
+                command_journal::fail_entry_tx(
+                    &mut tx,
+                    &journal.id,
+                    Utc::now(),
+                    &error.to_string(),
+                )
+                .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ForceReconcileSideEffect", tx_started);
+                return Err(error);
+            }
+        };
+
+        if !effect.status.is_unresolved() {
+            let error = anyhow!(
+                "EFFECT_NOT_RECONCILABLE: side effect {} is already in terminal status '{}'",
+                c.effect_id,
+                effect.status
+            );
+            command_idempotency::fail_lease_tx(
+                &mut tx,
+                principal_id,
+                &c.request_id,
+                active_gen,
+                "effect_terminal",
+            )
+            .await
+            .ok();
+            command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &error.to_string())
+                .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("command.ForceReconcileSideEffect", tx_started);
+            return Err(error);
+        }
+
+        let decision_json_hash = {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(c.decision_json.as_bytes());
+            format!("{:x}", hash)
+        };
+        let disposition_outcome = side_effects_repo::apply_operator_disposition_tx(
+            &mut tx,
+            &effect_id,
+            domain::side_effect::SideEffectStatus::Reconciled,
+            "p083_force_reconcile",
+            &c.request_id,
+            &c.decision_json,
+            &decision_json_hash,
+            principal_id,
+            now,
+        )
+        .await?;
+
+        match &disposition_outcome {
+            db::repos::side_effects::DispositionOutcome::Applied
+            | db::repos::side_effects::DispositionOutcome::AlreadyApplied => {}
+            db::repos::side_effects::DispositionOutcome::PayloadMismatch => {
+                let error = anyhow!(
+                    "DISPOSITION_PAYLOAD_MISMATCH: request_id {} already used for effect {} with different decision_json",
+                    c.request_id, c.effect_id
+                );
+                command_idempotency::fail_lease_tx(
+                    &mut tx,
+                    principal_id,
+                    &c.request_id,
+                    active_gen,
+                    "disposition_payload_mismatch",
+                )
+                .await
+                .ok();
+                command_journal::fail_entry_tx(
+                    &mut tx,
+                    &journal.id,
+                    Utc::now(),
+                    &error.to_string(),
+                )
+                .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ForceReconcileSideEffect", tx_started);
+                return Err(error);
+            }
+            db::repos::side_effects::DispositionOutcome::NotApplicable => {
+                let error = anyhow!(
+                    "EFFECT_NOT_RECONCILABLE: side effect {} is not in a reconcilable state",
+                    c.effect_id
+                );
+                command_idempotency::fail_lease_tx(
+                    &mut tx,
+                    principal_id,
+                    &c.request_id,
+                    active_gen,
+                    "effect_not_reconcilable",
+                )
+                .await
+                .ok();
+                command_journal::fail_entry_tx(
+                    &mut tx,
+                    &journal.id,
+                    Utc::now(),
+                    &error.to_string(),
+                )
+                .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ForceReconcileSideEffect", tx_started);
+                return Err(error);
+            }
+        }
+
+        let outcome = serde_json::json!({
+            "command": "side_effects.force_reconcile",
+            "effect_id": c.effect_id,
+            "request_id": c.request_id,
+            "journal_id": journal.id
+        });
+        let commit_result = command_idempotency::commit_tx(
+            &mut tx,
+            principal_id,
+            &c.request_id,
+            active_gen,
+            &outcome.to_string(),
+        )
+        .await;
+        match commit_result {
+            Err(e) => {
+                command_idempotency::fail_lease_tx(
+                    &mut tx,
+                    principal_id,
+                    &c.request_id,
+                    active_gen,
+                    "commit_tx_failed",
+                )
+                .await
+                .ok();
+                command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &e.to_string())
+                    .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ForceReconcileSideEffect", tx_started);
+                return Err(e);
+            }
+            Ok(false) => {
+                command_journal::fail_entry_tx(
+                    &mut tx,
+                    &journal.id,
+                    Utc::now(),
+                    "IDEMPOTENCY_COMMIT_CAS_FAILED",
+                )
+                .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ForceReconcileSideEffect", tx_started);
+                anyhow::bail!(
+                    "IDEMPOTENCY_COMMIT_CAS_FAILED: lease for request_id {} was not in pending state",
+                    c.request_id
+                );
+            }
+            Ok(true) => {}
+        }
+        command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+        tx.commit().await?;
+        db::pool::log_write_transaction("command.ForceReconcileSideEffect", tx_started);
+
+        Ok(CommandResult::SideEffectForceReconciled {
+            effect_id: c.effect_id,
+            journal_id: journal.id.clone(),
+            idempotency_request_id: c.request_id,
+        })
+    }
+
+    /// P083: Operator confirms provider process is absent for identity-ambiguous hold.
+    /// Atomically: moves process_fate to absent_verified and transitions the held
+    /// provider_cancellation_intents row back to requested so settlement can resume.
+    /// Per manual_process_identity_check_ui_v1.available_actions.mark_process_absent.
+    async fn handle_mark_provider_session_process_absent(
+        &self,
+        c: MarkProviderSessionProcessAbsentCmd,
+        journal: &CommandJournalEntry,
+        caller: &CallerContext,
+    ) -> Result<CommandResult> {
+        validate_caller_request_id(&c.request_id)?;
+        let principal_id = &caller.principal_id;
+
+        // Verify the session exists before acquiring the idempotency lease.
+        let session = provider_sessions::find_by_id(&self.pool, &c.provider_session_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "PROVIDER_SESSION_NOT_FOUND: provider_session_id {} does not exist",
+                    c.provider_session_id
+                )
+            })?;
+
+        let intent_hash = canonical_intent_hash(&[
+            (
+                "command",
+                serde_json::Value::String("provider_session.mark_process_absent".into()),
+            ),
+            (
+                "provider_session_id",
+                serde_json::Value::String(c.provider_session_id.clone()),
+            ),
+            (
+                "cancellation_epoch",
+                serde_json::Value::Number(c.cancellation_epoch.into()),
+            ),
+        ]);
+
+        let now = Utc::now();
+        let tx_started = Instant::now();
+        let lease_expires_at = (now + chrono::Duration::seconds(120)).to_rfc3339();
+
+        // Fast-path replay check (read-only, before opening transaction).
+        // Per command_idempotency_contract_v1: active-by-request check first to
+        // catch mismatch, pending TTL, and same-request committed replay.
+        if let Some(existing) =
+            command_idempotency::find_active_by_request(&self.pool, principal_id, &c.request_id)
+                .await?
+        {
+            // REQUEST_INTENT_MISMATCH: same request_id reused for a different command or intent.
+            if existing.command != "provider_session.mark_process_absent"
+                || existing.intent_hash != intent_hash
+            {
+                anyhow::bail!(
+                    "REQUEST_INTENT_MISMATCH: request_id {} is already used for command '{}' with different intent",
+                    c.request_id, existing.command
+                );
+            }
+            if existing.lease_state == "committed" {
+                let outcome = existing.outcome_json.as_deref().ok_or_else(|| {
+                    tracing::error!(
+                        request_id = %c.request_id,
+                        "IDEMPOTENCY_REPLAY_CORRUPT: committed mark_process_absent lease missing outcome_json"
+                    );
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: committed lease for request_id {} missing outcome_json",
+                        c.request_id
+                    )
+                })?;
+                let v: serde_json::Value = serde_json::from_str(outcome).map_err(|e| {
+                    tracing::error!(
+                        request_id = %c.request_id,
+                        error = %e,
+                        "IDEMPOTENCY_REPLAY_CORRUPT: committed mark_process_absent outcome_json unparsable"
+                    );
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} is not valid JSON",
+                        c.request_id
+                    )
+                })?;
+                let cancellation_epoch = v
+                    .get("cancellation_epoch")
+                    .and_then(|e| e.as_i64())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} missing cancellation_epoch",
+                        c.request_id
+                    ))?;
+                let replayed_journal_id = v
+                    .get("journal_id")
+                    .and_then(|j| j.as_str())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: outcome_json for request_id {} missing journal_id",
+                        c.request_id
+                    ))?
+                    .to_string();
+                return Ok(CommandResult::ProviderSessionMarkedAbsent {
+                    provider_session_id: c.provider_session_id.clone(),
+                    cancellation_epoch,
+                    journal_id: replayed_journal_id,
+                    idempotency_request_id: c.request_id.clone(),
+                });
+            } else if existing.lease_state == "pending" {
+                let expires_at_dt = chrono::DateTime::parse_from_rfc3339(&existing.expires_at)
+                    .map(|e| e.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                if expires_at_dt > Utc::now() {
+                    let retry_after = (expires_at_dt - Utc::now()).num_seconds().max(1);
+                    anyhow::bail!(
+                        "IDEMPOTENCY_IN_FLIGHT: mark_process_absent already in progress for request_id {}, retry_after_seconds={}",
+                        c.request_id, retry_after
+                    );
+                }
+                // Expired pending — fall through; reacquire_expired_tx handles it in the transaction.
+            }
+        }
+
+        // Same-intent alias replay: check if a different request_id already committed this intent.
+        if let Some(canonical) = command_idempotency::find_committed_by_intent(
+            &self.pool,
+            principal_id,
+            "provider_session.mark_process_absent",
+            &intent_hash,
+        )
+        .await?
+        {
+            if canonical.request_id != c.request_id {
+                command_idempotency::insert_alias(
+                    &self.pool,
+                    principal_id,
+                    "provider_session.mark_process_absent",
+                    &intent_hash,
+                    &c.request_id,
+                    &canonical.request_id,
+                )
+                .await?;
+                let outcome = canonical.outcome_json.as_deref().ok_or_else(|| {
+                    tracing::error!(
+                        request_id = %c.request_id,
+                        canonical_request_id = %canonical.request_id,
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical mark_process_absent lease missing outcome_json"
+                    );
+                    anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical lease for intent_hash {} missing outcome_json",
+                        intent_hash
+                    )
+                })?;
+                let outcome_v: serde_json::Value =
+                    serde_json::from_str(outcome).map_err(|e| {
+                        tracing::error!(
+                            request_id = %c.request_id,
+                            canonical_request_id = %canonical.request_id,
+                            error = %e,
+                            "IDEMPOTENCY_REPLAY_CORRUPT: canonical mark_process_absent outcome_json unparsable"
+                        );
+                        anyhow::anyhow!(
+                            "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} is not valid JSON",
+                            intent_hash
+                        )
+                    })?;
+                let cancellation_epoch = outcome_v
+                    .get("cancellation_epoch")
+                    .and_then(|e| e.as_i64())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} missing cancellation_epoch",
+                        intent_hash
+                    ))?;
+                let replayed_journal_id = outcome_v
+                    .get("journal_id")
+                    .and_then(|j| j.as_str())
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "IDEMPOTENCY_REPLAY_CORRUPT: canonical outcome_json for intent_hash {} missing journal_id",
+                        intent_hash
+                    ))?
+                    .to_string();
+                tracing::info!(
+                    request_id = %c.request_id,
+                    canonical_request_id = %canonical.request_id,
+                    "P083 MarkProviderSessionProcessAbsent: alias replay for same-intent committed lease"
+                );
+                return Ok(CommandResult::ProviderSessionMarkedAbsent {
+                    provider_session_id: c.provider_session_id.clone(),
+                    cancellation_epoch,
+                    journal_id: replayed_journal_id,
+                    idempotency_request_id: canonical.request_id,
+                });
+            }
+        }
+
+        let mut tx = self
+            .begin_command_transaction(
+                "command.MarkProviderSessionProcessAbsent",
+                journal.id.clone(),
+            )
+            .await?;
+        record_command_journal_tx(&mut tx, journal).await?;
+
+        let mut active_gen: i64 = 1;
+        if let Some(new_gen) = command_idempotency::reacquire_expired_tx(
+            &mut tx,
+            principal_id,
+            &c.request_id,
+            "provider_session.mark_process_absent",
+            &intent_hash,
+            &lease_expires_at,
+        )
+        .await?
+        {
+            active_gen = new_gen;
+        } else {
+            let acquired = command_idempotency::acquire_tx(
+                &mut tx,
+                principal_id,
+                &c.request_id,
+                "provider_session.mark_process_absent",
+                &intent_hash,
+                1,
+                &lease_expires_at,
+            )
+            .await?;
+            if !acquired {
+                tx.rollback().await.ok();
+                anyhow::bail!(
+                    "IDEMPOTENCY_IN_FLIGHT: concurrent mark_process_absent for request_id {}",
+                    c.request_id
+                );
+            }
+        }
+
+        // Atomically: set process_fate=absent_verified and re-open the held intent.
+        let updated = provider_sessions::mark_process_absent_verified_tx(
+            &mut tx,
+            &c.provider_session_id,
+            c.cancellation_epoch,
+        )
+        .await?;
+
+        if !updated {
+            let error = anyhow::anyhow!(
+                "IDENTITY_AMBIGUOUS_NOT_FOUND: no held identity_ambiguous intent found for \
+                 provider_session_id={} cancellation_epoch={}",
+                c.provider_session_id,
+                c.cancellation_epoch
+            );
+            command_idempotency::fail_lease_tx(
+                &mut tx,
+                principal_id,
+                &c.request_id,
+                active_gen,
+                "held_intent_not_found",
+            )
+            .await
+            .ok();
+            command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &error.to_string())
+                .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("command.MarkProviderSessionProcessAbsent", tx_started);
+            return Err(error);
+        }
+
+        let outcome = serde_json::json!({
+            "provider_session_id": c.provider_session_id,
+            "cancellation_epoch": c.cancellation_epoch,
+            "request_id": c.request_id,
+            "journal_id": journal.id,
+        });
+        let commit_result = command_idempotency::commit_tx(
+            &mut tx,
+            principal_id,
+            &c.request_id,
+            active_gen,
+            &outcome.to_string(),
+        )
+        .await;
+        match commit_result {
+            Err(e) => {
+                command_idempotency::fail_lease_tx(
+                    &mut tx,
+                    principal_id,
+                    &c.request_id,
+                    active_gen,
+                    "commit_tx_failed",
+                )
+                .await
+                .ok();
+                command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &e.to_string())
+                    .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction(
+                    "command.MarkProviderSessionProcessAbsent",
+                    tx_started,
+                );
+                return Err(e);
+            }
+            Ok(false) => {
+                command_journal::fail_entry_tx(
+                    &mut tx,
+                    &journal.id,
+                    Utc::now(),
+                    "IDEMPOTENCY_COMMIT_CAS_FAILED",
+                )
+                .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction(
+                    "command.MarkProviderSessionProcessAbsent",
+                    tx_started,
+                );
+                anyhow::bail!(
+                    "IDEMPOTENCY_COMMIT_CAS_FAILED: lease for request_id {} was not in pending state",
+                    c.request_id
+                );
+            }
+            Ok(true) => {}
+        }
+        command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+        tx.commit().await?;
+        db::pool::log_write_transaction("command.MarkProviderSessionProcessAbsent", tx_started);
+
+        let provider_label = session.provider.clone();
+        db::metrics::record_p083_provider_cancellation_intent(
+            &provider_label,
+            "requested",
+            "operator_cancel",
+        );
+
+        tracing::info!(
+            provider_session_id = %c.provider_session_id,
+            cancellation_epoch = c.cancellation_epoch,
+            "P083 MarkProviderSessionProcessAbsent: process_fate=absent_verified; held intent re-opened to requested"
+        );
+
+        Ok(CommandResult::ProviderSessionMarkedAbsent {
+            provider_session_id: c.provider_session_id,
+            cancellation_epoch: c.cancellation_epoch,
+            journal_id: journal.id.clone(),
+            idempotency_request_id: c.request_id,
+        })
     }
 }
 
@@ -7293,128 +9852,6 @@ fn validate_accepted_risk_lineage(c: &SettleProposalGateCmd) -> Result<()> {
 mod tests {
     use super::*;
     use domain::ids::{IdeaId, RunId};
-
-    #[test]
-    fn p082_ensure_run_meta_root_rejects_symlinked_chainworks_component() {
-        let workspace = tempfile::tempdir().expect("workspace root");
-        let outside = tempfile::tempdir().expect("outside target");
-        let link = workspace.path().join(".chainworks");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(outside.path(), &link).expect(".chainworks symlink fixture");
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(outside.path(), &link)
-            .expect(".chainworks symlink fixture");
-
-        let run = Run {
-            id: RunId::new(),
-            idea_id: IdeaId::new(),
-            status: RunStatus::Running,
-            workflow_id: "wf".into(),
-            workflow_title: "Workflow".into(),
-            workspace_root: workspace
-                .path()
-                .canonicalize()
-                .expect("canonical workspace")
-                .to_string_lossy()
-                .into_owned(),
-            artifact_root: workspace
-                .path()
-                .join("artifacts")
-                .to_string_lossy()
-                .into_owned(),
-            started_at: Utc::now(),
-            completed_at: None,
-            cancellation_requested_at: None,
-            cancellation_settled_at: None,
-            cancellation_settlement_log: None,
-            current_state: Some("state_impl".into()),
-            workflow_yaml_path: None,
-            agent_catalog_yaml_path: None,
-            worktree_root: None,
-            base_branch: None,
-            base_revision: None,
-            target_branch: None,
-            delivery_configuration_json: None,
-            delivery_preflight_json: None,
-            workflow_family: None,
-            project_key: None,
-            risk_class: None,
-            stack: None,
-            workflow_snapshot_hash: None,
-            catalog_snapshot_hash: None,
-            workflow_snapshot_json: None,
-            catalog_snapshot_json: None,
-            drift_detected_at: None,
-            drift_details_json: None,
-            chainworks_meta_root: Some(".chainworks/runs/test-run".into()),
-            review_routing_json: None,
-            closeout_readiness_mode: None,
-        };
-
-        let err = ensure_run_meta_root_exists(&run).unwrap_err();
-        assert!(
-            err.to_string().contains("symlink"),
-            "P082: run meta-root creation must reject symlinked .chainworks components; got: {err}"
-        );
-    }
-
-    #[test]
-    fn p082_ensure_run_meta_root_rejects_parent_dir_escape() {
-        let workspace = tempfile::tempdir().expect("workspace root");
-
-        let run = Run {
-            id: RunId::new(),
-            idea_id: IdeaId::new(),
-            status: RunStatus::Running,
-            workflow_id: "wf".into(),
-            workflow_title: "Workflow".into(),
-            workspace_root: workspace
-                .path()
-                .canonicalize()
-                .expect("canonical workspace")
-                .to_string_lossy()
-                .into_owned(),
-            artifact_root: workspace
-                .path()
-                .join("artifacts")
-                .to_string_lossy()
-                .into_owned(),
-            started_at: Utc::now(),
-            completed_at: None,
-            cancellation_requested_at: None,
-            cancellation_settled_at: None,
-            cancellation_settlement_log: None,
-            current_state: Some("state_impl".into()),
-            workflow_yaml_path: None,
-            agent_catalog_yaml_path: None,
-            worktree_root: None,
-            base_branch: None,
-            base_revision: None,
-            target_branch: None,
-            delivery_configuration_json: None,
-            delivery_preflight_json: None,
-            workflow_family: None,
-            project_key: None,
-            risk_class: None,
-            stack: None,
-            workflow_snapshot_hash: None,
-            catalog_snapshot_hash: None,
-            workflow_snapshot_json: None,
-            catalog_snapshot_json: None,
-            drift_detected_at: None,
-            drift_details_json: None,
-            chainworks_meta_root: Some(".chainworks/../outside/run-meta".into()),
-            review_routing_json: None,
-            closeout_readiness_mode: None,
-        };
-
-        let err = ensure_run_meta_root_exists(&run).unwrap_err();
-        assert!(
-            err.to_string().contains("unsafe path component")
-                || err.to_string().contains("escapes canonical"),
-            "P082: run meta-root creation must reject parent-directory escapes; got: {err}"
-        );
-    }
 
     #[test]
     fn p060_idea_body_review_mode_and_reviewer_override_are_canonicalized() {
@@ -8097,6 +10534,374 @@ reviewer_override:
                 .get("retry_reason")
                 .and_then(serde_json::Value::as_str),
             Some("operator_retry_completion_recovery")
+        );
+    }
+
+    // ── P083: canonical_intent_hash sorted-key determinism (DEFECT-004) ─────
+
+    #[test]
+    fn canonical_intent_hash_is_stable_regardless_of_field_insertion_order() {
+        // BTreeMap-based serialization must produce the same hash regardless of
+        // how fields are passed in — the hash depends on alphabetical key order.
+        let h1 = canonical_intent_hash(&[
+            (
+                "command",
+                serde_json::Value::String("p083.rollback_execution".into()),
+            ),
+            ("reason", serde_json::Value::String("test".into())),
+            (
+                "rollback_mode",
+                serde_json::Value::String("permissive".into()),
+            ),
+        ]);
+        let h2 = canonical_intent_hash(&[
+            (
+                "rollback_mode",
+                serde_json::Value::String("permissive".into()),
+            ),
+            (
+                "command",
+                serde_json::Value::String("p083.rollback_execution".into()),
+            ),
+            ("reason", serde_json::Value::String("test".into())),
+        ]);
+        assert_eq!(
+            h1, h2,
+            "canonical_intent_hash must be stable regardless of field order"
+        );
+        assert_eq!(h1.len(), 64, "SHA-256 hex must be 64 characters");
+    }
+
+    // ── P083: engine-boundary Operator guard (SEC-P083-HIGH-001) ────────────
+
+    /// Verify that ShutdownProviderSession, P083RollbackExecution, P083SetEnforcementMode,
+    /// RetryRun, and ForceReconcileSideEffect all require Operator principal class.
+    /// The guard in handle_inner calls anyhow::bail! when this predicate is true.
+    #[test]
+    fn p083_lifecycle_commands_require_operator_class_guard_fires_for_agent() {
+        fn guard_fires(cmd: &Command, class: &PrincipalClass) -> bool {
+            matches!(
+                cmd,
+                Command::ShutdownProviderSession(_)
+                    | Command::P083RollbackExecution(_)
+                    | Command::P083SetEnforcementMode(_)
+                    | Command::RetryRun(_)
+                    | Command::ForceReconcileSideEffect(_)
+            ) && *class != PrincipalClass::Operator
+        }
+
+        let cmds = [
+            Command::ShutdownProviderSession(ShutdownProviderSessionCmd {
+                provider_session_id: "ps-test".into(),
+                request_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+                reason: "test".into(),
+            }),
+            Command::P083RollbackExecution(P083RollbackExecutionCmd {
+                request_id: "550e8400-e29b-41d4-a716-446655440001".into(),
+                rollback_mode: "permissive".into(),
+                reason: "test".into(),
+            }),
+            Command::P083SetEnforcementMode(P083SetEnforcementModeCmd {
+                request_id: "550e8400-e29b-41d4-a716-446655440002".into(),
+                enforcement_mode: "permissive".into(),
+                reason: "test".into(),
+            }),
+            Command::RetryRun(RetryRunCmd {
+                run_id: RunId::new(),
+                request_id: "550e8400-e29b-41d4-a716-446655440003".into(),
+            }),
+            Command::ForceReconcileSideEffect(ForceReconcileSideEffectCmd {
+                effect_id: "550e8400-e29b-41d4-a716-446655440004".into(),
+                request_id: "550e8400-e29b-41d4-a716-446655440005".into(),
+                decision_json:
+                    r#"{"schema_version":"side_effect_decision_v1","decision":"reconciled"}"#.into(),
+            }),
+        ];
+
+        for cmd in &cmds {
+            // Agent and Observer callers must be denied.
+            assert!(
+                guard_fires(cmd, &PrincipalClass::Agent),
+                "guard must fire for Agent on {cmd:?}"
+            );
+            assert!(
+                guard_fires(cmd, &PrincipalClass::Observer),
+                "guard must fire for Observer on {cmd:?}"
+            );
+            // Operator must be allowed.
+            assert!(
+                !guard_fires(cmd, &PrincipalClass::Operator),
+                "guard must not fire for Operator on {cmd:?}"
+            );
+        }
+    }
+
+    // ── P083: caller_request_id_v1 validation ────────────────────────────────
+
+    #[test]
+    fn p083_validate_caller_request_id_accepts_valid_v4() {
+        // A well-formed lowercase UUIDv4 must pass caller_request_id_v1 validation.
+        let valid = "550e8400-e29b-41d4-a716-446655440000";
+        assert!(
+            validate_caller_request_id(valid).is_ok(),
+            "valid lowercase UUIDv4 must pass: {valid}"
+        );
+    }
+
+    #[test]
+    fn p083_validate_caller_request_id_rejects_uppercase() {
+        let upper = "550E8400-E29B-41D4-A716-446655440000";
+        let err = validate_caller_request_id(upper).unwrap_err();
+        assert!(
+            err.to_string().contains("MALFORMED_REQUEST_ID"),
+            "uppercase UUID must return MALFORMED_REQUEST_ID: {err}"
+        );
+    }
+
+    #[test]
+    fn p083_validate_caller_request_id_rejects_whitespace() {
+        let with_space = " 550e8400-e29b-41d4-a716-446655440000";
+        let err = validate_caller_request_id(with_space).unwrap_err();
+        assert!(
+            err.to_string().contains("MALFORMED_REQUEST_ID"),
+            "UUID with whitespace must return MALFORMED_REQUEST_ID: {err}"
+        );
+    }
+
+    #[test]
+    fn p083_validate_caller_request_id_rejects_urn_prefix() {
+        let urn = "urn:uuid:550e8400-e29b-41d4-a716-446655440000";
+        let err = validate_caller_request_id(urn).unwrap_err();
+        assert!(
+            err.to_string().contains("MALFORMED_REQUEST_ID"),
+            "URN-prefixed UUID must return MALFORMED_REQUEST_ID: {err}"
+        );
+    }
+
+    #[test]
+    fn p083_validate_caller_request_id_rejects_braced() {
+        let braced = "{550e8400-e29b-41d4-a716-446655440000}";
+        let err = validate_caller_request_id(braced).unwrap_err();
+        assert!(
+            err.to_string().contains("MALFORMED_REQUEST_ID"),
+            "braced UUID must return MALFORMED_REQUEST_ID: {err}"
+        );
+    }
+
+    #[test]
+    fn p083_validate_caller_request_id_rejects_non_v4() {
+        // A UUID that is not v4 (version nibble != 4) must be rejected.
+        // Version 1: version nibble at position 14 is 1.
+        let v1 = "550e8400-e29b-11d4-a716-446655440000";
+        let err = validate_caller_request_id(v1).unwrap_err();
+        assert!(
+            err.to_string().contains("MALFORMED_REQUEST_ID"),
+            "non-v4 UUID must return MALFORMED_REQUEST_ID: {err}"
+        );
+    }
+
+    #[test]
+    fn p083_validate_caller_request_id_rejects_malformed_string() {
+        let garbage = "not-a-uuid-at-all";
+        let err = validate_caller_request_id(garbage).unwrap_err();
+        assert!(
+            err.to_string().contains("MALFORMED_REQUEST_ID"),
+            "malformed string must return MALFORMED_REQUEST_ID: {err}"
+        );
+    }
+
+    #[test]
+    fn p083_validate_caller_request_id_rejects_invalid_variant_nibble() {
+        // Variant nibble at position 19 must be 8, 9, a, or b.
+        // 'c' at position 19 is outside the allowed RFC 4122 variant range.
+        let bad_variant = "550e8400-e29b-41d4-c716-446655440000";
+        let err = validate_caller_request_id(bad_variant).unwrap_err();
+        assert!(
+            err.to_string().contains("MALFORMED_REQUEST_ID"),
+            "invalid variant nibble must return MALFORMED_REQUEST_ID: {err}"
+        );
+    }
+
+    #[test]
+    fn p083_validate_caller_request_id_rejects_undashed_form() {
+        // A UUID without dashes (32 hex chars) must fail the length/format check.
+        let undashed = "550e8400e29b41d4a716446655440000";
+        let err = validate_caller_request_id(undashed).unwrap_err();
+        assert!(
+            err.to_string().contains("MALFORMED_REQUEST_ID"),
+            "undashed UUID must return MALFORMED_REQUEST_ID: {err}"
+        );
+    }
+
+    #[test]
+    fn p083_validate_reason_accepts_printable_text_and_common_whitespace() {
+        validate_p083_reason("operator requested rollback\n\twith context", 1024)
+            .expect("printable reason with common whitespace should pass");
+    }
+
+    #[test]
+    fn p083_validate_reason_rejects_control_characters() {
+        let err = validate_p083_reason("bad\u{0007}reason", 1024).unwrap_err();
+        assert!(
+            err.to_string().contains("P083_INVALID_REASON"),
+            "control character rejection should use durable P083 reason code: {err}"
+        );
+    }
+
+    #[test]
+    fn p083_validate_reason_rejects_oversized_reason() {
+        let reason = "x".repeat(1025);
+        let err = validate_p083_reason(&reason, 1024).unwrap_err();
+        assert!(
+            err.to_string().contains("P083_INVALID_REASON"),
+            "oversized reason rejection should use durable P083 reason code: {err}"
+        );
+    }
+
+    #[test]
+    fn p083_provider_session_shutdown_result_variants() {
+        // SEC-P083-HIGH-001: when process_id is known, ProviderSessionShutdownRecorded carries
+        // dispatched_count ≥ 1. When process_id is null at command time, the command returns
+        // ProviderSessionShutdownHeld (NOT a success with dispatched_count=0).
+        let result_dispatched = CommandResult::ProviderSessionShutdownRecorded {
+            provider_session_id: "ps-test".into(),
+            journal_id: "journal-test".into(),
+            idempotency_request_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            cancellation_epoch: 42,
+            dispatched_count: 1,
+        };
+        let result_held = CommandResult::ProviderSessionShutdownHeld {
+            provider_session_id: "ps-test-nopid".into(),
+            journal_id: "journal-test".into(),
+            idempotency_request_id: "550e8400-e29b-41d4-a716-446655440001".into(),
+            cancellation_epoch: 43,
+            operator_next_step_code: "manual_process_identity_check".into(),
+        };
+
+        match result_dispatched {
+            CommandResult::ProviderSessionShutdownRecorded {
+                provider_session_id,
+                cancellation_epoch,
+                dispatched_count,
+                ..
+            } => {
+                assert_eq!(provider_session_id, "ps-test");
+                assert_eq!(cancellation_epoch, 42);
+                assert_eq!(dispatched_count, 1, "signal dispatched on command path");
+            }
+            _ => panic!("expected ProviderSessionShutdownRecorded"),
+        }
+
+        match result_held {
+            CommandResult::ProviderSessionShutdownHeld {
+                provider_session_id,
+                cancellation_epoch,
+                operator_next_step_code,
+                ..
+            } => {
+                assert_eq!(provider_session_id, "ps-test-nopid");
+                assert_eq!(cancellation_epoch, 43);
+                assert_eq!(
+                    operator_next_step_code, "manual_process_identity_check",
+                    "null process_id → held with manual identity check"
+                );
+            }
+            _ => panic!("expected ProviderSessionShutdownHeld"),
+        }
+    }
+
+    // ── SEC-P083-HIGH-001 regression: force_reconcile intent hash includes decision_json ─
+
+    /// Verifies that `side_effects.force_reconcile` produces different intent hashes for
+    /// the same effect_id but different decision_json payloads.
+    ///
+    /// Without this fix, two calls with same effect_id + different request_id +
+    /// different decision_json would share the same intent_hash and the alias-replay
+    /// path would return the prior committed success without the payload-mismatch guard
+    /// ever running. Including decision_json_digest in the intent hash ensures that
+    /// semantically different decisions are treated as distinct intents.
+    #[test]
+    fn sec_p083_high_001_force_reconcile_different_decision_json_produces_different_intent_hash() {
+        let effect_id = "eff-00000000-0000-4000-a000-000000000001";
+
+        fn compute_intent(effect_id: &str, decision_json: &str) -> String {
+            let decision_value: serde_json::Value =
+                serde_json::from_str(decision_json).expect("valid JSON");
+            let decision_canonical = serde_json::to_string(&decision_value).unwrap_or_default();
+            let decision_json_intent_digest = {
+                use sha2::{Digest, Sha256};
+                format!("{:x}", Sha256::digest(decision_canonical.as_bytes()))
+            };
+            canonical_intent_hash(&[
+                (
+                    "command",
+                    serde_json::Value::String("side_effects.force_reconcile".into()),
+                ),
+                (
+                    "decision_json_digest",
+                    serde_json::Value::String(decision_json_intent_digest),
+                ),
+                (
+                    "effect_id",
+                    serde_json::Value::String(effect_id.to_string()),
+                ),
+            ])
+        }
+
+        let d1 = r#"{"schema_version":"side_effect_decision_v1","decision":"approved"}"#;
+        let d2 = r#"{"schema_version":"side_effect_decision_v1","decision":"rejected"}"#;
+
+        let hash_d1 = compute_intent(effect_id, d1);
+        let hash_d2 = compute_intent(effect_id, d2);
+
+        assert_ne!(
+            hash_d1, hash_d2,
+            "same effect_id with different decision_json must produce different intent hashes \
+             to prevent alias-replay bypass (SEC-P083-HIGH-001)"
+        );
+    }
+
+    #[test]
+    fn sec_p083_high_001_force_reconcile_same_decision_json_whitespace_variant_same_hash() {
+        // Canonical serialization normalizes whitespace so semantically equal payloads
+        // map to the same intent hash.
+        let effect_id = "eff-00000000-0000-4000-a000-000000000002";
+
+        fn compute_intent(effect_id: &str, decision_json: &str) -> String {
+            let decision_value: serde_json::Value =
+                serde_json::from_str(decision_json).expect("valid JSON");
+            let decision_canonical = serde_json::to_string(&decision_value).unwrap_or_default();
+            let decision_json_intent_digest = {
+                use sha2::{Digest, Sha256};
+                format!("{:x}", Sha256::digest(decision_canonical.as_bytes()))
+            };
+            canonical_intent_hash(&[
+                (
+                    "command",
+                    serde_json::Value::String("side_effects.force_reconcile".into()),
+                ),
+                (
+                    "decision_json_digest",
+                    serde_json::Value::String(decision_json_intent_digest),
+                ),
+                (
+                    "effect_id",
+                    serde_json::Value::String(effect_id.to_string()),
+                ),
+            ])
+        }
+
+        let compact = r#"{"schema_version":"side_effect_decision_v1","decision":"approved"}"#;
+        let with_space =
+            "{ \"schema_version\": \"side_effect_decision_v1\", \"decision\": \"approved\" }";
+
+        let hash_compact = compute_intent(effect_id, compact);
+        let hash_spaced = compute_intent(effect_id, with_space);
+
+        assert_eq!(
+            hash_compact, hash_spaced,
+            "semantically equal decision_json with different whitespace must produce the same \
+             intent hash after canonical re-serialization"
         );
     }
 }

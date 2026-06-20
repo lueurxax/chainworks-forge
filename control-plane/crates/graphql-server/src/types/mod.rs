@@ -5,6 +5,7 @@ pub mod escalation;
 pub mod idea;
 pub mod p031;
 pub mod p080;
+pub mod p083;
 pub mod run;
 pub mod scheduler;
 pub mod session;

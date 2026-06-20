@@ -1,0 +1,33 @@
+{
+  "fixture_id": "provider-session-shutdown-side-effect-receipt-settles",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "side_effect_idempotency_contract_v1",
+  "description": "A provider session that was shut down mid-execution settles its side-effect row when the receipt arrives on restart, preventing re-execution.",
+  "preconditions": {
+    "session_id": "session-provider-001",
+    "session_state": "shutdown",
+    "side_effect_id": "se-provider-001",
+    "side_effect_state": "planned",
+    "signal_issued": true,
+    "signal_generation": 1
+  },
+  "action": {
+    "event": "ProviderSessionReceiptArrived",
+    "session_id": "session-provider-001",
+    "side_effect_id": "se-provider-001",
+    "receipt": {
+      "status": "completed",
+      "signal_generation": 1,
+      "completed_at": "2026-06-11T10:10:00Z"
+    }
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "side_effect_state transitions from planned to committed",
+    "no new provider session launched",
+    "receipt generation matches signal_generation",
+    "downstream stage marked complete",
+    "duplicate receipt for same side_effect_id is idempotently ignored"
+  ]
+}

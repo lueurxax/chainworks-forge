@@ -929,8 +929,13 @@ impl McpServer {
                 // sentinel is inserted inside the command transaction so the idempotency claim,
                 // command_journal row, and durable domain writes share one write unit.
                 // Logic extracted to module-level helpers to keep this async fn's stack frame small.
+                // SEC-P083-LOW-002: P083 command tools bypass this precheck because they use
+                // request_id (CallerRequestId UUIDv4) via command_idempotency_contract_v1, not
+                // idempotency_key (P081 UUIDv7). They are still subject to audit-budget checks.
                 let (idempotency_claimed_key, idempotency_claimed_hash) =
-                    if is_state_changing_call(canonical_tool_name, &tool_params) {
+                    if is_state_changing_call(canonical_tool_name, &tool_params)
+                        && !is_p083_command_idempotency_tool(canonical_tool_name)
+                    {
                         match mcp_idempotency_precheck(
                             &self.pool,
                             id.clone(),
@@ -1683,10 +1688,8 @@ impl McpServer {
             let escalation_readback = if is_operator {
                 tools::runs::build_escalation_readback_json(&self.pool, run_id_parsed).await?
             } else {
-                serde_json::Value::Object(
-                    tools::runs::build_escalation_readback_summary_json(&self.pool, run_id_parsed)
-                        .await?,
-                )
+                tools::runs::build_escalation_readback_summary_json(&self.pool, run_id_parsed)
+                    .await?
             };
             obj.insert("escalation_readback".into(), escalation_readback);
         }
@@ -1769,7 +1772,7 @@ impl McpServer {
             // non-agents paths (storage, runs, runtime, etc.) in debug builds.
             Box::pin(tools::agents::execute(tool_name, params, pool, principal)).await
         } else if tool_name.starts_with("automation.") {
-            tools::automation::execute(tool_name, params).await
+            tools::automation::execute(tool_name, params, principal).await
         } else if tool_name.starts_with("p080.") {
             tools::p080::execute(tool_name, params, pool, principal).await
         } else {
@@ -1874,7 +1877,6 @@ fn is_state_changing_tool(tool_name: &str) -> bool {
     matches!(
         tools::canonical_tool_name(tool_name),
         "runs.start"
-            | "runs.cancel"
             | "runs.main_sync.request"
             | "runs.main_sync.retry"
             | "runs.main_sync.set_override"
@@ -1883,20 +1885,42 @@ fn is_state_changing_tool(tool_name: &str) -> bool {
             | "runs.knowledge_capsule.ignore"
             | "runs.settle_proposal_gate"
             | "ideas.create"
-            | "stages.retry"
             | "stages.consume_provider_quota_hold"
             | "legacy_discovery_override_create"
             | "workflow_conflicts.resolve"
             | "workflow_loop_budget.extend"
             | "artifacts.override_contract"
             | "steward.run_analysis"
-            | "approvals.resolve"
+            | "agents.continue_work"
             | "effects.mark_conflict"
             | "effects.mark_unrecoverable"
             | "effects.clear_after_manual_verification"
             | "storage.maintenance.repair_slot"
             | "storage.projections.clear_backlog"
-            | "storage.projections.clear_poison"
+            | "storage.projections.clear_poison" // runs.cancel, stages.retry, approvals.resolve use is_p083_command_idempotency_tool.
+    )
+}
+
+/// Returns true if this tool uses the P083 command_idempotency_contract_v1 (request_id /
+/// CallerRequestId UUIDv4) instead of the P081 idempotency_key (UUIDv7). These tools are
+/// state-changing and subject to audit-budget checks, but they must bypass the P081
+/// mcp_idempotency_precheck because that precheck requires idempotency_key, which is not
+/// present in the P083 tool schemas (additionalProperties=false). Each P083 tool handler
+/// validates request_id and acquires its own command_idempotency lease.
+/// SEC-P083-LOW-002: separating classification prevents P083 MCP callers from being
+/// denied with IDEMPOTENCY_KEY_REQUIRED when following the published request_id schema.
+fn is_p083_command_idempotency_tool(tool_name: &str) -> bool {
+    matches!(
+        tools::canonical_tool_name(tool_name),
+        "provider_session.shutdown"
+            | "provider_session.mark_process_absent"
+            | "p083.rollback_execution"
+            | "p083.set_enforcement_mode"
+            | "runs.retry"
+            | "runs.cancel"
+            | "stages.retry"
+            | "approvals.resolve"
+            | "side_effects.force_reconcile"
     )
 }
 
@@ -1905,6 +1929,11 @@ fn is_state_changing_tool(tool_name: &str) -> bool {
 /// that have both a read-only (dry-run) and a mutating (live) execution mode.
 fn is_state_changing_call(tool_name: &str, params: &serde_json::Value) -> bool {
     if is_state_changing_tool(tool_name) {
+        return true;
+    }
+    // P083 tools are state-changing for audit-budget purposes even though they bypass P081
+    // idempotency precheck (they use command_idempotency_contract_v1 with request_id).
+    if is_p083_command_idempotency_tool(tool_name) {
         return true;
     }
     // storage.reconcile_evidence_orphans: dryRun=false is state-changing.

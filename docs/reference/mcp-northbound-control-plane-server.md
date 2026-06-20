@@ -18,12 +18,12 @@ Related stable docs:
 
 The Rust control-plane daemon exposes two northbound surfaces on a single port (default `0.0.0.0:4000`):
 
-- **MCP** — JSON-RPC over stdio and Streamable HTTP (`/mcp`). Serves tools and resources to agents, CLIs, and automations.
-- **GraphQL** — HTTP POST `/graphql` and subscriptions over `/graphql/ws`. Serves read queries, approval-gate decisions, and event streams to the macOS operator UI.
+- **MCP** — JSON-RPC over stdio and Streamable HTTP (`/mcp`). Serves tools and resources to agents, CLIs, and automations. P083 enriches `runs.get` readback with `rollout_contract_rollback_disposition` (wrapped per `rollback_disposition_v1`) and `p083_shutdown_queue_rank`; the P083 command tools (`provider_session.shutdown`, `provider_session.mark_process_absent`, `p083.rollback_execution`, `p083.set_enforcement_mode`, `runs.retry`, `side_effects.force_reconcile`) are registered for authorized operator callers, validate lowercase UUIDv4 `request_id` values, and dispatch through durable command-idempotency handlers.
+- **GraphQL** — HTTP POST `/graphql` and subscriptions over `/graphql/ws`. Serves read queries, approval-gate decisions, P083 operator lifecycle mutations, and event streams to the macOS operator UI. P083 adds `p083RolloutContractReadback` on `Run`, the `p083IdentityHoldSessions` read query, the `RollbackDispositionJSON` output scalar with resolver-side validation, and operator-only lifecycle mutations for provider shutdown, process-absent confirmation, rollback, enforcement-mode changes, and run retry.
 
-MCP is the external control plane for operational commands. GraphQL is the UI read/subscription surface plus the approval-only human-gate mutation path. Non-approval operational commands such as run start, cancellation, stage retry, session reset, compaction, recovery, cloning, and experiment control are MCP-only. The governed UI action boundary is summarized in [ui-action-boundary.md](ui-action-boundary.md).
+MCP is the external control plane for operational commands. The governed macOS UI remains a GraphQL read/subscription surface plus the approval-only human-gate mutation path; it does not route P083 lifecycle mutations. Most non-approval operational commands such as run start, cancellation, stage retry, session reset, compaction, recovery, cloning, and experiment control are MCP-only. The governed UI action boundary is summarized in [ui-action-boundary.md](ui-action-boundary.md).
 
-Both surfaces are authenticated with bearer tokens and filter their visible surface area by the caller's principal class. MCP command tools and approval-gate GraphQL mutations converge on a single `engine::command_handler::CommandHandler` for command execution. Every command execution writes an auditable row to `command_journal` tagged with the caller's surface, principal id, principal class, and tool/mutation name.
+Both surfaces are authenticated with bearer tokens and filter their visible surface area by the caller's principal class. MCP command tools, approval-gate GraphQL mutations, and P083 operator GraphQL lifecycle mutations converge on a single `engine::command_handler::CommandHandler` for command execution. Every command execution writes an auditable row to `command_journal` tagged with the caller's surface, principal id, principal class, and tool/mutation name.
 
 P081 adds the boundary-first authorization contract that supersedes static-only
 principal-class filtering. The matrix, executable fixture, validator, audit-log
@@ -45,10 +45,10 @@ This reference covers:
 - domain-owned typed capability identifiers
 - bearer auth on MCP HTTP, MCP stdio (via `initialize`), GraphQL HTTP, and GraphQL WebSocket transports
 - per-class capability filtering for MCP `tools/list`, `tools/call`, `resources/list`, `resources/read`
-- the GraphQL approval-only mutation boundary and legacy non-UI compatibility boundary
+- the GraphQL approval mutation boundary, P083 operator lifecycle mutation surface, and legacy non-UI compatibility boundary
 - `CommandHandler` caller-context propagation and `command_journal` audit row shape
 - the `command_journal` redaction matrix
-- `journal_id` surfacing on MCP command-tool responses and approval mutation payload wrappers
+- `journal_id` surfacing on MCP command-tool responses and GraphQL command mutation payload wrappers
 - the typed `DeliveryPreflight` object on blocked MCP `runs.start`
 - the dogfood `.mcp.json` / `CLAUDE.md` contract
 - the canonical `proposal-029-mcp` verification gate
@@ -387,6 +387,16 @@ GraphQL is not a general-purpose operator command bus. The macOS operator UI may
 
 `approveApproval` and `rejectApproval` share the same capability because they differ only by `ApprovalDecision`; the surface policy allowlist distinguishes them from all non-approval command mutations. A mutation invoked by a principal whose class or surface policy is not permitted returns `async_graphql::Error("forbidden")` and writes no `command_journal` row.
 
+P083 also exposes an operator-only GraphQL lifecycle surface for non-UI callers that are explicitly authorized by capability/surface policy. Each mutation validates a lowercase UUIDv4 `request_id`, builds a `CallerContext::graphql(...)`, dispatches through `CommandHandler`, and returns a `journalId`/`requestId` pair:
+
+| Mutation | `CapabilityToolId` | Effect |
+|---|---|---|
+| `providerSessionShutdown` | `ProviderSessionShutdown` | Records provider-cancellation intent and planned shutdown signal rows, or returns `manual_process_identity_check` when identity is ambiguous. |
+| `p083MarkProviderSessionProcessAbsent` | `ProviderSessionMarkProcessAbsent` | Confirms an identity-ambiguous provider process is absent and re-opens the held cancellation intent. |
+| `p083RollbackExecution` | `P083RollbackExecution` | Moves enforcement mode back to `permissive` or `disabled` and writes rollback audit/idempotency rows. |
+| `p083SetEnforcementMode` | `P083SetEnforcementMode` | Changes P083 enforcement mode with transition journal, audit, and idempotency rows. |
+| `runsRetry` | `RetryRun` | Re-queues `AdvanceRun` for a stalled or failed run. |
+
 The following operations are MCP-only for agents, CLIs, automations, and operator diagnostics:
 
 | Operation | MCP tool | SwiftUI via GraphQL |
@@ -398,9 +408,10 @@ The following operations are MCP-only for agents, CLIs, automations, and operato
 | Resolve workflow conflict | `workflow_conflicts.resolve` | no |
 | Override legacy discovery policy | `legacy_discovery_override_create` | no |
 | Override artifact contract | `artifacts.override_contract` | no |
+| Force-reconcile side effect | `side_effects.force_reconcile` | no |
 | Run Steward analysis | `steward.run_analysis` | no |
 
-Current Rust schema compatibility note: older non-approval GraphQL mutation resolver names may remain in the compiled schema while downstream tests are retired, but production/default UI principals fail closed for those fields. They are not current operator API. SwiftUI must not call them, new UI work must not add call sites for them, and MCP remains the only supported write path for non-approval operations.
+Current Rust schema compatibility note: older non-approval GraphQL mutation resolver names may remain in the compiled schema while downstream tests are retired, but production/default UI principals fail closed for those fields. They are not current SwiftUI action-routing API. SwiftUI must not call them, and new UI work must not add call sites for them unless a later approved write-transport proposal changes the governed UI boundary.
 
 ### Enforcement points
 
@@ -409,7 +420,7 @@ Current Rust schema compatibility note: older non-approval GraphQL mutation reso
 - `resources/read` parses the concrete URI into a `ResourceTemplateId` via `resource_template_id_for_uri`, then calls `auth::match_resource_uri`. A denied read returns `-32002 "Resource not found"`.
 - GraphQL approval mutation resolvers read `Principal` from `async_graphql::Context`, evaluate the same injected `BoundaryPolicy`, and return the P081 denial envelope before command side effects on denial.
 
-Implementation: `control-plane/crates/auth/src/lib.rs` (`filter_tools`, `filter_resources`, `match_resource_uri`, `tool_allowed_for_class`, `resource_allowed_for_class`), `control-plane/crates/mcp-server/src/server.rs` (`handle_request`, `visible_tool_specs`), `control-plane/crates/graphql-server/src/schema.rs` (approval mutation resolvers and explicitly quarantined legacy compatibility resolvers).
+Implementation: `control-plane/crates/auth/src/lib.rs` (`filter_tools`, `filter_resources`, `match_resource_uri`, `tool_allowed_for_class`, `resource_allowed_for_class`), `control-plane/crates/mcp-server/src/server.rs` (`handle_request`, `visible_tool_specs`), `control-plane/crates/graphql-server/src/schema.rs` (approval mutation resolvers, P083 operator lifecycle mutation resolvers, and explicitly quarantined legacy compatibility resolvers).
 
 ## Caller context and command journal audit
 
@@ -422,7 +433,7 @@ pub struct CallerContext {
     pub surface: CallerSurface,      // Mcp | Graphql
     pub principal_id: String,
     pub principal_class: PrincipalClass,
-    pub caller_tool: String,         // MCP tool name or approval GraphQL mutation name
+    pub caller_tool: String,         // MCP tool name or GraphQL command mutation name
 }
 ```
 
@@ -437,7 +448,7 @@ distinct types; future phases may converge them further.
 Constructors:
 
 - `CallerContext::mcp(principal_id, &principal_class, tool_name)` — built at every MCP command-tool entry point.
-- `CallerContext::graphql(principal_id, &principal_class, mutation_name)` — built inside GraphQL approval mutation resolvers after the capability check. Legacy non-approval GraphQL mutation rows may still appear only through explicit compatibility fixtures while those resolvers remain compiled.
+- `CallerContext::graphql(principal_id, &principal_class, mutation_name)` — built inside GraphQL command mutation resolvers after the capability check. P083 operator lifecycle mutations also require a lowercase UUIDv4 `request_id` and dispatch through the same durable command-idempotency handlers as their MCP counterparts. Legacy non-approval GraphQL mutation rows may still appear only through explicit compatibility fixtures while those resolvers remain compiled.
 - `CallerContext::test_fixture()` — plain `pub fn` (not `cfg(test)`) so that integration tests in `engine/tests/`, `graphql-server/tests/`, `mcp-server/src/` and `daemon/tests/` can construct a well-formed context without touching auth. Rows tagged with this constructor show `caller_surface = "mcp"`, `principal_id = "test-operator"`, `principal_class = "operator"`, `caller_tool = "test"`.
 
 No `Internal` variant is defined. Extending `CallerSurface` to cover internal callers (executor, recovery) happens only when a future slice routes those callers through `CommandHandler`.
@@ -545,14 +556,19 @@ The server currently advertises `protocolVersion: "2024-11-05"`, which predates 
 
 The eight direct tools (`ideas.create`, `ideas.list`, `runs.list`, `runs.get`, `approvals.list`, `reports.get`, `steward.list_analyses`, `steward.get_analysis`) call repo functions directly and bypass `CommandHandler`. They write no `command_journal` row and their response JSON does not include `journal_id`.
 
-### GraphQL approval mutation payload wrappers
+### GraphQL command mutation payload wrappers
 
-Approval mutations return dedicated payload objects so that `journalId: ID!` lives on the mutation result and does not pollute shared entity types (`Approval`) that read queries also return.
+Command mutations return dedicated payload objects so that `journalId` lives on the mutation result and does not pollute shared entity types (`Approval`, `Run`, or provider-session readback rows) that read queries also return.
 
 | Mutation | Return type |
 |---|---|
 | `approveApproval` | `ApproveApprovalPayload { approval: Approval!, journalId: ID! }` |
 | `rejectApproval` | `RejectApprovalPayload { approval: Approval!, journalId: ID! }` |
+| `providerSessionShutdown` | `GqlP083ProviderSessionShutdownPayload { scheduled: Boolean!, providerSessionId: String!, cancellationEpoch: Int!, journalId: String!, requestId: String!, operatorNextStepCode: String }` |
+| `p083MarkProviderSessionProcessAbsent` | `GqlP083MarkProcessAbsentPayload { markedAbsent: Boolean!, providerSessionId: String!, cancellationEpoch: Int!, journalId: String!, requestId: String! }` |
+| `p083RollbackExecution` | `GqlP083RollbackExecutionPayload { committed: Boolean!, rollbackMode: String!, journalId: String!, requestId: String! }` |
+| `p083SetEnforcementMode` | `GqlP083SetEnforcementModePayload { committed: Boolean!, enforcementMode: String!, journalId: String!, requestId: String! }` |
+| `runsRetry` | `GqlRetryRunPayload { queued: Boolean!, runId: String!, journalId: String!, requestId: String! }` |
 
 Clients select the field via normal GraphQL syntax:
 
@@ -616,9 +632,9 @@ The gate enumerates a fixed inventory of focused tests covering:
 - capability filtering for tool lists, tool calls, resource lists, and resource reads (including the Steward trio and the `steward-analysis://` resource),
 - command-journal caller-metadata rows (per surface, per class),
 - the §8.1 redaction matrix (one test per decision),
-- `journal_id` surfacing on MCP command tools and approval GraphQL mutation payload wrappers,
+- `journal_id` surfacing on MCP command tools and GraphQL command mutation payload wrappers,
 - the typed `DeliveryPreflight` object on blocked MCP `runs.start`,
-- the UI action boundary: GraphQL is read/subscription plus approval-only mutation; MCP owns non-approval operational commands,
+- the UI action boundary: governed SwiftUI uses GraphQL read/subscription plus approval-only mutations; MCP owns non-approval operational commands for the governed UI while P083's operator GraphQL lifecycle mutations remain non-UI command surface,
 - dogfood `.mcp.json` and `CLAUDE.md` consistency.
 
 For each test in the inventory the gate runs `cargo test -p <crate> <name> -- --nocapture` and post-checks the output for a matching `test <name>` line, so a rename, typo, or deletion fails the gate independently of the test body. After every focused test passes, the gate runs `cargo test --workspace` as a final regression step.
@@ -635,4 +651,4 @@ The following items are explicitly out of scope for this reference:
 - **Per-subscription capability filtering.** All authenticated principals can subscribe to all subscriptions; narrowing is a future slice.
 - **Internal `CallerSurface` variant.** Executor and recovery do not route through `CommandHandler` today. The internal-caller audit lane is reserved for a future command-path consolidation slice.
 - **MCP `structuredContent` typed-output channel.** The server advertises `protocolVersion: "2024-11-05"`; a future protocol-uplift slice adds the typed `structuredContent.journal_id` mirror.
-- **Immediate physical deletion of legacy non-approval GraphQL mutation resolvers.** The resolvers remain compatibility surface only, not a product or SwiftUI action-routing contract. Production-style principals fail closed unless they carry explicit approval-only GraphQL surface policy.
+- **Immediate physical deletion of legacy non-approval GraphQL mutation resolvers.** Legacy resolvers remain compatibility surface only, not a product or SwiftUI action-routing contract. P083 operator lifecycle mutations are the current explicit non-approval GraphQL command surface, but governed SwiftUI must still stay within the read/subscription plus approval-only boundary.

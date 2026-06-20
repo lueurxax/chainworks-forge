@@ -22,6 +22,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "idempotency_key": { "type": "string", "description": "Required UUIDv7 per attempt for safe retry." }
                 }
             }),
+            output_schema: None,
         },
         McpTool {
             name: "steward.list_analyses".to_string(),
@@ -33,6 +34,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "status": { "type": "string", "description": "Optional status filter" }
                 }
             }),
+            output_schema: None,
         },
         McpTool {
             name: "steward.get_analysis".to_string(),
@@ -45,6 +47,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "analysis_id": { "type": "string", "description": "Steward analysis ID" }
                 }
             }),
+            output_schema: None,
         },
     ]
 }

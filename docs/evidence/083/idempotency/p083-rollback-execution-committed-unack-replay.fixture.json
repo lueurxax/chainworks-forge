@@ -1,0 +1,34 @@
+{
+  "fixture_id": "p083-rollback-execution-committed-unack-replay",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "command_idempotency_contract_v1",
+  "description": "A committed-but-unacknowledged execution replayed after restart returns the durable committed result without re-running the execution.",
+  "preconditions": {
+    "run_id": "run-005",
+    "execution_id": "exec-001",
+    "journal_entry": {
+      "request_id": "req-exec-001",
+      "command": "ExecuteStage",
+      "status": "committed",
+      "ack_state": "unacknowledged",
+      "intent_hash": "sha256:exec-intent-001"
+    },
+    "restart_occurred": true
+  },
+  "action": {
+    "command": "ExecuteStage",
+    "request_id": "req-exec-001",
+    "run_id": "run-005",
+    "execution_id": "exec-001",
+    "intent_hash": "sha256:exec-intent-001"
+  },
+  "expected_outcome": "idempotent_replay",
+  "assertions": [
+    "committed result returned without re-execution",
+    "ack_state transitions from unacknowledged to acknowledged",
+    "no new execution side-effect created",
+    "stage state reflects originally committed outcome",
+    "replay audit trail recorded"
+  ]
+}

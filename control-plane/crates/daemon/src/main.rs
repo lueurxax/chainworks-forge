@@ -678,6 +678,45 @@ async fn run_daemon() -> Result<()> {
         work_items_requeued = summary.work_items_requeued,
         "startup recovery complete"
     );
+    // P083: scan unresolved shutdown signals and identity-ambiguous provider sessions.
+    match engine::shutdown_service::recover_shutdown_state(&pool).await {
+        Ok(report) => {
+            info!(
+                sessions_scanned = report.sessions_scanned,
+                retry_signal = report.retry_signal_count,
+                observation_required = report.observation_required_count,
+                identity_ambiguous = report.identity_ambiguous_count,
+                "P083 shutdown recovery scan complete"
+            );
+        }
+        Err(err) => {
+            warn!(err = %err, "P083 shutdown recovery scan failed (non-fatal)");
+        }
+    }
+    // SEC-P083-HIGH-001: dispatch any planned shutdown signals that were never issued.
+    // Per shutdown_contract_v1.recovery_rules: planned rows recorded before a crash
+    // must be dispatched through identity-checked OS signal issuance on restart.
+    match engine::shutdown_service::dispatch_planned_shutdown_signals(&pool).await {
+        Ok(dispatched) => {
+            if dispatched > 0 {
+                info!(
+                    dispatched,
+                    "P083 shutdown signal dispatch on startup complete"
+                );
+            }
+        }
+        Err(err) => {
+            warn!(err = %err, "P083 shutdown signal dispatch failed (non-fatal)");
+        }
+    }
+    // P083 MISSING-007: insert a durable_monotonic_clock_samples baseline sample on startup.
+    // Per durable_monotonic_clock_contract: records wall_clock_ms and boot_id at startup so
+    // recovery code can detect post-restart monotonic epoch drift.
+    // Per durable_monotonic_clock_contract: baseline insert failure is FATAL.
+    // Recovery relies on at least one baseline row existing after daemon start.
+    insert_durable_monotonic_clock_baseline(&pool)
+        .await
+        .context("P083 fatal: durable_monotonic_clock_samples baseline insert failed")?;
     match db::repos::maintenance::run_reaper(&pool).await {
         Ok(()) => {
             info!("P087 startup maintenance reaper complete");
@@ -1556,6 +1595,105 @@ async fn serve_failed(
     .await
 }
 
+/// Determine a stable boot-session discriminator for durable_monotonic_clock_samples.
+///
+/// On macOS, uses sysctl kern.boottime (seconds since Unix epoch at last boot) so the
+/// value survives daemon restarts and changes only after a host reboot.
+/// On Linux, reads /proc/sys/kernel/random/boot_id which is assigned at boot.
+/// Falls back to daemon PID as a weak session discriminator when OS APIs are unavailable.
+fn read_platform_boot_id() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        use libc::{c_void, size_t, timeval, CTL_KERN, KERN_BOOTTIME};
+        let mut boot_time = timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let mut size: size_t = std::mem::size_of::<timeval>();
+        let mut mib: [libc::c_int; 2] = [CTL_KERN, KERN_BOOTTIME];
+        let ret = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                &mut boot_time as *mut timeval as *mut c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if ret == 0 && boot_time.tv_sec > 0 {
+            return format!("macos_boottime_s{}", boot_time.tv_sec);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(contents) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
+            let trimmed = contents.trim().to_string();
+            if !trimmed.is_empty() {
+                return format!("linux_boot_{}", trimmed);
+            }
+        }
+    }
+    // Fallback: daemon PID is a weak session discriminator; it changes across restarts
+    // but cannot distinguish a host reboot from a daemon restart.
+    format!("daemon_pid_{}", std::process::id())
+}
+
+/// Read the monotonic clock value in milliseconds using CLOCK_MONOTONIC (system uptime).
+/// This value is zero at boot and increases continuously, surviving daemon restarts.
+/// Recovery can compare baseline values across restarts to detect clock rollbacks.
+#[cfg(unix)]
+fn monotonic_clock_ms() -> i64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime with a valid timespec pointer and a valid clock ID is always safe.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as i64) * 1000 + (ts.tv_nsec as i64) / 1_000_000
+}
+
+#[cfg(not(unix))]
+fn monotonic_clock_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+/// Insert a durable_monotonic_clock_samples baseline sample on daemon startup.
+/// Per durable_monotonic_clock_contract: records monotonic_ms (from CLOCK_MONOTONIC)
+/// and wall clock at startup so recovery can detect post-restart monotonic epoch drift.
+/// Fatal: baseline insert failure aborts startup per the approved contract.
+async fn insert_durable_monotonic_clock_baseline(pool: &SqlitePool) -> anyhow::Result<()> {
+    let monotonic_ms = monotonic_clock_ms();
+    let observed_at_wall_clock = chrono::Utc::now().to_rfc3339();
+
+    let boot_id = read_platform_boot_id();
+    let sample_id = uuid::Uuid::new_v4().to_string();
+
+    sqlx::query(
+        r#"INSERT INTO durable_monotonic_clock_samples
+               (sample_id, boot_id, sample_state, monotonic_ms,
+                observed_at_wall_clock, created_at)
+               VALUES (?1, ?2, 'baseline', ?3, ?4, ?4)"#,
+    )
+    .bind(&sample_id)
+    .bind(&boot_id)
+    .bind(monotonic_ms)
+    .bind(&observed_at_wall_clock)
+    .execute(pool)
+    .await
+    .context("P083: insert durable_monotonic_clock_samples baseline")?;
+
+    info!(
+        boot_id,
+        sample_id, monotonic_ms, "P083 durable monotonic clock baseline recorded"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1785,6 +1923,14 @@ mcp:
             paths.log_path.is_none(),
             "dev mode must not allocate a file log sink (stderr only)"
         );
+    }
+
+    #[test]
+    fn p083_monotonic_clock_baseline_insert_function_exists() {
+        // Compile-time proof that insert_durable_monotonic_clock_baseline exists and
+        // accepts a SqlitePool reference. The function is called on startup after
+        // P083 shutdown recovery scan.
+        let _ = insert_durable_monotonic_clock_baseline;
     }
 
     #[test]

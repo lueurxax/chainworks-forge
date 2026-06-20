@@ -1,0 +1,32 @@
+{
+  "fixture_id": "unbounded-label-rejected",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "metrics_label_bounds_contract_v1",
+  "description": "An attempt to emit a metric with a label value outside the declared bounded domain is rejected and replaced with a sentinel value or causes a validation error.",
+  "preconditions": {
+    "metrics_enforcement_mode": "strict",
+    "declared_command_labels": ["CancelRun", "RetryStage", "ResolveApproval", "ExecuteStage", "SetEnforcementMode", "ForceReconcileSideEffect"]
+  },
+  "action": {
+    "event": "MetricEmitAttempt",
+    "metric_name": "command_journal_writes_total",
+    "label_values": {
+      "command": "UnknownDynamicCommand_run-abc123",
+      "status": "committed"
+    }
+  },
+  "expected_outcome": "rejected",
+  "assertions": [
+    "emission rejected because 'command' value is not in bounded domain",
+    "rejection logged with label_value and metric_name",
+    "no Prometheus metric emitted with unbounded label",
+    "sentinel value '_unknown' used if lenient mode active (strict mode: hard reject)",
+    "cardinality alarm NOT triggered by unbounded label reaching Prometheus"
+  ],
+  "metric_name": "command_journal_writes_total",
+  "label_domains": {
+    "command": "bounded_enum",
+    "violation": "UnknownDynamicCommand_run-abc123"
+  }
+}

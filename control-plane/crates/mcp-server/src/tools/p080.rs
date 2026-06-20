@@ -61,6 +61,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
+            output_schema: None,
         },
         McpTool {
             name: "p080.reconcile.request.v1".to_string(),
@@ -109,6 +110,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
+            output_schema: None,
         },
         McpTool {
             name: "p080.clear_permanent_hold.v1".to_string(),
@@ -146,6 +148,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
+            output_schema: None,
         },
     ]
 }

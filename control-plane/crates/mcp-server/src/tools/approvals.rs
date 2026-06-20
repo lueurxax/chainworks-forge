@@ -50,7 +50,7 @@ use domain::commands::{
 };
 use domain::ids::{ApprovalId, RunId};
 use domain::mediation::{ApprovalInboxItem, ApprovalSubjectKind};
-use engine::command_handler::CommandHandler;
+use engine::command_handler::{validate_caller_request_id, CommandHandler};
 
 use crate::protocol::McpTool;
 use crate::request_context::mcp_caller;
@@ -66,12 +66,19 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "type": "object",
                 "properties": {}
             }),
+            output_schema: None,
         },
         McpTool {
             name: "approvals.resolve".to_string(),
-            description: "Resolve a pending approval or mediation confirmation".to_string(),
+            description: "Resolve a pending approval or mediation confirmation. Requires a \
+                CallerRequestId (lowercase UUIDv4) for command_idempotency_contract_v1 \
+                replay safety (TTL=300s)."
+                .to_string(),
             input_schema: serde_json::json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
+                "required": ["decision", "request_id"],
+                "additionalProperties": false,
                 "properties": {
                     "subject_kind": {
                         "type": "string",
@@ -98,13 +105,28 @@ pub fn tool_specs() -> Vec<McpTool> {
                         "type": "string",
                         "description": "Required for lead_mediation_confirmation"
                     },
-                    "idempotency_key": {
+                    "request_id": {
                         "type": "string",
-                        "description": "Required UUIDv7 per attempt. Must be provided for stage_approval and lead_mediation_confirmation. Enables safe retry without duplicate settlement."
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "description": "CallerRequestId: lowercase UUIDv4 for command_idempotency_contract_v1 (TTL=300s)"
                     }
-                },
-                "required": ["decision", "idempotency_key"]
+                }
             }),
+            output_schema: Some(serde_json::json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["resolved"],
+                "properties": {
+                    "resolved": { "type": "boolean", "description": "true when the approval resolution was durably committed; false on denial" },
+                    "approval_id": { "type": "string" },
+                    "journal_id": { "type": "string" },
+                    "request_id": { "type": "string", "description": "Replayed CallerRequestId for idempotency confirmation" },
+                    "denied": { "type": "boolean", "description": "true when the command was denied before execution" },
+                    "denial_code": { "type": "string", "enum": ["malformed_request_id","request_intent_mismatch","idempotency_in_flight","idempotency_replayed","idempotency_expired_reacquired","idempotency_replay_corrupt","idempotency_terminal_failure","operator_required","p083_operator_required","provider_session_not_found","run_not_found","stage_not_retryable","approval_not_actionable","side_effect_not_reconcilable","enforcement_mode_transition_denied","identity_ambiguous","internal"], "description": "Bounded denial code from P083LifecycleDenialCode" },
+                    "message": { "type": "string", "description": "Human-readable denial or error message" }
+                }
+            })),
         },
     ]
 }
@@ -207,15 +229,23 @@ async fn resolve_stage_approval(
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing 'decision'"))?;
     let comment = params["comment"].as_str().map(|s| s.to_string());
-    // SEC-003: idempotency_key is required and must be a valid UUIDv7 for stage_approval.
-    let idempotency_key = params["idempotency_key"]
-        .as_str()
-        .ok_or_else(|| {
-            anyhow::anyhow!("Missing required 'idempotency_key' for stage_approval resolution")
-        })?
-        .to_string();
-    validate_uuidv7_idempotency_key(&idempotency_key)?;
-    let caller = mcp_caller(&principal, "approvals.resolve");
+
+    // P083 command_idempotency_contract_v1: request_id (lowercase UUIDv4) is required.
+    // Legacy idempotency_key fallback is removed per P083 CallerRequestId mandate.
+    let p083_request_id = if let Some(rid) = params["request_id"].as_str() {
+        validate_caller_request_id(rid)?;
+        rid.to_string()
+    } else {
+        return Err(anyhow::anyhow!(
+            "approvals.resolve requires 'request_id' (lowercase UUIDv4 per P083 command_idempotency_contract_v1)"
+        ));
+    };
+    let p081_idempotency_key: Option<String> = None;
+
+    // SEC-P083-MED-003: stamp the validated CallerRequestId into CallerContext so
+    // command_journal.request_id carries the lifecycle request id, not the HTTP request id.
+    let caller =
+        mcp_caller(&principal, "approvals.resolve").with_request_id(p083_request_id.clone());
 
     // P072: Prefer approval_id-based routing through ResolveApprovalCmd.
     if let Some(approval_id_str) = params["approval_id"].as_str() {
@@ -256,20 +286,19 @@ async fn resolve_stage_approval(
             rationale: comment,
             run_id: approval.run_id,
             stage_id: approval.stage_id,
-            idempotency_key: Some(idempotency_key.clone()),
+            idempotency_key: p081_idempotency_key,
+            request_id: Some(p083_request_id.clone()),
         });
 
         let commanded = cmd_handler.handle(cmd, caller).await?;
         return Ok(serde_json::json!({
             "resolved": true,
+            "request_id": p083_request_id,
             "journal_id": commanded.journal_id,
         }));
     }
 
     // Legacy path: resolve by run_id + stage_id.
-    // SEC-P081: idempotency_key is already required above. Look up the pending
-    // approval by run_id+stage_id and route through ResolveApproval so the
-    // idempotency contract is enforced identically to the approval_id path.
     let run_id: RunId = params["run_id"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing 'run_id' (required when approval_id is absent)"))?
@@ -299,12 +328,14 @@ async fn resolve_stage_approval(
         rationale: comment,
         run_id: approval.run_id,
         stage_id: approval.stage_id,
-        idempotency_key: Some(idempotency_key.clone()),
+        idempotency_key: p081_idempotency_key,
+        request_id: Some(p083_request_id.clone()),
     });
 
     let commanded = cmd_handler.handle(cmd, caller).await?;
     Ok(serde_json::json!({
         "resolved": true,
+        "request_id": p083_request_id,
         "journal_id": commanded.journal_id,
     }))
 }

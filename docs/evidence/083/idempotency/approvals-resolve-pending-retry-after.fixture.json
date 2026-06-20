@@ -1,0 +1,38 @@
+{
+  "fixture_id": "approvals-resolve-pending-retry-after",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "command_idempotency_contract_v1",
+  "description": "A ResolveApproval command that arrives while the approval is still pending is safely retried after commitment without duplicating the resolution side-effect.",
+  "preconditions": {
+    "approval_id": "approval-001",
+    "approval_state": "pending",
+    "run_id": "run-004",
+    "lease_state": "open"
+  },
+  "action": {
+    "command": "ResolveApproval",
+    "request_id": "req-resolve-approval-001",
+    "approval_id": "approval-001",
+    "decision": "approved",
+    "intent_hash": "sha256:approval-intent-001"
+  },
+  "expected_outcome": "pass",
+  "retry_scenario": {
+    "replayed_action": {
+      "command": "ResolveApproval",
+      "request_id": "req-resolve-approval-001",
+      "approval_id": "approval-001",
+      "decision": "approved",
+      "intent_hash": "sha256:approval-intent-001"
+    },
+    "expected_replay_outcome": "idempotent_replay"
+  },
+  "assertions": [
+    "first call transitions approval from pending to resolved",
+    "replay returns committed outcome without re-resolving",
+    "downstream stage advancement fires exactly once",
+    "lease_state transitions to closed after first commit",
+    "second call does not re-trigger stage transition"
+  ]
+}

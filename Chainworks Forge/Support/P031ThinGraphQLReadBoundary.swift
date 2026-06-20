@@ -228,7 +228,10 @@ struct P031GraphQLReadRequest: Equatable, Sendable {
 
   nonisolated private static func isAllowedApprovalMutationDocument(_ document: String) -> Bool {
     let scanDocument = document.maskingGraphQLIgnoredTextForP031OperationScan()
-    let allowedFields: Set<String> = ["approveApproval", "rejectApproval"]
+    let allowedFields: Set<String> = [
+      "approveApproval",
+      "rejectApproval",
+    ]
     guard let rootFields = mutationRootSelectionFields(in: scanDocument),
           !rootFields.isEmpty
     else { return false }

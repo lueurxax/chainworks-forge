@@ -454,6 +454,8 @@ async fn proposal_088_targeted_retry_recovery_carries_preserved_evidence_to_acti
         event_bus::new_bus(16),
         WorkQueue::new(pool.clone()),
     );
+    // P083: request_id is now required for all RetryStage paths (including narrow retry).
+    let narrow_retry_request_id = uuid::Uuid::new_v4().to_string();
     let result = handler
         .handle(
             Command::RetryStage(RetryStageCmd {
@@ -464,6 +466,7 @@ async fn proposal_088_targeted_retry_recovery_carries_preserved_evidence_to_acti
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(narrow_retry_request_id),
             }),
             operator_caller(),
         )

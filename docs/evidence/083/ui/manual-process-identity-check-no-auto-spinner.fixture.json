@@ -1,0 +1,26 @@
+{
+  "fixture_id": "manual-process-identity-check-no-auto-spinner",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "ui_process_identity_contract_v1",
+  "description": "The process identity check UI does not show an automatic progress spinner; the operator must actively choose a resolution action.",
+  "preconditions": {
+    "process_identity_state": "held_identity_ambiguous",
+    "run_id": "run-ui-002"
+  },
+  "action": {
+    "event": "ProcessIdentityCheckDisplayed",
+    "run_id": "run-ui-002"
+  },
+  "expected_outcome": "pass",
+  "component_name": "ProcessIdentityCheckView",
+  "assertions": [
+    "no ProgressView or activity indicator rendered",
+    "no automatic retry spinner shown",
+    "UI shows static held state, not loading state",
+    "operator sees clear call-to-action buttons, not spinning indicator",
+    "no auto-progress simulation while in held_identity_ambiguous state"
+  ],
+  "no_auto_spinner": true,
+  "voiceover_readable": true
+}

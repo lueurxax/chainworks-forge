@@ -178,6 +178,7 @@ async fn p065_full_stage_retry_with_operator_instruction_creates_binding() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: Some("Focus only on the GraphQL scheduler slice.".into()),
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             operator_caller(),
         )
@@ -249,6 +250,7 @@ async fn p065_full_stage_retry_without_instruction_has_no_binding() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             operator_caller(),
         )
@@ -296,6 +298,7 @@ async fn p065_validation_failure_rejects_empty_instruction() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: Some("   ".into()),
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             operator_caller(),
         )
@@ -341,6 +344,7 @@ async fn p065_validation_failure_rejects_too_long_instruction() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: Some(long),
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             operator_caller(),
         )
@@ -369,6 +373,7 @@ async fn p065_validation_failure_rejects_control_characters() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: Some("hello\x07world".into()),
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             operator_caller(),
         )
@@ -405,6 +410,7 @@ async fn p065_non_operator_cannot_attach_instruction() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: Some("Do X".into()),
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             agent_caller(),
         )
@@ -443,6 +449,7 @@ async fn p065_retry_without_instruction_from_agent_still_works() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             agent_caller(),
         )
@@ -596,6 +603,7 @@ async fn p065_targeted_retry_with_instruction_creates_binding_and_child_delivery
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: Some("Only implement the GraphQL readback slice.".into()),
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             operator_caller(),
         )

@@ -1,0 +1,33 @@
+{
+  "fixture_id": "restart-updates-existing-latch",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "late_output_overflow_contract_v1",
+  "description": "After a restart, late output that arrives for an existing latch updates the latch row rather than creating a duplicate entry.",
+  "preconditions": {
+    "existing_latch": {
+      "latch_id": "latch-002",
+      "run_id": "run-overflow-002",
+      "stage_id": "stage-b",
+      "artifact_key": "code_output",
+      "state": "active",
+      "output_count": 1
+    },
+    "restart_occurred": true
+  },
+  "action": {
+    "event": "LateOutputArrived",
+    "run_id": "run-overflow-002",
+    "stage_id": "stage-b",
+    "artifact_key": "code_output",
+    "late_output_index": 2
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "existing latch_id=latch-002 updated, not duplicated",
+    "output_count incremented from 1 to 2",
+    "no second latch row created for same key",
+    "latch state updated atomically",
+    "update idempotent if same late_output_index received twice"
+  ]
+}

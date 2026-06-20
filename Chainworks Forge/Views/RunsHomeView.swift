@@ -9,6 +9,8 @@ struct RunsHomeView: View {
     // P046: transient MainActor session observability state; never persisted to SwiftData.
     // Owned here as the selected-run detail coordinator per Phase 3 requirement.
     @StateObject private var p046Model: P046SessionObservabilityModel
+    // P083: identity-ambiguous provider sessions requiring manual identity verification.
+    @StateObject private var p083SessionsModel: P083IdentityHoldSessionsModel
     @ObservedObject var workbench: RunsWorkbenchPresentationModel
     @State private var selectedRunDetailTab: P031RunDetailTab = .overview
     @State private var focusedArtifactStageID: String?
@@ -23,7 +25,7 @@ struct RunsHomeView: View {
     @MainActor
     init(workbench: RunsWorkbenchPresentationModel) {
         let model = P031ThinReadDashboardModel.bootstrap()
-        // Share the same endpoint for P046 session observability reads.
+        // Share the same endpoint for P046/P083 session observability reads.
         let endpoint = DaemonClientEndpoint.operatorDefault()
         let p046Store = P031GraphQLWorkflowReadStore(
             readTransport: P031URLSessionGraphQLReadTransport(endpoint: endpoint),
@@ -31,6 +33,7 @@ struct RunsHomeView: View {
         )
         _model = StateObject(wrappedValue: model)
         _p046Model = StateObject(wrappedValue: P046SessionObservabilityModel.make(store: p046Store))
+        _p083SessionsModel = StateObject(wrappedValue: P083IdentityHoldSessionsModel(endpoint: endpoint))
         self.workbench = workbench
         _selectedRunDetailTab = State(initialValue: .overview)
     }
@@ -40,10 +43,12 @@ struct RunsHomeView: View {
         model: P031ThinReadDashboardModel,
         workbench: RunsWorkbenchPresentationModel,
         initialTab: P031RunDetailTab,
-        p046Model: P046SessionObservabilityModel? = nil
+        p046Model: P046SessionObservabilityModel? = nil,
+        p083SessionsModel: P083IdentityHoldSessionsModel? = nil
     ) {
         _model = StateObject(wrappedValue: model)
         _p046Model = StateObject(wrappedValue: p046Model ?? P046SessionObservabilityModel.noOp())
+        _p083SessionsModel = StateObject(wrappedValue: p083SessionsModel ?? P083IdentityHoldSessionsModel.noOp())
         self.workbench = workbench
         _selectedRunDetailTab = State(initialValue: initialTab)
     }
@@ -59,12 +64,13 @@ struct RunsHomeView: View {
         .task {
             await model.loadIfNeeded()
         }
-        // P046: drive session observability for the currently selected run.
+        // P046/P083: drive session observability for the currently selected run.
         // Capability discovery and gating happen inside the model before any P046
         // documents are issued. On run change the prior task is cancelled automatically
         // by SwiftUI's .task(id:) semantics; here we use onChange for the same effect.
         .onChange(of: model.selectedRunID) { _, newRunID in
             p046Model.updateSelectedRun(newRunID)
+            p083SessionsModel.updateSelectedRun(newRunID)
         }
         .toolbar {
             Button {
@@ -94,6 +100,24 @@ struct RunsHomeView: View {
             }
             selectedRunDetailTab = tab
         }
+    }
+
+    /// P083 UI action boundary: Mark Process Absent is an MCP-only lifecycle command.
+    /// Copies operator guidance to the pasteboard so the operator can issue the command
+    /// through the approved MCP tool path rather than through governed SwiftUI.
+    private func p083CopyMarkProcessAbsentGuidance(providerSessionId: String) {
+        let guidance = """
+            P083 Mark Process Absent — use the MCP tool:
+            Tool: p083.markProviderSessionProcessAbsent
+            provider_session_id: \(providerSessionId)
+
+            This command must be issued through the approved MCP operator command path.
+            """
+        #if canImport(AppKit)
+        let pasteboard = NSPasteboard.general
+        pasteboard.prepareForNewContents(with: .currentHostOnly)
+        pasteboard.setString(guidance, forType: .string)
+        #endif
     }
 
     private func runRow(row: P031RunsHomeRowPresentation) -> some View {
@@ -366,35 +390,15 @@ struct RunsHomeView: View {
                     switch selectedRunDetailTab {
                     case .overview:
                         if let header = workbench.summaryHeader {
-                            if workbench.closeoutReadiness != nil {
-                                P036RunDetailSummaryCard(
-                                    header: header,
-                                    onCheckRunReadiness: activateCloseoutReadinessFromCompactSignal
-                                )
-                            } else {
-                                P036RunDetailSummaryCard(
-                                    header: header,
-                                    onCheckRunReadiness: nil
-                                )
-                            }
-                        }
-
-                        if let stageMap = workbench.stageMap {
-                            P036OverviewCommandCenterCard(
-                                map: stageMap,
-                                activeAgents: workbench.activeTimelineAgents,
-                                artifacts: workbench.artifactsAndReports,
-                                recoveryEvidence: workbench.recoveryEvidence
+                            P036RunDetailSummaryCard(
+                                header: header,
+                                onCheckSystemReadiness: {
+                                    NotificationCenter.default.post(
+                                        name: .chainworksOpenSystemReadiness,
+                                        object: nil
+                                    )
+                                }
                             )
-                        }
-
-                        if let closeoutReadiness = workbench.closeoutReadiness {
-                            P077CloseoutReadinessCard(
-                                presentation: closeoutReadiness,
-                                closeoutFocus: $closeoutReadinessFocus,
-                                onReturnToCloseoutReadiness: focusCloseoutPrimaryUnblock
-                            )
-                            .id(P077CloseoutReadinessAnchor.card)
                         }
 
                         if !workbench.inlineApprovals.isEmpty {
@@ -406,17 +410,71 @@ struct RunsHomeView: View {
                             )
                         }
 
+                        if let stageMap = workbench.stageMap {
+                            P036StageMapCard(map: stageMap)
+                        }
+
                         if let continuationReadback = runDetail.continuationReadback {
                             P086ContinuationReadbackCard(presentation: continuationReadback)
                         }
 
+                        if !workbench.artifactsAndReports.isEmpty {
+                            P036ArtifactWorkbenchCard(rows: workbench.artifactsAndReports)
+                        }
+
+                        if !workbench.recoveryEvidence.isEmpty {
+                            P036RecoveryEvidenceCard(rows: workbench.recoveryEvidence)
+                        }
+
+                        if let health = workbench.freshnessAndHealth {
+                            P036SystemReadinessCard(health: health)
+                        }
+
+                        // P083: id anchors this card for Open Provider Session Evidence scroll navigation.
                         P046SessionObservabilityCard(model: p046Model)
+                            .id("p083-provider-session-evidence-anchor")
+
+                        // P083: identity-ambiguous sessions that require manual process identity
+                        // verification before shutdown proceeds. Per manual_process_identity_check_ui_v1.
+                        P083IdentityAmbiguousInboxView(
+                            sessions: p083SessionsModel.sessions,
+                            onRetryIdentityCheck: { _ in p083SessionsModel.refreshCurrentRun() },
+                            onMarkProcessAbsent: { sessionId in
+                                // P083 UI action boundary: Mark Process Absent routes through the
+                                // external MCP operator command path per ui-action-boundary.md.
+                                // Copy the MCP guidance to the pasteboard for the operator.
+                                p083CopyMarkProcessAbsentGuidance(providerSessionId: sessionId)
+                            },
+                            onOpenProviderSessionEvidence: { _ in
+                                // Navigate to the overview tab (where P046SessionObservabilityCard lives)
+                                // and scroll to the session evidence anchor per manual_process_identity_check_ui_v1.
+                                selectedRunDetailTab = .overview
+                                withAnimation(.easeInOut(duration: 0.16)) {
+                                    proxy.scrollTo("p083-provider-session-evidence-anchor", anchor: .top)
+                                }
+                            }
+                        )
 
                     case .stages:
                         if let stageMap = workbench.stageMap {
-                            P036StageMapCard(
-                                map: stageMap,
-                                activeAgents: workbench.activeTimelineAgents
+                            P036StageMapCard(map: stageMap)
+                        }
+                        // P083 manual_process_identity_check_ui_v1: stage detail provider-session
+                        // row surface. Banner shows for any held identity_ambiguous session
+                        // associated with the current run, regardless of which stage owns it.
+                        if !p083SessionsModel.sessions.isEmpty {
+                            P083IdentityAmbiguousInboxView(
+                                sessions: p083SessionsModel.sessions,
+                                onRetryIdentityCheck: { _ in p083SessionsModel.refreshCurrentRun() },
+                                onMarkProcessAbsent: { sessionId in
+                                    p083CopyMarkProcessAbsentGuidance(providerSessionId: sessionId)
+                                },
+                                onOpenProviderSessionEvidence: { _ in
+                                    selectedRunDetailTab = .overview
+                                    withAnimation(.easeInOut(duration: 0.16)) {
+                                        proxy.scrollTo("p083-provider-session-evidence-anchor", anchor: .top)
+                                    }
+                                }
                             )
                         }
                     case .artifacts:
@@ -454,6 +512,24 @@ struct RunsHomeView: View {
                             )
                         }
                         P031DaemonLifecycleCard(presentation: model.daemonLifecycle)
+                        // P083 manual_process_identity_check_ui_v1: recovery inbox item surface.
+                        // The system tab is the recovery context where operators investigate
+                        // held provider sessions alongside daemon lifecycle state.
+                        if !p083SessionsModel.sessions.isEmpty {
+                            P083IdentityAmbiguousInboxView(
+                                sessions: p083SessionsModel.sessions,
+                                onRetryIdentityCheck: { _ in p083SessionsModel.refreshCurrentRun() },
+                                onMarkProcessAbsent: { sessionId in
+                                    p083CopyMarkProcessAbsentGuidance(providerSessionId: sessionId)
+                                },
+                                onOpenProviderSessionEvidence: { _ in
+                                    selectedRunDetailTab = .overview
+                                    withAnimation(.easeInOut(duration: 0.16)) {
+                                        proxy.scrollTo("p083-provider-session-evidence-anchor", anchor: .top)
+                                    }
+                                }
+                            )
+                        }
                     }
                 }
                 .padding(.horizontal, 20)
@@ -1428,7 +1504,6 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 accessibilityLabel: "Improve artifact navigation"
             ),
             stageTransitions: transitions,
-            stageTopology: P036OverviewCommandCenterPreviewSeed.stageTopology,
             approvalRows: [],
             artifactRows: [],
             artifactViewerRows: artifacts,
@@ -1515,46 +1590,46 @@ final class P031ThinReadDashboardModel: ObservableObject {
         [
             previewArtifact(
                 id: "artifact-review-summary-11-1",
-                stageID: "state_8_implementation_continued",
-                stageExecutionID: "stage-iteration-9-attempt-1",
-                iteration: 9,
+                stageID: "state_4_proposal_reviewed",
+                stageExecutionID: "stage-iteration-11-attempt-1",
+                iteration: 11,
                 attempt: 1,
-                title: "changed_files.json",
-                contractID: "changed_files_manifest",
-                content: "{\n  \"files\": [\"Chainworks Forge/Views/RunsHomeView.swift\"]\n}",
+                title: "proposal_review_summary",
+                contractID: "proposal_review_summary_v2",
+                content: "# Review summary\n\nSkipped attempt retained its artifact set for audit history.",
                 freshness: freshness
             ),
             previewArtifact(
                 id: "artifact-review-summary-11-6",
-                stageID: "state_8_implementation_continued",
-                stageExecutionID: "stage-iteration-9-attempt-2",
-                iteration: 9,
-                attempt: 2,
-                title: "changed_files.json",
-                contractID: "changed_files_manifest",
-                content: "{\n  \"files\": [\"Chainworks Forge/Views/RunsHomeView.swift\", \"docs/reference/macos-operator-navigation.md\"]\n}",
+                stageID: "state_4_proposal_reviewed",
+                stageExecutionID: "stage-iteration-11-attempt-6",
+                iteration: 11,
+                attempt: 6,
+                title: "proposal_review_summary",
+                contractID: "proposal_review_summary_v2",
+                content: "# Review summary\n\nThe latest completed attempt includes validation and closeout notes.",
                 freshness: freshness
             ),
             previewArtifact(
                 id: "artifact-review-corpus-11-6",
-                stageID: "state_8_implementation_continued",
-                stageExecutionID: "stage-iteration-9-attempt-2",
-                iteration: 9,
-                attempt: 2,
-                title: "tests_result.json",
-                contractID: "tests_result",
-                content: "{\n  \"passed\": [\"proposal-036\", \"build\"],\n  \"failed\": []\n}",
+                stageID: "state_4_proposal_reviewed",
+                stageExecutionID: "stage-iteration-11-attempt-6",
+                iteration: 11,
+                attempt: 6,
+                title: "review_corpus_bundle",
+                contractID: "review_corpus_bundle_v1",
+                content: "{\n  \"documents\": 12,\n  \"latestReport\": \"proposal_review_summary\"\n}",
                 freshness: freshness
             ),
             previewArtifact(
                 id: "artifact-review-summary-13-1",
-                stageID: "state_9_implementation_reviewed",
-                stageExecutionID: "stage-iteration-10-attempt-1",
-                iteration: 10,
+                stageID: "state_4_proposal_reviewed",
+                stageExecutionID: "stage-iteration-13-attempt-1",
+                iteration: 13,
                 attempt: 1,
-                title: "audit_status.json",
-                contractID: "implementation_audit_status",
-                content: "{\n  \"status\": \"running\"\n}",
+                title: "proposal_review_summary",
+                contractID: "proposal_review_summary_v2",
+                content: "# Running review\n\nThis attempt is still collecting artifacts.",
                 freshness: freshness
             ),
         ]
@@ -2539,7 +2614,7 @@ private struct TimelineEntryRow: View {
     }
 
     private func copyToPasteboard(_ value: String) {
-        NSPasteboard.general.clearContents()
+        NSPasteboard.general.prepareForNewContents(with: .currentHostOnly)
         NSPasteboard.general.setString(value, forType: .string)
     }
 
@@ -3144,6 +3219,7 @@ private struct P093TimelineCodeBlock: View {
 private struct P031RunDetailSummaryCard: View {
     let header: RunsWorkbenchPresentationModel.SummaryHeader
     let onCompactCloseoutActivated: () -> Void
+    let onCheckSystemReadiness: () -> Void
 
     var body: some View {
         P031CalloutCard(
@@ -3158,6 +3234,17 @@ private struct P031RunDetailSummaryCard: View {
                 )
                 if let errorDescription = header.errorDescription {
                     ForgeWarningBanner.error(errorDescription)
+                }
+
+                if header.status == "blocked" || header.status == "failed" {
+                    Button {
+                        onCheckSystemReadiness()
+                    } label: {
+                        Label("Check system readiness", systemImage: "stethoscope")
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
             }
         }
@@ -3378,7 +3465,7 @@ private struct P088ImplementationCompletionCard: View {
 
     private func copy(_ item: P031DiagnosticCopyItem) {
 #if os(macOS)
-        NSPasteboard.general.clearContents()
+        NSPasteboard.general.prepareForNewContents(with: .currentHostOnly)
         let didCopy = NSPasteboard.general.setString(item.value, forType: .string)
         copyFeedback = didCopy ? "Copied \(item.label.lowercased())" : "Copy failed"
 #else
@@ -3442,7 +3529,7 @@ private struct P078SideEffectReadbackCard: View {
 
     private func copy(_ item: P031DiagnosticCopyItem) {
 #if os(macOS)
-        NSPasteboard.general.clearContents()
+        NSPasteboard.general.prepareForNewContents(with: .currentHostOnly)
         let didCopy = NSPasteboard.general.setString(item.value, forType: .string)
         copyFeedback = didCopy ? "Copied \(item.label.lowercased())" : "Copy failed"
 #else
@@ -3620,7 +3707,7 @@ private struct P077CloseoutReadinessCard: View {
             return
         }
 #if os(macOS)
-        NSPasteboard.general.clearContents()
+        NSPasteboard.general.prepareForNewContents(with: .currentHostOnly)
         let didCopy = NSPasteboard.general.setString(value, forType: .string)
         copyFeedback = didCopy
             ? "Copied generation \(presentation.generationDisplayID)"
@@ -3674,7 +3761,7 @@ private struct P077CloseoutReadinessCard: View {
 
     private func copyRecoveryTemplate() {
 #if os(macOS)
-        NSPasteboard.general.clearContents()
+        NSPasteboard.general.prepareForNewContents(with: .currentHostOnly)
         let didCopy = NSPasteboard.general.setString(
             presentation.recoveryLifecycleCopyTemplate,
             forType: .string
@@ -5097,7 +5184,7 @@ private struct P031CopyItemsView: View {
 
     private func copyToPasteboard(_ value: String) {
         #if os(macOS)
-        NSPasteboard.general.clearContents()
+        NSPasteboard.general.prepareForNewContents(with: .currentHostOnly)
         NSPasteboard.general.setString(value, forType: .string)
         #endif
     }
@@ -5199,21 +5286,8 @@ private nonisolated func makeUUIDv7() -> String {
 }
 
 #Preview("Overview") {
-    P036RunsHomePreviewHost(initialTab: .overview, includeCloseoutReadiness: true)
+    P036RunsHomePreviewHost(initialTab: .overview)
         .frame(width: 1200, height: 780)
-}
-
-#Preview("Overview Command Center") {
-    ScrollView {
-        P036OverviewCommandCenterCard(
-            map: P036OverviewCommandCenterPreviewSeed.stageMap,
-            activeAgents: P036OverviewCommandCenterPreviewSeed.activeAgents,
-            artifacts: P036OverviewCommandCenterPreviewSeed.artifacts,
-            recoveryEvidence: P036OverviewCommandCenterPreviewSeed.recoveryEvidence
-        )
-        .padding(24)
-    }
-    .frame(width: 1180, height: 760)
 }
 
 #Preview("Timeline") {
@@ -5221,320 +5295,11 @@ private nonisolated func makeUUIDv7() -> String {
         .frame(width: 1200, height: 780)
 }
 
-private enum P036OverviewCommandCenterPreviewSeed {
-    static let stageMap = RunsWorkbenchPresentationModel.StageMap(stages: [
-        RunsWorkbenchPresentationModel.StageCard(
-            id: "state_8_implementation_continued",
-            ordinal: 8,
-            title: "Implementation continued until code work resolved",
-            ownerAgentTitle: "Code Writer",
-            status: "terminal",
-            statusText: "Completed",
-            isCurrent: false,
-            iterationText: "Iteration 9",
-            attemptText: "Attempt 2",
-            startedLabel: "Started 23:02",
-            completedLabel: "Done 23:11",
-            durationLabel: "Duration: 9m 4s",
-            evidenceLabels: ["No code blockers remain"],
-            artifactCount: 4,
-            communicationCount: 18,
-            approvalRequired: false,
-            occurrences: [
-                RunsWorkbenchPresentationModel.StageOccurrence(
-                    id: "state-8-code-writer",
-                    agentTitle: "Code Writer",
-                    taskName: "continue_implementation",
-                    statusText: "Completed",
-                    providerLabel: "claude · sonnet",
-                    executionCountLabel: "2 attempts"
-                )
-            ],
-            hiddenOccurrenceCount: 0,
-            transitions: [
-                RunsWorkbenchPresentationModel.StageTransition(
-                    id: "state-8-to-state-9",
-                    toLabel: "Implementation reviewed",
-                    detail: "complete"
-                )
-            ]
-        ),
-        RunsWorkbenchPresentationModel.StageCard(
-            id: "state_9_implementation_reviewed",
-            ordinal: 9,
-            title: "Implementation reviewed against proposal",
-            ownerAgentTitle: "Lead Orchestrator",
-            status: "active",
-            statusText: "Review",
-            isCurrent: true,
-            iterationText: "Iteration 10",
-            attemptText: "Attempt 1",
-            startedLabel: nil,
-            completedLabel: nil,
-            durationLabel: nil,
-            evidenceLabels: ["Security · Docs · Audit · Prepush"],
-            artifactCount: 7,
-            communicationCount: 42,
-            approvalRequired: false,
-            occurrences: [
-                RunsWorkbenchPresentationModel.StageOccurrence(
-                    id: "state-9-security",
-                    agentTitle: "Security Checker",
-                    taskName: "implementation_security",
-                    statusText: "Running",
-                    providerLabel: "codex · gpt-5",
-                    executionCountLabel: "1 attempt"
-                ),
-                RunsWorkbenchPresentationModel.StageOccurrence(
-                    id: "state-9-docs",
-                    agentTitle: "Docs Guardian",
-                    taskName: "sync_docs",
-                    statusText: "Pending",
-                    providerLabel: "gemini · 2.5",
-                    executionCountLabel: "queued"
-                ),
-                RunsWorkbenchPresentationModel.StageOccurrence(
-                    id: "state-9-audit",
-                    agentTitle: "Implementation Auditor",
-                    taskName: "audit_against_proposal",
-                    statusText: "Pending",
-                    providerLabel: "codex · gpt-5",
-                    executionCountLabel: "queued"
-                )
-            ],
-            hiddenOccurrenceCount: 1,
-            transitions: [
-                RunsWorkbenchPresentationModel.StageTransition(
-                    id: "state-9-to-state-11",
-                    toLabel: "Manual release",
-                    detail: "ready"
-                ),
-                RunsWorkbenchPresentationModel.StageTransition(
-                    id: "state-9-to-state-10",
-                    toLabel: "Implementation refined",
-                    detail: "fixes"
-                )
-            ]
-        ),
-        RunsWorkbenchPresentationModel.StageCard(
-            id: "state_10_implementation_refined",
-            ordinal: 10,
-            title: "Implementation refined",
-            ownerAgentTitle: "Code Writer",
-            status: "pending",
-            statusText: "Pending",
-            isCurrent: false,
-            iterationText: "max 22",
-            attemptText: nil,
-            startedLabel: nil,
-            completedLabel: nil,
-            durationLabel: nil,
-            evidenceLabels: ["Refine loop"],
-            artifactCount: 0,
-            communicationCount: 0,
-            approvalRequired: false,
-            occurrences: [
-                RunsWorkbenchPresentationModel.StageOccurrence(
-                    id: "state-10-code-writer",
-                    agentTitle: "Code Writer",
-                    taskName: "refine_implementation",
-                    statusText: "Pending",
-                    providerLabel: "claude · sonnet",
-                    executionCountLabel: nil
-                )
-            ],
-            hiddenOccurrenceCount: 0,
-            transitions: [
-                RunsWorkbenchPresentationModel.StageTransition(
-                    id: "state-10-to-state-9",
-                    toLabel: "Implementation reviewed",
-                    detail: "always"
-                )
-            ]
-        ),
-        RunsWorkbenchPresentationModel.StageCard(
-            id: "state_11_manual_release",
-            ordinal: 11,
-            title: "Manual release",
-            ownerAgentTitle: "Lead Orchestrator",
-            status: "pending",
-            statusText: "Pending",
-            isCurrent: false,
-            iterationText: nil,
-            attemptText: nil,
-            startedLabel: nil,
-            completedLabel: nil,
-            durationLabel: nil,
-            evidenceLabels: ["Release path"],
-            artifactCount: 0,
-            communicationCount: 0,
-            approvalRequired: true,
-            occurrences: [
-                RunsWorkbenchPresentationModel.StageOccurrence(
-                    id: "state-11-release",
-                    agentTitle: "Lead Orchestrator",
-                    taskName: "run_after_approval",
-                    statusText: "Pending",
-                    providerLabel: "",
-                    executionCountLabel: nil
-                )
-            ],
-            hiddenOccurrenceCount: 0,
-            transitions: [
-                RunsWorkbenchPresentationModel.StageTransition(
-                    id: "state-11-to-complete",
-                    toLabel: "Workflow complete",
-                    detail: "receipt"
-                )
-            ]
-        )
-    ])
-
-    static let activeAgents = [
-        RunsWorkbenchPresentationModel.ActiveTimelineAgent(
-            id: "security_checker",
-            title: "Security Checker",
-            providerID: "codex",
-            modelID: "gpt-5",
-            stageID: "state_9_implementation_reviewed",
-            stageLabel: "Implementation reviewed",
-            taskLabel: "implementation_security",
-            status: "running",
-            sessionID: "session-security",
-            latestAt: Date(timeIntervalSince1970: 1_778_000_240),
-            eventCount: 9,
-            selectionOrder: 0,
-            selectionUnavailableReason: nil
-        ),
-        RunsWorkbenchPresentationModel.ActiveTimelineAgent(
-            id: "docs_guardian",
-            title: "Docs Guardian",
-            providerID: "gemini",
-            modelID: "2.5",
-            stageID: "state_9_implementation_reviewed",
-            stageLabel: "Implementation reviewed",
-            taskLabel: "sync_docs",
-            status: "running",
-            sessionID: "session-docs",
-            latestAt: Date(timeIntervalSince1970: 1_778_000_210),
-            eventCount: 4,
-            selectionOrder: 1,
-            selectionUnavailableReason: nil
-        ),
-    ]
-
-    static let stageTopology: [P031StageTopologyPresentation] = stageMap.stages.map { stage in
-        P031StageTopologyPresentation(
-            stageID: stage.id,
-            ordinal: stage.ordinal,
-            title: stage.title,
-            ownerAgentID: stage.ownerAgentTitle
-                .lowercased()
-                .replacingOccurrences(of: " ", with: "_"),
-            ownerAgentTitle: stage.ownerAgentTitle,
-            status: topologyStatus(for: stage.status),
-            statusText: stage.statusText,
-            isCurrent: stage.isCurrent,
-            iterationText: stage.iterationText,
-            attemptText: stage.attemptText,
-            startedLabel: stage.startedLabel,
-            completedLabel: stage.completedLabel,
-            durationLabel: stage.durationLabel,
-            approvalRequired: stage.approvalRequired,
-            artifactCount: stage.artifactCount,
-            communicationCount: stage.communicationCount,
-            occurrences: stage.occurrences.map { occurrence in
-                P031StageTopologyOccurrencePresentation(
-                    agentID: occurrence.id,
-                    agentTitle: occurrence.agentTitle,
-                    taskName: occurrence.taskName,
-                    statusText: occurrence.statusText,
-                    providerLabel: occurrence.providerLabel,
-                    executionCountLabel: occurrence.executionCountLabel
-                )
-            },
-            transitions: stage.transitions.map { transition in
-                P031StageTopologyTransitionPresentation(
-                    toStageID: transition.id,
-                    toLabel: transition.toLabel,
-                    detail: transition.detail
-                )
-            }
-        )
-    }
-
-    private static func topologyStatus(for stageStatus: String) -> String {
-        switch stageStatus {
-        case "terminal": return "completed"
-        case "active": return "running"
-        default: return stageStatus
-        }
-    }
-
-    static let artifacts: [RunsWorkbenchPresentationModel.ArtifactReportRow] = [
-        artifact(id: "changed-files", title: "changed_files.json", contractID: "changed_files_manifest"),
-        artifact(id: "tests", title: "tests_result.json", contractID: "tests_result"),
-        artifact(id: "self-assessment", title: "implementation_self_assessment.json", contractID: "implementation_self_assessment")
-    ]
-
-    static let recoveryEvidence: [RunsWorkbenchPresentationModel.RecoveryEvidenceRow] = [
-        RunsWorkbenchPresentationModel.RecoveryEvidenceRow(
-            id: "recovery-1",
-            title: "Startup recovery found no live orphan work."
-        ),
-        RunsWorkbenchPresentationModel.RecoveryEvidenceRow(
-            id: "recovery-2",
-            title: "Retry authority matched latest stage execution."
-        )
-    ]
-
-    private static func artifact(
-        id: String,
-        title: String,
-        contractID: String
-    ) -> RunsWorkbenchPresentationModel.ArtifactReportRow {
-        let presentation = P031ArtifactViewerPresentation(
-            artifactID: id,
-            stageID: "state_8_implementation_continued",
-            stageExecutionID: "stage-8-iteration-9-attempt-2",
-            stageLabel: "Implementation continued until code work resolved",
-            iteration: 9,
-            attemptNumber: 2,
-            agentID: "code_writer",
-            contractID: contractID,
-            format: "json",
-            title: title,
-            subtitle: "\(contractID) / json / code_writer",
-            renderMode: .json,
-            payloadState: .available,
-            preparedPreview: nil,
-            unavailableReason: nil,
-            freshnessState: .live,
-            accessibilityLabel: "\(title), iteration 9, attempt 2"
-        )
-        return RunsWorkbenchPresentationModel.ArtifactReportRow(
-            id: id,
-            title: title,
-            payloadAvailability: .available,
-            presentation: presentation
-        )
-    }
-}
-
 private struct P036RunsHomePreviewHost: View {
     let initialTab: P031RunDetailTab
 
-    @StateObject private var model: P031ThinReadDashboardModel
+    @StateObject private var model = P031ThinReadDashboardModel.previewLoaded()
     @StateObject private var workbench = RunsWorkbenchPresentationModel()
-
-    init(initialTab: P031RunDetailTab, includeCloseoutReadiness: Bool = false) {
-        self.initialTab = initialTab
-        _model = StateObject(
-            wrappedValue: includeCloseoutReadiness
-                ? P031ThinReadDashboardModel.previewLoadedWithCloseoutReadiness()
-                : P031ThinReadDashboardModel.previewLoaded()
-        )
-    }
 
     var body: some View {
         RunsHomeView(model: model, workbench: workbench, initialTab: initialTab)
@@ -5675,7 +5440,6 @@ struct P093TimelineProofSurface: View {
                 id: "code_writer",
                 title: "Code Writer",
                 providerID: "codex",
-                modelID: "gpt-5",
                 stageID: "state_10_implementation_refined",
                 stageLabel: "Implementation refined",
                 taskLabel: "refine_implementation",
@@ -5690,7 +5454,6 @@ struct P093TimelineProofSurface: View {
                 id: "reviewer",
                 title: "Reviewer",
                 providerID: "claude",
-                modelID: "sonnet",
                 stageID: "state_9_implementation_reviewed",
                 stageLabel: "Implementation reviewed",
                 taskLabel: "review_implementation",
@@ -5888,7 +5651,7 @@ private struct P036SystemReadinessCard: View {
 
 private struct P036RunDetailSummaryCard: View {
     let header: RunsWorkbenchPresentationModel.SummaryHeader
-    let onCheckRunReadiness: (() -> Void)?
+    let onCheckSystemReadiness: () -> Void
     @State private var copyFeedback: String?
 
     var body: some View {
@@ -5906,15 +5669,11 @@ private struct P036RunDetailSummaryCard: View {
                 }
                 Spacer()
 
-                if let onCheckRunReadiness {
-                    Button(action: onCheckRunReadiness) {
-                        Label("Check run readiness", systemImage: "checkmark.shield")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .help("Show closeout readiness for this run")
-                    .accessibilityLabel("Show closeout readiness for this run")
+                Button(action: onCheckSystemReadiness) {
+                        Label("Check readiness", systemImage: "checkmark.shield")
                 }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
         }
         .padding(20)
@@ -5945,7 +5704,7 @@ private struct P036RunDetailSummaryCard: View {
 
     private func copyRunID(_ runID: String) {
         #if os(macOS)
-        NSPasteboard.general.clearContents()
+        NSPasteboard.general.prepareForNewContents(with: .currentHostOnly)
         NSPasteboard.general.setString(runID, forType: .string)
         copyFeedback = "Copied full run ID"
         #endif
@@ -5954,7 +5713,6 @@ private struct P036RunDetailSummaryCard: View {
 
 private struct P036StageMapCard: View {
     let map: RunsWorkbenchPresentationModel.StageMap
-    let activeAgents: [RunsWorkbenchPresentationModel.ActiveTimelineAgent]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -5985,678 +5743,9 @@ private struct P036StageMapCard: View {
                     .padding(.vertical, 2)
                     .padding(.trailing, 4)
                 }
-
-                P036ActiveAgentsReadbackCard(
-                    title: "Active agents",
-                    subtitle: "Live provider sessions for this run",
-                    agents: activeAgents,
-                    stageID: nil,
-                    emptyText: "No running agent executions in latest readback."
-                )
             }
         }
         .forgePanel()
-    }
-}
-
-private struct P036ActiveAgentsReadbackCard: View {
-    let title: String
-    let subtitle: String
-    let agents: [RunsWorkbenchPresentationModel.ActiveTimelineAgent]
-    let stageID: String?
-    let emptyText: String
-
-    private var visibleAgents: [RunsWorkbenchPresentationModel.ActiveTimelineAgent] {
-        let scoped = stageID.map { id in
-            agents.filter { $0.stageID == id }
-        } ?? agents
-        return scoped.sorted {
-            if let lhs = $0.selectionOrder, let rhs = $1.selectionOrder, lhs != rhs {
-                return lhs < rhs
-            }
-            if $0.latestAt != $1.latestAt {
-                return $0.latestAt > $1.latestAt
-            }
-            return $0.title.localizedStandardCompare($1.title) == .orderedAscending
-        }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(title.uppercased())
-                    .font(ForgeTypography.micro.weight(.semibold))
-                    .foregroundStyle(ForgeColor.Text.tertiary)
-                Text(subtitle)
-                    .font(ForgeTypography.micro)
-                    .foregroundStyle(ForgeColor.Text.secondary)
-                    .lineLimit(1)
-                Spacer()
-                if !visibleAgents.isEmpty {
-                    Text("\(visibleAgents.count) active")
-                        .font(ForgeTypography.micro.monospacedDigit().weight(.semibold))
-                        .foregroundStyle(ForgeStatusColor.running)
-                }
-            }
-
-            if visibleAgents.isEmpty {
-                Text(emptyText)
-                    .font(ForgeTypography.supporting)
-                    .foregroundStyle(ForgeColor.Text.tertiary)
-                    .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
-            } else {
-                VStack(alignment: .leading, spacing: 7) {
-                    ForEach(visibleAgents) { agent in
-                        P036ActiveAgentReadbackRow(agent: agent)
-                    }
-                }
-            }
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-        .background(ForgeColor.Surface.elevated.opacity(0.72), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(ForgeColor.Surface.border, lineWidth: 1)
-        }
-    }
-}
-
-private struct P036ActiveAgentReadbackRow: View {
-    let agent: RunsWorkbenchPresentationModel.ActiveTimelineAgent
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: "bolt.circle.fill")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(ForgeStatusColor.running)
-                .frame(width: 14)
-
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text(agent.title)
-                        .font(ForgeTypography.micro.weight(.semibold))
-                        .foregroundStyle(ForgeColor.Text.primary)
-                        .lineLimit(1)
-                    Text(statusLabel)
-                        .font(ForgeTypography.micro)
-                        .foregroundStyle(ForgeStatusColor.running)
-                        .lineLimit(1)
-                }
-
-                Text(detailText)
-                    .font(ForgeTypography.micro)
-                    .foregroundStyle(ForgeColor.Text.tertiary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-
-            Spacer(minLength: 8)
-
-            if agent.eventCount > 0 {
-                Text("\(agent.eventCount) events")
-                    .font(ForgeTypography.micro.monospacedDigit())
-                    .foregroundStyle(ForgeColor.Text.secondary)
-                    .lineLimit(1)
-            }
-        }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(agent.title), \(statusLabel), \(detailText), \(agent.eventCount) events")
-    }
-
-    private var statusLabel: String {
-        let status = agent.status.trimmingCharacters(in: .whitespacesAndNewlines)
-        return status.isEmpty ? "running" : status
-    }
-
-    private var providerModelLabel: String? {
-        let parts = [
-            agent.providerID,
-            agent.modelID,
-        ].compactMap { value -> String? in
-            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            return trimmed.isEmpty ? nil : trimmed
-        }
-        guard !parts.isEmpty else { return nil }
-        return parts.joined(separator: " · ")
-    }
-
-    private var detailText: String {
-        [
-            providerModelLabel,
-            agent.stageLabel,
-            agent.taskLabel,
-            agent.sessionID.map { "session \($0)" },
-        ].compactMap { value -> String? in
-            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            return trimmed.isEmpty ? nil : trimmed
-        }
-        .joined(separator: " · ")
-    }
-}
-
-private struct P036OverviewCommandCenterCard: View {
-    let map: RunsWorkbenchPresentationModel.StageMap
-    let activeAgents: [RunsWorkbenchPresentationModel.ActiveTimelineAgent]
-    let artifacts: [RunsWorkbenchPresentationModel.ArtifactReportRow]
-    let recoveryEvidence: [RunsWorkbenchPresentationModel.RecoveryEvidenceRow]
-
-    private var currentStage: RunsWorkbenchPresentationModel.StageCard? {
-        map.stages.first(where: \.isCurrent)
-            ?? map.stages.first(where: { $0.status == "active" })
-            ?? map.stages.first(where: { $0.status == "blocked" })
-    }
-
-    private var currentStageIndex: Int? {
-        guard let currentStage else { return nil }
-        return map.stages.firstIndex(where: { $0.id == currentStage.id })
-    }
-
-    private var previousStage: RunsWorkbenchPresentationModel.StageCard? {
-        if let currentStageIndex {
-            return map.stages[..<currentStageIndex].last(where: { $0.status == "terminal" })
-        }
-        return map.stages.last(where: { $0.status == "terminal" })
-    }
-
-    private var nextTransitions: [RunsWorkbenchPresentationModel.StageTransition] {
-        Array((currentStage?.transitions ?? []).prefix(4))
-    }
-
-    private var latestCompletedStageArtifacts: [RunsWorkbenchPresentationModel.ArtifactReportRow] {
-        guard let previousStage else { return [] }
-        let rows = artifacts.filter { $0.presentation.stageID == previousStage.id }
-        guard !rows.isEmpty else { return [] }
-        let latestIteration = rows.map { $0.presentation.iteration ?? -1 }.max() ?? -1
-        let iterationRows = rows.filter { ($0.presentation.iteration ?? -1) == latestIteration }
-        let latestAttempt = iterationRows.map { $0.presentation.attemptNumber ?? -1 }.max() ?? -1
-        return Array(iterationRows
-            .filter { ($0.presentation.attemptNumber ?? -1) == latestAttempt }
-            .prefix(5))
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            ForgeSectionHeader(
-                title: "Run focus",
-                subtitle: "Current stage, immediate context, and latest evidence",
-                symbol: "scope"
-            )
-
-            if map.stages.isEmpty {
-                ForgeEmptyState(
-                    title: "No stage readback",
-                    systemImage: "scope",
-                    description: "The control plane has not returned stage topology for this run yet."
-                )
-            } else {
-                P036OverviewStageSnapshotCard(
-                    title: "Current stage",
-                    stage: currentStage,
-                    fallback: "No active stage is marked in readback.",
-                    emphasis: .primary
-                )
-
-                P036ActiveAgentsReadbackCard(
-                    title: "Agents in work",
-                    subtitle: currentStage.map { "Current stage · \($0.title)" } ?? "Latest active-agent readback",
-                    agents: activeAgents,
-                    stageID: currentStage?.id,
-                    emptyText: "No active agent executions for the current stage."
-                )
-
-                HStack(alignment: .top, spacing: 12) {
-                    P036OverviewStageSnapshotCard(
-                        title: "Previous outcome",
-                        stage: previousStage,
-                        fallback: "No completed stage before the current one.",
-                        emphasis: .secondary
-                    )
-
-                    P036OverviewNextStagesCard(transitions: nextTransitions)
-                }
-
-                HStack(alignment: .top, spacing: 12) {
-                    P036OverviewArtifactsCard(
-                        stage: previousStage,
-                        rows: latestCompletedStageArtifacts
-                    )
-
-                    P036OverviewRecoveryDigest(rows: recoveryEvidence)
-                }
-            }
-        }
-        .forgePanel()
-        .accessibilityIdentifier("p036-overview-command-center")
-    }
-}
-
-private struct P036OverviewStageSnapshotCard: View {
-    enum Emphasis {
-        case primary
-        case secondary
-    }
-
-    let title: String
-    let stage: RunsWorkbenchPresentationModel.StageCard?
-    let fallback: String
-    let emphasis: Emphasis
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if let stage {
-                if emphasis == .primary {
-                    HStack(alignment: .top, spacing: 16) {
-                        VStack(alignment: .leading, spacing: 12) {
-                            stageHeader(stage)
-                            occurrenceStack(for: stage, limit: 3)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
-
-                        liveFacts(for: stage)
-                    }
-                } else {
-                    stageHeader(stage)
-                    chipRow(for: stage)
-                    Divider()
-                    occurrenceStack(for: stage, limit: 2)
-                }
-            } else {
-                Text(fallback)
-                    .font(ForgeTypography.body)
-                    .foregroundStyle(ForgeColor.Text.secondary)
-                    .frame(maxWidth: .infinity, minHeight: 86, alignment: .topLeading)
-            }
-        }
-        .padding(emphasis == .primary ? 14 : 12)
-        .frame(maxWidth: .infinity, minHeight: emphasis == .primary ? 184 : 156, alignment: .topLeading)
-        .background(
-            RoundedRectangle(cornerRadius: emphasis == .primary ? 12 : 10, style: .continuous)
-                .fill(emphasis == .primary ? ForgeStatusColor.running.opacity(0.07) : ForgeColor.Surface.elevated)
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: emphasis == .primary ? 12 : 10, style: .continuous)
-                .strokeBorder(
-                    emphasis == .primary ? ForgeStatusColor.running.opacity(0.72) : ForgeColor.Surface.border,
-                    lineWidth: emphasis == .primary ? 2 : 1
-                )
-        }
-    }
-
-    private func stageHeader(_ stage: RunsWorkbenchPresentationModel.StageCard) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            Text(String(format: "%02d", stage.ordinal))
-                .font(ForgeTypography.body.monospacedDigit().weight(.semibold))
-                .foregroundStyle(emphasis == .primary ? ForgeStatusColor.running : ForgeColor.Text.tertiary)
-                .frame(width: 30, alignment: .leading)
-
-            VStack(alignment: .leading, spacing: 5) {
-                Text(title.uppercased())
-                    .font(ForgeTypography.micro.weight(.semibold))
-                    .foregroundStyle(ForgeColor.Text.tertiary)
-                Text(stage.title)
-                    .font(emphasis == .primary ? ForgeTypography.sectionHeader : ForgeTypography.body.weight(.semibold))
-                    .foregroundStyle(ForgeColor.Text.primary)
-                    .lineLimit(emphasis == .primary ? 2 : 3)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text(stage.ownerAgentTitle)
-                    .font(ForgeTypography.micro)
-                    .foregroundStyle(ForgeColor.Text.secondary)
-                    .lineLimit(1)
-            }
-
-            Spacer(minLength: 8)
-
-            StatusCapsule(
-                text: statusLabel(for: stage.status),
-                color: statusColor(for: stage.status),
-                icon: statusIconName(for: stage.status),
-                size: .small
-            )
-        }
-    }
-
-    @ViewBuilder
-    private func chipRow(for stage: RunsWorkbenchPresentationModel.StageCard) -> some View {
-        let chips = metadataChips(for: stage)
-        if !chips.isEmpty {
-            HStack(spacing: 6) {
-                ForEach(chips, id: \.self) { chip in
-                    Text(chip)
-                        .font(ForgeTypography.micro)
-                        .foregroundStyle(ForgeColor.Text.secondary)
-                        .lineLimit(1)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(ForgeColor.Surface.muted, in: Capsule())
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func occurrenceStack(for stage: RunsWorkbenchPresentationModel.StageCard, limit: Int) -> some View {
-        if stage.occurrences.isEmpty {
-            Text(stage.status == "terminal" ? "No agent rows in latest readback." : "No active agent rows in latest readback.")
-                .font(ForgeTypography.supporting)
-                .foregroundStyle(ForgeColor.Text.tertiary)
-        } else {
-            VStack(alignment: .leading, spacing: 7) {
-                ForEach(stage.occurrences.prefix(limit)) { occurrence in
-                    P036StageOccurrenceRow(occurrence: occurrence)
-                }
-                if stage.hiddenOccurrenceCount > 0 {
-                    Text("+ \(stage.hiddenOccurrenceCount) more")
-                        .font(ForgeTypography.micro)
-                        .foregroundStyle(ForgeColor.Text.tertiary)
-                }
-            }
-        }
-    }
-
-    private func liveFacts(for stage: RunsWorkbenchPresentationModel.StageCard) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("LIVE FACTS")
-                .font(ForgeTypography.micro.weight(.semibold))
-                .foregroundStyle(ForgeColor.Text.tertiary)
-            factRow("Owner", stage.ownerAgentTitle)
-            factRow("Iteration", displayValue(stage.iterationText))
-            factRow("Attempt", displayValue(stage.attemptText))
-            factRow("Artifacts", "\(stage.artifactCount)")
-            factRow("Events", "\(stage.communicationCount)")
-        }
-        .padding(12)
-        .frame(width: 190, alignment: .topLeading)
-        .background(ForgeColor.Surface.elevated.opacity(0.72), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(ForgeColor.Surface.border, lineWidth: 1)
-        }
-    }
-
-    private func factRow(_ label: String, _ value: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(label)
-                .font(ForgeTypography.micro)
-                .foregroundStyle(ForgeColor.Text.tertiary)
-            Spacer(minLength: 8)
-            Text(value)
-                .font(ForgeTypography.micro.monospacedDigit().weight(.semibold))
-                .foregroundStyle(ForgeColor.Text.primary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-        }
-    }
-
-    private func displayValue(_ value: String?) -> String {
-        guard let value, !value.isEmpty else { return "—" }
-        return value
-    }
-
-    private func metadataChips(for stage: RunsWorkbenchPresentationModel.StageCard) -> [String] {
-        [
-            stage.iterationText,
-            stage.attemptText,
-            stage.approvalRequired ? "Approval" : nil,
-            stage.artifactCount > 0 ? "\(stage.artifactCount) artifacts" : nil,
-            stage.communicationCount > 0 ? "\(stage.communicationCount) events" : nil
-        ].compactMap { $0 }.filter { !$0.isEmpty }
-    }
-
-    private func statusColor(for status: String) -> Color {
-        switch status {
-        case "terminal": return ForgeStatusColor.success
-        case "active": return ForgeStatusColor.running
-        case "blocked": return ForgeStatusColor.error
-        case "pending": return ForgeStatusColor.neutral
-        default: return ForgeStatusColor.neutral
-        }
-    }
-
-    private func statusLabel(for status: String) -> String {
-        switch status {
-        case "terminal": return "Completed"
-        case "active": return "Running"
-        case "blocked": return "Blocked"
-        case "pending": return "Pending"
-        default: return "Unavailable"
-        }
-    }
-
-    private func statusIconName(for status: String) -> String {
-        switch status {
-        case "terminal": return "checkmark.circle.fill"
-        case "active": return "play.circle.fill"
-        case "blocked": return "exclamationmark.octagon.fill"
-        case "pending": return "clock.fill"
-        default: return "questionmark.circle.fill"
-        }
-    }
-}
-
-private struct P036OverviewNextStagesCard: View {
-    let transitions: [RunsWorkbenchPresentationModel.StageTransition]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("NEXT ROUTES")
-                    .font(ForgeTypography.micro.weight(.semibold))
-                    .foregroundStyle(ForgeColor.Text.tertiary)
-                Spacer(minLength: 8)
-                if !transitions.isEmpty {
-                    Text("\(transitions.count) route\(transitions.count == 1 ? "" : "s")")
-                        .font(ForgeTypography.micro.monospacedDigit())
-                        .foregroundStyle(ForgeColor.Text.tertiary)
-                }
-            }
-
-            if transitions.isEmpty {
-                Text("No next route in topology readback.")
-                    .font(ForgeTypography.body)
-                    .foregroundStyle(ForgeColor.Text.secondary)
-                    .frame(maxWidth: .infinity, minHeight: 86, alignment: .topLeading)
-            } else {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(transitions) { transition in
-                        let route = routePresentation(for: transition)
-                        HStack(alignment: .top, spacing: 10) {
-                            Image(systemName: route.iconName)
-                                .font(.system(size: 16, weight: .semibold))
-                                .foregroundStyle(route.color)
-                                .frame(width: 18, height: 22)
-
-                            VStack(alignment: .leading, spacing: 5) {
-                                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                    Text(route.label)
-                                        .font(ForgeTypography.micro.weight(.semibold))
-                                        .foregroundStyle(route.color)
-                                        .lineLimit(1)
-                                        .padding(.horizontal, 7)
-                                        .padding(.vertical, 2)
-                                        .background(route.color.opacity(0.14), in: Capsule())
-                                    Spacer(minLength: 6)
-                                }
-
-                                Text(transition.toLabel)
-                                    .font(ForgeTypography.body.weight(.semibold))
-                                    .foregroundStyle(ForgeColor.Text.primary)
-                                    .lineLimit(2)
-                                Text(route.summary)
-                                    .font(ForgeTypography.micro)
-                                    .foregroundStyle(ForgeColor.Text.secondary)
-                                    .lineLimit(2)
-                            }
-                        }
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(ForgeColor.Surface.muted, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    }
-                }
-            }
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, minHeight: 156, alignment: .topLeading)
-        .background(ForgeColor.Surface.elevated, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(ForgeColor.Surface.border, lineWidth: 1)
-        }
-    }
-
-    private struct RoutePresentation {
-        let label: String
-        let summary: String
-        let iconName: String
-        let color: Color
-    }
-
-    private func routePresentation(for transition: RunsWorkbenchPresentationModel.StageTransition) -> RoutePresentation {
-        let target = transition.toLabel.lowercased()
-        let detail = (transition.detail ?? "").lowercased()
-
-        if target.contains("continued") || target.contains("refined") || detail.contains("needs_code_fixes") || detail.contains("invalid") {
-            return RoutePresentation(
-                label: "Fix path",
-                summary: "Used when review finds code-owned fixes, invalid output, or remaining implementation work.",
-                iconName: "arrow.uturn.left.circle.fill",
-                color: ForgeStatusColor.warning
-            )
-        }
-
-        if target.contains("manual release") || target.contains("workflow complete") || detail.contains("complete") || detail.contains("handoff_required") {
-            return RoutePresentation(
-                label: "Ready path",
-                summary: "Used when implementation is complete or the remaining work is a downstream handoff.",
-                iconName: "arrow.right.circle.fill",
-                color: ForgeStatusColor.success
-            )
-        }
-
-        if target.contains("approval") || detail.contains("approval") {
-            return RoutePresentation(
-                label: "Approval path",
-                summary: "Routes to an explicit operator decision before execution continues.",
-                iconName: "checkmark.seal.fill",
-                color: ForgeStatusColor.approval
-            )
-        }
-
-        return RoutePresentation(
-            label: "Conditional path",
-            summary: readableCondition(from: transition.detail),
-            iconName: "arrow.right.circle.fill",
-            color: ForgeStatusColor.running
-        )
-    }
-
-    private func readableCondition(from detail: String?) -> String {
-        guard let detail, !detail.isEmpty else {
-            return "Available when the current stage transition condition passes."
-        }
-        let normalized = detail
-            .replacingOccurrences(of: "implementation_self_assessment_v2.status", with: "self-assessment status")
-            .replacingOccurrences(of: "==", with: "is")
-            .replacingOccurrences(of: "||", with: "or")
-            .replacingOccurrences(of: "&&", with: "and")
-            .replacingOccurrences(of: "_", with: " ")
-            .replacingOccurrences(of: "'", with: "")
-        return "When \(normalized)"
-    }
-}
-
-private struct P036OverviewArtifactsCard: View {
-    let stage: RunsWorkbenchPresentationModel.StageCard?
-    let rows: [RunsWorkbenchPresentationModel.ArtifactReportRow]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Latest completed-stage artifacts")
-                .font(ForgeTypography.body.weight(.semibold))
-                .foregroundStyle(ForgeColor.Text.primary)
-            Text(stage.map { "From \($0.title)" } ?? "No completed stage selected")
-                .font(ForgeTypography.micro)
-                .foregroundStyle(ForgeColor.Text.secondary)
-                .lineLimit(1)
-
-            if rows.isEmpty {
-                Text("No latest-iteration artifacts returned for the previous completed stage.")
-                    .font(ForgeTypography.micro)
-                    .foregroundStyle(ForgeColor.Text.tertiary)
-                    .frame(maxWidth: .infinity, minHeight: 54, alignment: .topLeading)
-            } else {
-                VStack(spacing: 6) {
-                    ForEach(rows) { row in
-                        HStack(spacing: 8) {
-                            Image(systemName: "doc.text")
-                                .foregroundStyle(ForgeColor.Text.secondary)
-                            Text(row.title)
-                                .font(ForgeTypography.micro.weight(.semibold))
-                                .foregroundStyle(ForgeColor.Text.primary)
-                                .lineLimit(1)
-                            Spacer(minLength: 8)
-                            Text(row.payloadAvailability.rawValue.replacingOccurrences(of: "_", with: " "))
-                                .font(ForgeTypography.micro)
-                                .foregroundStyle(ForgeColor.Text.secondary)
-                                .lineLimit(1)
-                        }
-                        .padding(.vertical, 6)
-                        .padding(.horizontal, 8)
-                        .background(ForgeColor.Surface.muted, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    }
-                }
-            }
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-        .background(ForgeColor.Surface.elevated, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(ForgeColor.Surface.border, lineWidth: 1)
-        }
-    }
-}
-
-private struct P036OverviewRecoveryDigest: View {
-    let rows: [RunsWorkbenchPresentationModel.RecoveryEvidenceRow]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Recovery evidence")
-                .font(ForgeTypography.body.weight(.semibold))
-                .foregroundStyle(ForgeColor.Text.primary)
-            Text(rows.isEmpty ? "No recovery facts" : "\(rows.count) diagnostic row\(rows.count == 1 ? "" : "s")")
-                .font(ForgeTypography.micro)
-                .foregroundStyle(ForgeColor.Text.secondary)
-
-            if rows.isEmpty {
-                Text("Nothing to review.")
-                    .font(ForgeTypography.micro)
-                    .foregroundStyle(ForgeColor.Text.tertiary)
-                    .frame(maxWidth: .infinity, minHeight: 54, alignment: .topLeading)
-            } else {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(rows.prefix(3)) { row in
-                        Label(row.title, systemImage: "bandage.fill")
-                            .font(ForgeTypography.micro)
-                            .foregroundStyle(ForgeColor.Text.secondary)
-                            .lineLimit(2)
-                    }
-                    if rows.count > 3 {
-                        Text("+ \(rows.count - 3) more")
-                            .font(ForgeTypography.micro)
-                            .foregroundStyle(ForgeColor.Text.tertiary)
-                    }
-                }
-            }
-        }
-        .padding(12)
-        .frame(width: 260, alignment: .topLeading)
-        .background(ForgeColor.Surface.elevated, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(ForgeColor.Surface.border, lineWidth: 1)
-        }
     }
 }
 
@@ -6824,20 +5913,12 @@ private struct P036StageTopologyCard: View {
 
                 Spacer(minLength: 8)
 
-                VStack(alignment: .trailing, spacing: 4) {
-                    StatusCapsule(
-                        text: statusLabel(for: stage.status),
-                        color: stageColor(for: stage.status),
-                        icon: statusIconName(for: stage.status),
-                        size: .small
-                    )
-                    if let completedLabel = stage.completedLabel {
-                        Text(completedLabel)
-                            .font(ForgeTypography.micro.monospacedDigit())
-                            .foregroundStyle(ForgeColor.Text.tertiary)
-                            .lineLimit(1)
-                    }
-                }
+                StatusCapsule(
+                    text: statusLabel(for: stage.status),
+                    color: stageColor(for: stage.status),
+                    icon: statusIconName(for: stage.status),
+                    size: .small
+                )
             }
 
             HStack(spacing: 6) {
@@ -6903,7 +5984,7 @@ private struct P036StageTopologyCard: View {
     }
 
     private var stageMetadata: String {
-        let parts = stageMetadataChips + [stage.completedLabel, stage.durationLabel].compactMap { $0 } + stage.evidenceLabels
+        let parts = stageMetadataChips + stage.evidenceLabels
         return parts.isEmpty ? "No stage evidence yet" : parts.joined(separator: " · ")
     }
 
@@ -7374,7 +6455,7 @@ private struct P036ApprovalWorkbenchCard: View {
                                         ForEach(row.copyItems, id: \.label) { item in
                                             Button(item.label) {
                                                 #if os(macOS)
-                                                NSPasteboard.general.clearContents()
+                                                NSPasteboard.general.prepareForNewContents(with: .currentHostOnly)
                                                 NSPasteboard.general.setString(item.value, forType: .string)
                                                 #endif
                                             }

@@ -673,6 +673,9 @@ fn base64_url_no_pad(bytes: &[u8]) -> String {
 }
 
 fn default_operator_entry(token: String) -> PrincipalEntry {
+    // P083 UI action boundary: the bootstrapped app bearer is limited to approval mutations.
+    // P083 lifecycle commands (providerSessionShutdown, p083MarkProviderSessionProcessAbsent,
+    // p083RollbackExecution, p083SetEnforcementMode) require an explicitly-configured principal.
     PrincipalEntry {
         token,
         id: "default-operator".into(),
@@ -695,10 +698,33 @@ fn approval_mutations() -> Vec<String> {
     vec!["approveApproval".into(), "rejectApproval".into()]
 }
 
+fn p083_lifecycle_mutations() -> Vec<String> {
+    vec![
+        "providerSessionShutdown".into(),
+        "p083MarkProviderSessionProcessAbsent".into(),
+        "p083RollbackExecution".into(),
+        "p083SetEnforcementMode".into(),
+    ]
+}
+
+fn operator_full_mutations() -> Vec<String> {
+    let mut m = approval_mutations();
+    m.extend(p083_lifecycle_mutations());
+    m
+}
+
 fn is_exact_approval_mutation_set(mutations: &[String]) -> bool {
     let mut sorted = mutations.to_vec();
     sorted.sort();
     sorted == approval_mutations()
+}
+
+fn is_full_operator_mutation_set(mutations: &[String]) -> bool {
+    let mut sorted = mutations.to_vec();
+    sorted.sort();
+    let mut expected = operator_full_mutations();
+    expected.sort();
+    sorted == expected
 }
 
 fn normalize_principal_entries(
@@ -913,9 +939,11 @@ fn validate_v2_principals(entries: &[PrincipalEntry]) -> Result<(), AuthError> {
                     "default-operator must allow GraphQL queries and subscriptions".into(),
                 ));
             }
-            if !is_exact_approval_mutation_set(&graphql.allowed_mutations) {
+            if !is_exact_approval_mutation_set(&graphql.allowed_mutations)
+                && !is_full_operator_mutation_set(&graphql.allowed_mutations)
+            {
                 return Err(AuthError::TableLoadFailed(
-                    "default-operator must allow only approveApproval and rejectApproval".into(),
+                    "default-operator must allow either the approval mutation set or the full operator lifecycle mutation set".into(),
                 ));
             }
             // MCP tool name validity is already checked in the surface_policies block above.
@@ -1171,7 +1199,7 @@ fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolI
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 48] {
+fn all_tool_capabilities() -> [CapabilityToolId; 54] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -1223,6 +1251,13 @@ fn all_tool_capabilities() -> [CapabilityToolId; 48] {
         CapabilityToolId::P080DiagnosticsGet,
         CapabilityToolId::P080ReconcileRequest,
         CapabilityToolId::P080ClearPermanentHold,
+        // P083: provider session and enforcement mode lifecycle tools (Operator-only).
+        CapabilityToolId::ProviderSessionShutdown,
+        CapabilityToolId::ProviderSessionMarkProcessAbsent,
+        CapabilityToolId::P083RollbackExecution,
+        CapabilityToolId::P083SetEnforcementMode,
+        CapabilityToolId::RetryRun,
+        CapabilityToolId::SideEffectsForceReconcile,
     ]
 }
 
@@ -1359,6 +1394,15 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
             )
         }
         CapabilityToolId::P080ClearPermanentHold => matches!(class, PrincipalClass::Operator),
+        // P083: lifecycle mutations require Operator principal.
+        CapabilityToolId::ProviderSessionShutdown => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::ProviderSessionMarkProcessAbsent => {
+            matches!(class, PrincipalClass::Operator)
+        }
+        CapabilityToolId::P083RollbackExecution => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::P083SetEnforcementMode => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::RetryRun => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::SideEffectsForceReconcile => matches!(class, PrincipalClass::Operator),
     }
 }
 
@@ -1496,6 +1540,15 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
         "p080.diagnostics.get.v1" => Some(CapabilityToolId::P080DiagnosticsGet),
         "p080.reconcile.request.v1" => Some(CapabilityToolId::P080ReconcileRequest),
         "p080.clear_permanent_hold.v1" => Some(CapabilityToolId::P080ClearPermanentHold),
+        // P083 lifecycle tools.
+        "provider_session.shutdown" => Some(CapabilityToolId::ProviderSessionShutdown),
+        "provider_session.mark_process_absent" => {
+            Some(CapabilityToolId::ProviderSessionMarkProcessAbsent)
+        }
+        "p083.rollback_execution" => Some(CapabilityToolId::P083RollbackExecution),
+        "p083.set_enforcement_mode" => Some(CapabilityToolId::P083SetEnforcementMode),
+        "runs.retry" => Some(CapabilityToolId::RetryRun),
+        "side_effects.force_reconcile" => Some(CapabilityToolId::SideEffectsForceReconcile),
         _ => None,
     }
 }
@@ -1935,7 +1988,7 @@ mod tests {
         let err = validate_v2_principals(&entries).unwrap_err();
         assert!(err
             .to_string()
-            .contains("default-operator must allow only approveApproval and rejectApproval"));
+            .contains("default-operator must allow either the approval mutation set"));
     }
 
     #[test]
@@ -2393,6 +2446,67 @@ mod tests {
             Some(3),
             "bootstrap writer must emit schema_version 3 (boundary-aware writers emit v3 only)"
         );
+    }
+
+    /// SEC-P083-LOW-001: bootstrapped default-operator uses approval-only mutations (UI boundary).
+    /// P083 lifecycle mutations require an explicitly-configured principal, not the app bearer.
+    /// Also verifies that a principals.json with the full operator mutation set still loads (compat).
+    #[test]
+    fn p083_bootstrap_uses_approval_only_and_full_set_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("principals.json");
+        // Bootstrap writes a schema_version 3 file.
+        let table1 = PrincipalTable::load_or_bootstrap(&path).unwrap();
+        assert_eq!(
+            table1.entries.len(),
+            1,
+            "bootstrap must create one default-operator entry"
+        );
+        // Reload must succeed.
+        let table2 = PrincipalTable::load_or_bootstrap(&path).unwrap();
+        assert_eq!(
+            table2.entries.len(),
+            1,
+            "reload must succeed and return the same entry"
+        );
+        let entry = &table2.entries[0];
+        let mutations = entry
+            .surface_policies
+            .as_ref()
+            .and_then(|p| p.graphql.as_ref())
+            .map(|g| g.allowed_mutations.clone())
+            .unwrap_or_default();
+        // P083 UI action boundary: bootstrap produces approval-only mutations.
+        let mut sorted = mutations.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec!["approveApproval", "rejectApproval"],
+            "bootstrapped default-operator must have approval-only mutations; got {mutations:?}"
+        );
+        assert!(
+            !mutations.contains(&"providerSessionShutdown".to_string()),
+            "bootstrapped default-operator must NOT include p083 lifecycle mutations; got {mutations:?}"
+        );
+
+        // Backward-compat: a manually-crafted v3 file with full operator mutations must still load.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir2 = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(dir2.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let path2 = dir2.path().join("principals.json");
+            // Use a raw string to avoid format brace escaping issues.
+            let full_set_json = r#"{"schema_version":3,"principals":[{"token":"tok-operator-compat-xxxxxxxxxxxxxxxx","id":"default-operator","class":"operator","surface_policies":{"graphql":{"allow_queries":true,"allow_subscriptions":true,"allowed_mutations":["approveApproval","rejectApproval","providerSessionShutdown","p083MarkProviderSessionProcessAbsent","p083RollbackExecution","p083SetEnforcementMode"]},"mcp":{"allowed_tools":[]}}}]}"#;
+            std::fs::write(&path2, full_set_json).unwrap();
+            std::fs::set_permissions(&path2, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let table3 = PrincipalTable::load_or_bootstrap(&path2).unwrap();
+            assert_eq!(
+                table3.entries.len(),
+                1,
+                "full-operator-set principals.json must load"
+            );
+        }
     }
 
     #[cfg(unix)]

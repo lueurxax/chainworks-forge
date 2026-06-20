@@ -169,6 +169,23 @@ pub const P081_REQUIRED_METRICS: &[&str] = &[
     "audit_budget_cleanup_duration_ms",
 ];
 
+/// P083 bounded operational metric signatures from metric_labels_contract_v1.
+pub const P083_REQUIRED_METRICS: &[&str] = &[
+    "artifact_lineage_projection_integrity_total",
+    "provider_session_lifecycle_total",
+    "command_idempotency_lease_acquire_total",
+    "command_idempotency_replay_total",
+    "shutdown_interrupted_receipt_total",
+    "shutdown_duplicate_signal_suppressed_total",
+    "cancel_late_output_overflow_total",
+    "cancel_late_output_dropped_total",
+    "rollout_contract_lint_total",
+    "rollout_contract_run_start_block_total",
+    "p083_enforcement_mode_transition_total",
+    "p083_rollback_execution_total",
+    "provider_cancellation_intent_total",
+];
+
 pub const P058_REQUIRED_METRICS: &[&str] = &[
     "escalation_chains_started_total",
     "escalation_tier_success_rate",
@@ -1105,6 +1122,612 @@ pub fn record_projection_lag(projection: &str, lag: Duration) {
 pub fn get_projection_lag_p95(projection: &str) -> Option<u64> {
     let m = metrics().lock().unwrap();
     m.projection_lag.get(projection).and_then(|h| h.p95())
+}
+
+// ── P083 metric recording ────────────────────────────────────────────────────
+//
+// All P083 recorders use bounded_label() for every label. Per metric_labels_contract_v1:
+// every operational metric label must have a bounded domain or fail lint.
+// When an out-of-domain value is encountered, bounded_label returns None and the
+// recording function returns without recording the metric — no unbounded cardinality,
+// no silent "unknown" corruption. The tracing::error log surfaces the violation.
+// P083-SEC-L2: all recorders are enumerated here for audit.
+//
+// [bounded]: all P083 recorders below
+
+// Per metric_labels_contract_v1.bounded_label_domains.cancellation_reason.
+const CANCELLATION_REASON_DOMAIN: &[&str] = &[
+    "operator_cancel",
+    "backpressure_cutoff",
+    "shutdown_recovery",
+];
+
+// Per metric_labels_contract_v1.bounded_label_domains.interrupted_state.
+const INTERRUPTED_STATE_DOMAIN: &[&str] = &[
+    "grace_deadline_expired",
+    "kill_signal_issued",
+    "kill_pid_exit_observed",
+    "queued_no_signal",
+    "shutdown_interrupted",
+];
+
+// Per metric_labels_contract_v1.bounded_label_domains.proposal_id.
+const PROPOSAL_ID_DOMAIN: &[&str] = &["P083"];
+
+// Per metric_labels_contract_v1.bounded_label_domains.status.
+const ROLLOUT_STATUS_DOMAIN: &[&str] = &[
+    "pass",
+    "fail",
+    "waived",
+    "not_applicable",
+    "timeout",
+    "cancelled",
+    "missing_contract",
+    "stale",
+    "tamper_detected",
+];
+
+// Per metric_labels_contract_v1.bounded_label_domains.failure_reason.
+// No "none" sentinel — when status=pass, the failure_reason label is omitted entirely.
+const FAILURE_REASON_DOMAIN: &[&str] = &[
+    "schema_invalid",
+    "missing_fixture",
+    "metric_unbounded",
+    "auth_dependency_missing",
+    "hold_condition_present",
+    "burn_in_incomplete",
+    "rollback_contract_invalid",
+    "stale_revision",
+    "tamper_detected",
+    "missing_schema_version",
+];
+
+// Provider names from the allowlisted ACP provider registry.
+// Per metric_labels_contract_v1.bounded_label_domains.provider — "claude" not "claude_code".
+const PROVIDER_DOMAIN: &[&str] = &["codex", "claude", "gemini", "auggie", "junie"];
+
+// Provider session lifecycle states — must match provider_sessions.lifecycle_state CHECK values.
+// Per metric_labels_contract_v1.bounded_label_domains.lifecycle_state.
+const LIFECYCLE_STATE_DOMAIN: &[&str] = &[
+    "registered",
+    "spawn_error_no_child",
+    "launch_handshake",
+    "live",
+    "self_exit_observed",
+    "terminated_graceful",
+    "terminated_by_kill",
+    "orphan_settled",
+    "shutdown_interrupted",
+    "backpressure_cutoff",
+];
+
+// Lifecycle command names covered by command_idempotency_contract_v1.
+// Per metric_labels_contract_v1.bounded_label_domains.command — no "unknown".
+const COMMAND_DOMAIN: &[&str] = &[
+    "runs.cancel",
+    "runs.retry",
+    "stages.retry",
+    "approvals.resolve",
+    "side_effects.force_reconcile",
+    "command.run",
+    "copyable_command.regenerate",
+    "provider_session.shutdown",
+    "p083.rollback_execution",
+    "p083.set_enforcement_mode",
+];
+
+// Idempotency lease acquire/replay outcomes.
+// Per metric_labels_contract_v1.bounded_label_domains.outcome.
+const IDEMPOTENCY_OUTCOME_DOMAIN: &[&str] = &[
+    "acquired",
+    "replayed",
+    "denied",
+    "committed",
+    "failed",
+    "abandoned",
+    "expired_reacquired",
+];
+
+// Artifact lineage readback surface identifiers.
+// Per metric_labels_contract_v1.bounded_label_domains.surface.
+const SURFACE_DOMAIN: &[&str] = &[
+    "graphql",
+    "mcp",
+    "run_report",
+    "release_receipt",
+    "swift_ui",
+];
+
+// Artifact lineage projection integrity states.
+// Per metric_labels_contract_v1.bounded_label_domains.state.
+const PROJECTION_STATE_DOMAIN: &[&str] = &["fresh", "stale", "missing", "unknown", "tampered"];
+
+// Late-output overflow scope granularity.
+// Per metric_labels_contract_v1.bounded_label_domains.scope.
+const SCOPE_DOMAIN: &[&str] = &["session", "run", "global"];
+
+// Late-output overflow type classification.
+// Per metric_labels_contract_v1.bounded_label_domains.overflow_kind.
+const OVERFLOW_KIND_DOMAIN: &[&str] = &[
+    "message_count",
+    "session_bytes",
+    "elapsed_time",
+    "run_bytes",
+    "global_bytes",
+];
+
+// Reasons a run_start was blocked by rollout contract enforcement.
+// Per metric_labels_contract_v1.bounded_label_domains.reason.
+const BLOCK_REASON_DOMAIN: &[&str] = &[
+    "auth_dependency_missing",
+    "hold_condition_present",
+    "projection_not_fresh",
+    "migration_not_applied",
+    "rollback_ttl_expired",
+    "gate_failed",
+    "current_review_missing",
+    "identity_ambiguous",
+];
+
+// P083 enforcement mode values (matches set_enforcement_mode enum).
+// Per metric_labels_contract_v1.bounded_label_domains.enforcement_mode.
+const ENFORCEMENT_MODE_DOMAIN: &[&str] = &["disabled", "permissive", "enforce"];
+
+// Enforcement mode transition direction labels.
+// Per metric_labels_contract_v1.bounded_label_domains.transition.
+const TRANSITION_DOMAIN: &[&str] = &[
+    "disabled_to_permissive",
+    "permissive_to_enforce",
+    "enforce_to_permissive",
+    "permissive_to_disabled",
+    "disabled_to_enforce_denied",
+];
+
+// Rollback execution action labels (describes the rollback operation type).
+// Per metric_labels_contract_v1.bounded_label_domains.action.
+const ROLLBACK_ACTION_DOMAIN: &[&str] = &[
+    "disable_to_permissive",
+    "permissive_to_enforce",
+    "enforce_to_permissive",
+    "rollback_disable",
+    "reenable_after_rollback",
+    "manual_process_identity_check",
+];
+
+// Rollback execution status outcomes.
+// Per metric_labels_contract_v1.bounded_label_domains.status (shared status domain).
+const ROLLBACK_STATUS_DOMAIN: &[&str] = &[
+    "pass",
+    "fail",
+    "waived",
+    "not_applicable",
+    "timeout",
+    "cancelled",
+    "missing_contract",
+    "stale",
+    "tamper_detected",
+];
+
+// Rollback execution reason codes — what rollout hold condition prompted the rollback.
+// Per metric_labels_contract_v1.bounded_label_domains.reason (shared reason domain).
+const ROLLBACK_REASON_DOMAIN: &[&str] = &[
+    "auth_dependency_missing",
+    "hold_condition_present",
+    "projection_not_fresh",
+    "migration_not_applied",
+    "rollback_ttl_expired",
+    "gate_failed",
+    "current_review_missing",
+    "identity_ambiguous",
+];
+
+// Provider cancellation intent state machine values.
+// Per metric_labels_contract_v1.bounded_label_domains.intent_state.
+const INTENT_STATE_DOMAIN: &[&str] = &[
+    "requested",
+    "shutdown_started",
+    "settled",
+    "held",
+    "planned",
+    "issued",
+    "observed",
+    "suppressed",
+    "identity_mismatch",
+];
+
+fn bounded_label<'a>(
+    value: &'a str,
+    domain: &[&str],
+    metric: &str,
+    label_name: &str,
+) -> Option<&'a str> {
+    if domain.contains(&value) {
+        Some(value)
+    } else {
+        tracing::error!(
+            metric,
+            label_name,
+            value,
+            "P083 metric_labels_contract_v1 violation: out-of-domain label value; metric dropped"
+        );
+        None
+    }
+}
+
+pub fn record_p083_artifact_lineage_projection_integrity(surface: &str, state: &str) {
+    let Some(s) = bounded_label(
+        surface,
+        SURFACE_DOMAIN,
+        "artifact_lineage_projection_integrity_total",
+        "surface",
+    ) else {
+        return;
+    };
+    let Some(st) = bounded_label(
+        state,
+        PROJECTION_STATE_DOMAIN,
+        "artifact_lineage_projection_integrity_total",
+        "state",
+    ) else {
+        return;
+    };
+    increment_counter("artifact_lineage_projection_integrity_total");
+    increment_counter_with_label(
+        "artifact_lineage_projection_integrity_total",
+        &format!("surface={s},state={st}"),
+    );
+}
+
+pub fn record_p083_provider_session_lifecycle(provider: &str, lifecycle_state: &str) {
+    let Some(p) = bounded_label(
+        provider,
+        PROVIDER_DOMAIN,
+        "provider_session_lifecycle_total",
+        "provider",
+    ) else {
+        return;
+    };
+    let Some(ls) = bounded_label(
+        lifecycle_state,
+        LIFECYCLE_STATE_DOMAIN,
+        "provider_session_lifecycle_total",
+        "lifecycle_state",
+    ) else {
+        return;
+    };
+    increment_counter("provider_session_lifecycle_total");
+    increment_counter_with_label(
+        "provider_session_lifecycle_total",
+        &format!("provider={p},lifecycle_state={ls}"),
+    );
+}
+
+pub fn record_p083_command_idempotency_lease_acquire(command: &str, outcome: &str) {
+    let Some(c) = bounded_label(
+        command,
+        COMMAND_DOMAIN,
+        "command_idempotency_lease_acquire_total",
+        "command",
+    ) else {
+        return;
+    };
+    let Some(o) = bounded_label(
+        outcome,
+        IDEMPOTENCY_OUTCOME_DOMAIN,
+        "command_idempotency_lease_acquire_total",
+        "outcome",
+    ) else {
+        return;
+    };
+    increment_counter("command_idempotency_lease_acquire_total");
+    increment_counter_with_label(
+        "command_idempotency_lease_acquire_total",
+        &format!("command={c},outcome={o}"),
+    );
+}
+
+pub fn record_p083_command_idempotency_replay(command: &str, outcome: &str) {
+    let Some(c) = bounded_label(
+        command,
+        COMMAND_DOMAIN,
+        "command_idempotency_replay_total",
+        "command",
+    ) else {
+        return;
+    };
+    let Some(o) = bounded_label(
+        outcome,
+        IDEMPOTENCY_OUTCOME_DOMAIN,
+        "command_idempotency_replay_total",
+        "outcome",
+    ) else {
+        return;
+    };
+    increment_counter("command_idempotency_replay_total");
+    increment_counter_with_label(
+        "command_idempotency_replay_total",
+        &format!("command={c},outcome={o}"),
+    );
+}
+
+pub fn record_p083_shutdown_interrupted_receipt(provider: &str, interrupted_state: &str) {
+    let Some(p) = bounded_label(
+        provider,
+        PROVIDER_DOMAIN,
+        "shutdown_interrupted_receipt_total",
+        "provider",
+    ) else {
+        return;
+    };
+    let Some(state) = bounded_label(
+        interrupted_state,
+        INTERRUPTED_STATE_DOMAIN,
+        "shutdown_interrupted_receipt_total",
+        "interrupted_state",
+    ) else {
+        return;
+    };
+    increment_counter("shutdown_interrupted_receipt_total");
+    increment_counter_with_label(
+        "shutdown_interrupted_receipt_total",
+        &format!("provider={p},interrupted_state={state}"),
+    );
+}
+
+pub fn record_p083_shutdown_duplicate_signal_suppressed(provider: &str) {
+    let Some(p) = bounded_label(
+        provider,
+        PROVIDER_DOMAIN,
+        "shutdown_duplicate_signal_suppressed_total",
+        "provider",
+    ) else {
+        return;
+    };
+    increment_counter("shutdown_duplicate_signal_suppressed_total");
+    increment_counter_with_label(
+        "shutdown_duplicate_signal_suppressed_total",
+        &format!("provider={p}"),
+    );
+}
+
+pub fn record_p083_cancel_late_output_overflow(provider: &str, scope: &str, overflow_kind: &str) {
+    let Some(p) = bounded_label(
+        provider,
+        PROVIDER_DOMAIN,
+        "cancel_late_output_overflow_total",
+        "provider",
+    ) else {
+        return;
+    };
+    let Some(sc) = bounded_label(
+        scope,
+        SCOPE_DOMAIN,
+        "cancel_late_output_overflow_total",
+        "scope",
+    ) else {
+        return;
+    };
+    let Some(ok) = bounded_label(
+        overflow_kind,
+        OVERFLOW_KIND_DOMAIN,
+        "cancel_late_output_overflow_total",
+        "overflow_kind",
+    ) else {
+        return;
+    };
+    increment_counter("cancel_late_output_overflow_total");
+    increment_counter_with_label(
+        "cancel_late_output_overflow_total",
+        &format!("provider={p},scope={sc},overflow_kind={ok}"),
+    );
+}
+
+pub fn record_p083_cancel_late_output_dropped(provider: &str, scope: &str, overflow_kind: &str) {
+    let Some(p) = bounded_label(
+        provider,
+        PROVIDER_DOMAIN,
+        "cancel_late_output_dropped_total",
+        "provider",
+    ) else {
+        return;
+    };
+    let Some(sc) = bounded_label(
+        scope,
+        SCOPE_DOMAIN,
+        "cancel_late_output_dropped_total",
+        "scope",
+    ) else {
+        return;
+    };
+    let Some(ok) = bounded_label(
+        overflow_kind,
+        OVERFLOW_KIND_DOMAIN,
+        "cancel_late_output_dropped_total",
+        "overflow_kind",
+    ) else {
+        return;
+    };
+    increment_counter("cancel_late_output_dropped_total");
+    increment_counter_with_label(
+        "cancel_late_output_dropped_total",
+        &format!("provider={p},scope={sc},overflow_kind={ok}"),
+    );
+}
+
+pub fn record_p083_rollout_contract_lint(
+    proposal_id: &str,
+    status: &str,
+    failure_reason: Option<&str>,
+) {
+    let Some(pid) = bounded_label(
+        proposal_id,
+        PROPOSAL_ID_DOMAIN,
+        "rollout_contract_lint_total",
+        "proposal_id",
+    ) else {
+        return;
+    };
+    let Some(st) = bounded_label(
+        status,
+        ROLLOUT_STATUS_DOMAIN,
+        "rollout_contract_lint_total",
+        "status",
+    ) else {
+        return;
+    };
+    increment_counter("rollout_contract_lint_total");
+    // failure_reason label is omitted when absent (e.g. status=pass).
+    // Approved domain has no "none" sentinel.
+    match failure_reason {
+        Some(fr_raw) => {
+            let Some(fr) = bounded_label(
+                fr_raw,
+                FAILURE_REASON_DOMAIN,
+                "rollout_contract_lint_total",
+                "failure_reason",
+            ) else {
+                return;
+            };
+            increment_counter_with_label(
+                "rollout_contract_lint_total",
+                &format!("proposal_id={pid},status={st},failure_reason={fr}"),
+            );
+        }
+        None => {
+            increment_counter_with_label(
+                "rollout_contract_lint_total",
+                &format!("proposal_id={pid},status={st}"),
+            );
+        }
+    }
+}
+
+pub fn record_p083_rollout_contract_run_start_block(
+    proposal_id: &str,
+    reason: &str,
+    enforcement_mode: &str,
+) {
+    let Some(pid) = bounded_label(
+        proposal_id,
+        PROPOSAL_ID_DOMAIN,
+        "rollout_contract_run_start_block_total",
+        "proposal_id",
+    ) else {
+        return;
+    };
+    let Some(r) = bounded_label(
+        reason,
+        BLOCK_REASON_DOMAIN,
+        "rollout_contract_run_start_block_total",
+        "reason",
+    ) else {
+        return;
+    };
+    let Some(em) = bounded_label(
+        enforcement_mode,
+        ENFORCEMENT_MODE_DOMAIN,
+        "rollout_contract_run_start_block_total",
+        "enforcement_mode",
+    ) else {
+        return;
+    };
+    increment_counter("rollout_contract_run_start_block_total");
+    increment_counter_with_label(
+        "rollout_contract_run_start_block_total",
+        &format!("proposal_id={pid},reason={r},enforcement_mode={em}"),
+    );
+}
+
+pub fn record_p083_enforcement_mode_transition(transition: &str, enforcement_mode: &str) {
+    let Some(t) = bounded_label(
+        transition,
+        TRANSITION_DOMAIN,
+        "p083_enforcement_mode_transition_total",
+        "transition",
+    ) else {
+        return;
+    };
+    let Some(em) = bounded_label(
+        enforcement_mode,
+        ENFORCEMENT_MODE_DOMAIN,
+        "p083_enforcement_mode_transition_total",
+        "enforcement_mode",
+    ) else {
+        return;
+    };
+    increment_counter("p083_enforcement_mode_transition_total");
+    increment_counter_with_label(
+        "p083_enforcement_mode_transition_total",
+        &format!("transition={t},enforcement_mode={em}"),
+    );
+}
+
+pub fn record_p083_rollback_execution(action: &str, status: &str, reason: &str) {
+    let Some(a) = bounded_label(
+        action,
+        ROLLBACK_ACTION_DOMAIN,
+        "p083_rollback_execution_total",
+        "action",
+    ) else {
+        return;
+    };
+    let Some(s) = bounded_label(
+        status,
+        ROLLBACK_STATUS_DOMAIN,
+        "p083_rollback_execution_total",
+        "status",
+    ) else {
+        return;
+    };
+    let Some(r) = bounded_label(
+        reason,
+        ROLLBACK_REASON_DOMAIN,
+        "p083_rollback_execution_total",
+        "reason",
+    ) else {
+        return;
+    };
+    increment_counter("p083_rollback_execution_total");
+    increment_counter_with_label(
+        "p083_rollback_execution_total",
+        &format!("action={a},status={s},reason={r}"),
+    );
+}
+
+pub fn record_p083_provider_cancellation_intent(
+    provider: &str,
+    intent_state: &str,
+    cancellation_reason: &str,
+) {
+    let Some(p) = bounded_label(
+        provider,
+        PROVIDER_DOMAIN,
+        "provider_cancellation_intent_total",
+        "provider",
+    ) else {
+        return;
+    };
+    let Some(is) = bounded_label(
+        intent_state,
+        INTENT_STATE_DOMAIN,
+        "provider_cancellation_intent_total",
+        "intent_state",
+    ) else {
+        return;
+    };
+    let Some(reason) = bounded_label(
+        cancellation_reason,
+        CANCELLATION_REASON_DOMAIN,
+        "provider_cancellation_intent_total",
+        "cancellation_reason",
+    ) else {
+        return;
+    };
+    increment_counter("provider_cancellation_intent_total");
+    increment_counter_with_label(
+        "provider_cancellation_intent_total",
+        &format!("provider={p},intent_state={is},cancellation_reason={reason}"),
+    );
 }
 
 #[cfg(test)]

@@ -1,0 +1,31 @@
+{
+  "fixture_id": "queue-rank-restart-preserved",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "execution_queue_contract_v1",
+  "description": "queue_rank values written before a restart are read back in the identical order after restart, with no re-assignment or reordering.",
+  "preconditions": {
+    "queued_before_restart": [
+      {"execution_id": "ae-201", "queue_rank": 1, "state": "queued"},
+      {"execution_id": "ae-202", "queue_rank": 2, "state": "queued"},
+      {"execution_id": "ae-203", "queue_rank": 3, "state": "queued"}
+    ]
+  },
+  "action": {
+    "event": "process_restart",
+    "recovery_phase": "queue_rank_readback"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "ae-201 has queue_rank=1 after restart",
+    "ae-202 has queue_rank=2 after restart",
+    "ae-203 has queue_rank=3 after restart",
+    "dispatch order unchanged: ae-201 dispatched first",
+    "queue_rank values identical before and after restart"
+  ],
+  "recovery_rules": {
+    "restart_required": true,
+    "rank_resequenced_on_restart": false,
+    "rank_source": "durable_db_rows"
+  }
+}

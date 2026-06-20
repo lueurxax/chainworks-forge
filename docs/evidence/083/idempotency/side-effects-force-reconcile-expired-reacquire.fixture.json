@@ -1,0 +1,30 @@
+{
+  "fixture_id": "side-effects-force-reconcile-expired-reacquire",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "side_effect_idempotency_contract_v1",
+  "description": "An expired side-effect lease is reacquired and reconciled via force-reconcile without producing duplicate effects.",
+  "preconditions": {
+    "side_effect_id": "se-001",
+    "lease_state": "expired",
+    "lease_acquired_at": "2026-06-11T10:00:00Z",
+    "lease_expires_at": "2026-06-11T10:05:00Z",
+    "current_time": "2026-06-11T10:06:00Z",
+    "effect_committed": false
+  },
+  "action": {
+    "command": "ForceReconcileSideEffect",
+    "side_effect_id": "se-001",
+    "request_id": "req-reconcile-001",
+    "reacquire_lease": true,
+    "intent_hash": "sha256:reconcile-intent-001"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "expired lease is reacquired with new expiry",
+    "side-effect is executed exactly once",
+    "new lease_state transitions to committed after execution",
+    "no duplicate effect rows created",
+    "reconcile audit entry written to journal"
+  ]
+}

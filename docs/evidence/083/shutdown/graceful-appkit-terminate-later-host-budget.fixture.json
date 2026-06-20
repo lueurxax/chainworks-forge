@@ -1,0 +1,32 @@
+{
+  "fixture_id": "graceful-appkit-terminate-later-host-budget",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "shutdown_lifecycle_contract_v1",
+  "description": "AppKit applicationShouldTerminate returns .terminateLater and the host budget window is respected before final termination is granted.",
+  "preconditions": {
+    "termination_class": "graceful_appkit",
+    "active_runs": 2,
+    "host_budget_ms": 30000,
+    "delegate_available": true
+  },
+  "action": {
+    "event": "applicationShouldTerminate",
+    "source": "AppKit",
+    "user_initiated": true
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "applicationShouldTerminate returns NSTerminateLater",
+    "host_budget_ms budget starts counting down",
+    "active provider sessions receive graceful shutdown signal",
+    "side-effect rows flushed to durable storage within budget",
+    "replyToApplicationShouldTerminate(true) called before budget expires",
+    "budget_ms_used is recorded in shutdown audit"
+  ],
+  "recovery_rules": {
+    "restart_required": false,
+    "side_effects_settled": true,
+    "in_flight_sessions_signaled": true
+  }
+}

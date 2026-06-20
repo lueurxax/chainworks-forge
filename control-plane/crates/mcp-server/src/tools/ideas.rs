@@ -23,6 +23,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
+            output_schema: None,
         },
         McpTool {
             name: "ideas.create".to_string(),
@@ -38,6 +39,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "idempotency_key": { "type": "string", "description": "Required UUIDv7 per attempt for safe retry." }
                 }
             }),
+            output_schema: None,
         },
     ]
 }

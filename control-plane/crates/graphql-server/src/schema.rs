@@ -17,11 +17,18 @@ use db::repos::{
     sessions as session_repo, steward as steward_repo, workflow_conflicts,
 };
 use db::writer::DbWriterHeartbeat;
-use domain::commands::{ApprovalResolutionDecision, CallerContext, Command, ResolveApprovalCmd};
+use domain::commands::{
+    ApprovalResolutionDecision, CallerContext, Command, MarkProviderSessionProcessAbsentCmd,
+    P083RollbackExecutionCmd, P083SetEnforcementModeCmd, ResolveApprovalCmd, RetryRunCmd,
+    ShutdownProviderSessionCmd,
+};
 use domain::events::DomainEvent;
 use domain::ids::{ArtifactId, IdeaId, RunId};
 use domain::lifecycle::DaemonStatus;
-use engine::command_handler::{ApprovalResolutionConflict, CommandHandler};
+use engine::command_handler::{
+    validate_caller_request_id as validate_caller_request_id_engine, ApprovalResolutionConflict,
+    CommandHandler,
+};
 use engine::event_bus::EventSender;
 use engine::lifecycle_reporter::LifecycleReporter;
 
@@ -35,6 +42,11 @@ use crate::types::continuation::{
 use crate::types::idea::GqlIdea;
 use crate::types::p031::{
     GqlMutationConflictResultCode, GqlPayloadAvailabilityState, GqlPayloadUnavailableReasonCode,
+};
+use crate::types::p083::{
+    GqlP083IdentityHoldSession, GqlP083MarkProcessAbsentPayload,
+    GqlP083ProviderSessionShutdownPayload, GqlP083RollbackExecutionPayload,
+    GqlP083SetEnforcementModePayload, GqlRetryRunPayload,
 };
 use crate::types::run::GqlRun;
 use crate::types::scheduler::{GqlStartupRecoverySummary, GqlToolchainCacheHousekeepingSummary};
@@ -1406,10 +1418,62 @@ async fn enrich_run_with_artifact_contracts(
         artifact_contracts::find_active_implementation_self_assessment_summary(pool, run_id)
             .await?
             .map(|stored| stored.summary.into());
-    gql.rollout_contract_readback_json =
+    let rollout_check =
         rollout_contract_checks::find_terminal_rollout_contract_check_for_run(pool, run_id.inner())
-            .await?
-            .map(|check| Json(check.operator_readback_json_for_lane("graphql")));
+            .await?;
+    gql.rollout_contract_readback_json = rollout_check
+        .as_ref()
+        .map(|check| Json(check.operator_readback_json_for_lane("graphql")));
+    // P083: Full parity readback with RollbackDispositionJSON scalar and p083_shutdown_queue_rank.
+    gql.p083_rollout_contract_readback = if let Some(check) = rollout_check.as_ref() {
+        let readback = check.operator_readback_json_for_lane("graphql");
+        // Load latest queued_no_signal queue_rank for this run's provider sessions.
+        let queue_rank: Option<i64> = sqlx::query_scalar(
+            r#"SELECT r.queue_rank
+                 FROM shutdown_interrupted_receipts r
+                 JOIN provider_sessions ps ON ps.provider_session_id = r.provider_session_id
+                WHERE ps.run_id = ?1
+                  AND r.interrupted_state = 'queued_no_signal'
+                  AND r.recovered_at IS NULL
+                  AND r.queue_rank IS NOT NULL
+                ORDER BY r.shutdown_epoch DESC, r.receipt_generation DESC
+                LIMIT 1"#,
+        )
+        .bind(run_id.inner().to_string())
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        .flatten();
+        // Per rollback_disposition_json_v1.output_validation_rule: reject before serialization.
+        // from_readback_json returns Err when rollback_disposition validation fails.
+        let mut readback_obj =
+            match crate::types::p083::GqlP083RolloutContractReadback::from_readback_json(
+                &readback, queue_rank,
+            ) {
+                Ok(obj) => obj,
+                Err(e) => {
+                    tracing::error!(
+                        run_id = %run_id,
+                        error = %e,
+                        "P083 rollout contract readback rejected: rollback_disposition_v1 validation failed"
+                    );
+                    return Err(e.into());
+                }
+            };
+        // MISSING-009: Populate applied_migrations per migration_plan_v1 readback contract.
+        // Load P083 migration readback and attach to the GraphQL lane.
+        let migration_rows = db::repos::rollout_contract_checks::p083_migration_readback(pool)
+            .await
+            .unwrap_or_default();
+        let migration_json: Vec<serde_json::Value> = migration_rows
+            .iter()
+            .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
+            .collect();
+        readback_obj.applied_migrations = Some(Json(migration_json));
+        Some(readback_obj)
+    } else {
+        None
+    };
     gql.side_effect_readback_json = Some(Json(side_effect_readback_json(pool, run_id).await?));
     gql.p094_boundary_readback_json = Some(Json(
         db::repos::artifact_contracts::p094_readback_json(pool, run_id).await?,
@@ -5108,6 +5172,16 @@ pub enum MutationName {
     ApproveApproval,
     /// P072: Converged rejection mutation by approval_id.
     RejectApproval,
+    /// P083: Graceful shutdown of a provider session.
+    ProviderSessionShutdown,
+    /// P083: Rollback execution to permissive or disabled mode.
+    P083RollbackExecution,
+    /// P083: Set execution-truth enforcement mode.
+    P083SetEnforcementMode,
+    /// P083: Re-queue AdvanceRun for a stalled or failed run.
+    RetryRun,
+    /// P083: Operator confirms provider process is absent for identity-ambiguous hold.
+    P083MarkProviderSessionProcessAbsent,
 }
 
 impl MutationName {
@@ -5115,6 +5189,13 @@ impl MutationName {
         match self {
             MutationName::ApproveApproval => "approveApproval",
             MutationName::RejectApproval => "rejectApproval",
+            MutationName::ProviderSessionShutdown => "providerSessionShutdown",
+            MutationName::P083RollbackExecution => "p083RollbackExecution",
+            MutationName::P083SetEnforcementMode => "p083SetEnforcementMode",
+            MutationName::RetryRun => "runsRetry",
+            MutationName::P083MarkProviderSessionProcessAbsent => {
+                "p083MarkProviderSessionProcessAbsent"
+            }
         }
     }
 }
@@ -5123,6 +5204,13 @@ pub fn capability_id_for(mutation: MutationName) -> domain::CapabilityToolId {
     match mutation {
         MutationName::ApproveApproval | MutationName::RejectApproval => {
             domain::CapabilityToolId::ApprovalsResolve
+        }
+        MutationName::ProviderSessionShutdown => domain::CapabilityToolId::ProviderSessionShutdown,
+        MutationName::P083RollbackExecution => domain::CapabilityToolId::P083RollbackExecution,
+        MutationName::P083SetEnforcementMode => domain::CapabilityToolId::P083SetEnforcementMode,
+        MutationName::RetryRun => domain::CapabilityToolId::RetryRun,
+        MutationName::P083MarkProviderSessionProcessAbsent => {
+            domain::CapabilityToolId::ProviderSessionMarkProcessAbsent
         }
     }
 }
@@ -5280,6 +5368,126 @@ fn graphql_caller_with_request_id(
     caller
 }
 
+/// P083: Build a minimal CallerContext for P083 lifecycle mutations.
+/// Uses the principal id and class without extracting an X-Request-ID header,
+/// since P083 commands carry their own CallerRequestId in the command struct.
+fn graphql_caller(
+    ctx: &async_graphql::Context<'_>,
+    principal: &auth::Principal,
+    mutation_name: &str,
+) -> CallerContext {
+    let caller_class = auth::derive_caller_class(principal);
+    let mut caller = CallerContext::graphql(&principal.id, &principal.class, mutation_name)
+        .with_caller_class(caller_class.as_str());
+    // SEC-LOW-001: propagate derived token_id for audit correlation.
+    if let Ok(tid) = ctx.data::<crate::auth_layer::GraphqlTokenId>() {
+        caller = caller.with_token_id(&tid.0);
+    }
+    caller
+}
+
+/// P083: Validate a CallerRequestId as lowercase UUIDv4 per caller_request_id_v1.
+/// Returns a typed GraphQL error on validation failure.
+/// Delegates to the canonical engine validator (SEC-P083-MED-001 centralization).
+fn validate_caller_request_id_graphql(request_id: &str) -> Result<()> {
+    validate_caller_request_id_engine(request_id)
+        .map_err(|e| Error::new(format!("P083_INVALID_ARG: {e}")))
+}
+
+/// SEC-P083-MED-001: Validate a P083 operator-supplied reason field before persistence.
+/// Reasons are stored verbatim in p083_enforcement_mode_state.mode_reason and
+/// p083_rollback_audit.reason. Reject oversized inputs and control characters.
+/// Mirrors the same check in mcp-server/src/tools/runs.rs validate_p083_reason.
+fn validate_p083_reason_graphql(reason: &str, max_bytes: usize) -> Result<()> {
+    if reason.len() > max_bytes {
+        return Err(Error::new(format!(
+            "P083_INVALID_ARG: reason exceeds maximum length of {max_bytes} bytes (got {})",
+            reason.len()
+        )));
+    }
+    for (i, ch) in reason.char_indices() {
+        if ch.is_control() && !matches!(ch, ' ' | '\t' | '\n' | '\r') {
+            return Err(Error::new(format!(
+                "P083_INVALID_ARG: reason contains a disallowed control character at byte offset {i} (U+{:04X})",
+                ch as u32
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// SEC-P083-MED-001: Derive a non-reversible run-scoped display reference for a raw
+/// process_start_identity value. The raw value is never returned to callers; only this
+/// derived reference is serialized into GraphQL/UI payloads.
+///
+/// Formula: SHA-256("p083_process_start_identity|" + run_id + "|" + raw)
+fn derive_p083_process_identity_ref(run_id: &str, raw: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"p083_process_start_identity|");
+    hasher.update(run_id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(raw.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// P083: Convert a command-handler error into a GraphQL error with a bounded P083LifecycleDenialCode.
+/// All emitted code values are lowercase snake_case per P083LifecycleDenialCode::as_str().
+/// Logs the full error server-side but only exposes the denial code to callers.
+fn p083_command_error(mutation_name: &str, message: &str) -> Error {
+    // Map SCREAMING_SNAKE_CASE sentinel strings emitted by command handlers to bounded
+    // P083LifecycleDenialCode values. Keep in sync with the MCP tool denial_code enum.
+    let code: &str = if message.contains("PROVIDER_SESSION_NOT_FOUND") {
+        "provider_session_not_found"
+    } else if message.contains("IDEMPOTENCY_IN_FLIGHT") {
+        "idempotency_in_flight"
+    } else if message.contains("identity_ambiguous")
+        || message.contains("IDENTITY_AMBIGUOUS_NOT_FOUND")
+    {
+        "identity_ambiguous"
+    } else if message.contains("REQUEST_INTENT_MISMATCH") {
+        "request_intent_mismatch"
+    } else if message.contains("MALFORMED_REQUEST_ID") {
+        "malformed_request_id"
+    } else if message.contains("IDEMPOTENCY_REPLAY_CORRUPT") {
+        "idempotency_replay_corrupt"
+    } else if message.contains("IDEMPOTENCY_TERMINAL_FAILURE") {
+        "idempotency_terminal_failure"
+    } else if message.contains("APPROVAL_NOT_ACTIONABLE")
+        || message.contains("approval_not_actionable")
+    {
+        "approval_not_actionable"
+    } else if message.contains("cannot be retried")
+        || message.contains("cannot be targeted-retried")
+        || message.contains("STAGE_NOT_RETRYABLE")
+    {
+        "stage_not_retryable"
+    } else if message.contains("requires_effect_reconciliation")
+        || message.contains("SIDE_EFFECT_NOT_RECONCILABLE")
+    {
+        "side_effect_not_reconcilable"
+    } else if message.contains("ENFORCEMENT_MODE_TRANSITION_DENIED") {
+        "enforcement_mode_transition_denied"
+    } else if message.contains("RUN_NOT_FOUND") {
+        "run_not_found"
+    } else if message.contains("p083_operator_required")
+        || message.contains("P083_OPERATOR_REQUIRED")
+    {
+        "p083_operator_required"
+    } else if message.contains("operator_required") || message.contains("OPERATOR_REQUIRED") {
+        "operator_required"
+    } else {
+        tracing::error!(
+            mutation = mutation_name,
+            error = message,
+            "P083 command error"
+        );
+        "internal"
+    };
+    let mut e = Error::new(code);
+    e = e.extend_with(|_, ext| ext.set("code", code));
+    e
+}
+
 // ── P029 payload wrappers ──────────────────────────────────────────────
 // Dedicated types for each mutation so journal_id doesn't pollute shared
 // Run/Approval types used by read queries.
@@ -5298,32 +5506,6 @@ pub struct RejectApprovalPayload {
     pub approval: GqlApproval,
     pub journal_id: ID,
     pub conflict_result_code: Option<GqlMutationConflictResultCode>,
-}
-
-/// SEC-M-001: Validate that an idempotency key is a well-formed UUIDv7.
-/// UUIDv7 format: 8-4-4-4-12 hex groups where the version nibble (13th char) is '7'
-/// and the variant nibble (17th char) is '8', '9', 'a', or 'b' (RFC 4122 variant).
-/// Returns a typed, non-disclosing error on validation failure.
-fn validate_idempotency_key_uuidv7(key: &str) -> Result<()> {
-    let uuid = uuid::Uuid::parse_str(key).map_err(|_| {
-        let mut e = async_graphql::Error::new("INVALID_IDEMPOTENCY_KEY");
-        e = e.extend_with(|_, ext| ext.set("code", "INVALID_IDEMPOTENCY_KEY"));
-        e
-    })?;
-    // Version check: UUIDv7 has version nibble == 7
-    if uuid.get_version_num() != 7 {
-        let mut e = async_graphql::Error::new("INVALID_IDEMPOTENCY_KEY");
-        e = e.extend_with(|_, ext| ext.set("code", "INVALID_IDEMPOTENCY_KEY"));
-        return Err(e.into());
-    }
-    // SEC-M-001b: Variant check — must be RFC 4122 (high bits 10xx).
-    // Rejects malformed UUIDs that parse with version=7 but use a non-standard variant byte.
-    if uuid.get_variant() != uuid::Variant::RFC4122 {
-        let mut e = async_graphql::Error::new("INVALID_IDEMPOTENCY_KEY");
-        e = e.extend_with(|_, ext| ext.set("code", "INVALID_IDEMPOTENCY_KEY"));
-        return Err(e.into());
-    }
-    Ok(())
 }
 
 fn approval_resolution_conflict_code(
@@ -5360,17 +5542,17 @@ fn idempotency_conflict_gql_error(request_id: &Option<String>) -> Error {
 
 #[Object]
 impl MutationRoot {
-    /// P072/P081: Approve a stage approval by approval_id. The resolver
+    /// P072/P083: Approve a stage approval by approval_id. The resolver
     /// server-resolves run_id and stage_id from the approval record
     /// before constructing ResolveApprovalCmd.
-    /// P081: idempotency_key is a required UUIDv7 per ApprovalActionAttemptStore attempt.
-    /// SEC-P081-HIGH-001: Required to enforce committed-unack replay contract.
+    /// P083: request_id is a required lowercase UUIDv4 (CallerRequestId per
+    /// command_idempotency_contract_v1). TTL=300s.
     async fn approve_approval(
         &self,
         ctx: &Context<'_>,
         approval_id: ID,
         comment: Option<String>,
-        idempotency_key: String,
+        request_id: String,
     ) -> Result<ApproveApprovalPayload> {
         let pool = ctx.data::<SqlitePool>()?;
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
@@ -5382,23 +5564,14 @@ impl MutationRoot {
 
         mutation_allowed(ctx, &principal, MutationName::ApproveApproval).await?;
 
-        // SEC-M-001: Validate idempotencyKey as UUIDv7 before command handling or storage.
-        validate_idempotency_key_uuidv7(&idempotency_key)?;
+        // P083: Validate request_id as lowercase UUIDv4 (caller_request_id_v1).
+        validate_caller_request_id_graphql(&request_id)?;
 
         let caller = graphql_caller_with_request_id(ctx, &principal, "approveApproval");
-        // SEC-P081-002: Capture request_id before caller is consumed so internal errors
-        // can include it without disclosing the raw error chain to the client.
-        let request_id = caller.request_id.clone();
+        // Capture http_request_id for error attribution before caller is consumed.
+        let http_request_id = caller.request_id.clone();
 
-        // P081: Log a SHA-256 digest of the key — raw replay handles must not appear in logs.
-        {
-            let key_digest = {
-                use sha2::{Digest, Sha256};
-                let h = Sha256::digest(idempotency_key.as_bytes());
-                format!("{:x}", h)[..16].to_string()
-            };
-            tracing::debug!(idempotency_key_digest = %key_digest, approval_id = %*approval_id, "approveApproval idempotency_key received");
-        }
+        tracing::debug!(request_id = %request_id, approval_id = %*approval_id, "approveApproval request_id received");
 
         let aid: domain::ids::ApprovalId = approval_id
             .parse()
@@ -5415,7 +5588,8 @@ impl MutationRoot {
             rationale: comment,
             run_id: approval.run_id,
             stage_id: approval.stage_id.clone(),
-            idempotency_key: Some(idempotency_key),
+            idempotency_key: None,
+            request_id: Some(request_id.clone()),
         });
 
         let result = cmd_handler.handle(cmd, caller).await;
@@ -5445,32 +5619,30 @@ impl MutationRoot {
                         conflict_result_code: Some(conflict_result_code),
                     })
                 } else if e.to_string().contains("IDEMPOTENCY_CONFLICT") {
-                    // P081: same idempotency key with a different canonical request hash.
-                    // Return a deterministic IDEMPOTENCY_CONFLICT code, not an opaque INTERNAL.
-                    Err(idempotency_conflict_gql_error(&request_id))
+                    // P083: same request_id with a different intent hash.
+                    Err(idempotency_conflict_gql_error(&http_request_id))
                 } else {
-                    // SEC-P081-002: Log full error chain server-side; expose only INTERNAL + request_id.
-                    tracing::error!(error = %e, request_id = ?request_id, "approveApproval: internal command error");
+                    // Log full error chain server-side; expose only INTERNAL + request_id.
+                    tracing::error!(error = %e, request_id = %request_id, "approveApproval: internal command error");
                     let mut gql_err = Error::new("INTERNAL");
                     gql_err = gql_err.extend_with(|_, ext| ext.set("code", "INTERNAL"));
-                    if let Some(ref rid) = request_id {
-                        gql_err = gql_err.extend_with(|_, ext| ext.set("requestId", rid.clone()));
-                    }
+                    gql_err =
+                        gql_err.extend_with(|_, ext| ext.set("requestId", request_id.clone()));
                     Err(gql_err)
                 }
             }
         }
     }
 
-    /// P072/P081: Reject a stage approval by approval_id with a required reason.
-    /// P081: idempotency_key is a required UUIDv7 per ApprovalActionAttemptStore attempt.
-    /// SEC-P081-HIGH-001: Required to enforce committed-unack replay contract.
+    /// P072/P083: Reject a stage approval by approval_id with a required reason.
+    /// P083: request_id is a required lowercase UUIDv4 (CallerRequestId per
+    /// command_idempotency_contract_v1). TTL=300s.
     async fn reject_approval(
         &self,
         ctx: &Context<'_>,
         approval_id: ID,
         reason: String,
-        idempotency_key: String,
+        request_id: String,
     ) -> Result<RejectApprovalPayload> {
         let pool = ctx.data::<SqlitePool>()?;
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
@@ -5482,22 +5654,13 @@ impl MutationRoot {
 
         mutation_allowed(ctx, &principal, MutationName::RejectApproval).await?;
 
-        // SEC-M-001: Validate idempotencyKey as UUIDv7 before command handling or storage.
-        validate_idempotency_key_uuidv7(&idempotency_key)?;
+        // P083: Validate request_id as lowercase UUIDv4 (caller_request_id_v1).
+        validate_caller_request_id_graphql(&request_id)?;
 
-        // P081: Log a SHA-256 digest of the key — raw replay handles must not appear in logs.
-        {
-            let key_digest = {
-                use sha2::{Digest, Sha256};
-                let h = Sha256::digest(idempotency_key.as_bytes());
-                format!("{:x}", h)[..16].to_string()
-            };
-            tracing::debug!(idempotency_key_digest = %key_digest, approval_id = %*approval_id, "rejectApproval idempotency_key received");
-        }
+        tracing::debug!(request_id = %request_id, approval_id = %*approval_id, "rejectApproval request_id received");
 
         let caller = graphql_caller_with_request_id(ctx, &principal, "rejectApproval");
-        // SEC-P081-002: Capture request_id before caller is consumed.
-        let request_id = caller.request_id.clone();
+        let http_request_id = caller.request_id.clone();
 
         let aid: domain::ids::ApprovalId = approval_id
             .parse()
@@ -5514,7 +5677,8 @@ impl MutationRoot {
             rationale: Some(reason),
             run_id: approval.run_id,
             stage_id: approval.stage_id.clone(),
-            idempotency_key: Some(idempotency_key),
+            idempotency_key: None,
+            request_id: Some(request_id.clone()),
         });
 
         let result = cmd_handler.handle(cmd, caller).await;
@@ -5543,20 +5707,306 @@ impl MutationRoot {
                         conflict_result_code: Some(conflict_result_code),
                     })
                 } else if e.to_string().contains("IDEMPOTENCY_CONFLICT") {
-                    // P081: same idempotency key with a different canonical request hash.
-                    // Return a deterministic IDEMPOTENCY_CONFLICT code, not an opaque INTERNAL.
-                    Err(idempotency_conflict_gql_error(&request_id))
+                    // P083: same request_id with a different intent hash.
+                    Err(idempotency_conflict_gql_error(&http_request_id))
                 } else {
-                    // SEC-P081-002: Log full error chain server-side; expose only INTERNAL + request_id.
-                    tracing::error!(error = %e, request_id = ?request_id, "rejectApproval: internal command error");
+                    tracing::error!(error = %e, request_id = %request_id, "rejectApproval: internal command error");
                     let mut gql_err = Error::new("INTERNAL");
                     gql_err = gql_err.extend_with(|_, ext| ext.set("code", "INTERNAL"));
-                    if let Some(ref rid) = request_id {
-                        gql_err = gql_err.extend_with(|_, ext| ext.set("requestId", rid.clone()));
-                    }
+                    gql_err =
+                        gql_err.extend_with(|_, ext| ext.set("requestId", request_id.clone()));
                     Err(gql_err)
                 }
             }
+        }
+    }
+
+    /// P083: Initiate graceful shutdown of a provider session.
+    /// Requires Operator principal. request_id is a CallerRequestId (lowercase UUIDv4)
+    /// used by command_idempotency_contract_v1 for replay-safe deduplication.
+    async fn provider_session_shutdown(
+        &self,
+        ctx: &Context<'_>,
+        provider_session_id: String,
+        reason: String,
+        request_id: String,
+    ) -> Result<GqlP083ProviderSessionShutdownPayload> {
+        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
+
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
+            .clone();
+
+        mutation_allowed(ctx, &principal, MutationName::ProviderSessionShutdown).await?;
+
+        validate_caller_request_id_graphql(&request_id)?;
+        validate_p083_reason_graphql(&reason, 1024)?;
+
+        let caller = graphql_caller(&ctx, &principal, "providerSessionShutdown")
+            .with_request_id(&request_id);
+        let cmd = Command::ShutdownProviderSession(ShutdownProviderSessionCmd {
+            provider_session_id: provider_session_id.clone(),
+            request_id: request_id.clone(),
+            reason,
+        });
+
+        let commanded = cmd_handler.handle(cmd, caller).await.map_err(|e| {
+            tracing::error!(error = %e, "providerSessionShutdown: command error");
+            p083_command_error("providerSessionShutdown", &e.to_string())
+        })?;
+
+        match commanded.result {
+            engine::command_handler::CommandResult::ProviderSessionShutdownRecorded {
+                provider_session_id: ps_id,
+                journal_id,
+                idempotency_request_id,
+                cancellation_epoch,
+                dispatched_count,
+            } => Ok(GqlP083ProviderSessionShutdownPayload {
+                scheduled: dispatched_count > 0,
+                provider_session_id: ps_id,
+                cancellation_epoch,
+                journal_id,
+                request_id: idempotency_request_id,
+                operator_next_step_code: None,
+            }),
+            // SEC-P083-HIGH-001: process_id was null at command time; intent held pending operator action.
+            engine::command_handler::CommandResult::ProviderSessionShutdownHeld {
+                provider_session_id: ps_id,
+                journal_id,
+                idempotency_request_id,
+                cancellation_epoch,
+                operator_next_step_code,
+            } => Ok(GqlP083ProviderSessionShutdownPayload {
+                scheduled: false,
+                provider_session_id: ps_id,
+                cancellation_epoch,
+                journal_id,
+                request_id: idempotency_request_id,
+                operator_next_step_code: Some(operator_next_step_code),
+            }),
+            _ => Err(Error::new("INTERNAL: unexpected command result")),
+        }
+    }
+
+    /// P083: Roll back to permissive or disabled enforcement mode.
+    /// Requires Operator principal. request_id is a CallerRequestId (lowercase UUIDv4).
+    async fn p083_rollback_execution(
+        &self,
+        ctx: &Context<'_>,
+        rollback_mode: String,
+        reason: String,
+        request_id: String,
+    ) -> Result<GqlP083RollbackExecutionPayload> {
+        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
+
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
+            .clone();
+
+        mutation_allowed(ctx, &principal, MutationName::P083RollbackExecution).await?;
+
+        validate_caller_request_id_graphql(&request_id)?;
+        validate_p083_reason_graphql(&reason, 2048)?;
+
+        if !matches!(rollback_mode.as_str(), "permissive" | "disabled") {
+            return Err(Error::new(
+                "P083_INVALID_ARG: rollbackMode must be 'permissive' or 'disabled'",
+            ));
+        }
+
+        let caller =
+            graphql_caller(&ctx, &principal, "p083RollbackExecution").with_request_id(&request_id);
+        let cmd = Command::P083RollbackExecution(P083RollbackExecutionCmd {
+            request_id: request_id.clone(),
+            rollback_mode: rollback_mode.clone(),
+            reason,
+        });
+
+        let commanded = cmd_handler.handle(cmd, caller).await.map_err(|e| {
+            tracing::error!(error = %e, "p083RollbackExecution: command error");
+            p083_command_error("p083RollbackExecution", &e.to_string())
+        })?;
+
+        match commanded.result {
+            engine::command_handler::CommandResult::P083RollbackExecutionScheduled {
+                rollback_mode: mode,
+                journal_id,
+                idempotency_request_id,
+            } => Ok(GqlP083RollbackExecutionPayload {
+                committed: true,
+                rollback_mode: mode,
+                journal_id,
+                request_id: idempotency_request_id,
+            }),
+            _ => Err(Error::new("INTERNAL: unexpected command result")),
+        }
+    }
+
+    /// P083: Set execution-truth enforcement mode (disabled/permissive/enforce).
+    /// Requires Operator principal. request_id is a CallerRequestId (lowercase UUIDv4).
+    async fn p083_set_enforcement_mode(
+        &self,
+        ctx: &Context<'_>,
+        enforcement_mode: String,
+        reason: String,
+        request_id: String,
+    ) -> Result<GqlP083SetEnforcementModePayload> {
+        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
+
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
+            .clone();
+
+        mutation_allowed(ctx, &principal, MutationName::P083SetEnforcementMode).await?;
+
+        validate_caller_request_id_graphql(&request_id)?;
+        validate_p083_reason_graphql(&reason, 2048)?;
+
+        if !matches!(
+            enforcement_mode.as_str(),
+            "disabled" | "permissive" | "enforce"
+        ) {
+            return Err(Error::new(
+                "P083_INVALID_ARG: enforcementMode must be 'disabled', 'permissive', or 'enforce'",
+            ));
+        }
+
+        let caller =
+            graphql_caller(&ctx, &principal, "p083SetEnforcementMode").with_request_id(&request_id);
+        let cmd = Command::P083SetEnforcementMode(P083SetEnforcementModeCmd {
+            request_id: request_id.clone(),
+            enforcement_mode: enforcement_mode.clone(),
+            reason,
+        });
+
+        let commanded = cmd_handler.handle(cmd, caller).await.map_err(|e| {
+            tracing::error!(error = %e, "p083SetEnforcementMode: command error");
+            p083_command_error("p083SetEnforcementMode", &e.to_string())
+        })?;
+
+        match commanded.result {
+            engine::command_handler::CommandResult::P083EnforcementModeSet {
+                enforcement_mode: mode,
+                journal_id,
+                idempotency_request_id,
+            } => Ok(GqlP083SetEnforcementModePayload {
+                committed: true,
+                enforcement_mode: mode,
+                journal_id,
+                request_id: idempotency_request_id,
+            }),
+            _ => Err(Error::new("INTERNAL: unexpected command result")),
+        }
+    }
+
+    /// P083: Re-queue an AdvanceRun work item for a run that has failed or stalled.
+    /// Requires Operator principal. request_id is a CallerRequestId (lowercase UUIDv4).
+    async fn runs_retry(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+        request_id: String,
+    ) -> Result<GqlRetryRunPayload> {
+        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
+
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
+            .clone();
+
+        mutation_allowed(ctx, &principal, MutationName::RetryRun).await?;
+
+        validate_caller_request_id_graphql(&request_id)?;
+
+        let run_id_parsed: RunId = run_id
+            .as_str()
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+
+        let caller = graphql_caller(&ctx, &principal, "runsRetry").with_request_id(&request_id);
+        let cmd = Command::RetryRun(RetryRunCmd {
+            run_id: run_id_parsed,
+            request_id: request_id.clone(),
+        });
+
+        let commanded = cmd_handler.handle(cmd, caller).await.map_err(|e| {
+            tracing::error!(error = %e, "runsRetry: command error");
+            p083_command_error("runsRetry", &e.to_string())
+        })?;
+
+        match commanded.result {
+            engine::command_handler::CommandResult::RunRetried {
+                run_id: result_run_id,
+                journal_id,
+                idempotency_request_id,
+            } => Ok(GqlRetryRunPayload {
+                queued: true,
+                run_id: result_run_id.to_string(),
+                journal_id,
+                request_id: idempotency_request_id,
+            }),
+            _ => Err(Error::new("INTERNAL: unexpected command result")),
+        }
+    }
+
+    /// P083: Operator confirms provider process is absent for identity-ambiguous hold.
+    /// Requires Operator principal. request_id is a CallerRequestId (lowercase UUIDv4).
+    /// Per manual_process_identity_check_ui_v1: clears the identity hold so shutdown
+    /// settlement can resume without automatic process identity verification.
+    async fn p083_mark_provider_session_process_absent(
+        &self,
+        ctx: &Context<'_>,
+        provider_session_id: String,
+        cancellation_epoch: i64,
+        request_id: String,
+    ) -> Result<GqlP083MarkProcessAbsentPayload> {
+        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
+
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
+            .clone();
+
+        mutation_allowed(
+            ctx,
+            &principal,
+            MutationName::P083MarkProviderSessionProcessAbsent,
+        )
+        .await?;
+
+        validate_caller_request_id_graphql(&request_id)?;
+
+        let caller = graphql_caller(&ctx, &principal, "p083MarkProviderSessionProcessAbsent")
+            .with_request_id(&request_id);
+        let cmd = Command::MarkProviderSessionProcessAbsent(MarkProviderSessionProcessAbsentCmd {
+            provider_session_id: provider_session_id.clone(),
+            cancellation_epoch,
+            request_id: request_id.clone(),
+        });
+
+        let commanded = cmd_handler.handle(cmd, caller).await.map_err(|e| {
+            tracing::error!(error = %e, "p083MarkProviderSessionProcessAbsent: command error");
+            p083_command_error("p083MarkProviderSessionProcessAbsent", &e.to_string())
+        })?;
+
+        match commanded.result {
+            engine::command_handler::CommandResult::ProviderSessionMarkedAbsent {
+                provider_session_id: ps_id,
+                cancellation_epoch: epoch,
+                journal_id,
+                idempotency_request_id,
+            } => Ok(GqlP083MarkProcessAbsentPayload {
+                marked_absent: true,
+                provider_session_id: ps_id,
+                cancellation_epoch: epoch,
+                journal_id,
+                request_id: idempotency_request_id,
+            }),
+            _ => Err(Error::new("INTERNAL: unexpected command result")),
         }
     }
 }
@@ -13432,7 +13882,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8000-000000000001") {{
+                      approveApproval(approvalId: "{}", requestId: "a0000000-0000-4000-8000-000000000001") {{
                         approval {{ id }}
                         journalId
                       }}
@@ -13455,7 +13905,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8000-000000000002") {{
+                      approveApproval(approvalId: "{}", requestId: "a0000000-0000-4000-8000-000000000002") {{
                         approval {{
                           id
                           decision
@@ -13524,7 +13974,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8081-000000000002") {{
+                      approveApproval(approvalId: "{}", requestId: "a0000000-0000-4000-8000-000000000003") {{
                         approval {{ id decision }}
                         journalId
                       }}
@@ -13691,7 +14141,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8aaa-000000000001") {{
+                      approveApproval(approvalId: "{}", requestId: "a0000000-0000-4000-8000-000000000004") {{
                         approval {{ id }}
                         journalId
                       }}
@@ -13710,7 +14160,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8aaa-000000000002") {{
+                      approveApproval(approvalId: "{}", requestId: "a0000000-0000-4000-8000-000000000005") {{
                         approval {{ id decision }}
                         journalId
                       }}
@@ -13731,7 +14181,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8aaa-000000000003") {{
+                      approveApproval(approvalId: "{}", requestId: "a0000000-0000-4000-8000-000000000006") {{
                         approval {{ id decision }}
                         journalId
                         conflictResultCode
@@ -13780,7 +14230,7 @@ mod tests {
         let approve = |fields: &str, key: &str| {
             Request::new(format!(
                 r#"mutation {{
-                  approveApproval(approvalId: "{}", idempotencyKey: "{key}") {{
+                  approveApproval(approvalId: "{}", requestId: "{key}") {{
                     {fields}
                   }}
                 }}"#,
@@ -13792,7 +14242,7 @@ mod tests {
         let first = schema
             .execute(approve(
                 "approval { id decision } journalId conflictResultCode",
-                "01900000-0000-7000-8001-000000000001",
+                "a0000000-0000-4000-8000-000000000007",
             ))
             .await;
         assert!(
@@ -13815,7 +14265,7 @@ mod tests {
         let second = schema
             .execute(approve(
                 "approval { id decision } journalId conflictResultCode",
-                "01900000-0000-7000-8001-000000000002",
+                "a0000000-0000-4000-8000-000000000008",
             ))
             .await;
         assert!(
@@ -13919,7 +14369,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8002-000000000001") {{
+                      approveApproval(approvalId: "{}", requestId: "a0000000-0000-4000-8000-000000000009") {{
                         approval {{ id decision }}
                         journalId
                         conflictResultCode
@@ -13944,7 +14394,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      rejectApproval(approvalId: "{}", reason: "stale reject", idempotencyKey: "01900000-0000-7000-8002-000000000002") {{
+                      rejectApproval(approvalId: "{}", reason: "stale reject", requestId: "a0000000-0000-4000-8000-000000000010") {{
                         approval {{ id decision availableActions disabledReasonCode writePathState }}
                         journalId
                         conflictResultCode
@@ -14381,7 +14831,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      rejectApproval(approvalId: "{}", reason: "needs more work", idempotencyKey: "01900000-0000-7000-8003-000000000001") {{
+                      rejectApproval(approvalId: "{}", reason: "needs more work", requestId: "a0000000-0000-4000-8000-000000000011") {{
                         approval {{ id }}
                         journalId
                       }}
@@ -14403,7 +14853,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      rejectApproval(approvalId: "{}", reason: "needs more work", idempotencyKey: "01900000-0000-7000-8003-000000000002") {{
+                      rejectApproval(approvalId: "{}", reason: "needs more work", requestId: "a0000000-0000-4000-8000-000000000012") {{
                         approval {{ id decision }}
                         journalId
                       }}

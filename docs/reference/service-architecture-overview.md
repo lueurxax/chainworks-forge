@@ -62,8 +62,11 @@ flowchart TB
 
 The Rust control-plane daemon is the orchestrator. The governed macOS UI is not
 the orchestrator: it reads GraphQL projections and may only settle approval gates
-through `approveApproval` / `rejectApproval`. All non-approval operational
-commands belong to MCP.
+through `approveApproval` / `rejectApproval`. Non-approval operational commands
+belong to MCP, with the narrow exception of the P083 operator GraphQL lifecycle
+mutations (provider shutdown, process-absent confirmation, rollback execution,
+enforcement-mode changes, and run retry) reserved for explicitly authorized
+non-UI operator callers.
 
 Inside the daemon, command handling, scheduling, execution, recovery, artifact
 settlement, and projections all converge on SQLite as canonical truth.

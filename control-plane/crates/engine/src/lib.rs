@@ -27,6 +27,7 @@ pub mod release;
 pub mod rollout_contract_preflight;
 pub mod session;
 pub mod shadow_escalation;
+pub mod shutdown_service;
 pub mod side_effects;
 pub mod steward;
 pub mod synthesizers;

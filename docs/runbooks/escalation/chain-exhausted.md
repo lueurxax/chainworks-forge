@@ -4,4 +4,4 @@
 
 **Phase:** `runtime`
 
-**Operator Action Hint:** Extend the chain or accept terminal pause.
+**Operator Action Hint:** Extend the chain or accept terminal pause. If the pause came from a lifecycle-command denial, inspect the durable command/readback state before retrying.

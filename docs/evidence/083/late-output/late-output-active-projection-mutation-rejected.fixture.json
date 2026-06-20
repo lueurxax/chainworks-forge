@@ -1,0 +1,30 @@
+{
+  "fixture_id": "late-output-active-projection-mutation-rejected",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "late_output_overflow_contract_v1",
+  "description": "Late output arriving after a stage has moved to an active projection state is rejected to prevent backward mutation of committed projections.",
+  "preconditions": {
+    "stage_id": "stage-c",
+    "stage_state": "completed",
+    "projection_state": "active",
+    "latch": {
+      "latch_id": "latch-003",
+      "state": "closed"
+    }
+  },
+  "action": {
+    "event": "LateOutputArrived",
+    "stage_id": "stage-c",
+    "artifact_key": "final_report",
+    "late_output_index": 5
+  },
+  "expected_outcome": "rejected",
+  "assertions": [
+    "late output rejected because stage projection is in active state",
+    "existing committed projection NOT mutated",
+    "rejection logged with stage_id and projection_state",
+    "latch_id=latch-003 state remains closed",
+    "late output stored in overflow buffer if configured, otherwise discarded"
+  ]
+}

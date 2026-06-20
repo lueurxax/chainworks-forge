@@ -427,10 +427,10 @@ Important:
 
 Rust + SQLite local control-plane daemon gate. Runs the full `control-plane` Rust workspace test suite, covering:
 
-- SQLite repository layer (ideas, runs, stages, approvals, artifacts)
-- Projection rebuild and parity verification (`run_summaries`, `stage_summaries`, `approval_inbox`, `artifact_index`)
-- Domain engine transitions and command handler semantics (approve, reject, retry, cancel)
-- RecoveryService startup-repair for stuck-Running stages
+- SQLite repository layer (ideas, runs, stages, approvals, artifacts), plus P083 surfaces: command idempotency, shutdown interrupted receipts, signal side effects, post-cancel late-output overflow, enforcement-mode state/audit, rollback audit, durable monotonic clock samples, and provider cancellation intents.
+- Projection rebuild and parity verification (`run_summaries`, `stage_summaries`, `approval_inbox`, `artifact_index`).
+- Domain engine transitions and command handler semantics (approve, reject, retry, cancel).
+- RecoveryService startup-repair for stuck-Running stages, plus P083's shutdown recovery scan (`engine::shutdown_service::recover_shutdown_state`) over unresolved signal side-effects and identity-ambiguous provider sessions.
 
 Scope:
 
@@ -736,7 +736,7 @@ Scope:
 - focused `graphql-server` test slice for the P043 read-contract filters starting with `proposal_043_`
 - reference contract validation at `docs/reference/query-projections-and-client-consumption-contract.md`
 - matrix coverage for all P043 surfaces: runs home, run detail, stage list / progress, stage detail, approval inbox, artifact viewer, report viewer, runtime health, and experiment comparison
-- operator-only V1 scope, exact freshness budget rows, explicit projection freshness fields, freshness behavior limitations, subscription posture, P031/P043 delta policy, GraphQL field proof, projection parity, known gaps, and cutover decision evidence
+- operator-only V1 scope, exact freshness budget rows, explicit projection freshness fields, freshness behavior limitations, subscription posture, P031/P043 delta policy, GraphQL field proof, projection parity, known gaps, and cutover decision evidence. P083 adds `Run.p083RolloutContractReadback` (validated via the `RollbackDispositionJSON` output scalar) to this read surface.
 
 Use when:
 
@@ -946,12 +946,12 @@ Scope:
 - principal-table bootstrap (owner-only `0o600` file mode on Unix, one-time token log, fail-closed on empty table)
 - bearer auth on MCP HTTP (`POST /mcp`), MCP stdio (`initialize.params.clientInfo.principal_token`), GraphQL HTTP (`POST /graphql`), and GraphQL WebSocket (`/graphql/ws` via `on_connection_init`)
 - per-class capability filtering for MCP `tools/list`, `tools/call`, `resources/list`, `resources/read`, including the Steward trio policy (`steward.run_analysis` operator-only, `steward.list_analyses` + `steward.get_analysis` operator/observer, agent excluded)
-- GraphQL mutation class policy: UI/default principals may execute only `approveApproval` and `rejectApproval`; non-approval command mutations are MCP-only
+- GraphQL mutation class policy for the governed UI/default boundary: UI/default principals may execute only `approveApproval` and `rejectApproval`; P083's explicitly authorized operator GraphQL lifecycle mutations are covered by the P083 gate rather than this historical P029 inventory
 - `command_journal` caller metadata (`caller_surface`, `caller_principal_id`, `caller_principal_class`, `caller_tool`) populated per MCP command tool and per GraphQL mutation
 - the §8.1 redaction matrix (one test per `Command` variant decision)
 - `journal_id` surfacing inside `content[0].text` on MCP command tools and as `journalId: ID!` on approval GraphQL mutation payload wrappers
 - typed `DeliveryPreflight` object on MCP `runs.start` blocked preflight responses
-- command write-path boundary: non-approval operator commands route through MCP, while GraphQL remains read/subscription plus approval-only mutation surface
+- command write-path boundary for governed SwiftUI: non-approval UI commands route through MCP-owned workflows, while GraphQL remains read/subscription plus approval-only mutation surface for the governed UI; P083's operator GraphQL lifecycle mutations are non-UI command surface
 - dogfood `.mcp.json` / `CLAUDE.md` consistency (repo-root `.mcp.json` registers `chainworks-control-plane` with `Authorization: Bearer ${CHAINWORKS_MCP_TOKEN}`; `CLAUDE.md` documents the env var and URL)
 - full `cargo test --workspace` regression after the focused inventory
 
@@ -2487,7 +2487,6 @@ Command:
 ```
 
 Important:
-
 
 - `p086` and `p086-continuation-preflight` are accepted as aliases for the Phase 0 preflight
 - the gate fails closed when any required migration element, SHA-256 constraint, MCP/artifact schema, Rust unit test, passive SwiftUI readback hook, duplicate-send reconciliation guard, or daemon-level live ACP reuse regression is missing or invalid

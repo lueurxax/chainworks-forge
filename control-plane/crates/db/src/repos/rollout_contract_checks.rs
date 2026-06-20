@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
@@ -238,6 +239,35 @@ pub struct RolloutContractMetricEvent {
     pub occurred_at: DateTime<Utc>,
 }
 
+/// SEC-P083-HIGH-001: strip rollback_disposition to the four schema-mandated fields
+/// (schema_version, mode, data_loss_risk, steps) before any readback lane serialization.
+/// Always injects schema_version="rollback_disposition_v1" regardless of stored value.
+fn filter_rollback_disposition_readback(stored: &serde_json::Value) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "schema_version".to_string(),
+        serde_json::Value::String("rollback_disposition_v1".to_string()),
+    );
+    if let Some(obj) = stored.as_object() {
+        for (k, v) in obj {
+            match k.as_str() {
+                "mode" => {
+                    out.insert("mode".to_string(), v.clone());
+                }
+                "data_loss_risk" => {
+                    out.insert("data_loss_risk".to_string(), v.clone());
+                }
+                "steps" => {
+                    out.insert("steps".to_string(), v.clone());
+                }
+                // schema_version set above; all other keys stripped per rollback_disposition_v1.
+                _ => {}
+            }
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
 impl StoredRolloutContractCheck {
     pub fn operator_readback_json(&self) -> serde_json::Value {
         self.operator_readback_json_for_lane("run_report")
@@ -321,6 +351,13 @@ impl StoredRolloutContractCheck {
             }
         };
 
+        // SEC-P083-HIGH-001: filter rollback_disposition to whitelist-only fields before
+        // inserting into the readback JSON for any lane. The camelCase transformer for
+        // the GraphQL lane also whitelists, but the upstream value must be clean so that
+        // run_report, mcp, and release_receipt lanes never expose extra stored keys.
+        let safe_rollback_disposition =
+            filter_rollback_disposition_readback(&self.rollback_disposition);
+
         let readback = serde_json::json!({
             "schema_version": "operator_readback_v1",
             "authoritative_record_id": self.id.to_string(),
@@ -336,7 +373,7 @@ impl StoredRolloutContractCheck {
             "enforcement_mode": self.enforcement_mode,
             "enforcement_mode_reason": enforcement_mode_reason,
             "hold_conditions": hold_conditions,
-            "rollback_disposition": self.rollback_disposition,
+            "rollback_disposition": safe_rollback_disposition,
             "enabled_state": if self.enforcement_mode == RolloutContractEnforcementMode::Disabled {
                 "disabled"
             } else {
@@ -352,6 +389,10 @@ impl StoredRolloutContractCheck {
             "next_steps": next_steps,
             "adoption_metric": self.adoption_metric_summary_json(),
             "updated_at": self.updated_at.to_rfc3339(),
+            "rollout_contract_shutdown_deadline_config_state": "not_configured",
+            "rollout_contract_command_lease_ttl_config_state": "not_configured",
+            "p083_rollback_ttl_expires_at": serde_json::Value::Null,
+            "p083_last_preflight_hash": serde_json::Value::Null,
         });
         if source_lane == "graphql" {
             camel_case_operator_readback_json(&readback)
@@ -426,19 +467,31 @@ fn camel_case_operator_readback_json(value: &serde_json::Value) -> serde_json::V
     serde_json::Value::Object(out)
 }
 
+/// SEC-P083-HIGH-001: Only the four schema-mandated fields pass through.
+/// All other keys are stripped before GraphQL camelCase projection so that no
+/// unexpected stored fields can leak through the GraphQL readback lane.
 fn camel_case_rollback_disposition_json(value: &serde_json::Value) -> serde_json::Value {
     let Some(object) = value.as_object() else {
         return value.clone();
     };
     let mut out = serde_json::Map::new();
     for (key, value) in object {
-        out.insert(
-            match key.as_str() {
-                "data_loss_risk" => "dataLossRisk".to_string(),
-                other => other.to_string(),
-            },
-            value.clone(),
-        );
+        match key.as_str() {
+            "schema_version" => {
+                out.insert("schema_version".to_string(), value.clone());
+            }
+            "mode" => {
+                out.insert("mode".to_string(), value.clone());
+            }
+            "data_loss_risk" => {
+                out.insert("dataLossRisk".to_string(), value.clone());
+            }
+            "steps" => {
+                out.insert("steps".to_string(), value.clone());
+            }
+            // All other keys stripped — additionalProperties=false per rollback_disposition_v1.
+            _ => {}
+        }
     }
     serde_json::Value::Object(out)
 }
@@ -1345,4 +1398,187 @@ mod tests {
             .unwrap()
             .starts_with("rollout_contract_check:"));
     }
+}
+
+// ── P083 migration readback ─────────────────────────────────────────────────
+
+/// Metadata for a single P083 migration in the operator readback lane.
+/// Per migration_plan_v1: every release receipt, run_report, GraphQL, and MCP
+/// rollout readback lane exposes logical_id, filename, sha256, dependencies,
+/// applied_at, schema_version, state, and verification_query_result.
+#[derive(Debug, Serialize)]
+pub struct P083MigrationReadbackRow {
+    pub logical_id: String,
+    pub filename: String,
+    pub sha256: String,
+    pub depends_on: Vec<String>,
+    pub applied_at: Option<String>,
+    pub schema_version: String,
+    pub state: String,
+    pub verification_query_result: String,
+}
+
+/// Static descriptor for a P083 migration, used to build readback rows.
+struct P083MigrationDescriptor {
+    version: i64,
+    logical_id: &'static str,
+    filename: &'static str,
+    depends_on: &'static [&'static str],
+    verification_query: &'static str,
+}
+
+/// Per migration_plan_v1 sha256_source='migration_file_bytes': filename is the physical file on disk
+/// whose bytes are embedded by sqlx and whose SHA-256 is computed in p083_migration_sha256().
+/// Physical sqlx migration files use sequential 079-085 prefixes for ordering compatibility.
+const P083_MIGRATIONS: &[P083MigrationDescriptor] = &[
+    P083MigrationDescriptor {
+        version: 79,
+        logical_id: "p083_001_artifact_lineage_report_kind",
+        filename: "control-plane/crates/db/migrations/087_p083_001_artifact_lineage_report_kind.sql",
+        depends_on: &[],
+        verification_query: "SELECT artifact_id FROM artifact_lineage WHERE artifact_role = 'report' AND active = 1 AND (report_kind IS NULL OR report_kind NOT IN ('proposal_current','proposal_revision_summary','proposal_feedback_coverage','review_summary','run_report','release_receipt','evidence_pack'));",
+    },
+    P083MigrationDescriptor {
+        version: 80,
+        logical_id: "p083_002_command_idempotency_generations",
+        filename: "control-plane/crates/db/migrations/088_p083_002_command_idempotency_generations.sql",
+        depends_on: &["p083_001_artifact_lineage_report_kind"],
+        verification_query: "SELECT principal_id, request_id, lease_generation, COUNT(*) FROM command_idempotency GROUP BY principal_id, request_id, lease_generation HAVING COUNT(*) > 1;",
+    },
+    P083MigrationDescriptor {
+        version: 81,
+        logical_id: "p083_003_shutdown_receipts_and_signals",
+        filename: "control-plane/crates/db/migrations/089_p083_003_shutdown_receipts_and_signals.sql",
+        depends_on: &["p083_002_command_idempotency_generations"],
+        verification_query: "SELECT receipt_id FROM shutdown_interrupted_receipts WHERE (interrupted_state = 'queued_no_signal' AND queue_rank IS NULL) OR (interrupted_state <> 'queued_no_signal' AND queue_rank IS NOT NULL);",
+    },
+    P083MigrationDescriptor {
+        version: 82,
+        logical_id: "p083_004_cancel_late_output_overflow",
+        filename: "control-plane/crates/db/migrations/090_p083_004_cancel_late_output_overflow.sql",
+        depends_on: &["p083_003_shutdown_receipts_and_signals"],
+        verification_query: "SELECT scope, normalized_run_id, normalized_provider_session_id, cancellation_epoch, overflow_kind, COUNT(*) FROM cancel_late_output_overflow GROUP BY scope, normalized_run_id, normalized_provider_session_id, cancellation_epoch, overflow_kind HAVING COUNT(*) > 1;",
+    },
+    P083MigrationDescriptor {
+        version: 83,
+        logical_id: "p083_005_enforcement_and_rollback",
+        filename: "control-plane/crates/db/migrations/091_p083_005_enforcement_and_rollback.sql",
+        depends_on: &["p083_004_cancel_late_output_overflow"],
+        verification_query: "SELECT COUNT(*) FROM p083_enforcement_mode_transition_journal WHERE transition_state = 'transitioning' AND commit_marker IS NOT NULL;",
+    },
+    P083MigrationDescriptor {
+        version: 84,
+        logical_id: "p083_006_durable_monotonic_clock",
+        filename: "control-plane/crates/db/migrations/092_p083_006_durable_monotonic_clock.sql",
+        depends_on: &["p083_005_enforcement_and_rollback"],
+        verification_query: "SELECT COUNT(*) FROM durable_monotonic_clock_samples WHERE sample_state = 'baseline';",
+    },
+    P083MigrationDescriptor {
+        version: 85,
+        logical_id: "p083_007_provider_cancellation_intent_and_process_fate",
+        filename: "control-plane/crates/db/migrations/093_p083_007_provider_cancellation_intent_and_process_fate.sql",
+        depends_on: &["p083_006_durable_monotonic_clock"],
+        verification_query: "SELECT provider_session_id FROM provider_cancellation_intents WHERE intent_state IN ('shutdown_started','settled') AND shutdown_epoch IS NULL;",
+    },
+    P083MigrationDescriptor {
+        version: 86,
+        logical_id: "p083_008_signal_dispatching_state",
+        filename: "control-plane/crates/db/migrations/094_p083_008_signal_dispatching_state.sql",
+        depends_on: &["p083_007_provider_cancellation_intent_and_process_fate"],
+        verification_query: "SELECT COUNT(*) FROM shutdown_signal_side_effects WHERE intent_state NOT IN ('planned','dispatching','issued','observed','suppressed','identity_mismatch');",
+    },
+];
+
+/// Compute SHA-256 of the embedded migration SQL bytes for a given version.
+/// Returns a hex string, or "sha256_unavailable" if the migration is not found.
+fn p083_migration_sha256(version: i64) -> String {
+    use crate::migrate::MIGRATOR;
+    if let Some(m) = MIGRATOR.iter().find(|m| m.version == version) {
+        let sql_bytes = m.sql.as_bytes();
+        let mut hasher = Sha256::new();
+        hasher.update(sql_bytes);
+        format!("{:x}", hasher.finalize())
+    } else {
+        "sha256_unavailable".to_string()
+    }
+}
+
+/// Query the P083 migration readback rows from the database.
+///
+/// Returns one row per P083 migration with logical_id, filename, sha256 (of embedded SQL),
+/// dependencies, applied_at, state, and verification_query_result.
+/// Per migration_plan_v1: sha256_source = migration_file_bytes; we compute the hash from
+/// the embedded SQL at compile-time (same bytes as migration file at compile time).
+pub async fn p083_migration_readback(pool: &SqlitePool) -> Result<Vec<P083MigrationReadbackRow>> {
+    // Query applied migration versions from _sqlx_migrations.
+    let applied_rows = sqlx::query(
+        "SELECT version, installed_on FROM _sqlx_migrations WHERE success = 1 ORDER BY version",
+    )
+    .fetch_all(pool)
+    .await
+    .context("query _sqlx_migrations for P083 readback")?;
+
+    let applied_map: std::collections::HashMap<i64, String> = applied_rows
+        .into_iter()
+        .map(|r| {
+            let version: i64 = r.get("version");
+            let installed_on: String = r.get("installed_on");
+            (version, installed_on)
+        })
+        .collect();
+
+    let mut rows = Vec::with_capacity(P083_MIGRATIONS.len());
+    for desc in P083_MIGRATIONS {
+        let sha256 = p083_migration_sha256(desc.version);
+        let (state, applied_at, verification_result) =
+            if let Some(installed_on) = applied_map.get(&desc.version) {
+                // Run the verification query and capture the result.
+                // COUNT(*) queries always return one row containing a scalar integer;
+                // report "count:N" so callers can distinguish zero-count from zero-rows.
+                let is_count_query = desc
+                    .verification_query
+                    .trim_start()
+                    .to_ascii_uppercase()
+                    .starts_with("SELECT COUNT(*)");
+                let vq_result = if is_count_query {
+                    match sqlx::query(desc.verification_query).fetch_one(pool).await {
+                        Ok(row) => {
+                            let n: i64 = row.try_get(0).unwrap_or(0);
+                            if n == 0 {
+                                "zero_rows".to_string()
+                            } else {
+                                format!("count:{n}")
+                            }
+                        }
+                        Err(e) => format!("query_error:{e}"),
+                    }
+                } else {
+                    match sqlx::query(desc.verification_query).fetch_all(pool).await {
+                        Ok(vq_rows) => {
+                            if vq_rows.is_empty() {
+                                "zero_rows".to_string()
+                            } else {
+                                format!("{}_rows", vq_rows.len())
+                            }
+                        }
+                        Err(e) => format!("query_error:{e}"),
+                    }
+                };
+                ("applied".to_string(), Some(installed_on.clone()), vq_result)
+            } else {
+                ("pending".to_string(), None, "not_run".to_string())
+            };
+
+        rows.push(P083MigrationReadbackRow {
+            logical_id: desc.logical_id.to_string(),
+            filename: desc.filename.to_string(),
+            sha256,
+            depends_on: desc.depends_on.iter().map(|s| s.to_string()).collect(),
+            applied_at,
+            schema_version: "migration_plan_v1".to_string(),
+            state,
+            verification_query_result: verification_result,
+        });
+    }
+    Ok(rows)
 }

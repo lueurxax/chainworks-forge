@@ -23,6 +23,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "type": "object",
                 "properties": {}
             }),
+            output_schema: None,
         },
         boundary_runtime_tool_spec(),
         McpTool {
@@ -33,6 +34,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "type": "object",
                 "properties": {}
             }),
+            output_schema: None,
         },
     ]
 }
@@ -46,6 +48,7 @@ pub fn boundary_runtime_tool_spec() -> McpTool {
             "type": "object",
             "properties": {}
         }),
+        output_schema: None,
     }
 }
 

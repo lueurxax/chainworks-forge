@@ -1,0 +1,15 @@
+{
+  "fixture_id": "rollback-disposition-missing-schema-version-rejected",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "rollback_disposition_json_v1",
+  "description": "validate_rollback_disposition_v1 rejects a disposition object that lacks schema_version.",
+  "input": {
+    "mode": "p083.rollback_execution_to_permissive_or_disabled",
+    "data_loss_risk": "none",
+    "steps": ["Call p083RollbackExecution with operator principal class and CallerRequestId."]
+  },
+  "expected_outcome": "reject",
+  "expected_error": "rollback_disposition_v1 missing required field: schema_version",
+  "validation_point": "validate_rollback_disposition_v1 before GraphQL serialization"
+}
