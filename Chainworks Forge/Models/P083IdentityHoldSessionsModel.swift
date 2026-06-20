@@ -18,7 +18,7 @@ final class P083IdentityHoldSessionsModel: ObservableObject {
     private var fetchTask: Task<Void, Never>?
     private var currentRunID: String?
 
-    nonisolated init(endpoint: DaemonClientEndpoint) {
+    init(endpoint: DaemonClientEndpoint) {
         let transport = P031URLSessionGraphQLReadTransport(endpoint: endpoint)
         self.readClient = P031GraphQLReadClient(transport: transport)
     }

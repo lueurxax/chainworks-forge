@@ -1,7 +1,7 @@
 {
   "fixture_id": "p079-v1-single-flight-uniqueness",
   "description": "Asserts the single-flight lease guarantee: a deterministic composite lease_key (hash of run_id + stage_execution_id + parent_agent_execution_id + schema_version + frozen_fallback_policy_hash + lease_kind) prevents duplicate repair/fallback dispatch for the same invocation.",
-  "migration": "079_p079_output_contract_repair.sql",
+  "migration": "095_p079_output_contract_repair.sql",
   "guarantee": "single-flight dispatch via PRIMARY KEY on lease_key",
   "key_derivation": {
     "inputs": ["run_id", "stage_execution_id", "parent_agent_execution_id", "schema_version", "frozen_fallback_policy_hash", "lease_kind"],

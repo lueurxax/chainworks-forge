@@ -1,7 +1,7 @@
 {
   "fixture_id": "p079-v1-feature-disabled-rowset",
   "description": "Verifies behavior when feature flags are not present in the policy. Runs executed without CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED should produce status=skipped rows (not be absent), so operators can see that repair was evaluated but not engaged.",
-  "migration": "079_p079_output_contract_repair.sql",
+  "migration": "095_p079_output_contract_repair.sql",
   "scenario": "feature_flag_disabled",
   "given": {
     "policy_feature_flags": [],

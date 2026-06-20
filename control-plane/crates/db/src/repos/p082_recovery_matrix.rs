@@ -790,16 +790,16 @@ pub async fn readbacks_for_run(
         push_valid_projected_readback(&mut readbacks, readback);
     }
 
-    // Source 7: session_events.details_json.p082_recovery_matrix_readback (R04 repaired).
+    // Source 7: session_events.details_json.p082_recovery_matrix_readback (R04 repaired / R17 late-output settlement).
     let repaired_session_owner_rows = sqlx::query(
         r#"SELECT se.details_json, se.recorded_at
            FROM session_events se
            INNER JOIN session_lineages sl ON sl.id = se.lineage_id
-	           WHERE sl.run_id = ?1
-	             AND se.details_json IS NOT NULL
-	             AND LENGTH(se.details_json) <= ?2
-	             AND json_valid(se.details_json)
-	             AND json_extract(se.details_json, '$.p082_recovery_matrix_readback.scenario_id') = 'P082-R04'
+		           WHERE sl.run_id = ?1
+		             AND se.details_json IS NOT NULL
+		             AND LENGTH(se.details_json) <= ?2
+		             AND json_valid(se.details_json)
+		             AND json_extract(se.details_json, '$.p082_recovery_matrix_readback.scenario_id') IN ('P082-R04', 'P082-R17')
            ORDER BY se.recorded_at ASC
            LIMIT ?3"#,
     )

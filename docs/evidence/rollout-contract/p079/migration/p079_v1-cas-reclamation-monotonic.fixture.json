@@ -1,7 +1,7 @@
 {
   "fixture_id": "p079-v1-cas-reclamation-monotonic",
   "description": "Asserts CAS (compare-and-swap) reclamation semantics for expired leases. The 'version' column must increment monotonically on each reclamation attempt; a sweep that reads version=N must supply version=N in its UPDATE WHERE version=N to succeed. Stale sweeps (version mismatch) must fail silently (rows_affected=0).",
-  "migration": "079_p079_output_contract_repair.sql",
+  "migration": "095_p079_output_contract_repair.sql",
   "cas_column": "version INTEGER NOT NULL DEFAULT 0",
   "reclamation_states": ["reserved_ttl_expired", "prompt_sent_ttl_expired"],
   "scenarios": [

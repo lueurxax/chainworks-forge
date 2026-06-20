@@ -1,7 +1,7 @@
 {
   "fixture_id": "p079-v1-rollback-readback-preserved",
   "description": "Migration 079 is non-destructive. If migration 079 is rolled back (tables dropped), existing run and agent_execution rows must remain intact and readable. GraphQL/MCP surfaces return null for output_contract_repair. Swift DTO decodes as nil.",
-  "migration": "079_p079_output_contract_repair.sql",
+  "migration": "095_p079_output_contract_repair.sql",
   "scenario": "migration_rollback_safety",
   "rollback_operations": [
     "DROP INDEX IF EXISTS idx_ocre_run_id",

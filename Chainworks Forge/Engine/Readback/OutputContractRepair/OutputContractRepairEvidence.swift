@@ -742,7 +742,7 @@ extension OutputContractRepairEvidence: Identifiable {
 extension OutputContractRepairStatus {
     /// Normative projection from status to presentation category.
     /// For unknownDiagnostic, the raw string is propagated to the category for inspector forensics.
-    var presentationCategory: PresentationCategory {
+    nonisolated var presentationCategory: PresentationCategory {
         switch self {
         case .notAttempted: return .informational
         case .inProgress: return .informational

@@ -1,7 +1,7 @@
 {
   "fixture_id": "p079-v1-old-run-rowset",
   "description": "Verifies that runs created before migration 079 have no rows in output_contract_repair_events and that reads return nil without error (forward-compatibility: pre-P079 runs decode as nil in Swift DTO).",
-  "migration": "079_p079_output_contract_repair.sql",
+  "migration": "095_p079_output_contract_repair.sql",
   "scenario": "old_run_no_p079_events",
   "given": {
     "run_id": "run-pre-p079-001",

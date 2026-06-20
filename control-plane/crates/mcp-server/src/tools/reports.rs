@@ -217,14 +217,22 @@ pub async fn execute(
                 .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
                 .parse()?;
 
+            let p082_readbacks =
+                p082_recovery_matrix_readbacks_json(pool, run_id, &principal.class, "reports.get")
+                    .await?;
             let all_artifacts = artifacts::list_by_run(pool, run_id).await?;
             let rollout_contract_readback = rollout_contract_readback_json(pool, run_id).await?;
             let mut reports = Vec::new();
             for artifact in all_artifacts.into_iter() {
                 if artifact.report_kind.is_some() || is_release_report_artifact(&artifact.name) {
                     reports.push(
-                        artifact_report_json(pool, &artifact, Some(&rollout_contract_readback))
-                            .await?,
+                        artifact_report_json(
+                            pool,
+                            &artifact,
+                            Some(&rollout_contract_readback),
+                            &principal.class,
+                        )
+                        .await?,
                     );
                 }
             }
@@ -264,6 +272,7 @@ pub async fn execute(
                 "implementation_handoff_status": implementation_handoff_status_json(pool, run_id).await?,
                 "implementation_self_assessment_summary": implementation_self_assessment_summary_json(pool, run_id).await?,
                 "rollout_contract_readback": rollout_contract_readback,
+                "p082_recovery_matrix_readbacks": p082_readbacks,
                 // P080: top-level reconciliation section per proposal §8.1 placement.
                 "p080_reconciliation": db::repos::p080::p080_run_report_section_for_report(pool, &run_id.to_string()).await,
                 "implementation_closeout_readiness_summary": closeout_readiness_summary.clone(),
@@ -305,7 +314,10 @@ pub async fn execute(
                 }));
             }
 
-            Ok(serde_json::Value::Array(reports))
+            Ok(serde_json::json!({
+                "reports": reports,
+                "p082_recovery_matrix_readbacks": p082_readbacks,
+            }))
         }
 
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
@@ -1571,6 +1583,7 @@ pub(crate) async fn artifact_report_json(
     pool: &SqlitePool,
     artifact: &Artifact,
     rollout_contract_readback: Option<&serde_json::Value>,
+    principal_class: &auth::PrincipalClass,
 ) -> Result<serde_json::Value> {
     let mut value = serde_json::to_value(artifact)?;
     if let serde_json::Value::Object(ref mut map) = value {
@@ -1590,6 +1603,22 @@ pub(crate) async fn artifact_report_json(
                 None => rollout_contract_readback_json(pool, artifact.run_id).await?,
             };
             map.insert("rollout_contract_readback".to_string(), readback);
+            let p082_lane = if is_release_report_artifact(&artifact.name) {
+                "release_receipt"
+            } else {
+                "run_report"
+            };
+            // P082 gate anchor: p082_recovery_matrix_readbacks_json(pool, artifact.run_id, principal_class
+            map.insert(
+                "p082_recovery_matrix_readbacks".to_string(),
+                p082_recovery_matrix_readbacks_json(
+                    pool,
+                    artifact.run_id,
+                    principal_class,
+                    p082_lane,
+                )
+                .await?,
+            );
         }
     }
 

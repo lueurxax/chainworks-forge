@@ -253,7 +253,7 @@ pub enum LeaseSettledResult {
 }
 
 /// Full reclamation reason vocabulary per approved proposal.
-/// Matches the CHECK constraint in migrations/079_p079_output_contract_repair.sql.
+/// Matches the CHECK constraint in migrations/095_p079_output_contract_repair.sql.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LeaseReclamationReason {

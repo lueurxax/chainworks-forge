@@ -1937,7 +1937,10 @@ async fn test_cancel_run_marks_active_continuations_cancelling() {
     let handler = make_command_handler(pool.clone());
     handler
         .handle(
-            Command::CancelRun(domain::commands::CancelRunCmd { run_id }),
+            Command::CancelRun(domain::commands::CancelRunCmd {
+                run_id,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
+            }),
             CallerContext::test_fixture(),
         )
         .await
@@ -4304,6 +4307,7 @@ async fn p082_retry_agent_execution_stale_rejection_writes_valid_r08_readback() 
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -4784,6 +4788,7 @@ async fn p082_retry_stage_rejects_stage_execution_uuid_stage_id_before_mutation(
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -4899,6 +4904,7 @@ async fn p082_retry_stage_rejects_stage_execution_uuid_agent_execution_id_before
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -5709,6 +5715,7 @@ async fn test_retry_stage_on_blocked_implementation_review_targets_single_failed
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -5873,6 +5880,7 @@ async fn test_retry_stage_on_blocked_review_stage_retries_only_failed_reviewer()
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -7383,6 +7391,7 @@ async fn retry_stage_rejects_cancelled_run_even_when_stage_is_blocked() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -18428,6 +18437,7 @@ async fn p082_retry_agent_execution_side_effect_rejection_increments_mutation_re
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )

@@ -650,7 +650,10 @@ fn allowed_json_source_keys(
                 Some(&[SOURCE_KEY_COMMAND_JOURNAL_ERROR])
             }
         }
-        "P082-R03" | "P082-R17" => Some(&[SOURCE_KEY_STAGE_EXECUTIONS_RECOVERY_SNAPSHOT]),
+        "P082-R03" | "P082-R17" => Some(&[
+            SOURCE_KEY_STAGE_EXECUTIONS_RECOVERY_SNAPSHOT,
+            SOURCE_KEY_SESSION_EVENTS_DETAILS,
+        ]),
         "P082-R04" => Some(&[SOURCE_KEY_SESSION_EVENTS_DETAILS]),
         "P082-R05" => Some(&[SOURCE_KEY_WORK_ITEMS_STARTUP_RECOVERY]),
         "P082-R06" => Some(&[

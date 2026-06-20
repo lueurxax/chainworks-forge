@@ -14261,6 +14261,63 @@ You are continuing the same Chainworks agent execution through an existing live 
         Ok(artifacts_out)
     }
 
+    pub async fn p082_import_declared_contract_outputs_for_regression(
+        &self,
+        declared_outputs: &[DeclaredOutput],
+        captured_outputs: &[CapturedOutput],
+        workspace_root: &str,
+        run_id: RunId,
+        stage_id: &str,
+        agent_id: &str,
+        provider: &str,
+        model: Option<&str>,
+        stage_execution_id: domain::ids::StageExecutionId,
+        agent_exec_id: domain::ids::AgentExecutionId,
+        work_item_id: &str,
+        artifact_claim_key: &ArtifactSourceGenerationClaimKey,
+        session_generation_id: Option<&str>,
+        result_status: AgentStatus,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let mut persisted_paths = std::collections::HashSet::new();
+        let declared_artifacts = self.prepare_declared_output_artifacts(
+            declared_outputs,
+            None,
+            workspace_root,
+            run_id,
+            stage_id,
+            agent_id,
+            provider,
+            model.map(str::to_string),
+            completed_at,
+            &mut persisted_paths,
+        )?;
+
+        self.import_declared_contract_outputs(
+            declared_outputs,
+            captured_outputs,
+            &declared_artifacts,
+            &declared_artifacts,
+            stage_execution_id,
+            agent_exec_id,
+            work_item_id,
+            artifact_claim_key,
+            session_generation_id,
+            result_status,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &workflow::plan::DegradedOutputPolicy::default(),
+            None,
+            false,
+            completed_at,
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn import_declared_contract_outputs(
         &self,
         declared_outputs: &[DeclaredOutput],
@@ -14467,7 +14524,7 @@ You are continuing the same Chainworks agent execution through an existing live 
         let mut projection_dirty = false;
         // P083: track late-output overflow for cancel_late_output_overflow latch.
         let mut late_outputs_ignored: i64 = 0;
-        let mut late_output_bytes: i64 = 0;
+        let mut _late_output_bytes: i64 = 0;
         for prepared_import in prepared_imports {
             let (decision, output_bytes_if_late) = match prepared_import {
                 PreparedDeclaredContractImport::RunStateAdvisory(generation_input) => {
@@ -14507,7 +14564,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                 // dirty the active projection. The latch is written inside this tx below
                 // so active-projection mutations are strictly rejected as an invariant.
                 late_outputs_ignored += 1;
-                late_output_bytes += output_bytes_if_late;
+                _late_output_bytes += output_bytes_if_late;
             } else {
                 projection_dirty = true;
             }
@@ -14547,14 +14604,104 @@ You are continuing the same Chainworks agent execution through an existing live 
                 runtime_receipt_record_from_receipt(agent_exec_id, runtime_receipt, completed_at)?;
             agent_execution_runtime_receipts::upsert_tx(&mut tx, &receipt_record).await?;
         }
+        let ignored_late_outputs = late_outputs_ignored > 0;
+        if ignored_late_outputs {
+            runtime_facts.output_settlement = AgentOutputSettlement::IgnoredLateOutputs;
+            runtime_facts.valid_required_outputs = false;
+            runtime_facts.failure_kind = None;
+            runtime_facts.operator_action_hint = None;
+            runtime_facts.supervision_classification =
+                Some("cancelled_provider_late_output_ignored".to_string());
+            work_items::fail_tx(
+                &mut tx,
+                work_item_id,
+                "ignored_late_outputs: source output arrived after claim supersession/cancellation",
+                completed_at,
+            )
+            .await?;
+            if let Some(session_generation_id) = session_generation_id {
+                if let Some(generation) =
+                    sessions::find_generation_by_id_tx(&mut tx, session_generation_id).await?
+                {
+                    let active_session_generation_id = sqlx::query_scalar::<_, Option<String>>(
+                        r#"SELECT active_generation_id
+                           FROM session_lineages
+                           WHERE id = ?1"#,
+                    )
+                    .bind(&generation.lineage_id)
+                    .fetch_one(&mut **tx)
+                    .await
+                    .context("load active session generation for R17 readback")?
+                    .unwrap_or_default();
+                    sessions::end_generation_tx(
+                        &mut tx,
+                        session_generation_id,
+                        domain::session::SessionGenerationStatus::Closed,
+                        "ignored_late_outputs",
+                        completed_at,
+                    )
+                    .await?;
+                    let settlement = domain::recovery_matrix::build_late_output_settlement(
+                        &agent_exec_id.to_string(),
+                        work_item_id,
+                        session_generation_id,
+                        &active_session_generation_id,
+                        "closed",
+                        "ignored",
+                        late_outputs_ignored,
+                        "failed",
+                        result_status == AgentStatus::Cancelled,
+                    );
+                    let readback = domain::recovery_matrix::set_readback_late_output_settlement(
+                        domain::recovery_matrix::build_readback_v1(
+                            "P082-R17",
+                            "repaired",
+                            "cancel",
+                            domain::recovery_matrix::REASON_CANCELLED_PROVIDER_LATE_OUTPUT_IGNORED,
+                            "Cancelled provider output ignored; source work item terminalized and active projection left unchanged.",
+                            "artifact_contract_generations, agent_execution_runtime_facts, work_items, session_generations, session_events",
+                            "artifact_contracts, agent_execution_runtime_facts, work_items, sessions",
+                            work_item_id,
+                            Some("session_events.details_json.p082_recovery_matrix_readback"),
+                            "valid",
+                            &completed_at.to_rfc3339(),
+                        ),
+                        settlement,
+                    );
+                    sessions::insert_event_tx(
+                        &mut tx,
+                        &domain::session::SessionEvent {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            lineage_id: generation.lineage_id,
+                            generation_id: session_generation_id.to_string(),
+                            event_type: domain::session::SessionEventType::Closed,
+                            recorded_at: completed_at,
+                            details_json: Some(
+                                serde_json::json!({
+                                    "reason": "ignored_late_outputs",
+                                    "agent_execution_id": agent_exec_id.to_string(),
+                                    "source_work_item_id": work_item_id,
+                                    "p082_recovery_matrix_readback": readback,
+                                })
+                                .to_string(),
+                            ),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
         agent_execution_runtime_facts::upsert_tx(&mut tx, &runtime_facts).await?;
-        let invalidated_session_after_missing_outputs =
+        let invalidated_session_after_missing_outputs = if ignored_late_outputs {
+            false
+        } else {
             invalidate_generation_after_missing_required_outputs_tx(
                 &mut tx,
                 session_generation_id,
                 &runtime_facts,
             )
-            .await?;
+            .await?
+        };
         artifact_contracts::close_source_generation_claim_tx(&mut tx, artifact_claim_key).await?;
         tx.commit().await?;
         db::pool::log_write_transaction("executor.import_declared_outputs", tx_started);

@@ -23,6 +23,7 @@ pub struct McpServer {
     pool: SqlitePool,
     cmd_handler: Arc<CommandHandler>,
     pub principal_table: auth::PrincipalTable,
+    live_principal_source: auth::LivePrincipalSource,
     events: Option<EventSender>,
     storage_writer_heartbeat: Option<Arc<DbWriterHeartbeat>>,
     // P081 Phase 3: shared immutable boundary policy service injected at daemon startup.
@@ -139,6 +140,7 @@ impl McpServer {
         Self {
             pool,
             cmd_handler,
+            live_principal_source: auth::LivePrincipalSource::new(principal_table.clone()),
             principal_table,
             events: None,
             storage_writer_heartbeat: None,
@@ -155,6 +157,7 @@ impl McpServer {
         Self {
             pool,
             cmd_handler,
+            live_principal_source: auth::LivePrincipalSource::new(principal_table.clone()),
             principal_table,
             events: None,
             storage_writer_heartbeat: Some(storage_writer_heartbeat),
@@ -172,6 +175,7 @@ impl McpServer {
         Self {
             pool,
             cmd_handler,
+            live_principal_source: auth::LivePrincipalSource::new(principal_table.clone()),
             principal_table,
             events: None,
             storage_writer_heartbeat: Some(storage_writer_heartbeat),
@@ -188,6 +192,7 @@ impl McpServer {
         Self {
             pool,
             cmd_handler,
+            live_principal_source: auth::LivePrincipalSource::new(principal_table.clone()),
             principal_table,
             events: Some(events),
             storage_writer_heartbeat: None,
@@ -203,7 +208,11 @@ impl McpServer {
     }
 
     pub fn resolve_current_bearer(&self, token: &str) -> Result<auth::Principal, auth::AuthError> {
-        auth::resolve_bearer(token, &self.principal_table)
+        self.live_principal_source.resolve_bearer(token)
+    }
+
+    pub fn live_principal_source(&self) -> auth::LivePrincipalSource {
+        self.live_principal_source.clone()
     }
 
     pub async fn run_stdio(&self) -> Result<()> {
@@ -360,7 +369,7 @@ impl McpServer {
                         )
                         .await;
                     }
-                    Some(t) => match auth::resolve_bearer(t, &self.principal_table) {
+                    Some(t) => match self.resolve_current_bearer(t) {
                         Ok(p) => {
                             let is_operator = matches!(p.class, auth::PrincipalClass::Operator);
                             session_principal = Some(p);
@@ -1456,6 +1465,7 @@ impl McpServer {
                         &self.pool,
                         artifact,
                         Some(&run_report_rollout_readback),
+                        &principal.class,
                     )
                     .await?,
                 );
@@ -1473,6 +1483,14 @@ impl McpServer {
                 tools::reports::retry_authority_current_json(&self.pool, run_id_parsed).await?;
             let p091_orphan_repair_readback =
                 tools::reports::p091_orphan_repair_readback_json(&self.pool, run_id_parsed).await?;
+            let p082_recovery_matrix_readbacks =
+                tools::reports::p082_recovery_matrix_readbacks_json(
+                    &self.pool,
+                    run_id_parsed,
+                    &principal.class,
+                    "report_resource",
+                )
+                .await?;
 
             return Ok(serde_json::json!({
                 "run_id": run_id,
@@ -1494,6 +1512,7 @@ impl McpServer {
                 "retryAuthority": retry_authority,
                 "retryAuthorityHistory": retry_authority_history,
                 "p091OrphanRepairReadback": p091_orphan_repair_readback,
+                "p082_recovery_matrix_readbacks": p082_recovery_matrix_readbacks,
                 "implementation_self_assessment_summary": tools::reports::implementation_self_assessment_summary_json(&self.pool, run_id_parsed).await?,
                 "rollout_contract_readback": mcp_rollout_readback,
                 "implementation_closeout_readiness_summary": closeout_readiness_summary.clone(),
@@ -2977,7 +2996,7 @@ mod tests {
     use db::pool::create_pool;
     use db::repos::{
         artifact_contracts, artifacts, audit_log, command_journal, ideas, projections,
-        rollout_contract_checks, runs, steward, validation,
+        rollout_contract_checks, runs, startup_repairs, steward, validation,
     };
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
@@ -3194,6 +3213,64 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    async fn persist_p082_startup_repair_readback(
+        pool: &sqlx::SqlitePool,
+        run_id: domain::ids::RunId,
+    ) -> serde_json::Value {
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let startup_repair_id = format!("p082-startup-repair-{run_id}");
+        let summary = domain::recovery_matrix::build_startup_repair_summary(
+            &startup_repair_id,
+            "work-item-p082",
+            "command-journal-p082",
+            1,
+            1,
+            false,
+            60_000,
+            &now_str,
+            false,
+            None,
+            "run",
+        );
+        let readback = domain::recovery_matrix::set_readback_startup_repair(
+            domain::recovery_matrix::build_readback_v1(
+                "P082-R01",
+                "repaired",
+                "retry",
+                domain::recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+                "Continue from the startup repair requeue.",
+                "startup_repairs",
+                "startup_repairs",
+                &startup_repair_id,
+                Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+                "valid",
+                &now_str,
+            ),
+            summary,
+            Some("Startup repair requeued work once under P082 policy."),
+        );
+        assert!(
+            domain::recovery_matrix::validate_readback_v1_shape(&readback),
+            "test fixture must persist a valid P082 readback"
+        );
+        let notes = serde_json::json!({
+            "p082_recovery_matrix_readback": readback.clone(),
+        })
+        .to_string();
+        startup_repairs::record(
+            pool,
+            &startup_repair_id,
+            &run_id.to_string(),
+            "startup_requeue_once",
+            now,
+            Some(&notes),
+        )
+        .await
+        .unwrap();
+        readback
     }
 
     async fn test_pool() -> sqlx::SqlitePool {
@@ -3433,6 +3510,126 @@ mod tests {
         assert_eq!(
             run["rollout_contract_readback"]["backend_decision"],
             serde_json::json!("hold")
+        );
+    }
+
+    #[tokio::test]
+    async fn p082_report_resource_includes_plural_readbacks_not_singular() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let expected = persist_p082_startup_repair_readback(&pool, run_id).await;
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let value = server
+            .read_resource(&format!("report://{}", run_id))
+            .await
+            .unwrap();
+        let report = value.as_object().expect("report object");
+
+        assert!(
+            report.contains_key("p082_recovery_matrix_readbacks"),
+            "report:// must expose the plural P082 readback lane"
+        );
+        assert!(
+            !report.contains_key("p082_recovery_matrix_readback"),
+            "report:// must not expose the legacy singular P082 field"
+        );
+        assert_eq!(
+            report["p082_recovery_matrix_readbacks"][0]["source_identifier"],
+            expected["source_identifier"]
+        );
+    }
+
+    #[tokio::test]
+    async fn p082_report_resource_non_empty_readbacks_when_startup_repair_exists() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        persist_p082_startup_repair_readback(&pool, run_id).await;
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let value = server
+            .read_resource(&format!("report://{}", run_id))
+            .await
+            .unwrap();
+        let readbacks = value["p082_recovery_matrix_readbacks"]
+            .as_array()
+            .expect("P082 readbacks array");
+
+        assert!(
+            readbacks
+                .iter()
+                .any(|readback| readback["scenario_id"] == serde_json::json!("P082-R01")),
+            "report:// must surface startup-repair P082 readbacks for operators"
+        );
+    }
+
+    #[tokio::test]
+    async fn p082_report_resource_run_report_artifact_empty_for_non_operator() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        persist_p082_startup_repair_readback(&pool, run_id).await;
+        let artifact = Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "state_9_implementation_reviewed".into(),
+            agent_id: "implementation_auditor".into(),
+            name: "run_report".into(),
+            contract_id: "run_report".into(),
+            format: ArtifactFormat::Json,
+            file_path: "/tmp/p082-run-report.json".into(),
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: "system".into(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: false,
+            report_kind: Some("run_report".into()),
+            report_version: Some(1),
+            agent_execution_id: None,
+        };
+
+        let value = tools::reports::artifact_report_json(
+            &pool,
+            &artifact,
+            Some(&serde_json::json!({"schema_version": "operator_readback_v1"})),
+            &auth::PrincipalClass::Agent,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            value["p082_recovery_matrix_readbacks"],
+            serde_json::json!([]),
+            "non-Operator run_report artifact lane must not expose P082 operator readbacks"
         );
     }
 

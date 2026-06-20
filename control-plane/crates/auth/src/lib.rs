@@ -339,6 +339,10 @@ impl LivePrincipalSource {
         }
     }
 
+    pub fn update(&self, table: PrincipalTable) {
+        self.replace(table);
+    }
+
     pub fn resolve_bearer(&self, token: &str) -> Result<Principal, AuthError> {
         self.table
             .read()
@@ -376,6 +380,35 @@ impl PrincipalTable {
             entry.id = id.into();
         }
         table
+    }
+
+    pub fn test_fixture_with_class(
+        token: impl Into<String>,
+        id: impl Into<String>,
+        class: PrincipalClass,
+    ) -> Self {
+        PrincipalTable {
+            entries: vec![PrincipalEntry {
+                token: token.into(),
+                id: id.into(),
+                class,
+                surface_policies: None,
+                ..Default::default()
+            }],
+        }
+    }
+
+    pub fn test_fixture_disabled_token(token: impl Into<String>, id: impl Into<String>) -> Self {
+        PrincipalTable {
+            entries: vec![PrincipalEntry {
+                token: token.into(),
+                id: id.into(),
+                class: PrincipalClass::Operator,
+                disabled: Some(true),
+                surface_policies: None,
+                ..Default::default()
+            }],
+        }
     }
 
     /// Observer-class fixture for cross-crate tests that need a non-operator token.
@@ -3303,5 +3336,45 @@ mod tests {
         );
         assert!(check_p080_run_scope(&p, Some("run-abc-123")).is_ok());
         assert!(check_p080_run_scope(&p, Some("run-other")).is_err());
+    }
+
+    #[test]
+    fn live_principal_source_revalidates_revoked_disabled_and_rescoped_credentials() {
+        let token = "live-reload-token-xxxxxxxxxxxxxxx";
+        let source = LivePrincipalSource::new(PrincipalTable::test_fixture_with_class(
+            token,
+            "live-operator",
+            PrincipalClass::Operator,
+        ));
+
+        let initial = source.resolve_bearer(token).expect("initial token");
+        assert_eq!(initial.class, PrincipalClass::Operator);
+
+        source.update(PrincipalTable { entries: vec![] });
+        assert!(
+            matches!(source.resolve_bearer(token), Err(AuthError::UnknownToken)),
+            "revoked token must be rejected after live reload"
+        );
+
+        source.update(PrincipalTable::test_fixture_disabled_token(
+            token,
+            "disabled-operator",
+        ));
+        assert!(
+            matches!(source.resolve_bearer(token), Err(AuthError::UnknownToken)),
+            "disabled token must be rejected after live reload"
+        );
+
+        source.update(PrincipalTable::test_fixture_with_class(
+            token,
+            "rescoped-agent",
+            PrincipalClass::Agent,
+        ));
+        let rescoped = source.resolve_bearer(token).expect("rescoped token");
+        assert_eq!(rescoped.class, PrincipalClass::Agent);
+        assert!(
+            !is_tool_allowed(&rescoped, "approvals.resolve"),
+            "re-scoped bearer must not retain stale Operator privileges after live reload"
+        );
     }
 }

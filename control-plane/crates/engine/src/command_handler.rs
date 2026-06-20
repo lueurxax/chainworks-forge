@@ -42,7 +42,7 @@ use domain::commands::{
 };
 use domain::discovery::{LegacyBroadDiscoveryPolicy, LegacyDiscoveryOverrideInput};
 use domain::events::DomainEvent;
-use domain::ids::{ApprovalId, RunId};
+use domain::ids::{ApprovalId, RunId, StageExecutionId};
 use domain::proposal_gate_result::{
     ProposalGateFailureClassification, ProposalGateLineage, ProposalGateResult, ProposalGateStatus,
 };
@@ -76,6 +76,82 @@ use crate::synthesizers::closeout_readiness::{
     SynthesizerInputs, NO_DIFF_CONVERGENCE_THRESHOLD,
 };
 use crate::work_queue::WorkQueue;
+
+fn p082_retry_identifier_rejection_envelope(
+    command: &str,
+    provided_identifier: &str,
+    provided_identifier_kind: &str,
+    expected_identifier_kind: &str,
+    valid_identifier_examples: &[String],
+    operator_safe_summary: &str,
+    source_identifier: &str,
+) -> String {
+    let examples = valid_identifier_examples
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let guidance = domain::recovery_matrix::build_retry_identifier_guidance(
+        command,
+        provided_identifier,
+        provided_identifier_kind,
+        expected_identifier_kind,
+        &examples,
+    );
+    let now = Utc::now().to_rfc3339();
+    let readback = domain::recovery_matrix::set_readback_identifier_guidance(
+        domain::recovery_matrix::build_readback_v1(
+            "P082-R08",
+            "rejected",
+            "no_mutation",
+            domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
+            operator_safe_summary,
+            "command_journal",
+            "command_journal",
+            source_identifier,
+            Some("command_journal.error.p082_recovery_matrix_readback"),
+            "valid",
+            &now,
+        ),
+        guidance,
+    );
+    domain::recovery_matrix::build_rejected_command_error_envelope(
+        domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
+        command,
+        operator_safe_summary,
+        readback,
+    )
+}
+
+fn p082_side_effect_rejection_envelope(
+    command: &str,
+    operator_safe_summary: &str,
+    source_identifier: &str,
+) -> String {
+    let now = Utc::now().to_rfc3339();
+    let readback = domain::recovery_matrix::set_readback_side_effect_hold(
+        domain::recovery_matrix::build_readback_v1(
+            "P082-R07",
+            "held",
+            "reconcile_side_effects",
+            domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+            operator_safe_summary,
+            "side_effects, command_journal",
+            "side_effects, command_journal",
+            source_identifier,
+            Some("command_journal.error.p082_recovery_matrix_readback"),
+            "valid",
+            &now,
+        ),
+        "unresolved_side_effect_entries",
+        operator_safe_summary,
+    );
+    domain::recovery_matrix::build_rejected_command_error_envelope(
+        domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+        command,
+        operator_safe_summary,
+        readback,
+    )
+}
 
 // ── P083: monotonic clock ────────────────────────────────────────────────────
 
@@ -2259,6 +2335,89 @@ impl CommandHandler {
         self
     }
 
+    pub async fn auto_resume_elapsed_quota_ledgers(&self, now: DateTime<Utc>) -> Result<u64> {
+        let candidates =
+            agent_retry_budget_ledger::list_reset_elapsed_auto_retry_candidates(&self.pool, now)
+                .await?;
+        let mut scheduled = 0;
+
+        for candidate in candidates {
+            let active_work = work_items::list_by_run(&self.pool, candidate.run_id)
+                .await?
+                .into_iter()
+                .any(|item| {
+                    matches!(
+                        item.status,
+                        WorkItemStatus::Pending | WorkItemStatus::Running
+                    )
+                });
+            if active_work {
+                continue;
+            }
+
+            let journal_id = format!("quota-auto-retry:{}", candidate.ledger_id);
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let caller = CallerContext::mcp(
+                "system:auto_resume_elapsed_quota",
+                &domain::commands::PrincipalClass::Operator,
+                "quota_ledger.auto_resume_elapsed",
+            )
+            .with_request_id(request_id.clone())
+            .with_caller_class("system");
+            let journal = CommandJournalEntry {
+                id: journal_id.clone(),
+                command_type: "RetryStage",
+                payload_json: serde_json::json!({
+                    "run_id": candidate.run_id.to_string(),
+                    "stage_id": candidate.stage_id.clone(),
+                    "agent_execution_id": candidate.agent_execution_id.to_string(),
+                    "source_quota_ledger_id": candidate.ledger_id.clone(),
+                    "retry_reason": "quota_ledger_reset_elapsed_auto_retry",
+                    "request_id": request_id.clone(),
+                })
+                .to_string(),
+                run_id: Some(candidate.run_id.to_string()),
+                created_at: now,
+                caller_surface: Some("system".to_string()),
+                caller_principal_id: Some("system:auto_resume_elapsed_quota".to_string()),
+                caller_principal_class: Some("System".to_string()),
+                caller_tool: Some("quota_ledger.auto_resume_elapsed".to_string()),
+                request_id: Some(request_id),
+                caller_class: Some("system".to_string()),
+                token_id: None,
+                mcp_idempotency_key: None,
+                mcp_idempotency_request_hash: None,
+                boundary_row_id: None,
+            };
+
+            self.retry_stage_latest_attempt(
+                candidate.run_id,
+                &candidate.stage_id,
+                false,
+                &journal_id,
+                &journal,
+                "quota_ledger_reset_elapsed_auto_retry",
+                None,
+                &caller,
+            )
+            .await?;
+
+            let mut tx = self
+                .begin_command_transaction("command.QuotaLedgerAutoResume", journal_id.clone())
+                .await?;
+            agent_retry_budget_ledger::mark_reset_elapsed_retry_scheduled_tx(
+                &mut tx,
+                &candidate.ledger_id,
+                &journal_id,
+            )
+            .await?;
+            tx.commit().await?;
+            scheduled += 1;
+        }
+
+        Ok(scheduled)
+    }
+
     fn maybe_inject_retry_stage_failure(&self, step: &str) -> Result<()> {
         if let Some(injection) = &self.retry_stage_failure_injection {
             injection(step)?;
@@ -3497,6 +3656,43 @@ impl CommandHandler {
                     .await?;
                 record_command_journal_tx(&mut retry_tx, journal).await?;
                 self.maybe_inject_retry_stage_failure("record_journal")?;
+
+                if let Ok(provided_uuid) = uuid::Uuid::parse_str(&c.stage_id) {
+                    if let Some(provided_stage) =
+                        stages::find_by_id_tx(&mut retry_tx, StageExecutionId::from(provided_uuid))
+                            .await?
+                    {
+                        if provided_stage.run_id == c.run_id {
+                            let summary = format!(
+                            "wrong_identifier_kind: RetryStage stage_id received stage_execution_uuid {}; use workflow stage_id '{}'",
+                            c.stage_id, provided_stage.stage_id
+                        );
+                            let envelope = p082_retry_identifier_rejection_envelope(
+                                "RetryStage",
+                                &c.stage_id,
+                                "stage_execution_uuid",
+                                "workflow_stage_id",
+                                std::slice::from_ref(&provided_stage.stage_id),
+                                &summary,
+                                &journal.id,
+                            );
+                            command_journal::fail_entry_tx(
+                                &mut retry_tx,
+                                &journal.id,
+                                Utc::now(),
+                                &envelope,
+                            )
+                            .await?;
+                            retry_tx.commit().await?;
+                            db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
+                            anyhow::bail!(
+                            "wrong_identifier_kind: RetryStage stage_id field received stage_execution_uuid {}; use workflow stage_id '{}'",
+                            c.stage_id,
+                            provided_stage.stage_id
+                        );
+                        }
+                    }
+                }
 
                 // Acquire or reacquire P083 idempotency lease inside transaction.
                 if let (Some(ref req_id), Some(ref intent_hash), Some(ref expires_at), Some(gen)) = (
@@ -6506,9 +6702,49 @@ impl CommandHandler {
             return Err(anyhow!("Run {} is already in terminal state", run_id));
         }
 
-        let target_exec = agent_executions::find_by_id(&self.pool, agent_execution_id)
-            .await?
-            .ok_or_else(|| anyhow!("Agent execution {} not found", agent_execution_id))?;
+        let target_exec = match agent_executions::find_by_id(&self.pool, agent_execution_id).await?
+        {
+            Some(target_exec) => target_exec,
+            None => {
+                let as_stage_id = StageExecutionId::from(agent_execution_id.inner());
+                if let Some(stage) = stages::find_by_id(&self.pool, as_stage_id).await? {
+                    if stage.run_id != run_id || stage.stage_id != stage_id {
+                        return Err(anyhow!("Agent execution {} not found", agent_execution_id));
+                    }
+                    let valid_examples = agent_executions::find_by_stage(&self.pool, as_stage_id)
+                        .await?
+                        .into_iter()
+                        .map(|execution| execution.id.to_string())
+                        .take(3)
+                        .collect::<Vec<_>>();
+                    let summary = format!(
+                        "wrong_identifier_kind: targeted retry field agent_execution_id received stage_execution_uuid {}; use an agent execution id from stage_id '{}'",
+                        agent_execution_id, stage.stage_id
+                    );
+                    let envelope = p082_retry_identifier_rejection_envelope(
+                        "RetryAgentExecution",
+                        &agent_execution_id.to_string(),
+                        "stage_execution_uuid",
+                        "stage_execution_uuid",
+                        &valid_examples,
+                        &summary,
+                        journal_id,
+                    );
+                    self.record_failed_command_transaction(
+                        journal,
+                        "command.RetryAgentExecution",
+                        &envelope,
+                    )
+                    .await?;
+                    anyhow::bail!(
+                        "wrong_identifier_kind: targeted retry field agent_execution_id received stage_execution_uuid {}; use an agent execution id from stage_id '{}'",
+                        agent_execution_id,
+                        stage.stage_id
+                    );
+                }
+                return Err(anyhow!("Agent execution {} not found", agent_execution_id));
+            }
+        };
         let old_stage_execution_id = target_exec.stage_execution_id.ok_or_else(|| {
             anyhow!(
                 "Agent execution {} is not stage-owned and cannot be retried as a stage",
@@ -6546,6 +6782,31 @@ impl CommandHandler {
             .max_by_key(|s| s.started_at)
             .ok_or_else(|| anyhow!("Stage {} not found", stage_id))?;
         if latest_stage.id != old_stage.id {
+            let valid_examples = agent_executions::find_by_stage(&self.pool, latest_stage.id)
+                .await?
+                .into_iter()
+                .map(|execution| execution.id.to_string())
+                .take(3)
+                .collect::<Vec<_>>();
+            let summary = format!(
+                "stale stage execution: agent execution {} belongs to stale stage {}; latest for {} is {}",
+                agent_execution_id, old_stage.id, stage_id, latest_stage.id
+            );
+            let envelope = p082_retry_identifier_rejection_envelope(
+                "RetryAgentExecution",
+                &agent_execution_id.to_string(),
+                "unknown",
+                "stage_execution_uuid",
+                &valid_examples,
+                &summary,
+                journal_id,
+            );
+            self.record_failed_command_transaction(
+                journal,
+                "command.RetryAgentExecution",
+                &envelope,
+            )
+            .await?;
             return Err(anyhow!(
                 "Agent execution {} is on stale stage execution {}; latest for {} is {}",
                 agent_execution_id,
@@ -6566,6 +6827,37 @@ impl CommandHandler {
                 stage_id,
                 old_stage.status
             ));
+        }
+        let unresolved_effects =
+            side_effects_repo::list_unresolved_for_stage(&self.pool, &old_stage.id.to_string())
+                .await?;
+        let unresolved_target_effects = unresolved_effects
+            .iter()
+            .filter(|effect| {
+                effect
+                    .agent_execution_id
+                    .as_ref()
+                    .is_none_or(|effect_execution_id| effect_execution_id == &agent_execution_id)
+            })
+            .collect::<Vec<_>>();
+        if !unresolved_target_effects.is_empty() {
+            let summary = "requires_effect_reconciliation: Retry blocked: unresolved side-effect ledger entries exist.";
+            let envelope =
+                p082_side_effect_rejection_envelope("RetryAgentExecution", summary, journal_id);
+            self.record_failed_command_transaction(
+                journal,
+                "command.RetryAgentExecution",
+                &envelope,
+            )
+            .await?;
+            db::metrics::increment_counter_with_label(
+                "p082_recovery_mutation_rejected_total",
+                &format!(
+                    "{}:RetryAgentExecution",
+                    domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION
+                ),
+            );
+            anyhow::bail!("{summary}");
         }
         let has_release_post_approval_tasks = match retry_state_has_release_post_approval_tasks(
             &run,
@@ -6588,12 +6880,24 @@ impl CommandHandler {
             has_release_post_approval_tasks,
         ) {
             let error = requires_effect_reconciliation_error(&old_stage);
+            let envelope = p082_side_effect_rejection_envelope(
+                "RetryAgentExecution",
+                &error.to_string(),
+                journal_id,
+            );
             self.record_failed_command_transaction(
                 journal,
                 "command.RetryAgentExecution",
-                &error.to_string(),
+                &envelope,
             )
             .await?;
+            db::metrics::increment_counter_with_label(
+                "p082_recovery_mutation_rejected_total",
+                &format!(
+                    "{}:RetryAgentExecution",
+                    domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION
+                ),
+            );
             return Err(error);
         }
 

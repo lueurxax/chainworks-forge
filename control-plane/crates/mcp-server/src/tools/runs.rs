@@ -712,6 +712,28 @@ pub async fn execute(
                             .await?;
                     // P077 BLK-004: attach closeout_readiness_summary parity on runs.get.
                     let value = attach_closeout_readiness_summary(pool, value).await?;
+                    let mut value = value;
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert(
+                            "p082_recovery_matrix_readback".to_string(),
+                            crate::tools::reports::p082_recovery_matrix_readback_json(
+                                pool,
+                                run_id,
+                                &principal.class,
+                            )
+                            .await?,
+                        );
+                        obj.insert(
+                            "p082_recovery_matrix_readbacks".to_string(),
+                            crate::tools::reports::p082_recovery_matrix_readbacks_json(
+                                pool,
+                                run_id,
+                                &principal.class,
+                                "runs_get",
+                            )
+                            .await?,
+                        );
+                    }
                     // P058 Phase 1: attach escalation_readback parity on runs.get.
                     // Full chain detail only for Operator; summary-only for Agent/Observer.
                     attach_escalation_readback(pool, value, principal).await
@@ -741,10 +763,13 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
                 .parse()?;
-            // P083 command_idempotency_contract_v1: request_id is required UUIDv4 CallerRequestId.
+            // P083 command_idempotency_contract_v1: request_id is the canonical UUIDv4
+            // CallerRequestId. P082/P081 clients may still submit idempotency_key; preserve
+            // the legacy preflight error so missing-key calls fail before any mutation.
             let request_id = params["request_id"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'request_id'"))?
+                .or_else(|| params["idempotency_key"].as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
                 .to_string();
             validate_caller_request_id(&request_id)?;
             // SEC-P083-MED-003: stamp the validated CallerRequestId into CallerContext so
@@ -2220,6 +2245,13 @@ pub fn redact_run_snapshot_fields(value: &mut serde_json::Value, is_operator: bo
         "workflow_yaml_path",
         "agent_catalog_yaml_path",
         "worktree_root",
+        "base_branch",
+        "base_revision",
+        "target_branch",
+        "workflow_snapshot_hash",
+        "catalog_snapshot_hash",
+        "review_routing_json",
+        "cancellation_settlement_log",
         // HIGH-001: local filesystem paths must not be exposed to Agent/Observer principals.
         "workspace_root",
         "artifact_root",
