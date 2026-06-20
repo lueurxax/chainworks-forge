@@ -676,12 +676,16 @@ nonisolated struct OutputContractRepairEvidence: Codable, Sendable, Equatable {
     let lease: OutputContractLease?
     let policyFeatureFlags: [String]
     let repairPromptTemplateVersion: String?
+    /// Top-level recovery parser version tag; matches GraphQL `recoveryParserVersion` / MCP `recovery_parser_version`.
+    let recoveryParserVersion: String?
     let finalOutputSettlement: String?
     let evidenceArtifactPath: String?
     /// Monotonic content version; participates in Equatable but NOT in Identifiable.id.
     let evidenceVersion: Int
     let projectionIntegrity: String
     let projectionStaleSince: String?
+    /// Wall-clock timestamp when this repair record was first committed; matches GraphQL `recordedAt` / MCP `recorded_at`.
+    let recordedAt: String?
     let createdAt: String
     let updatedAt: String
 
@@ -711,11 +715,13 @@ nonisolated struct OutputContractRepairEvidence: Codable, Sendable, Equatable {
         case lease
         case policyFeatureFlags = "policy_feature_flags"
         case repairPromptTemplateVersion = "repair_prompt_template_version"
+        case recoveryParserVersion = "recovery_parser_version"
         case finalOutputSettlement = "final_output_settlement"
         case evidenceArtifactPath = "evidence_artifact_path"
         case evidenceVersion = "evidence_version"
         case projectionIntegrity = "projection_integrity"
         case projectionStaleSince = "projection_stale_since"
+        case recordedAt = "recorded_at"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
     }

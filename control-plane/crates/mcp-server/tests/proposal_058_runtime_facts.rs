@@ -397,7 +397,7 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
     .await
     .unwrap();
 
-    let canonical = payload["reports"]
+    let canonical = payload
         .as_array()
         .unwrap()
         .iter()
@@ -459,7 +459,10 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
     assert!(runtime_facts["created_at"].is_string());
     assert!(runtime_facts["updated_at"].is_string());
 
-    let observer_payload = mcp_server::tools::reports::execute(
+    // SEC-REPORTS-AUTHZ-001: Observer must be denied reports.get entirely.
+    // failure_kind_raw_debug and other operator-grade fields are inaccessible
+    // because non-operators are rejected at the authorization gate.
+    let observer_err = mcp_server::tools::reports::execute(
         "reports.get",
         serde_json::json!({ "run_id": run_id.to_string() }),
         &pool,
@@ -467,16 +470,10 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
         &auth::Principal::new("observer", auth::PrincipalClass::Observer),
     )
     .await
-    .unwrap();
-    let observer_canonical = observer_payload["reports"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|item| item["report_kind"] == serde_json::json!("mcp_execution_truth"))
-        .expect("observer mcp execution truth report");
-    assert_eq!(
-        observer_canonical["agent_executions"][0]["runtime_facts"]["failure_kind_raw_debug"],
-        serde_json::Value::Null
+    .expect_err("Observer must be denied reports.get (SEC-REPORTS-AUTHZ-001)");
+    assert!(
+        observer_err.to_string().contains("requires Operator"),
+        "denial message must identify Operator requirement; got: {observer_err}"
     );
 
     let server = McpServer::new(
@@ -484,6 +481,7 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
         Arc::new(make_command_handler(pool.clone())),
         auth::PrincipalTable::test_fixture(),
     );
+    // HIGH-001: report:// exposes execution evidence; Operator-only.
     let resource_response = server
         .handle_request(
             JsonRpcRequest {
@@ -497,6 +495,7 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
             &auth::Principal::new("operator", auth::PrincipalClass::Operator),
         )
         .await;
+    // HIGH-001: report:// is Operator-only; Observer must be denied.
     let observer_server = McpServer::new(
         pool.clone(),
         Arc::new(make_command_handler(pool.clone())),
@@ -514,20 +513,8 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
         )
         .await;
     assert!(
-        observer_resource_response.error.is_none(),
-        "Observer report:// read should succeed with redacted payload: {:?}",
-        observer_resource_response.error
-    );
-    let observer_resource_text = observer_resource_response.result.as_ref().unwrap()["contents"][0]
-        ["text"]
-        .as_str()
-        .expect("observer resource text");
-    let observer_resource_payload: serde_json::Value =
-        serde_json::from_str(observer_resource_text).unwrap();
-    assert_eq!(
-        observer_resource_payload["agent_executions"][0]["runtime_facts"]["failure_kind_raw_debug"],
-        serde_json::Value::Null,
-        "Observer report:// payload must redact raw runtime facts"
+        observer_resource_response.error.is_some(),
+        "Observer must NOT be able to read report:// (HIGH-001 regression)"
     );
 
     assert!(
@@ -602,7 +589,7 @@ async fn proposal_053_reports_get_projects_discovery_reconciliation_pending() {
     .await
     .unwrap();
 
-    let canonical = payload["reports"]
+    let canonical = payload
         .as_array()
         .unwrap()
         .iter()
@@ -1051,72 +1038,90 @@ async fn p079_sec_mcp001_runtime_receipt_sanitized_for_non_operator() {
         "Operator must see provider_session_id in runtime_receipt"
     );
 
-    // Observer must NOT see p079 path fields or payloads in runtime_receipt.
-    let observer_payload = mcp_server::tools::reports::execute(
+    // SEC-REPORTS-AUTHZ-001: Observer/Agent must be denied reports.get entirely.
+    // The p079 runtime_receipt path fields are operator-grade data; non-operators
+    // are blocked at the authorization gate before any report data is read.
+    for (principal_id, class) in [
+        ("observer", auth::PrincipalClass::Observer),
+        ("agent-sec-p079-mcp001", auth::PrincipalClass::Agent),
+    ] {
+        let err = mcp_server::tools::reports::execute(
+            "reports.get",
+            serde_json::json!({ "run_id": run_id.to_string() }),
+            &pool,
+            &make_command_handler(pool.clone()),
+            &auth::Principal::new(principal_id, class),
+        )
+        .await
+        .expect_err("non-Operator reports.get must be denied (SEC-REPORTS-AUTHZ-001)");
+        assert!(
+            err.to_string().contains("requires Operator"),
+            "denial message must identify Operator requirement; got: {err}"
+        );
+    }
+}
+
+// ── SEC-P079-MCP-001: invocation_owner_key must be gated on operator-debug ───────────────────────
+
+/// SEC-P079-MCP-001 regression: Observer/Agent callers of reports.get must NOT see
+/// runtime_facts.invocation_owner_key, which is a stable cross-report correlation value
+/// encoding run/stage/task/session lineage. Operator callers retain the field.
+#[tokio::test]
+async fn p079_sec_mcp_001_non_operator_reports_get_hides_invocation_owner_key() {
+    let pool = setup_pool().await;
+
+    // seed_execution sets invocation_owner_key = Some("owner-key")
+    let (run_id, _stage_execution_id, agent_execution_id) = seed_execution(&pool).await;
+    let now = Utc::now();
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+    facts.output_settlement = AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+    facts.valid_required_outputs = true;
+    agent_execution_runtime_facts::upsert(&pool, &facts)
+        .await
+        .unwrap();
+
+    // SEC-REPORTS-AUTHZ-001: Observer/Agent must be denied reports.get entirely.
+    // invocation_owner_key (and all other operator-grade fields) are inaccessible
+    // because non-operators are rejected at the authorization gate.
+    for (principal_id, class) in [
+        ("observer-sec-p079", auth::PrincipalClass::Observer),
+        ("agent-sec-p079", auth::PrincipalClass::Agent),
+    ] {
+        let err = mcp_server::tools::reports::execute(
+            "reports.get",
+            serde_json::json!({ "run_id": run_id.to_string() }),
+            &pool,
+            &make_command_handler(pool.clone()),
+            &auth::Principal::new(principal_id, class),
+        )
+        .await
+        .expect_err("non-Operator reports.get must be denied (SEC-REPORTS-AUTHZ-001)");
+        assert!(
+            err.to_string().contains("requires Operator"),
+            "denial message must identify Operator requirement; got: {err}"
+        );
+    }
+
+    // Operator MUST see invocation_owner_key.
+    let operator_payload = mcp_server::tools::reports::execute(
         "reports.get",
         serde_json::json!({ "run_id": run_id.to_string() }),
         &pool,
         &make_command_handler(pool.clone()),
-        &auth::Principal::new("observer", auth::PrincipalClass::Observer),
+        &auth::Principal::new("operator-sec-p079", auth::PrincipalClass::Operator),
     )
     .await
     .unwrap();
-    let observer_exec = observer_payload
+    let operator_canonical = operator_payload
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["report_kind"] == "mcp_execution_truth")
-        .unwrap();
-    let obs_receipt =
-        &observer_exec["agent_executions"][0]["runtime_facts"]["runtime_receipt"];
-    let obs_roundtrip = &obs_receipt["permission_roundtrips"][0];
-    assert!(
-        obs_roundtrip.get("p079_normalized_path").is_none()
-            || obs_roundtrip["p079_normalized_path"] == serde_json::Value::Null,
-        "Observer must NOT see p079_normalized_path (SEC-P079-MCP-001); got: {obs_roundtrip:?}"
-    );
-    assert!(
-        obs_roundtrip.get("p079_matched_canonical_path").is_none()
-            || obs_roundtrip["p079_matched_canonical_path"] == serde_json::Value::Null,
-        "Observer must NOT see p079_matched_canonical_path (SEC-P079-MCP-001)"
-    );
-    assert!(
-        obs_roundtrip.get("p079_decision_reason").is_none()
-            || obs_roundtrip["p079_decision_reason"] == serde_json::Value::Null,
-        "Observer must NOT see p079_decision_reason (SEC-P079-MCP-001)"
-    );
-    assert!(
-        obs_roundtrip.get("request_payload").is_none()
-            || obs_roundtrip["request_payload"] == serde_json::Value::Null,
-        "Observer must NOT see request_payload (SEC-P079-MCP-001)"
-    );
-    assert!(
-        obs_roundtrip.get("grant_payload").is_none()
-            || obs_roundtrip["grant_payload"] == serde_json::Value::Null,
-        "Observer must NOT see grant_payload (SEC-P079-MCP-001)"
-    );
-    assert!(
-        obs_receipt.get("provider_session_id").is_none()
-            || obs_receipt["provider_session_id"] == serde_json::Value::Null,
-        "Observer must NOT see provider_session_id in runtime_receipt (SEC-P079-MCP-001)"
-    );
-    // Safe counters must still be present for observers.
-    assert!(
-        obs_receipt["counters"]["total_messages"].as_i64().is_some(),
-        "Observer must still see receipt counters"
-    );
-    // roundtrip record itself is present; only sensitive fields stripped.
-    assert!(
-        obs_receipt["permission_roundtrips"]
-            .as_array()
-            .map(|a| a.len())
-            == Some(1),
-        "Observer must see permission_roundtrips array (sanitized)"
-    );
-    // outcome is a safe field that should remain.
+        .find(|item| item["report_kind"] == serde_json::json!("mcp_execution_truth"))
+        .expect("operator mcp execution truth report");
+    let operator_runtime_facts = &operator_canonical["agent_executions"][0]["runtime_facts"];
     assert_eq!(
-        obs_roundtrip["outcome"],
-        "post_grant_activity_observed",
-        "Observer must still see outcome field in roundtrip"
+        operator_runtime_facts["invocation_owner_key"],
+        serde_json::json!("owner-key"),
+        "Operator must still see invocation_owner_key (SEC-P079-MCP-001 regression)"
     );
 }

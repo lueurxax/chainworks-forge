@@ -3246,6 +3246,18 @@ impl RecoveryService {
                     domain::output_contract_repair::LeaseState::Settled => continue,
                 };
 
+            // REL-r2-2 budget correctness: consume the budget field that matches the
+            // lease kind, not a single shared bool. A repair lease consumes repair budget;
+            // a fallback lease consumes fallback budget.
+            let (repair_consumed, fallback_consumed) = if budget_consumed {
+                match lease.lease_kind {
+                    domain::output_contract_repair::LeaseKind::Repair => (true, false),
+                    domain::output_contract_repair::LeaseKind::Fallback => (false, true),
+                }
+            } else {
+                (false, false)
+            };
+
             match ocr_repo::reclaim_expired_lease_and_event(
                 &self.pool,
                 &lease.lease_key,
@@ -3254,7 +3266,8 @@ impl RecoveryService {
                 event_presentation,
                 "manual_investigation",
                 reason,
-                budget_consumed,
+                repair_consumed,
+                fallback_consumed,
                 &reclaim_ts,
             )
             .await
@@ -3265,8 +3278,10 @@ impl RecoveryService {
                         lease_key = %lease.lease_key,
                         repair_event_id = %lease.repair_event_id,
                         prior_state = %lease.lease_state,
+                        lease_kind = %lease.lease_kind,
                         reclamation_reason = %reason,
-                        budget_consumed = budget_consumed,
+                        repair_budget_consumed = repair_consumed,
+                        fallback_budget_consumed = fallback_consumed,
                         "P079 lease TTL sweep: reclaimed expired lease"
                     );
                 }

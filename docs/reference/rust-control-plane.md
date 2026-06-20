@@ -742,7 +742,7 @@ The work queue (`crates/engine/src/work_queue.rs`) wraps the `work_items` SQLite
 
 | Kind | Behavior |
 |---|---|
-| `InvokeAgent` | Spawns ACP session via the runtime manager. Concurrent (tokio::spawn). If no explicit tasks, the owner agent runs as a single task. Upon completion of an `InvokeAgent` task, the workflow engine's output settlement process is partially enhanced by P079 (Contract-Aware Output Repair and Provider Fallback): the same-session repair lane attempts to repair eligible missing/invalid required outputs before marking the stage as `Blocked` (gated for advisory-only providers per SEC-P079-HIGH-001). Transcript/provider-envelope recovery and controlled provider fallback are deferred and not yet wired. |
+| `InvokeAgent` | Spawns ACP session via the runtime manager. Concurrent (tokio::spawn). If no explicit tasks, the owner agent runs as a single task. Upon completion of an `InvokeAgent` task, the workflow engine's output settlement process is partially enhanced by P079 (Contract-Aware Output Repair and Provider Fallback): deterministic fixture same-session repair can repair eligible missing/invalid required outputs before marking the stage as `Blocked`. Production same-session repair remains fail-closed for advisory-only providers. Transcript recovery records bounded fail-closed evidence without accepting recovered output until transport attribution is implemented; controlled provider fallback dispatch remains deferred. |
 | `AdvanceRun` | Re-evaluates run state through the orchestrator. Inline. |
 | `TriggerNextStage` | Alias for AdvanceRun. Inline. |
 | `SettleStage` | Alias for AdvanceRun. Inline. |

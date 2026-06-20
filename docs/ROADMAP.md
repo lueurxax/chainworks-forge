@@ -51,7 +51,9 @@ These are not active workstreams:
 - **P092** retry authority payload target invariants and recovery.
   - Operational truth lives in [rust-control-plane.md](reference/rust-control-plane.md#retry-payload-target-invariants-and-recovery) and [test-gates.md](reference/test-gates.md#proposal-092p092-retained-historical-alias).
 - **P079** contract-aware output repair and provider fallback.
-  - Fully implemented. All features and deferred items mentioned previously are now operational.
+  - Partially implemented. Wired pieces include the SQLite migration, domain types, repair-event/lease repos, GraphQL/MCP readback, Swift DTOs, MCP runtime receipt sanitization, crash-consistent materialization, Junie plan-evidence capture/redaction, bounded transcript-recovery evidence that fails closed without transport attribution, deterministic-fixture same-session repair, and the current P079 security/settlement hardening.
+  - Accepted transcript/provider-envelope recovery, controlled provider fallback dispatch, full projection rebuild + recovery sweep, Swift macOS inspector UI, P079 operational metric emission, and the full `proposal-079`/`p079` acceptance gate remain deferred.
+  - Operational truth lives in [output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md#p079-output-contract-repair-and-fallback-details).
   - Keep scoped to contract-output repair/fallback.
   - Do not include release agents or bypass durable side-effect safety.
 - **P036/P085** macOS operator navigation and thin-client affordance baseline.

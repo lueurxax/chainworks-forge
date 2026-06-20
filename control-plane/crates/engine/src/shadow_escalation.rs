@@ -239,6 +239,10 @@ fn failure_kind_digest_value(failure_kind: Option<&AgentFailureKind>) -> &'stati
         Some(AgentFailureKind::ProviderPermissionRejected) => "provider_permission_rejected",
         Some(AgentFailureKind::HostInterruption) => "host_interruption",
         Some(AgentFailureKind::McpPermissionModalStall) => "mcp_permission_modal_stall",
+        Some(AgentFailureKind::ToolOutputBudgetExceeded) => "tool_output_budget_exceeded",
+        Some(AgentFailureKind::ToolOutputBudgetPreflightDenied) => {
+            "tool_output_budget_preflight_denied"
+        }
         Some(AgentFailureKind::Unknown) | None => "unknown",
     }
 }

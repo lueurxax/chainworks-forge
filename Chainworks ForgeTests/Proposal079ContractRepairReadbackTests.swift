@@ -75,6 +75,15 @@ struct Proposal079ContractRepairReadbackTests {
         #expect(p.showProgressChip == false)
     }
 
+    // MARK: - top-level recoveryParserVersion and recordedAt
+
+    @Test("Top-level recoveryParserVersion and recordedAt decode from fixture")
+    func topLevelRecoveryParserVersionAndRecordedAtDecode() throws {
+        let ev = try decode(P079Fixtures.notAttempted)
+        #expect(ev.recoveryParserVersion == "p079_recovery_v1")
+        #expect(ev.recordedAt == "2026-05-30T10:00:00Z")
+    }
+
     // MARK: - recovered via same-session repair
 
     @Test("Recovered (same-session repair) decodes and presents correctly")
@@ -519,6 +528,8 @@ private enum P079Fixtures {
           "evidence_version": \(evidenceVersion),
           "projection_integrity": "\(projectionIntegrity)",
           "projection_stale_since": \(staleSinceStr),
+          "recovery_parser_version": "p079_recovery_v1",
+          "recorded_at": "2026-05-30T10:00:00Z",
           "created_at": "2026-05-30T10:00:00Z",
           "updated_at": "2026-05-30T10:00:00Z"
         }

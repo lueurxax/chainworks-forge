@@ -721,6 +721,35 @@ mod tests {
     }
 
     #[test]
+    fn claude_long_context_usage_credits_message_is_provider_quota() {
+        assert!(matches!(
+            observation_from_acp_error_message(
+                "Usage credits are required for long context requests."
+            ),
+            RuntimeFailureObservation::ProviderQuota { retry_after: None }
+        ));
+    }
+
+    #[test]
+    fn codex_progress_timeout_with_search_limit_diagnostic_is_not_provider_quota() {
+        let message = concat!(
+            "ACP session progress timeout: provider_stream_silent_no_local_activity; ",
+            "no meaningful progress for 300s ",
+            "(session=019eb81b, local_event_count=0, function_calls=0, ",
+            "session_store_bytes_read=63706, codex_session_store_path_found=true, ",
+            "codex_session_store_search_limit_hit=false, ",
+            "codex_session_store_candidate_root_count=3)"
+        );
+
+        assert_eq!(
+            observation_from_acp_error_message(message),
+            RuntimeFailureObservation::ProviderTimeout {
+                supervision_classification: Some("provider_stream_silent_no_local_activity".into())
+            }
+        );
+    }
+
+    #[test]
     fn proposal_058_quota_retry_after_parses_local_provider_reset_message() {
         let now = DateTime::parse_from_rfc3339("2026-04-19T16:30:00Z")
             .unwrap()
@@ -762,35 +791,6 @@ mod tests {
                 retry_after: Some(_)
             }
         ));
-    }
-
-    #[test]
-    fn claude_long_context_usage_credits_message_is_provider_quota() {
-        assert!(matches!(
-            observation_from_acp_error_message(
-                "Usage credits are required for long context requests."
-            ),
-            RuntimeFailureObservation::ProviderQuota { retry_after: None }
-        ));
-    }
-
-    #[test]
-    fn codex_progress_timeout_with_search_limit_diagnostic_is_not_provider_quota() {
-        let message = concat!(
-            "ACP session progress timeout: provider_stream_silent_no_local_activity; ",
-            "no meaningful progress for 300s ",
-            "(session=019eb81b, local_event_count=0, function_calls=0, ",
-            "session_store_bytes_read=63706, codex_session_store_path_found=true, ",
-            "codex_session_store_search_limit_hit=false, ",
-            "codex_session_store_candidate_root_count=3)"
-        );
-
-        assert_eq!(
-            observation_from_acp_error_message(message),
-            RuntimeFailureObservation::ProviderTimeout {
-                supervision_classification: Some("provider_stream_silent_no_local_activity".into())
-            }
-        );
     }
 
     #[test]

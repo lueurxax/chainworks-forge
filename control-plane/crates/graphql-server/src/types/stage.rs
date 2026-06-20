@@ -45,21 +45,58 @@ fn p079_parse_json_capped(s: &str) -> Option<serde_json::Value> {
 
 // P079-SEC-LOW-001 / SEC-MED-002: reject absolute paths and all traversal forms before
 // returning evidence_artifact_path or provider_plan_evidence paths to callers.
-// Also rejects URL-encoded traversal sequences (%2e%2e, %2f, %5c) that could bypass
-// literal ".." checks in downstream reveal/open flows (SEC-P079-LOW-001).
+// Also rejects fully-encoded (%2e%2e, %2f, %5c) AND mixed literal/encoded traversal
+// (e.g. %2e. or .%2e) by validating the percent-decoded form as well (SEC-P079-LOW-001).
+fn p079_percent_decode_ascii(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_ascii_lowercase();
+            let lo = (bytes[i + 2] as char).to_ascii_lowercase();
+            let h = match hi {
+                '0'..='9' => (hi as u8) - b'0',
+                'a'..='f' => (hi as u8) - b'a' + 10,
+                _ => { out.push(bytes[i] as char); i += 1; continue; }
+            };
+            let l = match lo {
+                '0'..='9' => (lo as u8) - b'0',
+                'a'..='f' => (lo as u8) - b'a' + 10,
+                _ => { out.push(bytes[i] as char); i += 1; continue; }
+            };
+            out.push((h << 4 | l) as char);
+            i += 3;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn p079_path_has_traversal(p: &str) -> bool {
+    p.starts_with('/')
+        || p.starts_with('\\')
+        || p.contains("../")
+        || p.contains("..\\")
+        || p.split('/').any(|c| c == "..")
+        || p.split('\\').any(|c| c == "..")
+}
+
 fn p079_safe_relative_path(path: Option<&str>) -> Option<&str> {
     path.filter(|p| {
         let p_lower = p.to_lowercase();
-        !p.starts_with('/')
-            && !p.starts_with('\\')
-            && !p.contains("../")
-            && !p.contains("..\\")
-            && !p.split('/').any(|component| component == "..")
-            && !p.split('\\').any(|component| component == "..")
-            // SEC-P079-LOW-001: reject URL-encoded traversal that bypasses literal checks.
-            && !p_lower.contains("%2e%2e")
+        // SEC-P079-LOW-001: reject fully URL-encoded traversal sequences.
+        let no_encoded = !p_lower.contains("%2e%2e")
             && !p_lower.contains("%2f")
-            && !p_lower.contains("%5c")
+            && !p_lower.contains("%5c");
+        // SEC-P079-LOW-001: also validate the percent-decoded form to catch mixed
+        // literal/encoded traversal such as %2e. or .%2e (e.g. "%2e./etc/passwd").
+        let decoded = p079_percent_decode_ascii(p);
+        !p079_path_has_traversal(p)
+            && no_encoded
+            && !p079_path_has_traversal(&decoded)
     })
 }
 
@@ -85,6 +122,8 @@ pub enum AgentFailureKind {
     CancelledByOperator,
     SupersededByRetry,
     HostInterruption,
+    ToolOutputBudgetPreflightDenied,
+    ToolOutputBudgetExceeded,
     Unknown,
 }
 
@@ -647,6 +686,50 @@ impl From<XcodeHostExecutorEvent> for GqlXcodeHostExecutorEvent {
 // =============================================================================
 
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+#[graphql(name = "ProviderFamily", rename_items = "SCREAMING_SNAKE_CASE")]
+pub enum GqlProviderFamily {
+    Claude,
+    Gemini,
+    Codex,
+    Auggie,
+    Junie,
+    Fixture,
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+#[graphql(name = "AdapterFamily", rename_items = "SCREAMING_SNAKE_CASE")]
+pub enum GqlAdapterFamily {
+    Claude,
+    Gemini,
+    Codex,
+    Auggie,
+    Junie,
+    Fixture,
+}
+
+fn gql_provider_family(s: &str) -> GqlProviderFamily {
+    match s {
+        "claude" => GqlProviderFamily::Claude,
+        "gemini" => GqlProviderFamily::Gemini,
+        "codex" => GqlProviderFamily::Codex,
+        "auggie" => GqlProviderFamily::Auggie,
+        "junie" => GqlProviderFamily::Junie,
+        _ => GqlProviderFamily::Fixture,
+    }
+}
+
+fn gql_adapter_family(s: &str) -> GqlAdapterFamily {
+    match s {
+        "claude" => GqlAdapterFamily::Claude,
+        "gemini" => GqlAdapterFamily::Gemini,
+        "codex" => GqlAdapterFamily::Codex,
+        "auggie" => GqlAdapterFamily::Auggie,
+        "junie" => GqlAdapterFamily::Junie,
+        _ => GqlAdapterFamily::Fixture,
+    }
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
 #[graphql(name = "OutputContractRepairStatus", rename_items = "SCREAMING_SNAKE_CASE")]
 pub enum GqlOutputContractRepairStatus {
     NotAttempted,
@@ -738,7 +821,6 @@ pub enum GqlLeaseState {
     Reserved,
     PromptSent,
     Settled,
-    Unknown,
 }
 
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
@@ -746,7 +828,85 @@ pub enum GqlLeaseState {
 pub enum GqlLeaseKind {
     Repair,
     Fallback,
-    Unknown,
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+#[graphql(name = "RequiredOutputMode", rename_items = "SCREAMING_SNAKE_CASE")]
+pub enum GqlRequiredOutputMode {
+    StrictStructured,
+    ChainworksOutput,
+    FileArtifact,
+    StatusArtifact,
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+#[graphql(name = "InitialFailureSubtype", rename_items = "SCREAMING_SNAKE_CASE")]
+pub enum GqlInitialFailureSubtype {
+    PlanEventInsteadOfOutput,
+    EmptySubmitAfterPlan,
+    FilePlanWrittenInsteadOfPayload,
+    RepairRepeatedPlanBehavior,
+    MalformedEnvelope,
+    WrongOutputKey,
+    WrongChannel,
+    WrongCanonicalPath,
+    UnknownEnumValue,
+    MissingRequiredField,
+    UnsafeContinuation,
+    OversizedPayload,
+    UnattributableEnvelope,
+    OversizedFallbackPacket,
+    PrincipalRevoked,
+    TranscriptRecoveryFlagMissing,
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+#[graphql(name = "FinalOutputSettlement", rename_items = "SCREAMING_SNAKE_CASE")]
+pub enum GqlFinalOutputSettlement {
+    ValidOutputsFromCompletedExecution,
+    ValidOutputsFromRepair,
+    ValidOutputsFromTranscriptRecovery,
+    ValidOutputsFromProviderEnvelope,
+    ValidOutputsFromFallback,
+    BlockedMissingRequiredOutputs,
+    BlockedInvalidRequiredOutputs,
+    BlockedProviderModeMismatch,
+    IgnoredLateOutputs,
+    Cancelled,
+    FailedTransport,
+    DeadlineExceeded,
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+#[graphql(name = "RecommendedNextAction", rename_items = "SCREAMING_SNAKE_CASE")]
+pub enum GqlRecommendedNextAction {
+    Continue,
+    InspectRepairEvidence,
+    ConfigureFallbackPolicy,
+    OperatorResolveApproval,
+    OperatorResolveWorkflowConflict,
+    RetryAfterTransportRestored,
+    CancelAcknowledged,
+    ManualInvestigation,
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+#[graphql(name = "PermissionDecisionValue", rename_items = "SCREAMING_SNAKE_CASE")]
+pub enum GqlPermissionDecisionValue {
+    Allowed,
+    Denied,
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+#[graphql(name = "PermissionResourceKind", rename_items = "SCREAMING_SNAKE_CASE")]
+pub enum GqlPermissionResourceKind {
+    FsWriteCanonicalOutputPath,
+    FsWriteOther,
+    FsRead,
+    Shell,
+    Network,
+    ToolCustom,
+    ToolMcp,
 }
 
 #[derive(SimpleObject, Clone, Debug)]
@@ -806,8 +966,8 @@ pub struct GqlRequiredOutputBinding {
 #[graphql(name = "OutputContractPermissionDecision", rename_fields = "camelCase")]
 pub struct GqlPermissionDecision {
     pub method: String,
-    pub resource_kind: String,
-    pub decision: String,
+    pub resource_kind: GqlPermissionResourceKind,
+    pub decision: GqlPermissionDecisionValue,
     pub reason: String,
 }
 
@@ -844,15 +1004,15 @@ pub struct GqlOutputContractRepairEvidence {
     pub agent_execution_id: ID,
     pub session_generation_id: String,
     pub role: String,
-    pub provider_family: String,
-    pub adapter_family: String,
-    pub required_output_mode: String,
+    pub provider_family: GqlProviderFamily,
+    pub adapter_family: GqlAdapterFamily,
+    pub required_output_mode: GqlRequiredOutputMode,
     pub initial_failure_class: GqlInitialFailureClass,
-    pub initial_failure_subtype: Option<String>,
+    pub initial_failure_subtype: Option<GqlInitialFailureSubtype>,
     pub status: GqlOutputContractRepairStatus,
     pub presentation_category: GqlPresentationCategory,
-    pub recommended_next_action: String,
-    pub final_output_settlement: Option<String>,
+    pub recommended_next_action: GqlRecommendedNextAction,
+    pub final_output_settlement: Option<GqlFinalOutputSettlement>,
     pub same_session_repair: GqlSameSessionRepair,
     pub transcript_recovery: GqlTranscriptRecovery,
     pub provider_fallback: GqlProviderFallback,
@@ -860,15 +1020,15 @@ pub struct GqlOutputContractRepairEvidence {
     pub required_outputs: Vec<GqlRequiredOutputBinding>,
     pub permission_decisions: Vec<GqlPermissionDecision>,
     pub budget: GqlOutputContractRepairBudget,
-    pub repair_prompt_template_version: Option<String>,
-    pub recovery_parser_version: Option<String>,
+    pub repair_prompt_template_version: String,
+    pub recovery_parser_version: String,
     pub policy_feature_flags: Vec<String>,
     pub evidence_artifact_path: Option<String>,
     pub lease: Option<GqlOutputContractRepairLease>,
     pub evidence_version: i64,
     pub projection_integrity: String,
     pub projection_stale_since: Option<String>,
-    pub recorded_at: Option<String>,
+    pub recorded_at: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -966,16 +1126,93 @@ fn gql_lease_state(s: &str) -> GqlLeaseState {
     match s {
         "reserved" => GqlLeaseState::Reserved,
         "prompt_sent" => GqlLeaseState::PromptSent,
-        "settled" => GqlLeaseState::Settled,
-        _ => GqlLeaseState::Unknown,
+        _ => GqlLeaseState::Settled,
     }
 }
 
 fn gql_lease_kind(s: &str) -> GqlLeaseKind {
     match s {
-        "repair" => GqlLeaseKind::Repair,
         "fallback" => GqlLeaseKind::Fallback,
-        _ => GqlLeaseKind::Unknown,
+        _ => GqlLeaseKind::Repair,
+    }
+}
+
+fn gql_required_output_mode(s: &str) -> GqlRequiredOutputMode {
+    match s {
+        "strict_structured" => GqlRequiredOutputMode::StrictStructured,
+        "file_artifact" => GqlRequiredOutputMode::FileArtifact,
+        "status_artifact" => GqlRequiredOutputMode::StatusArtifact,
+        _ => GqlRequiredOutputMode::ChainworksOutput,
+    }
+}
+
+fn gql_initial_failure_subtype(s: &str) -> GqlInitialFailureSubtype {
+    match s {
+        "plan_event_instead_of_output" => GqlInitialFailureSubtype::PlanEventInsteadOfOutput,
+        "empty_submit_after_plan" => GqlInitialFailureSubtype::EmptySubmitAfterPlan,
+        "file_plan_written_instead_of_payload" => GqlInitialFailureSubtype::FilePlanWrittenInsteadOfPayload,
+        "repair_repeated_plan_behavior" => GqlInitialFailureSubtype::RepairRepeatedPlanBehavior,
+        "malformed_envelope" => GqlInitialFailureSubtype::MalformedEnvelope,
+        "wrong_output_key" => GqlInitialFailureSubtype::WrongOutputKey,
+        "wrong_channel" => GqlInitialFailureSubtype::WrongChannel,
+        "wrong_canonical_path" => GqlInitialFailureSubtype::WrongCanonicalPath,
+        "missing_required_field" => GqlInitialFailureSubtype::MissingRequiredField,
+        "unsafe_continuation" => GqlInitialFailureSubtype::UnsafeContinuation,
+        "oversized_payload" => GqlInitialFailureSubtype::OversizedPayload,
+        "unattributable_envelope" => GqlInitialFailureSubtype::UnattributableEnvelope,
+        "oversized_fallback_packet" => GqlInitialFailureSubtype::OversizedFallbackPacket,
+        "principal_revoked" => GqlInitialFailureSubtype::PrincipalRevoked,
+        "transcript_recovery_flag_missing" => GqlInitialFailureSubtype::TranscriptRecoveryFlagMissing,
+        _ => GqlInitialFailureSubtype::UnknownEnumValue,
+    }
+}
+
+fn gql_final_output_settlement(s: &str) -> GqlFinalOutputSettlement {
+    match s {
+        "valid_outputs_from_completed_execution" => GqlFinalOutputSettlement::ValidOutputsFromCompletedExecution,
+        "valid_outputs_from_repair" => GqlFinalOutputSettlement::ValidOutputsFromRepair,
+        "valid_outputs_from_transcript_recovery" => GqlFinalOutputSettlement::ValidOutputsFromTranscriptRecovery,
+        "valid_outputs_from_provider_envelope" => GqlFinalOutputSettlement::ValidOutputsFromProviderEnvelope,
+        "valid_outputs_from_fallback" => GqlFinalOutputSettlement::ValidOutputsFromFallback,
+        "blocked_missing_required_outputs" => GqlFinalOutputSettlement::BlockedMissingRequiredOutputs,
+        "blocked_invalid_required_outputs" => GqlFinalOutputSettlement::BlockedInvalidRequiredOutputs,
+        "blocked_provider_mode_mismatch" => GqlFinalOutputSettlement::BlockedProviderModeMismatch,
+        "ignored_late_outputs" => GqlFinalOutputSettlement::IgnoredLateOutputs,
+        "cancelled" => GqlFinalOutputSettlement::Cancelled,
+        "failed_transport" => GqlFinalOutputSettlement::FailedTransport,
+        _ => GqlFinalOutputSettlement::DeadlineExceeded,
+    }
+}
+
+fn gql_recommended_next_action(s: &str) -> GqlRecommendedNextAction {
+    match s {
+        "continue" => GqlRecommendedNextAction::Continue,
+        "inspect_repair_evidence" => GqlRecommendedNextAction::InspectRepairEvidence,
+        "configure_fallback_policy" => GqlRecommendedNextAction::ConfigureFallbackPolicy,
+        "operator_resolve_approval" => GqlRecommendedNextAction::OperatorResolveApproval,
+        "operator_resolve_workflow_conflict" => GqlRecommendedNextAction::OperatorResolveWorkflowConflict,
+        "retry_after_transport_restored" => GqlRecommendedNextAction::RetryAfterTransportRestored,
+        "cancel_acknowledged" => GqlRecommendedNextAction::CancelAcknowledged,
+        _ => GqlRecommendedNextAction::ManualInvestigation,
+    }
+}
+
+fn gql_permission_decision_value(s: &str) -> GqlPermissionDecisionValue {
+    match s {
+        "allowed" => GqlPermissionDecisionValue::Allowed,
+        _ => GqlPermissionDecisionValue::Denied,
+    }
+}
+
+fn gql_permission_resource_kind(s: &str) -> GqlPermissionResourceKind {
+    match s {
+        "fs_write_canonical_output_path" => GqlPermissionResourceKind::FsWriteCanonicalOutputPath,
+        "fs_write_other" => GqlPermissionResourceKind::FsWriteOther,
+        "fs_read" => GqlPermissionResourceKind::FsRead,
+        "shell" => GqlPermissionResourceKind::Shell,
+        "network" => GqlPermissionResourceKind::Network,
+        "tool_mcp" => GqlPermissionResourceKind::ToolMcp,
+        _ => GqlPermissionResourceKind::ToolCustom,
     }
 }
 
@@ -1115,8 +1352,8 @@ fn p079_gql_permission_decisions(json: &str, _include_operator_debug: bool) -> V
         .filter_map(|e| {
             Some(GqlPermissionDecision {
                 method: e["method"].as_str()?.to_owned(),
-                resource_kind: e["resource_kind"].as_str().unwrap_or("tool_custom").to_owned(),
-                decision: e["decision"].as_str().unwrap_or("denied").to_owned(),
+                resource_kind: gql_permission_resource_kind(e["resource_kind"].as_str().unwrap_or("tool_custom")),
+                decision: gql_permission_decision_value(e["decision"].as_str().unwrap_or("denied")),
                 reason: e["reason"].as_str().unwrap_or("").to_owned(),
             })
         })
@@ -1333,15 +1570,15 @@ impl GqlAgentExecution {
             agent_execution_id: ID(row.agent_execution_id),
             session_generation_id: row.session_generation_id,
             role: row.role,
-            provider_family: row.provider_family,
-            adapter_family: row.adapter_family,
-            required_output_mode: row.required_output_mode,
+            provider_family: gql_provider_family(&row.provider_family),
+            adapter_family: gql_adapter_family(&row.adapter_family),
+            required_output_mode: gql_required_output_mode(&row.required_output_mode),
             initial_failure_class: gql_initial_failure_class(&row.initial_failure_class),
-            initial_failure_subtype: row.initial_failure_subtype,
+            initial_failure_subtype: row.initial_failure_subtype.as_deref().map(gql_initial_failure_subtype),
             status: gql_output_contract_repair_status(&row.status),
             presentation_category: gql_presentation_category(&row.presentation_category),
-            recommended_next_action: row.recommended_next_action,
-            final_output_settlement: row.final_output_settlement,
+            recommended_next_action: gql_recommended_next_action(&row.recommended_next_action),
+            final_output_settlement: row.final_output_settlement.as_deref().map(gql_final_output_settlement),
             same_session_repair: p079_gql_same_session_repair(row.same_session_repair_json.as_deref())
                 .unwrap_or_else(|| GqlSameSessionRepair {
                     result: GqlSameSessionRepairResult::NotNeeded,
@@ -1387,8 +1624,12 @@ impl GqlAgentExecution {
                 repair_max_per_invocation: 1,
                 fallback_max_per_invocation: 1,
             },
-            repair_prompt_template_version: row.repair_prompt_template_version,
-            recovery_parser_version: row.recovery_parser_version,
+            repair_prompt_template_version: row
+                .repair_prompt_template_version
+                .unwrap_or_else(|| "p079_repair_v1".to_string()),
+            recovery_parser_version: row
+                .recovery_parser_version
+                .unwrap_or_else(|| "p079_recovery_v1".to_string()),
             policy_feature_flags: p079_gql_policy_feature_flags(&row.policy_feature_flags_json),
             // SEC-003: Gate evidence_artifact_path behind include_operator_debug to match
             // MCP redaction policy; prevents non-operator callers from learning run-meta
@@ -1403,7 +1644,7 @@ impl GqlAgentExecution {
             evidence_version: row.evidence_version,
             projection_integrity: row.projection_integrity,
             projection_stale_since: row.projection_stale_since,
-            recorded_at: Some(row.recorded_at),
+            recorded_at: row.recorded_at,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }))
@@ -1483,6 +1724,12 @@ impl GqlAgentExecutionRuntimeFacts {
                 }
                 domain::agent::AgentFailureKind::HostInterruption => {
                     AgentFailureKind::HostInterruption
+                }
+                domain::agent::AgentFailureKind::ToolOutputBudgetPreflightDenied => {
+                    AgentFailureKind::ToolOutputBudgetPreflightDenied
+                }
+                domain::agent::AgentFailureKind::ToolOutputBudgetExceeded => {
+                    AgentFailureKind::ToolOutputBudgetExceeded
                 }
                 domain::agent::AgentFailureKind::Unknown => AgentFailureKind::Unknown,
             }),
@@ -1821,6 +2068,27 @@ mod tests {
             p079_safe_relative_path(Some("output_contract_repair/abc/plan.json")),
             Some("output_contract_repair/abc/plan.json"),
             "safe path must still pass after adding encoded-traversal rejection"
+        );
+    }
+
+    // SEC-P079-LOW-001: mixed literal/encoded traversal must be rejected after percent-decode.
+    // Covers %2e. and .%2e forms that bypass single-layer checks.
+    #[test]
+    fn p079_safe_relative_path_rejects_mixed_encoded_traversal() {
+        // %2e. is percent-encoded '.' followed by literal '.' → decoded ".." = traversal
+        assert_eq!(p079_safe_relative_path(Some("%2e./etc/passwd")), None, "%2e. must be rejected");
+        assert_eq!(p079_safe_relative_path(Some(".%2e/etc/passwd")), None, ".%2e must be rejected");
+        // Uppercase variants
+        assert_eq!(p079_safe_relative_path(Some("%2E./etc/passwd")), None, "%2E. uppercase must be rejected");
+        assert_eq!(p079_safe_relative_path(Some(".%2E/etc/passwd")), None, ".%2E uppercase must be rejected");
+        // Fully encoded / as %2F in a traversal sequence
+        assert_eq!(p079_safe_relative_path(Some("..%2Fetc%2Fpasswd")), None, "..%2F must be rejected");
+        // Double-encoded %252e (decoded once = %2e, still single-encode — not further decoded here, but reject %25)
+        // A normal safe path must still pass
+        assert_eq!(
+            p079_safe_relative_path(Some("output_contract_repair/plan_evidence/plan.md")),
+            Some("output_contract_repair/plan_evidence/plan.md"),
+            "safe path must still pass"
         );
     }
 }

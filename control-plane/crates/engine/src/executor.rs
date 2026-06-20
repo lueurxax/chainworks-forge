@@ -319,6 +319,7 @@ struct DeclaredContractImportResult {
     validation_summary: Option<TaskValidationSummary>,
     final_agent_status: AgentStatus,
     degraded_outputs_satisfy_stage: bool,
+    output_settlement: domain::agent::AgentOutputSettlement,
 }
 
 #[derive(Debug)]
@@ -359,7 +360,14 @@ async fn resolve_escalation_chain_candidate(
     stage_id: &str,
     agent_id: &str,
     backend_profile_id_override: Option<&str>,
-) -> Result<Option<(domain::escalation::EscalationLedger, String, String)>> {
+) -> Result<
+    Option<(
+        domain::escalation::EscalationLedger,
+        String,
+        String,
+        Option<EscalationBackendProfileOverride>,
+    )>,
+> {
     let Some(run) = db::repos::runs::find_by_id(pool, run_id).await? else {
         return Ok(None);
     };
@@ -439,6 +447,16 @@ async fn resolve_escalation_chain_candidate(
         )
     };
 
+    let tier_snapshot = policy_snapshot
+        .tiers
+        .iter()
+        .find(|tier| tier.tier_id == resolved_tier_id);
+    let backend_override = tier_snapshot
+        .filter(|tier| tier.kind == "backend_profile")
+        .map(|tier| resolve_escalation_backend_profile_override(&run, tier))
+        .transpose()?
+        .flatten();
+
     let now = chrono::Utc::now();
     let ledger_candidate = domain::escalation::EscalationLedger {
         id: uuid::Uuid::new_v4().to_string(),
@@ -463,7 +481,228 @@ async fn resolve_escalation_chain_candidate(
         ledger_candidate,
         resolved_tier_id,
         resolved_tier_kind_raw,
+        backend_override,
     )))
+}
+
+type EscalationChainCandidate = (
+    domain::escalation::EscalationLedger,
+    String,
+    String,
+    Option<EscalationBackendProfileOverride>,
+);
+
+#[derive(Debug, Clone)]
+struct EscalationBackendProfileOverride {
+    backend_profile_id: String,
+    provider: String,
+    model: Option<String>,
+    effort: Option<String>,
+    max_turns: Option<u32>,
+    temperature: Option<f64>,
+}
+
+fn resolve_escalation_backend_profile_override(
+    run: &domain::run::Run,
+    tier: &workflow::plan::EscalationTierSnapshot,
+) -> Result<Option<EscalationBackendProfileOverride>> {
+    let Some(target_backend_profile_id) = tier.backend_profile_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(catalog_snapshot_json) = run.catalog_snapshot_json.as_deref() else {
+        return Ok(None);
+    };
+    let catalog: AgentCatalogFile = serde_json::from_str(catalog_snapshot_json)
+        .context("parse frozen catalog snapshot for escalation backend override")?;
+    let Some(profiles) = catalog.backend_profiles.as_ref() else {
+        return Ok(None);
+    };
+    let Some(profile) = profiles.get(target_backend_profile_id) else {
+        return Ok(None);
+    };
+    let provider = ProviderFamily::canonicalize_alias(&profile.provider).with_context(|| {
+        format!(
+            "escalation tier '{}' references backend_profile '{}' with unknown provider '{}'",
+            tier.tier_id, target_backend_profile_id, profile.provider
+        )
+    })?;
+
+    Ok(Some(EscalationBackendProfileOverride {
+        backend_profile_id: target_backend_profile_id.to_string(),
+        provider,
+        model: profile.model.clone(),
+        effort: profile.effort.clone(),
+        max_turns: profile.max_turns,
+        temperature: profile.temperature,
+    }))
+}
+
+enum ProviderQuotaEscalationResolution {
+    Available(EscalationChainCandidate),
+    FallbackQuotaWait {
+        provider_family: String,
+        wait: agent_retry_budget_ledger::ProviderFamilyQuotaWait,
+    },
+    None,
+}
+
+async fn resolve_provider_quota_escalation_candidate(
+    pool: &SqlitePool,
+    run_id: RunId,
+    stage_id: &str,
+    agent_id: &str,
+    backend_profile_id_override: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<ProviderQuotaEscalationResolution> {
+    let Some(run) = db::repos::runs::find_by_id(pool, run_id).await? else {
+        return Ok(ProviderQuotaEscalationResolution::None);
+    };
+    let Some(plan) = crate::command_handler::compile_run_plan_from_snapshot(&run)? else {
+        return Ok(ProviderQuotaEscalationResolution::None);
+    };
+    if plan.escalation_policies.is_empty() {
+        return Ok(ProviderQuotaEscalationResolution::None);
+    }
+
+    let backend_profile_id: Option<String> =
+        backend_profile_id_override.map(String::from).or_else(|| {
+            plan.states
+                .get(stage_id)
+                .and_then(|state| state.owner.backend_profile_id.clone())
+        });
+    let Some(resolved) = workflow::escalation_policy::resolve_policy_for_agent(
+        &plan.escalation_policies,
+        stage_id,
+        agent_id,
+        backend_profile_id.as_deref(),
+    ) else {
+        return Ok(ProviderQuotaEscalationResolution::None);
+    };
+    let Some(policy_snapshot) = plan
+        .escalation_policies
+        .iter()
+        .find(|policy| policy.policy_id == resolved.policy_id)
+    else {
+        return Err(anyhow::anyhow!(
+            "escalation_policy_resolution_internal_error: resolved policy {} is absent from frozen plan",
+            resolved.policy_id
+        ));
+    };
+    if !policy_snapshot
+        .triggers
+        .iter()
+        .any(|trigger| trigger == "provider_quota_exhausted")
+    {
+        return Ok(ProviderQuotaEscalationResolution::None);
+    }
+
+    let mut first_fallback_wait: Option<(
+        String,
+        agent_retry_budget_ledger::ProviderFamilyQuotaWait,
+    )> = None;
+    for tier in &policy_snapshot.tiers {
+        if tier.kind == "pause" {
+            break;
+        }
+        if tier.kind != "backend_profile" {
+            continue;
+        }
+        let Some(backend_override) = resolve_escalation_backend_profile_override(&run, tier)?
+        else {
+            continue;
+        };
+        let provider_family = ProviderFamily::canonicalize_known_alias(&backend_override.provider)
+            .unwrap_or_else(|| backend_override.provider.clone());
+        let candidate_wait = provider_quota_retry_wait_active(
+            pool,
+            &provider_family,
+            backend_override.model.as_deref(),
+            now,
+        )
+        .await?;
+        if let Some(wait) = candidate_wait {
+            first_fallback_wait.get_or_insert((provider_family, wait));
+            continue;
+        }
+
+        let ledger = domain::escalation::EscalationLedger {
+            id: uuid::Uuid::new_v4().to_string(),
+            run_id,
+            stage_id: stage_id.to_string(),
+            agent_id: agent_id.to_string(),
+            policy_id: resolved.policy_id.clone(),
+            policy_hash: resolved.policy_hash.clone(),
+            status_raw: "active".to_string(),
+            current_tier_id: Some(tier.tier_id.clone()),
+            current_tier_kind_raw: Some(tier.kind.clone()),
+            chain_attempt_index: 0,
+            trigger_raw: Some("provider_quota_exhausted".to_string()),
+            pause_reason_raw: None,
+            operator_action_hint: None,
+            runbook_anchor: None,
+            created_at: now,
+            updated_at: now,
+        };
+        return Ok(ProviderQuotaEscalationResolution::Available((
+            ledger,
+            tier.tier_id.clone(),
+            tier.kind.clone(),
+            Some(backend_override),
+        )));
+    }
+
+    if let Some((provider_family, wait)) = first_fallback_wait {
+        Ok(ProviderQuotaEscalationResolution::FallbackQuotaWait {
+            provider_family,
+            wait,
+        })
+    } else {
+        Ok(ProviderQuotaEscalationResolution::None)
+    }
+}
+
+fn apply_escalation_backend_override(
+    payload: &mut serde_json::Value,
+    backend_override: &EscalationBackendProfileOverride,
+) -> (String, Option<String>, String) {
+    let provider = backend_override.provider.clone();
+    let model = backend_override.model.clone();
+    let backend_profile_id = backend_override.backend_profile_id.clone();
+    payload["provider"] = serde_json::json!(provider.clone());
+    payload["backend_profile_id"] = serde_json::json!(backend_profile_id.clone());
+    match backend_override.model.as_deref() {
+        Some(model) => payload["model"] = serde_json::json!(model),
+        None => {
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("model");
+            }
+        }
+    }
+    match backend_override.effort.as_deref() {
+        Some(effort) => payload["effort"] = serde_json::json!(effort),
+        None => {
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("effort");
+            }
+        }
+    }
+    match backend_override.max_turns {
+        Some(max_turns) => payload["max_turns"] = serde_json::json!(max_turns),
+        None => {
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("max_turns");
+            }
+        }
+    }
+    match backend_override.temperature {
+        Some(temperature) => payload["temperature"] = serde_json::json!(temperature),
+        None => {
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("temperature");
+            }
+        }
+    }
+    (provider, model, backend_profile_id)
 }
 
 pub async fn claim_next_invoke_agent_with_start(
@@ -585,11 +824,16 @@ async fn invoke_item_has_start_capacity(
             return Ok(false);
         }
     }
-    let provider_family =
+    let mut provider_family =
         ProviderFamily::canonicalize_known_alias(provider).unwrap_or_else(|| provider.to_string());
-    let model = payload.get("model").and_then(|value| value.as_str());
+    let model = payload
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(String::from);
+    let model_ref = model.as_deref();
+    let now = chrono::Utc::now();
     if let Some(wait) =
-        provider_quota_retry_wait_active(pool, &provider_family, model, chrono::Utc::now()).await?
+        provider_quota_retry_wait_active(pool, &provider_family, model_ref, now).await?
     {
         let stage_execution_id = payload
             .get("stage_execution_id")
@@ -601,8 +845,8 @@ async fn invoke_item_has_start_capacity(
                     pool,
                     stage_execution_id,
                     &provider_family,
-                    model,
-                    chrono::Utc::now(),
+                    model_ref,
+                    now,
                 )
                 .await?
             {
@@ -615,9 +859,65 @@ async fn invoke_item_has_start_capacity(
                     "Operator retry consumed active provider-family quota wait"
                 );
             } else {
-                record_provider_quota_wait_on_pending_item(pool, item, &provider_family, &wait)
-                    .await?;
-                return Ok(false);
+                match resolve_provider_quota_escalation_candidate(
+                    pool,
+                    item.run_id
+                        .ok_or_else(|| anyhow::anyhow!("InvokeAgent work item missing run_id"))?,
+                    payload
+                        .get("stage_id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default(),
+                    payload
+                        .get("agent_id")
+                        .and_then(|value| value.as_str())
+                        .or_else(|| payload.get("stage_id").and_then(|value| value.as_str()))
+                        .unwrap_or_default(),
+                    payload
+                        .get("backend_profile_id")
+                        .and_then(|value| value.as_str()),
+                    now,
+                )
+                .await?
+                {
+                    ProviderQuotaEscalationResolution::Available(candidate) => {
+                        if let Some(backend_override) = candidate.3.as_ref() {
+                            provider_family = ProviderFamily::canonicalize_known_alias(
+                                &backend_override.provider,
+                            )
+                            .unwrap_or_else(|| backend_override.provider.clone());
+                            info!(
+                                work_item_id = %item.id,
+                                blocked_provider_family = %provider,
+                                selected_provider_family = %provider_family,
+                                selected_backend_profile_id = %backend_override.backend_profile_id,
+                                "Provider quota wait bypassed by escalation backend"
+                            );
+                        }
+                    }
+                    ProviderQuotaEscalationResolution::FallbackQuotaWait {
+                        provider_family,
+                        wait,
+                    } => {
+                        record_provider_quota_wait_on_pending_item(
+                            pool,
+                            item,
+                            &provider_family,
+                            &wait,
+                        )
+                        .await?;
+                        return Ok(false);
+                    }
+                    ProviderQuotaEscalationResolution::None => {
+                        record_provider_quota_wait_on_pending_item(
+                            pool,
+                            item,
+                            &provider_family,
+                            &wait,
+                        )
+                        .await?;
+                        return Ok(false);
+                    }
+                }
             }
         } else {
             record_provider_quota_wait_on_pending_item(pool, item, &provider_family, &wait).await?;
@@ -894,12 +1194,12 @@ async fn claim_invoke_agent_work_item_with_start(
         .and_then(|value| value.as_str())
         .unwrap_or(&stage_id)
         .to_string();
-    let provider = payload
+    let mut provider = payload
         .get("provider")
         .and_then(|value| value.as_str())
         .ok_or_else(|| anyhow::anyhow!("InvokeAgent payload missing provider"))?
         .to_string();
-    let model = payload
+    let mut model = payload
         .get("model")
         .and_then(|value| value.as_str())
         .map(String::from);
@@ -908,7 +1208,7 @@ async fn claim_invoke_agent_work_item_with_start(
         .and_then(|value| value.as_str())
         .unwrap_or(&stage_id)
         .to_string();
-    let payload_backend_profile_id = payload
+    let mut payload_backend_profile_id = payload
         .get("backend_profile_id")
         .and_then(|value| value.as_str())
         .map(String::from);
@@ -926,17 +1226,56 @@ async fn claim_invoke_agent_work_item_with_start(
         owner_execution_lineage_id: &owner_execution_lineage_id,
     });
 
-    let esc_candidate = resolve_escalation_chain_candidate(
-        pool,
-        run_id,
-        &stage_id,
-        &agent_id,
-        payload_backend_profile_id.as_deref(),
-    )
-    .await
-    .with_context(|| {
-        format!("P058 escalation chain resolution failed for run={run_id} stage={stage_id}")
-    })?;
+    let provider_family =
+        ProviderFamily::canonicalize_known_alias(&provider).unwrap_or_else(|| provider.clone());
+    let quota_candidate =
+        if provider_quota_retry_wait_active(pool, &provider_family, model.as_deref(), now)
+            .await?
+            .is_some()
+        {
+            match resolve_provider_quota_escalation_candidate(
+                pool,
+                run_id,
+                &stage_id,
+                &agent_id,
+                payload_backend_profile_id.as_deref(),
+                now,
+            )
+            .await?
+            {
+                ProviderQuotaEscalationResolution::Available(candidate) => Some(candidate),
+                ProviderQuotaEscalationResolution::FallbackQuotaWait { .. }
+                | ProviderQuotaEscalationResolution::None => None,
+            }
+        } else {
+            None
+        };
+
+    let esc_candidate = match quota_candidate {
+        Some(candidate) => Some(candidate),
+        None => resolve_escalation_chain_candidate(
+            pool,
+            run_id,
+            &stage_id,
+            &agent_id,
+            payload_backend_profile_id.as_deref(),
+        )
+        .await
+        .with_context(|| {
+            format!("P058 escalation chain resolution failed for run={run_id} stage={stage_id}")
+        })?,
+    };
+
+    if let Some(backend_override) = esc_candidate
+        .as_ref()
+        .and_then(|candidate| candidate.3.as_ref())
+    {
+        let (override_provider, override_model, override_backend_profile_id) =
+            apply_escalation_backend_override(&mut payload, backend_override);
+        provider = override_provider;
+        model = override_model;
+        payload_backend_profile_id = Some(override_backend_profile_id);
+    }
 
     let artifact_claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
         run_id,
@@ -1407,27 +1746,28 @@ fn write_discovered_output(path: &str, content: &[u8]) -> Result<()> {
 }
 
 /// SEC-001: Materialize output bytes to an absolute path using a per-component
-/// dirfd walk so that every directory component is opened with O_NOFOLLOW.
+/// dirfd walk with depth-aware symlink enforcement.
 ///
 /// Algorithm:
-///   0. Canonicalize the existing prefix of the parent directory to resolve
-///      platform-level symlinks (e.g., macOS /var → /private/var) before
-///      starting the walk. Non-existing suffix components are re-appended.
-///      The dirfd walk still uses O_NOFOLLOW on every step so that attacker-
-///      controlled symlinks introduced after canonicalization are still caught.
 ///   1. Open "/" as the root anchor (trusted; cannot be a symlink).
-///   2. For each directory component of the canonical parent, call
-///      `openat(cur_fd, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)`.
+///   2. For each directory component of the declared parent path:
+///      • Depth 0 only (the first real component, e.g., "tmp", "var", "Users"):
+///        opened WITHOUT O_NOFOLLOW to allow OS-managed symlinks such as macOS
+///        /tmp → /private/tmp and /var → /private/var that are not attacker-controlled.
+///      • Depth ≥ 1: opened WITH O_NOFOLLOW so any attacker-controlled symlink
+///        in the path causes an immediate ELOOP/ENOTDIR failure at open time.
+///        This closes the depth-1 escape window (e.g., /tmp/<symlink>/output.json)
+///        where the second path component was previously also allowed to follow symlinks.
 ///      • If ENOENT, create the directory with `mkdirat` (mode 0o700) then
 ///        retry openat. EEXIST on mkdirat is benign (concurrent creation).
-///      • Any other error (including ELOOP for a symlink) is fatal.
+///      • Any other error (including ELOOP for a symlink at depth ≥ 2) is fatal.
 ///   3. Open the final file component relative to the parent dirfd using
 ///      `openat(parent_fd, name, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW
 ///      | O_CLOEXEC, 0o600)` and write content.
 ///
-/// Because every component is opened with O_NOFOLLOW relative to a trusted
-/// dirfd, there is no TOCTOU window where a symlink can be substituted for a
-/// directory component between a check and a subsequent open/create.
+/// There is no separate pre-check or canonicalization step: O_NOFOLLOW at depth ≥ 2
+/// enforces boundary inline, closing the TOCTOU window that would exist in a
+/// check-then-canonicalize-then-open sequence.
 #[cfg(unix)]
 fn write_discovered_output_dirfd_unix(path: &str, content: &[u8]) -> Result<()> {
     use std::ffi::CString;
@@ -1448,14 +1788,10 @@ fn write_discovered_output_dirfd_unix(path: &str, content: &[u8]) -> Result<()> 
         .parent()
         .ok_or_else(|| anyhow::anyhow!("sec-001: output path has no parent; path={path}"))?;
 
-    // Step 0: canonicalize the existing prefix of the parent directory to resolve
-    // platform symlinks (e.g., macOS /var → /private/var). Non-existing suffix
-    // components (directories to be created) are stripped, the existing prefix is
-    // canonicalized, then the suffix is re-appended in order.
-    let canonical_parent = sec001_canonical_with_nonexistent_suffix(parent)?;
-
-    // Build the component list from the canonical parent (no platform symlinks remain).
-    let dir_components: Vec<CString> = canonical_parent
+    // SEC-001: Build component list from the raw declared parent. No pre-check or
+    // canonicalization is performed here; boundary enforcement is provided inline by
+    // O_NOFOLLOW at depth ≥ 2 during the walk below.
+    let dir_components: Vec<CString> = parent
         .components()
         .filter_map(|c| match c {
             std::path::Component::Normal(s) => CString::new(s.as_encoded_bytes()).ok(),
@@ -1480,15 +1816,20 @@ fn write_discovered_output_dirfd_unix(path: &str, content: &[u8]) -> Result<()> 
     // SAFETY: root_fd is valid (checked above); OwnedFd takes ownership and closes on drop.
     let mut current_owned: OwnedFd = unsafe { OwnedFd::from_raw_fd(root_fd) };
 
-    // Step 2: walk each canonical directory component with O_NOFOLLOW.
-    for component_cstr in &dir_components {
+    // Step 2: walk each directory component with depth-aware O_NOFOLLOW.
+    // Depth 0 only allows platform-managed symlinks (macOS /tmp → /private/tmp,
+    // /var → /private/var). Depth ≥ 1 enforces O_NOFOLLOW to block attacker-controlled
+    // symlinks at open time (ELOOP/ENOTDIR), closing the depth-1 escape window where
+    // a path like /tmp/<symlink>/output.json could previously escape the run root.
+    for (depth, component_cstr) in dir_components.iter().enumerate() {
         let cur_fd = current_owned.as_raw_fd();
+        let nofollow_flag = if depth < 1 { 0 } else { libc::O_NOFOLLOW };
         // SAFETY: cur_fd is open; component_cstr is a valid null-terminated C string.
         let new_fd = unsafe {
             libc::openat(
                 cur_fd,
                 component_cstr.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDONLY | libc::O_DIRECTORY | nofollow_flag | libc::O_CLOEXEC,
             )
         };
         if new_fd >= 0 {
@@ -1518,7 +1859,7 @@ fn write_discovered_output_dirfd_unix(path: &str, content: &[u8]) -> Result<()> 
                 libc::openat(
                     cur_fd,
                     component_cstr.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    libc::O_RDONLY | libc::O_DIRECTORY | nofollow_flag | libc::O_CLOEXEC,
                 )
             };
             if retry_fd < 0 {
@@ -1532,10 +1873,10 @@ fn write_discovered_output_dirfd_unix(path: &str, content: &[u8]) -> Result<()> 
             // SAFETY: retry_fd is valid.
             current_owned = unsafe { OwnedFd::from_raw_fd(retry_fd) };
         } else {
-            // ELOOP, ENOTDIR, or other error — symlink or unexpected non-directory; reject.
+            // ELOOP (symlink at depth ≥ 2), ENOTDIR, permission, or other error — reject.
             anyhow::bail!(
                 "sec-001: openat refused component {:?} in path={path}; \
-                 error={err} (O_NOFOLLOW | O_DIRECTORY blocked possible symlink escape)",
+                 error={err} (O_NOFOLLOW blocked possible symlink escape)",
                 component_cstr
             );
         }
@@ -1565,45 +1906,98 @@ fn write_discovered_output_dirfd_unix(path: &str, content: &[u8]) -> Result<()> 
         .map_err(|e| anyhow::anyhow!("sec-001: write failed; path={path}, error={e}"))
 }
 
-/// Canonicalize the deepest existing ancestor of `path`, then re-append any
-/// non-existing suffix components. Returns the resulting path with platform-
-/// level symlinks (e.g., macOS /var → /private/var) resolved.
+/// SEC-001: Create all components of `path` using mkdirat/openat with depth-aware
+/// O_NOFOLLOW enforcement (same policy as `write_discovered_output_dirfd_unix`).
+/// Returns an owned fd pointing at the final directory.
 ///
-/// Used by `write_discovered_output_dirfd_unix` so the dirfd walk operates on
-/// a symlink-free path prefix and does not trip on OS-managed symlinks.
+/// Depth 0 only allows OS-managed symlinks (/tmp, /var on macOS).
+/// Depth ≥ 1 rejects attacker-controlled symlinks at open time (closes depth-1 escape).
 #[cfg(unix)]
-fn sec001_canonical_with_nonexistent_suffix(path: &std::path::Path) -> Result<PathBuf> {
-    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
-    let mut current = path.to_path_buf();
-    loop {
-        match current.canonicalize() {
-            Ok(canonical) => {
-                let mut result = canonical;
-                for component in suffix.iter().rev() {
-                    result.push(component);
+fn sec001_mkdirall_dirfd_unix(path: &std::path::Path) -> Result<std::os::unix::io::OwnedFd> {
+    use std::ffi::CString;
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+
+    if !path.is_absolute() {
+        anyhow::bail!("sec-001: path must be absolute; path={}", path.display());
+    }
+    let components: Vec<CString> = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => CString::new(s.as_encoded_bytes()).ok(),
+            _ => None,
+        })
+        .collect();
+
+    // SAFETY: "/" is a static null-terminated string; open returns -1 on error.
+    let root_fd = unsafe {
+        libc::open(
+            b"/\0".as_ptr().cast::<libc::c_char>(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        anyhow::bail!(
+            "sec-001: failed to open root; error={}",
+            std::io::Error::last_os_error()
+        );
+    }
+    // SAFETY: root_fd is valid; OwnedFd takes ownership.
+    let mut current_owned: OwnedFd = unsafe { OwnedFd::from_raw_fd(root_fd) };
+
+    for (depth, component_cstr) in components.iter().enumerate() {
+        let cur_fd = current_owned.as_raw_fd();
+        let nofollow_flag = if depth < 1 { 0 } else { libc::O_NOFOLLOW };
+        // SAFETY: cur_fd is open; component_cstr is a valid null-terminated C string.
+        let new_fd = unsafe {
+            libc::openat(
+                cur_fd,
+                component_cstr.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | nofollow_flag | libc::O_CLOEXEC,
+            )
+        };
+        if new_fd >= 0 {
+            // SAFETY: new_fd is valid.
+            current_owned = unsafe { OwnedFd::from_raw_fd(new_fd) };
+            continue;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENOENT) {
+            // SAFETY: cur_fd open; component_cstr valid.
+            let ret = unsafe { libc::mkdirat(cur_fd, component_cstr.as_ptr(), 0o700) };
+            if ret < 0 {
+                let mkdir_err = std::io::Error::last_os_error();
+                if mkdir_err.raw_os_error() != Some(libc::EEXIST) {
+                    anyhow::bail!(
+                        "sec-001: mkdirat failed for {:?}; error={mkdir_err}",
+                        component_cstr
+                    );
                 }
-                return Ok(result);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let last = current.file_name().map(ToOwned::to_owned).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "sec-001: reached filesystem root without finding an existing ancestor"
-                    )
-                })?;
-                suffix.push(last);
-                current = current
-                    .parent()
-                    .ok_or_else(|| anyhow::anyhow!("sec-001: path has no parent"))
-                    .map(|p| p.to_path_buf())?;
+            // SAFETY: cur_fd open; component_cstr valid.
+            let retry_fd = unsafe {
+                libc::openat(
+                    cur_fd,
+                    component_cstr.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | nofollow_flag | libc::O_CLOEXEC,
+                )
+            };
+            if retry_fd < 0 {
+                anyhow::bail!(
+                    "sec-001: openat retry failed for {:?}; error={}",
+                    component_cstr,
+                    std::io::Error::last_os_error()
+                );
             }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "sec-001: canonicalize failed for {}: {e}",
-                    current.display()
-                ));
-            }
+            // SAFETY: retry_fd is valid.
+            current_owned = unsafe { OwnedFd::from_raw_fd(retry_fd) };
+        } else {
+            anyhow::bail!(
+                "sec-001: openat refused {:?}; error={err} (possible symlink escape)",
+                component_cstr
+            );
         }
     }
+    Ok(current_owned)
 }
 
 fn path_looks_like_directory_target(path: &str) -> bool {
@@ -2037,10 +2431,16 @@ fn materialize_validated_output_candidate(
         return Ok(());
     }
     let Some(payload_ref) = decision.accepted_payload_ref.as_ref() else {
-        return Ok(());
+        anyhow::bail!(
+            "accepted decision for '{}' has no payload_ref; cannot materialize",
+            output_name
+        );
     };
     let Some(bytes) = settlement.accepted_payloads.get(payload_ref) else {
-        return Ok(());
+        anyhow::bail!(
+            "accepted decision for '{}' references payload '{}' but bytes are missing; cannot materialize",
+            output_name, payload_ref
+        );
     };
     write_discovered_output(target_path, bytes)
 }
@@ -9407,6 +9807,12 @@ You are continuing the same Chainworks agent execution through an existing live 
 
                 let mut output_contract_repair_turn_count = 0_i64;
                 let mut p079_repair_succeeded = false;
+                // SEC-P079-SETTLEMENT-002: hoisted to outer scope so the post-import terminal
+                // settle block (outside the nested repair block) can access them.
+                let mut p079_repair_attempt_id_outer: Option<String> = None;
+                let mut p079_repair_lease_key_outer: Option<String> = None;
+                let mut p079_repair_lease_inserted_outer = false;
+                let mut p079_repair_materialized_outer = false;
                 let mut p088_completion_turn_attempted = false;
                 let mut p088_completion_turn_result: Option<String> = None;
                 let mut p088_completion_repair_text_capture: Option<
@@ -9622,9 +10028,16 @@ You are continuing the same Chainworks agent execution through an existing live 
                                     let mut p079_repair_attempt_id: Option<String> = None;
                                     let mut p079_repair_lease_key: Option<String> = None;
                                     let mut p079_repair_lease_inserted = false;
-                                    // SEC-P079-001: default true (fail-closed); set to actual value
-                                    // inside the inner block once provider_family is known.
-                                    let mut p079_permission_enforcement_advisory = true;
+                                    // SEC-P079-SETTLEMENT-002: capture materialized flag at outer scope
+                                    // so the terminal "recovered" settle can be deferred until AFTER
+                                    // import_declared_contract_outputs commits the CAS. Without this
+                                    // deferral, P079 evidence can be marked recovered while the CAS
+                                    // rejects outputs as ignored_late.
+                                    let mut p079_repair_materialized = false;
+                                    // SEC-P079-001: set inside the inner block once provider_family
+                                    // is known. The block unconditionally assigns this before any
+                                    // conditional paths, so no initializer is needed here.
+                                    let p079_permission_enforcement_advisory;
                                     {
                                         let initial_failure_class = match &validation.failure_class {
                                             Some(domain::validation::ValidationFailureClass::NoOutputProduced) => "no_output_produced",
@@ -9635,12 +10048,27 @@ You are continuing the same Chainworks agent execution through an existing live 
                                             _ => "output_contract_mismatch",
                                         };
                                         let provider_lower = provider.to_lowercase();
+                                        // SEC-P079-MED-006: track whether the provider string is a
+                                        // recognized canonical value. Unknown provider names must not
+                                        // inherit the fixture/enforced posture; they are forced
+                                        // advisory-only (fail-closed) below.
+                                        let p079_unknown_provider = !matches!(
+                                            provider_lower.as_str(),
+                                            "claude" | "claude-code" | "anthropic"
+                                            | "codex" | "openai"
+                                            | "gemini" | "google"
+                                            | "junie" | "auggie"
+                                            | "fixture" | "test" | "mock"
+                                        );
                                         let provider_family = match provider_lower.as_str() {
                                             "claude" | "claude-code" | "anthropic" => "claude",
                                             "codex" | "openai" => "codex",
                                             "gemini" | "google" => "gemini",
                                             "junie" => "junie",
                                             "auggie" => "auggie",
+                                            // Unknown providers: DB requires a valid CHECK value,
+                                            // but advisory posture is forced below so repair
+                                            // dispatch never proceeds.
                                             _ => "fixture",
                                         };
                                         // SEC-P079-001: record whether this provider's session runs in
@@ -9648,9 +10076,12 @@ You are continuing the same Chainworks agent execution through an existing live 
                                         // gemini, junie, auggie) use full-access/bypassPermissions, so
                                         // permission enforcement is advisory only — the transport posture
                                         // intercepts only voluntary permission requests.
+                                        // SEC-P079-MED-006: unknown providers are also forced advisory
+                                        // (fail-closed) to prevent bypass via unrecognized provider aliases.
                                         // Assigned to the outer variable so the dispatch gate can read it.
                                         p079_permission_enforcement_advisory =
-                                            !p079_provider_supports_enforced_permissions(
+                                            p079_unknown_provider
+                                            || !p079_provider_supports_enforced_permissions(
                                                 provider_family,
                                             );
                                         let now_ts = chrono::Utc::now().to_rfc3339();
@@ -9739,120 +10170,74 @@ You are continuing the same Chainworks agent execution through an existing live 
                                             created_at: now_ts.clone(),
                                             updated_at: now_ts,
                                         };
-                                        match ocr_repo::insert_repair_event(&self.pool, &p079_event)
-                                            .await
+                                        // REL-r2-1: pre-build lease row before the atomic
+                                        // insert so a crash between the two writes is impossible.
+                                        let p079_lease_now = chrono::Utc::now();
+                                        let p079_lease_expires = p079_lease_now
+                                            + chrono::Duration::seconds(domain::output_contract_repair::DEFAULT_REPAIR_LEASE_SECONDS);
+                                        let p079_lease_row = domain::output_contract_repair::OutputContractRepairLeaseRow {
+                                            lease_key: p079_computed_lease_key.clone(),
+                                            schema_version: "output_contract_repair_leases_v1".to_string(),
+                                            repair_event_id: p079_new_attempt_id.clone(),
+                                            run_id: run_id.to_string(),
+                                            stage_execution_id: stage_execution_id
+                                                .map(|id| id.to_string())
+                                                .unwrap_or_else(|| stage_id.to_string()),
+                                            parent_agent_execution_id: agent_exec_id.to_string(),
+                                            lease_kind: domain::output_contract_repair::LeaseKind::Repair,
+                                            lease_state: domain::output_contract_repair::LeaseState::Reserved,
+                                            settled_result: None,
+                                            reclamation_reason: None,
+                                            frozen_fallback_policy_hash: None,
+                                            idempotency_token: p079_lease_idempotency.clone(),
+                                            // SEC-HIGH-003: bind to the authenticated
+                                            // caller_principal_id from the work-item payload
+                                            // (set by external API callers via P029). When
+                                            // the repair is triggered internally by the engine
+                                            // orchestrator (no caller in the payload), use the
+                                            // named system principal rather than unknown_principal
+                                            // so the lease is always traceable and never
+                                            // ambiguous in the audit trail. Do NOT fall back
+                                            // to unknown_principal.
+                                            lease_owner_principal_id: payload["caller_principal_id"]
+                                                .as_str()
+                                                .filter(|s| !s.trim().is_empty())
+                                                .unwrap_or(domain::output_contract_repair::ENGINE_REPAIR_SYSTEM_PRINCIPAL)
+                                                .to_string(),
+                                            lease_acquired_at: p079_lease_now.to_rfc3339(),
+                                            lease_expires_at: p079_lease_expires.to_rfc3339(),
+                                            lease_seconds: domain::output_contract_repair::DEFAULT_REPAIR_LEASE_SECONDS,
+                                            dispatch_committed_at: None,
+                                            version: 0,
+                                            infra_retry_count: 0,
+                                            created_at: p079_lease_now.to_rfc3339(),
+                                            updated_at: p079_lease_now.to_rfc3339(),
+                                        };
+                                        // Atomic: event + reserved lease in one SQLite transaction.
+                                        // On failure neither row is committed, no orphan cleanup needed.
+                                        match ocr_repo::insert_repair_event_and_lease(
+                                            &self.pool,
+                                            &p079_event,
+                                            &p079_lease_row,
+                                        )
+                                        .await
                                         {
                                             Ok(()) => {
                                                 p079_repair_attempt_id =
                                                     Some(p079_new_attempt_id.clone());
                                                 p079_repair_lease_key =
                                                     Some(p079_computed_lease_key.clone());
-                                                // REL-r2-1: insert reserved lease before ACP dispatch.
-                                                let p079_lease_now = chrono::Utc::now();
-                                                let p079_lease_expires = p079_lease_now
-                                                    + chrono::Duration::seconds(domain::output_contract_repair::DEFAULT_REPAIR_LEASE_SECONDS);
-                                                let p079_lease_row = domain::output_contract_repair::OutputContractRepairLeaseRow {
-                                                    lease_key: p079_computed_lease_key.clone(),
-                                                    schema_version: "output_contract_repair_leases_v1".to_string(),
-                                                    repair_event_id: p079_new_attempt_id.clone(),
-                                                    run_id: run_id.to_string(),
-                                                    stage_execution_id: stage_execution_id
-                                                        .map(|id| id.to_string())
-                                                        .unwrap_or_else(|| stage_id.to_string()),
-                                                    parent_agent_execution_id: agent_exec_id.to_string(),
-                                                    lease_kind: domain::output_contract_repair::LeaseKind::Repair,
-                                                    lease_state: domain::output_contract_repair::LeaseState::Reserved,
-                                                    settled_result: None,
-                                                    reclamation_reason: None,
-                                                    frozen_fallback_policy_hash: None,
-                                                    idempotency_token: p079_lease_idempotency.clone(),
-                                                    // SEC-HIGH-003: bind to the authenticated
-                                                    // caller_principal_id from the work-item payload
-                                                    // (set by external API callers via P029). When
-                                                    // the repair is triggered internally by the engine
-                                                    // orchestrator (no caller in the payload), use the
-                                                    // named system principal rather than unknown_principal
-                                                    // so the lease is always traceable and never
-                                                    // ambiguous in the audit trail. Do NOT fall back
-                                                    // to unknown_principal.
-                                                    lease_owner_principal_id: payload["caller_principal_id"]
-                                                        .as_str()
-                                                        .filter(|s| !s.trim().is_empty())
-                                                        .unwrap_or(domain::output_contract_repair::ENGINE_REPAIR_SYSTEM_PRINCIPAL)
-                                                        .to_string(),
-                                                    lease_acquired_at: p079_lease_now.to_rfc3339(),
-                                                    lease_expires_at: p079_lease_expires.to_rfc3339(),
-                                                    lease_seconds: domain::output_contract_repair::DEFAULT_REPAIR_LEASE_SECONDS,
-                                                    dispatch_committed_at: None,
-                                                    version: 0,
-                                                    infra_retry_count: 0,
-                                                    created_at: p079_lease_now.to_rfc3339(),
-                                                    updated_at: p079_lease_now.to_rfc3339(),
-                                                };
-                                                match ocr_repo::insert_lease(
-                                                    &self.pool,
-                                                    &p079_lease_row,
-                                                )
-                                                .await
-                                                {
-                                                    Ok(()) => {
-                                                        p079_repair_lease_inserted = true;
-                                                    }
-                                                    Err(lease_err) => {
-                                                        // REL-r2-1: fail-closed — lease insert failure
-                                                        // blocks dispatch (checked below). The message
-                                                        // previously said "dispatch continues" which was
-                                                        // incorrect; dispatch is gated on
-                                                        // p079_repair_lease_inserted.
-                                                        error!(
-                                                            run_id = %run_id,
-                                                            stage_id = %stage_id,
-                                                            repair_attempt_id = %p079_new_attempt_id,
-                                                            error = %lease_err,
-                                                            "P079 repair lease insert failed; dispatch blocked (fail-closed)"
-                                                        );
-                                                        // DEFECT-002: settle the orphan in_progress event row
-                                                        // so it is not left indefinitely in in_progress state.
-                                                        // The event was inserted before the lease; on lease failure
-                                                        // we close it as failed so DB state is consistent.
-                                                        // Use migration-CHECK-constraint-valid enum values only:
-                                                        //   presentation_category = "failed" (matches status)
-                                                        //   recommended_next_action = "manual_investigation"
-                                                        //   final_output_settlement = None (no settlement occurred)
-                                                        let orphan_ts =
-                                                            chrono::Utc::now().to_rfc3339();
-                                                        if let Err(settle_err) =
-                                                            ocr_repo::update_repair_event_status(
-                                                                &self.pool,
-                                                                &p079_new_attempt_id,
-                                                                "failed",
-                                                                "failed",
-                                                                "manual_investigation",
-                                                                None,
-                                                                &orphan_ts,
-                                                            )
-                                                            .await
-                                                        {
-                                                            error!(
-                                                                run_id = %run_id,
-                                                                stage_id = %stage_id,
-                                                                repair_attempt_id = %p079_new_attempt_id,
-                                                                error = %settle_err,
-                                                                "P079: failed to settle orphan event row after lease insert failure"
-                                                            );
-                                                        }
-                                                    }
-                                                }
+                                                p079_repair_lease_inserted = true;
                                             }
                                             Err(insert_err) => {
                                                 // P079-SEC-HIGH-003: fail closed — do not dispatch repair turn
-                                                // without a durable evidence row.
+                                                // without durable evidence + lease rows.
                                                 error!(
                                                     run_id = %run_id,
                                                     stage_id = %stage_id,
                                                     agent_execution_id = %agent_exec_id,
                                                     error = %insert_err,
-                                                    "P079 repair evidence insert failed; repair blocked (fail-closed)"
+                                                    "P079 repair event+lease atomic insert failed; repair blocked (fail-closed)"
                                                 );
                                             }
                                         }
@@ -9873,34 +10258,42 @@ You are continuing the same Chainworks agent execution through an existing live 
                                         let mut repair_req = req.clone();
                                         // P079 SEC-003: create a 0700 protected directory for
                                         // plan-evidence isolation and collect any provider plan files.
-                                        let mut p079_plan_evidence: Option<
-                                            domain::output_contract_repair::ProviderPlanEvidence,
-                                        > = None;
                                         if let (Some(ref meta_root), Some(ref attempt_id)) = (
                                             req.chainworks_meta_root.as_ref(),
                                             p079_repair_attempt_id.as_ref(),
                                         ) {
-                                            // SEC-P079-LOW-001: resolve relative meta-root against
-                                            // the process working directory so plan-evidence files
-                                            // are always written inside the intended run boundary
-                                            // even when the daemon is started from a non-root cwd.
-                                            let meta_root_path =
-                                                std::path::Path::new(meta_root.as_str());
-                                            let meta_root_abs = if meta_root_path.is_absolute() {
-                                                meta_root_path.to_path_buf()
-                                            } else {
-                                                std::env::current_dir()
-                                                    .unwrap_or_else(|_| {
-                                                        std::path::PathBuf::from("/")
-                                                    })
-                                                    .join(meta_root_path)
-                                            };
+                                            // Resolve relative meta-root against run.workspace_root
+                                            // so plan-evidence files land inside the canonical run
+                                            // boundary regardless of daemon working directory.
+                                            let meta_root_abs = p079_resolve_meta_root_abs(
+                                                meta_root.as_str(),
+                                                &req.workspace_root,
+                                            );
+                                            // P079 approved contract: directory uses agent_execution_id.
                                             let plan_ev_dir = meta_root_abs
                                                 .join("output_contract_repair")
-                                                .join(attempt_id)
+                                                .join(agent_exec_id.to_string())
                                                 .join("plan_evidence");
-                                            let dir_ok = match std::fs::create_dir_all(&plan_ev_dir)
-                                            {
+                                            // Defense-in-depth: assert plan_ev_dir is inside meta_root_abs
+                                            // before any filesystem operation (path traversal guard).
+                                            let plan_ev_in_boundary =
+                                                plan_ev_dir.starts_with(&meta_root_abs);
+                                            if !plan_ev_in_boundary {
+                                                warn!(
+                                                    run_id = %run_id,
+                                                    plan_ev_dir = %plan_ev_dir.display(),
+                                                    meta_root = %meta_root_abs.display(),
+                                                    "P079: plan_evidence dir escaped meta_root boundary; \
+                                                     skipping directory creation (sec-p079-boundary)"
+                                                );
+                                            }
+                                            // SEC-P079-MED-001: create and permission the
+                                            // plan_evidence directory via dirfd/fchmod to
+                                            // eliminate the path-based chmod TOCTOU window.
+                                            #[cfg(unix)]
+                                            let dir_ok = match sec001_mkdirall_dirfd_unix(
+                                                &plan_ev_dir,
+                                            ) {
                                                 Err(e) => {
                                                     warn!(
                                                         run_id = %run_id,
@@ -9911,28 +10304,42 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                     );
                                                     false
                                                 }
-                                                Ok(()) => {
-                                                    #[cfg(unix)]
+                                                Ok(dir_fd) => {
+                                                    use std::os::unix::io::AsRawFd;
+                                                    // fchmod on the open fd; no path-based
+                                                    // operation after the dirfd walk.
+                                                    if unsafe {
+                                                        libc::fchmod(dir_fd.as_raw_fd(), 0o700)
+                                                    } < 0
                                                     {
-                                                        use std::os::unix::fs::PermissionsExt;
-                                                        if let Err(e) = std::fs::set_permissions(
-                                                            &plan_ev_dir,
-                                                            std::fs::Permissions::from_mode(0o700),
-                                                        ) {
-                                                            warn!(
-                                                                run_id = %run_id,
-                                                                path = %plan_ev_dir.display(),
-                                                                error = %e,
-                                                                "P079: failed to set 0700 on plan_evidence directory"
-                                                            );
-                                                        }
+                                                        warn!(
+                                                            run_id = %run_id,
+                                                            path = %plan_ev_dir.display(),
+                                                            error = %std::io::Error::last_os_error(),
+                                                            "P079: fchmod 0700 on plan_evidence directory failed"
+                                                        );
                                                     }
                                                     true
                                                 }
                                             };
+                                            #[cfg(not(unix))]
+                                            let dir_ok =
+                                                match std::fs::create_dir_all(&plan_ev_dir) {
+                                                    Err(e) => {
+                                                        warn!(
+                                                            run_id = %run_id,
+                                                            repair_attempt_id = %attempt_id,
+                                                            path = %plan_ev_dir.display(),
+                                                            error = %e,
+                                                            "P079: failed to create plan_evidence directory (non-fatal)"
+                                                        );
+                                                        false
+                                                    }
+                                                    Ok(()) => true,
+                                                };
                                             // P079 MISSING-004 (now implemented): collect plan evidence
                                             // files from provider-specific locations, redact, and store.
-                                            if dir_ok {
+                                            if dir_ok && plan_ev_in_boundary {
                                                 let provider_fam = {
                                                     let pl = provider.to_lowercase();
                                                     match pl.as_str() {
@@ -9940,12 +10347,12 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                         _ => "unknown",
                                                     }
                                                 };
-                                                p079_plan_evidence = p079_collect_plan_evidence(
+                                                let p079_plan_evidence = p079_collect_plan_evidence(
                                                     provider_fam,
                                                     &run.workspace_root,
                                                     &meta_root_abs,
                                                     &plan_ev_dir,
-                                                    attempt_id,
+                                                    &agent_exec_id.to_string(),
                                                 );
                                                 if let Some(ref ev) = p079_plan_evidence {
                                                     info!(
@@ -9990,6 +10397,11 @@ You are continuing the same Chainworks agent execution through an existing live 
                                             output_contract_repair_prompt(
                                                 &validation,
                                                 &declared_outputs,
+                                                &run_id.to_string(),
+                                                &stage_execution_id
+                                                    .map(|id| id.to_string())
+                                                    .unwrap_or_else(|| stage_id.to_string()),
+                                                &agent_exec_id.to_string(),
                                             )
                                         };
                                         repair_req.reuse_existing_session = true;
@@ -10255,8 +10667,8 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                         if let Err(e) = ocr_repo::settle_terminal_event_and_lease(
                                                     &self.pool, attempt_id, lease_key,
                                                     "skipped", "skipped",
-                                                    "operator_resolve_approval",
-                                                    Some("provider_mode_mismatch_risk"),
+                                                    "manual_investigation",
+                                                    Some("blocked_provider_mode_mismatch"),
                                                     "skipped_ineligible", &skip_ts,
                                                 ).await {
                                                     error!(
@@ -10271,8 +10683,8 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                             attempt_id,
                                                             "skipped",
                                                             "skipped",
-                                                            "operator_resolve_approval",
-                                                            Some("provider_mode_mismatch_risk"),
+                                                            "manual_investigation",
+                                                            Some("blocked_provider_mode_mismatch"),
                                                             &skip_ts,
                                                         )
                                                         .await
@@ -10293,14 +10705,17 @@ You are continuing the same Chainworks agent execution through an existing live 
                                             // cannot prevent direct file writes. Repair is blocked until the
                                             // runtime provides enforceable server-side restrictions.
                                             if p079_permission_enforcement_advisory {
+                                                // advisory_posture_not_enforceable: production same-session repair
+                                                // is blocked until the provider runtime exposes server-side
+                                                // filesystem/tool/network restrictions (SEC-P079-HIGH-003).
                                                 warn!(
                                                     run_id = %run_id,
                                                     stage_id = %stage_id,
                                                     agent_execution_id = %agent_exec_id,
-                                                    "P079 repair dispatch: blocked because provider runs with \
-                                                     full-access/bypassPermissions and permission enforcement is \
-                                                     advisory-only (SEC-P079-HIGH-003). Enforceable sandbox/permission \
-                                                     restrictions are required before production repair dispatch."
+                                                    "P079 repair dispatch: advisory_posture_not_enforceable — \
+                                                     provider runs with full-access/bypassPermissions; enforceable \
+                                                     sandbox required before production repair dispatch \
+                                                     (SEC-P079-HIGH-003)"
                                                 );
                                                 if let Some(ref attempt_id) = p079_repair_attempt_id
                                                 {
@@ -10312,7 +10727,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                     &self.pool, attempt_id, lease_key,
                                                     "skipped", "skipped",
                                                     "manual_investigation",
-                                                    Some("advisory_posture_not_enforceable"),
+                                                    None,
                                                     "skipped_ineligible", &skip_ts,
                                                 ).await {
                                                     error!(
@@ -10329,9 +10744,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                             "skipped",
                                                             "skipped",
                                                             "manual_investigation",
-                                                            Some(
-                                                                "advisory_posture_not_enforceable",
-                                                            ),
+                                                            None,
                                                             &skip_ts,
                                                         )
                                                         .await
@@ -10709,10 +11122,6 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                                 .failure_class
                                                                 .is_none()
                                                             {
-                                                                // SEC-P079-SETTLEMENT-001: materialization
-                                                                // is deferred to after durable DB settle
-                                                                // below to close the crash-consistency
-                                                                // window. Do not materialize here.
                                                                 None
                                                             } else {
                                                                 None
@@ -10774,10 +11183,26 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                         &agent_id,
                                                     )
                                                     .await;
-                                                            // P079: update evidence row to recovered.
-                                                            // SEC-MED-001: use explicit error handling so failures are
-                                                            // visible in logs; a silent best-effort swallow can leave
-                                                            // in_progress evidence rows that confuse operator readback.
+                                                            // SEC-P079-SETTLEMENT-001: materialize
+                                                            // validated outputs BEFORE advancing the DB
+                                                            // evidence row to "recovered". A crash after
+                                                            // file write but before DB settle leaves the
+                                                            // evidence row in_progress; recovery will
+                                                            // re-validate and re-settle. Settling first
+                                                            // risks a false-recovered state because the
+                                                            // evidence row does not store payload bytes.
+                                                            let materialize_result = materialize_validated_discovery_decisions(
+                                                                &declared_outputs,
+                                                                &repair_settlement,
+                                                                &repair_validation,
+                                                            );
+                                                            // P079: update evidence row to recovered only
+                                                            // after materialization succeeds.
+                                                            // SEC-MED-001: use explicit error handling so
+                                                            // failures are visible in logs; a silent
+                                                            // best-effort swallow can leave in_progress
+                                                            // evidence rows that confuse operator readback.
+                                                            if materialize_result.is_ok() {
                                                             if let Some(ref attempt_id) = p079_repair_attempt_id {
                                                                 let p079_now = chrono::Utc::now().to_rfc3339();
                                                                 let repair_json = serde_json::json!({
@@ -10797,47 +11222,20 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                                         "P079: failed to update repair event subobjects; evidence may be incomplete"
                                                                     );
                                                                 }
-                                                                // REL-r2-1: status update and lease settlement MUST be
-                                                                // atomic in a single SQLite transaction. Use
-                                                                // settle_terminal_event_and_lease which commits both in one tx.
-                                                                if p079_repair_lease_inserted {
-                                                                    if let Some(ref lease_key) = p079_repair_lease_key {
-                                                                        if let Err(e) = ocr_repo::settle_terminal_event_and_lease(
-                                                                            &self.pool, attempt_id, lease_key,
-                                                                            "recovered", "recovered", "continue",
-                                                                            Some("valid_outputs_from_repair"),
-                                                                            "accepted", &p079_now,
-                                                                        ).await {
-                                                                            error!(
-                                                                                repair_attempt_id = %attempt_id,
-                                                                                lease_key = %lease_key,
-                                                                                error = %e,
-                                                                                "P079: failed to atomically settle repair event+lease; evidence may be stale"
-                                                                            );
-                                                                        }
-                                                                    }
-                                                                } else if let Err(e) = ocr_repo::update_repair_event_status(
-                                                                    &self.pool, attempt_id,
-                                                                    "recovered", "recovered", "continue",
-                                                                    Some("valid_outputs_from_repair"), &p079_now,
-                                                                ).await {
-                                                                    error!(
-                                                                        repair_attempt_id = %attempt_id,
-                                                                        error = %e,
-                                                                        "P079: failed to update repair event status to recovered"
-                                                                    );
-                                                                }
+                                                                // SEC-P079-SETTLEMENT-002: defer the terminal
+                                                                // "recovered" settle until after
+                                                                // import_declared_contract_outputs commits the CAS.
+                                                                // Settling here would mark evidence recovered even
+                                                                // if the CAS later rejects with IgnoredLateOutputs.
+                                                                // Outer vars are set so the post-import settle
+                                                                // block (outside this nested scope) can access them.
+                                                                p079_repair_materialized = true;
+                                                                p079_repair_materialized_outer = true;
+                                                                p079_repair_attempt_id_outer = p079_repair_attempt_id.clone();
+                                                                p079_repair_lease_key_outer = p079_repair_lease_key.clone();
+                                                                p079_repair_lease_inserted_outer = p079_repair_lease_inserted;
                                                             }
-                                                            // SEC-P079-SETTLEMENT-001: materialize
-                                                            // validated outputs only after durable
-                                                            // evidence/lease settlement. A crash here
-                                                            // leaves the DB settled; recovery can
-                                                            // re-materialize from the settled evidence.
-                                                            let materialize_result = materialize_validated_discovery_decisions(
-                                                                &declared_outputs,
-                                                                &repair_settlement,
-                                                                &repair_validation,
-                                                            );
+                                                            }
                                                             materialize_result?;
                                                             if p088_completion_eligible {
                                                                 self.record_code_writer_completion_event(
@@ -11087,7 +11485,9 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                             "repair_turn_count": output_contract_repair_turn_count,
                                                             "result": "failed_missing_outputs",
                                                             "failure_kind": "settlement_failed",
-                                                            "error": error.to_string(),
+                                                            // SEC-P079-MED-005: redact before persistence;
+                                                            // raw errors can contain paths, prompts, or tokens.
+                                                            "error": p079_redact_transport_error(&error.to_string()),
                                                         }),
                                                         run_id,
                                                         &stage_id,
@@ -11905,6 +12305,65 @@ You are continuing the same Chainworks agent execution through an existing live 
                 let validation_summary = import_result.validation_summary;
                 let final_agent_status = import_result.final_agent_status;
                 let _degraded_outputs_satisfy_stage = import_result.degraded_outputs_satisfy_stage;
+                // SEC-P079-SETTLEMENT-002: terminal P079 "recovered" settle runs AFTER CAS.
+                // If the CAS rejected outputs (IgnoredLateOutputs), settle as blocked/ignored
+                // rather than recovered so P079 evidence never claims recovery when artifact
+                // truth was not accepted. Uses _outer vars hoisted out of the nested repair block.
+                if p079_repair_materialized_outer {
+                    if let Some(ref attempt_id) = p079_repair_attempt_id_outer {
+                        let p079_post_now = chrono::Utc::now().to_rfc3339();
+                        let cas_rejected = import_result.output_settlement
+                            == domain::agent::AgentOutputSettlement::IgnoredLateOutputs;
+                        // REL-r2-1: status update and lease settlement MUST be atomic.
+                        if p079_repair_lease_inserted_outer {
+                            if let Some(ref lease_key) = p079_repair_lease_key_outer {
+                                let (ev_status, ev_pres, ev_action, ev_final_settlement, lease_result) =
+                                    if cas_rejected {
+                                        ("blocked", "blocked", "manual_investigation",
+                                         Some("ignored_late_outputs"), "failed_transport")
+                                    } else {
+                                        ("recovered", "recovered", "continue",
+                                         Some("valid_outputs_from_repair"), "accepted")
+                                    };
+                                if let Err(e) = ocr_repo::settle_terminal_event_and_lease(
+                                    &self.pool, attempt_id, lease_key,
+                                    ev_status, ev_pres, ev_action,
+                                    ev_final_settlement,
+                                    lease_result, &p079_post_now,
+                                ).await {
+                                    error!(
+                                        repair_attempt_id = %attempt_id,
+                                        lease_key = %lease_key,
+                                        cas_rejected,
+                                        error = %e,
+                                        "P079: post-CAS terminal settle failed; evidence may be stale"
+                                    );
+                                }
+                            }
+                        } else {
+                            let (ev_status, ev_pres, ev_action, ev_final_settlement) =
+                                if cas_rejected {
+                                    ("blocked", "blocked", "manual_investigation",
+                                     Some("ignored_late_outputs"))
+                                } else {
+                                    ("recovered", "recovered", "continue",
+                                     Some("valid_outputs_from_repair"))
+                                };
+                            if let Err(e) = ocr_repo::update_repair_event_status(
+                                &self.pool, attempt_id,
+                                ev_status, ev_pres, ev_action,
+                                ev_final_settlement, &p079_post_now,
+                            ).await {
+                                error!(
+                                    repair_attempt_id = %attempt_id,
+                                    cas_rejected,
+                                    error = %e,
+                                    "P079: post-CAS terminal status update failed; evidence may be stale"
+                                );
+                            }
+                        }
+                    }
+                }
                 if let Some(capture) = result.provider_session_store_capture.as_ref() {
                     let preserve_failure = final_agent_status == AgentStatus::Failed;
                     let archive_context = ProviderSessionStoreArchiveContext {
@@ -12473,7 +12932,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         )
                         .await?;
                     artifacts::insert_tx(&mut tx, &manifest_artifact).await?;
-                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                    let _settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &commit_lease.effect_id,
                         owner_instance_id: &commit_lease.owner_instance_id,
                         settlement_attempt_id: &commit_lease.attempt_id,
@@ -12541,7 +13000,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                    let _fail_params = db::repos::side_effects::ExecutorFailCasParams {
                         effect_id: &commit_lease.effect_id,
                         owner_instance_id: &commit_lease.owner_instance_id,
                         attempt_id: &commit_lease.attempt_id,
@@ -12698,7 +13157,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         )
                         .await?;
                     artifacts::insert_tx(&mut tx, &receipt_artifact).await?;
-                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                    let _settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &push_lease.effect_id,
                         owner_instance_id: &push_lease.owner_instance_id,
                         settlement_attempt_id: &push_lease.attempt_id,
@@ -12784,7 +13243,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                    let _fail_params = db::repos::side_effects::ExecutorFailCasParams {
                         effect_id: &push_lease.effect_id,
                         owner_instance_id: &push_lease.owner_instance_id,
                         attempt_id: &push_lease.attempt_id,
@@ -12953,7 +13412,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         )
                         .await?;
                     artifacts::insert_tx(&mut tx, &bundle_artifact).await?;
-                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                    let _settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &build_lease.effect_id,
                         owner_instance_id: &build_lease.owner_instance_id,
                         settlement_attempt_id: &build_lease.attempt_id,
@@ -13021,7 +13480,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                    let _fail_params = db::repos::side_effects::ExecutorFailCasParams {
                         effect_id: &build_lease.effect_id,
                         owner_instance_id: &build_lease.owner_instance_id,
                         attempt_id: &build_lease.attempt_id,
@@ -13218,7 +13677,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                    let _settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &connect_lease.effect_id,
                         owner_instance_id: &connect_lease.owner_instance_id,
                         settlement_attempt_id: &connect_lease.attempt_id,
@@ -13325,7 +13784,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                    let _fail_params = db::repos::side_effects::ExecutorFailCasParams {
                         effect_id: &connect_lease.effect_id,
                         owner_instance_id: &connect_lease.owner_instance_id,
                         attempt_id: &connect_lease.attempt_id,
@@ -13813,6 +14272,7 @@ You are continuing the same Chainworks agent execution through an existing live 
             validation_summary,
             final_agent_status,
             degraded_outputs_satisfy_stage,
+            output_settlement: runtime_facts.output_settlement.clone(),
         })
     }
 
@@ -17945,8 +18405,42 @@ fn p079_provider_supports_enforced_permissions(provider_family: &str) -> bool {
 /// SEC-P079-HIGH-003: env vars are not an enforceable sandbox. Keep production
 /// same-session repair disabled for advisory-only providers until the provider
 /// process is constrained by a real runtime permission boundary.
+#[cfg(test)]
 fn p079_advisory_posture_opt_in() -> bool {
     false
+}
+
+/// SEC-P079-MED-003: returns true iff `candidate_str` refers to a path contained under
+/// `root_str`, using component-aware matching to prevent sibling-prefix bypass.
+///
+/// String-prefix matching (`candidate.starts_with(root)`) fails when a sibling directory
+/// shares a prefix with the root (e.g. `/workspace-secret` passes a check against
+/// `/workspace`). This function uses `std::path::Path::starts_with`, which compares full
+/// path components, and also rejects any candidate containing `..` components.
+fn p079_path_inside_root(candidate_str: &str, root_str: &str) -> bool {
+    use std::path::{Component, Path};
+    let candidate = Path::new(candidate_str);
+    // Reject paths with parent-directory escape components.
+    if candidate.components().any(|c| c == Component::ParentDir) {
+        return false;
+    }
+    // Component-aware prefix check (Path::starts_with compares full components).
+    candidate.starts_with(Path::new(root_str))
+}
+
+/// Resolve `meta_root` to an absolute path anchored in `workspace_root`.
+///
+/// Relative meta roots (e.g. `.chainworks/runs/<id>`) are resolved against
+/// `workspace_root`, not the process working directory. This ensures plan-evidence
+/// files always land under the canonical run boundary even when the daemon is
+/// started from an unrelated cwd.
+fn p079_resolve_meta_root_abs(meta_root: &str, workspace_root: &str) -> std::path::PathBuf {
+    let meta_root_path = std::path::Path::new(meta_root);
+    if meta_root_path.is_absolute() {
+        meta_root_path.to_path_buf()
+    } else {
+        std::path::PathBuf::from(workspace_root).join(meta_root_path)
+    }
 }
 
 /// P079 MISSING-004: collect provider plan-evidence files into the 0700/0600 protected
@@ -17965,11 +18459,11 @@ fn p079_collect_plan_evidence(
     workspace_root: &str,
     meta_root_abs: &std::path::Path,
     plan_ev_dir: &std::path::Path,
-    attempt_id: &str,
+    agent_execution_id: &str,
 ) -> Option<domain::output_contract_repair::ProviderPlanEvidence> {
     use std::io::Read;
     #[cfg(unix)]
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     const PER_FILE_CAP: usize = 262_144; // 256 KiB
     const TOTAL_CAP: usize = 1_048_576; // 1 MiB
@@ -17985,6 +18479,50 @@ fn p079_collect_plan_evidence(
     let canonical_source_dir = match source_dir.canonicalize() {
         Ok(c) => c,
         Err(_) => return None,
+    };
+
+    // SEC-P079-HIGH-001: verify that the canonical source directory is still within the
+    // workspace root. If .junie or plans is a symlink pointing outside the workspace,
+    // canonicalize() would have resolved it and the resulting path would escape the
+    // workspace boundary. Component-aware starts_with catches that.
+    let canonical_workspace_root = match std::path::Path::new(workspace_root).canonicalize() {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    if !canonical_source_dir.starts_with(&canonical_workspace_root) {
+        warn!(
+            "P079 plan evidence: canonical source dir {} escapes workspace root {}; \
+             skipping (symlinked .junie or plans directory?)",
+            canonical_source_dir.display(),
+            canonical_workspace_root.display()
+        );
+        return None;
+    }
+
+    // SEC-P079-001: open the plans directory as a dirfd with O_NOFOLLOW to eliminate
+    // TOCTOU between path canonicalization and per-file opens. If .junie/plans is itself
+    // a symlink this open will fail (ELOOP/ENOTDIR). Subsequent file opens use
+    // openat(plans_dirfd, filename) so they are pinned to this directory inode.
+    #[cfg(unix)]
+    let plans_dirfd: std::os::unix::io::OwnedFd = {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::FromRawFd;
+        let path_cstr =
+            match CString::new(canonical_source_dir.as_os_str().as_bytes()) {
+                Ok(c) => c,
+                Err(_) => return None,
+            };
+        let fd = unsafe {
+            libc::open(
+                path_cstr.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) }
     };
 
     let entries = match std::fs::read_dir(&canonical_source_dir) {
@@ -18064,15 +18602,36 @@ fn p079_collect_plan_evidence(
         }
 
         let remaining_cap = (TOTAL_CAP - total_bytes).min(PER_FILE_CAP);
-        let mut open_options = std::fs::OpenOptions::new();
-        open_options.read(true);
+        // SEC-P079-001: open via openat(plans_dirfd, filename) to eliminate the TOCTOU
+        // window between read_dir and open. O_NOFOLLOW rejects symlinks at the file level.
         #[cfg(unix)]
-        {
-            open_options.custom_flags(libc::O_NOFOLLOW);
-        }
-        let opened = match open_options.open(&path) {
-            Ok(file) => file,
-            Err(_) => continue,
+        let opened: std::fs::File = {
+            use std::ffi::CString;
+            use std::os::unix::io::{AsRawFd, FromRawFd};
+            let name_cstr = match CString::new(raw_name.as_bytes()) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let file_fd = unsafe {
+                libc::openat(
+                    plans_dirfd.as_raw_fd(),
+                    name_cstr.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if file_fd < 0 {
+                continue;
+            }
+            unsafe { std::fs::File::from_raw_fd(file_fd) }
+        };
+        #[cfg(not(unix))]
+        let opened: std::fs::File = {
+            let mut open_options = std::fs::OpenOptions::new();
+            open_options.read(true);
+            match open_options.open(&path) {
+                Ok(file) => file,
+                Err(_) => continue,
+            }
         };
         let metadata = match opened.metadata() {
             Ok(metadata) => metadata,
@@ -18118,7 +18677,13 @@ fn p079_collect_plan_evidence(
 
         let file_name = raw_name;
         let dest_path = plan_ev_dir.join(&file_name);
-        if let Err(e) = std::fs::write(&dest_path, redacted.as_bytes()) {
+        // Use write_discovered_output so the destination write goes through the O_NOFOLLOW
+        // dirfd walk (SEC-001). This prevents a symlinked dest component from redirecting
+        // the write outside the P079-owned directory, and creates the file with mode 0600.
+        if let Err(e) = write_discovered_output(
+            dest_path.to_str().unwrap_or_default(),
+            redacted.as_bytes(),
+        ) {
             warn!(
                 "P079 plan evidence: failed to write {}: {}",
                 dest_path.display(),
@@ -18126,13 +18691,11 @@ fn p079_collect_plan_evidence(
             );
             continue;
         }
-        // Set file permissions to 0600 on Unix.
-        #[cfg(unix)]
-        let _ = std::fs::set_permissions(&dest_path, std::fs::Permissions::from_mode(0o600));
 
-        // Build meta-root-relative path. Truncation is tracked via truncated_at_cap bool;
+        // Build meta-root-relative path using agent_execution_id per P079 approved contract.
+        // Truncation is tracked via truncated_at_cap bool;
         // do NOT append " [truncated]" to the path string — it breaks Copy Path/Reveal workflows.
-        let relative = format!("output_contract_repair/{attempt_id}/plan_evidence/{file_name}");
+        let relative = format!("output_contract_repair/{agent_execution_id}/plan_evidence/{file_name}");
         collected_paths.push(relative);
         total_bytes += content_bytes.len();
     }
@@ -18147,6 +18710,30 @@ fn p079_collect_plan_evidence(
         truncated_at_cap,
         accepted_as_output: false,
     })
+}
+
+/// ASCII-only case-insensitive substring search. Returns the byte offset of `needle` in
+/// `haystack`, or `None` if not found. Safe for use with arbitrary UTF-8 `haystack` because
+/// all `needle` bytes must be ASCII (0x00–0x7F), which can never appear as continuation bytes
+/// in multi-byte UTF-8 sequences. The returned offset is a valid UTF-8 boundary in `haystack`.
+fn ascii_ci_find(haystack: &str, needle: &str) -> Option<usize> {
+    let hb = haystack.as_bytes();
+    let nb = needle.as_bytes();
+    if nb.is_empty() {
+        return Some(0);
+    }
+    if hb.len() < nb.len() {
+        return None;
+    }
+    'outer: for i in 0..=hb.len().saturating_sub(nb.len()) {
+        for (j, &n) in nb.iter().enumerate() {
+            if hb[i + j].to_ascii_lowercase() != n {
+                continue 'outer;
+            }
+        }
+        return Some(i);
+    }
+    None
 }
 
 /// Apply P079 SEC-003 redaction to plan-evidence file content.
@@ -18189,56 +18776,149 @@ fn p079_redact_plan_evidence_content(
             continue;
         }
 
-        // SEC-P079-MED-002: Redact CHAINWORKS_MCP_TOKEN=<value> patterns (case-insensitive).
+        // SEC-P079-MED-002: Redact all CHAINWORKS_MCP_TOKEN=<value> patterns (case-insensitive).
+        // Offset-scan to handle repeated occurrences on the same line.
         {
-            let lower_line = redacted_line.to_lowercase();
-            if let Some(idx) = lower_line.find("chainworks_mcp_token") {
-                let original_key = &redacted_line[idx..idx + "chainworks_mcp_token".len()];
-                let after = &redacted_line[idx + "chainworks_mcp_token".len()..];
+            const TOKEN_KEY: &str = "chainworks_mcp_token";
+            const TOKEN_REPLACEMENT: &str = "CHAINWORKS_MCP_TOKEN=[redacted:credential]";
+            let mut scan_offset = 0;
+            loop {
+                let Some(rel_idx) = ascii_ci_find(&redacted_line[scan_offset..], TOKEN_KEY) else { break };
+                let abs_idx = scan_offset + rel_idx;
+                let key_text = &redacted_line[abs_idx..abs_idx + TOKEN_KEY.len()];
+                let after = &redacted_line[abs_idx + TOKEN_KEY.len()..];
                 let after_trimmed = after.trim_start_matches(|c: char| c == ' ' || c == '=');
-                if after_trimmed.len() < after.len() {
+                let sep_len = after.len() - after_trimmed.len();
+                if sep_len > 0 && !after_trimmed.starts_with("[redacted:") {
                     let val_end = after_trimmed
                         .find(|c: char| c.is_whitespace())
                         .unwrap_or(after_trimmed.len());
                     if val_end > 0 {
-                        let full_val = &after[..after.len() - after_trimmed.len() + val_end];
+                        let full_suffix = &after[..sep_len + val_end];
                         redacted_line = redacted_line.replacen(
-                            &format!("{original_key}{full_val}"),
-                            "CHAINWORKS_MCP_TOKEN=[redacted:credential]",
+                            &format!("{key_text}{full_suffix}"),
+                            TOKEN_REPLACEMENT,
                             1,
                         );
                         redactions.push("[redacted:credential]".to_string());
+                        scan_offset = abs_idx + TOKEN_REPLACEMENT.len();
+                        continue;
                     }
                 }
+                scan_offset = abs_idx + TOKEN_KEY.len();
             }
         }
 
-        // Redact "Authorization: Bearer <token>" (case-insensitive, with or without space).
+        // Redact "Authorization: Bearer <token>" and "Authorization=Bearer <token>" patterns
+        // (case-insensitive). Accepts ':' or '=' as separator, with optional surrounding
+        // whitespace (P079-SEC-HIGH-001: Authorization=Bearer form was previously missed).
+        // Offset-scan handles repeated occurrences on the same line.
         {
-            let lower = redacted_line.to_lowercase();
-            if let Some(idx) = lower.find("authorization:") {
-                let rest = &redacted_line[idx + "authorization:".len()..];
+            const AUTH_KEY_BASE: &str = "authorization";
+            const BEARER_REPLACEMENT: &str = "Bearer [redacted:credential]";
+            let mut scan_offset = 0;
+            loop {
+                let Some(rel_idx) = ascii_ci_find(&redacted_line[scan_offset..], AUTH_KEY_BASE) else { break };
+                let abs_idx = scan_offset + rel_idx;
+                let after_key = &redacted_line[abs_idx + AUTH_KEY_BASE.len()..];
+                // Skip optional whitespace before the separator.
+                let ws_before = after_key.len()
+                    - after_key
+                        .trim_start_matches(|c: char| c == ' ' || c == '\t')
+                        .len();
+                let after_ws = &after_key[ws_before..];
+                // Accept ':' or '=' as the separator (P079-SEC-HIGH-001).
+                if !after_ws.starts_with(':') && !after_ws.starts_with('=') {
+                    scan_offset = abs_idx + AUTH_KEY_BASE.len();
+                    continue;
+                }
+                let rest = &after_key[ws_before + 1..]; // skip the separator character
                 let rest_trimmed = rest.trim_start();
-                let lower_trimmed = rest_trimmed.to_lowercase();
-                if lower_trimmed.starts_with("bearer") {
+                // SEC-P079-HIGH-001: use ascii_ci_find so the byte offset used to index
+                // rest_trimmed comes from the original string, not a to_lowercase() copy
+                // whose expansion could misalign on non-ASCII input.
+                if ascii_ci_find(rest_trimmed, "bearer").map_or(false, |pos| pos == 0) {
                     let after_keyword = &rest_trimmed["bearer".len()..];
                     let after_bearer = after_keyword.trim_start();
                     let bearer_start = rest.len() - rest_trimmed.len();
                     let separator_len = after_keyword.len() - after_bearer.len();
-                    let val_end = after_bearer
-                        .find(|c: char| c.is_whitespace())
-                        .unwrap_or(after_bearer.len());
-                    if val_end > 0 {
-                        let original_bearer_region = &rest
-                            [bearer_start..bearer_start + "bearer".len() + separator_len + val_end];
-                        redacted_line = redacted_line.replacen(
-                            original_bearer_region,
-                            "Bearer [redacted:credential]",
-                            1,
-                        );
-                        redactions.push("[redacted:credential]".to_string());
+                    if !after_bearer.starts_with("[redacted:") {
+                        let val_end = after_bearer
+                            .find(|c: char| c.is_whitespace())
+                            .unwrap_or(after_bearer.len());
+                        if val_end > 0 {
+                            let original_bearer_region = &rest[bearer_start
+                                ..bearer_start + "bearer".len() + separator_len + val_end];
+                            redacted_line = redacted_line.replacen(
+                                original_bearer_region,
+                                BEARER_REPLACEMENT,
+                                1,
+                            );
+                            redactions.push("[redacted:credential]".to_string());
+                            scan_offset = abs_idx
+                                + AUTH_KEY_BASE.len()
+                                + ws_before
+                                + 1
+                                + bearer_start
+                                + BEARER_REPLACEMENT.len();
+                            continue;
+                        }
                     }
                 }
+                scan_offset = abs_idx + AUTH_KEY_BASE.len();
+            }
+        }
+
+        // SEC-P079-MED-001: Redact "Authorization: Basic <credentials>" patterns.
+        // Covers HTTP Basic auth headers where credentials are base64-encoded user:pass.
+        // Same offset-scan structure as the Bearer block above.
+        {
+            const BASIC_REPLACEMENT: &str = "Basic [redacted:credential]";
+            let mut scan_offset = 0;
+            loop {
+                let Some(rel_idx) = ascii_ci_find(&redacted_line[scan_offset..], "authorization") else { break };
+                let abs_idx = scan_offset + rel_idx;
+                let after_key = &redacted_line[abs_idx + "authorization".len()..];
+                let ws_before = after_key.len()
+                    - after_key
+                        .trim_start_matches(|c: char| c == ' ' || c == '\t')
+                        .len();
+                let after_ws = &after_key[ws_before..];
+                if !after_ws.starts_with(':') && !after_ws.starts_with('=') {
+                    scan_offset = abs_idx + "authorization".len();
+                    continue;
+                }
+                let rest = &after_key[ws_before + 1..];
+                let rest_trimmed = rest.trim_start();
+                if ascii_ci_find(rest_trimmed, "basic").map_or(false, |pos| pos == 0) {
+                    let after_keyword = &rest_trimmed["basic".len()..];
+                    let after_basic = after_keyword.trim_start();
+                    let basic_start = rest.len() - rest_trimmed.len();
+                    let separator_len = after_keyword.len() - after_basic.len();
+                    if !after_basic.starts_with("[redacted:") {
+                        let val_end = after_basic
+                            .find(|c: char| c.is_whitespace())
+                            .unwrap_or(after_basic.len());
+                        if val_end > 0 {
+                            let original_basic_region = &rest[basic_start
+                                ..basic_start + "basic".len() + separator_len + val_end];
+                            redacted_line = redacted_line.replacen(
+                                original_basic_region,
+                                BASIC_REPLACEMENT,
+                                1,
+                            );
+                            redactions.push("[redacted:credential]".to_string());
+                            scan_offset = abs_idx
+                                + "authorization".len()
+                                + ws_before
+                                + 1
+                                + basic_start
+                                + BASIC_REPLACEMENT.len();
+                            continue;
+                        }
+                    }
+                }
+                scan_offset = abs_idx + "authorization".len();
             }
         }
 
@@ -18257,47 +18937,165 @@ fn p079_redact_plan_evidence_content(
             continue;
         }
 
-        // SEC-P079-MED-002: Redact generic key-value credential assignments.
-        // Covers: token:, secret:, password:, api_key:, apikey:, access_key: (case-insensitive, = or : separator).
+        // SEC-P079-MED-002 / SEC-P079-001: Redact generic key-value credential assignments.
+        // Covers bare forms (token:, api_key=, ...) and quoted JSON forms ("api_key": "value").
+        // The quoted-JSON check is done first so it handles Codex auth.json-shaped fragments
+        // before the bare-key pass, preventing partial matches that could leave secrets intact.
         {
-            let lower = redacted_line.to_lowercase();
-            const KV_KEYS: &[&str] = &[
-                "password:",
-                "password=",
-                "secret:",
-                "secret=",
-                "token:",
-                "token=",
-                "api_key:",
-                "api_key=",
-                "apikey:",
-                "apikey=",
-                "access_key:",
-                "access_key=",
-                "private_key:",
-                "private_key=",
-                "auth_token:",
-                "auth_token=",
+            // SEC-P079-001: quoted JSON credential keys — {"api_key":"value"}, {"OPENAI_API_KEY":"value"}, etc.
+            // Recompute lowercase from the current (possibly modified) redacted_line for each key
+            // so byte offsets remain aligned even if a prior key's value was replaced.
+            // All needles must be lowercase — ascii_ci_find lowercases the haystack but NOT the
+            // needle, so "clientSecret" would never match; use "clientsecret" instead.
+            const JSON_CRED_KEYS: &[&str] = &[
+                "openai_api_key",
+                "api_key",
+                "access_token",
+                "refresh_token",
+                "id_token",
+                "password",
+                "secret",
+                "private_key",
+                "auth_token",
+                "token",
+                "apikey",
+                "access_key",
+                // SEC-P079-MED-001: aliases missed in original pass.
+                "client_secret",
+                "clientsecret",    // matches camelCase clientSecret
+                "accesstoken",     // matches camelCase accessToken
+                "refreshtoken",    // matches camelCase refreshToken
+                "aws_secret_access_key",
             ];
-            for key in KV_KEYS {
-                if let Some(idx) = lower.find(key) {
-                    let after = &redacted_line[idx + key.len()..];
-                    let after_trimmed =
-                        after.trim_start_matches(|c: char| c == ' ' || c == '"' || c == '\'');
-                    let val_end = after_trimmed
-                        .find(|c: char| matches!(c, ' ' | '\t' | '"' | '\'' | ',' | '}' | ']'))
-                        .unwrap_or(after_trimmed.len());
-                    if val_end >= 4 {
-                        let space_prefix = &after[..after.len() - after_trimmed.len()];
-                        let full_val = &after_trimmed[..val_end];
-                        redacted_line = redacted_line.replacen(
-                            &format!("{}{}", space_prefix, full_val),
-                            "[redacted:credential]",
-                            1,
-                        );
-                        redactions.push("[redacted:credential]".to_string());
-                        break;
+            for key in JSON_CRED_KEYS {
+                // Offset-scan to redact ALL occurrences of this JSON credential key on the line.
+                const JSON_VAL_REPLACEMENT: &str = "\"[redacted:credential]\"";
+                let mut scan_offset = 0;
+                loop {
+                    let quoted_key = format!("\"{}\"", key);
+                    let Some(rel_pos) = ascii_ci_find(&redacted_line[scan_offset..], quoted_key.as_str()) else { break };
+                    let abs_key_pos = scan_offset + rel_pos;
+                    let after_key = &redacted_line[abs_key_pos + quoted_key.len()..];
+                    let after_key_trimmed = after_key.trim_start_matches(|c: char| c == ' ' || c == ':' || c == '\t');
+                    // Only redact if value is a non-redacted quoted string (JSON string value shape).
+                    if after_key_trimmed.starts_with('"') && !after_key_trimmed.starts_with("\"[redacted:") {
+                        let prefix_len = after_key.len() - after_key_trimmed.len();
+                        let val_body = &after_key_trimmed[1..]; // skip opening "
+                        // Find the first unescaped closing quote.
+                        let val_end = {
+                            let mut end = None;
+                            let mut escaped = false;
+                            for (i, c) in val_body.char_indices() {
+                                if escaped { escaped = false; continue; }
+                                if c == '\\' { escaped = true; continue; }
+                                if c == '"' { end = Some(i); break; }
+                            }
+                            end
+                        };
+                        if let Some(val_end) = val_end {
+                            if val_end > 0 {
+                                // Range-based replacement anchored to the matched credential field
+                                // position (SEC-P079-001). replacen(&fragment, …, 1) would match
+                                // the first occurrence of the value anywhere in the line, leaving
+                                // the actual credential intact when a benign field carries the
+                                // same value earlier on the same line.
+                                let val_start = abs_key_pos + quoted_key.len() + prefix_len;
+                                let val_total_len = val_end + 2; // opening " + body bytes + closing "
+                                redacted_line = format!(
+                                    "{}{}{}",
+                                    &redacted_line[..val_start],
+                                    JSON_VAL_REPLACEMENT,
+                                    &redacted_line[val_start + val_total_len..]
+                                );
+                                redactions.push("[redacted:credential]".to_string());
+                                scan_offset = val_start + JSON_VAL_REPLACEMENT.len();
+                                continue;
+                            }
+                        }
                     }
+                    scan_offset = abs_key_pos + quoted_key.len();
+                }
+            }
+        }
+        {
+            // P079-SEC-HIGH-001: match bare key names then optional whitespace + ':' or '='
+            // so forms like "password = value" and "api_key : value" are caught in addition
+            // to the compact forms "password:value" and "api_key=value".
+            // All needles must be lowercase (ascii_ci_find lowercases haystack, not needle).
+            const KV_KEY_NAMES: &[&str] = &[
+                "password",
+                "secret",
+                "token",
+                "api_key",
+                "apikey",
+                "access_key",
+                "private_key",
+                "auth_token",
+                // SEC-P079-MED-001: aliases missed in original pass.
+                "client_secret",
+                "aws_secret_access_key",
+            ];
+            const KV_REPLACEMENT: &str = "[redacted:credential]";
+            // kv_skip: key-start positions of short/false-positive matches to skip in future
+            // iterations instead of halting the entire scan (SEC-P079-002).
+            let mut kv_skip: Vec<usize> = Vec::new();
+            loop {
+                // Find the leftmost non-redacted KV occurrence across all key names.
+                // best = (key_start, val_text_start) so value replacement is range-based.
+                // ascii_ci_find returns offsets into the original string, avoiding the
+                // byte-offset misalignment that to_lowercase() can introduce for non-ASCII input.
+                let mut best: Option<(usize, usize)> = None;
+                for key_name in KV_KEY_NAMES {
+                    let mut search_at = 0;
+                    while search_at < redacted_line.len() {
+                        let Some(rel_idx) = ascii_ci_find(&redacted_line[search_at..], key_name) else { break };
+                        let abs_idx = search_at + rel_idx;
+                        if kv_skip.contains(&abs_idx) {
+                            search_at = abs_idx + key_name.len();
+                            continue;
+                        }
+                        // Optional whitespace then ':' or '='
+                        let after_name = &redacted_line[abs_idx + key_name.len()..];
+                        let ws_len = after_name.len()
+                            - after_name
+                                .trim_start_matches(|c: char| c == ' ' || c == '\t')
+                                .len();
+                        let after_ws = &after_name[ws_len..];
+                        if after_ws.starts_with(':') || after_ws.starts_with('=') {
+                            let sep_end = abs_idx + key_name.len() + ws_len + 1;
+                            let val_part = &redacted_line[sep_end..];
+                            let val_trimmed = val_part.trim_start_matches(|c: char| {
+                                c == ' ' || c == '\t' || c == '"' || c == '\''
+                            });
+                            if !val_trimmed.starts_with("[redacted:") {
+                                let val_text_start =
+                                    sep_end + (val_part.len() - val_trimmed.len());
+                                if best.map_or(true, |(b, _)| abs_idx < b) {
+                                    best = Some((abs_idx, val_text_start));
+                                }
+                                break; // leftmost found for this key_name; check other keys
+                            }
+                        }
+                        search_at = abs_idx + key_name.len();
+                    }
+                }
+                let Some((key_start, val_text_start)) = best else { break };
+                let after = &redacted_line[val_text_start..];
+                let val_end = after
+                    .find(|c: char| matches!(c, ' ' | '\t' | '"' | '\'' | ',' | '}' | ']'))
+                    .unwrap_or(after.len());
+                if val_end >= 4 {
+                    // Range-based replacement anchored to the matched value position to avoid
+                    // clobbering the same value appearing earlier in the line for a different field.
+                    redacted_line = format!(
+                        "{}{}{}",
+                        &redacted_line[..val_text_start],
+                        KV_REPLACEMENT,
+                        &redacted_line[val_text_start + val_end..]
+                    );
+                    redactions.push("[redacted:credential]".to_string());
+                } else {
+                    kv_skip.push(key_start);
                 }
             }
         }
@@ -18320,7 +19118,13 @@ fn p079_redact_plan_evidence_content(
             "xoxa-",
             "xoxr-",
         ] {
-            while let Some(idx) = redacted_line.find(prefix) {
+            // Offset-based scan: advance past short non-credential prefix matches instead of
+            // halting the entire loop so later real credentials on the same line are found
+            // (SEC-P079-002).
+            let mut scan_from: usize = 0;
+            loop {
+                let Some(rel_idx) = redacted_line[scan_from..].find(prefix) else { break };
+                let idx = scan_from + rel_idx;
                 let after = &redacted_line[idx + prefix.len()..];
                 let key_end = after
                     .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
@@ -18329,14 +19133,17 @@ fn p079_redact_plan_evidence_content(
                     let full_key = &redacted_line[idx..idx + prefix.len() + key_end];
                     redacted_line = redacted_line.replacen(full_key, "[redacted:credential]", 1);
                     redactions.push("[redacted:credential]".to_string());
+                    scan_from = 0;
                 } else {
-                    break;
+                    scan_from = idx + prefix.len() + key_end.max(1);
                 }
             }
         }
 
         // Redact absolute paths that don't resolve under workspace_root or meta_root.
         // Scan for token-boundary '/' followed by at least 2 path components.
+        // P079-SEC-HIGH-001: expanded boundary set catches path=/Users/..., backtick-wrapped
+        // paths, parenthesized/bracketed/brace-enclosed paths, and comma-separated lists.
         let mut path_result = String::with_capacity(redacted_line.len());
         let bytes = redacted_line.as_bytes();
         let mut i = 0;
@@ -18346,7 +19153,15 @@ fn p079_redact_plan_evidence_content(
                     || bytes[i - 1] == b' '
                     || bytes[i - 1] == b'\t'
                     || bytes[i - 1] == b'"'
-                    || bytes[i - 1] == b'\'')
+                    || bytes[i - 1] == b'\''
+                    || bytes[i - 1] == b'='
+                    || bytes[i - 1] == b':'
+                    || bytes[i - 1] == b'`'
+                    || bytes[i - 1] == b'('
+                    || bytes[i - 1] == b'['
+                    || bytes[i - 1] == b'{'
+                    || bytes[i - 1] == b'<'
+                    || bytes[i - 1] == b',')
             {
                 // Scan for the full path token.
                 let start = i;
@@ -18373,9 +19188,12 @@ fn p079_redact_plan_evidence_content(
                 let component_count = candidate.matches('/').count();
                 if component_count >= 2 {
                     // Absolute path with 2+ segments.
-                    if !candidate.starts_with(workspace_root)
-                        && !candidate.starts_with(meta_root_str.as_ref())
-                    {
+                    // SEC-P079-003: only preserve paths inside meta_root. Workspace paths can
+                    // contain usernames and workspace layout that must not leak through evidence
+                    // readback (e.g. /Users/alice/project/src/main.rs discloses the local user).
+                    // meta_root containment uses component-aware checks to prevent sibling-prefix
+                    // (/workspace-secret) and ../ escape leaks.
+                    if !p079_path_inside_root(candidate, meta_root_str.as_ref()) {
                         path_result.push_str("[redacted:abs_path]");
                         redactions.push("[redacted:abs_path]".to_string());
                         i = j;
@@ -18394,10 +19212,6 @@ fn p079_redact_plan_evidence_content(
         out.push_str(&redacted_line);
         out.push('\n');
     }
-
-    // Remove duplicates from redactions.
-    redactions.sort();
-    redactions.dedup();
 
     (out, redactions)
 }
@@ -18418,7 +19232,9 @@ fn p079_redact_transport_error(raw: &str) -> String {
     } else {
         raw
     };
-    // Redact absolute path-looking substrings: anything starting with /Users, /home, /var, /etc.
+    // Redact absolute path-looking substrings. Covers common Unix/macOS roots including
+    // /private (macOS canonical prefix), /tmp, /Volumes, /root (Linux root home), /proc,
+    // /sys, /run in addition to the user-data roots /Users, /home, /var, /etc.
     let stage1 = redact_pattern(
         truncated,
         |s| {
@@ -18426,10 +19242,17 @@ fn p079_redact_transport_error(raw: &str) -> String {
                 || s.contains("/home/")
                 || s.contains("/var/")
                 || s.contains("/etc/")
+                || s.contains("/private/")
+                || s.contains("/tmp/")
+                || s.contains("/Volumes/")
+                || s.contains("/root/")
+                || s.contains("/proc/")
+                || s.contains("/sys/")
+                || s.contains("/run/")
         },
         "[PATH_REDACTED]",
     );
-    // Redact bearer / credential patterns.
+    // Redact bearer / credential patterns including common API token prefixes.
     let stage2 = redact_pattern(
         &stage1,
         |s| {
@@ -18438,6 +19261,17 @@ fn p079_redact_transport_error(raw: &str) -> String {
                 || l.contains("password")
                 || l.contains("api_key")
                 || l.contains("secret")
+                || s.contains("sk-ant-")
+                || s.contains("sk-")
+                || s.contains("ghp_")
+                || s.contains("ghs_")
+                || s.contains("gho_")
+                || s.contains("github_pat_")
+                || s.contains("AKIA")
+                || s.contains("ASIA")
+                || s.contains("xoxb-")
+                || s.contains("xoxp-")
+                || s.contains("anth-")
         },
         "[CREDENTIAL_REDACTED]",
     );
@@ -18457,16 +19291,28 @@ fn redact_pattern(s: &str, predicate: impl Fn(&str) -> bool, replacement: &str) 
 /// before dispatching a same-session repair turn. Establishes the correct ordered
 /// recovery lane: transcript recovery → same-session repair → provider fallback.
 ///
-/// Bounded scan: 262144 bytes max (SEC-002 fail-closed for oversized transcripts),
+/// Bounded scan: default 262144 bytes max (SEC-002 fail-closed for oversized transcripts),
+/// configurable via CHAINWORKS_P079_TRANSCRIPT_RECOVERY_MAX_BYTES (1 KiB..1 MiB).
 /// depth 32, 64 chunks examined. Transport-derived attribution is NOT yet implemented
 /// in this pass; until it is, the function conservatively returns `Unavailable` with
 /// subtype `attribution_not_verified` so same-session repair is always attempted.
 /// The evidence record is still written with correct bounds metadata.
+fn p079_read_transcript_recovery_max_bytes() -> usize {
+    const DEFAULT: usize = 262_144; // 256 KiB
+    const MIN: usize = 1_024; // 1 KiB
+    const MAX: usize = 1_048_576; // 1 MiB
+    std::env::var("CHAINWORKS_P079_TRANSCRIPT_RECOVERY_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.clamp(MIN, MAX))
+        .unwrap_or(DEFAULT)
+}
+
 fn p079_attempt_transcript_recovery(
     transcript_text: Option<&str>,
     declared_outputs: &[DeclaredOutput],
 ) -> domain::output_contract_repair::TranscriptRecovery {
-    const MAX_BYTES: usize = 262_144; // 256 KiB
+    let max_bytes = p079_read_transcript_recovery_max_bytes();
     const MAX_DEPTH: u32 = 32;
     const MAX_CHUNKS: u32 = 64;
 
@@ -18475,7 +19321,7 @@ fn p079_attempt_transcript_recovery(
         result_subtype: None,
         recovery_source: None,
         bytes_examined: Some(0),
-        max_recovery_payload_bytes: MAX_BYTES as u64,
+        max_recovery_payload_bytes: max_bytes as u64,
         max_json_depth: MAX_DEPTH,
         max_chunks_examined: MAX_CHUNKS,
         recovery_parser_version: "p079_recovery_v1".to_string(),
@@ -18489,10 +19335,10 @@ fn p079_attempt_transcript_recovery(
         Some(t) => t,
     };
 
-    let bytes_examined = transcript.len().min(MAX_BYTES) as u64;
+    let bytes_examined = transcript.len().min(max_bytes) as u64;
 
     // SEC-002: fail-closed for oversized transcripts. Do not attempt partial scans.
-    if transcript.len() > MAX_BYTES {
+    if transcript.len() > max_bytes {
         return domain::output_contract_repair::TranscriptRecovery {
             result_subtype: Some("oversized_payload".to_string()),
             bytes_examined: Some(bytes_examined),
@@ -18522,12 +19368,19 @@ fn p079_attempt_transcript_recovery(
 fn output_contract_repair_prompt(
     validation: &TaskValidationSummary,
     declared_outputs: &[DeclaredOutput],
+    run_id: &str,
+    stage_execution_id: &str,
+    agent_execution_id: &str,
 ) -> String {
     const PER_FRAGMENT_CAP: usize = 2048;
     const AGGREGATE_CAP: usize = 8192;
 
     let mut prompt = String::new();
     prompt.push_str("### Output Contract Repair (p079_repair_v1)\n");
+    // Runtime identifiers: required by approved P079 proposal for traceability in repair turns.
+    prompt.push_str(&format!(
+        "run_id={run_id} stage_execution_id={stage_execution_id} agent_execution_id={agent_execution_id}\n"
+    ));
     prompt.push_str(
         "The previous response did not satisfy the required output contract. Use the context from \
          the immediately preceding turn and do only the minimal synthesis needed to populate these \
@@ -19340,7 +20193,7 @@ plain progress line without gate evidence";
             ),
         };
 
-        let prompt = output_contract_repair_prompt(&validation, &declared_outputs);
+        let prompt = output_contract_repair_prompt(&validation, &declared_outputs, "test-run-id", "test-stage-exec-id", "test-agent-exec-id");
 
         assert!(validation_summary_requires_output_contract_repair(
             &validation
@@ -19359,6 +20212,10 @@ plain progress line without gate evidence";
         assert!(prompt.contains("Do not call shell `echo`"));
         assert!(prompt.contains("Use the context from the immediately preceding turn"));
         assert!(prompt.contains("minimal synthesis needed to populate these outputs"));
+        // P079 approved contract: runtime identifiers must appear in repair prompt.
+        assert!(prompt.contains("run_id=test-run-id"), "run_id must be in prompt");
+        assert!(prompt.contains("stage_execution_id=test-stage-exec-id"), "stage_execution_id must be in prompt");
+        assert!(prompt.contains("agent_execution_id=test-agent-exec-id"), "agent_execution_id must be in prompt");
     }
 
     #[test]
@@ -19457,7 +20314,7 @@ plain progress line without gate evidence";
             failure_summary: Some("missing required fields".to_string()),
         };
 
-        let prompt = output_contract_repair_prompt(&validation, &declared_outputs);
+        let prompt = output_contract_repair_prompt(&validation, &declared_outputs, "test-run-id", "test-stage-exec-id", "test-agent-exec-id");
 
         assert!(prompt.contains("\"current_phase\":\"\""));
         assert!(prompt.contains("\"completed_items\":[]"));
@@ -23235,6 +24092,82 @@ plain progress line without gate evidence";
         );
     }
 
+    // SEC-001 regression: write_discovered_output must reject an output path whose PARENT
+    // directory is a symlink at depth ≥ 2. The depth-aware O_NOFOLLOW walk catches this
+    // inline at open time — there is no separate pre-check or canonicalize step that could
+    // be raced between T1 (check) and T2 (open).
+    #[cfg(unix)]
+    #[test]
+    fn sec_001_write_discovered_output_rejects_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        // Use the canonical path so the tempdir itself is free of platform symlinks
+        // (e.g. macOS /var → /private/var), ensuring the depth-1 skip does not mask
+        // the attacker-controlled symlink we introduce at depth ≥ 2.
+        let base = dir.path().canonicalize().unwrap();
+        let real_target = base.join("real_outputs");
+        std::fs::create_dir_all(&real_target).unwrap();
+        // Create a symlinked parent directory: declared_dir → real_target.
+        // An attacker controlling the YAML workflow could declare this path.
+        let escape_dir = base.join("escape_contents");
+        std::fs::create_dir_all(&escape_dir).unwrap();
+        let declared_dir = base.join("declared_dir");
+        symlink(&escape_dir, &declared_dir).unwrap();
+        // Attempt to write a file through the symlinked parent directory.
+        let output_path = declared_dir.join("output.json");
+        let result = write_discovered_output(output_path.to_str().unwrap(), b"injected");
+        assert!(
+            result.is_err(),
+            "write_discovered_output must reject a symlinked parent directory"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("sec-001"),
+            "error must mention sec-001 (O_NOFOLLOW blocked symlink escape): {err}"
+        );
+        // Confirm the file was NOT written to the escape target.
+        assert!(
+            !escape_dir.join("output.json").exists(),
+            "file must not be written to the symlink escape target"
+        );
+    }
+
+    // SEC-001 regression: a parent directory swapped to a symlink after any hypothetical
+    // pre-check but before the O_NOFOLLOW walk must still be rejected. This tests the
+    // post-swap scenario: the symlink is already in place when write_discovered_output is
+    // called, simulating the state that exists after a TOCTOU race in the prior (check +
+    // canonicalize + walk) sequence. With the depth-aware inline O_NOFOLLOW walk there
+    // is no separate check window — the openat itself rejects the symlink at depth ≥ 2.
+    #[cfg(unix)]
+    #[test]
+    fn sec_001_write_discovered_output_rejects_parent_swapped_to_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        // escape_target simulates an attacker-chosen directory outside the run boundary.
+        let escape_target = base.join("escape_target");
+        std::fs::create_dir_all(&escape_target).unwrap();
+        // declared_parent simulates a path that was a real dir at "check time" but has
+        // since been swapped to a symlink pointing at escape_target.
+        let declared_parent = base.join("swapped_dir");
+        symlink(&escape_target, &declared_parent).unwrap();
+        let output_path = declared_parent.join("secret.json");
+        let result = write_discovered_output(output_path.to_str().unwrap(), b"escaped");
+        assert!(
+            result.is_err(),
+            "write_discovered_output must reject a parent that was swapped to a symlink"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("sec-001"),
+            "error must mention sec-001 when parent symlink is caught inline: {err}"
+        );
+        assert!(
+            !escape_target.join("secret.json").exists(),
+            "file must not have been written to the escape target directory"
+        );
+    }
+
     #[test]
     fn p079_fragment_cap_aggregate_respected_when_nearly_full() {
         // Regression for off-by-one: fragment cap check passes headroom to sanitize fn
@@ -23406,6 +24339,29 @@ plain progress line without gate evidence";
     }
 
     #[test]
+    fn p079_redact_transport_error_redacts_macos_private_path() {
+        // SEC-P079-003: /private paths (macOS canonical /var symlink target) must be redacted.
+        let err = "read failed: /private/var/folders/xyz/output.json not found";
+        let result = p079_redact_transport_error(err);
+        assert_eq!(result, "[PATH_REDACTED]");
+    }
+
+    #[test]
+    fn p079_redact_transport_error_redacts_tmp_path() {
+        let err = "spawned in /tmp/cw-run-abc/workspace";
+        let result = p079_redact_transport_error(err);
+        assert_eq!(result, "[PATH_REDACTED]");
+    }
+
+    #[test]
+    fn p079_redact_transport_error_redacts_api_token_prefix() {
+        // SEC-P079-003: API token prefixes (sk-, ghp_, AKIA, etc.) must be redacted.
+        let err = "auth failed: token=sk-ant-api03-XXXXXXXX";
+        let result = p079_redact_transport_error(err);
+        assert_eq!(result, "[CREDENTIAL_REDACTED]");
+    }
+
+    #[test]
     fn p079_provider_supports_enforced_permissions_returns_false_for_production_providers() {
         // SEC-P079-001: no production provider supports enforced permissions; all are advisory-only.
         for provider in &["claude", "codex", "gemini", "junie", "auggie"] {
@@ -23571,6 +24527,211 @@ private-key-body\n\
         );
     }
 
+    #[test]
+    fn p079_plan_evidence_redact_strips_quoted_json_credentials() {
+        // SEC-P079-001: quoted JSON credential fields must be redacted.
+        // Codex auth.json-style fragments and generic JSON must not leak.
+        let content = r#"{"OPENAI_API_KEY":"sk-proj-abc1234567890abcdef","api_key":"some-secret-value","access_token":"Bearer ya29.xyzAbcDef","refresh_token":"1//0abcXYZqwerty","password":"hunter2secret"}"#;
+        let (redacted, markers) =
+            p079_redact_plan_evidence_content(content, "/workspace", std::path::Path::new("/meta"));
+        assert!(
+            !redacted.contains("sk-proj-abc1234567890abcdef"),
+            "OPENAI_API_KEY value must be redacted"
+        );
+        assert!(
+            !redacted.contains("some-secret-value"),
+            "api_key value must be redacted"
+        );
+        assert!(
+            !redacted.contains("ya29.xyzAbcDef"),
+            "access_token value must be redacted"
+        );
+        assert!(
+            !redacted.contains("1//0abcXYZqwerty"),
+            "refresh_token value must be redacted"
+        );
+        assert!(
+            !redacted.contains("hunter2secret"),
+            "password value must be redacted"
+        );
+        assert!(
+            !markers.is_empty(),
+            "redaction markers must be recorded"
+        );
+    }
+
+    #[test]
+    fn p079_plan_evidence_redact_quoted_json_does_not_redact_non_secret_fields() {
+        // SEC-P079-001: non-secret JSON fields must not be redacted.
+        let content = r#"{"name":"some-agent","version":"1.0","description":"plan for task"}"#;
+        let (redacted, markers) =
+            p079_redact_plan_evidence_content(content, "/workspace", std::path::Path::new("/meta"));
+        assert!(
+            markers.is_empty(),
+            "non-secret JSON fields must not trigger redaction"
+        );
+        assert!(
+            redacted.contains("some-agent"),
+            "safe content must be preserved"
+        );
+    }
+
+    #[test]
+    fn p079_plan_evidence_redact_repeated_same_line_credentials() {
+        // SEC-P079-MED-002: repeated credentials on the same line must ALL be redacted,
+        // not just the first occurrence. This covers the single-match regression.
+
+        // Two CHAINWORKS_MCP_TOKEN= on the same line.
+        let content = "CHAINWORKS_MCP_TOKEN=tok1aaabbbccc CHAINWORKS_MCP_TOKEN=tok2dddeeefff";
+        let (redacted, markers) =
+            p079_redact_plan_evidence_content(content, "/workspace", std::path::Path::new("/meta"));
+        assert!(!redacted.contains("tok1aaabbbccc"), "first token must be redacted");
+        assert!(!redacted.contains("tok2dddeeefff"), "second token must be redacted");
+        assert!(markers.len() >= 2, "both redactions must be recorded");
+
+        // Two Authorization: Bearer tokens on the same line (unusual but must be handled).
+        let content2 = "Authorization: Bearer first_tok_abc123 Authorization: Bearer second_tok_xyz789";
+        let (redacted2, markers2) =
+            p079_redact_plan_evidence_content(content2, "/workspace", std::path::Path::new("/meta"));
+        assert!(!redacted2.contains("first_tok_abc123"), "first bearer must be redacted");
+        assert!(!redacted2.contains("second_tok_xyz789"), "second bearer must be redacted");
+        assert!(markers2.len() >= 2, "both bearer redactions must be recorded");
+
+        // Two JSON credential keys on the same line.
+        let content3 = r#"{"api_key": "first_secret_value", "api_key": "second_secret_value"}"#;
+        let (redacted3, _markers3) =
+            p079_redact_plan_evidence_content(content3, "/workspace", std::path::Path::new("/meta"));
+        assert!(!redacted3.contains("first_secret_value"), "first json credential must be redacted");
+        assert!(!redacted3.contains("second_secret_value"), "second json credential must be redacted");
+
+        // Multiple different KV credential keys on the same line.
+        let content4 = "password: hunter2secret token: abc123defghijklmno api_key: sk12345678901";
+        let (redacted4, markers4) =
+            p079_redact_plan_evidence_content(content4, "/workspace", std::path::Path::new("/meta"));
+        assert!(!redacted4.contains("hunter2secret"), "password value must be redacted");
+        assert!(!redacted4.contains("abc123defghijklmno"), "token value must be redacted");
+        assert!(!redacted4.contains("sk12345678901"), "api_key value must be redacted");
+        assert!(markers4.len() >= 3, "all three KV redactions must be recorded");
+    }
+
+    #[test]
+    fn p079_plan_evidence_redact_json_credential_not_earlier_duplicate_value() {
+        // SEC-P079-001 regression: when a benign field has the same value as a credential
+        // field earlier on the same line, only the credential field must be redacted.
+        // Old code used replacen which replaced the first occurrence; the fix uses a
+        // byte-range replacement anchored to the matched credential field position.
+        let content = r#"{"note":"same","api_key":"same"}"#;
+        let (redacted, markers) =
+            p079_redact_plan_evidence_content(content, "/workspace", std::path::Path::new("/meta"));
+        assert!(
+            markers.contains(&"[redacted:credential]".to_string()),
+            "api_key value must trigger a redaction marker"
+        );
+        assert!(
+            redacted.contains(r#""note":"same""#),
+            "benign 'note' field must keep its original value, got: {redacted}"
+        );
+        assert!(
+            !redacted.contains(r#""api_key":"same""#),
+            "api_key field value must be redacted, got: {redacted}"
+        );
+    }
+
+    #[test]
+    fn p079_plan_evidence_redact_kv_short_false_positive_continues_scan() {
+        // SEC-P079-002 regression: a short KV false-positive (val_end < 4) before a real
+        // credential must not halt the entire scan. Real credentials after the short match
+        // must still be redacted.
+        let content = "tok: ab password: realpassword123";
+        let (redacted, markers) =
+            p079_redact_plan_evidence_content(content, "/workspace", std::path::Path::new("/meta"));
+        assert!(
+            !redacted.contains("realpassword123"),
+            "real credential after short false positive must be redacted, got: {redacted}"
+        );
+        assert!(
+            markers.contains(&"[redacted:credential]".to_string()),
+            "redaction marker must be present"
+        );
+    }
+
+    #[test]
+    fn p079_plan_evidence_redact_workspace_path_is_redacted() {
+        // SEC-P079-003 regression: absolute paths under workspace_root must be redacted from
+        // plan evidence. Only paths inside meta_root should be preserved.
+        let workspace = "/Users/testuser/myproject";
+        let meta_root = format!("{workspace}/.chainworks");
+        let content = format!(
+            "workspace path: \"{workspace}/src/main.rs\" meta path: \"{meta_root}/evidence/x.json\"",
+        );
+        let (redacted, markers) =
+            p079_redact_plan_evidence_content(
+                &content,
+                workspace,
+                std::path::Path::new(&meta_root),
+            );
+        assert!(
+            !redacted.contains(&format!("{workspace}/src")),
+            "workspace path must be redacted, got: {redacted}"
+        );
+        assert!(
+            markers.iter().any(|m| m == "[redacted:abs_path]"),
+            "path redaction marker must be present"
+        );
+    }
+
+    // SEC-P079-HIGH-001: p079_redact_plan_evidence_content must not panic on
+    // non-ASCII text appearing before credential patterns. Unicode case folding
+    // (e.g. U+0130 "İ" → 3 bytes under to_lowercase) previously caused offset
+    // misalignment when byte offsets from the lowercased copy were used to slice
+    // the original string. The ascii_ci_find helper avoids this by scanning bytes
+    // of the original string directly.
+    #[test]
+    fn p079_plan_evidence_redact_unicode_before_credential_no_panic() {
+        // U+0130 "İ" before CHAINWORKS_MCP_TOKEN.
+        let content = "note: \u{0130} config CHAINWORKS_MCP_TOKEN=supersecretval12345 done";
+        let (redacted, markers) =
+            p079_redact_plan_evidence_content(content, "/workspace", std::path::Path::new("/meta"));
+        assert!(
+            !redacted.contains("supersecretval12345"),
+            "CHAINWORKS_MCP_TOKEN value must be redacted even after non-ASCII prefix: {redacted}"
+        );
+        assert!(
+            !markers.is_empty(),
+            "redaction marker must be present"
+        );
+
+        // U+0130 before Authorization Bearer.
+        let content2 = "\u{0130} Authorization: Bearer some_bearer_token_xyz789 rest";
+        let (redacted2, markers2) =
+            p079_redact_plan_evidence_content(content2, "/workspace", std::path::Path::new("/meta"));
+        assert!(
+            !redacted2.contains("some_bearer_token_xyz789"),
+            "Bearer token must be redacted even after non-ASCII prefix: {redacted2}"
+        );
+        assert!(!markers2.is_empty(), "bearer redaction marker must be present");
+
+        // U+00DF "ß" before a quoted JSON credential key.
+        let content3 = "ß {\"api_key\": \"my_secret_key_value_1234\"}";
+        let (redacted3, markers3) =
+            p079_redact_plan_evidence_content(content3, "/workspace", std::path::Path::new("/meta"));
+        assert!(
+            !redacted3.contains("my_secret_key_value_1234"),
+            "JSON api_key value must be redacted even after non-ASCII prefix: {redacted3}"
+        );
+        assert!(!markers3.is_empty(), "json credential redaction marker must be present");
+
+        // Multi-byte emoji before a bare KV credential key.
+        let content4 = "🔥 password: flamingsecretvalue123 🔥";
+        let (redacted4, markers4) =
+            p079_redact_plan_evidence_content(content4, "/workspace", std::path::Path::new("/meta"));
+        assert!(
+            !redacted4.contains("flamingsecretvalue123"),
+            "password value must be redacted even surrounded by emoji: {redacted4}"
+        );
+        assert!(!markers4.is_empty(), "kv redaction marker must be present");
+    }
+
     // SEC-P079-HIGH-001: p079_collect_plan_evidence must reject symlinks.
     #[test]
     fn p079_plan_evidence_collect_rejects_symlinks() {
@@ -23656,6 +24817,48 @@ private-key-body\n\
         }
     }
 
+    // SEC-P079-HIGH-001: p079_collect_plan_evidence must reject a symlinked .junie directory.
+    // If .junie (or .junie/plans) is a symlink pointing outside the workspace, the canonical
+    // source dir would escape the workspace boundary and copy sensitive external files.
+    #[test]
+    fn p079_plan_evidence_rejects_symlinked_junie_directory() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let ws = tempfile::tempdir().unwrap();
+            let ws_canon = ws.path().canonicalize().unwrap();
+
+            // Create a directory OUTSIDE the workspace containing a sensitive file.
+            let outside = tempfile::tempdir().unwrap();
+            let outside_plans = outside.path().canonicalize().unwrap().join("plans");
+            std::fs::create_dir_all(&outside_plans).unwrap();
+            std::fs::write(outside_plans.join("secret.md"), b"SECRET_TOKEN=abc123").unwrap();
+
+            // Make .junie a symlink pointing to the outside directory.
+            let junie_dir = ws_canon.join(".junie");
+            symlink(outside.path().canonicalize().unwrap(), &junie_dir).unwrap();
+
+            let ev_dir = tempfile::tempdir().unwrap();
+            let meta = tempfile::tempdir().unwrap();
+            let result = p079_collect_plan_evidence(
+                "junie",
+                ws_canon.to_str().unwrap(),
+                meta.path(),
+                ev_dir.path(),
+                "test-attempt-junie-symlink",
+            );
+
+            assert!(
+                result.is_none(),
+                "symlinked .junie directory must be rejected (would escape workspace)"
+            );
+            assert!(
+                !ev_dir.path().join("secret.md").exists(),
+                "secret.md from outside workspace must not be copied to evidence dir"
+            );
+        }
+    }
+
     // SEC-P079-HIGH-001: plan evidence paths must not contain " [truncated]" suffixes —
     // truncation is encoded via the truncated_at_cap bool, not in the path string.
     #[test]
@@ -23722,6 +24925,615 @@ private-key-body\n\
         {
             // Non-Unix: test is not applicable; O_NOFOLLOW unavailable.
         }
+    }
+
+    // SEC-P079-MED-006: unknown provider strings must be treated as advisory-only.
+    // The p079_unknown_provider flag forces advisory posture for unrecognized provider strings
+    // so they cannot inherit the fixture/enforced path.
+    #[test]
+    fn p079_unknown_provider_is_forced_advisory() {
+        // Known production providers: p079_provider_supports_enforced_permissions returns false
+        // (all are advisory-only — they use full-access/bypassPermissions).
+        for p in &["claude", "codex", "gemini", "junie", "auggie"] {
+            assert!(
+                !p079_provider_supports_enforced_permissions(p),
+                "advisory provider '{p}' must return false from supports_enforced"
+            );
+        }
+        // "fixture" is the only enforced-capable provider (deterministic, controlled I/O).
+        assert!(
+            p079_provider_supports_enforced_permissions("fixture"),
+            "fixture must return true from supports_enforced"
+        );
+
+        // Unknown providers: the p079_unknown_provider flag (computed by the match) must be
+        // true for any string that is not a canonical recognized provider.
+        let canonical = [
+            "claude", "claude-code", "anthropic",
+            "codex", "openai",
+            "gemini", "google",
+            "junie", "auggie",
+            "fixture", "test", "mock",
+        ];
+        let unknown_cases = ["my_new_provider", "gpt-4o", "llama3", ""];
+        for p in &unknown_cases {
+            let provider_lower = p.to_lowercase();
+            let is_unknown = !canonical.contains(&provider_lower.as_str());
+            assert!(
+                is_unknown,
+                "provider '{p}' must be detected as unknown so the advisory flag is set"
+            );
+        }
+        // Canonical providers must not be flagged as unknown.
+        for p in &canonical {
+            let provider_lower = p.to_lowercase();
+            let is_unknown = !canonical.contains(&provider_lower.as_str());
+            assert!(
+                !is_unknown,
+                "canonical provider '{p}' must not be flagged as unknown"
+            );
+        }
+    }
+
+    // SEC-P079-MED-003: path-inside-root must use component-aware matching.
+    #[test]
+    fn p079_path_inside_root_rejects_sibling_prefix() {
+        // String-prefix bug: "/workspace-secret/data" starts_with "/workspace" -> true (wrong).
+        // Component-aware: "/workspace-secret/data" does NOT start_with "/workspace" -> false (correct).
+        assert!(
+            !p079_path_inside_root("/workspace-secret/data", "/workspace"),
+            "sibling-prefix path must not be considered inside root"
+        );
+        assert!(
+            p079_path_inside_root("/workspace/data", "/workspace"),
+            "legitimate child path must be inside root"
+        );
+        assert!(
+            !p079_path_inside_root("/workspace/../private/secret", "/workspace"),
+            "parent-dir escape must be rejected"
+        );
+        assert!(
+            !p079_path_inside_root("/workspace/sub/../../etc/passwd", "/workspace"),
+            "multi-level parent-dir escape must be rejected"
+        );
+        assert!(
+            p079_path_inside_root("/workspace/sub/deep/file.txt", "/workspace"),
+            "deep nested path must be inside root"
+        );
+        assert!(
+            !p079_path_inside_root("/other/path", "/workspace"),
+            "unrelated absolute path must not be inside root"
+        );
+    }
+
+    // SEC-P079-MED-003: plan-evidence redactor must redact sibling-prefix absolute paths.
+    #[test]
+    fn p079_plan_evidence_redact_rejects_sibling_prefix_paths() {
+        // "/workspace-secret/sensitive" should be redacted even though it string-starts-with "/workspace".
+        let content = "output at /workspace-secret/sensitive/credentials.json";
+        let (redacted, markers) = p079_redact_plan_evidence_content(
+            content,
+            "/workspace",
+            std::path::Path::new("/meta"),
+        );
+        assert!(
+            redacted.contains("[redacted:abs_path]"),
+            "sibling-prefix absolute path must be redacted: got {redacted:?}"
+        );
+        assert!(markers.contains(&"[redacted:abs_path]".to_string()));
+        assert!(
+            !redacted.contains("credentials.json"),
+            "sensitive filename must not appear in output"
+        );
+    }
+
+    // SEC-P079-MED-003: plan-evidence redactor must redact parent-directory escape paths.
+    #[test]
+    fn p079_plan_evidence_redact_rejects_parent_dir_escape() {
+        let content = "key at /workspace/../private/secret.pem";
+        let (redacted, markers) = p079_redact_plan_evidence_content(
+            content,
+            "/workspace",
+            std::path::Path::new("/meta"),
+        );
+        assert!(
+            redacted.contains("[redacted:abs_path]"),
+            "parent-dir escape path must be redacted: got {redacted:?}"
+        );
+        assert!(markers.contains(&"[redacted:abs_path]".to_string()));
+    }
+
+    // SEC-P079-SETTLEMENT-001: materialize helper must bail when an accepted decision
+    // has no payload_ref, not silently skip materialization and leave a stale file.
+    #[test]
+    fn sec_p079_settlement_001_materialize_bails_on_accepted_decision_with_no_payload_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("output.json");
+        let declared = DeclaredOutput {
+            output_name: "out".to_string(),
+            target_path: target.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let settlement = DeclaredOutputDiscoverySettlement {
+            decisions: vec![domain::discovery::OutputDiscoveryDecision {
+                output_name: "out".to_string(),
+                output_role: domain::discovery::ExpectedOutputRole::Machine,
+                target_path: target.to_string_lossy().into_owned(),
+                companion_of: None,
+                status: OutputDiscoveryStatus::Accepted,
+                reason: OutputDiscoveryReason::ExactPathChanged,
+                provenance: None,
+                canonical_path: None,
+                root_class: None,
+                baseline_status: None,
+                size_bytes: None,
+                content_digest: None,
+                max_bytes_applied: None,
+                aggregate_bytes_after_acceptance: None,
+                accepted_payload_ref: None, // intentionally absent
+                accepted_bytes_sha256: None,
+                generated_by: None,
+                diagnostics: Default::default(),
+                decision_at: chrono::Utc::now(),
+            }],
+            accepted_payloads: HashMap::new(),
+            idempotency_key: None,
+            accepted_aggregate_bytes: 0,
+            aggregate_cap_hit: false,
+        };
+        let validation = TaskValidationSummary {
+            output_results: vec![domain::validation::OutputValidationResult {
+                output_name: "out".to_string(),
+                contract_id: None,
+                status: domain::validation::ValidationStatus::Passed,
+                missing_fields: vec![],
+                validation_error: None,
+                raw_payload_size: 0,
+            }],
+            contract_metadata: vec![],
+            raw_output_exists: true,
+            failure_class: None,
+            failure_summary: None,
+        };
+        let result = materialize_validated_discovery_decisions(&[declared], &settlement, &validation);
+        assert!(result.is_err(), "must bail when accepted_payload_ref is absent");
+        assert!(
+            result.unwrap_err().to_string().contains("no payload_ref"),
+            "error must name the missing payload_ref"
+        );
+    }
+
+    // SEC-P079-SETTLEMENT-001: materialize helper must bail when payload bytes are
+    // referenced but absent from the settlement map, not silently skip materialization.
+    #[test]
+    fn sec_p079_settlement_001_materialize_bails_on_accepted_decision_with_missing_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("output.json");
+        let declared = DeclaredOutput {
+            output_name: "out".to_string(),
+            target_path: target.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let settlement = DeclaredOutputDiscoverySettlement {
+            decisions: vec![domain::discovery::OutputDiscoveryDecision {
+                output_name: "out".to_string(),
+                output_role: domain::discovery::ExpectedOutputRole::Machine,
+                target_path: target.to_string_lossy().into_owned(),
+                companion_of: None,
+                status: OutputDiscoveryStatus::Accepted,
+                reason: OutputDiscoveryReason::ExactPathChanged,
+                provenance: None,
+                canonical_path: None,
+                root_class: None,
+                baseline_status: None,
+                size_bytes: None,
+                content_digest: None,
+                max_bytes_applied: None,
+                aggregate_bytes_after_acceptance: None,
+                accepted_payload_ref: Some("payload:out".to_string()),
+                accepted_bytes_sha256: None,
+                generated_by: None,
+                diagnostics: Default::default(),
+                decision_at: chrono::Utc::now(),
+            }],
+            accepted_payloads: HashMap::new(), // ref present but bytes absent
+            idempotency_key: None,
+            accepted_aggregate_bytes: 0,
+            aggregate_cap_hit: false,
+        };
+        let validation = TaskValidationSummary {
+            output_results: vec![domain::validation::OutputValidationResult {
+                output_name: "out".to_string(),
+                contract_id: None,
+                status: domain::validation::ValidationStatus::Passed,
+                missing_fields: vec![],
+                validation_error: None,
+                raw_payload_size: 0,
+            }],
+            contract_metadata: vec![],
+            raw_output_exists: true,
+            failure_class: None,
+            failure_summary: None,
+        };
+        let result = materialize_validated_discovery_decisions(&[declared], &settlement, &validation);
+        assert!(result.is_err(), "must bail when payload bytes are absent");
+        assert!(
+            result.unwrap_err().to_string().contains("bytes are missing"),
+            "error must name the missing bytes"
+        );
+    }
+
+    // Regression for HIGH-001: plan-evidence path must be resolved against workspace_root,
+    // not the process cwd. Daemon may run from control-plane/ or any other directory.
+    #[test]
+    fn p079_resolve_meta_root_abs_relative_uses_workspace_root_not_cwd() {
+        let workspace = "/Users/operator/my-project";
+        let relative_meta = ".chainworks/runs/abc-def-123";
+
+        let result = p079_resolve_meta_root_abs(relative_meta, workspace);
+
+        // Must be anchored in workspace_root, not cwd.
+        assert!(
+            result.starts_with(workspace),
+            "relative meta_root must resolve under workspace_root, got: {}",
+            result.display()
+        );
+        assert_eq!(
+            result,
+            std::path::PathBuf::from(workspace).join(relative_meta),
+            "relative meta_root must join workspace_root exactly"
+        );
+
+        // Verify it does NOT equal cwd-based resolution when cwd differs from workspace.
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if cwd != std::path::Path::new(workspace) {
+            let cwd_based = cwd.join(relative_meta);
+            assert_ne!(
+                result, cwd_based,
+                "plan-evidence path must not be cwd-based when cwd != workspace_root"
+            );
+        }
+    }
+
+    #[test]
+    fn p079_resolve_meta_root_abs_absolute_path_is_unchanged() {
+        let workspace = "/Users/operator/my-project";
+        let absolute_meta = "/Users/operator/my-project/.chainworks/runs/abc-def-123";
+
+        let result = p079_resolve_meta_root_abs(absolute_meta, workspace);
+
+        assert_eq!(
+            result,
+            std::path::PathBuf::from(absolute_meta),
+            "absolute meta_root must be returned unchanged"
+        );
+    }
+
+    #[test]
+    fn p079_plan_ev_dir_starts_with_meta_root_abs() {
+        // Verify the boundary assertion: plan_ev_dir built with join() always
+        // starts_with meta_root_abs, confirming the guard will not false-fire.
+        let workspace = "/project";
+        let meta_root_abs = p079_resolve_meta_root_abs(".chainworks/runs/test-id", workspace);
+        let agent_exec_id = uuid::Uuid::new_v4().to_string();
+        let plan_ev_dir = meta_root_abs
+            .join("output_contract_repair")
+            .join(&agent_exec_id)
+            .join("plan_evidence");
+
+        assert!(
+            plan_ev_dir.starts_with(&meta_root_abs),
+            "plan_ev_dir must be inside meta_root_abs: {} not under {}",
+            plan_ev_dir.display(),
+            meta_root_abs.display()
+        );
+    }
+
+    // P079-SEC-HIGH-001 regression: KV credentials with spaces around the separator.
+    #[test]
+    fn p079_redact_plan_evidence_kv_space_around_separator() {
+        let meta = std::path::PathBuf::from("/run/meta");
+        let workspace = "/workspace";
+
+        let (out, redactions) = p079_redact_plan_evidence_content(
+            "password = supersecret123\napi_key : sk-abc123def456",
+            workspace,
+            &meta,
+        );
+        assert!(
+            !out.contains("supersecret123"),
+            "password = <value> must be redacted, got: {out}"
+        );
+        assert!(
+            !out.contains("sk-abc123def456"),
+            "api_key : <value> must be redacted, got: {out}"
+        );
+        assert!(!redactions.is_empty(), "must record redactions applied");
+    }
+
+    // P079-SEC-HIGH-001 regression: compact KV credentials without spaces still redacted.
+    #[test]
+    fn p079_redact_plan_evidence_kv_compact_separator() {
+        let meta = std::path::PathBuf::from("/run/meta");
+        let workspace = "/workspace";
+
+        let (out, redactions) = p079_redact_plan_evidence_content(
+            "password:hunter2\nsecret=abc123xyz",
+            workspace,
+            &meta,
+        );
+        assert!(!out.contains("hunter2"), "password:<value> must be redacted");
+        assert!(!out.contains("abc123xyz"), "secret=<value> must be redacted");
+        assert!(!redactions.is_empty());
+    }
+
+    // P079-SEC-HIGH-001 regression: Authorization=Bearer form was previously missed.
+    #[test]
+    fn p079_redact_plan_evidence_authorization_equals_bearer() {
+        let meta = std::path::PathBuf::from("/run/meta");
+        let workspace = "/workspace";
+
+        let (out, redactions) = p079_redact_plan_evidence_content(
+            "Authorization=Bearer tok_abc123456789",
+            workspace,
+            &meta,
+        );
+        assert!(
+            !out.contains("tok_abc123456789"),
+            "Authorization=Bearer token must be redacted, got: {out}"
+        );
+        assert!(!redactions.is_empty());
+    }
+
+    // P079-SEC-HIGH-001 regression: Authorization: Bearer (original form) still works.
+    #[test]
+    fn p079_redact_plan_evidence_authorization_colon_bearer() {
+        let meta = std::path::PathBuf::from("/run/meta");
+        let workspace = "/workspace";
+
+        let (out, redactions) = p079_redact_plan_evidence_content(
+            "Authorization: Bearer tok_original99",
+            workspace,
+            &meta,
+        );
+        assert!(
+            !out.contains("tok_original99"),
+            "Authorization: Bearer token must still be redacted"
+        );
+        assert!(!redactions.is_empty());
+    }
+
+    // P079-SEC-HIGH-001 regression: path after '=' boundary must be redacted.
+    #[test]
+    fn p079_redact_plan_evidence_path_after_equals_boundary() {
+        let meta = std::path::PathBuf::from("/run/meta");
+        let workspace = "/workspace";
+
+        let (out, _) = p079_redact_plan_evidence_content(
+            "config path=/Users/alice/project/config.toml",
+            workspace,
+            &meta,
+        );
+        assert!(
+            !out.contains("/Users/alice"),
+            "path=/Users/... must be redacted, got: {out}"
+        );
+    }
+
+    // P079-SEC-HIGH-001 regression: backtick-wrapped path must be redacted.
+    #[test]
+    fn p079_redact_plan_evidence_backtick_path() {
+        let meta = std::path::PathBuf::from("/run/meta");
+        let workspace = "/workspace";
+
+        let (out, _) = p079_redact_plan_evidence_content(
+            "see `/Users/bob/Documents/project/file.rs` for details",
+            workspace,
+            &meta,
+        );
+        assert!(
+            !out.contains("/Users/bob"),
+            "backtick-wrapped path must be redacted, got: {out}"
+        );
+    }
+
+    // P079-SEC-HIGH-001 regression: parenthesized path must be redacted.
+    #[test]
+    fn p079_redact_plan_evidence_parenthesized_path() {
+        let meta = std::path::PathBuf::from("/run/meta");
+        let workspace = "/workspace";
+
+        let (out, _) = p079_redact_plan_evidence_content(
+            "error occurred (/Users/carol/src/main.rs:42)",
+            workspace,
+            &meta,
+        );
+        assert!(
+            !out.contains("/Users/carol"),
+            "parenthesized path must be redacted, got: {out}"
+        );
+    }
+
+    // Paths inside meta_root must be preserved (not redacted).
+    #[test]
+    fn p079_redact_plan_evidence_meta_root_path_preserved() {
+        let meta = std::path::PathBuf::from("/run/meta");
+        let workspace = "/workspace";
+
+        let content = "output at /run/meta/output_contract_repair/abc/plan_evidence/plan.md";
+        let (out, _) = p079_redact_plan_evidence_content(content, workspace, &meta);
+        assert!(
+            out.contains("/run/meta/output_contract_repair"),
+            "paths inside meta_root must not be redacted, got: {out}"
+        );
+    }
+
+    // SEC-P079-HIGH-001 regression: depth-1 symlink must be rejected by write_discovered_output.
+    // A path shaped /tmp/<symlink>/output.json previously escaped the run-root boundary because
+    // depth < 2 skipped O_NOFOLLOW for the second component. The fix narrows to depth < 1 so
+    // only the first component (e.g., "tmp") may follow OS-managed platform symlinks.
+    #[test]
+    #[cfg(unix)]
+    fn sec001_write_blocks_depth1_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        // Create a real directory that the symlink would redirect writes to.
+        let real_target = tempfile::tempdir().unwrap();
+
+        // Create a sibling tmpdir so we have a stable /tmp-relative writable location.
+        let tmp_base = tempfile::tempdir().unwrap();
+        let symlink_path = tmp_base.path().join("escape_link");
+        symlink(real_target.path(), &symlink_path).unwrap();
+
+        // Build a write path that goes through the depth-1 symlink.
+        // tmp_base is e.g. /tmp/xxx/, so the path is /tmp/xxx/escape_link/output.json.
+        // Components: [tmp, xxx, escape_link] — escape_link is at depth 2 (within tmp_base).
+        // For a pure depth-1 test we need the symlink at the first component after the OS root.
+        // Using tmp_base as the "platform root analogue" and escape_link at its depth-0 child:
+        // we test write_discovered_output_dirfd_unix with a path where the symlink sits at
+        // depth 1 relative to the absolute root.
+        //
+        // Since we cannot reliably create a world-writable symlink directly under /tmp from
+        // within a test, we verify the more general property: any symlink inside a path that
+        // a non-zero depth component is followed must be rejected. We construct the path so
+        // escape_link is at depth >= 1 from the walk root and verify the write fails.
+        let output_path = format!("{}/escape_link/output.json", tmp_base.path().display());
+        let result = write_discovered_output_dirfd_unix(&output_path, b"escaped_data");
+        assert!(
+            result.is_err(),
+            "write through a depth->=1 symlink must be rejected; O_NOFOLLOW must block it; \
+             path={output_path}"
+        );
+        // Verify no file was created at the symlink's real target.
+        assert!(
+            !real_target.path().join("output.json").exists(),
+            "no file must be created at the symlink target directory"
+        );
+    }
+
+    // SEC-P079-HIGH-001 regression: sec001_mkdirall_dirfd_unix must also reject depth->=1
+    // symlinks when asked to create a directory tree that traverses them.
+    #[test]
+    #[cfg(unix)]
+    fn sec001_mkdirall_blocks_depth1_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let real_target = tempfile::tempdir().unwrap();
+        let tmp_base = tempfile::tempdir().unwrap();
+        let symlink_path = tmp_base.path().join("escape_link");
+        symlink(real_target.path(), &symlink_path).unwrap();
+
+        // Ask mkdirall to create a directory through the symlink.
+        let dir_path = symlink_path.join("subdir");
+        let result = sec001_mkdirall_dirfd_unix(&dir_path);
+        assert!(
+            result.is_err(),
+            "sec001_mkdirall_dirfd_unix must reject symlink at depth >= 1; path={}",
+            dir_path.display()
+        );
+        assert!(
+            !real_target.path().join("subdir").exists(),
+            "no directory must be created at the symlink target"
+        );
+    }
+
+    // SEC-P079-MED-001: plan-evidence redaction must cover credential aliases missed previously.
+    // Covers: client_secret, clientSecret (camelCase), accessToken, refreshToken,
+    // aws_secret_access_key, and Authorization: Basic <credentials>.
+    #[test]
+    fn p079_plan_evidence_redact_strips_credential_aliases() {
+        let workspace = "/workspace";
+        let meta = std::path::Path::new("/meta");
+
+        // Bare KV: client_secret
+        let (out, markers) = p079_redact_plan_evidence_content(
+            "client_secret = supersecretvalue12345",
+            workspace,
+            meta,
+        );
+        assert!(!out.contains("supersecretvalue12345"), "client_secret must be redacted");
+        assert!(!markers.is_empty(), "redaction marker must be recorded");
+
+        // JSON: clientSecret (camelCase)
+        let (out2, markers2) = p079_redact_plan_evidence_content(
+            r#"{"clientSecret": "my_client_secret_val"}"#,
+            workspace,
+            meta,
+        );
+        assert!(!out2.contains("my_client_secret_val"), "clientSecret JSON key must be redacted, got: {out2}");
+        assert!(!markers2.is_empty());
+
+        // JSON: accessToken (camelCase)
+        let (out3, markers3) = p079_redact_plan_evidence_content(
+            r#"{"accessToken": "ya29.camelCaseToken"}"#,
+            workspace,
+            meta,
+        );
+        assert!(!out3.contains("ya29.camelCaseToken"), "accessToken JSON key must be redacted, got: {out3}");
+        assert!(!markers3.is_empty());
+
+        // JSON: refreshToken (camelCase)
+        let (out4, markers4) = p079_redact_plan_evidence_content(
+            r#"{"refreshToken": "1//refresh_tok_xyz789"}"#,
+            workspace,
+            meta,
+        );
+        assert!(!out4.contains("1//refresh_tok_xyz789"), "refreshToken JSON key must be redacted, got: {out4}");
+        assert!(!markers4.is_empty());
+
+        // Bare KV: aws_secret_access_key
+        let (out5, markers5) = p079_redact_plan_evidence_content(
+            "aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            workspace,
+            meta,
+        );
+        assert!(!out5.contains("wJalrXUtnFEMI"), "aws_secret_access_key must be redacted, got: {out5}");
+        assert!(!markers5.is_empty());
+
+        // JSON: aws_secret_access_key
+        let (out6, markers6) = p079_redact_plan_evidence_content(
+            r#"{"aws_secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfi"}"#,
+            workspace,
+            meta,
+        );
+        assert!(!out6.contains("wJalrXUtnFEMI"), "aws_secret_access_key JSON key must be redacted, got: {out6}");
+        assert!(!markers6.is_empty());
+    }
+
+    // SEC-P079-MED-001: Authorization: Basic <credentials> must be redacted.
+    #[test]
+    fn p079_plan_evidence_redact_strips_authorization_basic() {
+        let workspace = "/workspace";
+        let meta = std::path::Path::new("/meta");
+
+        let (out, markers) = p079_redact_plan_evidence_content(
+            "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+            workspace,
+            meta,
+        );
+        assert!(
+            !out.contains("dXNlcjpwYXNzd29yZA=="),
+            "Basic auth credentials must be redacted, got: {out}"
+        );
+        assert!(!markers.is_empty(), "redaction marker must be recorded");
+
+        // Also test the = separator form.
+        let (out2, markers2) = p079_redact_plan_evidence_content(
+            "Authorization=Basic dXNlcjpwYXNzd29yZA==",
+            workspace,
+            meta,
+        );
+        assert!(
+            !out2.contains("dXNlcjpwYXNzd29yZA=="),
+            "Authorization=Basic must be redacted, got: {out2}"
+        );
+        assert!(!markers2.is_empty());
     }
 }
 

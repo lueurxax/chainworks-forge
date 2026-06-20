@@ -752,11 +752,17 @@ Use:
 
 ## P079: Output Contract Repair and Fallback Details
 
+Operator guidance for inspecting and rolling back P079 lives in [../runbooks/orchestration/p079-output-repair.md](../runbooks/orchestration/p079-output-repair.md).
+
 ### Implementation status
 
-P079 is partially implemented. The schemas, enums, hold conditions, rollback disposition, GraphQL/MCP readback shapes, and SQLite migration described below are wired today. The deterministic fixture same-session repair lane is dispatched by the engine executor with the lease/evidence lifecycle, MCP runtime receipt sanitization (SEC-P079-MCP-001), crash-consistent materialization (SEC-P079-SETTLEMENT-001), and Junie plan-evidence capture/redaction in place. Per SEC-P079-HIGH-003, production same-session repair is fail-closed for advisory-only providers until enforceable sandbox/permission restrictions exist; the Junie `provider_mode_mismatch_risk` eligibility gate skips repair for Junie plan-mode failures.
+P079 is partially implemented. Wired today: the SQLite migration, domain schema/enums, repair-event and lease repositories, GraphQL/MCP/run-report readback, Swift DTO decode/presentation helpers, deterministic fixture same-session repair with lease/evidence lifecycle, MCP runtime receipt sanitization (SEC-P079-MCP-001), crash-consistent materialization (SEC-P079-SETTLEMENT-001), and Junie plan-evidence capture/redaction. The transcript-recovery lane now records bounded evidence in the correct order, but it still fails closed as `unavailable` until transport-attributed chunk scanning can prove current-execution ownership.
 
-Deferred lanes remain: transcript/provider-envelope recovery, controlled provider fallback (YAML `output_repair_policies` parsing, RunPlanSnapshot freeze, fallback packet assembly, and child dispatch), full projection artifact rebuild with the bounded 60s background sweep, release-lane and source-generation supersession eligibility exclusions, the Swift macOS inspector UI (GroupBox/progress chip/Copy Path), P079 operational metrics, the required reference docs `p079-repair-prompt-template.md`, `p079-recovery-attribution.md`, and `p079-adapter-idempotency.md`, and the full proposal-079 acceptance gate.
+Current hardening includes component-aware plan-evidence path containment (`p079_path_inside_root` rejects sibling-prefix paths and `..` escapes), GraphQL/MCP readback rejection of URL-encoded traversal in evidence and plan-evidence paths (including mixed literal/encoded forms validated after percent-decode), broader redaction for embedded absolute paths and common token prefixes in JSON-RPC method names and persisted transport/settlement errors, explicit permission-denial responses in P079 repair mode when no safe `allow_once` option exists, multi-path ambiguity rejection in the posture check (`p079_posture_denied` denies tool calls that present more than one distinct structured target path), fail-closed advisory posture for unknown provider strings, and dirfd/openat materialization that rejects symlinked parent or final output components at depth >= 2 while allowing OS-managed first-level symlinks. Plan-evidence collection canonicalizes the source `.junie` directory, rejects sources that escape the workspace, rejects symlinks and hard-linked entries, writes through the dirfd `O_NOFOLLOW` materializer, and creates the P079-owned `plan_evidence` directory through `sec001_mkdirall_dirfd_unix`.
+
+Per SEC-P079-HIGH-003, production same-session repair remains fail-closed for advisory-only providers until enforceable sandbox/permission restrictions exist; `p079_advisory_posture_opt_in` is currently hard-wired to `false`. Junie provider-mode mismatch skips persist `blocked_provider_mode_mismatch` as `final_output_settlement` and `manual_investigation` as `recommended_next_action`. Advisory fail-closed skips record `final_output_settlement = NULL` rather than an unchecked synthetic enum value so SQLite CHECK constraints remain authoritative.
+
+Deferred lanes remain: accepted transcript/provider-envelope recovery, controlled provider fallback dispatch from frozen YAML policy, full projection artifact rebuild with the bounded background sweep, release-lane and source-generation supersession eligibility exclusions, the Swift macOS inspector UI, P079 operational metric emission, the required reference docs `p079-repair-prompt-template.md`, `p079-recovery-attribution.md`, and `p079-adapter-idempotency.md`, and the full `proposal-079`/`p079` acceptance gate.
 
 ### Problem
 
@@ -778,14 +784,14 @@ P079's rollout contract specifies its applicability and enforcement mechanisms. 
 -   **Gate Aliases**: `proposal-079` and `p079`.
 -   **Commands**: Allowlisted commands for gate checks, such as `./scripts/test-gate.sh proposal-079`.
 -   **Migrations**: Requires a SQLite migration (`p079_output_contract_repair_v1`) to create tables for events, leases, and fallback parent links.
--   **Metrics**: Defines key metrics for adoption (`p079_eligible_output_failures_recovered_percent`) and operational monitoring (e.g., `p079_output_repair_attempt_total`, `p079_provider_fallback_attempt_total`).
+-   **Metrics**: Defines the contract inventory for adoption and operational monitoring. P079 metric emission remains deferred.
 
 ### Key Schema Purposes
 
 Beyond the `output_contract_repair.v1` schema, P079 relies on:
 
--   **`fallback_context_packet_v1_schema`**: Defines the structure for the context packet used during provider fallback, ensuring sanitized and size-capped data transfer. It prevents sensitive information leakage and enforces content-addressing.
--   **`fallback_policy_schema`**: Specifies how fallback policies are defined and applied, including matching rules for `role_family_match`, allowed `failure_classes`, `output_modes`, and required feature flags for activation. This schema governs the conditions under which fallback attempts are permitted.
+-   **`fallback_context_packet_v1_schema`**: Defines the intended provider-fallback context packet, including sanitized, size-capped, content-addressed transfer. Controlled fallback dispatch remains deferred.
+-   **`fallback_policy_schema`**: Specifies the intended matching rules for fallback policy. YAML `output_repair_policies` parsing and frozen fallback dispatch are not wired today.
 
 ### OutputContractRepair.v1 Schema Enums Detail
 
@@ -946,8 +952,6 @@ The `OutputContractRepairEvidence` is exposed via GraphQL and MCP for readback a
     -   The `output_contract_repair` object matches the `output_contract_repair.v1` schema in snake_case.
     -   For older runs, `output_contract_repair` is null, and `output_contract_repair_status` is `not_attempted` in flattened operator report views.
     -   The full `readback_contract` details for MCP and run reports, including specific shapes, missing behaviors, and parity fixtures, are available in the original P079 proposal document.
-
-### P079 SQLite Migration Appendix
 
 ### P079 SQLite Migration Appendix
 
