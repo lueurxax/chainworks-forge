@@ -79,45 +79,55 @@ use sqlx::SqlitePool;
 /// transient launch conflict from a normal daemon crash.
 const EX_TEMPFAIL: i32 = 75;
 const DAEMON_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
-const DEFAULT_PRINCIPALS_RELOAD_SECS: u64 = 2;
-const MIN_PRINCIPALS_RELOAD_SECS: u64 = 1;
 
 fn main() -> Result<()> {
-    let result = tokio::runtime::Builder::new_multi_thread()
+    // P080: --p080-rollout-control-seed is a one-shot admin subcommand.
+    // It seeds the rollout-control matrix (rejected if already seeded) and exits.
+    // This implements the Phase0/1 explicit operator seed path from proposal §Feature Flags.
+    if std::env::args().any(|a| a == "--p080-rollout-control-seed") {
+        return tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_stack_size(DAEMON_WORKER_STACK_BYTES)
+            .build()
+            .context("build tokio runtime for seed command")?
+            .block_on(run_p080_rollout_control_seed());
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(DAEMON_WORKER_STACK_BYTES)
         .build()
         .context("build daemon tokio runtime")?
-        .block_on(run_daemon());
-    if let Err(err) = &result {
-        tracing::error!(
-            err = %err,
-            pid = std::process::id(),
-            "daemon lifecycle: run_daemon returned error"
-        );
-    }
-    result
+        .block_on(run_daemon())
 }
 
-fn principals_reload_interval_secs_from_env_value(raw: Option<&str>) -> u64 {
-    match raw.and_then(|value| value.parse::<u64>().ok()) {
-        Some(secs) if secs >= MIN_PRINCIPALS_RELOAD_SECS => secs,
-        _ => DEFAULT_PRINCIPALS_RELOAD_SECS,
-    }
-}
+/// One-shot P080 rollout-control seeding subcommand.
+///
+/// Runs migration preflight, then calls `seed_rollout_control_if_absent` (no-op if
+/// already seeded) and validates completeness. Exits 0 on success, non-zero on failure.
+/// Rejected with an error if the rollout-control table already has rows.
+async fn run_p080_rollout_control_seed() -> Result<()> {
+    let mode_raw = std::env::var("MODE").unwrap_or_else(|_| "dev".to_string());
+    let mode = packaging::DaemonMode::from_env_var(&mode_raw);
+    let paths = packaging::resolve_paths(mode)?;
 
-fn principals_reload_interval_secs() -> u64 {
-    let raw = std::env::var("CHAINWORKS_PRINCIPALS_RELOAD_SECS").ok();
-    let secs = principals_reload_interval_secs_from_env_value(raw.as_deref());
-    if raw.is_some() && raw.as_deref().and_then(|value| value.parse::<u64>().ok()) != Some(secs) {
-        warn!(
-            configured = raw.as_deref().unwrap_or("<unset>"),
-            fallback_secs = DEFAULT_PRINCIPALS_RELOAD_SECS,
-            min_secs = MIN_PRINCIPALS_RELOAD_SECS,
-            "invalid CHAINWORKS_PRINCIPALS_RELOAD_SECS; using safe default"
+    // Run migration preflight before opening the runtime pool.
+    migrate::run_preflight(&paths.database_url, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("Migration preflight failed: {e:?}"))?;
+
+    let pool = db::pool::create_pool(&paths.database_url).await?;
+
+    let n = db::repos::p080::seed_rollout_control_if_absent(&pool).await?;
+    if n == 0 {
+        anyhow::bail!(
+            "P080 rollout-control table already seeded; \
+             --p080-rollout-control-seed is rejected when rows are present"
         );
     }
-    secs
+    db::repos::p080::validate_rollout_control_completeness(&pool).await?;
+    println!("P080 rollout-control matrix seeded ({n} rows). Validation passed.");
+    Ok(())
 }
 
 async fn run_daemon() -> Result<()> {
@@ -161,7 +171,6 @@ async fn run_daemon() -> Result<()> {
     // lifetime — dropping it flushes buffered logs.
     let _log_guard: Option<tracing_appender::non_blocking::WorkerGuard> =
         init_tracing_for_mode(mode, paths.log_path.as_deref());
-    install_daemon_lifecycle_panic_hook();
     // `build-sha.txt` is written after the daemon reaches `Ready` per P042
     // §9.4 so the Swift diagnostics bundle never reads a sha for a
     // process that never actually came up.
@@ -177,14 +186,6 @@ async fn run_daemon() -> Result<()> {
     let events = new_bus(1024);
     let binary_schema_version = migrate::binary_schema_version();
     let build_sha = packaging::resolved_build_sha();
-    warn!(
-        pid = std::process::id(),
-        mode = %mode,
-        build_sha = %build_sha,
-        database_url = %paths.database_url,
-        bind_addr = %paths.bind_addr,
-        "daemon lifecycle: starting"
-    );
     let reporter = LifecycleReporter::new(binary_schema_version, build_sha, events.clone());
     reporter.set_state(DaemonLifecycleState::Starting);
 
@@ -256,7 +257,6 @@ async fn run_daemon() -> Result<()> {
     // to consult and would have panicked on `Extension<PrincipalTable>`
     // extraction.
     let principal_table = auth::PrincipalTable::load_or_bootstrap(&paths.principals_path)?;
-    let live_principal_source = auth::LivePrincipalSource::new(principal_table.clone());
     info!(
         path = %paths.principals_path.display(),
         "Principal table loaded"
@@ -482,7 +482,7 @@ async fn run_daemon() -> Result<()> {
                 format!("{count} crashes; first at unix={first_crash_at}"),
                 None,
             );
-            return serve_failed(&reporter, &live_principal_source, &paths).await;
+            return serve_failed(&reporter, &principal_table, &paths).await;
         }
     }
 
@@ -508,7 +508,7 @@ async fn run_daemon() -> Result<()> {
                     "migration preflight failed — entering §8.7 failed-serve mode"
                 );
                 reporter.set_failed(kind, detail, backup_path);
-                return serve_failed(&reporter, &live_principal_source, &paths).await;
+                return serve_failed(&reporter, &principal_table, &paths).await;
             }
         };
 
@@ -521,6 +521,32 @@ async fn run_daemon() -> Result<()> {
 
     let db_writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
     db::writer::register_shared_writer(&pool, db_writer.clone()).await?;
+
+    // P080: seed rollout control matrix (first-run only, all-or-nothing).
+    // Fail-closed: if seeding fails (including partial-row-set detection) the
+    // daemon refuses to start so tool registration and the reconciliation loop
+    // cannot proceed with an unknown rollout state (HIGH-001 fix).
+    match db::repos::p080::seed_rollout_control_if_absent(&pool).await {
+        Ok(n) if n > 0 => info!(seeded = n, "P080 rollout control matrix seeded (first run)"),
+        Ok(_) => {}
+        Err(e) => {
+            error!(
+                err = %e,
+                "P080 rollout control seeding failed; refusing to start (fail-closed)"
+            );
+            return Err(e);
+        }
+    }
+    // HIGH-001: validate that the complete set of required rollout-control rows
+    // is present after seeding.  Refuses daemon startup if any class is missing
+    // (e.g. a deleted or corrupted live_disable row must not be silently skipped).
+    if let Err(e) = db::repos::p080::validate_rollout_control_completeness(&pool).await {
+        error!(
+            err = %e,
+            "P080 rollout control validation failed; refusing to start (fail-closed)"
+        );
+        return Err(e);
+    }
 
     // SEC-M-004: Verify the latest audit checkpoint window before constructing
     // request-serving components. If tamper_suspected, replace boundary_policy
@@ -664,33 +690,28 @@ async fn run_daemon() -> Result<()> {
         }
     }
     let _maintenance_reaper = db::repos::maintenance::spawn_maintenance_reaper(pool.clone());
-    tokio::spawn({
-        let pool = pool.clone();
-        async move {
-            match daemon::storage_startup::run_startup_evidence_orphan_sweep(&pool).await {
-                Ok(summary) => {
-                    info!(
-                        roots_inspected = summary.roots_inspected,
-                        roots_missing = summary.roots_missing,
-                        scanned_files = summary.scanned_files,
-                        already_indexed = summary.already_indexed,
-                        recovered_orphans = summary.recovered_orphans,
-                        skipped_files = summary.skipped_files,
-                        bytes_read = summary.bytes_read,
-                        truncated = summary.truncated,
-                        errors = summary.errors,
-                        "P075 startup evidence orphan sweep complete"
-                    );
-                }
-                Err(err) => {
-                    warn!(
-                        err = %err,
-                        "P075 startup evidence orphan sweep could not enumerate active runs"
-                    );
-                }
-            }
+    match daemon::storage_startup::run_startup_evidence_orphan_sweep(&pool).await {
+        Ok(summary) => {
+            info!(
+                roots_inspected = summary.roots_inspected,
+                roots_missing = summary.roots_missing,
+                scanned_files = summary.scanned_files,
+                already_indexed = summary.already_indexed,
+                recovered_orphans = summary.recovered_orphans,
+                skipped_files = summary.skipped_files,
+                bytes_read = summary.bytes_read,
+                truncated = summary.truncated,
+                errors = summary.errors,
+                "P075 startup evidence orphan sweep complete"
+            );
         }
-    });
+        Err(err) => {
+            warn!(
+                err = %err,
+                "P075 startup evidence orphan sweep could not enumerate active runs"
+            );
+        }
+    }
     let host_interruption_service =
         HostInterruptionService::with_capacity_config_runtime_cleanup_and_db_writer(
             pool.clone(),
@@ -726,41 +747,16 @@ async fn run_daemon() -> Result<()> {
             );
             info!("BackgroundExecutor started");
             reporter.set_state(DaemonLifecycleState::Ready);
-            warn!(
-                pid = std::process::id(),
-                mode = %mode,
-                build_sha = %build_sha,
-                "daemon lifecycle: ready"
-            );
             if let Err(e) = packaging::write_build_sha(&paths) {
                 warn!(err = %e, "failed to write build-sha.txt (non-fatal)");
             }
             let mcp = mcp_server::server::McpServer::new_with_storage_writer_and_boundary_policy(
                 pool.clone(),
                 cmd_handler.clone(),
-                principal_table.clone(),
+                principal_table,
                 db_writer.heartbeat.clone(),
                 Arc::clone(&boundary_policy),
-            )
-            .with_live_principal_source(live_principal_source.clone());
-            let principals_reload_secs = principals_reload_interval_secs();
-            let principals_path_for_reload = paths.principals_path.clone();
-            let live_principal_source_for_reload = live_principal_source.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(principals_reload_secs))
-                        .await;
-                    match auth::PrincipalTable::load_or_bootstrap(&principals_path_for_reload) {
-                        Ok(new_table) => live_principal_source_for_reload.update(new_table),
-                        Err(e) => {
-                            live_principal_source_for_reload.mark_unavailable();
-                            tracing::warn!(
-                                "MCP stdio principal reload failed; auth source marked unavailable: {e:#}"
-                            );
-                        }
-                    }
-                }
-            });
+            );
             mcp.run_stdio().await?;
         }
         _ => {
@@ -773,8 +769,7 @@ async fn run_daemon() -> Result<()> {
                     principal_table.clone(),
                     db_writer.heartbeat.clone(),
                     Arc::clone(&boundary_policy),
-                )
-                .with_live_principal_source(live_principal_source.clone()),
+                ),
             );
             let mcp_routes = mcp_server::http::routes(mcp);
             info!("MCP HTTP transport mounted at /mcp");
@@ -792,18 +787,19 @@ async fn run_daemon() -> Result<()> {
             // P046: periodically reload principals.json so subscription auth rechecks
             // observe revocation promptly, without requiring a daemon restart.
             // Default interval is 2 seconds; override with CHAINWORKS_PRINCIPALS_RELOAD_SECS.
-            let principals_reload_secs = principals_reload_interval_secs();
+            let principals_reload_secs: u64 = std::env::var("CHAINWORKS_PRINCIPALS_RELOAD_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2);
             let principals_path_for_reload = paths.principals_path.clone();
-            let live_principal_source_for_reload = live_principal_source.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(principals_reload_secs))
                         .await;
                     match auth::PrincipalTable::load_or_bootstrap(&principals_path_for_reload) {
                         Ok(new_table) => {
-                            p046_live_handle.update(new_table.clone()).await;
-                            live_principal_source_for_reload.update(new_table);
-                            tracing::debug!("principal table reloaded for live revocation");
+                            p046_live_handle.update(new_table).await;
+                            tracing::debug!("P046 principal table reloaded for live revocation");
                         }
                         Err(e) => {
                             // Mark the auth source unavailable so running subscriptions
@@ -811,10 +807,9 @@ async fn run_daemon() -> Result<()> {
                             // than continuing under stale grants after a revocation write
                             // that we could not observe.
                             p046_live_handle.mark_unavailable().await;
-                            live_principal_source_for_reload.mark_unavailable();
                             tracing::warn!(
                                 "P046 principal reload failed; auth source marked unavailable \
-                                 (GraphQL subscriptions and MCP requests will fail-closed): {e:#}"
+                                 (subscriptions will fail-closed): {e:#}"
                             );
                         }
                     }
@@ -826,12 +821,7 @@ async fn run_daemon() -> Result<()> {
             // GraphQL server takes the socket.
             let (listener, port) = packaging::bind_with_fallback(&paths).await?;
             packaging::write_daemon_endpoint_snapshot(&paths, std::process::id(), port, build_sha)?;
-            warn!(
-                pid = std::process::id(),
-                port,
-                build_sha = %build_sha,
-                "daemon lifecycle: listener bound"
-            );
+            info!(port, "bound HTTP listener; handing off to graphql-server");
 
             let xcode_broker_pool =
                 new_daemon_xcode_broker_pool(port, acp.xcode_runtime_observation_sink());
@@ -883,13 +873,6 @@ async fn run_daemon() -> Result<()> {
             // §5.1: Ready only AFTER HTTP bind so a client receiving
             // `state=ready` is guaranteed it can connect.
             reporter.set_state(DaemonLifecycleState::Ready);
-            warn!(
-                pid = std::process::id(),
-                port,
-                mode = %mode,
-                build_sha = %build_sha,
-                "daemon lifecycle: ready"
-            );
 
             // §9.4: write build-sha.txt after successful Ready so the
             // Swift diagnostics bundle only ever reports a sha for a
@@ -941,11 +924,7 @@ async fn run_daemon() -> Result<()> {
             let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
             let shutdown_signal = async move {
                 wait_for_shutdown_signal().await;
-                warn!(
-                    pid = std::process::id(),
-                    deadline_secs = SHUTDOWN_DRAIN_DEADLINE.as_secs(),
-                    "daemon lifecycle: shutdown signal received; transitioning to Shutdown"
-                );
+                info!("shutdown signal received; transitioning to Shutdown");
                 shutdown_reporter.set_state(DaemonLifecycleState::Shutdown);
                 match tokio::time::timeout(
                     SHUTDOWN_DRAIN_DEADLINE,
@@ -953,13 +932,13 @@ async fn run_daemon() -> Result<()> {
                 )
                 .await
                 {
-                    Ok(closed_sessions) => warn!(
+                    Ok(closed_sessions) => info!(
                         closed_sessions,
-                        "daemon lifecycle: closed live ACP sessions during shutdown"
+                        "closed live ACP sessions during daemon shutdown"
                     ),
                     Err(_) => warn!(
                         deadline_secs = SHUTDOWN_DRAIN_DEADLINE.as_secs(),
-                        "daemon lifecycle: timed out closing live ACP sessions during shutdown"
+                        "timed out closing live ACP sessions during daemon shutdown"
                     ),
                 }
                 // Notify the main task that the drain window has started.
@@ -971,12 +950,11 @@ async fn run_daemon() -> Result<()> {
             let serve_fut = async {
                 let extra_routes =
                     mcp_routes.merge(daemon::xcode_broker_http::routes(xcode_broker_pool.clone()));
-                graphql_server::server::serve_with_listener_until_with_live_principal_source(
+                graphql_server::server::serve_with_listener_until(
                     schema,
                     listener,
                     extra_routes,
                     principal_table,
-                    live_principal_source.clone(),
                     reporter.clone(),
                     shutdown_signal,
                 )
@@ -991,21 +969,16 @@ async fn run_daemon() -> Result<()> {
 
             match drain_outcome {
                 DrainOutcome::ServeReturnedFirst => {
-                    warn!(
-                        pid = std::process::id(),
-                        "daemon lifecycle: HTTP serve returned before shutdown signal; exit 0"
-                    );
+                    info!("HTTP serve returned before shutdown signal; exit 0");
                 }
-                DrainOutcome::DrainedWithinDeadline => warn!(
-                    pid = std::process::id(),
+                DrainOutcome::DrainedWithinDeadline => info!(
                     deadline_secs = SHUTDOWN_DRAIN_DEADLINE.as_secs(),
-                    "daemon lifecycle: HTTP serve drained cleanly within deadline; exit 0"
+                    "HTTP serve drained cleanly within deadline; exit 0"
                 ),
                 DrainOutcome::DrainDeadlineExceeded => {
                     error!(
-                        pid = std::process::id(),
                         deadline_secs = SHUTDOWN_DRAIN_DEADLINE.as_secs(),
-                        "daemon lifecycle: graceful shutdown did not drain within deadline; exit {EX_TEMPFAIL}"
+                        "graceful shutdown did not drain within deadline; exit {EX_TEMPFAIL}"
                     );
                     std::process::exit(EX_TEMPFAIL);
                 }
@@ -1175,12 +1148,6 @@ fn spawn_background_executor_watchdog(
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(300),
         );
-        let stale_targeted_advance_after = chrono::Duration::seconds(
-            std::env::var("CHAINWORKS_TARGETED_ADVANCE_RUN_STALE_SECS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(60),
-        );
         let scheduler_health_stale_after = chrono::Duration::seconds(
             std::env::var("CHAINWORKS_SCHEDULER_HEALTH_STALE_SECS")
                 .ok()
@@ -1191,64 +1158,6 @@ fn spawn_background_executor_watchdog(
         loop {
             tokio::time::sleep(interval).await;
             let now = chrono::Utc::now();
-            match work_items::complete_targeted_advance_runs_with_existing_invokes(
-                &pool,
-                now,
-                "watchdog_targeted_advance_existing_invoke",
-            )
-            .await
-            {
-                Ok(0) => {}
-                Ok(completed) => {
-                    warn!(
-                        completed,
-                        "BackgroundExecutor watchdog completed targeted AdvanceRun work items whose InvokeAgent already exists"
-                    );
-                    if let Err(error) = work_queue.refresh_scheduler_projection().await {
-                        warn!(
-                            error = %error,
-                            "BackgroundExecutor watchdog failed to refresh scheduler projection after targeted AdvanceRun completion"
-                        );
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "BackgroundExecutor watchdog failed to complete targeted AdvanceRun rows with existing invokes"
-                    );
-                }
-            }
-
-            let targeted_stale_before = now - stale_targeted_advance_after;
-            match work_items::requeue_stale_running_targeted_advance_items(
-                &pool,
-                targeted_stale_before,
-                now,
-                "watchdog_stale_targeted_advance_run",
-            )
-            .await
-            {
-                Ok(0) => {}
-                Ok(requeued) => {
-                    warn!(
-                        requeued,
-                        "BackgroundExecutor watchdog requeued stale targeted AdvanceRun work items"
-                    );
-                    if let Err(error) = work_queue.refresh_scheduler_projection().await {
-                        warn!(
-                            error = %error,
-                            "BackgroundExecutor watchdog failed to refresh scheduler projection after stale targeted AdvanceRun requeue"
-                        );
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "BackgroundExecutor watchdog failed to requeue stale targeted AdvanceRun rows"
-                    );
-                }
-            }
-
             let stale_before = now - stale_advance_after;
             match work_items::requeue_stale_running_advance_items(
                 &pool,
@@ -1540,44 +1449,6 @@ fn init_tracing_for_mode(
     }
 }
 
-fn install_daemon_lifecycle_panic_hook() {
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        let payload = panic_info
-            .payload()
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| {
-                panic_info
-                    .payload()
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-            })
-            .unwrap_or("<non-string panic payload>");
-        let location = panic_info
-            .location()
-            .map(|location| {
-                format!(
-                    "{}:{}:{}",
-                    location.file(),
-                    location.line(),
-                    location.column()
-                )
-            })
-            .unwrap_or_else(|| "<unknown location>".to_string());
-        let current_thread = std::thread::current();
-        let thread_name = current_thread.name().unwrap_or("<unnamed>");
-        tracing::error!(
-            pid = std::process::id(),
-            thread = thread_name,
-            location = %location,
-            payload = payload,
-            "daemon lifecycle: panic observed"
-        );
-        previous_hook(panic_info);
-    }));
-}
-
 /// Wait for SIGTERM (packaged supervisor) or SIGINT (developer Ctrl-C).
 /// Resolves as soon as either signal is observed.
 #[cfg(unix)]
@@ -1586,27 +1457,15 @@ async fn wait_for_shutdown_signal() {
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
     tokio::select! {
-        _ = sigterm.recv() => warn!(
-            pid = std::process::id(),
-            signal = "SIGTERM",
-            "daemon lifecycle: shutdown signal observed"
-        ),
-        _ = sigint.recv() => warn!(
-            pid = std::process::id(),
-            signal = "SIGINT",
-            "daemon lifecycle: shutdown signal observed"
-        ),
+        _ = sigterm.recv() => info!("SIGTERM received"),
+        _ = sigint.recv() => info!("SIGINT received"),
     }
 }
 
 #[cfg(not(unix))]
 async fn wait_for_shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
-    warn!(
-        pid = std::process::id(),
-        signal = "Ctrl-C",
-        "daemon lifecycle: shutdown signal observed"
-    );
+    info!("Ctrl-C received");
 }
 
 /// Map a typed [`MigrationError`] to the `(FailureKind, detail, backup_path)`
@@ -1674,7 +1533,7 @@ fn extract_backup_path_hint(msg: &str) -> Option<String> {
 /// is therefore uniform for Ready and Failed servers.
 async fn serve_failed(
     reporter: &LifecycleReporter,
-    live_principal_source: &auth::LivePrincipalSource,
+    principal_table: &auth::PrincipalTable,
     paths: &ModePaths,
 ) -> Result<()> {
     let (listener, port) = packaging::bind_with_fallback(paths).await?;
@@ -1689,26 +1548,9 @@ async fn serve_failed(
         bind_addr = %paths.bind_addr,
         "failed-serve: bound listener; daemon.port written so clients can discover the status surface"
     );
-    let principals_reload_secs = principals_reload_interval_secs();
-    let principals_path_for_reload = paths.principals_path.clone();
-    let live_source_for_reload = live_principal_source.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(principals_reload_secs)).await;
-            match auth::PrincipalTable::load_or_bootstrap(&principals_path_for_reload) {
-                Ok(new_table) => live_source_for_reload.update(new_table),
-                Err(e) => {
-                    live_source_for_reload.mark_unavailable();
-                    tracing::warn!(
-                        "failed-serve principal reload failed; auth source marked unavailable: {e:#}"
-                    );
-                }
-            }
-        }
-    });
-    failed_serve::serve_failed_state_with_live_principal_source(
+    failed_serve::serve_failed_state_with_listener(
         reporter.clone(),
-        live_principal_source.clone(),
+        principal_table.clone(),
         listener,
     )
     .await
@@ -1724,17 +1566,6 @@ mod tests {
             new_daemon_xcode_broker_pool(41234, Arc::new(acp::NoopXcodeRuntimeObservationSink));
 
         assert!(pool.has_backend());
-    }
-
-    #[test]
-    fn principals_reload_interval_rejects_zero_and_invalid_values() {
-        assert_eq!(principals_reload_interval_secs_from_env_value(None), 2);
-        assert_eq!(principals_reload_interval_secs_from_env_value(Some("5")), 5);
-        assert_eq!(principals_reload_interval_secs_from_env_value(Some("0")), 2);
-        assert_eq!(
-            principals_reload_interval_secs_from_env_value(Some("not-a-number")),
-            2
-        );
     }
 
     #[test]

@@ -24,7 +24,7 @@ The Rust control-plane daemon is a server-side parity replica of the orchestrati
 - **escalation policy resolution, trigger classification, blocker digest calculation, and policy lifecycle management**
 - projection updates for read models
 - ACP runtime adapter coordination
-- escalation ledger persistence (domain enums, three SQLite tables, repo-layer redaction enforcement, `run_escalation_readback` GraphQL query) and tier selection writer (`engine/src/shadow_escalation.rs`) populating `would_select_*` diagnostics while advancing durable ledger/event readback for owned active tiers
+- escalation ledger persistence (domain enums, three SQLite tables, repo-layer redaction enforcement, `run_escalation_readback` GraphQL query) and P058 tier selection writer (`engine/src/shadow_escalation.rs`) populating `would_select_*` diagnostics while advancing durable ledger/event readback for owned active tiers
 
 The daemon runs alongside the desktop application on the same machine. During the current phase, the SwiftUI client remains the canonical user-facing owner. The daemon provides shadow truth through GraphQL and MCP, validated before any authority transfer.
 
@@ -124,7 +124,7 @@ for the full authentication and capability filtering reference.
 - `POST /graphql` -- queries and mutations
 - `WS /graphql/ws` -- subscriptions
 
-Representative query families: ideas, runs, approvals, artifacts, stages, workflow topology, active agent executions, raw timeline detail, queue summaries, escalation readback, Steward analyses, daemon lifecycle, boundary runtime diagnostics, operator alerts, storage health, startup recovery, toolchain-cache housekeeping, unresolved side effects, session observability, continuation status/candidates/history, and continuation metrics.
+Queries: `ideas`, `idea`, `runs`, `run`, `stages`, `approvals`, `artifacts`, `storageHealth`, `p080Diagnostics`.
 
 **Storage Health Readback:**
 The `storageHealth` query exposes the current health state of the storage subsystem, including `DbWriter`, WAL, projections, evidence spool, and freshness details, aligning with the P087 proposal for local storage tiering and read-path liveness. Specifically, it now exposes identity-bearing `ProjectionFreshnessV1` data through additive GraphQL fields such as `projectionFreshness` and `projectionFreshnessBySource`.
@@ -145,7 +145,9 @@ settlement surface. Non-approval operator commands such as starting runs,
 retrying stages, cancelling runs, resolving workflow conflicts, and recovery
 actions are MCP-only.
 
-Subscriptions: `runStatusChanged`, `stageStatusChanged`, `approvalRequested`, `approvalResolved`, `runtimeStatusChanged`.
+Subscriptions: `runStatusChanged`, `stageStatusChanged`, `approvalRequested`, `approvalResolved`, `runtimeStatusChanged`, `p080DiagnosticsUpdates`.
+
+**P080 stale execution diagnostics readback (Phase 1 detection-only):** the `p080Diagnostics` query and `p080DiagnosticsUpdates` subscription are registered read-only GraphQL surfaces and require operator-read capability. The query is DB-backed over `p080_readback_heartbeats_v1` when `live_disable` is off and `detection_only` is enabled; it supports filter fields, page-size clamping, and optional budgeted `total_count`. The subscription emits current matching rows as `InitialSnapshotRow` events, then polls the projection and emits `RowUpdated`, `RowRemoved`, `ProjectionRebuilt`, or `AuthorizationLost` events until the client disconnects or authorization/gates fail. MCP `p080.diagnostics.get.v1` and `p080.reconcile.request.v1` are allowed for `Operator` and `ReadOnlyOperator`; `p080.clear_permanent_hold.v1` is Operator-only. The `p080.reconcile.request.v1` handler admits `ReadOnlyOperator` only for `requested_action=diagnose_only` and rejects `repair_if_safe` or `hold` with `unauthorized_missing_capability`. `ArtifactEntity` and `ReportEntity` MCP resources are Operator-only — ReadOnlyOperator carries no default MCP resource capabilities (SEC-P080-001). Per-run row scoping is enforced at both surfaces: restricted GraphQL and MCP callers fail closed unless `filter.run_id` or `target.run_id` is within configured `run_scope`; northbound handlers surface these failures as `unauthorized_missing_capability` while the auth helper distinguishes `auth_scope_required` from `auth_scope_violation` internally. MCP `p080.diagnostics.get.v1` reads existing `p080_readback_heartbeats_v1` rows only when the `detection_only` rollout-control row is enabled; otherwise it fails closed with `rollout_disabled`. When `live_disable` is off and `detection_only` is enabled, the live loop refreshes classifier rows and writes diagnose-only readback heartbeats and reconciliation events for `acp_startup_stale` candidates on every tick, independent of the `acp_startup_stale` class flag (which only governs the readback's `rollout_disablement` field: `none` when the class is enabled, `class_disabled` while still phase-gated). It does not perform ACP resets or scheduler repair in this slice. `acp_prompt_stale` is delegated to P037 prompt supervision with zero P080 mutations. `repair_if_safe`, `hold`, and `clear_permanent_hold` are gated to `action_disabled_in_phase` or `class_disabled`/`rollout_disabled` while Phase 1 is in effect. See [P080](../proposals/080-continuous-stale-execution-reconciliation.md) for the approved active-repair design. Operator runbooks for stale-execution repair and live-loop termination live at [`docs/runbooks/p080-stale-execution-repair.md`](../runbooks/p080-stale-execution-repair.md) and [`docs/runbooks/p080-reconciliation-loop-termination.md`](../runbooks/p080-reconciliation-loop-termination.md); the rollout-critical alert rules and overview dashboard live at [`docs/evidence/alerts/p080-alerts.yaml`](../evidence/alerts/p080-alerts.yaml) and [`docs/evidence/dashboards/p080-overview.json`](../evidence/dashboards/p080-overview.json); per-phase soak and readiness artifacts collect under [`docs/evidence/rollout/p080/`](../evidence/rollout/p080/).
 
 Implementation: `control-plane/crates/graphql-server/src/schema.rs`.
 
@@ -162,19 +164,12 @@ Tools are namespaced:
 | Namespace | Tools |
 |---|---|
 | `ideas.*` | `ideas.create`, `ideas.list` |
-| `runs.*` | `runs.start`, `runs.list`, `runs.get`, `runs.cancel`, `runs.retrofit_catalog_snapshot`, `runs.main_sync.request`, `runs.main_sync.retry`, `runs.main_sync.set_override`, `runs.main_sync.repair_state`, `runs.main_sync.record_recovery_decision`, `runs.knowledge_capsule.ignore`, `runs.settle_proposal_gate` |
+| `runs.*` | `runs.start`, `runs.list`, `runs.get`, `runs.cancel`, `runs.main_sync.request`, `runs.main_sync.retry`, `runs.main_sync.set_override`, `runs.main_sync.repair_state`, `runs.main_sync.record_recovery_decision`, `runs.knowledge_capsule.ignore`, `runs.settle_proposal_gate` |
 | `approvals.*` | `approvals.list`, `approvals.resolve` |
-| `stages.*` and workflow tools | `stages.retry`, `stages.consume_provider_quota_hold`, `legacy_discovery_override_create`, `workflow_conflicts.resolve`, `workflow_loop_budget.extend` |
-| `effects.*` | `effects.list`, `effects.inspect`, `effects.reconcile`, `effects.mark_conflict`, `effects.mark_unrecoverable`, `effects.clear_after_manual_verification` |
+| `stages.*` | `stages.retry` |
+| `effects.*` | `effects.list`, `effects.inspect`, `effects.reconcile`, `effects.mark_unrecoverable`, `effects.clear_after_manual_verification` |
 | `reports.*` | `reports.get` |
-| `artifacts.*` | `artifacts.override_contract` |
-| `steward.*` | `steward.run_analysis`, `steward.list_analyses`, `steward.get_analysis` |
-| Runtime and boundary diagnostics | `runtime.health`, `boundary.runtime.get`, `operator.alerts.list` |
-| `storage.*` | `storage.health`, `storage.write_pressure`, `storage.evidence_spool_summary`, `storage.reconcile_evidence_orphans`, `storage.maintenance.repair_slot`, `storage.projections.clear_backlog`, `storage.projections.clear_poison` |
-| `agents.*` | `agents.continuation_status`, `agents.continuation_candidates`, `agents.continue_work` |
-| `automation.*` | `automation.auto_retry.latest` |
-
-The exhaustive capability registry is owned by [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md) and enforced in `domain::CapabilityToolId` plus `mcp-server/src/tools/mod.rs`.
+| `p080.*` | `p080.diagnostics.get.v1`, `p080.reconcile.request.v1`, `p080.clear_permanent_hold.v1` |
 
 **Implementation self-assessment detail extension:**
 `runs.get` and `runs.list` (detail view) include `implementation_self_assessment_summary` in the response payload.
@@ -188,7 +183,7 @@ The exhaustive capability registry is owned by [mcp-northbound-control-plane-ser
 **Targeted Retry Authority Readback:**
 `runs.get` includes `retry_authority`, `retry_authority_history`, and `p091_orphan_repair_readback`. `reports.get` includes the same truth as `retryAuthority`, `retryAuthorityHistory`, and `p091OrphanRepairReadback`.
 
-**Escalation Readback:**
+**Escalation Readback (P058 Phase 1):**
 `runs.get` includes an `escalation_readback` projection at parity with the GraphQL `runEscalationReadback` query. Operator principals receive full chain detail (capped at 50 ledgers, 200 events/ledger, 100 execution-metadata rows/ledger with `*_truncated`/`*_total` markers); Agent and Observer principals receive a summary projection (`chains_redacted: true`) with `paused_chain_count` and `has_active_escalation` only. See [escalation-policies.md](escalation-policies.md) for the full contract.
 
 Resources follow two URI families:
@@ -566,7 +561,6 @@ High-volume runtime evidence is spooled to the local filesystem instead of being
 - **`summary_json` Canonicalization**: The persisted form is the re-serialized output of the parsed JSON object (`canonicalize_summary_json`), not the raw producer string. This neutralizes duplicate-key smuggling — a payload like `{"line_count":1,"line_count":"<raw transcript>"}` would otherwise round-trip its second value through SQLite even though `serde_json::Map` parsing keeps only the last key. Both `insert_tx` and `insert_idempotent` bind the canonical form.
 - **Canonical Layout Enforcement** (P075-SEC-002): `write_spool_file` rejects any `relative_path` that does not start with `evidence/runs/` (`evidence/runs/{run_id}/stages/{stage_id}/agents/{agent_id}/{kind}/...`). Producers cannot write spool files outside this layout.
 - **Symlink-Escape Prevention** (P075-SEC-H001): `artifact_root` is canonicalized via `tokio::fs::canonicalize` before path joining, and parent directories are created by a per-segment symlink-safe walk (`create_spool_parent_safe`). Each path component is checked with `symlink_metadata` (no-follow) **before** any `mkdir`, so a symlinked intermediate directory is rejected without ever creating a directory through the symlink — filesystem state outside the canonical root is never mutated. `verify_spool_file` and `sweep_evidence_orphans` use `symlink_metadata` (no-follow) on candidates and treat any symlink as missing/skipped, so orphan recovery cannot follow a symlink to leak fingerprints of files outside the spool tree.
-- **Workspace-Root Containment**: runtime producers that create artifact/evidence parents, including side-effect receipt evidence and P088 completion-repair artifacts, first canonicalize the run `workspace_root`, reject symlink components, and require the target artifact path to remain under that canonical workspace root before writing bytes.
 - **Restrictive Permissions** (P075-SEC-H002, Unix): Spool files are created with mode `0o600` and parent directories with mode `0o700` regardless of the process umask, so spooled transcripts and tool traces are not group- or world-readable.
 - **No-Clobber Commit** (P075-SEC-002): If `final_path` already exists when `write_spool_file` is about to rename, the writer compares the existing file against the new content. Identical bytes (matching SHA-256 and size) are treated as an idempotent retry and the rename is skipped; differing content returns a hard error directing the operator to `storage.reconcile_evidence_orphans`. Committed evidence cannot be silently overwritten before the Class C metadata idempotency check runs.
 - **Verify Read Cap** (P075-SEC-004): `verify_spool_file` `stat`s the target before reading and rejects files larger than `VERIFY_SIZE_CAP_BYTES` (512 MiB) to prevent unbounded RAM allocation when the orphan sweep or another reader passes a large or attacker-influenced path. `sweep_evidence_orphans` honours the same cap when hashing recovery candidates. Streaming verification is reserved for larger artifacts.
@@ -639,7 +633,7 @@ queue-wait latency.
 
 The database schema is evolved through migrations located at `control-plane/crates/db/migrations/`. These migrations define the canonical domain tables, support projections for client readback, and metadata for scheduling and recovery.
 
-**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `044_p084_rollout_contract.sql`, `045_p084_rollout_contract_readback.sql`, `046_p075_evidence_spool_refs.sql`, `047_p075_storage_write_pressure_snapshots.sql`, `048_p075_evidence_path_constraints.sql`, `049_p075_storage_write_pressure_window_key.sql`, `052_p078_side_effect_ledger.sql`, `057_p087_storage_tiering_projections.sql`, `058_p087_hot_read_refinements.sql`, `059_p087_projection_refinement.sql`, `060_p087_projection_invalidation_lifecycle.sql`, `061_p087_hot_read_promotion_budget.sql`, `062_p087_projection_freshness_healthy_window.sql`, `076_p058_escalation_schema.sql`, `077_p058_escalation_redaction_version.sql`, `078_p058_escalation_idempotency.sql`):
+**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `044_p084_rollout_contract.sql`, `045_p084_rollout_contract_readback.sql`, `046_p075_evidence_spool_refs.sql`, `047_p075_storage_write_pressure_snapshots.sql`, `048_p075_evidence_path_constraints.sql`, `049_p075_storage_write_pressure_window_key.sql`, `052_p078_side_effect_ledger.sql`, `057_p087_storage_tiering_projections.sql`, `058_p087_hot_read_refinements.sql`, `059_p087_projection_refinement.sql`, `060_p087_projection_invalidation_lifecycle.sql`, `061_p087_hot_read_promotion_budget.sql`, `062_p087_projection_freshness_healthy_window.sql`, `076_p058_escalation_schema.sql`, `077_p058_escalation_redaction_version.sql`, `078_p058_escalation_idempotency.sql`, `079_p080_stale_execution_reconciliation.sql`):
 
 | Table | Purpose |
 |---|---|
@@ -671,6 +665,13 @@ The database schema is evolved through migrations located at `control-plane/crat
 | `artifacts` | Artifact metadata (file path, format, checksum, provider, report kind) |
 | `work_items` | Internal work queue (kind, payload, status, attempts, errors) |
 | `command_journal` | Audit trail for mutating commands (type, payload, result, errors, caller metadata) |
+| `p080_rollout_control_v1` | P080: per-class rollout-control rows seeded default-disabled, including the `live_disable` row and generation counter used for fail-closed enforcement |
+| `p080_rollout_control_audit_v1` | P080: additive audit table for rollout-control transitions; no operator rollout mutation surface is enabled in the current slice |
+| `p080_reconciliation_events_v1` | P080: typed reconciliation event log; the current slice records diagnose-only operator/live-loop events |
+| `p080_operator_request_dedup_v1` | P080: dedup/idempotency fence for MCP operator requests, fingerprinted by auth/policy/generation/rollout/class |
+| `p080_readback_heartbeats_v1` | P080: bounded classifier/readback rows consumed by MCP diagnostics and GraphQL `p080Diagnostics` when `detection_only` is enabled; `p080DiagnosticsUpdates` emits initial snapshot and live polling events from the same projection |
+| `p080_helper_leases_v1`, `p080_helper_lease_members_v1` | P080: additive schema for Chainworks-owned helper process lease/membership records used by future orphan-reaping gates |
+| `p080_candidate_deferral_v1`, `p080_iteration_cursor_v1`, `p080_recurrence_epoch_v1`, `p080_executor_registration_watchdog_v1` | P080: additive scheduling, deferral, recurrence, and watchdog state for later continuous-reconciliation phases |
 
 **AgentExecution Owner Migration:**
 To support lead-mediated conflicts without synthetic stage states, `agent_executions`
@@ -728,9 +729,9 @@ state, not only process logs.
 | `recovery_action_chosen_total` | Counter event | `conflict_reason`, `action_class`, `source_surface`, `result` | Counts chosen recovery actions (retry, clone, manual_fallback). |
 | `phase_c_validation_outcome_total` | Counter | `outcome` | Phase C validation results: `static_fail`, `preflight_fail`, `legacy_catalog_warning`, `pass`. |
 
-### Escalation Metrics
+### Escalation Metrics (P058)
 
-The control plane declares the full escalation metric inventory in `db::metrics::P058_REQUIRED_METRICS`; `P058` is retained in the symbol name as a historical gate/schema alias. Durable escalation ledger inserts emit `escalation_chains_started_total`; escalation event writes emit the relevant pause, exhausted-chain, repeated-digest, capacity, force-detach, drift, storm, retry-after, late-frame, and success-rate counters from redacted event metadata. Metrics that require wall-clock SLO samples, provider force-detach timings, or operator adjudication are emitted by their corresponding event producers rather than synthesized at read time.
+The control plane declares the full P058 metric inventory in `db::metrics::P058_REQUIRED_METRICS`. Durable escalation ledger inserts emit `escalation_chains_started_total`; escalation event writes emit the relevant pause, exhausted-chain, repeated-digest, capacity, force-detach, drift, storm, retry-after, late-frame, and success-rate counters from redacted event metadata. Metrics that require wall-clock SLO samples, provider force-detach timings, or operator adjudication are emitted by their corresponding event producers rather than synthesized at read time.
 
 ## Work queue
 
@@ -791,10 +792,7 @@ capacity-blocked work pending.
   `scheduler_queue_summaries` and `scheduler_health_snapshots` projections.
 - **Wake-up**: `InvokeAgent` completion inserts an idempotent post-completion
   `AdvanceRun` wake-up inside `work_items.complete`, so fan-in observes the
-  completed work item before settling the stage. For a running `InvokeAgent`,
-  completion is accepted only after runtime facts prove valid required outputs;
-  otherwise the work item, agent execution, follow-up `AdvanceRun`, and active
-  artifact source claim remain unchanged.
+  completed work item before settling the stage.
 
 ### Scheduler Fairness
 
@@ -845,8 +843,6 @@ The recovery service at `crates/engine/src/recovery.rs` runs at daemon startup (
 6. Re-enqueues `AdvanceRun` for affected runs.
 
 The service returns a `RecoverySummary` with counts of inspected runs, repaired runs, and requeued work items.
-
-Recovery and retry behavior across startup repair, late output, cancellation, side-effect reconciliation, approval restart, mediation, session ownership, and crash-during-repair is governed by the P082 recovery/retry matrix. See [recovery-retry-state-machine-test-matrix.md](recovery-retry-state-machine-test-matrix.md) for the 17 canonical scenarios (P082-R01..R17), the `p082_recovery_matrix_readback_v1` schema, nested subcontracts, lane placement, observability thresholds, and the shared reason-code module at `control-plane/crates/domain/src/recovery_matrix.rs`.
 
 ## Running the daemon
 
@@ -948,10 +944,9 @@ Integration tests are located in:
 
 Additional focused gates:
 
-- The retained escalation proof gate documented in [test-gates.md](test-gates.md) covers ACP failure classification, runtime facts, and escalation-policy readback.
+- `./scripts/test-gate.sh proposal-058` for ACP failure classification and runtime facts.
 - `./scripts/test-gate.sh proposal-061` for SQLite write serialization, executor backpressure, host-interruption recovery, scheduler-health readback, and generated-state housekeeping safety. The `proposal-061|p061` names are retained historical gate aliases for this implemented contract.
 - `./scripts/test-gate.sh proposal-084` (retained historical alias `p084`) for the rollout-contract template, linter, fixtures, run-start preflight, parity-lane operator readback, and Swift read-only presentation slice. See [executable-rollout-gate-template.md](executable-rollout-gate-template.md).
-- `./scripts/test-gate.sh proposal-082` (alias `p082`) for the recovery/retry state-machine matrix: static fixture/matrix validation, DB and engine proof for all 17 canonical scenarios, `p082_recovery_matrix_readback_v1` lane parity on MCP/report surfaces, auth and revocation regressions for live principal revalidation including failed-serve diagnostics, fixture-enforced nested subcontracts, fail-closed side-effect retry, and crash-loop replay. See [recovery-retry-state-machine-test-matrix.md](recovery-retry-state-machine-test-matrix.md).
 
 ## Key design decisions
 

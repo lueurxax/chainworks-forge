@@ -99,11 +99,11 @@ The implemented [durable side-effect ledger](../reference/rust-control-plane.md#
 
 This pair is now the most important safety foundation after the UI/action boundary.
 
-#### P079 and P080 appeared as recovery-quality proposals
+#### P079 and P080 recovery-quality proposals
 
 [P079](../proposals/079-contract-aware-output-repair-and-provider-fallback.md) covers contract-aware output repair and provider fallback.
 
-[P080](../proposals/080-continuous-stale-execution-reconciliation.md) covers continuous stale execution reconciliation.
+[P080](../proposals/080-continuous-stale-execution-reconciliation.md) covers continuous stale execution reconciliation. Its initial detection/readback scaffold is implemented; active repair remains rollout-gated.
 
 Both are useful, but both must remain downstream of the implemented write-budget contract and durable side-effect safety rails.
 
@@ -324,7 +324,7 @@ Minimum rows:
 - late output after supersede,
 - duplicate startup/session.
 
-#### Step 8 - Auto-retry ledger / P080 recovery automation
+#### Step 8 - Auto-retry ledger / P080 recovery automation (initial scaffold implemented)
 
 Only after the durable side-effect guard exists.
 
@@ -458,7 +458,7 @@ P073
 -> write-budget contract
 -> durable side-effect ledger
 -> P082
--> auto-retry ledger / P080
+-> auto-retry ledger / P080 (initial scaffold implemented)
 -> P079
 -> P031 closeout
 -> P038/P046

@@ -3157,7 +3157,829 @@ impl QueryRoot {
         .await?;
         Ok(GqlContinuationMetricsSummary::from(summary))
     }
+
+    /// P080: Read-only page of stale execution diagnostics (DB-backed, Phase 1).
+    async fn p080_diagnostics(
+        &self,
+        ctx: &Context<'_>,
+        filter: Option<crate::types::p080::GqlP080DiagnosticsFilter>,
+        first: Option<i32>,
+        after: Option<String>,
+        include_recent_repaired: Option<bool>,
+        request_total_count: Option<bool>,
+    ) -> Result<crate::types::p080::GqlP080DiagnosticsConnection> {
+        require_p080_graphql_diagnostics_read(ctx, false).await?;
+        let pool = ctx.data::<SqlitePool>()?;
+
+        // SEC-P080-002: run-scope auth checked BEFORE rollout gates so unauthorized
+        // callers cannot infer rollout state through error codes.
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| Error::new("unauthorized"))?;
+        let filter_run_id: Option<&str> = filter
+            .as_ref()
+            .and_then(|f| f.run_id.as_ref())
+            .map(|id| id.as_str());
+        if let Err(_scope_err) = auth::check_p080_run_scope(principal, filter_run_id) {
+            return Err(p080_gql_error(
+                "p080: run-scope authorization required; run_scope must include filter.runId",
+                "unauthorized_missing_capability",
+                None,
+                "p080_diagnostics_get_request_v1",
+            ));
+        }
+
+        // Rollout gates run after run-scope auth is established.
+        p080_check_graphql_gate(pool).await?;
+
+        let page_size = first.unwrap_or(50).clamp(1, 200) as usize;
+        let include_recent_repaired_flag = include_recent_repaired.unwrap_or(false);
+        // SEC-P080-MED-001: reject invalid identifier filters at the network boundary.
+        let mut db_filter = p080_gql_filter_to_db(&filter)?;
+        db_filter.include_recent_repaired = include_recent_repaired_flag;
+        // Compute filter hash before cursor decode so cursor binding can be validated.
+        // include_recent_repaired is part of the filter identity: a cursor issued with
+        // one value must not be accepted on a query using the other value.
+        let filter_hash = compute_p080_gql_filter_hash(&db_filter, include_recent_repaired_flag);
+        let current_projection_generation =
+            db::repos::p080::get_current_projection_generation(pool, &db_filter).await;
+        let cursor_after = decode_p080_page_cursor(
+            after.as_deref(),
+            &filter_hash,
+            current_projection_generation,
+        )?;
+
+        let total_count: Option<i32> = if request_total_count.unwrap_or(false) {
+            match db::repos::p080::count_readback_matching_budgeted(pool, &db_filter).await {
+                Ok(Some(n)) => Some(n.min(i32::MAX as i64) as i32),
+                Ok(None) => {
+                    // Over-budget: return enumeration_budget_exceeded per the proposal contract.
+                    return Err(p080_enumeration_budget_exceeded_error());
+                }
+                Err(e) => {
+                    warn!(error = %e, "p080 count_readback_matching_budgeted failed");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut rows = db::repos::p080::list_readback_page_keyset(
+            pool,
+            db_filter,
+            page_size + 1,
+            cursor_after.as_ref(),
+        )
+        .await
+        .map_err(p080_gql_db_error)?;
+        let has_next_page = rows.len() > page_size;
+        if has_next_page {
+            rows.truncate(page_size);
+        }
+
+        let edges: Vec<crate::types::p080::GqlP080DiagnosticsEdge> = rows
+            .iter()
+            .map(|row| {
+                let readback = p080_readback_from_db_row(row);
+                let last_event_at =
+                    chrono::DateTime::parse_from_rfc3339(&row.projection_updated_at)
+                        .map(|t| t.with_timezone(&chrono::Utc))
+                        .ok();
+                let item = crate::types::p080::GqlP080DiagnosticsItem {
+                    readback,
+                    last_repair_event_id: row.last_repair_event_id.as_deref().map(ID::from),
+                    last_event_at,
+                    recurrence_epoch: row.recurrence_epoch as i32,
+                };
+                // Each edge cursor encodes the ordering tuple of its own row so the
+                // client can continue from any edge. The last edge's cursor is used as
+                // the connection's end_cursor.
+                let row_keyset = db::repos::p080::KeysetAfter {
+                    projection_updated_at: row.projection_updated_at.clone(),
+                    run_id: row.run_id.clone(),
+                    stage_id: row.stage_id.clone(),
+                    work_item_id: row.work_item_id.clone(),
+                };
+                let cursor = encode_p080_page_cursor(
+                    &row_keyset,
+                    &filter_hash,
+                    current_projection_generation,
+                    include_recent_repaired_flag,
+                );
+                crate::types::p080::GqlP080DiagnosticsEdge { cursor, node: item }
+            })
+            .collect();
+        let end_cursor = edges.last().map(|edge| edge.cursor.clone());
+        // Expose cursor expiry in pageInfo when a cursor is returned.
+        // The cursor encodes expires_at = now + 1h; mirror the same value here so
+        // clients can proactively detect stale cursors without decoding the opaque token.
+        let cursor_expires_at = end_cursor
+            .as_ref()
+            .map(|_| chrono::Utc::now() + chrono::Duration::hours(1));
+
+        Ok(crate::types::p080::GqlP080DiagnosticsConnection {
+            edges,
+            page_info: crate::types::p080::GqlP080PageInfo {
+                end_cursor,
+                cursor_version: 1,
+                cursor_expires_at,
+                has_next_page,
+            },
+            projection_integrity: crate::types::p080::GqlP080ProjectionIntegrity::Valid,
+            schema_version: "p080_diagnostics_connection_v1".to_string(),
+            total_count,
+        })
+    }
 }
+
+// ── P080 GraphQL helpers ─────────────────────────────────────────────────────
+
+async fn require_p080_graphql_diagnostics_read(
+    ctx: &Context<'_>,
+    subscription: bool,
+) -> Result<()> {
+    let principal = ctx
+        .data::<auth::Principal>()
+        .map_err(|_| Error::new("unauthorized"))?
+        .clone();
+
+    if principal.class == auth::PrincipalClass::ReadOnlyOperator {
+        let caller_class = auth::derive_caller_class(&principal);
+        record_p081_caller_class_diagnostics(
+            &principal,
+            &caller_class,
+            if subscription {
+                "graphql_subscription"
+            } else {
+                "graphql_query"
+            },
+        );
+        if principal
+            .tool_capabilities
+            .contains(&domain::CapabilityToolId::P080DiagnosticsGet)
+        {
+            // SEC-HIGH-002: fail CLOSED for ReadOnlyOperator when graphql stanza is absent.
+            // Require Some(true) — None (missing stanza) and Some(false) both deny.
+            // This prevents an MCP-only diagnostic token from crossing into GraphQL
+            // diagnostics simply because no graphql surface policy stanza was written.
+            let table = ctx
+                .data::<auth::PrincipalTable>()
+                .map_err(|_| p080_gql_error(
+                    "p080:diagnostics unauthenticated",
+                    "unauthenticated",
+                    None,
+                    "p080_diagnostics_get_request_v1",
+                ))?;
+            let surface_allowed = if subscription {
+                auth::is_subscription_allowed_by_surface_policy(table, &principal.id) == Some(true)
+            } else {
+                auth::is_query_allowed_by_surface_policy(table, &principal.id) == Some(true)
+            };
+            if !surface_allowed {
+                return Err(p080_gql_error(
+                    "p080:diagnostics graphql surface policy not explicitly allowed for read_only_operator",
+                    "unauthorized_missing_capability",
+                    None,
+                    "p080_diagnostics_get_request_v1",
+                ));
+            }
+            // SEC-P080-GQL-001: evaluate BoundaryPolicy for ReadOnlyOperator so that
+            // enforce-mode deny decisions and deny audits apply consistently with the
+            // standard require_operator_read/require_subscription_read paths.
+            // In shadow and legacy_passthrough modes, the surface policy check above
+            // is treated as sufficient authorization evidence (no legacy-Operator guard).
+            if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
+                let transport = if subscription {
+                    "graphql_subscription"
+                } else {
+                    "graphql_query"
+                };
+                let started = std::time::Instant::now();
+                let decision =
+                    policy.evaluate(caller_class.as_str(), transport, Some("p080.read"));
+                let elapsed = started.elapsed();
+                db::metrics::record_p081_boundary_decision_latency(
+                    transport,
+                    caller_class.as_str(),
+                    policy.mode().as_str(),
+                    elapsed,
+                );
+                match decision {
+                    auth::boundary::PolicyDecision::Allow { row_id } => {
+                        db::metrics::record_p081_boundary_decision(
+                            transport,
+                            row_id.as_deref(),
+                            caller_class.as_str(),
+                            "p080.read",
+                            "allow",
+                            None,
+                            policy.mode().as_str(),
+                        );
+                    }
+                    auth::boundary::PolicyDecision::Deny {
+                        reason_code,
+                        row_id,
+                        ..
+                    } => {
+                        db::metrics::record_p081_boundary_decision(
+                            transport,
+                            row_id.as_deref(),
+                            caller_class.as_str(),
+                            "p080.read",
+                            "deny",
+                            Some(reason_code.as_str()),
+                            policy.mode().as_str(),
+                        );
+                        if let Ok(pool) = ctx.data::<SqlitePool>() {
+                            write_graphql_deny_audit(
+                                pool,
+                                ctx,
+                                &principal,
+                                transport,
+                                "p080.read",
+                                &reason_code,
+                                row_id.as_deref(),
+                                caller_class.as_str(),
+                                &policy,
+                            )
+                            .await?;
+                        }
+                        return Err(p080_gql_error(
+                            "p080:diagnostics boundary policy denied for read_only_operator",
+                            "unauthorized_missing_capability",
+                            None,
+                            "p080_diagnostics_get_request_v1",
+                        ));
+                    }
+                    auth::boundary::PolicyDecision::Shadow { matched_decision } => {
+                        // Shadow mode: log the matrix decision, do not enforce.
+                        if let auth::boundary::PolicyDecision::Deny {
+                            reason_code,
+                            row_id,
+                            ..
+                        } = *matched_decision
+                        {
+                            db::metrics::record_p081_boundary_decision(
+                                transport,
+                                row_id.as_deref(),
+                                caller_class.as_str(),
+                                "p080.read",
+                                "shadow_deny",
+                                Some(reason_code.as_str()),
+                                policy.mode().as_str(),
+                            );
+                        }
+                    }
+                    auth::boundary::PolicyDecision::LegacyPassthrough => {
+                        // Legacy mode: surface policy + capability check is sufficient.
+                    }
+                }
+            }
+            return Ok(());
+        }
+        return Err(p080_gql_error(
+            "p080:diagnostics capability required for P080 GraphQL diagnostics",
+            "unauthorized_missing_capability",
+            None,
+            "p080_diagnostics_get_request_v1",
+        ));
+    }
+
+    if subscription {
+        require_subscription_read(ctx).await?;
+    } else {
+        require_operator_read(ctx).await?;
+    }
+
+    let principal = ctx
+        .data::<auth::Principal>()
+        .map_err(|_| p080_gql_error(
+            "p080:diagnostics unauthenticated",
+            "unauthenticated",
+            None,
+            "p080_diagnostics_get_request_v1",
+        ))?;
+    if !principal
+        .tool_capabilities
+        .contains(&domain::CapabilityToolId::P080DiagnosticsGet)
+    {
+        return Err(p080_gql_error(
+            "p080:diagnostics capability required for P080 GraphQL diagnostics",
+            "unauthorized_missing_capability",
+            None,
+            "p080_diagnostics_get_request_v1",
+        ));
+    }
+    Ok(())
+}
+
+/// Build a P080 GraphQL error with the full approved extension vocabulary.
+///
+/// Required by proposal §6.3: extensions must include code, retryAfterSeconds,
+/// cursorReason, rolloutDisablement, and schemaVersion on every P080 error path.
+/// Nullable fields that don't apply are set to null (not omitted) per the proposal.
+fn p080_gql_error(
+    message: &str,
+    code: &str,
+    rollout_disablement: Option<&str>,
+    schema_version: &str,
+) -> async_graphql::Error {
+    p080_gql_error_full(message, code, rollout_disablement, schema_version, None, None)
+}
+
+/// Full-fidelity P080 GraphQL error builder with all approved extension fields.
+fn p080_gql_error_full(
+    message: &str,
+    code: &str,
+    rollout_disablement: Option<&str>,
+    schema_version: &str,
+    retry_after_seconds: Option<i64>,
+    cursor_reason: Option<&str>,
+) -> async_graphql::Error {
+    let rd = rollout_disablement.map(|s| s.to_string());
+    let sv = schema_version.to_string();
+    let code_str = code.to_string();
+    let ras = retry_after_seconds;
+    let cr = cursor_reason.map(|s| s.to_string());
+    async_graphql::Error::new(message).extend_with(move |_, ext| {
+        ext.set("code", code_str.as_str());
+        match ras {
+            Some(v) => ext.set("retryAfterSeconds", v),
+            None => ext.set("retryAfterSeconds", async_graphql::Value::Null),
+        }
+        match &cr {
+            Some(v) => ext.set("cursorReason", v.as_str()),
+            None => ext.set("cursorReason", async_graphql::Value::Null),
+        }
+        match &rd {
+            Some(v) => ext.set("rolloutDisablement", v.as_str()),
+            None => ext.set("rolloutDisablement", async_graphql::Value::Null),
+        }
+        ext.set("schemaVersion", sv.as_str());
+    })
+}
+
+/// Check P080 rollout gates before serving diagnostic readback data.
+///
+/// Mirrors the MCP handler's live_disable and detection_only checks so that
+/// GraphQL cannot bypass rollout controls that the MCP surface enforces.
+/// Fails closed on any DB error or missing row.
+///
+/// SEC-P080-LOW-001: DB errors are logged server-side and returned as a stable
+/// opaque error code — raw DB error text never appears in the GraphQL response.
+/// All errors include the full P080 extension vocabulary (code, retryAfterSeconds,
+/// cursorReason, rolloutDisablement, schemaVersion).
+async fn p080_check_graphql_gate(pool: &SqlitePool) -> async_graphql::Result<()> {
+    const SCHEMA_VER: &str = "p080_diagnostics_get_request_v1";
+
+    let live_disable = db::repos::p080::get_rollout_control(pool, "live_disable")
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "p080_rollout_gate: failed to read live_disable row");
+            p080_gql_error(
+                "p080_rollout_gate: internal error reading rollout state",
+                "internal_error",
+                None,
+                SCHEMA_VER,
+            )
+        })?;
+
+    match live_disable {
+        None => {
+            return Err(p080_gql_error(
+                "p080_live_disabled: rollout-control live_disable row absent (fail-closed)",
+                "live_disabled",
+                Some("live_disabled"),
+                SCHEMA_VER,
+            ));
+        }
+        Some(row) if row.enabled => {
+            return Err(p080_gql_error(
+                "p080_live_disabled: P080 diagnostics are currently live-disabled",
+                "live_disabled",
+                Some("live_disabled"),
+                SCHEMA_VER,
+            ));
+        }
+        _ => {}
+    }
+
+    let detection_only = db::repos::p080::get_rollout_control(pool, "detection_only")
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "p080_rollout_gate: failed to read detection_only row");
+            p080_gql_error(
+                "p080_rollout_gate: internal error reading rollout state",
+                "internal_error",
+                None,
+                SCHEMA_VER,
+            )
+        })?;
+
+    match detection_only {
+        None => {
+            return Err(p080_gql_error(
+                "p080_not_active: rollout-control detection_only row absent (fail-closed)",
+                "rollout_disabled",
+                Some("class_disabled"),
+                SCHEMA_VER,
+            ));
+        }
+        Some(row) if !row.enabled => {
+            return Err(p080_gql_error(
+                "p080_not_active: P080 detection is not yet enabled (detection_only gate is off)",
+                "rollout_disabled",
+                Some("class_disabled"),
+                SCHEMA_VER,
+            ));
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn p080_gql_db_error(err: anyhow::Error) -> async_graphql::Error {
+    warn!(error = %err, "p080 diagnostics DB read failed");
+    p080_gql_error(
+        "p080 diagnostics data unavailable due to internal error",
+        "internal_error",
+        None,
+        "p080_diagnostics_get_request_v1",
+    )
+}
+
+fn p080_enumeration_budget_exceeded_error() -> async_graphql::Error {
+    async_graphql::Error::new("enumeration_budget_exceeded: total_count exceeds budget; narrow your filter or omit requestTotalCount")
+        .extend_with(|_, ext| {
+            ext.set("code", "enumeration_budget_exceeded");
+            ext.set("retryAfterSeconds", 0i32);
+            ext.set("cursorReason", async_graphql::Value::Null);
+            ext.set("rolloutDisablement", async_graphql::Value::Null);
+            ext.set("schemaVersion", "p080_diagnostics_get_request_v1");
+        })
+}
+
+/// Convert the GraphQL filter to the db filter, validating identifier values.
+///
+/// SEC-P080-MED-001: rejects empty, oversized, and control/bidi-bearing
+/// identifiers — matching the MCP `sanitize_identifier` semantics — before any
+/// SQL or cursor-hash work touches the value. Returns a GraphQL error with code
+/// `INVALID_FILTER_FIELD` on the first invalid field; the error path-extension
+/// names the offending field so operators can correct the request.
+fn p080_gql_filter_to_db(
+    filter: &Option<crate::types::p080::GqlP080DiagnosticsFilter>,
+) -> async_graphql::Result<db::repos::p080::ReadbackFilter> {
+    use crate::types::p080::*;
+    let stale_class_to_str = |sc: GqlP080StaleClass| -> &'static str {
+        match sc {
+            GqlP080StaleClass::Useful => "useful",
+            GqlP080StaleClass::WarmupPending => "warmup_pending",
+            GqlP080StaleClass::AcpStartupStale => "acp_startup_stale",
+            GqlP080StaleClass::AcpPromptStale => "acp_prompt_stale",
+            GqlP080StaleClass::SchedulerOwnershipDrift => "scheduler_ownership_drift",
+            GqlP080StaleClass::HelperOrphanDrift => "helper_orphan_drift",
+            GqlP080StaleClass::ReleaseSideEffectDrift => "release_side_effect_drift",
+            GqlP080StaleClass::AmbiguousOwner => "ambiguous_owner",
+            GqlP080StaleClass::Unknown => "unknown",
+        }
+    };
+    let hold_reason_to_str = |hr: GqlP080HoldReason| -> &'static str {
+        match hr {
+            GqlP080HoldReason::None => "none",
+            GqlP080HoldReason::CooldownActive => "cooldown_active",
+            GqlP080HoldReason::PermanentHoldActive => "permanent_hold_active",
+            GqlP080HoldReason::AmbiguousOwner => "ambiguous_owner",
+            GqlP080HoldReason::SideEffectDriftUnsafe => "side_effect_drift_unsafe",
+            GqlP080HoldReason::DependencyReadFailure => "dependency_read_failure",
+            GqlP080HoldReason::GatewaySaturated => "gateway_saturated",
+            GqlP080HoldReason::LiveDisable => "live_disable",
+            GqlP080HoldReason::WarmupPending => "warmup_pending",
+            GqlP080HoldReason::RolloutDisabled => "rollout_disabled",
+            GqlP080HoldReason::Unknown => "unknown",
+        }
+    };
+    let invalid_field = |field: &'static str| -> async_graphql::Error {
+        async_graphql::Error::new(format!(
+            "invalid_filter_field: filter.{field} is empty, exceeds 256 bytes, or contains control/bidi characters"
+        ))
+        .extend_with(|_, ext| {
+            // Use `invalid_field` to match MCP surface behavior (approved proposal vocabulary
+            // for filter validation errors; `INVALID_FILTER_FIELD` was not in the closed list).
+            ext.set("code", "invalid_field");
+            ext.set("field_path", format!("filter.{field}"));
+            ext.set("retryAfterSeconds", async_graphql::Value::Null);
+            ext.set("cursorReason", async_graphql::Value::Null);
+            ext.set("rolloutDisablement", async_graphql::Value::Null);
+            ext.set("schemaVersion", "p080_diagnostics_get_request_v1");
+        })
+    };
+    let sanitize_opt =
+        |field: &'static str, raw: Option<&str>| -> async_graphql::Result<Option<String>> {
+            match raw {
+                None => Ok(None),
+                Some(s) => match db::repos::p080::sanitize_p080_identifier(s) {
+                    Some(v) => Ok(Some(v)),
+                    None => Err(invalid_field(field)),
+                },
+            }
+        };
+    match filter {
+        None => Ok(db::repos::p080::ReadbackFilter::default()),
+        Some(f) => Ok(db::repos::p080::ReadbackFilter {
+            run_id: sanitize_opt("run_id", f.run_id.as_ref().map(|id| id.as_str()))?,
+            stage_id: sanitize_opt("stage_id", f.stage_id.as_ref().map(|id| id.as_str()))?,
+            work_item_id: sanitize_opt(
+                "work_item_id",
+                f.work_item_id.as_ref().map(|id| id.as_str()),
+            )?,
+            stale_class: f.stale_class.map(|sc| stale_class_to_str(sc).to_string()),
+            hold_reason: f.hold_reason.map(|hr| hold_reason_to_str(hr).to_string()),
+            // include_recent_repaired is a top-level GQL query arg, not part of the filter input;
+            // it is set by the caller after p080_gql_filter_to_db returns.
+            include_recent_repaired: false,
+        }),
+    }
+}
+
+fn p080_readback_from_db_row(
+    row: &db::repos::p080::ReadbackHeartbeatRow,
+) -> crate::types::p080::GqlP080Readback {
+    use crate::types::p080::*;
+    // Apply egress redaction before extracting any field values.
+    // This strips forbidden keys, rejects non-scalar values, and redacts
+    // secret-pattern strings on every field — matching the MCP output gate.
+    let raw: serde_json::Value = serde_json::from_str(&row.readback_json).unwrap_or_default();
+    let rb = db::repos::p080::redact_readback_json(raw);
+    // SEC-P080-MED-001: if the sanitizer detected a tampered row, force TamperDetected
+    // regardless of what the DB row's projection_integrity field says.
+    let sanitizer_detected_tamper = rb["projection_integrity"].as_str() == Some("tamper_detected");
+    let projection_updated_at = chrono::DateTime::parse_from_rfc3339(&row.projection_updated_at)
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now());
+
+    // Audit defect 4: unknown schema_version must mark row as stale/rebuilt, never silently default.
+    // The only accepted version is "p080_readback_v1". Any other value (missing or future)
+    // results in a projection_integrity=Stale sentinel row rather than partial decode.
+    let schema_version = rb["schema_version"].as_str().unwrap_or("");
+    if schema_version != "p080_readback_v1" {
+        // SEC-MED-001: sanitize raw DB column values before emitting on GraphQL lane.
+        let safe_run_id = db::repos::p080::sanitize_identifier_for_output(&row.run_id);
+        let safe_stage_id = db::repos::p080::sanitize_identifier_for_output(&row.stage_id);
+        let safe_work_item_id = db::repos::p080::sanitize_identifier_for_output(&row.work_item_id);
+        let safe_stale_class = db::repos::p080::sanitize_stale_class_for_output(&row.stale_class);
+        return GqlP080Readback {
+            schema_version: "p080_readback_v1".to_string(),
+            run_id: ID::from(safe_run_id.as_str()),
+            stage_id: ID::from(safe_stage_id.as_str()),
+            work_item_id: ID::from(safe_work_item_id.as_str()),
+            stale_class: GqlP080StaleClass::from(safe_stale_class),
+            running_truth: GqlP080RunningTruth::Unknown,
+            repair_action: GqlP080RepairAction::None,
+            hold_reason: GqlP080HoldReason::Unknown,
+            hold_age_seconds: None,
+            next_retry_or_backoff_time: None,
+            projection_updated_at,
+            projection_integrity: GqlP080ProjectionIntegrity::Stale,
+            executor_reregistration_state: GqlP080ExecutorReregistrationState::Missing,
+            rollout_disablement: GqlP080RolloutDisablement::None,
+            side_effect_status: GqlP080SideEffectStatus::Unknown,
+            operator_message: "[stale: unknown schema_version — rebuilt required]".to_string(),
+            evidence_marker_hash: None,
+            repair_idempotency_key: None,
+        };
+    }
+
+    // SEC-MED-001: sanitize raw DB column values on the normal output path too.
+    let safe_run_id = db::repos::p080::sanitize_identifier_for_output(&row.run_id);
+    let safe_stage_id = db::repos::p080::sanitize_identifier_for_output(&row.stage_id);
+    let safe_work_item_id = db::repos::p080::sanitize_identifier_for_output(&row.work_item_id);
+    let safe_stale_class = db::repos::p080::sanitize_stale_class_for_output(&row.stale_class);
+
+    // Decode closed v1 enums. Unknown on any of these is a decode failure per
+    // proposal lines 447 and 453 — downgrade projection_integrity to Stale below.
+    let stale_class = GqlP080StaleClass::from(safe_stale_class);
+    let running_truth = GqlP080RunningTruth::from(rb["running_truth"].as_str().unwrap_or("unknown"));
+    let hold_reason = GqlP080HoldReason::from(rb["hold_reason"].as_str().unwrap_or("none"));
+    let side_effect_status = GqlP080SideEffectStatus::from(
+        rb["side_effect_status"].as_str().unwrap_or("not_applicable"),
+    );
+
+    // If any closed v1 enum decoded to Unknown, force projection_integrity=Stale.
+    // Unknown on a v1 row means the DB contains a value this binary does not recognise,
+    // so partial data must not be returned as if it were valid (proposal §6 enum contract).
+    let closed_enum_unknown = matches!(stale_class, GqlP080StaleClass::Unknown)
+        || matches!(running_truth, GqlP080RunningTruth::Unknown)
+        || matches!(hold_reason, GqlP080HoldReason::Unknown)
+        || matches!(side_effect_status, GqlP080SideEffectStatus::Unknown);
+
+    let projection_integrity = if sanitizer_detected_tamper {
+        GqlP080ProjectionIntegrity::TamperDetected
+    } else if closed_enum_unknown {
+        warn!(
+            run_id = %row.run_id,
+            stage_id = %row.stage_id,
+            "p080: closed v1 enum decoded to Unknown; downgrading projection_integrity to Stale"
+        );
+        GqlP080ProjectionIntegrity::Stale
+    } else {
+        GqlP080ProjectionIntegrity::try_from(row.projection_integrity.as_str())
+            .unwrap_or(GqlP080ProjectionIntegrity::Stale)
+    };
+
+    GqlP080Readback {
+        schema_version: schema_version.to_string(),
+        run_id: ID::from(safe_run_id.as_str()),
+        stage_id: ID::from(safe_stage_id.as_str()),
+        work_item_id: ID::from(safe_work_item_id.as_str()),
+        stale_class,
+        running_truth,
+        repair_action: rb["repair_action"]
+            .as_str()
+            .and_then(|s| GqlP080RepairAction::try_from(s).ok())
+            .unwrap_or(GqlP080RepairAction::None),
+        hold_reason,
+        hold_age_seconds: rb["hold_age_seconds"].as_i64().map(|n| n as i32),
+        next_retry_or_backoff_time: rb["next_retry_or_backoff_time"]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc)),
+        projection_updated_at,
+        projection_integrity,
+        executor_reregistration_state: rb["executor_reregistration_state"]
+            .as_str()
+            .and_then(|s| GqlP080ExecutorReregistrationState::try_from(s).ok())
+            .unwrap_or(GqlP080ExecutorReregistrationState::Missing),
+        rollout_disablement: rb["rollout_disablement"]
+            .as_str()
+            .and_then(|s| GqlP080RolloutDisablement::try_from(s).ok())
+            .unwrap_or(GqlP080RolloutDisablement::None),
+        side_effect_status,
+        operator_message: rb["operator_message"].as_str().unwrap_or("").to_string(),
+        evidence_marker_hash: rb["evidence_marker_hash"].as_str().map(String::from),
+        repair_idempotency_key: rb["repair_idempotency_key"].as_str().map(String::from),
+    }
+}
+
+const P080_GQL_CURSOR_SCOPE: &str = "graphql";
+const P080_GQL_TOOL_NAME: &str = "graphql.p080_diagnostics";
+
+/// Compute a filter-stability hash binding a cursor to its issuing surface,
+/// tool, and query filter.  Including cursor_scope and tool_name prevents
+/// cross-surface cursor replay even when filter values match (P080-SEC-MED-001).
+/// `include_recent_repaired` is included so a cursor issued with one value cannot
+/// be replayed against a query using the other value.
+fn compute_p080_gql_filter_hash(
+    filter: &db::repos::p080::ReadbackFilter,
+    include_recent_repaired: bool,
+) -> String {
+    let mut h = Sha256::new();
+    h.update(P080_GQL_CURSOR_SCOPE.as_bytes());
+    h.update(b"\x00");
+    h.update(P080_GQL_TOOL_NAME.as_bytes());
+    h.update(b"\x00");
+    h.update(filter.run_id.as_deref().unwrap_or("").as_bytes());
+    h.update(b"\x00");
+    h.update(filter.stage_id.as_deref().unwrap_or("").as_bytes());
+    h.update(b"\x00");
+    h.update(filter.work_item_id.as_deref().unwrap_or("").as_bytes());
+    h.update(b"\x00");
+    h.update(filter.stale_class.as_deref().unwrap_or("").as_bytes());
+    h.update(b"\x00");
+    h.update(filter.hold_reason.as_deref().unwrap_or("").as_bytes());
+    h.update(b"\x00");
+    h.update(if include_recent_repaired { b"1" } else { b"0" });
+    format!("{:x}", h.finalize())
+}
+
+/// Encode a p080_cursor_v1 for the GraphQL surface per the approved keyset contract:
+/// base64url-encoded JSON with cursor_scope="graphql", tool_name, filter_hash,
+/// projection_generation, include_recent_repaired, last_ordering_tuple, and expires_at.
+/// `offset` is intentionally absent; continuation uses the last_ordering_tuple keyset bound.
+fn encode_p080_page_cursor(
+    last_row: &db::repos::p080::KeysetAfter,
+    filter_hash: &str,
+    projection_generation: i64,
+    include_recent_repaired: bool,
+) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let expires_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let lot = serde_json::json!({
+        "projection_updated_at": last_row.projection_updated_at,
+        "run_id": last_row.run_id,
+        "stage_id": last_row.stage_id,
+        "work_item_id": last_row.work_item_id,
+    });
+    let payload = serde_json::json!({
+        "cursor_version": 1,
+        "cursor_scope": P080_GQL_CURSOR_SCOPE,
+        "tool_name": P080_GQL_TOOL_NAME,
+        "filter_hash": filter_hash,
+        "projection_generation": projection_generation,
+        "include_recent_repaired": include_recent_repaired,
+        "last_ordering_tuple": lot,
+        "expires_at": expires_at
+    });
+    URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes())
+}
+
+/// Decode and validate a p080_cursor_v1 issued by this GraphQL endpoint.
+/// Returns the keyset anchor (`Some`) or None for first page (no cursor).
+/// Uses approved cursor_reason vocabulary: malformed, expired, filter_changed,
+/// projection_generation_mismatch.
+/// Cross-surface (cursor_scope mismatch) and wrong-operation (tool_name mismatch)
+/// rejections use filter_changed per the approved P080 cursor_reason contract.
+fn decode_p080_page_cursor(
+    cursor: Option<&str>,
+    filter_hash: &str,
+    current_projection_generation: i64,
+) -> async_graphql::Result<Option<db::repos::p080::KeysetAfter>> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    if cursor.is_empty() {
+        return Ok(None);
+    }
+    if cursor.len() > 2048 {
+        return Err(p080_invalid_cursor_error("malformed"));
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| p080_invalid_cursor_error("malformed"))?;
+    let json_str =
+        std::str::from_utf8(&bytes).map_err(|_| p080_invalid_cursor_error("malformed"))?;
+    let data: serde_json::Value =
+        serde_json::from_str(json_str).map_err(|_| p080_invalid_cursor_error("malformed"))?;
+    match data["cursor_version"].as_i64() {
+        Some(1) => {}
+        Some(_) => return Err(p080_invalid_cursor_error("version_mismatch")),
+        None => return Err(p080_invalid_cursor_error("malformed")),
+    }
+    // Validate cursor_scope: must be "graphql" for this surface.
+    if data["cursor_scope"].as_str() != Some(P080_GQL_CURSOR_SCOPE) {
+        return Err(p080_invalid_cursor_error("filter_changed"));
+    }
+    // Validate tool_name: cursor must be reused on the same operation.
+    if data["tool_name"].as_str() != Some(P080_GQL_TOOL_NAME) {
+        return Err(p080_invalid_cursor_error("filter_changed"));
+    }
+    match data["projection_generation"].as_i64() {
+        Some(cursor_generation) if cursor_generation == current_projection_generation => {}
+        Some(_) => return Err(p080_invalid_cursor_error("projection_generation_mismatch")),
+        None => return Err(p080_invalid_cursor_error("malformed")),
+    }
+    let expires_at_str = data["expires_at"]
+        .as_str()
+        .ok_or_else(|| p080_invalid_cursor_error("malformed"))?;
+    let expires_at = chrono::DateTime::parse_from_rfc3339(expires_at_str)
+        .map_err(|_| p080_invalid_cursor_error("malformed"))?;
+    if chrono::Utc::now() > expires_at.with_timezone(&chrono::Utc) {
+        return Err(p080_invalid_cursor_error("expired"));
+    }
+    let fh = data["filter_hash"]
+        .as_str()
+        .ok_or_else(|| p080_invalid_cursor_error("malformed"))?;
+    if fh != filter_hash {
+        return Err(p080_invalid_cursor_error("filter_changed"));
+    }
+    // Extract last_ordering_tuple for keyset continuation.
+    let lot = &data["last_ordering_tuple"];
+    let proj_at = lot["projection_updated_at"]
+        .as_str()
+        .ok_or_else(|| p080_invalid_cursor_error("malformed"))?;
+    let run_id = lot["run_id"]
+        .as_str()
+        .ok_or_else(|| p080_invalid_cursor_error("malformed"))?;
+    let stage_id = lot["stage_id"]
+        .as_str()
+        .ok_or_else(|| p080_invalid_cursor_error("malformed"))?;
+    let work_item_id = lot["work_item_id"]
+        .as_str()
+        .ok_or_else(|| p080_invalid_cursor_error("malformed"))?;
+    Ok(Some(db::repos::p080::KeysetAfter {
+        projection_updated_at: proj_at.to_string(),
+        run_id: run_id.to_string(),
+        stage_id: stage_id.to_string(),
+        work_item_id: work_item_id.to_string(),
+    }))
+}
+
+fn p080_invalid_cursor_error(cursor_reason: &'static str) -> async_graphql::Error {
+    Error::new("invalid_cursor").extend_with(|_, ext| {
+        ext.set("code", "invalid_cursor");
+        ext.set("retryAfterSeconds", async_graphql::Value::Null);
+        ext.set("cursorReason", cursor_reason);
+        ext.set("rolloutDisablement", async_graphql::Value::Null);
+        ext.set("schemaVersion", "p080_diagnostics_get_request_v1");
+    })
+}
+
+// ── P042 GqlDaemonStatus ─────────────────────────────────────────────────────
 
 /// GraphQL wrapper around [`DaemonStatus`] (P042 §5.2). Every field of the
 /// domain type is exposed as a first-class GraphQL field: `state`,
@@ -5194,6 +6016,447 @@ impl SubscriptionRoot {
                         }
                     }
                 }
+            }
+        });
+
+        Ok(ReceiverStream::new(rx))
+    }
+
+    /// P080: Read-only stale execution diagnostics subscription.
+    ///
+    /// Emits an initial snapshot (InitialSnapshotRow per row) followed by live
+    /// change events (RowUpdated, RowRemoved) on a 10-second polling interval.
+    /// When the change set exceeds the rate-shed threshold (20 rows), emits a
+    /// single ProjectionRebuilt event instead of individual row events.
+    /// Terminates with AuthorizationLost when the rollout gate disables access.
+    async fn p080_diagnostics_updates(
+        &self,
+        ctx: &Context<'_>,
+        filter: Option<crate::types::p080::GqlP080DiagnosticsFilter>,
+    ) -> Result<
+        impl async_graphql::futures_util::Stream<
+            Item = Result<crate::types::p080::GqlP080DiagnosticsEvent>,
+        >,
+    > {
+        require_p080_graphql_diagnostics_read(ctx, true).await?;
+        let pool = ctx.data::<SqlitePool>()?.clone();
+
+        // SEC-P080-002: run-scope auth checked BEFORE rollout gates.
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| Error::new("unauthorized"))?;
+        let filter_run_id: Option<&str> = filter
+            .as_ref()
+            .and_then(|f| f.run_id.as_ref())
+            .map(|id| id.as_str());
+        if let Err(_scope_err) = auth::check_p080_run_scope(principal, filter_run_id) {
+            return Err(p080_gql_error(
+                "p080: run-scope authorization required; run_scope must include filter.runId",
+                "unauthorized_missing_capability",
+                None,
+                "p080_diagnostics_get_request_v1",
+            ));
+        }
+
+        // Rollout gates run after run-scope auth is established.
+        p080_check_graphql_gate(&pool).await?;
+
+        // SEC-P080-GQL-SUB-AUTH-001: capture live principal handle and credential
+        // for per-poll-tick revalidation. The async task must fail closed on token
+        // revocation, class downgrade, capability removal, or run_scope narrowing.
+        let live_principal_handle = ctx.data::<P046LivePrincipalHandle>()?.clone();
+        let principal_id = principal.id.clone();
+        let live_credential = ctx
+            .data_opt::<P046LiveCredential>()
+            .cloned()
+            .or_else(|| {
+                ctx.data::<auth::PrincipalTable>().ok().and_then(|table| {
+                    auth::principal_token_fingerprint_by_id(table, &principal_id).map(
+                        |token_fingerprint| P046LiveCredential {
+                            principal_id: principal_id.clone(),
+                            token_fingerprint,
+                        },
+                    )
+                })
+            })
+            .ok_or_else(|| Error::new("unauthorized"))?;
+        let filter_run_id_for_live: Option<String> = filter
+            .as_ref()
+            .and_then(|f| f.run_id.as_ref())
+            .map(|id| id.to_string());
+
+        // SEC-P080-MED-001: reject invalid identifier filters at the network boundary.
+        let db_filter = match p080_gql_filter_to_db(&filter) {
+            Ok(f) => f,
+            Err(err) => {
+                return Ok(ReceiverStream::new({
+                    let (tx, rx) =
+                        tokio::sync::mpsc::channel::<
+                            Result<crate::types::p080::GqlP080DiagnosticsEvent>,
+                        >(1);
+                    let _ = tx.try_send(Err(err));
+                    rx
+                }));
+            }
+        };
+
+        // Channel capacity: 64 events — slow consumers are disconnected by drop.
+        let (tx, rx) = tokio::sync::mpsc::channel::<
+            Result<crate::types::p080::GqlP080DiagnosticsEvent>,
+        >(64);
+
+        // Snapshot scan limit: 200 rows max per poll tick (mirrors the query limit).
+        const SNAPSHOT_LIMIT: usize = 200;
+        // Rate-shed budget: more than 200 events per principal per minute triggers
+        // ProjectionRebuilt instead of individual RowUpdated/RowRemoved events.
+        const RATE_SHED_BUDGET_PER_MINUTE: usize = 200;
+        // Polling interval between live update checks.
+        const POLL_INTERVAL_SECS: u64 = 10;
+
+        // Capture principal class for metric labels; move into the async task.
+        let principal_class_label = principal.class.to_string();
+
+        tokio::spawn(async move {
+            use crate::types::p080::{
+                GqlP080DiagnosticsEvent, GqlP080DiagnosticsEventType, GqlP080DiagnosticsItem,
+                GqlP080ProjectionIntegrity,
+            };
+
+            // Per-minute event budget: track how many events were emitted in the
+            // current 60-second window to enforce the 200/min/principal rate limit.
+            let mut events_emitted_this_window: usize = 0;
+            let mut window_start = tokio::time::Instant::now();
+
+            // SEC-P080-GQL-SUB-AUTH-001: revalidate live credentials BEFORE emitting
+            // any rows from the initial snapshot. Prevents a token revoked immediately
+            // after subscription setup from receiving diagnostics data.
+            {
+                let pre_auth_ok = live_principal_handle
+                    .auth_ok_for_p080_subscription(
+                        &live_credential,
+                        filter_run_id_for_live.as_deref(),
+                    )
+                    .await;
+                let pre_gate_ok = p080_check_graphql_gate(&pool).await.is_ok();
+                if !pre_auth_ok || !pre_gate_ok {
+                    let now_lost = chrono::Utc::now();
+                    let lost_event = GqlP080DiagnosticsEvent {
+                        r#type: GqlP080DiagnosticsEventType::AuthorizationLost,
+                        item: None,
+                        projection_integrity: GqlP080ProjectionIntegrity::Stale,
+                        projection_updated_at: now_lost,
+                        projection_generation: 1,
+                    };
+                    let _ = tx.send(Ok(lost_event)).await;
+                    let reason = if !pre_auth_ok {
+                        "p080: authorization lost; principal revoked, downgraded, or run_scope narrowed"
+                    } else {
+                        "p080: authorization lost; live_disable or detection_only gate changed"
+                    };
+                    let code = if !pre_auth_ok { "unauthorized_missing_capability" } else { "live_disabled" };
+                    let rollout_disablement = if !pre_auth_ok { None } else { Some("live_disabled") };
+                    let _ = tx.send(Err(p080_gql_error(
+                        reason,
+                        code,
+                        rollout_disablement,
+                        "p080_diagnostics_get_request_v1",
+                    ))).await;
+                    return;
+                }
+            }
+
+            // ── Initial snapshot ─────────────────────────────────────────────────
+            let now = chrono::Utc::now();
+            let initial_rows =
+                match db::repos::p080::list_readback_page(&pool, db_filter.clone(), SNAPSHOT_LIMIT)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(err) => {
+                        let _ = tx.try_send(Err(p080_gql_db_error(err)));
+                        return;
+                    }
+                };
+
+            // Build the initial snapshot map: key → projection_generation.
+            // Used to diff against subsequent polls.
+            let mut prev_gen_map: std::collections::HashMap<
+                (String, String, String, String),
+                i64,
+            > = initial_rows
+                .iter()
+                .map(|r| {
+                    (
+                        (
+                            r.run_id.clone(),
+                            r.stage_id.clone(),
+                            r.work_item_id.clone(),
+                            r.stale_class.clone(),
+                        ),
+                        r.projection_generation,
+                    )
+                })
+                .collect();
+
+            for row in &initial_rows {
+                let readback = p080_readback_from_db_row(row);
+                let last_event_at =
+                    chrono::DateTime::parse_from_rfc3339(&row.projection_updated_at)
+                        .map(|t| t.with_timezone(&chrono::Utc))
+                        .ok();
+                let item = GqlP080DiagnosticsItem {
+                    readback,
+                    last_repair_event_id: row.last_repair_event_id.as_deref().map(ID::from),
+                    last_event_at,
+                    recurrence_epoch: row.recurrence_epoch as i32,
+                };
+                let event = GqlP080DiagnosticsEvent {
+                    r#type: GqlP080DiagnosticsEventType::InitialSnapshotRow,
+                    item: Some(item),
+                    projection_integrity: GqlP080ProjectionIntegrity::Valid,
+                    projection_updated_at: now,
+                    projection_generation: 1,
+                };
+                if tx.send(Ok(event)).await.is_err() {
+                    return; // client disconnected
+                }
+            }
+
+            // Count initial snapshot events toward the per-minute budget.
+            events_emitted_this_window += initial_rows.len();
+
+            // ── Live polling loop ─────────────────────────────────────────────────
+            let mut generation_counter: i32 = 2;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
+
+                // Reset per-minute event budget when 60 seconds have elapsed.
+                let now_instant = tokio::time::Instant::now();
+                if now_instant.duration_since(window_start).as_secs() >= 60 {
+                    events_emitted_this_window = 0;
+                    window_start = now_instant;
+                }
+
+                // SEC-P080-GQL-SUB-AUTH-001: revalidate live principal on every tick.
+                // Fails closed on token revocation, class downgrade, capability removal,
+                // run_scope narrowing, or principals.json reload failure.
+                let principal_auth_ok = live_principal_handle
+                    .auth_ok_for_p080_subscription(
+                        &live_credential,
+                        filter_run_id_for_live.as_deref(),
+                    )
+                    .await;
+                let gate_ok = p080_check_graphql_gate(&pool).await.is_ok();
+
+                if !principal_auth_ok || !gate_ok {
+                    let now = chrono::Utc::now();
+                    let lost_event = GqlP080DiagnosticsEvent {
+                        r#type: GqlP080DiagnosticsEventType::AuthorizationLost,
+                        item: None,
+                        projection_integrity: GqlP080ProjectionIntegrity::Stale,
+                        projection_updated_at: now,
+                        projection_generation: generation_counter,
+                    };
+                    // Emit AuthorizationLost event first so the client can distinguish
+                    // graceful termination from a protocol error, then send the error frame.
+                    let _ = tx.send(Ok(lost_event)).await;
+                    let reason = if !principal_auth_ok {
+                        "p080: authorization lost; principal revoked, downgraded, or run_scope narrowed"
+                    } else {
+                        "p080: authorization lost; live_disable or detection_only gate changed"
+                    };
+                    let code = if !principal_auth_ok {
+                        "unauthorized_missing_capability"
+                    } else {
+                        "live_disabled"
+                    };
+                    // rolloutDisablement must be a P080RolloutDisablement value or null.
+                    // "unauthorized_missing_capability" is an error code, not a rollout value;
+                    // only "live_disabled" is a valid P080RolloutDisablement in this context.
+                    let rollout_disablement = if !principal_auth_ok { None } else { Some("live_disabled") };
+                    let _ = tx.send(Err(p080_gql_error(
+                        reason,
+                        code,
+                        rollout_disablement,
+                        "p080_diagnostics_get_request_v1",
+                    ))).await;
+                    break;
+                }
+
+                let poll_now = chrono::Utc::now();
+                let current_rows = match db::repos::p080::list_readback_page(
+                    &pool,
+                    db_filter.clone(),
+                    SNAPSHOT_LIMIT,
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(err) => {
+                        warn!(error = %err, "p080 subscription: poll DB read failed; skipping tick");
+                        db::metrics::increment_counter(
+                            "p080_graphql_subscription_stale_event_dropped_total",
+                        );
+                        continue;
+                    }
+                };
+
+                let current_map: std::collections::HashMap<
+                    (String, String, String, String),
+                    (i64, &db::repos::p080::ReadbackHeartbeatRow),
+                > = current_rows
+                    .iter()
+                    .map(|r| {
+                        (
+                            (
+                                r.run_id.clone(),
+                                r.stage_id.clone(),
+                                r.work_item_id.clone(),
+                                r.stale_class.clone(),
+                            ),
+                            (r.projection_generation, r),
+                        )
+                    })
+                    .collect();
+
+                // Rows updated or newly added.
+                let updated: Vec<&db::repos::p080::ReadbackHeartbeatRow> = current_map
+                    .iter()
+                    .filter_map(|(key, (gen, row))| {
+                        let prev = prev_gen_map.get(key);
+                        if prev.is_none() || prev != Some(gen) {
+                            Some(*row)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                // Rows removed (present in prev but absent in current).
+                let removed_keys: Vec<(String, String, String, String)> = prev_gen_map
+                    .keys()
+                    .filter(|k| !current_map.contains_key(*k))
+                    .cloned()
+                    .collect();
+
+                let change_count = updated.len() + removed_keys.len();
+
+                if change_count == 0 {
+                    // No changes; nothing to emit.
+                    prev_gen_map = current_map
+                        .into_iter()
+                        .map(|(k, (gen, _row))| (k, gen))
+                        .collect();
+                    continue;
+                }
+
+                if events_emitted_this_window + change_count > RATE_SHED_BUDGET_PER_MINUTE {
+                    // Rate-shed: the per-principal 200-event/minute budget would be exceeded.
+                    // Emit a single ProjectionRebuilt event and reset the window.
+                    db::metrics::increment_counter_with_label(
+                        "p080_graphql_subscription_rate_shed_total",
+                        &principal_class_label,
+                    );
+                    let rebuilt_event = GqlP080DiagnosticsEvent {
+                        r#type: GqlP080DiagnosticsEventType::ProjectionRebuilt,
+                        item: None,
+                        projection_integrity: GqlP080ProjectionIntegrity::Valid,
+                        projection_updated_at: poll_now,
+                        projection_generation: generation_counter,
+                    };
+                    if tx.send(Ok(rebuilt_event)).await.is_err() {
+                        return; // client disconnected
+                    }
+                    // Reset window after shed so the client re-querying gets a full budget.
+                    events_emitted_this_window = 0;
+                    window_start = tokio::time::Instant::now();
+                } else {
+                    // Emit individual RowUpdated and RowRemoved events.
+                    for row in updated {
+                        let readback = p080_readback_from_db_row(row);
+                        let last_event_at =
+                            chrono::DateTime::parse_from_rfc3339(&row.projection_updated_at)
+                                .map(|t| t.with_timezone(&chrono::Utc))
+                                .ok();
+                        let item = GqlP080DiagnosticsItem {
+                            readback,
+                            last_repair_event_id: row.last_repair_event_id.as_deref().map(ID::from),
+                            last_event_at,
+                            recurrence_epoch: row.recurrence_epoch as i32,
+                        };
+                        let event = GqlP080DiagnosticsEvent {
+                            r#type: GqlP080DiagnosticsEventType::RowUpdated,
+                            item: Some(item),
+                            projection_integrity: GqlP080ProjectionIntegrity::Valid,
+                            projection_updated_at: poll_now,
+                            projection_generation: generation_counter,
+                        };
+                        if tx.send(Ok(event)).await.is_err() {
+                            return; // client disconnected
+                        }
+                    }
+                    for (run_id, stage_id, work_item_id, stale_class) in &removed_keys {
+                        // Synthesize a minimal readback for the removed row.
+                        // SEC-P080-GQL-002: apply the same output sanitizers as the normal
+                        // RowUpdated path so control/bidi characters and unknown enum values
+                        // cannot leak to subscribers via the RowRemoved synthetic readback.
+                        use crate::types::p080::*;
+                        let safe_run_id =
+                            db::repos::p080::sanitize_identifier_for_output(run_id);
+                        let safe_stage_id =
+                            db::repos::p080::sanitize_identifier_for_output(stage_id);
+                        let safe_work_item_id =
+                            db::repos::p080::sanitize_identifier_for_output(work_item_id);
+                        let safe_stale_class =
+                            db::repos::p080::sanitize_stale_class_for_output(stale_class);
+                        let readback = GqlP080Readback {
+                            schema_version: "p080_readback_v1".to_string(),
+                            run_id: async_graphql::ID(safe_run_id),
+                            stage_id: async_graphql::ID(safe_stage_id),
+                            work_item_id: async_graphql::ID(safe_work_item_id),
+                            stale_class: GqlP080StaleClass::from(safe_stale_class),
+                            running_truth: GqlP080RunningTruth::Unknown,
+                            repair_action: GqlP080RepairAction::None,
+                            hold_reason: GqlP080HoldReason::None,
+                            hold_age_seconds: None,
+                            next_retry_or_backoff_time: None,
+                            projection_updated_at: poll_now,
+                            projection_integrity: GqlP080ProjectionIntegrity::Stale,
+                            executor_reregistration_state:
+                                GqlP080ExecutorReregistrationState::Missing,
+                            rollout_disablement: GqlP080RolloutDisablement::None,
+                            side_effect_status: GqlP080SideEffectStatus::NotApplicable,
+                            operator_message: String::new(),
+                            evidence_marker_hash: None,
+                            repair_idempotency_key: None,
+                        };
+                        let item = GqlP080DiagnosticsItem {
+                            readback,
+                            last_repair_event_id: None,
+                            last_event_at: None,
+                            recurrence_epoch: 0,
+                        };
+                        let event = GqlP080DiagnosticsEvent {
+                            r#type: GqlP080DiagnosticsEventType::RowRemoved,
+                            item: Some(item),
+                            projection_integrity: GqlP080ProjectionIntegrity::Valid,
+                            projection_updated_at: poll_now,
+                            projection_generation: generation_counter,
+                        };
+                        if tx.send(Ok(event)).await.is_err() {
+                            return; // client disconnected
+                        }
+                    }
+                    // Count these events toward the per-minute budget.
+                    events_emitted_this_window += change_count;
+                }
+
+                // Advance generation counter and update snapshot.
+                generation_counter = generation_counter.saturating_add(1);
+                prev_gen_map = current_map
+                    .into_iter()
+                    .map(|(k, (gen, _row))| (k, gen))
+                    .collect();
             }
         });
 
@@ -13646,6 +14909,81 @@ mod tests {
             call_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "non-transient errors must not be retried (exactly 1 attempt)"
+        );
+    }
+
+    // ── P080: GraphQL ReadOnlyOperator surface-policy denial ─────────────────
+
+    /// SEC-P080 / P072: A ReadOnlyOperator principal that has P080DiagnosticsGet
+    /// capability but whose graphql surface_policy sets allow_queries: false must
+    /// be denied access to p080Diagnostics. Without the surface-policy check in
+    /// require_p080_graphql_diagnostics_read, ReadOnlyOperator could bypass the
+    /// allow_queries gate that Operator principals must pass via require_operator_read.
+    #[tokio::test]
+    async fn p080_graphql_read_only_operator_surface_policy_query_denied() {
+        let pool = test_pool().await;
+        // Seed rollout controls so the gate would succeed if auth passed.
+        db::repos::p080::seed_rollout_control_if_absent(&pool)
+            .await
+            .unwrap();
+
+        // Create a principals.json with a ReadOnlyOperator whose surface_policy
+        // explicitly denies GraphQL queries.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        // The mcp stanza must grant p080.diagnostics.get.v1 so tool_capabilities
+        // includes P080DiagnosticsGet — surface_policies present with no mcp stanza
+        // zeroes all tool capabilities, which would hit a capability check first.
+        // The graphql stanza then separately denies queries at the surface-policy layer.
+        fs::write(
+            file.path(),
+            r#"{
+              "schema_version": 2,
+              "principals": [
+                {
+                  "token": "ro-deny-token",
+                  "id": "p080-ro-deny",
+                  "class": "read_only_operator",
+                  "surface_policies": {
+                    "graphql": {
+                      "allow_queries": false,
+                      "allow_subscriptions": false,
+                      "allowed_mutations": []
+                    },
+                    "mcp": {
+                      "allowed_tools": ["p080.diagnostics.get.v1"]
+                    }
+                  }
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let table = auth::PrincipalTable::load_or_bootstrap(file.path()).unwrap();
+        let ro_principal = auth::resolve_bearer("ro-deny-token", &table).unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            table,
+            test_reporter(),
+        );
+
+        let result = schema
+            .execute(
+                async_graphql::Request::new("{ p080Diagnostics { schemaVersion } }")
+                    .data(ro_principal),
+            )
+            .await;
+
+        assert!(
+            !result.errors.is_empty(),
+            "p080Diagnostics query must be denied when allow_queries is false for ReadOnlyOperator"
+        );
+        let error_msg = &result.errors[0].message;
+        assert!(
+            error_msg.contains("surface policy"),
+            "error must cite surface policy denial; got: {error_msg}"
         );
     }
 }

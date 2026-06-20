@@ -141,13 +141,14 @@ fn test_high_002_symlinked_principals_file_is_rejected() {
 fn test_principals_daemon_refuses_empty_principals_file() {
     let dir = tempfile::tempdir().expect("create tmp dir");
     let path = dir.path().join("principals.json");
-    // SEC-005: parent directory must be 0700 and file must be 0600.
+    // Write with owner-only permissions so SEC-005 mode check passes.
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // SEC-005: parent directory must be 0700 for load_or_bootstrap to proceed.
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
-            .expect("set parent dir to 0700");
+            .expect("set dir perms to 0700");
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)

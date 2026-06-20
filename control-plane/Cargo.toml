@@ -31,3 +31,4 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 toml = { version = "0.8", features = ["parse"] }
 sha2 = "0.10"
+base64 = "0.22"

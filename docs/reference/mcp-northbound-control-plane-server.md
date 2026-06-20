@@ -11,7 +11,6 @@ Related stable docs:
 - [failed-stage-evidence-delivery-preflight-and-mcp-resolution.md](failed-stage-evidence-delivery-preflight-and-mcp-resolution.md)
 - [steward-analysis-system.md](steward-analysis-system.md)
 - [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md)
-- [bounded-tool-output-and-safe-search-policy.md](bounded-tool-output-and-safe-search-policy.md)
 - [test-gates.md](test-gates.md)
 - [ui-action-boundary.md](ui-action-boundary.md)
 
@@ -57,7 +56,7 @@ This reference covers:
 It does not cover:
 
 - southbound per-agent MCP policy (covered by [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md))
-- token delegation or external lifecycle management beyond the daemon's live principal-table reload path
+- token rotation, revocation, or delegation (daemon reads the principal table once at startup; changes require a restart)
 - YAML-driven or per-subscription capability policy (first-wave uses static class tables)
 
 ## Crate graph
@@ -84,67 +83,46 @@ Implementation: `control-plane/crates/domain/src/commands.rs` (`PrincipalClass`,
 
 | `CapabilityToolId` variant | MCP tool name | Command tool? |
 |---|---|---|
-| `IdeasCreate` | `ideas.create` | yes |
+| `IdeasCreate` | `ideas.create` | no (direct) |
 | `IdeasList` | `ideas.list` | no (direct) |
 | `RunsStart` | `runs.start` | yes |
 | `RunsList` | `runs.list` | no (direct) |
 | `RunsGet` | `runs.get` | no (direct) |
-| `RunsMainSyncRequest` | `runs.main_sync.request` | yes |
-| `RunsMainSyncRetry` | `runs.main_sync.retry` | yes |
-| `RunsMainSyncSetOverride` | `runs.main_sync.set_override` | yes |
-| `RunsMainSyncRepairState` | `runs.main_sync.repair_state` | yes |
-| `RunsMainSyncRecordRecoveryDecision` | `runs.main_sync.record_recovery_decision` | yes |
-| `RunsKnowledgeCapsuleIgnore` | `runs.knowledge_capsule.ignore` | yes |
-| `RunsRetrofitCatalogSnapshot` | `runs.retrofit_catalog_snapshot` | yes |
 | `RunsCancel` | `runs.cancel` | yes |
 | `ApprovalsList` | `approvals.list` | no (direct) |
 | `ApprovalsResolve` | `approvals.resolve` | yes |
 | `StagesRetry` | `stages.retry` | yes |
-| `StagesConsumeProviderQuotaHold` | `stages.consume_provider_quota_hold` | yes |
 | `WorkflowConflictsResolve` | `workflow_conflicts.resolve` | yes |
-| `WorkflowLoopBudgetExtend` | `workflow_loop_budget.extend` | yes |
 | `LegacyDiscoveryOverrideCreate` | `legacy_discovery_override_create` | yes |
 | `ReportsGet` | `reports.get` | no (direct) |
 | `ArtifactsOverrideContract` | `artifacts.override_contract` | yes |
 | `StewardRunAnalysis` | `steward.run_analysis` | yes |
 | `StewardListAnalyses` | `steward.list_analyses` | no (direct) |
 | `StewardGetAnalysis` | `steward.get_analysis` | no (direct) |
-| `RuntimeHealth` | `runtime.health`, `boundary.runtime.get` | no (direct) |
-| `OperatorAlertsList` | `operator.alerts.list` | no (direct) |
-| `StorageHealth` | `storage.health` | no (direct) |
-| `StorageWritePressure` | `storage.write_pressure` | no (direct) |
-| `StorageEvidenceSpoolSummary` | `storage.evidence_spool_summary` | no (direct) |
-| `StorageReconcileEvidenceOrphans` | `storage.reconcile_evidence_orphans` | no (direct) |
-| `StorageMaintenanceRepairSlot` | `storage.maintenance.repair_slot` | no (direct journal) |
-| `StorageProjectionsClearBacklog` | `storage.projections.clear_backlog` | no (direct journal) |
-| `StorageProjectionsClearPoison` | `storage.projections.clear_poison` | no (direct journal) |
+| `RunsMainSyncRequest` | `runs.main_sync.request` | yes |
+| `RunsMainSyncRetry` | `runs.main_sync.retry` | yes |
+| `RunsMainSyncSetOverride` | `runs.main_sync.set_override` | yes |
+| `RunsMainSyncRepairState` | `runs.main_sync.repair_state` | yes |
+| `RunsMainSyncRecordRecoveryDecision` | `runs.main_sync.record_recovery_decision` | yes |
+| `RunsKnowledgeCapsuleIgnore` | `runs.knowledge_capsule.ignore` | yes |
 | `ProposalGateSettle` | `runs.settle_proposal_gate` | yes |
 | `EffectsList` | `effects.list` | no (direct) |
 | `EffectsInspect` | `effects.inspect` | no (direct) |
 | `EffectsReconcile` | `effects.reconcile` | no (direct) |
-| `EffectsMarkConflict` | `effects.mark_conflict` | no (direct disposition) |
-| `EffectsMarkUnrecoverable` | `effects.mark_unrecoverable` | no (direct disposition) |
-| `EffectsClearAfterManualVerification` | `effects.clear_after_manual_verification` | no (direct disposition) |
+| `EffectsMarkUnrecoverable` | `effects.mark_unrecoverable` | no (direct) |
+| `EffectsClearAfterManualVerification` | `effects.clear_after_manual_verification` | no (direct) |
 | `AgentsContinuationStatus` | `agents.continuation_status` | no (direct) |
 | `AgentsContinuationCandidates` | `agents.continuation_candidates` | no (direct) |
-| `AgentsContinueWork` | `agents.continue_work` | no (journaled admission) |
-| `AutomationAutoRetryLatest` | `automation.auto_retry.latest` | no (direct) |
+| `AgentsContinueWork` | `agents.continue_work` | no (direct) |
+| `P080DiagnosticsGet` | `p080.diagnostics.get.v1` | no (direct) |
+| `P080ReconcileRequest` | `p080.reconcile.request.v1` | no (direct) |
+| `P080ClearPermanentHold` | `p080.clear_permanent_hold.v1` | no (direct) |
 
-This table is derived from `domain::CapabilityToolId` plus `mcp-server/src/tools/mod.rs`. It intentionally lists the current 45 capability identifiers, including the `boundary.runtime.get` tool that shares the `RuntimeHealth` capability.
+Command tools build a typed `Command` enum value and call `CommandHandler::handle`; they emit a `command_journal` row and return `journal_id`. Direct tools call repo functions directly and do not produce journal rows or `journal_id`.
 
-Command tools build a typed `Command` enum value and call `CommandHandler::handle`; they emit a `command_journal` row and return `journal_id`. Direct tools call repo functions or purpose-built admission paths. Some direct tools still persist their own journal/disposition ids; the `Command tool?` column only means "routes through `CommandHandler`."
+The Proposal 080 stale-execution reconciliation tools (`p080.diagnostics.get.v1`, `p080.reconcile.request.v1`, `p080.clear_permanent_hold.v1`) have typed `CapabilityToolId` variants (`P080DiagnosticsGet`, `P080ReconcileRequest`, `P080ClearPermanentHold`) so they participate in standard `tools/list` capability filtering. In the current slice `p080.diagnostics.get.v1` and `p080.reconcile.request.v1` are allowed for `Operator` and `ReadOnlyOperator`; `p080.clear_permanent_hold.v1` is `Operator`-only. The `p080.reconcile.request.v1` handler admits `ReadOnlyOperator` only for `requested_action=diagnose_only` and returns `unauthorized_missing_capability` for `repair_if_safe` or `hold`. `ArtifactEntity` and `ReportEntity` MCP resources are `Operator`-only; ReadOnlyOperator has no default MCP resource capabilities (SEC-P080-001). Per-run row scoping is enforced at the handler: `p080.diagnostics.get.v1` rejects ReadOnlyOperator (and Agent) callers unless `filter.run_id` is present and authorized by `run_scope`, surfacing `unauthorized_missing_capability` while the shared auth helper records whether the internal cause was `auth_scope_required` or `auth_scope_violation`. The tools are dispatched by prefix into a separate `tools::p080` namespace in `control-plane/crates/mcp-server/src/server.rs` and call repo functions directly without emitting `command_journal` rows. The current slice is detection/readback-first: `p080.diagnostics.get.v1` requires the `detection_only` rollout-control row before reading existing projection rows; `repair_if_safe` still refuses with `rollout_disabled` or `class_disabled` even when `detection_only` and `acp_startup_stale` are enabled (active repair is Phase 2+); `hold` returns `action_disabled_in_phase`; and `p080.clear_permanent_hold.v1` returns `action_disabled_in_phase` until later rollout phases. The live reconciliation loop, not the MCP `repair_if_safe` request path, records `diagnosed` / `diagnose_only` events and readback for `acp_startup_stale` candidates whenever `live_disable` is off and `detection_only` is enabled; the `acp_startup_stale` class flag only governs the readback's `rollout_disablement` field (`none` when enabled, `class_disabled` while still phase-gated) and does not gate event emission. `acp_prompt_stale` is delegated to P037 prompt supervision with zero P080 mutations; the loop does not perform ACP reset or scheduler capacity reclamation in this slice.
 
-The continuation tools (`agents.continue_work`, `agents.continuation_status`, `agents.continuation_candidates`) have typed `CapabilityToolId` variants (`AgentsContinueWork`, `AgentsContinuationStatus`, `AgentsContinuationCandidates`) so they participate in standard `tools/list` capability filtering. The read tools are exposed to `Operator` and `Observer` principals. `agents.continue_work` is exposed to `Operator` and `Agent` principals, but the handler accepts Agent callers only for validated `lead_auto` requests. They are dispatched by prefix into a separate `tools::agents` namespace in `control-plane/crates/mcp-server/src/server.rs` rather than through `CommandHandler::handle`: `agents.continue_work` runs its own atomic admission transaction that persists a `command_journal_id` on the `agent_work_continuations` row alongside the canonical request fingerprint, while the read tools omit unauthorized rows without leaking existence. See [`agent-work-continuation.md`](agent-work-continuation.md) for the request/response schemas and admission semantics.
-
-Storage diagnostics and maintenance tools are intentionally split between read-only snapshots (`storage.health`, `storage.write_pressure`, `storage.evidence_spool_summary`), bounded orphan reconciliation (`storage.reconcile_evidence_orphans`), and guarded maintenance writes (`storage.maintenance.repair_slot`, `storage.projections.clear_backlog`, `storage.projections.clear_poison`). Runtime boundary tools expose policy/audit health (`boundary.runtime.get`) and operator alerts (`operator.alerts.list`) without exposing raw audit rows.
-
-`runtime.health` / `boundary.runtime.get` also expose
-`toolOutputGuard`: the bounded-output policy version, guard version,
-generated-root denylist, per-output and cumulative budget defaults, static
-policy readback status, and provider-wrapper enforcement/probe state. Agents
-and operators use that readback to distinguish preflight-denied safe-search
-commands from post-output budget failures. The full contract is
-[bounded-tool-output-and-safe-search-policy.md](bounded-tool-output-and-safe-search-policy.md).
+The Proposal 086 continuation tools (`agents.continue_work`, `agents.continuation_status`, `agents.continuation_candidates`) have typed `CapabilityToolId` variants (`AgentsContinueWork`, `AgentsContinuationStatus`, `AgentsContinuationCandidates`) so they participate in standard `tools/list` capability filtering. The read tools are exposed to `Operator` and `Observer` principals; `agents.continue_work` is exposed only to `Operator`. They are dispatched by prefix into a separate `tools::agents` namespace in `control-plane/crates/mcp-server/src/server.rs` rather than through `CommandHandler::handle`: `agents.continue_work` runs its own atomic admission transaction that persists a `command_journal_id` on the `agent_work_continuations` row alongside the canonical request fingerprint, while the read tools omit unauthorized rows without leaking existence. See [`agent-work-continuation.md`](agent-work-continuation.md) for the request/response schemas and admission semantics.
 
 ### MCP tool payloads
 
@@ -167,11 +145,6 @@ The `approvals.resolve` tool supports additive evolution to handle both legacy s
 - `comment`: String (optional)
 
 Both subtypes route through `ResolveApprovalCmd` so the approval-mutation idempotency contract enforced by `approval_mutation_idempotency` applies uniformly to MCP and GraphQL approval surfaces.
-
-#### `runs.cancel`
-
-- `run_id`: UUID string (required)
-- `idempotency_key`: UUIDv7 string (required). Replaying the same cancellation request with the same key returns the existing command settlement instead of creating a second cancellation mutation. A later cancellation request with a different key after the run has already reached a terminal cancellation state is treated as an idempotent no-op over the existing terminal state; it must not create new work, side effects, provider sessions, or a second active settlement.
 
 ### Registered resource templates
 
@@ -225,18 +198,6 @@ Readback rules:
 
 Implementation: `control-plane/crates/domain/src/capabilities.rs`, `control-plane/crates/mcp-server/src/tools/mod.rs` (`capability_id_for`, `mcp_tool_for`, `all_capability_tool_ids`), `control-plane/crates/mcp-server/src/server.rs` (`resource_template_id_for_uri`).
 
-### P082 recovery-matrix readback lanes
-
-`p082_recovery_matrix_readback_v1` rows are exposed with strict singular/plural placement per the [recovery/retry state-machine matrix](recovery-retry-state-machine-test-matrix.md):
-
-- `runs.get` result exposes **both** `p082_recovery_matrix_readback` (singular: latest non-`not_applicable` row by `updated_at`, ties broken by `scenario_id` ascending) and `p082_recovery_matrix_readbacks` (plural array).
-- `reports.get` result exposes `p082_recovery_matrix_readbacks` only; the singular field is absent. Per-report entries may carry their own `p082_recovery_matrix_readbacks` array.
-- `report://{run_id}` and generated run-report JSON expose `p082_recovery_matrix_readbacks` only and must remain byte-equivalent to `reports.get` snake_case payloads.
-- Release receipts include `rollout_contract_readback` plus an optional additive `p082_recovery_matrix_readbacks` diagnostic; release receipts are not a recovery-command lane.
-- Advisory GraphQL fields (`p082RecoveryMatrixReadbackJson`, `p082RecoveryMatrixReadbacksJson`) remain diagnostic-only camelCase projections and are not a required readback lane.
-
-Operator displays render sanitized summaries only; raw `command_journal.error` envelope JSON (`p082_rejected_command_error_v1`) must never reach operator surfaces unredacted. The shared accessor and full-surface fixture live at `control-plane/crates/db/src/repos/p082_recovery_matrix.rs` and `docs/evidence/rollout-contract/operator-readback/p082-full-surface.fixture.json`.
-
 ## Principal table
 
 ### File shape
@@ -249,7 +210,7 @@ Operator displays render sanitized summaries only; raw `command_journal.error` e
 }
 ```
 
-`class` is one of `operator`, `agent`, or `observer`.
+`class` is one of `operator`, `agent`, `observer`, or `read_only_operator`. The `read_only_operator` class was added with P080 to back diagnostics-only bearers: it is admitted to `p080.diagnostics.get.v1` and `p080.reconcile.request.v1` (only for `requested_action=diagnose_only`), carries no MCP resource capabilities, and is rejected from every mutating tool including `p080.clear_permanent_hold.v1`.
 
 P081 added a `schema_version 3` reader path for boundary-aware caller and transport
 policy. Existing files without a `schema_version` field (legacy v1) and explicit
@@ -265,6 +226,10 @@ optional time-and-state fields used by the boundary-aware loader:
 - `not_before_ms` (i64, optional): Unix epoch milliseconds before which the entry is rejected. Absent means no not-before constraint.
 - `disabled` (bool, optional): When `true`, the entry is rejected without disclosing the disable reason. Absent or `false` means enabled.
 
+P080 added one optional authorization-scope field used by `check_p080_run_scope` for restricted classes (`agent`, `read_only_operator`):
+
+- `run_scope` (array of run_id strings, optional): When present and non-empty, the principal may only access P080 diagnostics for `filter.run_id` values that appear in the list; any other run is rejected fail-closed. When present and empty, every run is rejected. When absent on a restricted principal, every P080 call is rejected fail-closed (SEC-P080-001). Operator principals are never restricted by `run_scope`. The shared auth helper classifies these internal causes as `auth_scope_violation` or `auth_scope_required`; northbound P080 handlers surface the failure as `unauthorized_missing_capability`. The field is ignored on non-P080 surfaces.
+
 v3 files reject unknown JSON fields at every level and require an explicit
 `surface_policies` stanza for every principal (no implicit class-default fallback).
 Bearer-token comparison is constant-time across all entries; `token_id` derivation
@@ -275,36 +240,33 @@ stays in-process and is never logged or emitted on the wire.
 - **Env var:** `CHAINWORKS_AUTH_PRINCIPALS_PATH` names an absolute path to the principal table JSON. Relative paths are rejected; in packaged daemon modes the path must canonicalize within `~/.chainworks/auth/` so a config-injection attack cannot redirect auth loading to an arbitrary file.
 - **Default:** `~/.chainworks/auth/principals.json`.
 - **Empty env:** if `CHAINWORKS_AUTH_PRINCIPALS_PATH` is set to the empty string, the daemon refuses to start.
-- **Missing file:** on first start the daemon generates a random 256-bit base64url bearer token, writes a single-entry table with `class = operator` and `id = default-operator` to the discovered path, and logs the path with a redacted note. The raw token is never logged.
+- **Missing file:** on first start the daemon generates a random UUID token, writes a single-entry table with `class = operator` and `id = default-operator` to the discovered path, and logs the path + token at `info` level exactly once.
 - **File mode:** on Unix, bootstrap opens the file with `OpenOptions::mode(0o600)` before writing, so only the owning user can read it. On non-Unix platforms the mode is not enforced and the corresponding test is `cfg(unix)`-gated.
 - **TOCTOU-safe read:** on Unix, `load_or_bootstrap` runs `symlink_metadata` first (rejecting symlinks), then opens the file once and verifies mode against the opened descriptor's `fstat`, closing the window between the symlink check and the read. Any mode other than `0o600` aborts startup.
-- **Size cap:** principal-table reads fail closed before JSON parsing when `principals.json` exceeds 1 MiB.
-- **Strict surface policies in `schema_version: 2` and `schema_version: 3`:** every entry — not only the default operator — must declare `surface_policies` explicitly. An entry that omits `surface_policies` is rejected at load time, so a misconfigured custom principal cannot silently inherit class-default MCP/resource access. When `surface_policies` is present, `Principal::from_entry` overrides both capability sets: an absent or empty `mcp.allowed_tools` stanza maps to an empty `tool_capabilities` set, and `resource_capabilities` is always zeroed (no v2/v3 field yet allowlists MCP resources, so the default is deny-all resources). The GraphQL surface follows the same fail-closed rule: when an entry carries `surface_policies` but omits the `graphql` stanza, GraphQL query, mutation, and subscription policy checks return `Some(false)` so GraphQL access is denied rather than falling through to class defaults.
+- **Strict surface policies in `schema_version: 2`:** every entry — not only the default operator — must declare `surface_policies` explicitly. An entry that omits `surface_policies` is rejected at load time, so a misconfigured custom principal cannot silently inherit class-default MCP/resource access. When `surface_policies` is present, `Principal::from_entry` overrides both capability sets: an absent or empty `mcp.allowed_tools` stanza maps to an empty `tool_capabilities` set, and `resource_capabilities` is always zeroed (no v2 field yet allowlists MCP resources, so the v2 default is deny-all resources). The GraphQL surface follows the same fail-closed rule: when an entry carries `surface_policies` but omits the `graphql` stanza, `is_query_allowed_by_surface_policy` and `is_subscription_allowed_by_surface_policy` return `Some(false)` so queries and subscriptions are denied rather than falling through to class defaults.
 - **Empty table:** if the file parses successfully but contains zero principals, the daemon refuses to start with `AuthError::TableLoadFailed("principal table contains zero entries")`. There is no silent auth-disabled mode.
 
 ### Token resolution
 
-`auth::extract_bearer_token` parses an `Authorization` header value with strict grammar: exactly `"Bearer <token>"`, one space after `Bearer`, no surrounding whitespace, and a token that is 32 to 4096 bytes of visible ASCII (`0x21`-`0x7e`). Missing prefixes, short or oversized tokens, spaces inside the token, control characters, and non-ASCII bytes return `AuthError::MalformedHeader`. `auth::resolve_bearer` looks the token up in the `PrincipalTable` and returns a fresh `Principal` built by `Principal::from_entry`. Without `surface_policies` (v1 entries), `tool_capabilities` and `resource_capabilities` come from the class default set. With `surface_policies` (v2/v3 entries), the entry overrides both sets as described above; resource access is deny-all by default.
+`auth::extract_bearer_token` parses `"Bearer <token>"` from an `Authorization` header value (trimming whitespace; rejecting an empty token with `AuthError::MalformedHeader`). `auth::resolve_bearer` looks the token up in the `PrincipalTable` and returns a fresh `Principal` built by `Principal::from_entry`. Without `surface_policies` (v1 entries), `tool_capabilities` and `resource_capabilities` come from the class default set. With `surface_policies` (v2 entries), the entry overrides both sets as described above; resource access is deny-all by default.
 
 Token comparison is constant-time: `resolve_bearer` scans every entry without early exit and folds bytes with a non-short-circuiting XOR, so neither match position nor entry count leaks through timing.
 
-### Rotation And Revocation
+### Rotation
 
-The daemon starts from the principal table loaded at bootstrap, then shares a `LivePrincipalSource` across MCP HTTP, MCP stdio, GraphQL HTTP, GraphQL WebSocket, and failed-serve diagnostic authentication. A background reload task rereads `principals.json` every 2 seconds by default, overrideable with `CHAINWORKS_PRINCIPALS_RELOAD_SECS`; invalid values and values below 1 second fall back to the 2-second default.
+Token rotation, revocation, and delegation are out of scope for the current implementation on MCP transports. The principal table consumed by MCP HTTP and stdio is loaded once at daemon startup; to rotate or revoke an MCP token, edit `principals.json` and restart the daemon.
 
-A revocation written to the file is observed by new MCP HTTP requests, GraphQL HTTP requests, failed-serve status requests, and GraphQL WebSocket `connection_init` handshakes within roughly one reload interval. MCP stdio sessions bind a live credential at `initialize` and recheck that credential before later requests, so rescoped or revoked capabilities are observed without restarting the session. P046 GraphQL session observability subscriptions also use their dedicated live auth handle for per-emission authorization recheck; affected streams terminate fail-closed with `authorization_recheck_failed` rather than continuing under stale grants.
-
-If the reload fails, the live auth source is marked unavailable. The reload path does not bootstrap a replacement table when `principals.json` is missing; new bearer resolutions fail closed, and running subscription rechecks terminate fail-closed until a later reload succeeds.
+P046 GraphQL session observability subscriptions are the exception: the daemon spawns a periodic `principals.json` reloader (default interval 2 s, override with `CHAINWORKS_PRINCIPALS_RELOAD_SECS`) that updates the dedicated P046 live auth source used by per-emission authorization recheck. A revocation written to the file is observed by `sessionStatusChanged` within roughly one reload interval and the affected stream terminates fail-closed; reload failures mark the source unavailable so subscriptions terminate with `authorization_recheck_failed` rather than continuing under stale grants. MCP token resolution is not affected by this reloader.
 
 Bearer-token equality on every lookup uses a constant-time byte comparison so timing side channels cannot probe the principal table.
 
-Implementation: `control-plane/crates/auth/src/lib.rs` (`PrincipalTable::load_or_bootstrap`, `LivePrincipalSource`, `resolve_bearer`, `extract_bearer_token`, `validate_raw_token`, `token_fingerprint`), `control-plane/crates/daemon/src/main.rs` (`principals_path_from_env`, principal reload loop).
+Implementation: `control-plane/crates/auth/src/lib.rs` (`PrincipalTable::load_or_bootstrap`, `resolve_bearer`, `extract_bearer_token`, `ct_eq_bytes`), `control-plane/crates/daemon/src/main.rs` (`principals_path_from_env`, P046 principals reload loop).
 
 ## Bearer auth on transports
 
 ### MCP HTTP (`POST /mcp`)
 
-`handle_mcp_post` parses `Authorization: Bearer <token>` on every request, resolves it through the daemon's live principal source, and returns a JSON-RPC error with `code = -32000` and `message = "unauthorized"` (HTTP 200 body) on any of: missing header, malformed header, unknown token, or unavailable live auth source. Valid requests carry the resolved `Principal` into `McpServer::handle_request`. `Mcp-Session-Id` correlation is preserved; the principal is re-resolved per request rather than cached by session.
+`handle_mcp_post` parses `Authorization: Bearer <token>` on every request, resolves it through `auth::resolve_bearer`, and returns a JSON-RPC error with `code = -32000` and `message = "unauthorized"` (HTTP 200 body) on any of: missing header, malformed header, unknown token. Valid requests carry the resolved `Principal` into `McpServer::handle_request`. `Mcp-Session-Id` correlation is preserved; the principal is re-resolved per request rather than cached by session.
 
 Implementation: `control-plane/crates/mcp-server/src/http.rs`.
 
@@ -320,11 +282,10 @@ Authentication piggybacks on the MCP `initialize` method:
 Contract (see `McpServer::run_stdio`):
 
 1. Any first frame whose method is not `initialize` receives `-32002 "server not initialized"` and closes the session.
-2. `initialize` without `params.clientInfo.principal_token`, with a malformed token, or with an unresolvable token receives opaque `-32000 "unauthorized"` and closes.
-3. Token validation uses the same visible-ASCII length bounds as HTTP bearer parsing before resolution.
-4. On success a live principal credential is bound to the stdio session.
-5. Later requests recheck that credential against the live principal source before dispatch, so revocation or capability rescope is observed without restarting the session.
-6. A mid-session second `initialize` is rejected with `-32600 "Session already initialized"`; the bound credential is not replaced.
+2. `initialize` without `params.clientInfo.principal_token` receives `-32000 "unauthorized: principal_token required on initialize"` and closes.
+3. `initialize` with an unresolvable token receives `-32000 "unauthorized: unknown token"` and closes.
+4. On success the `Principal` is bound to the stdio session for its lifetime.
+5. A mid-session second `initialize` is rejected with `-32600 "Session already initialized"`; the bound principal is not replaced (session-lifetime immutability).
 
 Implementation: `control-plane/crates/mcp-server/src/server.rs` (`run_stdio`), `control-plane/crates/mcp-server/src/protocol.rs`.
 
@@ -333,26 +294,24 @@ Implementation: `control-plane/crates/mcp-server/src/server.rs` (`run_stdio`), `
 The `/graphql` HTTP route is wrapped in an axum middleware (`auth_layer::require_auth`) that:
 
 - parses `Authorization: Bearer <token>`,
-- resolves through the daemon's live principal source,
+- resolves through `auth::resolve_bearer`,
 - on success inserts the `Principal` into the request's `http::Extensions` so `async_graphql::Context::data::<auth::Principal>()` can retrieve it in resolvers,
 - on failure responds with HTTP 401 and a GraphQL-shaped error body: `{ "errors": [{ "message": "unauthorized", "extensions": { "code": "UNAUTHORIZED" } }] }`.
 
-If the bearer resolves to a principal whose explicit `surface_policies` omit the `graphql` stanza, the HTTP middleware denies the request with HTTP 403 and `CAPABILITY_OUT_OF_SCOPE`. If the `graphql` stanza is present, resolvers still enforce the live `allow_queries`, `allow_subscriptions`, and `allowed_mutations` values so reloads can revoke GraphQL access without restarting the daemon.
-
 The GET playground is exempt from auth only when `CHAINWORKS_PLAYGROUND_AUTH=skip` is set at daemon startup.
 
-Implementation: `control-plane/crates/graphql-server/src/auth_layer.rs`, `control-plane/crates/graphql-server/src/server.rs` (`build_router_with_live_principal_source`).
+Implementation: `control-plane/crates/graphql-server/src/auth_layer.rs`, `control-plane/crates/graphql-server/src/server.rs` (`build_router`).
 
 ### GraphQL WebSocket (`/graphql/ws`)
 
 WebSocket subscriptions are mounted outside the HTTP auth middleware because the middleware cannot reject a WebSocket upgrade while still allowing a `connection_init` handshake to fire. P081 therefore pre-validates the first WebSocket frame before handing the socket to async-graphql:
 
 - the `connection_init` payload must include `{ "Authorization": "Bearer <token>" }`,
-- `connection_init_data` extracts the bearer token with the same strict `auth::extract_bearer_token` grammar used by HTTP GraphQL and resolves it through the daemon's live principal source,
+- `connection_init_data` extracts the bearer token and calls `auth::resolve_bearer`,
 - on success the resolved `Principal` is injected into the subscription's `async_graphql::Data` and subscription resolvers can read it,
-- missing or malformed `Authorization`, or an unresolvable token, closes the socket with `4401`,
-- authenticated callers that are not allowed to use the UI GraphQL subscription surface, including principals whose explicit `surface_policies` omit `graphql` or set `allow_subscriptions=false`, close with `4403`,
-- missing, malformed, oversized, delayed, or non-`connection_init` first frames close with `4408`; oversized frames are rejected before JSON parsing,
+- missing or unresolvable token closes the socket with `4401`,
+- authenticated callers that are not allowed to use the UI GraphQL subscription surface close with `4403`,
+- missing, malformed, delayed, or non-`connection_init` first frames close with `4408`,
 - policy reload remains `4408` with reason `POLICY_RELOAD`; the Swift shell reconnects and restores operator window state.
 
 Implementation: `control-plane/crates/graphql-server/src/server.rs` (`graphql_ws_handler`, `connection_init_data`).
@@ -372,19 +331,16 @@ Both checks are required, so a future change that wants to narrow a specific pri
 |---|:-:|:-:|:-:|
 | `ideas.create` | yes | yes | no |
 | `ideas.list` | yes | yes | yes |
-| `runs.start` | yes | yes | no | (Caller-supplied filesystem paths still pass through boundary policy, path validation, and principal capabilities before command execution.) |
+| `runs.start` | yes | no | no | (SEC-001: caller-supplied filesystem paths — Operator-only.) |
 | `runs.list` | yes | yes | yes | (SEC-003: local filesystem path fields — `workspace_root`, `artifact_root`, `chainworks_meta_root` — are redacted from each projection row for non-Operator callers.) |
-| `runs.get` | yes | yes | yes | (Escalation readback: operator-only snapshot fields (`workflow_snapshot_json`, `catalog_snapshot_json`, `delivery_*_json`, `drift_details_json`, and local filesystem paths) are stripped for non-Operator callers, and `escalation_readback` collapses to the summary projection (`chains_redacted: true`); see [escalation-policies.md](escalation-policies.md).) |
+| `runs.get` | yes | yes | yes | (P058 Phase 1: operator-only snapshot fields (`workflow_snapshot_json`, `catalog_snapshot_json`, `delivery_*_json`, `drift_details_json`, and local filesystem paths) are stripped for non-Operator callers, and `escalation_readback` collapses to the summary projection (`chains_redacted: true`); see [escalation-policies.md](escalation-policies.md).) |
 | `runs.cancel` | yes | no | no |
-| `runs.retrofit_catalog_snapshot` | yes | no | no |
 | `approvals.list` | yes | no | yes | (Mixed inbox: stage approvals + lead mediation confirmations) |
 | `approvals.resolve` | yes | no | no | (Resolves stage approvals or lead mediation confirmations) |
 | `stages.retry` | yes | no | no |
-| `stages.consume_provider_quota_hold` | yes | no | no |
 | `workflow_conflicts.resolve` | yes | no | no |
-| `workflow_loop_budget.extend` | yes | no | no |
 | `legacy_discovery_override_create` | yes | no | no |
-| `reports.get` | yes | no | no | (Operator-only report surface; non-Operator callers are denied before report lanes are loaded. `report://` resource reads are also Operator-only.) |
+| `reports.get` | yes | no | no | (SEC-HIGH-001: returns operator-grade evidence, rollout readback, and local `file_path` values — Operator-only, matches the `report://` resource boundary.) |
 | `artifacts.override_contract` | yes | no | no |
 | `steward.run_analysis` | yes | no | no |
 | `steward.list_analyses` | yes | no | yes |
@@ -392,25 +348,14 @@ Both checks are required, so a future change that wants to narrow a specific pri
 | `runs.main_sync.*` | yes | no | no | (Includes request, retry, set_override, repair_state, record_recovery_decision) |
 | `runs.knowledge_capsule.ignore` | yes | no | no |
 | `runs.settle_proposal_gate` | yes | no | no |
-| `runtime.health` / `boundary.runtime.get` | yes | no | no |
-| `operator.alerts.list` | yes | no | no |
-| `storage.health` | yes | no | no |
-| `storage.write_pressure` | yes | no | no |
-| `storage.evidence_spool_summary` | yes | no | no |
-| `storage.reconcile_evidence_orphans` | yes | no | no |
-| `storage.maintenance.repair_slot` | yes | no | no |
-| `storage.projections.clear_backlog` | yes | no | no |
-| `storage.projections.clear_poison` | yes | no | no |
 | `effects.list` | yes | no | no |
 | `effects.inspect` | yes | no | no |
 | `effects.reconcile` | yes | no | no |
-| `effects.mark_conflict` | yes | no | no |
 | `effects.mark_unrecoverable` | yes | no | no |
 | `effects.clear_after_manual_verification` | yes | no | no |
 | `agents.continuation_status` | yes | no | yes |
 | `agents.continuation_candidates` | yes | no | yes |
-| `agents.continue_work` | yes | yes | no | (Agent visibility is for validated `lead_auto` requests; manual continuation remains Operator-owned.) |
-| `automation.auto_retry.latest` | yes | no | yes |
+| `agents.continue_work` | yes | no | no |
 
 Rationale for the Steward trio: `run_analysis` queues compute work and drives the quality-gate pipeline, so only operators can trigger it. `list_analyses` and `get_analysis` are read-only over persisted analysis records and are visible to the operational/audit (observer) class. Agents are scoped to executing their own run and have no legitimate cross-cohort read surface, so they see none of the three.
 
@@ -420,14 +365,14 @@ Rationale for the Steward trio: `run_analysis` queues compute work and drives th
 |---|:-:|:-:|:-:|
 | `run://{run_id}` | yes | yes | yes |
 | `idea://{idea_id}` | yes | yes | yes |
-| `artifact://{artifact_id}` | yes | yes | yes | (Returns artifact metadata plus an `artifact_metadata_pointer`; payload path and raw filesystem fields are redacted.) |
-| `report://{run_id}` | yes | no | no | (Operator-only report resource; non-Operator callers are denied before report payload lanes are materialized.) |
+| `artifact://{artifact_id}` | yes | no | no | (HIGH-001: exposes local `file_path` — Operator-only.) |
+| `report://{run_id}` | yes | no | no | (HIGH-001: exposes execution evidence and artifact payloads — Operator-only.) |
 | `steward-analysis://{analysis_id}` | yes | no | yes |
-| `chainworks://runs` | yes | yes | yes | (Operator sees the full active-run projection; non-Operator callers receive rows with local filesystem paths, implementation-completion details, and closeout readiness summaries redacted.) |
+| `chainworks://runs` | yes | yes | yes |
 | `chainworks://ideas` | yes | yes | yes |
 | `chainworks://approvals/inbox` | yes | no | yes |
 | `chainworks://runs/{run_id}/stages` | yes | no | yes |
-| `chainworks://runs/{run_id}/artifacts` | yes | no | yes | (Operator sees full projection; Observer receives redacted rows without `file_path` or source generation identifiers.) |
+| `chainworks://runs/{run_id}/artifacts` | yes | no | no | (SEC-HIGH-002: returns unredacted `file_path` and source generation metadata — Operator-only.) |
 
 ### GraphQL mutation boundary
 
@@ -460,7 +405,7 @@ Current Rust schema compatibility note: older non-approval GraphQL mutation reso
 - `McpServer::handle_request` filters `tools/list` through `visible_tool_specs` (which calls `auth::filter_tools`), evaluates the injected P081 `BoundaryPolicy` for known `tools/call` requests, and then applies the caller token capability set. Unknown tools and feature-gated tools return `-32601 "Method not found: <name>"`; known-but-denied tools return `-32004 "tool denied"` with `error.data.reason_code`, `caller_class`, `row_id`, and `boundary_policy_version`. Storage diagnostics tools keep their typed success-envelope error protocol after the required deny audit row commits.
 - `resources/list` is filtered by `auth::filter_resources` over `auth::all_resource_templates()`.
 - `resources/read` parses the concrete URI into a `ResourceTemplateId` via `resource_template_id_for_uri`, then calls `auth::match_resource_uri`. A denied read returns `-32002 "Resource not found"`.
-- GraphQL query, subscription, and approval mutation paths read `Principal` from `async_graphql::Context`, evaluate the same injected `BoundaryPolicy`, then recheck the live principal source for surface-policy revocation or rescope. Approval mutation denials occur before command side effects.
+- GraphQL approval mutation resolvers read `Principal` from `async_graphql::Context`, evaluate the same injected `BoundaryPolicy`, and return the P081 denial envelope before command side effects on denial.
 
 Implementation: `control-plane/crates/auth/src/lib.rs` (`filter_tools`, `filter_resources`, `match_resource_uri`, `tool_allowed_for_class`, `resource_allowed_for_class`), `control-plane/crates/mcp-server/src/server.rs` (`handle_request`, `visible_tool_specs`), `control-plane/crates/graphql-server/src/schema.rs` (approval mutation resolvers and explicitly quarantined legacy compatibility resolvers).
 
@@ -524,7 +469,7 @@ Migration `011_auth_tracking.sql` adds four nullable TEXT columns to the existin
 |---|---|
 | `caller_surface` | `"mcp"` or `"graphql"` (serde `snake_case`) |
 | `caller_principal_id` | principal id from the auth table (e.g. `default-operator`, `observer`, `test-operator`) |
-| `caller_principal_class` | `"operator"`, `"agent"`, or `"observer"` |
+| `caller_principal_class` | `"operator"`, `"agent"`, `"observer"`, or `"read_only_operator"` (added with P080) |
 | `caller_tool` | MCP tool name (e.g. `runs.start`) or approval GraphQL mutation name (e.g. `approveApproval`) |
 
 Columns are nullable so pre-P029 rows remain readable. Post-P029 rows written through `CommandHandler::handle` always populate all four.
@@ -577,7 +522,7 @@ Implementation: `control-plane/crates/engine/src/command_journal_redact.rs` (bot
 
 ### MCP command tools
 
-MCP command tools marked `yes` in the registry table include `journal_id` inside their `tools/call` response. The value lives at `result.content[0].text` as stringified JSON, alongside the tool's existing result fields:
+The five MCP command tools (`runs.start`, `runs.cancel`, `approvals.resolve`, `stages.retry`, `steward.run_analysis`) include `journal_id` inside their `tools/call` response. The value lives at `result.content[0].text` as stringified JSON, alongside the tool's existing result fields:
 
 ```json
 {
@@ -596,7 +541,7 @@ The server currently advertises `protocolVersion: "2024-11-05"`, which predates 
 
 ### MCP direct tools
 
-Direct tools marked `no (...)` in the registry table bypass `CommandHandler`. Pure read tools call repo functions and do not return `journal_id`. Direct maintenance, disposition, and continuation-admission tools may persist their own journal/disposition ids; those ids are tool-specific and are not evidence that the request routed through `CommandHandler`.
+The eight direct tools (`ideas.create`, `ideas.list`, `runs.list`, `runs.get`, `approvals.list`, `reports.get`, `steward.list_analyses`, `steward.get_analysis`) call repo functions directly and bypass `CommandHandler`. They write no `command_journal` row and their response JSON does not include `journal_id`.
 
 ### GraphQL approval mutation payload wrappers
 
@@ -621,23 +566,6 @@ mutation {
 ### Blocked `runs.start` preflight
 
 MCP `runs.start` returns a typed blocked delivery-preflight payload when repo-backed run creation is rejected before a run row exists. The payload includes `passed` and individual `checks`; callers must not parse generic error strings to determine preflight status.
-
-Before command journaling or filesystem reads, `runs.start` also validates the
-filesystem boundary against the target idea. The idea's persisted
-`workspace_root_path` is the trusted root and may be set by `ideas.create` only
-for Operator principals. Agent principals can create ideas without a filesystem
-root, but cannot establish root-backed authority or call `runs.start`. The
-trusted root must exist, must not be a symlink, must not contain symlink
-components, and must not be a broad root such as `/`, `/tmp`, `/Users`, or the
-operator home directory. The submitted `workspace_root` must canonicalize to the
-same path. `artifact_root`, `workflow_yaml_path`, and `agent_catalog_yaml_path`
-must remain under that root. A missing `artifact_root` is created and
-canonicalized before `StartRun` persistence, using a component-by-component
-walk that rejects parent-directory, root, prefix, and symlink-replacement
-components. Per-run meta-root directories are created under the canonical
-workspace root with the same component checks.
-Failures at this argument-validation layer return an MCP error without
-`journal_id`, because no `CommandHandler` command has been recorded.
 
 Compatibility note: the compiled schema may still contain older `startRun`-family fields for historical tests, but production/default UI principals fail closed for non-approval GraphQL command mutations. The typed `DeliveryPreflight` wrapper is not part of the SwiftUI target contract; use MCP `runs.start` for run creation.
 
@@ -665,7 +593,7 @@ The repo-root `.mcp.json` registers this daemon as an MCP server for Claude Code
 }
 ```
 
-The header references `CHAINWORKS_MCP_TOKEN`, which operators set in their shell. After first-start bootstrap the operator reads the token from `~/.chainworks/auth/principals.json` and exports it.
+The header references `CHAINWORKS_MCP_TOKEN`, which operators set in their shell. After first-start bootstrap the operator reads the token from `~/.chainworks/auth/principals.json` (or copies it from the one-time bootstrap log line) and exports it.
 
 `CLAUDE.md` documents the same URL, the `Authorization: Bearer` contract, and the env var name. The two files are kept in sync by focused tests that live alongside the daemon and fail the `proposal-029-mcp` gate on drift.
 
@@ -681,7 +609,7 @@ The canonical verification command is:
 
 The gate enumerates a fixed inventory of focused tests covering:
 
-- principal-table bootstrap (0o600 file mode, redacted bootstrap log, empty-file fail-closed),
+- principal-table bootstrap (0o600 file mode, one-time token log, empty-file fail-closed),
 - transport auth for MCP HTTP, MCP stdio, GraphQL HTTP, GraphQL WebSocket,
 - capability filtering for tool lists, tool calls, resource lists, and resource reads (including the Steward trio and the `steward-analysis://` resource),
 - command-journal caller-metadata rows (per surface, per class),
@@ -700,9 +628,9 @@ Gate ownership and the inventory source of truth are documented in [test-gates.m
 The following items are explicitly out of scope for this reference:
 
 - **Southbound per-agent MCP policy.** Covered by [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md). Northbound and southbound are different layers and do not share code.
-- **Token delegation and external lifecycle management.** The daemon observes principal-table revocation and capability rescope through live reload; delegated token issuance, operator-facing rotation workflows, and external auth lifecycle integrations remain future scope.
+- **Token rotation, revocation, delegation.** The table is read once at startup; editing requires a restart. A future auth-lifecycle slice owns rotation.
 - **YAML-driven capability policy.** First-wave uses static class tables in `auth::tool_allowed_for_class` and `auth::resource_allowed_for_class`.
-- **Per-subscription capability filtering.** Subscription access is enforced at the GraphQL surface-policy boundary; narrowing individual subscription fields beyond that surface policy remains a future slice.
+- **Per-subscription capability filtering.** All authenticated principals can subscribe to all subscriptions; narrowing is a future slice.
 - **Internal `CallerSurface` variant.** Executor and recovery do not route through `CommandHandler` today. The internal-caller audit lane is reserved for a future command-path consolidation slice.
 - **MCP `structuredContent` typed-output channel.** The server advertises `protocolVersion: "2024-11-05"`; a future protocol-uplift slice adds the typed `structuredContent.journal_id` mirror.
 - **Immediate physical deletion of legacy non-approval GraphQL mutation resolvers.** The resolvers remain compatibility surface only, not a product or SwiftUI action-routing contract. Production-style principals fail closed unless they carry explicit approval-only GraphQL surface policy.

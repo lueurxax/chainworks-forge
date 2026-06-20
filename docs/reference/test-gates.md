@@ -522,9 +522,36 @@ Important:
 - this gate hard-depends on `proposal-029`
 - `proposal-033` is the repo-owned proof lane for [acp-runtime-transport.md](acp-runtime-transport.md)
 
+### Session Observability GraphQL
+
+Session observability GraphQL proof gate. The `proposal-046` and `p046` command names are retained historical aliases for reproducible verification. Operational truth lives in [rust-control-plane.md](rust-control-plane.md#graphql) and [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md#operator-surfaces).
+
+Scope:
+
+- runs `cargo test -p graphql-server --test proposal_046_session_graphql` plus the `p046_retry_db` unit-test lane in `graphql-server` for the pinned retry policy; these test names are retained historical aliases
+- verifies the operator readback fixture under `docs/evidence/rollout-contract/operator-readback/`, the session observability negative fixtures under `docs/evidence/rollout-contract/negative/`, and the retained historical alias P046 metric inventory in `graphql-server` source
+- covers SDL snapshots (Connection/Edge/PageInfo shape, cursor nullability, absence of `resetSession` and any equivalent session-control mutation), explicit disabled-schema behavior, operator-read authorization across `runId`- and ID-based resolvers, parent-run/lineage ownership lookup with not-found-or-not-visible behavior, cursor pagination and `limit+1` `hasNextPage` semantics, sanitized invalid-cursor errors, derived non-secret replacements for `providerSessionId`/`bindingFingerprint`/`invocationOwnerKey`/`workingDirectory`, the pinned transient sqlite retry policy (3 attempts, 50/150 ms backoff, <=250 ms sleep budget, >=250 ms resolver headroom, deterministic `db_unavailable` or `UNKNOWN/transient_db_unavailable` on exhaustion), event-details redaction (`p046_event_details_redaction_v1` allowlist, unknown-shape fail-closed), and `sessionStatusChanged` run-filtering, per-emission authorization recheck, 64-payload per-subscriber buffer, at-most-once `resyncRequired`, and slow-consumer disconnect; `p046_*` labels are retained historical aliases
+
+Host policy:
+
+- local target only; runtime/unit proof lane without a UI target
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-046  # retained historical alias
+./scripts/test-gate.sh p046          # retained historical alias
+```
+
+Important:
+
+- session observability is read/subscription-only by contract: no GraphQL `resetSession`, `closeSession`, `invalidateSession`, or equivalent session-control mutation may appear in the schema; reset remains MCP-only
+- session observability GraphQL fields are enabled by default; clients still must gate documents on capability/schema discovery so explicit disabled-schema mode does not produce validation errors
+- no SQL schema migration or additive index is allowed in this slice; profiling-driven indexing requires a follow-up proposal revision
+
 ### `proposal-036|p036`
 
-UX consolidation and navigation simplification gate.
+macOS operator navigation and read-model UX gate. The alias retains the historical proposal number; the stable behavior contract is [macos-operator-navigation.md](macos-operator-navigation.md).
 
 Scope:
 
@@ -541,7 +568,8 @@ Use when:
 
 Host policy:
 
-- unit/runtime tests run locally
+- on local hosts, `proposal-036` runs the build plus unit/runtime slices and skips the UI smoke slice
+- on approved remote UI hosts, the same `proposal-036` gate also runs the UI smoke cases
 - UI smoke tests are remote-only per repository policy and must run via the approved host (`test@SMacBook.local`)
 
 Command:
@@ -553,8 +581,42 @@ ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-ga
 
 Important:
 
-- this gate is the repo-owned proof lane for proposal-036 UX consolidation
+- this gate is the repo-owned proof lane for the consolidated macOS operator shell
 - inline approval rendering follows the [thin-client read-model affordance contract](thin-client-read-model-affordance-contract.md); legacy Approvals routes redirect into Runs with waiting-approval focus after the Phase 2c top-level tab removal
+
+### Retained historical alias: `proposal-093|p093`
+
+Retained historical alias for the live agent Timeline UX and readability gate. The stable behavior is documented in [macOS Operator Navigation and Read-Model UX](macos-operator-navigation.md#timeline); this section owns only the proof lane.
+
+Scope:
+
+- focused `Proposal036UXConsolidationTests` slices for chunk accumulation, terminal response summaries, truthful raw-detail availability, newest-first ordering, agent selector presence, formatting, and expandable card behavior
+- `Proposal031ThinGraphQLReadBoundaryTests` for thin read-model compatibility
+- `graphql-server` runtime timeline tests for additive daemon-owned timeline fields and the raw-detail resolver surface
+
+Use when:
+
+- changing live Timeline cards, response chunk coalescing, newest-first ordering, active-agent selection, raw-detail copy labeling, or formatted expanded details
+- changing `runtimeStatusChanged` fields or the `timelineRawDetail(handle:)` resolver contract
+
+Host policy:
+
+- on local hosts, the retained historical alias runs the build plus non-UI focused tests and skips remote UI proof
+- on approved remote UI hosts, the same gate may include UI smoke coverage
+- UI smoke tests remain remote-only per repository policy
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-093 # retained historical alias
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-093" # retained historical alias
+```
+
+Important:
+
+- Timeline remains a control-plane readback surface; this gate must not be satisfied by Swift-local orchestration history or artifact scans
+- raw-detail handles are opaque daemon tokens and must be resolved only through the control-plane read API
+- the latest retained historical alias live-agent Timeline remote UI proof is recorded at `docs/evidence/macos-operator-navigation/p093-remote-ui-proof-2026-05-22.json`
 
 ### `proposal-037`
 
@@ -881,7 +943,7 @@ MCP + GraphQL northbound auth, capability filtering, and audit-journaling gate f
 
 Scope:
 
-- principal-table bootstrap (owner-only `0o600` file mode on Unix, redacted bootstrap log, fail-closed on empty table)
+- principal-table bootstrap (owner-only `0o600` file mode on Unix, one-time token log, fail-closed on empty table)
 - bearer auth on MCP HTTP (`POST /mcp`), MCP stdio (`initialize.params.clientInfo.principal_token`), GraphQL HTTP (`POST /graphql`), and GraphQL WebSocket (`/graphql/ws` via `on_connection_init`)
 - per-class capability filtering for MCP `tools/list`, `tools/call`, `resources/list`, `resources/read`, including the Steward trio policy (`steward.run_analysis` operator-only, `steward.list_analyses` + `steward.get_analysis` operator/observer, agent excluded)
 - GraphQL mutation class policy: UI/default principals may execute only `approveApproval` and `rejectApproval`; non-approval command mutations are MCP-only
@@ -1406,9 +1468,9 @@ Important:
 
 ### `proposal-058|p058`
 
-Regression gate for ACP provider failure classification, session artifact ownership, and configurable escalation-chain proof.
+Regression gate for ACP provider failure classification, session artifact ownership, and P058 configurable escalation chain proof.
 
-The original ACP-classification proposal and the configurable escalation-chain proposal have been implemented and retired; the gate name remains `proposal-058|p058` because Swift/Rust test targets, migration symbols, and historical proof lanes use that identifier. This gate covers the implemented escalation policy schema, readback, metrics inventory, macOS read surface, and owned tier-selection behavior documented in [escalation-policies.md](escalation-policies.md).
+The original ACP-classification proposal has been implemented and retired; the gate name remains `proposal-058` because Rust test targets and the historical proof lane use that identifier. This gate also covers the P058 configurable escalation chains schema, readback, metrics inventory, and owned tier-selection behavior.
 
 Scope:
 
@@ -1431,7 +1493,7 @@ Scope:
 - tier selection writes (`agent_execution_runtime_facts.would_select_*`) populated from the frozen `RunPlan` policy at agent-execution completion (`engine/src/shadow_escalation.rs`)
 - durable scheduler readback fields derived from redacted `escalation_events` (`waiting_retry_after_until`, `escalation_trace_json_redacted`, `external_acknowledgement_ref`, `feature_flag_state`, and per-attempt `digest_inputs`)
 - governed macOS read-surface components compile and are covered by focused Swift tests (`EscalationStatusCapsule`, `EscalationBannerStack`, `EscalationLineageView`, `EscalationPauseCard`, `EscalationTraceTimeline`, `DriftReviewSheet`, MenuBarExtra overflow routing, retained shared adapters, command disabled-state parity, actual drift sheet tier/trigger/max-attempt inputs, compact banner co-occurrence summarization, non-collapsed lineage disclosures, pause-card ultra-narrow fallback, SF Symbol availability, drift diff presentation, and read-only trace pasteboard copy)
-- full escalation metric inventory declaration plus production emission from ledger/event writes for the metrics backed by durable escalation state
+- full P058 metric inventory declaration plus production emission from ledger/event writes for the metrics backed by durable escalation state
 - idempotency-key uniqueness enforced by migration `078_p058_escalation_idempotency.sql` (one chain per `run_id`/`stage_id`/`agent_id`/`policy_id`; one execution-metadata row per `ledger_id`/`tier_id`/`tier_attempt_index`)
 
 Use when:
@@ -1441,12 +1503,14 @@ Use when:
 - changing session reuse, retry supersession, or late-output handling
 - changing artifact active-index source provenance
 - changing GraphQL or MCP execution truth readback
+- changing escalation domain types, repository layer, or GraphQL escalation readback
+- changing escalation_policy_v1 YAML parsing, compile validation, or RunPlan policy snapshot
 
 Host policy:
 
 - local Rust and macOS Swift test toolchains required
 - no live provider account, simulator, daemon process, UI target, network, or real quota exhaustion required
-- remote visual/runtime, Full Keyboard Access, contrast/reduced-motion, and live operational drill evidence is owned by [P100](../proposals/100-p058-release-evidence-and-macos-runtime-proof.md), not this implementation gate
+- remote visual/runtime, Full Keyboard Access, contrast/reduced-motion, and live operational drill evidence is owned by P096, not this implementation gate
 
 Command:
 
@@ -1468,7 +1532,8 @@ Important:
 - DB claim-start and MCP parity are executed single-job in gate-owned target directories so stale shared `target/` artifacts cannot satisfy or block the proof
 - `ignored_late_outputs` is output settlement truth, not an `AgentFailureKind`
 - stale output from `closed`, `superseded`, or `superseded_pending_retry` claims must never update active artifact truth
-- the gate fails closed if runtime facts, source-generation claims, pending retry supersession, artifact provenance, or GraphQL/MCP runtime-facts parity evidence is missing
+- the gate fails closed if runtime facts, source-generation claims, pending retry supersession, artifact provenance, GraphQL/MCP runtime-facts parity, or escalation schema evidence is missing
+- escalation events must supply a `redaction_version` stamp; insert without one must fail
 
 ### `proposal-061|p061`
 
@@ -1817,60 +1882,8 @@ Important:
 - typed operator overrides are separate from raw report files, require operator capability, write command journal evidence, expire at `expires_at_stage`, and remain visible in readback after expiry
 - the gate fails closed if canonical status normalization, active-index SQLite ownership, stale export rebuild, raw artifact fallback denial, degraded policy, typed overrides, or GraphQL/MCP readback parity evidence is missing
 
-### `proposal-058|p058`
-
-Implemented regression gate for ACP provider failure classification and session artifact ownership.
-
-The original proposal document has been retired after implementation. The gate name
-remains `proposal-058` because the Rust test targets and historical proof lane use that
-identifier.
-
-Scope:
-
-- typed `AgentFailureKind`, `AgentOutputSettlement`, runtime facts, and operator action hints
-- typed ACP/P037/P045/P051/P057 failure-observation classification matrix coverage
-- runtime failure redaction fixtures and P045 recovery-action mapping from P058 runtime facts
-- durable `agent_execution_runtime_facts` read/write behavior
-- artifact source-generation claims, including `superseded_pending_retry`
-- `InvokeAgent` claim/start ownership: generic work-queue claim skips `InvokeAgent`, while the engine-owned start transaction pre-creates exactly one `agent_executions` row and matching source-generation claim
-- retry enqueue-to-claim late-output rejection and source-generation CAS behavior
-- GraphQL/MCP runtime-facts parity and artifact source provenance
-- no-secret redacted runtime failure readback
-
-Use when:
-
-- changing ACP provider/transport error classification
-- changing executor output validation settlement or degraded output behavior
-- changing session reuse, retry supersession, or late-output handling
-- changing artifact active-index source provenance
-- changing GraphQL or MCP execution truth readback
-
-Host policy:
-
-- local Rust toolchain required
-- no live provider account, Xcode, simulator, daemon process, UI target, network, or real quota exhaustion required
-
-Command:
-
-```bash
-./scripts/test-gate.sh proposal-058
-```
-
-Prerequisite posture:
-
-- Same-tree dependency evidence: P058 consumes P037 timeout semantics, P045 recovery/retry semantics, P051 Xcode MCP observations, and canonical artifact contracts.
-- The focused P058 gate uses fixture/fake transport coverage for those consumed seams rather than requiring live provider, live Xcode, or UI evidence.
-
-Important:
-
-- `p058` is accepted as an alias
-- runtime facts are durable typed execution truth, not log parsing
-- `InvokeAgent` provider startup must use the pre-created execution identity from the claim/start DTO; creating a second execution row after the claim boundary is a gate failure
-- P058 claim/start tests must run; compiling them with `--no-run` is not sufficient proof
-- DB claim-start and MCP parity are executed single-job in gate-owned target directories so stale shared `target/` artifacts cannot satisfy or block the proof
-- `ignored_late_outputs` is output settlement truth, not an `AgentFailureKind`
-- stale output from `closed`, `superseded`, or `superseded_pending_retry` claims must never update active artifact truth
-- the gate fails closed if runtime facts, source-generation claims, pending retry supersession, artifact provenance, or GraphQL/MCP runtime-facts parity evidence is missing
+- the gate fails closed if runtime facts, source-generation claims, pending retry supersession, artifact provenance, GraphQL/MCP runtime-facts parity, or escalation schema evidence is missing
+- escalation events must supply a `redaction_version` stamp; insert without one must fail
 
 ### `proposal-061|p061`
 
@@ -1947,36 +1960,6 @@ Important:
 - this is a Phase 0 contract/readback gate, not proof that Git mutation or capsule prompt injection is enabled
 - later P064 phases must extend this gate before shipping repositories, sync execution, dirty preservation, conflict routing, or prompt injection
 
-### `proposal-082|p082`
-
-Recovery/retry state-machine fixture and readback contract gate.
-
-The original P082 implementation scope is retained as a proof alias for the
-recovery/retry matrix readback contract. The gate validates the durable fixture
-surface rather than running live providers.
-
-Scope:
-
-- `docs/evidence/rollout-contract/operator-readback/p082-full-surface.fixture.json` exists, is schema-versioned, and carries the required `operator_readback_v1` rollout-contract fields
-- `runs_get` exposes both singular `p082_recovery_matrix_readback` and plural `p082_recovery_matrix_readbacks`
-- `reports_get`, `report_resource`, `run_report`, and `release_receipt` expose only plural `p082_recovery_matrix_readbacks`
-- Required reason codes cover retry identifier guidance, cancel/late-output settlement, side-effect retry block, startup requeue exhaustion, Xcode startup grace, rejected-command typed error, legacy rejected-command fallback, and workflow conflict operator hold
-- Nested subcontracts are present for retry identifier guidance, late-output settlement, startup repair summary, and rejected-command error parsing
-- All P082 negative fixtures under `docs/evidence/rollout-contract/negative/p082-*.json` are present, schema-versioned, non-placeholder, and carry a concrete expected failure code plus mutation/assertion description
-
-Command:
-
-```bash
-./scripts/test-gate.sh proposal-082
-./scripts/test-gate.sh p082
-```
-
-Important:
-
-- `proposal-082|p082` is a retained proof alias for fixture, lane, and readback-contract integrity
-- the gate fails closed if any fixture regresses to placeholder text, drops required rollout fields, drifts singular/plural lane placement, loses nested subcontract schemas, or removes a required negative case
-- P082 readbacks are diagnostic and operator-safe; release receipts may include plural diagnostic rows but do not become a recovery command lane
-
 ### `proposal-085|p085`
 
 Thin-client read-model parity and affordance contract gate.
@@ -2017,6 +2000,29 @@ Important:
 - the gate fails closed if the contract doc is missing a required row, P081 boundary row, or term; any negative fixture is absent or fails its scenario-specific semantic expectation; the backend GraphQL proof is missing/failing; the presenter file is missing a required symbol; or the `Proposal085Tests` Swift slice fails
 - `payload_deferred` must never collapse to `unavailable`; enforced by the Swift test slice
 - unknown GraphQL enum values must produce `.unknown` states; proved by `unknownPayloadStateFailsClosed` and `unknownFreshnessStateFailsClosed` tests
+
+### `proposal-087|p087`
+
+Retained historical alias for the local storage tiering, read-path liveness, and SQLite exit-criteria gate. Operational truth lives in [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) and [rust-control-plane.md](rust-control-plane.md).
+
+Scope:
+
+- verifies the storage-tiering migrations, projection freshness schema, hot-read circuit state, maintenance-operation readback, invalidation wiring, and typed MCP storage-health error contract
+- validates retained evidence fixtures under `docs/evidence/p087/api/`, `docs/evidence/rollout-contract/operator-readback/p087-storage-tiering-full-surface.fixture.json`, and `docs/evidence/rollout-contract/negative/p087-*.json`
+- runs focused Rust slices for DB, auth, engine, MCP, and GraphQL storage-health behavior plus Swift source checks for projection-lag and daemon lifecycle diagnostics readback
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-087
+./scripts/test-gate.sh p087
+```
+
+Important:
+
+- `proposal-087|p087` is retained as a historical gate alias; the retired proposal document is not the source of operational truth
+- `p087_*` remains stable rollout-readback vocabulary for this implemented contract
+- the gate is a focused proof path for storage tiering and read-path liveness, not a substitute for the full repository gate
 
 ### `proposal-088|p088`
 
@@ -2156,6 +2162,37 @@ Important:
 - historical orphan recovery settles as `status = skipped` with `terminal_reason = stale_retry_recovered` and a non-active recovered authority provenance row
 - `terminal_reason` is stage-owned and authority-history-owned for recovered orphan rows
 
+### `proposal-092|p092` retained historical alias
+
+Retained historical alias for the implemented retry authority payload target invariants and recovery contract. Operational truth lives in [`rust-control-plane.md#retry-payload-target-invariants-and-recovery`](rust-control-plane.md#retry-payload-target-invariants-and-recovery).
+Short label: retry payload target invariants runtime proof.
+
+Scope:
+
+- verifies the stable Rust control-plane reference owns the current-target/provenance split, targeted retry sanitizer, post-invoke fail-closed behavior, startup/live recovery, and retained gate naming
+- verifies the retained alias does not reuse the Junie runtime-hardening `proposal-090|p090` identity
+- verifies the implementation covers all targeted retry producers, including auto-contract retry and `CommandHandler::RetryAgentExecution`
+- verifies bounded startup and live recovery entry points are owned directly by the recovery service and daemon watchdog
+- verifies durable `retry_payload_recovery_events` storage is the backing source for GraphQL, MCP, and report readback
+- verifies rollout controls for diagnostic/enforce mode, disable switch, live batch limit, cooldown, counters, and idempotent repair keys are specified
+- verifies startup diagnostic/enforce behavior is explicit and diagnostic startup does not fall through to generic abandoned-invoke blind retry for retry payload recovery candidates
+- verifies GraphQL, MCP, and report readback schema placement for `retryPayloadRecovery` / `retry_payload_recovery`
+- runs focused runtime tests for forward producer sanitization, post-invoke hard mismatch, durable recovery event storage, configurable live batch limiting, explicit `excluded_total` diagnostics, startup diagnostic/enforce recovery, GraphQL/MCP nullable missing-authority readback, and daemon live-hook compilation
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-092  # retained historical alias
+./scripts/test-gate.sh p092          # retained historical alias
+```
+
+Important:
+
+- this gate proves the retry payload recovery runtime contract with focused Rust tests; it is not a full workspace regression substitute
+- `proposal-092|p092` is a retained historical alias; the retired proposal document is not the source of operational truth
+- the alias does not replace P091 targeted retry authority or the retained Junie runtime-hardening `proposal-090|p090` gate
+- live recovery is intentionally bounded to active runs with running `invoke_agent` work items and active retry authority, and defaults to diagnostic mode
+
 ### `proposal-075|p075`
 
 Retained historical alias for the local persistence write budget, evidence spooling, storage diagnostics, and fail-closed registry gate. Operational truth lives in `docs/reference/rust-control-plane.md`.
@@ -2195,6 +2232,48 @@ Important:
 - `p075` is accepted as an alias
 - this is a fail-closed persistence contract gate, not an inventory-only check
 - startup orphan reconciliation is available through the storage MCP diagnostic tool; daemon startup scheduling and telemetry producer extensions must keep this gate green
+
+### `proposal-076|p076` retained historical alias
+
+Auto-retry observation ledger contract, fixture, readback, and rollup proof gate. These retained historical aliases validate the observe-only invariant and exercise the MCP `automation.auto_retry.latest` readback source plus rollup tooling against a temporary JSONL ledger.
+
+Scope:
+
+- `auto_retry_observation_v1` strict-mode validation: required top-level fields, `observation_id` format `ar_obs_<UTC basic timestamp>_<12 lowercase hex>`, RFC3339 `observed_at`, closed `blocker_class` / `policy_decision` / `retry_action` / `retry_result` / `known_issue_status` / `budget_status` / `diagnostic_severity` / `readback_policy_status` enum domains, `additionalProperties=false` rejection of unknown fields, nested `budget_ref_v1` and `observation_summary_v1` shapes (required fields, nullable fields, scalar types)
+- observe-only policy enforcement: ledger-created observations must have `retry_action` in `{none, recommend_retry}` and `retry_result` in `{not_attempted, not_allowed}`; any side-effecting retry dispatch in an auto-retry ledger record is a gate failure
+- `auto_retry_readback_v1` six top-level required path fields: `ledger_path`, `budget_state_path`, `known_issue_catalog_path`, `generated_markdown_catalog_path`, `lock_path`, `rollup_report_path`
+- `version_negotiation` object shape and JSON-RPC `unsupported_version` application error (`code: -32076`, populated `error.data` with `code`, `supported_versions`, `unsupported_versions`, `requested_versions`, no partial success payload)
+- degraded-success readback (artifact-read degradation returns successful response with diagnostics + empty arrays, not a transport error) and `no_observation_history` null-readback path
+- rollup grouping by `blocker_signature_id` from valid fixture records and from `scripts/chainworks/auto_retry_rollup.py`
+- focused Rust test proving `automation.auto_retry.latest` reads a real JSONL ledger from the resolved meta-root and returns latest-by-run readback
+- retained historical alias negative fixture inventory under `docs/evidence/rollout-contract/negative/` — twenty `p076-*` fixtures covering side-effect retry presence, human-gate retry, missing schema field, invalid enum, ledger-append missing newline / not fsynced, missing `budget_ref_v1` / `observation_summary_v1` / readback `lock_path` / `rollup_report_path`, budget failure retried, backpressure exceeded, human-gate starvation, orphaned planned attempt not escalated, PID-reuse lock liveness gap, poll timeout without observation, retry timeout duplicate not suppressed, markdown catalog as authority, unsafe stale-lock recovery, and unknown-field-strict rejection
+- retained historical alias operator-readback fixture at `docs/evidence/rollout-contract/operator-readback/p076-full-surface.fixture.json` covering all required `operator_readback_v1` decision fields plus the auto-retry readback projection
+
+Use when:
+
+- changing auto-retry normative schemas (`auto_retry_observation_v1`, `auto_retry_readback_v1`, `auto_retry_budget_v1`, `auto_retry_known_issues_v1`, `budget_ref_v1`, `observation_summary_v1`, `common_diagnostic_v1`) or their enum domains
+- adding, renaming, or removing retained historical alias negative fixtures or the operator-readback fixture
+- changing the observe-only monitor, JSONL ledger, budget store, MCP readback, or rollup tool
+- referencing the auto-retry observation ledger from dependent proposals (contract-aware repair, P080 continuous stale execution reconciliation, retry test matrix, temporary artifact lifecycle, retry authority)
+
+Host policy:
+
+- Python 3 fixture/rollup validation plus focused Rust MCP readback test; no Swift, app launch, or daemon process required
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-076  # retained historical alias
+./scripts/test-gate.sh p076          # retained historical alias
+```
+
+Important:
+
+- `p076` is accepted as a retained historical alias
+- this is an observe-only proof gate; landing side-effecting retry remains out of scope and requires a later proposal
+- the auto-retry ledger is observe-only by design — the gate enforces that ledger records do not record side-effecting retry dispatch and that human-gate retries are absent
+- canonical JSON known-issue catalog is authoritative; markdown is generated-only and the retained historical alias negative fixture `p076-markdown-catalog-as-authority.json` proves this boundary
+- implemented readback and rollup behavior is documented in `docs/reference/auto-retry-observation-ledger.md`
 
 ### `proposal-084|p084` retained historical alias
 
@@ -2241,119 +2320,182 @@ Important:
 - the gate validates parity-lane fixture shape (run_report, mcp, release_receipt, graphql), Rust rollout-contract preflight/storage regressions, clean migration install, and the Swift read-only presentation slice
 - the gate fails closed if the template is missing a required term, any negative fixture is absent or malformed, the retained historical alias `p084-full-surface` fixture omits a required readback field or parity-lane payload, or the `Proposal084Tests` Swift slice fails
 
-### `proposal-082|p082` recovery and retry state-machine matrix gate
+### `proposal-081|p081`
 
-Canonical recovery/retry state-machine matrix and proof gate covering restart, retry, cancellation, stale startup, late output, side-effect, approval, session, and mediation recovery boundaries.
+Boundary-first API and auth contract matrix gate (matrix/fixture validation, shared `BoundaryPolicy`, bounded `boundaryRuntime` and `operatorAlerts` readback, GraphQL WebSocket close-code enforcement, GraphQL `extensions.redactions`, `approval_mutation_idempotency`, Swift approval action attempt persistence, and `mcp_command_idempotency` dispatcher enforcement for state-changing MCP tools).
+
+Operational truth lives in [boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md)
+and the executable fixture [boundary-first-api-auth-contract.json](boundary-first-api-auth-contract.json);
+the macOS-side contract lives in [swift-macos-boundary-contract.md](swift-macos-boundary-contract.md).
 
 Scope:
 
-- `docs/reference/recovery-retry-state-machine-test-matrix.md` exists and contains all 17 required scenario rows (P082-R01 through P082-R17) with setup, expected repair or reject, DB assertion, engine assertion, readback requirement, durable storage owner, projection path, crash/replay proof, and observability threshold
-- All canonical reason codes are documented and defined in `control-plane/crates/domain/src/recovery_matrix.rs`
-- `p082_rejected_command_error_v1` typed envelope contract and backward-compatible legacy plain-text fallback rules are documented and implemented
-- Exact readback lane placement is enforced: `runs.get` exposes both singular `p082_recovery_matrix_readback` and plural `p082_recovery_matrix_readbacks`; `reports.get` exposes plural only; singular must be absent from reports.get
-- P082 readback projection strips unknown keys, recursively allowlists nested subcontracts, rejects malformed/tampered rows with safe fallback readback, and sanitizes operator-facing strings so absolute filesystem paths, including punctuation-adjacent paths, raw diagnostics, and token-like URL query/key-value material do not leak through readback lanes
-- Rejected-command readback is selected from `command_journal` rows with `result_status` `failed` or `rejected`
-- The retained DB harness test owns `p082_recovery_matrix_gate_result_total{scenario_id,status}` evidence for all 17 scenario assertion groups; runtime readback accessors must not emit this gate-result metric. The `proposal-082` shell path runs that harness as part of the DB P082 matrix suite.
-- Security/review regressions are included for Operator-only `runs.start`, Operator-only root-backed `ideas.create`, symlink-safe run filesystem boundaries, `runs.get.escalation_readback`, InvokeAgent completion ownership validation, and the documented `serde_yaml`/`unsafe-libyaml` pinned-risk fallback when dependency-audit tooling is unavailable
-- Rollout fixture `docs/evidence/rollout-contract/operator-readback/p082-full-surface.fixture.json` exists with schema_version `p082_operator_readback_fixture_v1`, all five readback lanes, nested subcontracts, Xcode startup grace row, startup_requeue_exhausted row, cancel-then-late-output row, and fixture assertions naming all reason codes and scenario IDs
-- The P082 static fixture/matrix checklist runs before the focused Rust suites. It validates the positive fixture shape, all 16 negative fixtures, key source-wiring expectations including P082-R05 ownership in `work_items.payload_json.p061_startup_recovery`, metric ownership, and required proof-test names before cargo tests execute.
-- DB, engine, MCP readback, auth live-principal revalidation, MCP HTTP live-revocation, and daemon failed-serve revocation tests compile and pass under the gate's default bounded cargo target. The default request is `target/proposal-082`, remapped by the shared cargo-cache policy unless local targets are explicitly allowed; set `CHAINWORKS_PROPOSAL_082_CARGO_TARGET_DIR=<path>` to request a different bounded target directory
+- `scripts/check-boundary-coverage.sh` (also runs from `guardrails`)
+- fixture validity: `boundary-first-api-auth-contract.json` parses, declares `schema_version == 1`, carries a `matrix_id`, and contains all 11 required row ids (`p081.ui_operator.graphql_query.read`, `p081.ui_operator.graphql_subscription.subscribe`, `p081.ui_operator.graphql_mutation.approval_action`, `p081.agent_operator.mcp_initialize.capability`, `p081.agent_operator.mcp_tools_list.discovery`, `p081.agent_operator.mcp_tools_call.command`, `p081.automation.mcp_tools_list.discovery`, `p081.automation.mcp_tools_call.command`, `p081.observer.mcp_tools_call.compact_read`, `p081.observer.graphql_query.read_only_opt_in`, `p081.developer_break_glass.debug_endpoint.disabled`)
+- `boundary-first-api-auth-contract.md` exists
+- `cargo test -p auth boundary::` — fixture loader, validator error codes, embedded last-known-good fallback into `read_only_safe_mode`
+- `cargo test -p auth caller_class` — `CallerClass` enum, `CallerContext.caller_class`, and resolver
+- `cargo test -p auth bootstrap_emits_schema_version_3` and `v3_principal_table_rejects_unknown_schema_version` — principal-table v3 parser
+- `cargo test -p db repos::audit_log::` — `audit_log` repository write/append/checkpoint semantics
+- `cargo test -p graphql-server proposal_081_boundary_runtime_graphql_readback_is_bounded` — bounded GraphQL `boundaryRuntime` operator diagnostic lane for active policy mode, safe-mode state, and audit-log health
+- `cargo test -p graphql-server test_graphql_ws_rejects_missing_connection_init_auth` and `test_graphql_ws_rejects_non_ui_caller_with_forbidden_close` — GraphQL WebSocket pre-auth close-code contract (`4401`, `4403`, `4408`)
+- `RUST_MIN_STACK=8388608 cargo test -p mcp-server proposal_081_runtime_health_includes_boundary_runtime_readback` — bounded MCP `runtime.health.boundaryRuntime` diagnostic lane with the same audit-log health envelope
+- `RUST_MIN_STACK=8388608 cargo test -p mcp-server p081_ideas_create_records_command_journal_and_idempotency_linkage` and `p081_ideas_create_idempotency_replay_does_not_duplicate_command_commit` — MCP state-changing idempotency requires a durable command-journal link and duplicate replays do not duplicate command/domain rows
+- `Chainworks ForgeTests/Proposal081ApprovalActionAttemptStoreTests` — Swift approval action attempt store reuses one idempotency key across retries/restarts, scopes by approval action, and clears after terminal success
+- `Chainworks ForgeTests/Proposal081GraphQLRedactionTests` — Swift decodes typed GraphQL redaction metadata and operator-alert lifecycle/native-delivery fields with accessibility metadata
+- migration presence: `control-plane/crates/db/migrations/068_p081_audit_log.sql`, `069_p081_audit_log_checkpoints.sql`, `070_p081_caller_class.sql`, `071_p081_approval_idempotency.sql`, `072_p081_fix_payload_length_check.sql`, `073_p081_approval_idempotency_request_hash.sql`, `074_p081_mcp_command_idempotency.sql`, `075_p081_command_journal_idempotency.sql`
 
 Use when:
 
-- Adding or modifying recovery/retry behavior in the control-plane engine, DB repos, MCP server, or release paths
-- Verifying that all P082 matrix rows have DB, engine, and readback coverage
-- Proving that rejected-command readback uses command_journal.error typed envelopes and not command_journal.payload_json
+- changing the boundary matrix doc/fixture
+- editing `control-plane/crates/auth/src/boundary/`, the `auth::resolve` caller-class derivation, `db::repos::audit_log`, or the P081 migrations
+- changing Swift approval action idempotency ownership in `RunsHomeView`
+- adding or renaming a matrix row, transport, caller class, denial reason code, or rollout phase
 
 Host policy:
 
-- Local Rust toolchain and Python 3 required; no UI target or network required
-- The Python static preflight runs inside the P082 alias before the focused Rust suites
-- No daemon process required
+- local Rust toolchain and Python 3 required; no UI host, daemon, or network required
 
 Command:
 
 ```bash
-./scripts/test-gate.sh proposal-082
-./scripts/test-gate.sh p082
+./scripts/test-gate.sh proposal-081
+./scripts/test-gate.sh p081
 ```
 
 Important:
 
-- `p082` is accepted as an alias
-- Gate fails if the static fixture/matrix checklist or focused DB, engine, or MCP tests for required matrix rows, durable owners, readback assertions, crash/replay proof, observability thresholds, or readback-lane regressions fail
-- Gate fails if focused auth, MCP HTTP live-revocation, or daemon failed-serve revocation checks fail
-- Gate fails if GraphQL is treated as a required readback lane without a contract amendment
-- Gate fails if Swift app-facing P082 consumption paths exist without tolerant decode and MainActor tests
-- No schema migration is permitted; if required readback cannot be stored in existing owners, P082 must be amended first
+- `p081` is accepted as an alias
+- this gate proves the P081 boundary contract as implemented repository truth: daemon-injected policy wiring, GraphQL/MCP bounded readback, WebSocket close-code enforcement, GraphQL redaction envelopes, Swift redaction/accessibility decoding, approval idempotency, and MCP command idempotency linked to `command_journal`
+- the gate fails closed if the fixture is missing any required row, the doc is missing, the auth/db/readback/WebSocket/idempotency/Swift slices fail, or any of the P081 migrations (`064`–`071`) is absent
 
-### `proposal-094|p094` workflow-owned blocker-boundary contract/readback gate
+### `proposal-080|p080`
 
-Retained historical alias proof gate for workflow-owned quality-gate blocker
-boundaries. The proposal artifact is retired; the gate validates stable
-reference docs, workflow/catalog examples, and focused Rust implementation
-suites.
+Continuous stale execution reconciliation — Phase 1 detection-only scaffolding for the DB migration shape, MCP admission surface (`p080.diagnostics.get.v1`, `p080.reconcile.request.v1` with `requested_action in {diagnose_only, repair_if_safe, hold}`, `p080.clear_permanent_hold.v1`), the rollout-control seed (default-disabled including `live_disable` row and generation counter), the dedup/idempotency repository primitives, the principal-class CHECK constraint vocabulary, and the proposal §3.1 admission matrix as exercised at the handler (`diagnose_only` admitted for ReadOnlyOperator, `repair_if_safe` rejected; `clear_permanent_hold` Operator-only). Full Phase 2+ dedup replay/fingerprint-conflict handling is not enabled in this gate.
 
 Scope:
 
-- Quality-gate artifact templates stay on `${CHAINWORKS_META_ROOT:-.chainworks}` and do not double-nest `.chainworks/runs/{id}/runs/{id}`
-- The engine resolver proves quality-gate templates resolve under the per-run meta root without unresolved `${run_id}` placeholders
-- Human approval examples remain compatible with the current string-valued `approval: required` DSL shape
-- Quality-gate boundary contract IDs are registered in the domain vocabulary and DB alias/readback layer
-- Workflow-consumed fields for `proposal_decomposition_plan`, `blocker_boundary_status`, and `blocker_boundary_approval_request` are canonical DB-extracted fields, exported through active-index/readback projection, and fail closed when unregistered
-- The bundled full-MVP workflow compiles with the P094 decomposition, boundary evaluator, lower-layer recovery, manual approval, accepted-boundary, follow-up seed, and external evidence hold states
-- The in-process quality-gate boundary evaluator routes lower-layer recovery, stale/unknown evidence refresh, fresh local code tail, `external_environment`/external blockers, server-verified no-progress, and pass states through explicit status/route-hint vocabulary
-- The evaluator accepts review owner classes (`security_reviewer`, `prepush_reviewer`, `implementation_auditor`) plus the `unknown` owner value, and routes them fail-closed to review refresh instead of implementation refinement
-- The evaluator fails closed for unknown blocker enum values and missing required route/gate fields, and `blocked_no_progress` requires server-owned prior boundary truth rather than an agent-authored flag alone
-- The server-generated `blocker_boundary_approval_request_v1` readback is linked to the concrete manual approval id created for the P094 boundary gate
-- GraphQL run detail and MCP operator surfaces expose the same full P094 boundary readback from canonical artifact-contract generations, including blocker details, hard blockers, and approval-request payloads
-- `proposal_decomposition_plan.requires_split = true` is accepted only when a non-empty blocking `split_candidates` entry is present; malformed split-required payloads fail closed before exposing workflow-consumed fields
-- `runtime.health` and operator report readback expose P094 `qualityGateBoundary` mode/readiness vocabulary plus a rollout decision object with go/hold criteria, current metric values, owner decision, promotion readiness, and the command-journal/rollout-contract auditability requirement for any enforcement-mode change
-- Quality-gate rollout/diagnostic metric names are retained in the DB metric inventory and covered by recorder tests, including `{proposal_id}` labeling for avoided refine loops and percent-valued guardrail readback
-- Human `accept` / `reject` labels normalize to durable `granted` / `rejected` approval states
-
-Command:
-
-```bash
-./scripts/test-gate.sh proposal-094
-./scripts/test-gate.sh p094
-```
-
-Important:
-
-- `p094` is accepted as an alias
-- The gate runs static proposal/schema checks before focused Rust tests
-- The DB/API test slices must prove canonical readback for `status`, `requires_split`, `implementation_start_decision`, `followup_proposal_required`, `has_release_blocking_external_blockers`, `has_no_release_blocking_external_blockers`, `projection_integrity`, `primary_owner_class`, `workflow_route_hint`, freshness, allowed workflow routes, blocker fingerprints, hard blockers, and the approval-request lane
-- The gate fails if required P094 cargo filters select zero tests
-
-### `proposal-096|p096` bounded tool output and safe-search guard
-
-Retained safe-search guard that keeps reviewer and auditor discovery bounded and verifies that the P096 alias remains available alongside proposal gates.
-
-Scope:
-
-- `scripts/test-gate.sh` advertises `proposal-096|p096`
-- the gate script retains the safe-search guard text and P082 adjacency token
-- the gate is a static shell/Python check; it does not execute repo-wide searches or run the daemon
+- `control-plane/crates/db/migrations/079_p080_stale_execution_reconciliation.sql` exists and declares the approved `principal_class IN ('operator','read_only_operator')` check constraint (no `'agent'` admission)
+- `cargo build -p db -p mcp-server` succeeds
+- the DB unit tests under `cargo test -p db` cover the rollout-control seed (all classes inserted, idempotent reseed, includes the detection-only class), the read-side classifier and readback page (empty-DB shape, single-row readback), the dedup-entry roundtrip, the reconciliation event insert, the live-loop diagnose-only path (`stale_suspected` remains `stale_suspected` with `repair_action=diagnose_only`), and the secret-like redaction matrix for embedded secrets in diagnostic strings
+- the MCP unit tests under `cargo test -p mcp-server` cover `p080.diagnostics.get.v1` (rollout-disabled while `detection_only` is off, empty when enabled, read-only, opaque cursor forward-pagination, malformed-cursor rejection with `cursor_reason: malformed`, nested-filter-field validation), schema-version-required errors, `p080.reconcile.request.v1` with `diagnose_only` happy-path (returns `diagnosed`) and dedup-key rejection, `repair_if_safe` while class rollout is disabled (`class_disabled` or `rollout_disabled`), `repair_if_safe` while the class row is enabled but active repair is still phase-gated (`rollout_disabled`), `p080.clear_permanent_hold.v1` (`action_disabled_in_phase` and the P080-specific dedup precheck), ReadOnlyOperator handler admission (can call `diagnose_only`; rejected for `repair_if_safe`), HTTP duplicate-key scanning (before JSON-RPC parse, before auth, with escaped method and Unicode-escaped key canonicalization), fail-closed `tools/list` filtering that omits Codex aliases when the rollout-control row is unreadable, and the current pre-dedup rollout-gate behavior for repeated, changed, fingerprint-mismatch, or `live_disable` generation-mismatch `repair_if_safe` requests
+- the canonical test list lives in `PROPOSAL_080_RUST_TESTS` in `scripts/test-gate.sh`; renamed or missing tests must update both the array and the gate-run grep guard
 
 Use when:
 
-- Verifying that bounded-output discovery policy remains wired into the canonical gate list
-- Checking that future gate edits did not drop the P096 safe-search alias
+- editing the P080 migration, the `db::repos::p080` repo, the `mcp-server::tools::p080` surface, or the rollout-control seed
+- changing the diagnostic allow-list, dedup principal-class vocabulary, or the rollout fail-closed defaults
 
 Host policy:
 
-- Local shell and Python 3 required
-- No Rust, Swift, UI host, daemon process, or network required
+- local Rust toolchain only; no UI host, daemon, or network required
 
 Command:
 
 ```bash
-./scripts/test-gate.sh proposal-096
-./scripts/test-gate.sh p096
+./scripts/test-gate.sh proposal-080
+./scripts/test-gate.sh p080
 ```
 
 Important:
 
-- `p096` is accepted as an alias
-- the gate fails if the alias, safe-search wording, bounded-output wording, or retained P082 adjacency marker is missing from `scripts/test-gate.sh`
+- `p080` is accepted as an alias
+- the gate fails closed if the migration file is absent, the principal-class CHECK constraint deviates from the approved vocabulary, any test in `PROPOSAL_080_RUST_TESTS` returns non-zero, or `cargo test` produces no matching test line for a listed name (rename/typo guard)
+- Phase 1 is detection-only by default: `p080.diagnostics.get.v1` refuses with `rollout_disabled` while `detection_only` is disabled; MCP `repair_if_safe` still refuses with `rollout_disabled` after the class row is enabled because active repair is phase-gated; the live loop records `diagnosed` / `diagnose_only` readback and reconciliation events whenever `live_disable` is off and `detection_only` is enabled (the `acp_startup_stale` class flag only sets `rollout_disablement` to `none` vs `class_disabled` in the readback and does not gate event emission); `clear_permanent_hold` remains `action_disabled_in_phase`; the handler unit tests (`p080_read_only_operator_can_call_diagnose_only`, `p080_read_only_operator_rejected_for_repair_if_safe`) lock in the proposal §3.1 handler-level matrix (`diagnose_only` admitted, `repair_if_safe` rejected with `unauthorized_missing_capability`). The auth capability table admits ReadOnlyOperator for `p080.diagnostics.get.v1` and `p080.reconcile.request.v1`, keeps `p080.clear_permanent_hold.v1` Operator-only, and grants ReadOnlyOperator no MCP resources; those auth-unit regressions are outside this DB/MCP-focused gate.
+
+### `proposal-086|p086|p086-continuation-preflight`
+
+Retained historical gate alias for agent work continuation: migration shape, MCP/artifact JSON Schemas, Rust domain/DB/MCP unit tests for `agents.continue_work`, `agents.continuation_status`, and `agents.continuation_candidates`, the async MCP admission plus terminal-readback contract, GraphQL continuation readback tests, passive SwiftUI readback source guards plus the dedicated P031 Swift readback test slice, durable metrics checks, orphan ACP reap checks, duplicate prompt reconciliation guards, plus a daemon-level MCP -> worker -> live ACP reuse regression. The stable contract lives in [`agent-work-continuation.md`](agent-work-continuation.md); `proposal-086`, `p086`, and `p086-continuation-*` remain gate names only.
+
+Scope:
+
+- `control-plane/crates/db/migrations/065_p086_agent_work_continuations.sql` exists and declares the tables `agent_work_continuations`, `agent_external_side_effect_ledger`, and `supervised_workers_continuation`, the required indexes (`idx_awc_agent_created_at`, `idx_awc_run_status`, `idx_awc_stage`, `idx_awc_recon`, `idx_awc_admission`, `idx_awc_recovery`, `idx_ledger_cont_seq`, `idx_ledger_unresolved`, `idx_swc_heartbeat`, `idx_swc_generation`, `uniq_swc_active_continuation`), and SHA-256 `NOT GLOB` check constraints
+- `control-plane/crates/db/migrations/066_p086_supervised_worker_provider_process.sql` declares the durable provider pid/process-group/uid binding used by restart recovery, and `067_p086_continuation_metric_events.sql` declares bounded metric events plus the `idx_p086_metric_run_time` index
+- `control-plane/crates/db/migrations/066_p086_supervised_worker_provider_process.sql` exists and declares durable provider process binding fields (`provider_child_pid`, `provider_process_group_id`, `provider_process_uid`) used by restart orphan-reap recovery
+- All six MCP schemas under `docs/reference/p086/schemas/mcp/` parse as Draft 2020-12 JSON Schema; `agents.continue_work.request.schema.json` exposes the full continuation context (`run_id`, `stage_execution_id`, `session_generation_id`, `provider_session_id`, `operator_instruction`, `max_turns`, `max_wall_clock_seconds`, `blockers`), and `agents.continue_work.response.schema.json` requires the `outcome` field
+- `agents.continue_work.response.schema.json` remains a bounded async admission response (`accepted` / `replay` / `rejected`) and does not reintroduce terminal artifact fields that belong to `agents.continuation_status`, `continuations(runId:)`, and `continuationStatus(agentExecutionId:)`
+- `control-plane/crates/engine/src/executor.rs` routes live-handle continuation through ACP `execute(... reuse_existing_session=true ...)`, does not call ACP `start_session` for that path, persists the ACP provider process binding, reconciles duplicate post-`prompt_sent` work only from post-continuation worktree evidence paired with a committed `provider_send` row, records durable continuation metric events for raw counters and KPI rollups (useful progress, validation success, time saved, provider/session budget), and contains the canonical P086 mode-reset prompt guardrails retained by the implementation
+- Admission is catalog-gated and side-effect-safe: `examples/agents/agents.yaml` declares `code_writer.continuation_capability`, the workflow catalog model preserves it in frozen snapshots, MCP admission rejects forbidden release/publish/git-push/upload/distribution lanes, engine-owned lead-auto orchestration validates `lead_continuation_decision_v1` and enqueues `ProcessContinuation`, and admission queries unresolved P078 `side_effects` before accepting a continuation
+- `lead_auto` may enter through Agent principals only for `trigger_kind=lead_auto`; the handler still requires server-side lead decision artifact identity/hash/target/safety validation before admission
+- Startup recovery contains the durable provider process-group reap path and records `orphan_reap_attempted` / `orphan_reap_verified` evidence, signal counts, and TERM/KILL deadlines before releasing stale supervised-worker rows
+- GraphQL exposes `continuationStatus`, `continuationCandidates`, `continuations(runId:)`, and `continuationMetricsSummary(runId:)`; the Swift P031 read model and Runs Overview card consume the history/metrics fields, including P086 rates/time-saved/budget rollups, as passive readback only, and `Proposal031ThinGraphQLReadBoundaryTests` runs inside the P086 gate to prove the Swift decode/presentation path
+- All nine artifact schemas under `docs/reference/p086/schemas/artifacts/` parse as JSON Schema with `additionalProperties=false`
+- Rust tests covering `domain::continuation`, the `agent_work_continuations` repo including metric summaries, the `agents.*` MCP tool surface, auth lead-auto capability, GraphQL continuation history/metrics readback, orphan provider process-group reap, and the daemon-level MCP → continuation worker → live ACP reuse path run green under `cargo test`
+
+Use when:
+
+- Landing or revising the continuation migration, schema artifacts, or Rust admission/repo/MCP/runtime worker surface
+- Verifying that the canonical continuation path still reuses a live ACP session instead of falling back to a fresh-session path
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-086
+./scripts/test-gate.sh p086
+./scripts/test-gate.sh p086-continuation-preflight
+```
+
+Important:
+
+- `p086` and `p086-continuation-preflight` are accepted as aliases for the Phase 0 preflight
+- the gate fails closed when any required migration element, SHA-256 constraint, MCP/artifact schema, Rust unit test, passive SwiftUI readback hook, duplicate-send reconciliation guard, or daemon-level live ACP reuse regression is missing or invalid
+
+### `p086-continuation-readback`
+
+Retained Phase 1 readback gate for agent work continuation. Verifies the operator readback fixture `docs/evidence/rollout-contract/operator-readback/p086-continuation-full-surface.fixture.json` carries all `operator_readback_v1` decision fields plus the continuation surface (request/response fingerprints, lifecycle status, projection lag, reconciliation status, cancel termination proof, orphan reap outcome, attach receipt, kill-switch last change). The gate rejects placeholder-looking ids/hashes and requires an `evidence_provenance` block tying the fixture to the same-tree daemon/MCP proof instead of accepting synthetic rollout placeholders.
+
+Use when:
+
+- Producing or refreshing operator readback evidence for an internal Phase 1 run
+- Verifying readback parity across the `mcp`, `release_receipt`, and `graphql` lanes for an eligible `code_writer` continuation
+
+Command:
+
+```bash
+./scripts/test-gate.sh p086-continuation-readback
+```
+
+Important:
+
+- fails closed while the fixture is a Phase 0 placeholder; only fixtures with `rollout_contract_status="pass"` and the full operator readback surface satisfy this gate
+- distinct from `p086-continuation-preflight` — the two gates address different `rollout_contract_v1` decision surfaces
+
+### `p086-continuation-negative-fixtures`
+
+Retained Phase 2 hold-condition gate for agent work continuation. Verifies that every negative fixture under `docs/evidence/rollout-contract/p086/negative/` exists, is valid JSON, and is no longer a Phase 0 placeholder. Each fixture corresponds to a `rollout_contract_v1` hold condition (admission timeout sweeper, duplicate prompt prevention after `prompt_sent`, idempotency fingerprint conflict, lead decision freshness, malformed hashes, schema lint failures, missing log correlation keys, pre-prompt crash recovery, provider session resurrection ordering, saturation drain, terminal artifact presence, worker panic recovery).
+
+Use when:
+
+- Materializing real SQL/readback/runtime evidence as Phase 2 worker behavior lands
+- Proving hold-condition coverage before broader continuation rollout
+
+Command:
+
+```bash
+./scripts/test-gate.sh p086-continuation-negative-fixtures
+```
+
+Important:
+
+- fails closed if any fixture is missing or still carries `status="placeholder"`
+- coupled to continuation worker behavior (provider prompt send, side-effect ledger commit, reconciliation, cancellation lifecycle); fixture evidence requirements are encoded in the fixture set and the stable continuation contract
+
+### `p086-continuation-operator-report`
+
+Retained Phase 1 operator-report gate for agent work continuation. Verifies that the operator readback fixture exposes the subset of operator report fields required by the rollout contract (rollout status/decision/hold conditions/enforcement mode, continuation/run/stage/agent identifiers, mode, trigger kind, lifecycle status, request fingerprint, eligibility, lead decision, confirmation required) and is not a placeholder.
+
+Use when:
+
+- Publishing the operator report after a Phase 1 enablement run
+- Verifying the operator-facing surface before expanding continuation enablement
+
+Command:
+
+```bash
+./scripts/test-gate.sh p086-continuation-operator-report
+```
+
+Important:
+
+- fails closed while the fixture contains a `placeholder` key, has `rollout_contract_status` other than `pass`, or omits any required operator field
+- distinct from `p086-continuation-preflight` and `p086-continuation-readback` — operator-report coverage is its own `rollout_contract_v1` decision surface

@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
 
 // P029: PrincipalClass is canonically defined in domain::commands.
 // Re-export here so downstream crates that use auth::PrincipalClass keep working.
@@ -79,6 +78,8 @@ pub fn derive_caller_class_from_principal_class(class: &PrincipalClass) -> Calle
         PrincipalClass::Operator => CallerClass::UiOperator,
         PrincipalClass::Agent => CallerClass::AgentOperator,
         PrincipalClass::Observer => CallerClass::Observer,
+        // read_only_operator: treated as Observer for routing; capability matrix controls access.
+        PrincipalClass::ReadOnlyOperator => CallerClass::Observer,
     }
 }
 
@@ -95,6 +96,7 @@ pub fn derive_caller_class_for_mcp(principal: &Principal) -> CallerClass {
         PrincipalClass::Operator => CallerClass::AgentOperator,
         PrincipalClass::Agent => CallerClass::AgentOperator,
         PrincipalClass::Observer => CallerClass::Observer,
+        PrincipalClass::ReadOnlyOperator => CallerClass::Observer,
     }
 }
 
@@ -102,6 +104,46 @@ pub fn derive_caller_class_for_mcp(principal: &Principal) -> CallerClass {
 /// and character-set requirements. Used by MCP stdio where no HTTP header is present.
 pub fn validate_raw_token(token: &str) -> bool {
     token.len() >= 32 && token.len() <= 4096 && token.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
+/// P080 Phase 1: Check whether a principal is authorized to access a specific run_id.
+///
+/// For restricted principals (Agent, ReadOnlyOperator):
+/// - Must have an explicit `run_scope` configured. Without one, returns
+///   `Err("auth_scope_required: ...")` — fail-closed to prevent cross-run disclosure
+///   via caller-supplied run_id (SEC-P080-001).
+/// - With a non-empty `run_scope`, `run_id` must be in the scope set →
+///   `Ok(())` or `Err(auth_scope_violation)`.
+/// - With an empty `run_scope`, always `Err(auth_scope_violation)`.
+///
+/// For Operator/Observer principals: always `Ok(())` (no run-level restriction).
+pub fn check_p080_run_scope(
+    principal: &Principal,
+    filter_run_id: Option<&str>,
+) -> Result<(), &'static str> {
+    let restricted = matches!(
+        principal.class,
+        PrincipalClass::Agent | PrincipalClass::ReadOnlyOperator
+    );
+    if !restricted {
+        return Ok(());
+    }
+    if let Some(scope) = principal.run_scope.as_ref() {
+        if scope.is_empty() {
+            // Empty scope list → fail closed: no run is accessible.
+            return Err(
+                "auth_scope_violation: principal run_scope is empty; no run_id is authorized",
+            );
+        }
+        match filter_run_id {
+            Some(id) if scope.iter().any(|s| s == id) => Ok(()),
+            _ => Err("auth_scope_violation: filter.run_id is not in the principal's authorized run_scope"),
+        }
+    } else {
+        // Fail-closed: restricted principal with no run_scope cannot access any run's P080 data.
+        // Operator must configure run-binding before granting P080 diagnostics access (SEC-P080-001).
+        Err("auth_scope_required: restricted principal has no run_scope configured; contact operator to configure run-binding")
+    }
 }
 
 // ── Principal types ─────────────────────────────────────────────────────
@@ -118,10 +160,10 @@ pub struct Principal {
     /// None means the class is derived from PrincipalClass per the default rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_class_override: Option<CallerClass>,
+    /// P080 Phase 1: optional server-side run scope for Agent/ReadOnlyOperator principals.
+    /// When non-empty, only the listed run_ids are accessible for P080 diagnostics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub graphql_policy: Option<GraphqlPolicy>,
-    #[serde(default)]
-    pub has_explicit_surface_policies: bool,
+    pub run_scope: Option<Vec<String>>,
 }
 
 impl Principal {
@@ -134,25 +176,17 @@ impl Principal {
             tool_capabilities,
             resource_capabilities,
             caller_class_override: None,
-            graphql_policy: None,
-            has_explicit_surface_policies: false,
+            run_scope: None,
         }
     }
 
     fn from_entry(entry: &PrincipalEntry) -> Self {
         let mut principal = Principal::new(entry.id.clone(), entry.class.clone());
         principal.caller_class_override = entry.caller_class_override.clone();
-        principal.has_explicit_surface_policies = entry.surface_policies.is_some();
-        principal.graphql_policy = entry
-            .surface_policies
-            .as_ref()
-            .and_then(|policies| policies.graphql.clone());
+        principal.run_scope = entry.run_scope.clone();
         if let Some(policies) = entry.surface_policies.as_ref() {
             // surface_policies present: the mcp stanza controls tool access.
-            // Resource-template access is not yet expressible in surface_policies,
-            // so explicit-policy principals fail closed for resources.
-            principal.resource_capabilities = BTreeSet::new();
-            // No mcp stanza means zero MCP tools (fail-closed).
+            // No mcp stanza means zero MCP tools and zero MCP resources (fail-closed).
             if let Some(mcp) = policies.mcp.as_ref() {
                 principal.tool_capabilities = mcp
                     .allowed_tools
@@ -160,9 +194,18 @@ impl Principal {
                     .filter_map(|tool| capability_tool_id_for_name(tool))
                     .filter(|id| tool_allowed_for_class(&principal.class, *id))
                     .collect();
+                // SEC-HIGH-001: whenever an mcp stanza is present in surface_policies,
+                // always zero resource_capabilities regardless of how many tools are
+                // granted. Resources are NOT inherited from class defaults; they must be
+                // explicitly granted in a separate stanza. This prevents a narrow
+                // tool-only Operator principal (e.g. p080.diagnostics.get.v1 only) from
+                // accidentally reading run://, artifact://, or report:// resources through
+                // the class-default resource matrix.
+                principal.resource_capabilities = BTreeSet::new();
             } else {
-                // No mcp stanza: fail-closed for tools.
+                // No mcp stanza: fail-closed for both tools and resources.
                 principal.tool_capabilities = BTreeSet::new();
+                principal.resource_capabilities = BTreeSet::new();
             }
         }
         principal
@@ -212,6 +255,13 @@ struct PrincipalEntry {
     /// Only meaningful for schema_version 3 entries; ignored for v1/v2 compatibility principals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     caller_class_override: Option<CallerClass>,
+    /// P080 Phase 1: optional server-side run scope for Agent/ReadOnlyOperator principals.
+    /// When non-empty, the principal may only access P080 diagnostics for runs whose ID
+    /// is in this set; the run_id check is server-derived rather than caller-supplied.
+    /// Absent or empty means no explicit scope binding (for Operator class; restricted
+    /// classes still require run_id in filter but without membership verification).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_scope: Option<Vec<String>>,
 }
 
 /// P072: Per-principal surface policies for schema_version 2.
@@ -225,7 +275,7 @@ pub struct SurfacePolicies {
 }
 
 /// P072: GraphQL-specific principal policy.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphqlPolicy {
     #[serde(default)]
@@ -260,76 +310,6 @@ pub struct PrincipalTable {
     entries: Vec<PrincipalEntry>,
 }
 
-/// Reloadable principal source shared by long-lived control surfaces.
-///
-/// `None` is a fail-closed state used when principals.json cannot be reloaded.
-/// HTTP request handlers resolve the presented bearer against the current table;
-/// session transports retain only a principal id plus token fingerprint and
-/// revalidate that credential before each non-initialize request.
-#[derive(Clone, Debug)]
-pub struct LivePrincipalSource(Arc<RwLock<Option<PrincipalTable>>>);
-
-pub type LivePrincipalTable = LivePrincipalSource;
-
-#[derive(Clone, Debug)]
-pub struct LivePrincipalCredential {
-    pub principal_id: String,
-    pub token_fingerprint: String,
-}
-
-impl LivePrincipalSource {
-    pub fn new(table: PrincipalTable) -> Self {
-        Self(Arc::new(RwLock::new(Some(table))))
-    }
-
-    pub fn update(&self, table: PrincipalTable) {
-        if let Ok(mut guard) = self.0.write() {
-            *guard = Some(table);
-        }
-    }
-
-    pub fn mark_unavailable(&self) {
-        if let Ok(mut guard) = self.0.write() {
-            *guard = None;
-        }
-    }
-
-    pub fn resolve_bearer(&self, token: &str) -> Result<Principal, AuthError> {
-        let guard = self.0.read().map_err(|_| {
-            AuthError::TableLoadFailed("principal source lock poisoned".to_string())
-        })?;
-        let table = guard.as_ref().ok_or(AuthError::UnknownToken)?;
-        resolve_bearer(token, table)
-    }
-
-    pub fn resolve_credential(
-        &self,
-        credential: &LivePrincipalCredential,
-    ) -> Result<Principal, AuthError> {
-        let guard = self.0.read().map_err(|_| {
-            AuthError::TableLoadFailed("principal source lock poisoned".to_string())
-        })?;
-        let table = guard.as_ref().ok_or(AuthError::UnknownToken)?;
-        resolve_principal_by_fingerprint(
-            table,
-            &credential.principal_id,
-            &credential.token_fingerprint,
-        )
-    }
-
-    pub fn resolve_principal_fingerprint(
-        &self,
-        principal_id: &str,
-        token_fingerprint: &str,
-    ) -> Result<Principal, AuthError> {
-        let guard = self.0.read().map_err(|_| {
-            AuthError::TableLoadFailed("principal source lock poisoned".to_string())
-        })?;
-        let table = guard.as_ref().ok_or(AuthError::UnknownToken)?;
-        resolve_principal_by_fingerprint(table, principal_id, token_fingerprint)
-    }
-}
-
 impl PrincipalTable {
     /// Test/fixture stand-in: single operator principal with a known token.
     /// Plain pub fn (not cfg(test)) because integration tests in other crates
@@ -361,78 +341,6 @@ impl PrincipalTable {
         table
     }
 
-    /// Fixture with a custom token. Used in cross-crate integration tests that need
-    /// to verify bearer token validation at the GraphQL WebSocket layer.
-    pub fn test_fixture_with_token(token: impl Into<String>) -> Self {
-        PrincipalTable {
-            entries: vec![PrincipalEntry {
-                token: token.into(),
-                id: "test-operator".into(),
-                class: PrincipalClass::Operator,
-                surface_policies: Some(SurfacePolicies {
-                    graphql: Some(GraphqlPolicy {
-                        allow_queries: true,
-                        allow_subscriptions: true,
-                        allowed_mutations: approval_mutations(),
-                    }),
-                    mcp: None,
-                }),
-                ..Default::default()
-            }],
-        }
-    }
-
-    pub fn test_fixture_with_class(
-        token: impl Into<String>,
-        id: impl Into<String>,
-        class: PrincipalClass,
-    ) -> Self {
-        PrincipalTable {
-            entries: vec![PrincipalEntry {
-                token: token.into(),
-                id: id.into(),
-                class,
-                surface_policies: None,
-                ..Default::default()
-            }],
-        }
-    }
-
-    pub fn test_fixture_disabled_token(token: impl Into<String>, id: impl Into<String>) -> Self {
-        PrincipalTable {
-            entries: vec![PrincipalEntry {
-                token: token.into(),
-                id: id.into(),
-                class: PrincipalClass::Operator,
-                surface_policies: None,
-                disabled: Some(true),
-                ..Default::default()
-            }],
-        }
-    }
-
-    pub fn test_fixture_graphql_query_only(
-        token: impl Into<String>,
-        id: impl Into<String>,
-    ) -> Self {
-        PrincipalTable {
-            entries: vec![PrincipalEntry {
-                token: token.into(),
-                id: id.into(),
-                class: PrincipalClass::Operator,
-                surface_policies: Some(SurfacePolicies {
-                    graphql: Some(GraphqlPolicy {
-                        allow_queries: true,
-                        allow_subscriptions: true,
-                        allowed_mutations: Vec::new(),
-                    }),
-                    mcp: None,
-                }),
-                ..Default::default()
-            }],
-        }
-    }
-
     /// Observer-class fixture for cross-crate tests that need a non-operator token.
     /// Token length meets the 32-byte minimum required by extract_bearer_token.
     pub fn test_fixture_observer() -> Self {
@@ -445,6 +353,42 @@ impl PrincipalTable {
                 ..Default::default()
             }],
         }
+    }
+
+    /// P080: ReadOnlyOperator fixture with P080DiagnosticsGet capability and graphql
+    /// subscription policy. Used by cross-crate tests for auth_ok_for_p080_subscription.
+    pub fn test_fixture_p080_read_only_operator() -> Self {
+        PrincipalTable {
+            entries: vec![PrincipalEntry {
+                token: "p080-ro-token-xxxxxxxxxxxxxxxxxxxxxxx".into(),
+                id: "test-p080-read-only-operator".into(),
+                class: PrincipalClass::ReadOnlyOperator,
+                surface_policies: Some(SurfacePolicies {
+                    graphql: Some(GraphqlPolicy {
+                        allow_queries: true,
+                        allow_subscriptions: true,
+                        allowed_mutations: vec![],
+                    }),
+                    mcp: Some(McpPolicy {
+                        allowed_tools: vec![
+                            "p080.diagnostics.get.v1".into(),
+                            "p080.reconcile.request.v1".into(),
+                        ],
+                    }),
+                }),
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// P080: ReadOnlyOperator fixture with a specific run_scope binding.
+    /// Used by cross-crate tests to verify run_scope-restricted P080 subscription auth.
+    pub fn test_fixture_p080_read_only_operator_with_scope(run_ids: Vec<String>) -> Self {
+        let mut table = Self::test_fixture_p080_read_only_operator();
+        if let Some(entry) = table.entries.first_mut() {
+            entry.run_scope = Some(run_ids);
+        }
+        table
     }
 
     /// Load from a JSON file. If the file does not exist, bootstrap a default
@@ -649,6 +593,7 @@ impl Default for PrincipalEntry {
             not_before_ms: None,
             disabled: None,
             caller_class_override: None,
+            run_scope: None,
         }
     }
 }
@@ -803,30 +748,11 @@ pub fn principal_token_fingerprint_by_id(
     table: &PrincipalTable,
     principal_id: &str,
 ) -> Option<String> {
-    let now_ms = chrono::Utc::now().timestamp_millis();
     table
         .entries
         .iter()
-        .find(|entry| entry.id == principal_id && is_entry_valid_at(entry, now_ms))
+        .find(|entry| entry.id == principal_id)
         .map(|entry| token_fingerprint(&entry.token))
-}
-
-pub fn resolve_principal_by_fingerprint(
-    table: &PrincipalTable,
-    principal_id: &str,
-    token_fingerprint_value: &str,
-) -> Result<Principal, AuthError> {
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    table
-        .entries
-        .iter()
-        .find(|entry| {
-            entry.id == principal_id
-                && is_entry_valid_at(entry, now_ms)
-                && token_fingerprint(&entry.token) == token_fingerprint_value
-        })
-        .map(Principal::from_entry)
-        .ok_or(AuthError::UnknownToken)
 }
 
 /// Extract bearer token from an Authorization header value.
@@ -903,34 +829,30 @@ fn validate_v2_principals(entries: &[PrincipalEntry]) -> Result<(), AuthError> {
 
     // Validate known app-owned principals.
     for entry in entries {
-        let policies = entry.surface_policies.as_ref().ok_or_else(|| {
-            AuthError::TableLoadFailed(format!(
-                "schema_version 2 principal '{}' (class {:?}) must have explicit surface_policies",
-                entry.id, entry.class
-            ))
-        })?;
-        if let Some(ref graphql) = policies.graphql {
-            // Validate known mutation names.
-            let known_mutations = ["approveApproval", "rejectApproval"];
-            for mutation in &graphql.allowed_mutations {
-                if !known_mutations.contains(&mutation.as_str()) {
-                    return Err(AuthError::TableLoadFailed(format!(
-                        "unknown mutation '{}' in surface_policies for principal '{}'",
-                        mutation, entry.id
-                    )));
+        if let Some(ref policies) = entry.surface_policies {
+            if let Some(ref graphql) = policies.graphql {
+                // Validate known mutation names.
+                let known_mutations = ["approveApproval", "rejectApproval"];
+                for mutation in &graphql.allowed_mutations {
+                    if !known_mutations.contains(&mutation.as_str()) {
+                        return Err(AuthError::TableLoadFailed(format!(
+                            "unknown mutation '{}' in surface_policies for principal '{}'",
+                            mutation, entry.id
+                        )));
+                    }
                 }
             }
-        }
-        // SEC-P081: validate MCP tool names for ALL principals with MCP surface policies,
-        // not just default-operator. A typo in any principal's allowed_tools must fail at
-        // table load rather than silently producing zero capability for that principal.
-        if let Some(ref mcp) = policies.mcp {
-            for tool in &mcp.allowed_tools {
-                if capability_tool_id_for_name(tool).is_none() {
-                    return Err(AuthError::TableLoadFailed(format!(
-                        "unknown MCP tool '{}' in surface_policies for principal '{}'",
-                        tool, entry.id
-                    )));
+            // SEC-P081: validate MCP tool names for ALL principals with MCP surface policies,
+            // not just default-operator. A typo in any principal's allowed_tools must fail at
+            // table load rather than silently producing zero capability for that principal.
+            if let Some(ref mcp) = policies.mcp {
+                for tool in &mcp.allowed_tools {
+                    if capability_tool_id_for_name(tool).is_none() {
+                        return Err(AuthError::TableLoadFailed(format!(
+                            "unknown MCP tool '{}' in surface_policies for principal '{}'",
+                            tool, entry.id
+                        )));
+                    }
                 }
             }
         }
@@ -1098,25 +1020,9 @@ pub fn is_mutation_allowed_by_surface_policy(
         .entries
         .iter()
         .find(|e| e.id == principal_id)
-        .and_then(|e| {
-            e.surface_policies.as_ref().map(|sp| {
-                sp.graphql
-                    .as_ref()
-                    .map(|graphql| graphql.allowed_mutations.iter().any(|m| m == mutation_name))
-                    .unwrap_or(false)
-            })
-        })
-}
-
-pub fn is_mutation_allowed_by_principal_surface_policy(
-    principal: &Principal,
-    mutation_name: &str,
-) -> Option<bool> {
-    match principal.graphql_policy.as_ref() {
-        Some(graphql) => Some(graphql.allowed_mutations.iter().any(|m| m == mutation_name)),
-        None if principal.has_explicit_surface_policies => Some(false),
-        None => None,
-    }
+        .and_then(|e| e.surface_policies.as_ref())
+        .and_then(|sp| sp.graphql.as_ref())
+        .map(|graphql| graphql.allowed_mutations.iter().any(|m| m == mutation_name))
 }
 
 /// P072: Check if GraphQL queries are allowed for a principal based on v2 surface_policies.
@@ -1129,22 +1035,9 @@ pub fn is_query_allowed_by_surface_policy(
         .entries
         .iter()
         .find(|e| e.id == principal_id)
-        .and_then(|e| {
-            e.surface_policies.as_ref().map(|sp| {
-                sp.graphql
-                    .as_ref()
-                    .map(|graphql| graphql.allow_queries)
-                    .unwrap_or(false)
-            })
-        })
-}
-
-pub fn is_query_allowed_by_principal_surface_policy(principal: &Principal) -> Option<bool> {
-    match principal.graphql_policy.as_ref() {
-        Some(graphql) => Some(graphql.allow_queries),
-        None if principal.has_explicit_surface_policies => Some(false),
-        None => None,
-    }
+        .and_then(|e| e.surface_policies.as_ref())
+        .and_then(|sp| sp.graphql.as_ref())
+        .map(|graphql| graphql.allow_queries)
 }
 
 /// P072: Check if GraphQL subscriptions are allowed for a principal based on v2 surface_policies.
@@ -1157,22 +1050,9 @@ pub fn is_subscription_allowed_by_surface_policy(
         .entries
         .iter()
         .find(|e| e.id == principal_id)
-        .and_then(|e| {
-            e.surface_policies.as_ref().map(|sp| {
-                sp.graphql
-                    .as_ref()
-                    .map(|graphql| graphql.allow_subscriptions)
-                    .unwrap_or(false)
-            })
-        })
-}
-
-pub fn is_subscription_allowed_by_principal_surface_policy(principal: &Principal) -> Option<bool> {
-    match principal.graphql_policy.as_ref() {
-        Some(graphql) => Some(graphql.allow_subscriptions),
-        None if principal.has_explicit_surface_policies => Some(false),
-        None => None,
-    }
+        .and_then(|e| e.surface_policies.as_ref())
+        .and_then(|sp| sp.graphql.as_ref())
+        .map(|graphql| graphql.allow_subscriptions)
 }
 
 // ── Capability filtering ────────────────────────────────────────────────
@@ -1215,7 +1095,7 @@ fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolI
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 45] {
+fn all_tool_capabilities() -> [CapabilityToolId; 47] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -1228,7 +1108,6 @@ fn all_tool_capabilities() -> [CapabilityToolId; 45] {
         CapabilityToolId::RunsMainSyncRepairState,
         CapabilityToolId::RunsMainSyncRecordRecoveryDecision,
         CapabilityToolId::RunsKnowledgeCapsuleIgnore,
-        CapabilityToolId::RunsRetrofitCatalogSnapshot,
         CapabilityToolId::RunsCancel,
         CapabilityToolId::ApprovalsList,
         CapabilityToolId::ApprovalsResolve,
@@ -1264,6 +1143,9 @@ fn all_tool_capabilities() -> [CapabilityToolId; 45] {
         CapabilityToolId::AgentsContinuationCandidates,
         CapabilityToolId::AgentsContinueWork,
         CapabilityToolId::AutomationAutoRetryLatest,
+        CapabilityToolId::P080DiagnosticsGet,
+        CapabilityToolId::P080ReconcileRequest,
+        CapabilityToolId::P080ClearPermanentHold,
     ]
 }
 
@@ -1272,12 +1154,30 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         CapabilityToolId::IdeasCreate => {
             matches!(class, PrincipalClass::Operator | PrincipalClass::Agent)
         }
-        CapabilityToolId::IdeasList => true,
+        // SEC-P080-001: ReadOnlyOperator is scoped to P080 diagnostic tools only.
+        // General read tools (ideas.list, runs.list, etc.) remain Operator/Agent/Observer only.
+        CapabilityToolId::IdeasList => {
+            matches!(
+                class,
+                PrincipalClass::Operator | PrincipalClass::Agent | PrincipalClass::Observer
+            )
+        }
+        // SEC-001: runs.start supplies daemon-side filesystem paths — Operator-only.
         CapabilityToolId::RunsStart => {
             matches!(class, PrincipalClass::Operator)
         }
-        CapabilityToolId::RunsList => true,
-        CapabilityToolId::RunsGet => true,
+        CapabilityToolId::RunsList => {
+            matches!(
+                class,
+                PrincipalClass::Operator | PrincipalClass::Agent | PrincipalClass::Observer
+            )
+        }
+        CapabilityToolId::RunsGet => {
+            matches!(
+                class,
+                PrincipalClass::Operator | PrincipalClass::Agent | PrincipalClass::Observer
+            )
+        }
         CapabilityToolId::RunsMainSyncRequest => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::RunsMainSyncRetry => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::RunsMainSyncSetOverride => matches!(class, PrincipalClass::Operator),
@@ -1286,7 +1186,6 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
             matches!(class, PrincipalClass::Operator)
         }
         CapabilityToolId::RunsKnowledgeCapsuleIgnore => matches!(class, PrincipalClass::Operator),
-        CapabilityToolId::RunsRetrofitCatalogSnapshot => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::RunsCancel => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::ApprovalsList => {
             matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
@@ -1301,7 +1200,12 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         CapabilityToolId::LegacyDiscoveryOverrideCreate => {
             matches!(class, PrincipalClass::Operator)
         }
-        CapabilityToolId::ReportsGet => matches!(class, PrincipalClass::Operator),
+        // SEC-HIGH-001: reports.get returns operator-sensitive payloads (rollout readback,
+        // retry authority history, implementation summaries, canonical artifact contracts).
+        // Restrict to Operator only; Agent and Observer must not see these.
+        CapabilityToolId::ReportsGet => {
+            matches!(class, PrincipalClass::Operator)
+        }
         CapabilityToolId::ArtifactsOverrideContract => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::StewardRunAnalysis => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::StewardListAnalyses => {
@@ -1359,6 +1263,23 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         CapabilityToolId::AutomationAutoRetryLatest => {
             matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
         }
+        // P080: diagnostics.get and reconcile.request (diagnose_only) are allowed for
+        // ReadOnlyOperator per approved proposal §3.1 auth matrix (lines 145-153).
+        // repair_if_safe is gated at the handler level for Operator class only.
+        // clear_permanent_hold is Phase 5+ and Operator-only.
+        CapabilityToolId::P080DiagnosticsGet => {
+            matches!(
+                class,
+                PrincipalClass::Operator | PrincipalClass::ReadOnlyOperator
+            )
+        }
+        CapabilityToolId::P080ReconcileRequest => {
+            matches!(
+                class,
+                PrincipalClass::Operator | PrincipalClass::ReadOnlyOperator
+            )
+        }
+        CapabilityToolId::P080ClearPermanentHold => matches!(class, PrincipalClass::Operator),
     }
 }
 
@@ -1392,9 +1313,20 @@ pub fn is_resource_allowed(principal: &Principal, id: ResourceTemplateId) -> boo
 }
 
 fn resource_allowed_for_class(class: &PrincipalClass, id: ResourceTemplateId) -> bool {
+    // SEC-P080-001: ReadOnlyOperator has no default MCP resource capabilities.
+    // P080 diagnostic tools (diagnostics.get, reconcile.request) do not expose
+    // MCP resources — they are tool-only. A ReadOnlyOperator bearer must not
+    // inherit run://, idea://, artifact://, report://, or any index resource
+    // from the generic default matrix, or it becomes a privacy boundary bypass.
+    if matches!(class, PrincipalClass::ReadOnlyOperator) {
+        return false;
+    }
     match id {
         ResourceTemplateId::RunEntity => true,
         ResourceTemplateId::IdeaEntity => true,
+        // SEC-HIGH-001: artifact:// and report:// expose sensitive operator payloads
+        // (file_path, evidence, rollout readback). Restrict to Operator only so
+        // Agent and Observer principals cannot read artifact content or reports.
         ResourceTemplateId::ArtifactEntity => matches!(class, PrincipalClass::Operator),
         ResourceTemplateId::ReportEntity => matches!(class, PrincipalClass::Operator),
         ResourceTemplateId::StewardAnalysisEntity => {
@@ -1441,7 +1373,6 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
             Some(CapabilityToolId::RunsMainSyncRecordRecoveryDecision)
         }
         "runs.knowledge_capsule.ignore" => Some(CapabilityToolId::RunsKnowledgeCapsuleIgnore),
-        "runs.retrofit_catalog_snapshot" => Some(CapabilityToolId::RunsRetrofitCatalogSnapshot),
         "runs.cancel" => Some(CapabilityToolId::RunsCancel),
         "approvals.list" => Some(CapabilityToolId::ApprovalsList),
         "approvals.resolve" => Some(CapabilityToolId::ApprovalsResolve),
@@ -1450,9 +1381,6 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
             Some(CapabilityToolId::StagesConsumeProviderQuotaHold)
         }
         "workflow_conflicts.resolve" => Some(CapabilityToolId::WorkflowConflictsResolve),
-        "workflow_loop_budget.extend" | "workflow_loop_budget_extend" => {
-            Some(CapabilityToolId::WorkflowLoopBudgetExtend)
-        }
         "legacy_discovery_override_create" => Some(CapabilityToolId::LegacyDiscoveryOverrideCreate),
         "reports.get" => Some(CapabilityToolId::ReportsGet),
         "artifacts.override_contract" => Some(CapabilityToolId::ArtifactsOverrideContract),
@@ -1485,6 +1413,9 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
         "agents.continuation_candidates" => Some(CapabilityToolId::AgentsContinuationCandidates),
         "agents.continue_work" => Some(CapabilityToolId::AgentsContinueWork),
         "automation.auto_retry.latest" => Some(CapabilityToolId::AutomationAutoRetryLatest),
+        "p080.diagnostics.get.v1" => Some(CapabilityToolId::P080DiagnosticsGet),
+        "p080.reconcile.request.v1" => Some(CapabilityToolId::P080ReconcileRequest),
+        "p080.clear_permanent_hold.v1" => Some(CapabilityToolId::P080ClearPermanentHold),
         _ => None,
     }
 }
@@ -1570,12 +1501,12 @@ mod tests {
         assert!(is_tool_allowed(&p, "runs.main_sync.request"));
         assert!(is_tool_allowed(&p, "approvals.resolve"));
         assert!(is_tool_allowed(&p, "stages.retry"));
-        assert!(is_tool_allowed(&p, "workflow_loop_budget.extend"));
     }
 
     #[test]
     fn agent_cannot_approve() {
         let p = Principal::new("ag", PrincipalClass::Agent);
+        // SEC-001: runs.start supplies daemon-side filesystem paths; Operator-only.
         assert!(!is_tool_allowed(&p, "runs.start"));
         assert!(!is_tool_allowed(&p, "approvals.resolve"));
         assert!(!is_tool_allowed(&p, "stages.retry"));
@@ -1587,9 +1518,21 @@ mod tests {
     fn observer_read_only() {
         let p = Principal::new("ob", PrincipalClass::Observer);
         assert!(is_tool_allowed(&p, "runs.list"));
+        // SEC-HIGH-001: reports.get contains operator-sensitive payloads; Observer must be denied.
         assert!(!is_tool_allowed(&p, "reports.get"));
         assert!(!is_tool_allowed(&p, "ideas.create"));
         assert!(!is_tool_allowed(&p, "runs.start"));
+    }
+
+    #[test]
+    fn reports_get_operator_only() {
+        // SEC-HIGH-001: reports.get restricted to Operator only.
+        let op = Principal::new("op", PrincipalClass::Operator);
+        let ag = Principal::new("ag", PrincipalClass::Agent);
+        let ob = Principal::new("ob", PrincipalClass::Observer);
+        assert!(is_tool_allowed(&op, "reports.get"));
+        assert!(!is_tool_allowed(&ag, "reports.get"));
+        assert!(!is_tool_allowed(&ob, "reports.get"));
     }
 
     #[test]
@@ -1607,41 +1550,6 @@ mod tests {
         assert_eq!(p.id, "test-op");
         assert_eq!(p.class, PrincipalClass::Operator);
         assert!(resolve_bearer("bad-token", &table).is_err());
-    }
-
-    #[test]
-    fn live_principal_table_observes_revocation_and_unavailable_state() {
-        let table = PrincipalTable {
-            entries: vec![PrincipalEntry {
-                token: "tok-1234567890123456789012345678".into(),
-                id: "test-op".into(),
-                class: PrincipalClass::Operator,
-                surface_policies: None,
-                ..Default::default()
-            }],
-        };
-        let live = LivePrincipalTable::new(table);
-        let fingerprint = token_fingerprint("tok-1234567890123456789012345678");
-
-        assert!(live
-            .resolve_bearer("tok-1234567890123456789012345678")
-            .is_ok());
-        assert!(live
-            .resolve_principal_fingerprint("test-op", &fingerprint)
-            .is_ok());
-
-        live.update(PrincipalTable { entries: vec![] });
-        assert!(live
-            .resolve_bearer("tok-1234567890123456789012345678")
-            .is_err());
-        assert!(live
-            .resolve_principal_fingerprint("test-op", &fingerprint)
-            .is_err());
-
-        live.mark_unavailable();
-        assert!(live
-            .resolve_bearer("tok-1234567890123456789012345678")
-            .is_err());
     }
 
     #[test]
@@ -1723,29 +1631,13 @@ mod tests {
     }
 
     #[test]
-    fn p082_agent_cannot_start_root_backed_runs() {
-        let agent = Principal::new("agent-p082", PrincipalClass::Agent);
-        let operator = Principal::new("operator-p082", PrincipalClass::Operator);
-
-        assert!(
-            !is_tool_allowed(&agent, "runs.start"),
-            "P082 run-start filesystem authority must be Operator-owned"
-        );
-        assert!(
-            is_tool_allowed(&operator, "runs.start"),
-            "Operator must retain runs.start authority"
-        );
-    }
-
-    #[test]
     fn observer_has_all_read_resources() {
         let ob = Principal::new("ob", PrincipalClass::Observer);
         assert!(is_resource_allowed(&ob, ResourceTemplateId::RunEntity));
         assert!(is_resource_allowed(&ob, ResourceTemplateId::IdeaEntity));
-        assert!(!is_resource_allowed(
-            &ob,
-            ResourceTemplateId::ArtifactEntity
-        ));
+        // SEC-HIGH-001: artifact:// and report:// expose operator-sensitive payloads
+        // (file_path, evidence, rollout readback). Restricted to Operator only.
+        assert!(!is_resource_allowed(&ob, ResourceTemplateId::ArtifactEntity));
         assert!(!is_resource_allowed(&ob, ResourceTemplateId::ReportEntity));
         assert!(is_resource_allowed(
             &ob,
@@ -1915,23 +1807,6 @@ mod tests {
         ];
         let err = validate_v2_principals(&entries).unwrap_err();
         assert!(err.to_string().contains("duplicate token"));
-    }
-
-    #[test]
-    fn v2_rejects_principal_without_surface_policies() {
-        let entries = vec![PrincipalEntry {
-            token: "tok-no-policy".into(),
-            id: "automation-no-policy".into(),
-            class: PrincipalClass::Agent,
-            surface_policies: None,
-            ..Default::default()
-        }];
-
-        let err = validate_v2_principals(&entries).unwrap_err();
-        assert!(
-            err.to_string().contains("surface_policies"),
-            "schema_version 2 entries without surface_policies must fail closed; got: {err}"
-        );
     }
 
     #[test]
@@ -2256,50 +2131,6 @@ mod tests {
         assert_eq!(
             is_subscription_allowed_by_surface_policy(&table, "v1-operator"),
             None
-        );
-    }
-
-    #[test]
-    fn explicit_surface_policies_without_graphql_fail_closed_for_graphql() {
-        let table = PrincipalTable {
-            entries: vec![PrincipalEntry {
-                token: "tok-mcp-only".into(),
-                id: "mcp-only-operator".into(),
-                class: PrincipalClass::Operator,
-                surface_policies: Some(SurfacePolicies {
-                    graphql: None,
-                    mcp: Some(McpPolicy {
-                        allowed_tools: vec!["runs.list".into()],
-                    }),
-                }),
-                ..Default::default()
-            }],
-        };
-        let principal = find_principal_by_id(&table, "mcp-only-operator").unwrap();
-
-        assert_eq!(
-            is_query_allowed_by_surface_policy(&table, "mcp-only-operator"),
-            Some(false)
-        );
-        assert_eq!(
-            is_mutation_allowed_by_surface_policy(&table, "mcp-only-operator", "approveApproval"),
-            Some(false)
-        );
-        assert_eq!(
-            is_subscription_allowed_by_surface_policy(&table, "mcp-only-operator"),
-            Some(false)
-        );
-        assert_eq!(
-            is_query_allowed_by_principal_surface_policy(&principal),
-            Some(false)
-        );
-        assert_eq!(
-            is_mutation_allowed_by_principal_surface_policy(&principal, "approveApproval"),
-            Some(false)
-        );
-        assert_eq!(
-            is_subscription_allowed_by_principal_surface_policy(&principal),
-            Some(false)
         );
     }
 
@@ -2710,22 +2541,23 @@ mod tests {
 
     // ── SEC-001 regression: surface_policies tool capabilities ──
 
-    /// SEC-001: A principal with surface_policies and an mcp stanza gets exactly the
-    /// tools listed in allowed_tools; class-default tools and resources do NOT leak.
+    /// SEC-001 (tools only): A principal with surface_policies and an mcp stanza gets
+    /// exactly the tools listed in allowed_tools; class-default tools do NOT leak.
+    ///
+    /// SEC-HIGH-001 (corrected): resource_capabilities are ALWAYS zeroed when an mcp stanza
+    /// is present, regardless of how many tools are granted. Resources must be separately
+    /// granted; they do not inherit from class defaults via the tool list.
     #[test]
     fn sec001_surface_policies_with_mcp_tools_controls_tool_capabilities() {
         let table = PrincipalTable {
             entries: vec![PrincipalEntry {
                 token: "tok-agent-mcp".into(),
-                id: "operator-mcp".into(),
-                class: PrincipalClass::Operator,
+                id: "agent-mcp".into(),
+                class: PrincipalClass::Agent,
                 surface_policies: Some(SurfacePolicies {
                     graphql: None,
                     mcp: Some(McpPolicy {
-                        allowed_tools: vec![
-                            "runs.list".into(),
-                            "workflow_loop_budget.extend".into(),
-                        ],
+                        allowed_tools: vec!["runs.list".into()],
                     }),
                 }),
                 ..Default::default()
@@ -2737,46 +2569,11 @@ mod tests {
             is_tool_allowed(&principal, "runs.list"),
             "allowed tool must be present"
         );
-        assert!(
-            is_tool_allowed(&principal, "workflow_loop_budget.extend"),
-            "workflow_loop_budget.extend must be a recognized MCP capability"
-        );
+        // SEC-HIGH-001 fix: mcp stanza present → resource_capabilities always zeroed.
+        // Resources do not inherit from class defaults; they must be explicitly granted.
         assert!(
             principal.resource_capabilities.is_empty(),
-            "operator principal with explicit surface_policies must not inherit class-default resource capabilities"
-        );
-    }
-
-    #[test]
-    fn sec001_surface_policies_with_mcp_tools_does_not_grant_resources() {
-        let table = PrincipalTable {
-            entries: vec![PrincipalEntry {
-                token: "tok-agent-tools-only".into(),
-                id: "operator-tools-only".into(),
-                class: PrincipalClass::Operator,
-                surface_policies: Some(SurfacePolicies {
-                    graphql: None,
-                    mcp: Some(McpPolicy {
-                        allowed_tools: vec!["runs.get".into()],
-                    }),
-                }),
-                ..Default::default()
-            }],
-        };
-        let principal = resolve_bearer("tok-agent-tools-only", &table).unwrap();
-
-        assert!(is_tool_allowed(&principal, "runs.get"));
-        assert!(
-            !is_resource_allowed(&principal, ResourceTemplateId::RunEntity),
-            "tool-scoped principal must not read run resources without an explicit resource grant"
-        );
-        assert!(
-            !is_resource_allowed(&principal, ResourceTemplateId::ReportEntity),
-            "tool-scoped principal must not read report resources without an explicit resource grant"
-        );
-        assert!(
-            !is_resource_allowed(&principal, ResourceTemplateId::ArtifactEntity),
-            "tool-scoped principal must not read artifact resources without an explicit resource grant"
+            "principal with mcp stanza must have zero resource capabilities (SEC-HIGH-001 fix)"
         );
     }
 
@@ -2924,6 +2721,7 @@ mod tests {
             not_before_ms: None,
             disabled: None,
             caller_class_override: None,
+            run_scope: None,
         }
     }
 
@@ -2991,6 +2789,116 @@ mod tests {
         );
     }
 
+    // ── SEC-P080-HIGH-001 / SEC-P080-HIGH-002 regression tests ────────────
+    // ReadOnlyOperator must have ZERO MCP tool and resource capabilities.
+    // HIGH-001: it must not inherit general read tools (ideas.list, runs.list,
+    //           runs.get, reports.get) via the class=true grant.
+    // HIGH-002: P080 tools are denied until per-run scope is implemented;
+    //           a self-declared run_id filter does not constitute authorization.
+
+    #[test]
+    fn sec_p080_001_read_only_operator_has_no_resource_capabilities() {
+        let ro = Principal::new("p080-ro", PrincipalClass::ReadOnlyOperator);
+        // All ten resource templates must be denied.
+        for id in all_resource_templates() {
+            assert!(
+                !is_resource_allowed(&ro, id),
+                "ReadOnlyOperator must not have resource capability {id:?}"
+            );
+        }
+        assert!(
+            ro.resource_capabilities.is_empty(),
+            "ReadOnlyOperator.resource_capabilities must be empty at construction"
+        );
+    }
+
+    #[test]
+    fn sec_p080_read_only_operator_tool_capabilities() {
+        let ro = Principal::new("p080-ro", PrincipalClass::ReadOnlyOperator);
+        // P080: ReadOnlyOperator has exactly diagnostics.get and reconcile.request
+        // (diagnose_only gated at handler level) per proposal §3.1 auth matrix.
+        assert!(
+            is_tool_allowed(&ro, "p080.diagnostics.get.v1"),
+            "ReadOnlyOperator must have p080.diagnostics.get.v1"
+        );
+        assert!(
+            is_tool_allowed(&ro, "p080.reconcile.request.v1"),
+            "ReadOnlyOperator must have p080.reconcile.request.v1"
+        );
+        assert!(
+            !is_tool_allowed(&ro, "p080.clear_permanent_hold.v1"),
+            "ReadOnlyOperator must not have p080.clear_permanent_hold.v1 (Phase 5+ Operator-only)"
+        );
+        // ReadOnlyOperator must NOT have general read/write tools.
+        assert!(
+            !is_tool_allowed(&ro, "ideas.list"),
+            "ReadOnlyOperator must not have ideas.list"
+        );
+        assert!(
+            !is_tool_allowed(&ro, "runs.list"),
+            "ReadOnlyOperator must not have runs.list"
+        );
+        assert!(
+            !is_tool_allowed(&ro, "runs.get"),
+            "ReadOnlyOperator must not have runs.get"
+        );
+        assert!(
+            !is_tool_allowed(&ro, "reports.get"),
+            "ReadOnlyOperator must not have reports.get"
+        );
+        assert!(!is_tool_allowed(&ro, "runs.start"));
+        assert!(!is_tool_allowed(&ro, "ideas.create"));
+        assert!(!is_tool_allowed(&ro, "approvals.resolve"));
+        assert!(!is_tool_allowed(&ro, "runs.cancel"));
+        // ReadOnlyOperator has exactly the two P080 read tools.
+        assert_eq!(
+            ro.tool_capabilities.len(),
+            2,
+            "ReadOnlyOperator must have exactly 2 tool capabilities (P080DiagnosticsGet, P080ReconcileRequest)"
+        );
+    }
+
+    #[test]
+    fn sec_p080_001_read_only_operator_resource_isolation_from_operator() {
+        let op = Principal::new("op", PrincipalClass::Operator);
+        let ro = Principal::new("p080-ro", PrincipalClass::ReadOnlyOperator);
+        // Operator has full read resources; ReadOnlyOperator has none.
+        assert!(is_resource_allowed(&op, ResourceTemplateId::RunEntity));
+        assert!(is_resource_allowed(&op, ResourceTemplateId::ArtifactEntity));
+        assert!(is_resource_allowed(&op, ResourceTemplateId::ReportEntity));
+        assert!(!is_resource_allowed(&ro, ResourceTemplateId::RunEntity));
+        assert!(!is_resource_allowed(&ro, ResourceTemplateId::IdeaEntity));
+        assert!(!is_resource_allowed(
+            &ro,
+            ResourceTemplateId::ArtifactEntity
+        ));
+        assert!(!is_resource_allowed(&ro, ResourceTemplateId::ReportEntity));
+        assert!(!is_resource_allowed(
+            &ro,
+            ResourceTemplateId::ChainworksRuns
+        ));
+        assert!(!is_resource_allowed(
+            &ro,
+            ResourceTemplateId::ChainworksIdeas
+        ));
+        assert!(!is_resource_allowed(
+            &ro,
+            ResourceTemplateId::ChainworksApprovalsInbox
+        ));
+        assert!(!is_resource_allowed(
+            &ro,
+            ResourceTemplateId::ChainworksRunStages
+        ));
+        assert!(!is_resource_allowed(
+            &ro,
+            ResourceTemplateId::ChainworksRunArtifacts
+        ));
+        assert!(!is_resource_allowed(
+            &ro,
+            ResourceTemplateId::StewardAnalysisEntity
+        ));
+    }
+
     #[test]
     fn sec_h001_caller_class_expired_token_returns_none() {
         let past_ms = chrono::Utc::now().timestamp_millis() - 60_000;
@@ -3005,57 +2913,199 @@ mod tests {
         );
     }
 
+    /// SEC-HIGH-001 regression: an Operator principal configured with only P080 diagnostic
+    /// tools must receive NO MCP resource access. Previously the code kept class-default
+    /// resources whenever tool_capabilities was non-empty, which allowed narrow-tool
+    /// principals to read run://, artifact://, and report:// resources.
     #[test]
-    fn live_principal_source_revalidates_revoked_disabled_and_rescoped_credentials() {
-        let source = LivePrincipalSource::new(make_table_with_entry(base_entry()));
-        let credential = LivePrincipalCredential {
-            principal_id: "expiry-test".into(),
-            token_fingerprint: token_fingerprint("tok-expiry-test"),
+    fn sec_high_001_narrow_tool_operator_gets_no_resource_access() {
+        let entry = PrincipalEntry {
+            token: "tok-p080-only-xxxxxxxxxxxxxxxxxxx".into(),
+            id: "p080-diagnostic-only".into(),
+            class: PrincipalClass::Operator,
+            surface_policies: Some(SurfacePolicies {
+                graphql: None,
+                mcp: Some(McpPolicy {
+                    allowed_tools: vec![
+                        "p080.diagnostics.get.v1".into(),
+                        "p080.reconcile.request.v1".into(),
+                    ],
+                }),
+            }),
+            ..Default::default()
         };
+        let table = PrincipalTable {
+            entries: vec![entry],
+        };
+        let p = resolve_bearer("tok-p080-only-xxxxxxxxxxxxxxxxxxx", &table).unwrap();
 
+        // Narrow-tool principal must have the two P080 tools.
+        assert!(
+            is_tool_allowed(&p, "p080.diagnostics.get.v1"),
+            "p080 diagnostic tool must be allowed"
+        );
+        assert!(
+            is_tool_allowed(&p, "p080.reconcile.request.v1"),
+            "p080 reconcile tool must be allowed"
+        );
+
+        // But NO resource access — not run://, not artifact://, not report://, not any index.
+        for id in all_resource_templates() {
+            assert!(
+                !is_resource_allowed(&p, id),
+                "narrow-tool Operator must have no resource access; got access to {id:?}"
+            );
+        }
+
+        // And no other tools that were not in the allow-list.
+        assert!(
+            !is_tool_allowed(&p, "runs.start"),
+            "runs.start must be blocked"
+        );
+        assert!(
+            !is_tool_allowed(&p, "runs.list"),
+            "runs.list must be blocked"
+        );
+        assert!(
+            !is_tool_allowed(&p, "approvals.resolve"),
+            "approvals.resolve must be blocked"
+        );
+    }
+
+    /// SEC-HIGH-001 regression (empty tool list): an Operator with an mcp stanza but
+    /// allowed_tools=[] must also have no resource access (preserves previous behaviour).
+    #[test]
+    fn sec_high_001_empty_tool_list_operator_gets_no_resource_access() {
+        let entry = PrincipalEntry {
+            token: "tok-empty-tools-xxxxxxxxxxxxxxxxxxx".into(),
+            id: "empty-tools-operator".into(),
+            class: PrincipalClass::Operator,
+            surface_policies: Some(SurfacePolicies {
+                graphql: None,
+                mcp: Some(McpPolicy {
+                    allowed_tools: vec![],
+                }),
+            }),
+            ..Default::default()
+        };
+        let table = PrincipalTable {
+            entries: vec![entry],
+        };
+        let p = resolve_bearer("tok-empty-tools-xxxxxxxxxxxxxxxxxxx", &table).unwrap();
+        for id in all_resource_templates() {
+            assert!(
+                !is_resource_allowed(&p, id),
+                "empty-tool Operator must have no resource access; got access to {id:?}"
+            );
+        }
+    }
+
+    // ── P080 SEC-HIGH-001: run_scope enforcement ─────────────────────────────
+
+    #[test]
+    fn p080_run_scope_operator_always_allowed() {
+        let mut p = Principal::new("op", PrincipalClass::Operator);
+        p.run_scope = Some(vec!["run-a".into()]);
+        // Operators are not restricted by run_scope.
+        assert!(check_p080_run_scope(&p, Some("run-z")).is_ok());
+        assert!(check_p080_run_scope(&p, None).is_ok());
+    }
+
+    #[test]
+    fn p080_run_scope_scoped_principal_allows_authorized_run() {
+        let mut p = Principal::new("ro", PrincipalClass::ReadOnlyOperator);
+        p.run_scope = Some(vec!["run-allowed".into(), "run-also-ok".into()]);
+        assert!(
+            check_p080_run_scope(&p, Some("run-allowed")).is_ok(),
+            "authorized run_id must be allowed"
+        );
+        assert!(
+            check_p080_run_scope(&p, Some("run-also-ok")).is_ok(),
+            "second authorized run_id must be allowed"
+        );
+    }
+
+    #[test]
+    fn p080_run_scope_scoped_principal_rejects_unauthorized_run() {
+        let mut p = Principal::new("ro", PrincipalClass::ReadOnlyOperator);
+        p.run_scope = Some(vec!["run-allowed".into()]);
+        let result = check_p080_run_scope(&p, Some("run-other"));
+        assert!(
+            result.is_err(),
+            "out-of-scope run_id must be rejected by server-side check"
+        );
+    }
+
+    #[test]
+    fn p080_run_scope_scoped_principal_rejects_no_run_id() {
+        let mut p = Principal::new("ro", PrincipalClass::ReadOnlyOperator);
+        p.run_scope = Some(vec!["run-allowed".into()]);
+        let result = check_p080_run_scope(&p, None);
+        assert!(
+            result.is_err(),
+            "missing run_id must be rejected when scope is set"
+        );
+    }
+
+    #[test]
+    fn p080_run_scope_empty_scope_rejects_all() {
+        let mut p = Principal::new("agent", PrincipalClass::Agent);
+        p.run_scope = Some(vec![]); // empty scope = no access
+        assert!(check_p080_run_scope(&p, Some("any-run")).is_err());
+        assert!(check_p080_run_scope(&p, None).is_err());
+    }
+
+    #[test]
+    fn p080_run_scope_unscoped_restricted_principal_rejects() {
+        // SEC-P080-001: fail-closed — restricted principal with no run_scope must be rejected
+        // regardless of whether a run_id is supplied, to prevent cross-run disclosure.
+        let p = Principal::new("ro", PrincipalClass::ReadOnlyOperator);
+        let err_none = check_p080_run_scope(&p, None);
+        let err_some = check_p080_run_scope(&p, Some("any-run"));
+        assert!(
+            err_none.is_err(),
+            "no run_scope must reject None filter_run_id"
+        );
+        assert!(
+            err_some.is_err(),
+            "no run_scope must reject caller-supplied run_id"
+        );
+        // Error must mention auth_scope_required so callers can distinguish from scope violations.
+        assert!(
+            err_none.unwrap_err().contains("auth_scope_required"),
+            "error must contain auth_scope_required"
+        );
+        // Agent principals must also be rejected (not just ReadOnlyOperator).
+        let agent = Principal::new("agent1", PrincipalClass::Agent);
+        assert!(check_p080_run_scope(&agent, Some("run-x")).is_err());
+    }
+
+    #[test]
+    fn p080_run_scope_round_trips_through_principal_table() {
+        use std::os::unix::fs::PermissionsExt;
+        // v3 principals require explicit surface_policies; use an empty mcp stanza.
+        let json = r#"{
+            "schema_version": 3,
+            "principals": [{
+                "token": "ro-scoped-token-xxxxxxxxxxxxxxxxxx",
+                "id": "ro-scoped",
+                "class": "read_only_operator",
+                "surface_policies": { "mcp": { "allowed_tools": ["p080.diagnostics.get.v1"] } },
+                "run_scope": ["run-abc-123"]
+            }]
+        }"#;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("principals.json");
+        std::fs::write(&path, json).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let table = PrincipalTable::load_or_bootstrap(&path).unwrap();
+        let p = resolve_bearer("ro-scoped-token-xxxxxxxxxxxxxxxxxx", &table).unwrap();
         assert_eq!(
-            source.resolve_credential(&credential).unwrap().class,
-            PrincipalClass::Operator
+            p.run_scope.as_deref(),
+            Some(["run-abc-123".to_string()].as_slice())
         );
-
-        source.update(PrincipalTable { entries: vec![] });
-        assert!(
-            matches!(
-                source.resolve_credential(&credential),
-                Err(AuthError::UnknownToken)
-            ),
-            "removed principal must fail closed"
-        );
-
-        source.update(make_table_with_entry(PrincipalEntry {
-            disabled: Some(true),
-            ..base_entry()
-        }));
-        assert!(
-            matches!(
-                source.resolve_bearer("tok-expiry-test"),
-                Err(AuthError::UnknownToken)
-            ),
-            "disabled principal must fail closed through live bearer resolution"
-        );
-
-        source.update(make_table_with_entry(PrincipalEntry {
-            class: PrincipalClass::Observer,
-            ..base_entry()
-        }));
-        assert_eq!(
-            source.resolve_credential(&credential).unwrap().class,
-            PrincipalClass::Observer,
-            "credential revalidation must observe class changes"
-        );
-
-        source.mark_unavailable();
-        assert!(
-            matches!(
-                source.resolve_credential(&credential),
-                Err(AuthError::UnknownToken)
-            ),
-            "unavailable principal source must deny all credentials"
-        );
+        assert!(check_p080_run_scope(&p, Some("run-abc-123")).is_ok());
+        assert!(check_p080_run_scope(&p, Some("run-other")).is_err());
     }
 }

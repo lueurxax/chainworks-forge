@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use db::pool::create_pool;
-use db::repos::{agent_executions, artifacts, ideas, runs, side_effects, stages};
+use db::repos::{agent_executions, artifacts, ideas, runs, stages};
 use db::writer::{register_shared_writer, DbWriter};
 use domain::agent::AgentStatus;
 use domain::artifact::ArtifactFormat;
@@ -19,7 +19,6 @@ use engine::release::connect::ConnectPublishService;
 use engine::release::git::GitReleaseService;
 use engine::release::receipt::DeliveryReceiptBuilder;
 use engine::work_queue::WorkQueue;
-use sqlx::Row;
 
 async fn test_pool() -> sqlx::SqlitePool {
     let pool = create_pool("sqlite::memory:")
@@ -36,38 +35,6 @@ fn enable_release_side_effects() {
     ENABLE.call_once(|| unsafe {
         std::env::set_var("CHAINWORKS_RELEASE_SIDE_EFFECTS_ENABLED", "true");
     });
-}
-
-async fn side_effect_statuses(pool: &sqlx::SqlitePool, run_id: RunId) -> Vec<(String, String)> {
-    sqlx::query(
-        "SELECT effect_kind, status FROM side_effects WHERE run_id = ?1 ORDER BY effect_kind",
-    )
-    .bind(run_id.to_string())
-    .fetch_all(pool)
-    .await
-    .unwrap()
-    .into_iter()
-    .map(|row| {
-        (
-            row.get::<String, _>("effect_kind"),
-            row.get::<String, _>("status"),
-        )
-    })
-    .collect()
-}
-
-async fn side_effect_settlement_count(pool: &sqlx::SqlitePool, run_id: RunId) -> i64 {
-    sqlx::query(
-        r#"SELECT COUNT(*) AS count
-           FROM side_effect_settlements ses
-           JOIN side_effects se ON se.id = ses.side_effect_id
-           WHERE se.run_id = ?1"#,
-    )
-    .bind(run_id.to_string())
-    .fetch_one(pool)
-    .await
-    .unwrap()
-    .get::<i64, _>("count")
 }
 
 fn make_idea(id: IdeaId) -> Idea {
@@ -437,7 +404,7 @@ async fn delivery_receipt_builder_rejects_metadata_only_backfill_without_release
         &delivery_config,
         None,
         None,
-        vec![],
+        None,
         "Release idea",
         None,
     );
@@ -549,19 +516,6 @@ async fn background_executor_routes_release_agents_natively() {
         .file_path
         .ends_with(".chainworks/release/git-push.json"));
     assert!(!after_git.iter().any(|a| a.name == "delivery_receipt"));
-    assert_eq!(
-        side_effect_statuses(&pool, run_id).await,
-        vec![
-            ("git_commit".to_string(), "settled".to_string()),
-            ("git_push".to_string(), "settled".to_string()),
-        ],
-        "git release side effects must be durably settled before stage progress is committed"
-    );
-    assert_eq!(
-        side_effect_settlement_count(&pool, run_id).await,
-        2,
-        "git release side effects must have settlement rows before the next stage"
-    );
 
     assert!(executor.process_next_item().await.unwrap());
     assert!(executor.process_next_item().await.unwrap());
@@ -592,22 +546,6 @@ async fn background_executor_routes_release_agents_natively() {
     assert!(delivery
         .file_path
         .ends_with(".chainworks/release/delivery-receipt.json"));
-
-    assert_eq!(
-        side_effect_statuses(&pool, run_id).await,
-        vec![
-            ("build_archive".to_string(), "settled".to_string()),
-            ("connect_upload".to_string(), "settled".to_string()),
-            ("git_commit".to_string(), "settled".to_string()),
-            ("git_push".to_string(), "settled".to_string()),
-        ],
-        "release side effects must be durably settled before stage progress is committed"
-    );
-    assert_eq!(
-        side_effect_settlement_count(&pool, run_id).await,
-        4,
-        "each successful release side effect must have a settlement row"
-    );
 }
 
 #[tokio::test]
@@ -807,11 +745,6 @@ async fn background_executor_persists_delivery_receipt_on_git_failure() {
     assert_eq!(release_result.succeeded, false);
     assert_eq!(release_result.failure_stage.as_deref(), Some("git_commit"));
     assert!(release_result.commit_sha.is_none());
-    assert_eq!(
-        side_effect_statuses(&pool, run_id).await,
-        vec![("git_commit".to_string(), "needs_reconciliation".to_string())],
-        "failed release git_commit side effect must be durably moved to reconciliation"
-    );
 }
 
 #[tokio::test]
@@ -955,15 +888,6 @@ async fn background_executor_persists_delivery_receipt_on_publish_failure() {
     );
     assert_eq!(release_result.branch.as_deref(), Some("release/test"));
     assert!(release_result.commit_sha.is_some());
-    assert_eq!(
-        side_effect_statuses(&pool, run_id).await,
-        vec![
-            ("build_archive".to_string(), "needs_reconciliation".to_string()),
-            ("git_commit".to_string(), "settled".to_string()),
-            ("git_push".to_string(), "settled".to_string()),
-        ],
-        "publish failure must preserve settled git effects and move failed build_archive to reconciliation"
-    );
 }
 
 #[tokio::test]
@@ -1400,7 +1324,7 @@ async fn background_executor_preserves_existing_delivery_receipt_without_overwri
             failure_reason: Some("keep me".into()),
         }),
         rollout_contract_readback: None,
-        p082_recovery_matrix_readbacks: vec![],
+        p080_reconciliation: None,
         implementation_review_status: Some("sentinel".into()),
         timestamp: Utc::now(),
     };

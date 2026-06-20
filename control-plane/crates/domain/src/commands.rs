@@ -13,6 +13,10 @@ pub enum PrincipalClass {
     Operator,
     Agent,
     Observer,
+    /// P080: read-only operator — diagnostics and diagnose_only only.
+    /// Grants p080:diagnostics and p080.reconcile diagnose_only; excludes
+    /// all mutating repair/clear actions.
+    ReadOnlyOperator,
 }
 
 impl std::fmt::Display for PrincipalClass {
@@ -21,6 +25,7 @@ impl std::fmt::Display for PrincipalClass {
             PrincipalClass::Operator => write!(f, "operator"),
             PrincipalClass::Agent => write!(f, "agent"),
             PrincipalClass::Observer => write!(f, "observer"),
+            PrincipalClass::ReadOnlyOperator => write!(f, "read_only_operator"),
         }
     }
 }

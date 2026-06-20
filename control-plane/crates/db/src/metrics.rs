@@ -191,6 +191,35 @@ pub const P058_REQUIRED_METRICS: &[&str] = &[
     "escalation_provider_late_frame_after_detach_total",
 ];
 
+/// P080 rollout-critical metric names (proposal §7 pinned vocabulary).
+pub const P080_REQUIRED_METRICS: &[&str] = &[
+    "stale_execution_detected_total",
+    "stale_execution_repaired_total",
+    "stale_execution_repair_failed_total",
+    "stale_execution_repair_race_aborted_total",
+    "stale_execution_classifier_error_total",
+    "stale_execution_hold_age_seconds",
+    "p080_mcp_unauthorized_missing_capability_total",
+    "p080_mcp_disabled_action_rejected_total",
+    "p080_operator_request_dedup_hit_total",
+    "p080_operator_request_dedup_idempotency_conflict_total",
+    "p080_diagnostics_enumeration_budget_exceeded_total",
+    "p080_graphql_subscription_rate_shed_total",
+    "p080_graphql_subscription_stale_event_dropped_total",
+    "p080_reconciliation_deferred_total",
+    "p080_reconciliation_loop_termination_total",
+    "p080_reconciliation_readback_projection_total",
+    "p080_recurrence_epoch_advanced_total",
+    "p080_permanent_hold_engaged_total",
+    "p080_permanent_hold_cleared_total",
+    "helper_reap_signal_escalation_total",
+    "p080_mcp_parser_rejected_total",
+    "p080_mcp_canonicalization_budget_exceeded_total",
+    "p080_mcp_unsupported_version_total",
+    "p080_migration_shape_validation_total",
+    "p080_reconciliation_enabled_nonterminal_runs_percent",
+];
+
 fn metrics() -> &'static Mutex<SystemMetrics> {
     METRICS.get_or_init(|| Mutex::new(SystemMetrics::default()))
 }

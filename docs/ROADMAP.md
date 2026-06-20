@@ -89,6 +89,7 @@ Active stabilization and correctness work, in order:
   - **P099** read-only diagnostics window.
   - Use P082 as the proof harness.
   - Release/publish/git side-effect lanes remain fail-closed and route through durable side-effect reconciliation.
+  - P080 implementation refined and underway; active repair remains rollout-gated.
 - **P079** contract-aware output repair and provider fallback.
   - Keep scoped to contract-output repair/fallback.
   - Do not include release agents.
