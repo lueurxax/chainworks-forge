@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents.attach_receipt.get.request.schema.json",
+  "title": "agents.attach_receipt.get request",
+  "description": "P086: MCP request schema for agents.attach_receipt.get. Fetches the provider-session attach receipt for a resurrection continuation. Only Operator principals (scoped to the continuation's run) receive the raw receipt; Reviewer principals receive a redacted projection; Guest principals receive only an existence indicator.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["continuation_id", "run_id"],
+  "properties": {
+    "continuation_id": {
+      "type": "string",
+      "description": "UUID of the provider_session_resurrection continuation whose attach receipt to fetch.",
+      "maxLength": 512
+    },
+    "run_id": {
+      "type": "string",
+      "description": "UUID of the run that owns this continuation. Used for run-scoped authorization; requests from principals not scoped to this run receive auth_failure.",
+      "maxLength": 512
+    }
+  }
+}

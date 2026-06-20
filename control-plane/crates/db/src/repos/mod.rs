@@ -24,6 +24,7 @@ pub mod maintenance;
 pub mod mcp_command_idempotency;
 pub mod p077_rollout;
 pub mod p082_recovery_matrix;
+pub mod p086_resurrection_raw_receipts;
 pub mod projection_invalidation;
 pub mod projections;
 pub mod retry_operator_instructions;

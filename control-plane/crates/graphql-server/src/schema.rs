@@ -28,6 +28,7 @@ use engine::lifecycle_reporter::LifecycleReporter;
 use crate::types::approval::GqlApproval;
 use crate::types::artifact::{GqlArtifact, P085_NO_DEADLINE_JUSTIFICATION};
 use crate::types::continuation::{
+    GqlAttachReceiptGuest, GqlAttachReceiptOperator, GqlAttachReceiptReviewer,
     GqlContinuationCandidatesResult, GqlContinuationMetricsSummary, GqlContinuationRecord,
     GqlContinuationStatus,
 };
@@ -3157,6 +3158,153 @@ impl QueryRoot {
         .await?;
         Ok(GqlContinuationMetricsSummary::from(summary))
     }
+
+    /// P086: Fetch provider_session_attach_receipt_v2 with principal-access-matrix enforcement.
+    ///
+    /// Operator (run-scoped, run_id must match) → ProviderSessionAttachReceiptOperator with full raw JSON.
+    /// Observer (Reviewer)                      → ProviderSessionAttachReceiptReviewer with redacted fields.
+    /// Agent (Guest)                            → ProviderSessionAttachReceiptGuest with existence + phase.
+    ///
+    /// All projections have constant shape per principal class. Operator-only fields are absent
+    /// (not null-set) in lower-principal projections to defeat field-presence side-channel inference.
+    #[graphql(name = "providerSessionAttachReceipt")]
+    async fn provider_session_attach_receipt(
+        &self,
+        ctx: &Context<'_>,
+        continuation_id: ID,
+        run_id: Option<ID>,
+    ) -> Result<serde_json::Value> {
+        use db::repos::p086_resurrection_raw_receipts;
+        let pool = ctx.data::<SqlitePool>()?;
+        let principal = ctx.data::<auth::Principal>()?;
+        let cont_id = continuation_id.as_str();
+        let req_run_id: Option<&str> = run_id.as_ref().map(|id| id.as_str());
+
+        match &principal.class {
+            auth::PrincipalClass::Operator => {
+                // Verify run scope before any DB read (no existence oracle for wrong-run).
+                let actual_run = p086_resurrection_raw_receipts::continuation_run_id(pool, cont_id).await
+                    .map_err(|e| Error::new(e.to_string()))?;
+                let authorized = req_run_id.map(|r| actual_run.as_deref() == Some(r)).unwrap_or(actual_run.is_some());
+                if !authorized {
+                    let audit_id = uuid::Uuid::new_v4().to_string();
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let _ = p086_resurrection_raw_receipts::record_access_audit(
+                        pool,
+                        &p086_resurrection_raw_receipts::ReceiptAccessAuditRow {
+                            id: audit_id, principal_id: principal.id.clone(),
+                            principal_class: "operator".to_string(), continuation_id: cont_id.to_string(),
+                            run_id: req_run_id.unwrap_or("").to_string(),
+                            requested_at: now, source_channel: "graphql".to_string(),
+                            outcome: "denied".to_string(),
+                            denial_reason: Some("wrong_run_or_not_found".to_string()),
+                        },
+                    ).await;
+                    return Err(Error::new("auth_failure: run_id does not match or not found"));
+                }
+                let raw = p086_resurrection_raw_receipts::find_by_continuation_id(pool, cont_id).await
+                    .map_err(|e| Error::new(e.to_string()))?;
+                let audit_id = uuid::Uuid::new_v4().to_string();
+                let now = chrono::Utc::now().to_rfc3339();
+                let (receipt_json, outcome) = match raw {
+                    Some(ref row) => (Some(row.raw_receipt_json.clone()), "raw_read"),
+                    None => (None, "denied"),
+                };
+                let _ = p086_resurrection_raw_receipts::record_access_audit(
+                    pool,
+                    &p086_resurrection_raw_receipts::ReceiptAccessAuditRow {
+                        id: audit_id, principal_id: principal.id.clone(),
+                        principal_class: "operator".to_string(), continuation_id: cont_id.to_string(),
+                        run_id: actual_run.as_deref().unwrap_or("").to_string(),
+                        requested_at: now, source_channel: "graphql".to_string(),
+                        outcome: outcome.to_string(),
+                        denial_reason: if outcome == "denied" { Some("receipt_not_found".to_string()) } else { None },
+                    },
+                ).await;
+                Ok(serde_json::to_value(GqlAttachReceiptOperator {
+                    continuation_id: cont_id.to_string(),
+                    access_level: "raw".to_string(),
+                    receipt_json,
+                }).unwrap_or_default())
+            }
+            auth::PrincipalClass::Observer => {
+                let raw = p086_resurrection_raw_receipts::find_by_continuation_id(pool, cont_id).await
+                    .map_err(|e| Error::new(e.to_string()))?;
+                let redacted_json = raw.as_ref().map(|row| {
+                    let v: serde_json::Value = serde_json::from_str(&row.raw_receipt_json).unwrap_or_default();
+                    serde_json::to_string(&reviewer_redact_receipt_gql(&v)).unwrap_or_default()
+                });
+                let audit_id = uuid::Uuid::new_v4().to_string();
+                let now = chrono::Utc::now().to_rfc3339();
+                let _ = p086_resurrection_raw_receipts::record_access_audit(
+                    pool,
+                    &p086_resurrection_raw_receipts::ReceiptAccessAuditRow {
+                        id: audit_id, principal_id: principal.id.clone(),
+                        principal_class: "observer".to_string(), continuation_id: cont_id.to_string(),
+                        run_id: req_run_id.unwrap_or("").to_string(),
+                        requested_at: now, source_channel: "graphql".to_string(),
+                        outcome: "reviewer_projection".to_string(), denial_reason: None,
+                    },
+                ).await;
+                Ok(serde_json::to_value(GqlAttachReceiptReviewer {
+                    continuation_id: cont_id.to_string(),
+                    access_level: "reviewer_redacted".to_string(),
+                    redacted_receipt_json: redacted_json,
+                }).unwrap_or_default())
+            }
+            auth::PrincipalClass::Agent => {
+                // Guest/Agent: minimal projection — existence + resurrection_phase only.
+                let phase = sqlx::query(
+                    "SELECT resurrection_phase FROM agent_work_continuations WHERE id = ?1",
+                )
+                .bind(cont_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| Error::new(e.to_string()))?
+                .and_then(|r| r.try_get::<Option<String>, _>("resurrection_phase").ok().flatten());
+                Ok(serde_json::to_value(GqlAttachReceiptGuest {
+                    continuation_id: cont_id.to_string(),
+                    resurrection_phase: phase,
+                }).unwrap_or_default())
+            }
+        }
+    }
+}
+
+/// P086: Reviewer-redacted projection of a raw receipt JSON.
+/// Used in GraphQL resolver (mirrors logic in MCP handler).
+fn reviewer_redact_receipt_gql(raw: &serde_json::Value) -> serde_json::Value {
+    let Some(obj) = raw.as_object() else {
+        return serde_json::json!({});
+    };
+    const ABSENT_FIELDS: &[&str] = &[
+        "adapter_runtime_home_realpath", "adapter_runtime_home_dev_ino",
+        "managed_child_pid", "managed_process_group_id",
+        "managed_child_process_group_id", "managed_child_start_time",
+    ];
+    const SESSION_ID_FIELDS: &[&str] = &[
+        "requested_provider_session_id", "actual_provider_session_id",
+    ];
+    let mut out = serde_json::Map::new();
+    for (k, v) in obj {
+        if ABSENT_FIELDS.contains(&k.as_str()) { continue; }
+        if SESSION_ID_FIELDS.contains(&k.as_str()) {
+            if let Some(s) = v.as_str() {
+                let hash: String = Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+                let prefix: String = s.chars().take(4).collect();
+                out.insert(k.clone(), serde_json::Value::String(format!("{prefix}...{hash}")));
+            } else {
+                out.insert(k.clone(), v.clone());
+            }
+            continue;
+        }
+        if k == "identity_proof_artifact_id" {
+            out.insert(k.clone(), serde_json::Value::String("[redacted]".to_string()));
+            continue;
+        }
+        out.insert(k.clone(), v.clone());
+    }
+    serde_json::Value::Object(out)
 }
 
 /// GraphQL wrapper around [`DaemonStatus`] (P042 §5.2). Every field of the
