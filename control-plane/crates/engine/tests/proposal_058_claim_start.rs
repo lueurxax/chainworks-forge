@@ -1969,6 +1969,7 @@ async fn proposal_058_retry_stage_supersedes_old_claim_before_retry_work_is_clai
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -2177,6 +2178,7 @@ async fn proposal_078_retry_release_stage_requires_effect_reconciliation_before_
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -2289,6 +2291,7 @@ async fn proposal_078_retry_manual_release_gate_checks_post_approval_release_tas
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -2432,6 +2435,7 @@ async fn proposal_078_targeted_release_retry_records_failed_journal_entry() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -2586,6 +2590,7 @@ async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() 
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -2615,6 +2620,7 @@ async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() 
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )

@@ -1,0 +1,28 @@
+{
+  "fixture_id": "no-key-lifecycle-window-disabled-visible",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "macos_command_routing_contract_v1",
+  "description": "When no lifecycle window is key, lifecycle commands appear in the menu and toolbar as disabled (visible but not interactive).",
+  "preconditions": {
+    "lifecycle_window_state": "not_key",
+    "commands_present": ["CancelRun", "RetryStage", "ResolveApproval"]
+  },
+  "action": {
+    "event": "CommandAvailabilityCheck",
+    "window_state": "no_key_lifecycle_window"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "CancelRun menu item visible but disabled (grayed out)",
+    "RetryStage menu item visible but disabled",
+    "ResolveApproval menu item visible but disabled",
+    "toolbar buttons visible but non-interactive",
+    "commands NOT hidden from menu, only disabled"
+  ],
+  "window_type": "lifecycle",
+  "command_routing": {
+    "enabled_when": "key_and_focused",
+    "disabled_state": "visible_not_interactive"
+  }
+}

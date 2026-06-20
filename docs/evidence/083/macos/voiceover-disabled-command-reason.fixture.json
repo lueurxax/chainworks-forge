@@ -1,0 +1,29 @@
+{
+  "fixture_id": "voiceover-disabled-command-reason",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "macos_command_routing_contract_v1",
+  "description": "VoiceOver announces the reason why a lifecycle command is disabled, not just that it is disabled, enabling screen reader users to understand the blocked state.",
+  "preconditions": {
+    "voiceover_enabled": true,
+    "lifecycle_window_state": "not_key",
+    "command": "CancelRun",
+    "command_enabled": false
+  },
+  "action": {
+    "event": "VoiceOverFocusesDisabledMenuItem",
+    "menu_item": "CancelRun"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "VoiceOver reads accessibilityLabel for CancelRun menu item",
+    "VoiceOver reads reason for disabled state (e.g. 'No lifecycle window active')",
+    "disabled reason provided via accessibilityHint or accessibilityValue",
+    "announcement does not just say 'dimmed' without context",
+    "reason is human-readable and actionable"
+  ],
+  "accessibility": {
+    "disabled_reason_announced": true,
+    "accessibilityHint_includes_reason": true
+  }
+}

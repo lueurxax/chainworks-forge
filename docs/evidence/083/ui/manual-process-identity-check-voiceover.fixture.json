@@ -1,0 +1,32 @@
+{
+  "fixture_id": "manual-process-identity-check-voiceover",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "ui_process_identity_contract_v1",
+  "description": "The process identity check UI provides correct VoiceOver accessibility labels so screen reader users can understand the ambiguous state and available actions.",
+  "preconditions": {
+    "voiceover_enabled": true,
+    "process_identity_state": "held_identity_ambiguous",
+    "run_id": "run-ui-003"
+  },
+  "action": {
+    "event": "VoiceOverFocusesProcessIdentityCheckView",
+    "run_id": "run-ui-003"
+  },
+  "expected_outcome": "pass",
+  "component_name": "ProcessIdentityCheckView",
+  "assertions": [
+    "banner has accessibilityLabel describing ambiguous process identity",
+    "each resolution action button has unique accessibilityLabel",
+    "accessibilityHint describes outcome of each action",
+    "focused element reads state as 'held' or 'ambiguous', not 'loading'",
+    "VoiceOver can navigate all interactive elements without trap"
+  ],
+  "no_auto_spinner": true,
+  "voiceover_readable": true,
+  "accessibility": {
+    "accessibilityLabel_present": true,
+    "accessibilityHint_present": true,
+    "accessibilityTraits": ["button", "staticText"]
+  }
+}

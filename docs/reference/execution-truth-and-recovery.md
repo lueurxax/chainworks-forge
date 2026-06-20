@@ -2,11 +2,11 @@
 
 Stable reference for the execution-truth, settlement, and recovery contract.
 
-Configurable escalation policies layer a chain-level contract on top of agent-level execution truth: tier advancement, trigger classification, ledger persistence, and recovery semantics are owned by the Rust control plane. See [escalation-policies.md](escalation-policies.md) for policy schema, pause-reason catalog, and rollout state. The escalation-specific invariants relevant to recovery readers are pinned in *Escalation chain invariants* below.
+P058 layers a chain-level escalation contract on top of agent-level execution truth: tier advancement, trigger classification, ledger persistence, and recovery semantics are owned by the Rust control plane. See [escalation-policies.md](escalation-policies.md) for policy schema, pause-reason catalog, and rollout phasing. The escalation-specific invariants relevant to recovery readers are pinned in *Escalation chain invariants* below.
 
 ## Purpose
 
-The runtime must be able to say, once and only once, what actually happened in an agent attempt after output, timeout, cancellation, limit exhaustion, relaunch, and recovery.
+The runtime must be able to say, once and only once, what actually happened in an agent attempt after output, timeout, cancellation, limit exhaustion, relaunch, and recovery. P083, the Execution-Truth Ownership and Invariant Model, further refines this by pinning durable shutdown state, command-idempotency storage, bounded metric labels, and rollout-contract readback to persisted control-plane records, along with defining specific UI interactions for manual identity verification and comprehensive migration plans. It introduces explicit contracts for CallerRequestIDs, RollbackDispositionJSON, Shutdown Contracts, Provider Cancellation Intents, and Late Output Overflow.
 
 This document is the stable contract for:
 
@@ -84,9 +84,11 @@ It exists to explain the settled outcome, not to compete with it.
 
 Readers must use this precedence:
 
-1. flattened persisted execution-truth columns,
-2. supporting evidence such as `outcomeEnvelopeJSON`, `providerReceiptJSON`, and validation payloads,
-3. coarse legacy fields like `AgentStatus` only when canonical columns are absent.
+1.  flattened persisted execution-truth columns,
+2.  supporting evidence such as `outcomeEnvelopeJSON`, `providerReceiptJSON`, and validation payloads,
+3.  coarse legacy fields like `AgentStatus` only when canonical columns are absent.
+
+**P083 Data Authority Rule**: SQLite rows are authoritative. GraphQL, MCP, filesystem artifacts, report JSON, and SwiftData projections are readback or evidence surfaces only.
 
 Raw receipts or transcripts must never silently override canonical persisted outcome truth.
 
@@ -226,7 +228,7 @@ It may narrow the operator action after a watchdog failure or exhausted retry, b
 
 ### Durable Side-Effect Ledger and Reconciliation
 
-For irreversible or externally visible operations (e.g., `git_push`, `connect_upload`), success is not just about the agent finishing. The system must ensure that the side effect is durable and reconcilable if a crash occurs mid-execution.
+For irreversible or externally visible operations (e.g., `git_push`, `connect_upload`), success is not just about the agent finishing. The system must ensure that the side effect is durable and reconcilable if a crash occurs mid-execution. P083 introduces the `command_idempotency_contract_v1`, `shutdown_signal_side_effect_contract_v1`, and `provider_cancellation_intent_contract_v1` to rigorously define these behaviors.
 
 **Durability Rules:**
 - **Durable Intent**: The control plane persists a `SideEffect` record with status `prepared` before the external operation begins.
@@ -283,7 +285,7 @@ graph authority.
 
 ### Transition Cursor Authority
 
-Transition completion and cursor update are one atomic settlement unit. 
+Transition completion and cursor update are one atomic settlement unit.
 The run-level transition cursor is the authoritative continuation signal:
 
 - `currentStageID` resolution is cursor-first.
@@ -440,11 +442,12 @@ The narrower binding contract is documented in [provider-binding-truth.md](provi
 
 Current report/recovery readers should prefer:
 
-1. `AgentExecution` execution-truth columns,
-2. Rust `agent_execution_runtime_facts` when present,
-3. `StageExecution` failure and recovery payloads,
-4. run-level trust / provenance metadata,
-5. coarse legacy statuses only as compatibility fallback.
+1.  `AgentExecution` execution-truth columns,
+2.  `command_idempotency` and `shutdown_interrupted_receipts` as durable command and shutdown state,
+3.  Rust `agent_execution_runtime_facts` when present,
+4.  `StageExecution` failure and recovery payloads,
+5.  run-level trust / provenance metadata,
+6.  coarse legacy statuses only as compatibility fallback.
 
 This keeps report timelines, failed-step summaries, retry hints, and resume guidance tied to persisted truth rather than heuristic rescans of historical artifacts.
 
@@ -454,14 +457,16 @@ This slice is currently proved primarily through current-head non-UI test suites
 
 High-signal proof owners include:
 
-- `RuntimeAgentExecutorTests` for transport-outcome classification and limit exhaustion,
-- `OrchestratorTests` for persistence of canonical outcome, provider/model truth, and validation-after-output settlement,
-- `ResumeManagerTests` for interrupted-run classification and approval restore behavior,
-- `RecoveryCoordinatorTests` for narrow recovery action ownership,
-- failed-stage evidence and report/recovery fallback suites,
-- retained escalation proof gate for Rust ACP runtime facts, claim/start ownership,
-  source-generation artifact ownership, GraphQL/MCP readback parity, and provider-quota
-  retry ledger behavior.
+-   `RuntimeAgentExecutorTests` for transport-outcome classification and limit exhaustion,
+-   `OrchestratorTests` for persistence of canonical outcome, provider/model truth, and validation-after-output settlement,
+-   `ResumeManagerTests` for interrupted-run classification and approval restore behavior,
+-   `RecoveryCoordinatorTests` for narrow recovery action ownership,
+-   failed-stage evidence and report/recovery fallback suites,
+-   `control-plane/crates/db/tests/proposal_083_migrations.rs` for P083's additive SQLite migrations,
+-   `docs/evidence/083/` fixtures for command idempotency, shutdown, cancellation, late output, UI, metrics, and macOS behavior,
+-   `./scripts/test-gate.sh proposal-058` for Rust ACP runtime facts, claim/start ownership,
+    source-generation artifact ownership, GraphQL/MCP readback parity, and provider-quota
+    retry ledger behavior.
 
 ## Adjacent References
 
@@ -471,5 +476,4 @@ Use:
 - [workflow-execution-engine.md](workflow-execution-engine.md) for orchestrator topology,
 - [run-control.md](run-control.md) for cancellation settlement and operator-visible cancel truth,
 - [provider-binding-truth.md](provider-binding-truth.md) for historical binding provenance,
-- [operator-experience.md](operator-experience.md) for shell/report/recovery presentation contracts,
-- [recovery-retry-state-machine-test-matrix.md](recovery-retry-state-machine-test-matrix.md) for the canonical P082 scenario matrix, reason-code vocabulary, readback schemas, and proof gate that recovery behavior changes must extend.
+- [operator-experience.md](operator-experience.md) for shell/report/recovery presentation contracts.

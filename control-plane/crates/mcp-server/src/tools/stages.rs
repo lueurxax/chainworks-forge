@@ -8,7 +8,7 @@ use domain::commands::{
 };
 use domain::discovery::LegacyBroadDiscoveryPolicy;
 use domain::ids::{RunId, StageExecutionId};
-use engine::command_handler::CommandHandler;
+use engine::command_handler::{validate_caller_request_id, CommandHandler};
 
 use crate::protocol::McpTool;
 use crate::request_context::mcp_caller;
@@ -17,14 +17,22 @@ pub fn tool_specs() -> Vec<McpTool> {
     vec![
         McpTool {
             name: "stages.retry".to_string(),
-            description: "Retry a failed or blocked stage".to_string(),
+            description: "Retry a failed or blocked stage. Requires a CallerRequestId \
+                (lowercase UUIDv4) for command_idempotency_contract_v1 replay safety (TTL=120s)."
+                .to_string(),
             input_schema: serde_json::json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
-                "required": ["run_id", "stage_id", "idempotency_key"],
+                "required": ["run_id", "stage_id", "request_id"],
+                "additionalProperties": false,
                 "properties": {
                     "run_id": { "type": "string" },
                     "stage_id": { "type": "string" },
-                    "idempotency_key": { "type": "string", "description": "Required UUIDv7 per attempt for safe retry." },
+                    "request_id": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "description": "CallerRequestId: lowercase UUIDv4 for command_idempotency_contract_v1"
+                    },
                     "agent_execution_id": {
                         "type": "string",
                         "description": "Optional. Retry only this InvokeAgent execution instead of the full stage fanout."
@@ -35,6 +43,22 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "operator_instruction": { "type": "string", "description": "Optional one-shot operator instruction for the retry-created invocation scope (1-2000 chars, operator-only)." }
                 }
             }),
+            output_schema: Some(serde_json::json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["retried"],
+                "properties": {
+                    "retried": { "type": "boolean", "description": "true when the stage retry was durably committed; false on denial" },
+                    "run_id": { "type": "string" },
+                    "stage_id": { "type": "string" },
+                    "journal_id": { "type": "string" },
+                    "request_id": { "type": "string", "description": "Replayed CallerRequestId for idempotency confirmation" },
+                    "denied": { "type": "boolean", "description": "true when the command was denied before execution" },
+                    "denial_code": { "type": "string", "enum": ["malformed_request_id","request_intent_mismatch","idempotency_in_flight","idempotency_replayed","idempotency_expired_reacquired","idempotency_replay_corrupt","idempotency_terminal_failure","operator_required","p083_operator_required","provider_session_not_found","run_not_found","stage_not_retryable","approval_not_actionable","side_effect_not_reconcilable","enforcement_mode_transition_denied","identity_ambiguous","internal"], "description": "Bounded denial code from P083LifecycleDenialCode" },
+                    "message": { "type": "string", "description": "Human-readable denial or error message" }
+                }
+            })),
         },
         McpTool {
             name: "stages.consume_provider_quota_hold".to_string(),
@@ -51,6 +75,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "idempotency_key": { "type": "string", "description": "Required UUIDv7 per attempt for safe repair." }
                 }
             }),
+            output_schema: None,
         },
         McpTool {
             name: "legacy_discovery_override_create".to_string(),
@@ -78,6 +103,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "idempotency_key": { "type": "string", "description": "Required UUIDv7 per attempt for safe retry." }
                 }
             }),
+            output_schema: None,
         },
         McpTool {
             name: "workflow_conflicts.resolve".to_string(),
@@ -113,6 +139,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
+            output_schema: None,
         },
         McpTool {
             name: "workflow_loop_budget.extend".to_string(),
@@ -130,6 +157,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "target_conflict_id": { "type": "string" }
                 }
             }),
+            output_schema: None,
         },
     ]
 }
@@ -166,8 +194,18 @@ pub async fn execute(
                 .as_str()
                 .map(String::from);
             let operator_instruction = params["operator_instruction"].as_str().map(String::from);
+            // P083 command_idempotency_contract_v1: request_id must be a lowercase UUIDv4
+            // (CallerRequestId). Required per schema; validate format before acquiring lease.
+            let request_id = params["request_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'request_id'"))?
+                .to_string();
+            validate_caller_request_id(&request_id)?;
 
-            let caller = mcp_caller(&principal, "stages.retry");
+            // SEC-P083-MED-003: stamp the validated CallerRequestId into CallerContext so
+            // command_journal.request_id carries the lifecycle request id, not the HTTP request id.
+            let caller = mcp_caller(&principal, "stages.retry")
+                .with_request_id(request_id.clone());
             let cmd = Command::RetryStage(RetryStageCmd {
                 run_id,
                 stage_id,
@@ -176,6 +214,7 @@ pub async fn execute(
                 legacy_discovery_override_policy,
                 legacy_discovery_override_reason,
                 operator_instruction,
+                request_id: Some(request_id.clone()),
             });
             let commanded = cmd_handler.handle(cmd, caller).await?;
             let (legacy_discovery_override_id, retry_instruction_binding_id) =
@@ -191,7 +230,8 @@ pub async fn execute(
                     _ => (None, None),
                 };
             Ok(serde_json::json!({
-                "scheduled": true,
+                "retried": true,
+                "request_id": request_id,
                 "journal_id": commanded.journal_id,
                 "legacy_discovery_override_id": legacy_discovery_override_id,
                 "retry_instruction_binding_id": retry_instruction_binding_id,

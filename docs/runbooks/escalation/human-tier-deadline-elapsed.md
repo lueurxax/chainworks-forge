@@ -4,4 +4,4 @@
 
 **Phase:** `runtime`
 
-**Operator Action Hint:** Resume with operator decision or extend human tier deadline.
+**Operator Action Hint:** Resume with operator decision or extend human tier deadline. If an identity hold is visible, do not retry until provider identity is resolved.

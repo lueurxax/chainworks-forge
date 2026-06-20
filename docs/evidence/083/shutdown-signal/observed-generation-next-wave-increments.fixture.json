@@ -1,0 +1,25 @@
+{
+  "fixture_id": "observed-generation-next-wave-increments",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "shutdown_signal_generation_contract_v1",
+  "description": "When a new wave of signals is issued after a previously observed generation is committed, the generation counter increments by exactly one.",
+  "preconditions": {
+    "session_id": "session-wave-001",
+    "last_committed_generation": 3,
+    "current_observed_generation": 3
+  },
+  "action": {
+    "event": "NewSignalWaveRequested",
+    "session_id": "session-wave-001",
+    "trigger": "operator_retry_after_previous_settled"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "new signal planned with generation=4 (incremented from 3)",
+    "generation increments by exactly 1 per wave",
+    "prior generation=3 receipt already committed",
+    "generation=4 signal row persisted before issuance",
+    "stale receipt for generation=3 rejected after wave advances to 4"
+  ]
+}

@@ -109,10 +109,31 @@ async fn build_reconciliation_readback(
         .iter()
         .find(|path| Path::new(path).is_file())
         .cloned();
+    // SEC-P083-MED-002: canonicalize path and enforce containment under artifact_root
+    // before reading. evidence_root comes from DB metadata and could be corrupted or
+    // crafted to redirect reads outside the artifact directory. Apply the same 1 MiB
+    // cap used by reports.get and reject symlink escapes via canonicalization.
+    const MAX_EVIDENCE_BYTES: u64 = 1_048_576; // 1 MiB
     let matched_payload = matched_path
         .as_ref()
         .map(|path| -> Result<serde_json::Value> {
-            let raw = std::fs::read_to_string(path)
+            let canonical_root = std::fs::canonicalize(&run.artifact_root)
+                .with_context(|| format!("cannot canonicalize artifact_root: {}", run.artifact_root))?;
+            let canonical_path = std::fs::canonicalize(path)
+                .with_context(|| format!("cannot canonicalize evidence path: {path}"))?;
+            if !canonical_path.starts_with(&canonical_root) {
+                anyhow::bail!("evidence path escapes artifact_root containment");
+            }
+            let meta = std::fs::metadata(&canonical_path)
+                .with_context(|| format!("stat evidence path: {path}"))?;
+            if meta.len() > MAX_EVIDENCE_BYTES {
+                anyhow::bail!(
+                    "evidence file exceeds {} byte limit ({} bytes)",
+                    MAX_EVIDENCE_BYTES,
+                    meta.len()
+                );
+            }
+            let raw = std::fs::read_to_string(&canonical_path)
                 .with_context(|| format!("read reconciliation evidence {}", path))?;
             Ok(parse_json_or_string(&raw))
         })
@@ -175,6 +196,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
+            output_schema: None,
         },
         McpTool {
             name: "effects.inspect".to_string(),
@@ -189,6 +211,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
+            output_schema: None,
         },
         McpTool {
             name: "effects.reconcile".to_string(),
@@ -208,6 +231,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
+            output_schema: None,
         },
         McpTool {
             name: "effects.mark_conflict".to_string(),
@@ -239,6 +263,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
+            output_schema: None,
         },
         McpTool {
             name: "effects.mark_unrecoverable".to_string(),
@@ -270,6 +295,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
+            output_schema: None,
         },
         McpTool {
             name: "effects.clear_after_manual_verification".to_string(),
@@ -301,6 +327,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
+            output_schema: None,
         },
     ]
 }

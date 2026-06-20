@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use db::repos::{
     agent_execution_discovery_diagnostics, agent_execution_runtime_facts,
     agent_execution_runtime_receipts, agent_executions, artifact_contracts, artifacts, closeout,
-    code_writer_completion_receipts, lead_conflict_mediations, legacy_discovery_overrides,
+    code_writer_completion_receipts, cancel_late_output_overflow as cancel_late_output_overflow_repo,
+    lead_conflict_mediations, legacy_discovery_overrides,
     retry_payload_recovery_events, retry_stage_execution_authorities, rollout_contract_checks,
     runs, sessions, validation, workflow_conflicts,
 };
@@ -47,6 +48,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "run_id": { "type": "string", "description": "The run ID to retrieve report artifacts for" }
             }
         }),
+        output_schema: None,
     }]
 }
 
@@ -1065,17 +1067,155 @@ pub(crate) async fn rollout_contract_readback_json(
     if base.is_null() {
         return Ok(base);
     }
-    // Merge live P087 fields into the run_report readback lane.
+
+    let base_obj = match base.as_object() {
+        Some(obj) => obj.clone(),
+        None => return Ok(base),
+    };
+    let mut merged = base_obj;
+
+    // Merge live P087 fields.
     let p087 = db::repos::storage_health::p087_rollout_readback_fields(pool).await;
-    if let (Some(base_obj), Some(p087_obj)) = (base.as_object(), p087.as_object()) {
-        let mut merged = base_obj.clone();
+    if let Some(p087_obj) = p087.as_object() {
         for (k, v) in p087_obj {
             merged.insert(k.clone(), v.clone());
         }
-        Ok(serde_json::Value::Object(merged))
-    } else {
-        Ok(base)
     }
+
+    // P083 rollout_readback_api_parity_v1: add rollout_contract_* prefixed aliases
+    // so run_report and release_receipt lanes carry the full parity field set.
+    let alias_pairs: &[(&str, &str)] = &[
+        ("status", "rollout_contract_status"),
+        ("backend_decision", "rollout_contract_decision"),
+        ("failure_reasons", "rollout_contract_failure_reasons"),
+        ("waiver_state", "rollout_contract_waiver_state"),
+        ("waiver_expires_at", "rollout_contract_waiver_expires_at"),
+        ("enforcement_mode", "rollout_contract_enforcement_mode"),
+        (
+            "enforcement_mode_reason",
+            "rollout_contract_enforcement_mode_reason",
+        ),
+        ("hold_conditions", "rollout_contract_hold_conditions"),
+        ("source_lane", "rollout_contract_source_lane"),
+        ("enabled_state", "rollout_contract_enabled_state"),
+        (
+            "disabled_reason_code",
+            "rollout_contract_disabled_reason_code",
+        ),
+        ("action_id", "rollout_contract_action_id"),
+        ("operator_message", "rollout_contract_operator_message"),
+        (
+            "projection_integrity",
+            "rollout_contract_projection_integrity",
+        ),
+        (
+            "cutover_policy_revision",
+            "rollout_contract_cutover_policy_revision",
+        ),
+        (
+            "diagnostic_redaction",
+            "rollout_contract_diagnostic_redaction",
+        ),
+        ("next_steps", "rollout_contract_next_steps"),
+    ];
+    for (src, dst) in alias_pairs {
+        if let Some(v) = merged.get(*src).cloned() {
+            merged.insert(dst.to_string(), v);
+        }
+    }
+
+    // rollout_contract_rollback_disposition: validated rollback_disposition_v1 wrapper.
+    // Per rollout_readback_api_parity_v1 and SEC-P083-HIGH-001: only the four whitelist
+    // fields (schema_version, mode, data_loss_risk, steps) pass through. Fail closed on
+    // invalid disposition — do not null-coalesce.
+    let rollout_contract_rollback_disposition = if let Some(inline) = merged.get("rollback_disposition").cloned() {
+        let mut wrapped = serde_json::json!({ "schema_version": "rollback_disposition_v1" });
+        if let (Some(out), Some(inp)) = (wrapped.as_object_mut(), inline.as_object()) {
+            for (k, v) in inp {
+                // Strict whitelist: only mode, data_loss_risk, steps pass through.
+                // schema_version is always the canonical value set above.
+                match k.as_str() {
+                    "mode" => { out.insert("mode".to_string(), v.clone()); }
+                    "data_loss_risk" => { out.insert("data_loss_risk".to_string(), v.clone()); }
+                    "steps" => { out.insert("steps".to_string(), v.clone()); }
+                    _ => {}
+                }
+            }
+        }
+        graphql_server::types::p083::validate_rollback_disposition_v1(&wrapped)
+            .map_err(|e| anyhow::anyhow!("rollout_contract_rollback_disposition validation failed: {}", e))?;
+        wrapped
+    } else {
+        serde_json::Value::Null
+    };
+    merged.insert(
+        "rollout_contract_rollback_disposition".to_string(),
+        rollout_contract_rollback_disposition,
+    );
+
+    // p083_shutdown_queue_rank: latest queued_no_signal queue_rank for this run's provider sessions.
+    let queue_rank: Option<i64> = sqlx::query_scalar(
+        r#"SELECT r.queue_rank
+             FROM shutdown_interrupted_receipts r
+             JOIN provider_sessions ps ON ps.provider_session_id = r.provider_session_id
+            WHERE ps.run_id = ?1
+              AND r.interrupted_state = 'queued_no_signal'
+              AND r.recovered_at IS NULL
+              AND r.queue_rank IS NOT NULL
+            ORDER BY r.shutdown_epoch DESC, r.receipt_generation DESC
+            LIMIT 1"#,
+    )
+    .bind(run_id.to_string())
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None)
+    .flatten();
+    merged.insert(
+        "p083_shutdown_queue_rank".to_string(),
+        queue_rank
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null),
+    );
+
+    // applied_migrations: P083 migration readback per migration_plan_v1.
+    // Exposes logical_id, filename (canonical), sha256, dependencies, applied_at,
+    // schema_version, state, and verification_query_result for each P083 migration.
+    let applied_migrations = rollout_contract_checks::p083_migration_readback(pool)
+        .await
+        .map(|rows| {
+            serde_json::to_value(rows).unwrap_or(serde_json::Value::Array(vec![]))
+        })
+        .unwrap_or(serde_json::Value::Array(vec![]));
+    merged.insert("applied_migrations".to_string(), applied_migrations);
+
+    // P083 post_cancel_late_output_contract_v1: include p083_cancel_late_output_overflow in
+    // run_report lane per rollout_readback_api_parity_v1.
+    let overflow_rows = cancel_late_output_overflow_repo::find_by_run_id(pool, &run_id.to_string())
+        .await
+        .unwrap_or_default();
+    let overflow_json: Vec<serde_json::Value> = overflow_rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "scope": r.scope,
+                "normalized_run_id": r.normalized_run_id,
+                "normalized_provider_session_id": r.normalized_provider_session_id,
+                "cancellation_epoch": r.cancellation_epoch,
+                "overflow_kind": r.overflow_kind,
+                "dropped_message_count": r.dropped_message_count,
+                "dropped_byte_count": r.dropped_byte_count,
+                "quarantine_uri": r.quarantine_uri,
+                "reservation_release_state": r.reservation_release_state,
+                "projection_mutation_blocked": r.projection_mutation_blocked,
+            })
+        })
+        .collect();
+    merged.insert(
+        "p083_cancel_late_output_overflow".to_string(),
+        serde_json::Value::Array(overflow_json),
+    );
+
+    Ok(serde_json::Value::Object(merged))
 }
 
 pub(crate) async fn p094_rollout_decision_json(

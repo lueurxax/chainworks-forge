@@ -1,0 +1,36 @@
+{
+  "fixture_id": "crash-after-signal-before-receipt-settles-from-side-effect-row",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "shutdown_lifecycle_contract_v1",
+  "description": "A crash after the signal was issued but before the receipt was recorded causes restart to await and settle the receipt from the durable side-effect row.",
+  "preconditions": {
+    "termination_class": "crash",
+    "crash_window": "after_signal_before_receipt",
+    "signal_entry": {
+      "side_effect_id": "se-crash-002",
+      "state": "issued",
+      "signal_generation": 2,
+      "issued": true,
+      "receipt_recorded": false
+    }
+  },
+  "action": {
+    "event": "process_restart_after_crash",
+    "recovery_phase": "receipt_settlement"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "recovery detects issued-but-unreceipted signal row",
+    "restart waits for provider receipt with matching generation",
+    "receipt arrival transitions side_effect to committed",
+    "signal NOT re-issued (already in issued state)",
+    "run continues from settled state after receipt"
+  ],
+  "recovery_rules": {
+    "restart_required": true,
+    "signal_generation_reused": true,
+    "recovery_source": "issued_signal_side_effect_row",
+    "re_issue_signal": false
+  }
+}

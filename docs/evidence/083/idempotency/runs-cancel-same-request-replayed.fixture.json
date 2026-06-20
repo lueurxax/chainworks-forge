@@ -1,0 +1,31 @@
+{
+  "fixture_id": "runs-cancel-same-request-replayed",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "command_idempotency_contract_v1",
+  "description": "Replaying a CancelRun command with the same request_id returns the committed outcome without re-executing the cancellation side-effect.",
+  "preconditions": {
+    "run_id": "run-001",
+    "run_state": "running",
+    "existing_journal_entry": {
+      "request_id": "req-cancel-abc123",
+      "command": "CancelRun",
+      "status": "committed",
+      "intent_hash": "sha256:aabbcc"
+    }
+  },
+  "action": {
+    "command": "CancelRun",
+    "request_id": "req-cancel-abc123",
+    "run_id": "run-001",
+    "intent_hash": "sha256:aabbcc"
+  },
+  "expected_outcome": "idempotent_replay",
+  "assertions": [
+    "response equals previously committed outcome",
+    "no new journal entry written",
+    "cancellation side-effect NOT re-triggered",
+    "lease_state remains closed",
+    "replay_count incremented on existing entry"
+  ]
+}

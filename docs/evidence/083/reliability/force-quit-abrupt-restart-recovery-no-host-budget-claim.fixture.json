@@ -1,0 +1,29 @@
+{
+  "fixture_id": "force-quit-abrupt-restart-recovery-no-host-budget-claim",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "shutdown_reliability_contract_v1",
+  "description": "Force-quit is abrupt with no host budget window; restart recovery proceeds without claiming a host budget and relies entirely on durable rows.",
+  "preconditions": {
+    "termination_class": "force_quit",
+    "delegate_invoked": false,
+    "host_budget_claimed": false,
+    "durable_side_effect_rows": 2
+  },
+  "action": {
+    "event": "process_restart_after_force_quit",
+    "recovery_phase": "startup_recovery"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "NO host_total_ms budget claimed during restart recovery",
+    "recovery reads durable side-effect rows directly",
+    "no assumption of pre-quit in-memory state",
+    "recovery completes idempotently from DB-only state",
+    "runs restored to correct pre-quit checkpoint"
+  ],
+  "host_budget": {
+    "host_total_ms": null,
+    "budget_class": "none_abrupt"
+  }
+}

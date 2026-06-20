@@ -143,4 +143,6 @@ pub struct McpTool {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
 }

@@ -44,6 +44,9 @@ pub enum Command {
     KnowledgeCapsuleIgnore(KnowledgeCapsuleIgnoreCmd),
     RetrofitCatalogSnapshot(RetrofitCatalogSnapshotCmd),
     CancelRun(CancelRunCmd),
+    /// P083: Retry a run — re-queues a new AdvanceRun work item for the run.
+    /// CallerRequestId is required; command_idempotency_contract_v1 guards duplicate issuance.
+    RetryRun(RetryRunCmd),
     ResetSession(ResetSessionCmd),
     RunStewardAnalysis(RunStewardAnalysisCmd),
     OverrideArtifactContract(OverrideArtifactContractCmd),
@@ -61,6 +64,26 @@ pub enum Command {
     /// CallerContext.principal_id overrides the command's principal field at the engine
     /// boundary (BLK-008: bind from authenticated context, not caller-supplied payload).
     SettleProposalGate(SettleProposalGateCmd),
+    /// P083: Initiate graceful shutdown of a provider session.
+    /// Writes a planned shutdown signal and records idempotency lease.
+    /// CallerRequestId UUIDv4 supplied by operator; command_idempotency_contract_v1 guards
+    /// against duplicate issuance.
+    ShutdownProviderSession(ShutdownProviderSessionCmd),
+    /// P083: Execute rollback from enforce to permissive or disabled.
+    /// Writes to p083_rollback_audit and updates enforcement mode state.
+    /// CallerRequestId UUIDv4 supplied by operator.
+    P083RollbackExecution(P083RollbackExecutionCmd),
+    /// P083: Set enforcement mode (disabled/permissive/enforce).
+    /// Writes to p083_enforcement_mode_transition_journal and updates enforcement mode state.
+    /// CallerRequestId UUIDv4 supplied by operator.
+    P083SetEnforcementMode(P083SetEnforcementModeCmd),
+    /// P083: Force-reconcile a side effect to reconciled status with operator decision.
+    /// CallerRequestId UUIDv4 supplied by operator; command_idempotency_contract_v1 with TTL=300s.
+    ForceReconcileSideEffect(ForceReconcileSideEffectCmd),
+    /// P083: Operator confirms process is absent for identity-ambiguous hold.
+    /// Moves process_fate to absent_verified and transitions held intent back to requested
+    /// so settlement can resume. Requires CallerRequestId and operator confirmation.
+    MarkProviderSessionProcessAbsent(MarkProviderSessionProcessAbsentCmd),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -134,6 +157,10 @@ pub struct RetryStageCmd {
     /// P065: Optional one-shot operator instruction for the retry-created invocation scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_instruction: Option<String>,
+    /// P083: CallerRequestId (lowercase UUIDv4) for command_idempotency_contract_v1.
+    /// Optional for backward compatibility; idempotency is applied when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -303,6 +330,32 @@ pub struct KnowledgeCapsuleIgnoreCmd {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CancelRunCmd {
     pub run_id: RunId,
+    /// P083: CallerRequestId (lowercase UUIDv4) for command_idempotency_contract_v1.
+    /// Optional for backward compatibility; idempotency is applied when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+/// P083: Retry a run — re-queues a new AdvanceRun work item for a run that has failed or stalled.
+/// CallerRequestId is required for command_idempotency_contract_v1 (TTL 120s).
+/// Principal is bound from CallerContext, not this struct.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RetryRunCmd {
+    pub run_id: RunId,
+    /// P083: CallerRequestId (lowercase UUIDv4). Required for idempotency lease.
+    pub request_id: String,
+}
+
+/// P083: Force-reconcile a side effect to reconciled status.
+/// command_idempotency_contract_v1 with TTL=300s. Principal bound from CallerContext.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ForceReconcileSideEffectCmd {
+    /// UUID of the side effect to force-reconcile.
+    pub effect_id: String,
+    /// P083: CallerRequestId (lowercase UUIDv4). Required for idempotency lease.
+    pub request_id: String,
+    /// Operator-supplied decision JSON (side_effect_decision_v1).
+    pub decision_json: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -384,6 +437,12 @@ pub struct ResolveApprovalCmd {
     /// approval_mutation_idempotency and returns the original result on retry.
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// P083: CallerRequestId (lowercase UUIDv4) for command_idempotency_contract_v1.
+    /// When present, uses P083 idempotency path (TTL=300s) in preference to
+    /// idempotency_key. P081 idempotency_key is accepted for backward compatibility
+    /// when request_id is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 // ── P077: Gate settlement command ──────────────────────────────────────
@@ -434,6 +493,58 @@ pub struct SettleProposalGateCmd {
     /// Free-form known_risks text never satisfies release entry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_risks: Vec<RiskAcceptanceLineage>,
+}
+
+// ── P083: Lifecycle commands ─────────────────────────────────────────────
+
+/// P083: Graceful shutdown of a provider session.
+/// provider_session_id must exist in provider_sessions.
+/// cancellation_epoch is service-assigned; caller MUST NOT supply it.
+/// Principal is bound from CallerContext, not this struct.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ShutdownProviderSessionCmd {
+    pub provider_session_id: String,
+    /// CallerRequestId (UUIDv4) for command_idempotency_contract_v1.
+    pub request_id: String,
+    pub reason: String,
+}
+
+/// P083: Roll back enforcement mode to permissive or disabled.
+/// rollback_mode must be "permissive" or "disabled".
+/// Principal is bound from CallerContext, not this struct.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct P083RollbackExecutionCmd {
+    /// CallerRequestId (UUIDv4) for command_idempotency_contract_v1.
+    pub request_id: String,
+    /// "permissive" or "disabled"
+    pub rollback_mode: String,
+    pub reason: String,
+}
+
+/// P083: Set enforcement mode (disabled/permissive/enforce).
+/// enforcement_mode must be one of the three allowed values.
+/// Principal is bound from CallerContext, not this struct.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct P083SetEnforcementModeCmd {
+    /// CallerRequestId (UUIDv4) for command_idempotency_contract_v1.
+    pub request_id: String,
+    /// "disabled", "permissive", or "enforce"
+    pub enforcement_mode: String,
+    pub reason: String,
+}
+
+/// P083: Operator confirms a provider process is absent for an identity-ambiguous hold.
+/// Atomically moves process_fate to absent_verified and transitions held intent back to
+/// requested so shutdown settlement can resume. Requires CallerRequestId and operator
+/// confirmation per manual_process_identity_check_ui_v1.available_actions.mark_process_absent.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MarkProviderSessionProcessAbsentCmd {
+    /// The provider session that holds the identity_ambiguous fate.
+    pub provider_session_id: String,
+    /// The cancellation_epoch of the held intent to clear.
+    pub cancellation_epoch: i64,
+    /// CallerRequestId (UUIDv4) for command_idempotency_contract_v1. TTL=120s.
+    pub request_id: String,
 }
 
 // ── P029: Caller identity for audit journaling ──────────────────────────
@@ -598,6 +709,227 @@ pub struct RunStewardAnalysisCmd {
     pub artifact_base: Option<String>,
 }
 
+// ── P083 HARDEN-001/002: Shared typed denial vocabulary ─────────────────────
+
+/// P083 lifecycle denial codes shared between GraphQL error extensions and MCP
+/// `denial_code` response fields. Per implementation_hardening_requirements_v1
+/// P083-HARDEN-001 and P083-HARDEN-002: this enum is the canonical denial
+/// vocabulary referenced by both API surfaces.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum P083LifecycleDenialCode {
+    /// Request-id format does not match lowercase UUIDv4 pattern.
+    MalformedRequestId,
+    /// Same request_id, different command or intent_hash.
+    RequestIntentMismatch,
+    /// Same request_id and intent_hash with a still-pending lease (retry_after_seconds applies).
+    IdempotencyInFlight,
+    /// Committed outcome replayed for same or aliased request.
+    IdempotencyReplayed,
+    /// Expired pending lease reacquired by a concurrent caller; current caller lost the race.
+    IdempotencyExpiredReacquired,
+    /// Caller principal class is not operator.
+    OperatorRequired,
+    /// P083 operator class required specifically for P083 lifecycle commands.
+    P083OperatorRequired,
+    /// Provider session not found in authoritative table.
+    ProviderSessionNotFound,
+    /// Run not found or in terminal state.
+    RunNotFound,
+    /// Stage execution not found or not retryable.
+    StageNotRetryable,
+    /// Approval not found or not actionable.
+    ApprovalNotActionable,
+    /// Side effect not found or not force-reconcilable.
+    SideEffectNotReconcilable,
+    /// Enforcement mode transition is not permitted from the current mode.
+    EnforcementModeTransitionDenied,
+    /// Process identity ambiguous — manual_process_identity_check required.
+    IdentityAmbiguous,
+    /// Committed idempotency row exists but outcome_json is absent or unparseable.
+    IdempotencyReplayCorrupt,
+    /// Terminal failure for this command/intent; retry not allowed by per-command policy.
+    IdempotencyTerminalFailure,
+    /// Internal error — details logged server-side; not surfaced to caller.
+    Internal,
+}
+
+impl P083LifecycleDenialCode {
+    /// The bounded string value used in MCP `denial_code` fields and GraphQL
+    /// error extension `code` values. All values are lowercase_snake_case.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::MalformedRequestId => "malformed_request_id",
+            Self::RequestIntentMismatch => "request_intent_mismatch",
+            Self::IdempotencyInFlight => "idempotency_in_flight",
+            Self::IdempotencyReplayed => "idempotency_replayed",
+            Self::IdempotencyExpiredReacquired => "idempotency_expired_reacquired",
+            Self::OperatorRequired => "operator_required",
+            Self::P083OperatorRequired => "p083_operator_required",
+            Self::ProviderSessionNotFound => "provider_session_not_found",
+            Self::RunNotFound => "run_not_found",
+            Self::StageNotRetryable => "stage_not_retryable",
+            Self::ApprovalNotActionable => "approval_not_actionable",
+            Self::SideEffectNotReconcilable => "side_effect_not_reconcilable",
+            Self::EnforcementModeTransitionDenied => "enforcement_mode_transition_denied",
+            Self::IdentityAmbiguous => "identity_ambiguous",
+            Self::IdempotencyReplayCorrupt => "idempotency_replay_corrupt",
+            Self::IdempotencyTerminalFailure => "idempotency_terminal_failure",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// All denial code strings for use in bounded metric label validation and
+    /// GraphQL schema documentation. Mirrors `metric_labels_contract_v1`.
+    pub const ALL: &'static [&'static str] = &[
+        "malformed_request_id",
+        "request_intent_mismatch",
+        "idempotency_in_flight",
+        "idempotency_replayed",
+        "idempotency_expired_reacquired",
+        "operator_required",
+        "p083_operator_required",
+        "provider_session_not_found",
+        "run_not_found",
+        "stage_not_retryable",
+        "approval_not_actionable",
+        "side_effect_not_reconcilable",
+        "enforcement_mode_transition_denied",
+        "identity_ambiguous",
+        "idempotency_replay_corrupt",
+        "idempotency_terminal_failure",
+        "internal",
+    ];
+}
+
+impl std::fmt::Display for P083LifecycleDenialCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ── P083 HARDEN-011: Per-command recommended minimum TTL ────────────────────
+
+/// Per-command recommended minimum TTL seconds per
+/// implementation_hardening_requirements_v1 P083-HARDEN-011.
+/// Rollout lint warns when configured TTL is below recommendation.
+pub struct P083CommandTtlPolicy {
+    pub command: &'static str,
+    /// Mandatory TTL from command_idempotency_contract_v1.
+    pub ttl_seconds: u64,
+    /// Minimum TTL recommended for safe operation.
+    pub recommended_min_ttl_seconds: u64,
+}
+
+/// Centralized per-command TTL policy table per P083-HARDEN-011.
+/// All entries from command_idempotency_contract_v1.ttl_seconds.
+pub const P083_COMMAND_TTL_POLICIES: &[P083CommandTtlPolicy] = &[
+    P083CommandTtlPolicy { command: "runs.cancel",                ttl_seconds: 120, recommended_min_ttl_seconds: 60  },
+    P083CommandTtlPolicy { command: "runs.retry",                 ttl_seconds: 120, recommended_min_ttl_seconds: 60  },
+    P083CommandTtlPolicy { command: "stages.retry",               ttl_seconds: 120, recommended_min_ttl_seconds: 60  },
+    P083CommandTtlPolicy { command: "approvals.resolve",          ttl_seconds: 300, recommended_min_ttl_seconds: 120 },
+    P083CommandTtlPolicy { command: "side_effects.force_reconcile", ttl_seconds: 300, recommended_min_ttl_seconds: 120 },
+    P083CommandTtlPolicy { command: "provider_session.shutdown",  ttl_seconds: 120, recommended_min_ttl_seconds: 90  },
+    P083CommandTtlPolicy { command: "p083.rollback_execution",    ttl_seconds: 120, recommended_min_ttl_seconds: 60  },
+    P083CommandTtlPolicy { command: "p083.set_enforcement_mode",  ttl_seconds: 120, recommended_min_ttl_seconds: 60  },
+];
+
+/// Return the TTL policy for a command. Returns None for unknown commands.
+pub fn p083_ttl_policy_for(command: &str) -> Option<&'static P083CommandTtlPolicy> {
+    P083_COMMAND_TTL_POLICIES.iter().find(|p| p.command == command)
+}
+
+/// Check whether `ttl_seconds` is below the recommended minimum for `command`.
+/// Returns Some(recommended) when below recommendation, None when acceptable.
+pub fn p083_ttl_below_recommendation(command: &str, ttl_seconds: u64) -> Option<u64> {
+    p083_ttl_policy_for(command).and_then(|p| {
+        if ttl_seconds < p.recommended_min_ttl_seconds {
+            Some(p.recommended_min_ttl_seconds)
+        } else {
+            None
+        }
+    })
+}
+
+// ── P083 HARDEN-007: Centralized per-command failed-terminal retry policy ───
+
+/// Whether a new same-intent request may acquire a lease after the prior
+/// attempt reached a failed-terminal state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailedTerminalRetryAllowed {
+    /// New same-intent request may always acquire a new lease after failure.
+    Always,
+    /// New same-intent request may acquire a new lease only after a cooldown period.
+    AfterCooldownSeconds(u64),
+    /// New same-intent request for the same intent is denied after terminal failure.
+    Never,
+}
+
+/// Per-command failed-terminal retry policy per implementation_hardening_requirements_v1
+/// P083-HARDEN-007.
+pub struct P083FailedTerminalRetryPolicy {
+    pub command: &'static str,
+    /// Whether a new lease may be acquired after a terminal failure.
+    pub retry_allowed: FailedTerminalRetryAllowed,
+    /// Rationale for the retry policy.
+    pub rationale: &'static str,
+}
+
+/// Centralized per-command failed-terminal retry policy table per P083-HARDEN-007.
+/// All entries from command_idempotency_contract_v1 recovery_rules.
+pub const P083_FAILED_TERMINAL_RETRY_POLICIES: &[P083FailedTerminalRetryPolicy] = &[
+    P083FailedTerminalRetryPolicy {
+        command: "runs.cancel",
+        retry_allowed: FailedTerminalRetryAllowed::Always,
+        rationale: "Cancel is idempotent in effect; a new attempt with the same intent is safe.",
+    },
+    P083FailedTerminalRetryPolicy {
+        command: "runs.retry",
+        retry_allowed: FailedTerminalRetryAllowed::Always,
+        rationale: "Re-queue is safe to retry; backend guards against double-queuing via run status.",
+    },
+    P083FailedTerminalRetryPolicy {
+        command: "stages.retry",
+        retry_allowed: FailedTerminalRetryAllowed::Always,
+        rationale: "Stage retry is guarded by stage status; new same-intent request may proceed.",
+    },
+    P083FailedTerminalRetryPolicy {
+        command: "approvals.resolve",
+        retry_allowed: FailedTerminalRetryAllowed::Never,
+        rationale: "Approval resolution is a one-way state transition; failure requires a human decision, not an automatic retry.",
+    },
+    P083FailedTerminalRetryPolicy {
+        command: "side_effects.force_reconcile",
+        retry_allowed: FailedTerminalRetryAllowed::Always,
+        rationale: "Force-reconcile failure leaves the side effect unresolved; a new attempt is safe.",
+    },
+    P083FailedTerminalRetryPolicy {
+        command: "provider_session.shutdown",
+        retry_allowed: FailedTerminalRetryAllowed::AfterCooldownSeconds(30),
+        rationale: "Shutdown failure may reflect a transient identity state; 30s cooldown reduces PID reuse risk.",
+    },
+    P083FailedTerminalRetryPolicy {
+        command: "p083.rollback_execution",
+        retry_allowed: FailedTerminalRetryAllowed::Always,
+        rationale: "Rollback failure is safe to retry with a new request after the prior terminal failure.",
+    },
+    P083FailedTerminalRetryPolicy {
+        command: "p083.set_enforcement_mode",
+        retry_allowed: FailedTerminalRetryAllowed::Always,
+        rationale: "Mode-set failure is safe to retry; backend enforces CAS on the mode state table.",
+    },
+];
+
+/// Return the failed-terminal retry policy for a command. Returns None for unknown commands.
+pub fn p083_failed_terminal_retry_policy_for(
+    command: &str,
+) -> Option<&'static P083FailedTerminalRetryPolicy> {
+    P083_FAILED_TERMINAL_RETRY_POLICIES
+        .iter()
+        .find(|p| p.command == command)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,5 +1004,106 @@ mod tests {
         );
         assert_eq!(MainSyncMode::default(), MainSyncMode::Off);
         assert_eq!(KnowledgeCapsulesMode::default(), KnowledgeCapsulesMode::Off);
+    }
+
+    #[test]
+    fn p083_lifecycle_denial_code_all_round_trip_as_str() {
+        let codes = [
+            P083LifecycleDenialCode::MalformedRequestId,
+            P083LifecycleDenialCode::RequestIntentMismatch,
+            P083LifecycleDenialCode::IdempotencyInFlight,
+            P083LifecycleDenialCode::IdempotencyReplayed,
+            P083LifecycleDenialCode::IdempotencyExpiredReacquired,
+            P083LifecycleDenialCode::OperatorRequired,
+            P083LifecycleDenialCode::P083OperatorRequired,
+            P083LifecycleDenialCode::ProviderSessionNotFound,
+            P083LifecycleDenialCode::RunNotFound,
+            P083LifecycleDenialCode::StageNotRetryable,
+            P083LifecycleDenialCode::ApprovalNotActionable,
+            P083LifecycleDenialCode::SideEffectNotReconcilable,
+            P083LifecycleDenialCode::EnforcementModeTransitionDenied,
+            P083LifecycleDenialCode::IdentityAmbiguous,
+            P083LifecycleDenialCode::IdempotencyReplayCorrupt,
+            P083LifecycleDenialCode::IdempotencyTerminalFailure,
+            P083LifecycleDenialCode::Internal,
+        ];
+        assert_eq!(codes.len(), P083LifecycleDenialCode::ALL.len());
+        for code in &codes {
+            assert!(
+                P083LifecycleDenialCode::ALL.contains(&code.as_str()),
+                "denial code {} not in ALL",
+                code.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn p083_ttl_policy_covers_all_eight_commands() {
+        let required = [
+            "runs.cancel",
+            "runs.retry",
+            "stages.retry",
+            "approvals.resolve",
+            "side_effects.force_reconcile",
+            "provider_session.shutdown",
+            "p083.rollback_execution",
+            "p083.set_enforcement_mode",
+        ];
+        for cmd in &required {
+            let policy = p083_ttl_policy_for(cmd);
+            assert!(policy.is_some(), "no TTL policy for command {cmd}");
+            let p = policy.unwrap();
+            assert!(
+                p.ttl_seconds >= p.recommended_min_ttl_seconds,
+                "command {cmd}: ttl_seconds {} < recommended_min_ttl_seconds {}",
+                p.ttl_seconds,
+                p.recommended_min_ttl_seconds
+            );
+        }
+    }
+
+    #[test]
+    fn p083_ttl_below_recommendation_returns_none_when_acceptable() {
+        assert_eq!(p083_ttl_below_recommendation("runs.cancel", 120), None);
+        assert_eq!(p083_ttl_below_recommendation("runs.cancel", 60), None);
+    }
+
+    #[test]
+    fn p083_ttl_below_recommendation_returns_recommendation_when_too_low() {
+        let result = p083_ttl_below_recommendation("runs.cancel", 10);
+        assert_eq!(result, Some(60));
+    }
+
+    #[test]
+    fn p083_failed_terminal_retry_policy_covers_all_eight_commands() {
+        let required = [
+            "runs.cancel",
+            "runs.retry",
+            "stages.retry",
+            "approvals.resolve",
+            "side_effects.force_reconcile",
+            "provider_session.shutdown",
+            "p083.rollback_execution",
+            "p083.set_enforcement_mode",
+        ];
+        for cmd in &required {
+            let policy = p083_failed_terminal_retry_policy_for(cmd);
+            assert!(policy.is_some(), "no failed-terminal retry policy for command {cmd}");
+        }
+    }
+
+    #[test]
+    fn p083_approvals_resolve_retry_not_allowed_after_terminal_failure() {
+        let policy = p083_failed_terminal_retry_policy_for("approvals.resolve").unwrap();
+        assert_eq!(policy.retry_allowed, FailedTerminalRetryAllowed::Never);
+    }
+
+    #[test]
+    fn p083_provider_session_shutdown_has_cooldown_policy() {
+        let policy = p083_failed_terminal_retry_policy_for("provider_session.shutdown").unwrap();
+        assert!(matches!(
+            policy.retry_allowed,
+            FailedTerminalRetryAllowed::AfterCooldownSeconds(_)
+        ));
     }
 }

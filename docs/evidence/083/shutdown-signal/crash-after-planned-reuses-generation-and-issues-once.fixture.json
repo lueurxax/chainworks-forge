@@ -1,0 +1,28 @@
+{
+  "fixture_id": "crash-after-planned-reuses-generation-and-issues-once",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "shutdown_signal_generation_contract_v1",
+  "description": "After a crash where a signal was planned but not yet issued, the restart path reuses the same generation number and issues the signal exactly once.",
+  "preconditions": {
+    "crash_window": "after_planned_before_issued",
+    "signal_row": {
+      "side_effect_id": "se-gen-001",
+      "signal_generation": 5,
+      "state": "planned",
+      "issued_count": 0
+    }
+  },
+  "action": {
+    "event": "process_restart",
+    "recovery_phase": "signal_issuance"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "signal issued with generation=5 (reused, not incremented)",
+    "issued_count after recovery equals 1",
+    "second restart with same planned row does not issue again (idempotent)",
+    "generation NOT advanced past 5 for this signal",
+    "signal_row transitions from planned to issued"
+  ]
+}

@@ -83,8 +83,8 @@ pub struct GqlRun {
     pub closeout_readiness_summary_json: Option<Json<serde_json::Value>>,
     /// P077: Documented alias for the implementation closeout readiness summary.
     pub implementation_closeout_readiness_summary: Option<Json<serde_json::Value>>,
-    /// P094: Workflow-owned quality-gate blocker boundary readback.
-    pub p094_boundary_readback_json: Option<Json<serde_json::Value>>,
+    /// P083: Rollout contract readback with validated RollbackDispositionJSON scalar.
+    pub p083_rollout_contract_readback: Option<crate::types::p083::GqlP083RolloutContractReadback>,
 }
 
 impl From<Run> for GqlRun {
@@ -141,7 +141,7 @@ impl From<Run> for GqlRun {
             p091_orphan_repair_readback_json: None,
             closeout_readiness_summary_json: None,
             implementation_closeout_readiness_summary: None,
-            p094_boundary_readback_json: None,
+            p083_rollout_contract_readback: None,
         }
     }
 }
@@ -225,7 +225,7 @@ impl From<RunProjectionRow> for GqlRun {
             p091_orphan_repair_readback_json: None,
             closeout_readiness_summary_json: closeout_readiness_summary_json.clone(),
             implementation_closeout_readiness_summary: closeout_readiness_summary_json,
-            p094_boundary_readback_json: None,
+            p083_rollout_contract_readback: None,
         }
     }
 }

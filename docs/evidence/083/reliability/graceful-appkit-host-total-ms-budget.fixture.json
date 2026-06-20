@@ -1,0 +1,29 @@
+{
+  "fixture_id": "graceful-appkit-host-total-ms-budget",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "shutdown_reliability_contract_v1",
+  "description": "Graceful AppKit shutdown claims a host_total_ms budget and completes all durable writes within that window before replying to the system.",
+  "preconditions": {
+    "termination_class": "graceful_appkit",
+    "host_total_ms_budget": 30000,
+    "active_side_effects": 3,
+    "delegate_available": true
+  },
+  "action": {
+    "event": "applicationShouldTerminate",
+    "source": "AppKit"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "host_total_ms budget claimed at shutdown start",
+    "all durable writes complete within host_total_ms",
+    "replyToApplicationShouldTerminate called before budget expiry",
+    "budget_ms_remaining > 0 at time of reply",
+    "shutdown audit records actual_ms_used < host_total_ms_budget"
+  ],
+  "host_budget": {
+    "host_total_ms": 30000,
+    "budget_class": "graceful_appkit"
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "fixture_id": "manual-process-identity-check-banner",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "manual_process_identity_check_ui_v1",
+  "description": "When a provider cancellation intent is held with process_fate=identity_ambiguous, ManualProcessIdentityCheckBanner appears with title 'Process identity needs review', body copy, and disabled automatic retry.",
+  "preconditions": {
+    "process_identity_state": "held_identity_ambiguous",
+    "intent_state": "held",
+    "process_fate": "identity_ambiguous",
+    "run_id": "run-ui-001"
+  },
+  "action": {
+    "event": "ManualProcessIdentityCheckBannerDisplayed",
+    "run_id": "run-ui-001"
+  },
+  "expected_outcome": "pass",
+  "component_name": "ManualProcessIdentityCheckBanner",
+  "assertions": [
+    "ManualProcessIdentityCheckBanner component appears in the view hierarchy for provider-session detail and any run/stage surface containing the held provider",
+    "banner displays title: 'Process identity needs review'",
+    "banner displays body: 'Forge could not prove this provider process is still the same process that was cancelled. Automatic retry is paused until you verify the process identity.'",
+    "automatic retry is disabled with no spinner and no countdown: 'Automatic retry paused: process identity is ambiguous.'",
+    "banner persists until backend readback moves intent_state away from held or process_fate away from identity_ambiguous",
+    "banner does not auto-dismiss without operator action or backend state change",
+    "VoiceOver announces title, provider display name, reason, and focused action"
+  ],
+  "no_auto_spinner": true,
+  "voiceover_readable": true
+}

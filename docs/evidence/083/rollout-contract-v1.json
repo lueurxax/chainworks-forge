@@ -1,0 +1,145 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "applicability": "required",
+  "gate_aliases": ["proposal-083", "p083"],
+  "commands": {
+    "allowlist": [
+      "./scripts/test-gate.sh proposal-083",
+      "./scripts/test-gate.sh p083"
+    ],
+    "commentary": "Gate commands are declarative expectations; the linter does not execute them."
+  },
+  "migrations": {
+    "not_applicable": false,
+    "justification": "P083 owns seven additive SQLite migrations enumerated in migration_plan_v1. Release receipt and operator readback must expose sha256 and verification query result for each logical_id."
+  },
+  "metrics": {
+    "adoption_metric": "p083_applicable_runs_with_passing_execution_truth_preflight_percent",
+    "operational_metrics": [
+      "artifact_lineage_projection_integrity_total{surface,state}",
+      "provider_session_lifecycle_total{provider,lifecycle_state}",
+      "command_idempotency_lease_acquire_total{command,outcome}",
+      "command_idempotency_replay_total{command,outcome}",
+      "shutdown_interrupted_receipt_total{provider,interrupted_state}",
+      "shutdown_duplicate_signal_suppressed_total{provider}",
+      "cancel_late_output_overflow_total{provider,scope,overflow_kind}",
+      "cancel_late_output_dropped_total{provider,scope,overflow_kind}",
+      "rollout_contract_lint_total{proposal_id,status,failure_reason}",
+      "rollout_contract_run_start_block_total{proposal_id,reason,enforcement_mode}",
+      "p083_enforcement_mode_transition_total{transition,enforcement_mode}",
+      "p083_rollback_execution_total{action,status,reason}",
+      "provider_cancellation_intent_total{provider,intent_state,cancellation_reason}"
+    ]
+  },
+  "readback_lanes": ["run_report", "mcp", "release_receipt", "graphql"],
+  "readback_fields": [
+    "rollout_contract_status",
+    "rollout_contract_decision",
+    "rollout_contract_failure_reasons",
+    "rollout_contract_waiver_state",
+    "rollout_contract_waiver_expires_at",
+    "rollout_contract_enforcement_mode",
+    "rollout_contract_enforcement_mode_reason",
+    "rollout_contract_hold_conditions",
+    "rollout_contract_rollback_disposition",
+    "rollout_contract_source_lane",
+    "rollout_contract_enabled_state",
+    "rollout_contract_disabled_reason_code",
+    "rollout_contract_action_id",
+    "rollout_contract_operator_message",
+    "rollout_contract_projection_integrity",
+    "rollout_contract_cutover_policy_revision",
+    "rollout_contract_diagnostic_redaction",
+    "rollout_contract_next_steps",
+    "rollout_contract_shutdown_deadline_config_state",
+    "rollout_contract_command_lease_ttl_config_state",
+    "p083_rollback_ttl_expires_at",
+    "p083_last_preflight_hash",
+    "p083_shutdown_queue_rank"
+  ],
+  "readback_fixture": "docs/evidence/rollout-contract/operator-readback/p083-full-surface.fixture.json",
+  "operator_report_fields": [
+    "rollout_contract_status",
+    "rollout_contract_decision",
+    "rollout_contract_failure_reasons",
+    "rollout_contract_waiver_state",
+    "rollout_contract_waiver_expires_at",
+    "rollout_contract_enforcement_mode",
+    "rollout_contract_enforcement_mode_reason",
+    "rollout_contract_hold_conditions",
+    "rollout_contract_rollback_disposition",
+    "rollout_contract_source_lane",
+    "rollout_contract_enabled_state",
+    "rollout_contract_disabled_reason_code",
+    "rollout_contract_action_id",
+    "rollout_contract_operator_message",
+    "rollout_contract_projection_integrity",
+    "rollout_contract_cutover_policy_revision",
+    "rollout_contract_diagnostic_redaction",
+    "rollout_contract_next_steps",
+    "rollout_contract_shutdown_deadline_config_state",
+    "rollout_contract_command_lease_ttl_config_state",
+    "p083_rollback_ttl_expires_at",
+    "p083_last_preflight_hash",
+    "p083_shutdown_queue_rank"
+  ],
+  "hold_conditions": [
+    "projection_integrity_not_fresh",
+    "rollout_contract_lint_failed",
+    "metric_scrape_stale",
+    "auth_dependency_missing",
+    "shutdown_receipt_history_invalid",
+    "post_cancel_overflow_latch_failed",
+    "migration_readback_missing_or_hash_mismatch",
+    "shutdown_deadline_config_invalid",
+    "command_lease_ttl_config_invalid",
+    "current_security_review_missing_or_stale",
+    "current_observability_rollout_review_missing_or_stale",
+    "command_idempotency_contract_invalid",
+    "migration_readback_sha256_missing",
+    "manual_identity_check_unresolved"
+  ],
+  "rollback_disposition": {
+    "mode": "p083.rollback_execution_to_permissive_or_disabled",
+    "data_loss_risk": "none",
+    "steps": [
+      "Call p083RollbackExecution or p083.rollback_execution with operator principal class and CallerRequestId.",
+      "Persist rollback audit and enforcement-mode audit rows.",
+      "Expose disabled/permissive state, generated schema-versioned rollback disposition readback, and TTL in every readback lane.",
+      "Require fresh permissive burn-in and enforce preflight before returning to enforce mode."
+    ]
+  },
+  "decision_vocabulary": [
+    "pass",
+    "fail",
+    "waived",
+    "not_applicable",
+    "timeout",
+    "cancelled",
+    "missing_contract",
+    "tamper_detected",
+    "stale",
+    "release",
+    "hold",
+    "waive"
+  ],
+  "negative_fixtures": {
+    "missing_metric_domain": "docs/evidence/rollout-contract/negative/p083-missing-metric-domain.json",
+    "missing_rollback_contract": "docs/evidence/rollout-contract/negative/p083-missing-rollback-contract.json",
+    "foreign_fixture_reference": "docs/evidence/rollout-contract/negative/p083-foreign-fixture-reference.json",
+    "enforce_without_burnin": "docs/evidence/rollout-contract/negative/p083-enforce-without-burnin.json",
+    "stale_security_review": "docs/evidence/rollout-contract/negative/p083-stale-security-review.json",
+    "stale_observability_rollout_review": "docs/evidence/rollout-contract/negative/p083-stale-observability-rollout-review.json",
+    "force_quit_host_budget_claim": "docs/evidence/rollout-contract/negative/p083-force-quit-host-budget-claim.json",
+    "queue_rank_final_readback_rank_storage": "docs/evidence/rollout-contract/negative/p083-final-readback-rank-stored.json",
+    "rollback_disposition_missing_schema_version": "docs/evidence/rollout-contract/negative/p083-rollback-disposition-missing-schema-version.json",
+    "migration_sha256_missing": "docs/evidence/rollout-contract/negative/p083-migration-sha256-missing.json",
+    "unbounded_metric_label": "docs/evidence/rollout-contract/negative/p083-unbounded-metric-label.json"
+  },
+  "cutover_policy": {
+    "revision": "p083-rollout-cutover-r68",
+    "enforcement_mode_at_cutover": "enforce",
+    "applicable_to": "post_ready_implementation_starts",
+    "effective_timestamp_iso8601": "2026-06-02T00:00:00Z"
+  }
+}

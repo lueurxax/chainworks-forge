@@ -1,0 +1,33 @@
+{
+  "fixture_id": "logout-system-shutdown-delegate-invoked",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "shutdown_lifecycle_contract_v1",
+  "description": "System logout or shutdown triggers the AppKit delegate path, ensuring the graceful shutdown protocol is invoked with a host budget.",
+  "preconditions": {
+    "termination_class": "logout_system_shutdown",
+    "active_runs": 1,
+    "host_budget_ms": 30000,
+    "delegate_available": true
+  },
+  "action": {
+    "event": "applicationShouldTerminate",
+    "source": "System",
+    "trigger": "logout_or_shutdown",
+    "user_initiated": false
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "AppKit delegate applicationShouldTerminate IS invoked",
+    "termination_class classified as logout_system_shutdown",
+    "host_budget_ms budget allocated and observed",
+    "in-flight side-effect rows durably written before reply",
+    "replyToApplicationShouldTerminate called before system timeout",
+    "shutdown audit entry records termination_class=logout_system_shutdown"
+  ],
+  "recovery_rules": {
+    "restart_required": false,
+    "delegate_available": true,
+    "host_budget_honored": true
+  }
+}

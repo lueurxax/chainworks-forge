@@ -1,0 +1,28 @@
+{
+  "fixture_id": "crash-after-issued-reuses-generation-and-suppresses-duplicate",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "shutdown_signal_generation_contract_v1",
+  "description": "After a crash where a signal was already issued, restart detects the issued state and suppresses any duplicate signal emission.",
+  "preconditions": {
+    "crash_window": "after_issued_before_receipt",
+    "signal_row": {
+      "side_effect_id": "se-gen-002",
+      "signal_generation": 5,
+      "state": "issued",
+      "issued_count": 1
+    }
+  },
+  "action": {
+    "event": "process_restart",
+    "recovery_phase": "signal_dedup_check"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "recovery detects state=issued and suppresses re-emission",
+    "issued_count remains 1 after recovery",
+    "generation NOT incremented",
+    "recovery awaits receipt with generation=5",
+    "no second signal sent to provider"
+  ]
+}

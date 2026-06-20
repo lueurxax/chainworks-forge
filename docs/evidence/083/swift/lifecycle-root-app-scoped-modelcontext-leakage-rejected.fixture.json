@@ -1,0 +1,30 @@
+{
+  "fixture_id": "lifecycle-root-app-scoped-modelcontext-leakage-rejected",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "swift_swiftdata_lifecycle_contract_v1",
+  "description": "Any attempt to expose a root-app-scoped lifecycle ModelContext into the SwiftUI WindowGroup or view tree is statically or dynamically rejected.",
+  "preconditions": {
+    "p083_enforcement": true,
+    "attempted_context_scope": "root_app",
+    "model_container_type": "lifecycle"
+  },
+  "action": {
+    "event": "view_hierarchy_build",
+    "attempted_injection": {
+      "context_type": "lifecycle_modelcontext",
+      "scope": "root_app",
+      "target": "WindowGroup_environment"
+    }
+  },
+  "expected_outcome": "rejected",
+  "assertions": [
+    "lifecycle ModelContext injection into WindowGroup rejected",
+    "rejection occurs at enforcement boundary check",
+    "error logged with context_scope=root_app and scope=WindowGroup",
+    "view hierarchy built without lifecycle context in environment",
+    "app continues running with projection_only context"
+  ],
+  "model_container_type": "lifecycle",
+  "lifecycle_access_allowed": false
+}

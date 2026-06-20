@@ -143,6 +143,9 @@ pub fn redact_for_journal(cmd: &Command, payload_json: &str) -> String {
         Command::CancelRun(_) => {
             // §8.1: preserve all fields.
         }
+        Command::RetryRun(_) => {
+            // P083: preserve run_id and request_id for audit.
+        }
         Command::ResetSession(_) => {
             // §8.1: preserve all fields.
         }
@@ -172,6 +175,34 @@ pub fn redact_for_journal(cmd: &Command, payload_json: &str) -> String {
                 redact_field_if_present(obj, "reason");
                 redact_field_if_present(obj, "receipt_json");
             }
+        }
+        Command::ShutdownProviderSession(_) => {
+            // P083: redact reason (operator-submitted text); preserve provider_session_id, request_id.
+            if let Some(obj) = inner {
+                redact_field_if_present(obj, "reason");
+            }
+        }
+        Command::P083RollbackExecution(_) => {
+            // P083: redact reason; preserve request_id and rollback_mode.
+            if let Some(obj) = inner {
+                redact_field_if_present(obj, "reason");
+            }
+        }
+        Command::P083SetEnforcementMode(_) => {
+            // P083: redact reason; preserve request_id and enforcement_mode.
+            if let Some(obj) = inner {
+                redact_field_if_present(obj, "reason");
+            }
+        }
+        Command::ForceReconcileSideEffect(_) => {
+            // P083: redact decision_json; preserve effect_id and request_id for audit.
+            if let Some(obj) = inner {
+                redact_field_if_present(obj, "decision_json");
+            }
+        }
+        Command::MarkProviderSessionProcessAbsent(_) => {
+            // P083: all fields (provider_session_id, cancellation_epoch, request_id) are
+            // non-sensitive audit material; preserve all.
         }
     }
 
@@ -383,6 +414,7 @@ mod tests {
             legacy_discovery_override_policy: None,
             legacy_discovery_override_reason: None,
             operator_instruction: None,
+            request_id: None,
         });
         let original: Value = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
         let redacted = round_trip(&cmd);
@@ -403,6 +435,7 @@ mod tests {
             legacy_discovery_override_policy: None,
             legacy_discovery_override_reason: None,
             operator_instruction: Some("Focus only on the GraphQL scheduler slice".into()),
+            request_id: None,
         });
         let v = round_trip(&cmd);
         let inner = inner(&v);
@@ -471,7 +504,7 @@ mod tests {
     #[test]
     fn test_redact_cancel_run_preserves_run_id() {
         let run_id = RunId::new();
-        let cmd = Command::CancelRun(CancelRunCmd { run_id });
+        let cmd = Command::CancelRun(CancelRunCmd { run_id, request_id: None });
         let original: Value = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
         let redacted = round_trip(&cmd);
         assert_eq!(original, redacted);
@@ -552,6 +585,7 @@ mod tests {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: None,
             }),
             Command::RetryStage(RetryStageCmd {
                 run_id: RunId::new(),
@@ -561,6 +595,7 @@ mod tests {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: Some("Focus on X".into()),
+                request_id: None,
             }),
             Command::ConsumeProviderQuotaHold(ConsumeProviderQuotaHoldCmd {
                 run_id: RunId::new(),
@@ -627,6 +662,7 @@ mod tests {
             }),
             Command::CancelRun(CancelRunCmd {
                 run_id: RunId::new(),
+                request_id: None,
             }),
             Command::ResetSession(ResetSessionCmd {
                 run_id: RunId::new(),
@@ -652,6 +688,7 @@ mod tests {
                 run_id: RunId::new(),
                 stage_id: "state_6".into(),
                 idempotency_key: None,
+                request_id: None,
             }),
             Command::ResolveApproval(ResolveApprovalCmd {
                 approval_id: domain::ids::ApprovalId::new(),
@@ -660,6 +697,7 @@ mod tests {
                 run_id: RunId::new(),
                 stage_id: "state_3".into(),
                 idempotency_key: None,
+                request_id: None,
             }),
             Command::RetrofitCatalogSnapshot(RetrofitCatalogSnapshotCmd {
                 run_id: RunId::new(),
@@ -706,6 +744,12 @@ mod tests {
                 Command::ResolveLeadMediationConfirmation(_) => {}
                 Command::ResolveApproval(_) => {}
                 Command::SettleProposalGate(_) => {}
+                Command::ShutdownProviderSession(_) => {}
+                Command::P083RollbackExecution(_) => {}
+                Command::P083SetEnforcementMode(_) => {}
+                Command::RetryRun(_) => {}
+                Command::ForceReconcileSideEffect(_) => {}
+                Command::MarkProviderSessionProcessAbsent(_) => {}
             }
         }
     }

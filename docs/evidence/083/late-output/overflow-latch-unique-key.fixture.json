@@ -1,0 +1,38 @@
+{
+  "fixture_id": "overflow-latch-unique-key",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "late_output_overflow_contract_v1",
+  "description": "Each overflow latch is stored with a unique composite key (run_id, stage_id, artifact_key) ensuring no two latches collide for the same logical output slot.",
+  "preconditions": {
+    "latches": [
+      {
+        "latch_id": "latch-001",
+        "run_id": "run-overflow-001",
+        "stage_id": "stage-a",
+        "artifact_key": "proposal_current",
+        "state": "active"
+      }
+    ]
+  },
+  "action": {
+    "event": "OverflowLatchCreate",
+    "run_id": "run-overflow-001",
+    "stage_id": "stage-a",
+    "artifact_key": "proposal_current"
+  },
+  "expected_outcome": "rejected",
+  "assertions": [
+    "second latch creation with same (run_id, stage_id, artifact_key) rejected",
+    "UNIQUE constraint on composite key enforced at DB level",
+    "existing latch_id=latch-001 unchanged",
+    "no duplicate latch rows created",
+    "rejection error includes composite key in error message"
+  ],
+  "latch_key": {
+    "run_id": "run-overflow-001",
+    "stage_id": "stage-a",
+    "artifact_key": "proposal_current",
+    "uniqueness": "composite_key_enforced"
+  }
+}

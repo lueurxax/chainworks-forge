@@ -1,0 +1,47 @@
+{
+  "fixture_id": "sigkill-no-delegate-assumption-restart-recovers-from-provider-cancellation-intents",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "shutdown_lifecycle_contract_v1",
+  "description": "SIGKILL allows no delegate or cleanup; restart recovery uses durable provider cancellation intent rows to reconstruct and resume safe state.",
+  "preconditions": {
+    "termination_class": "sigkill",
+    "active_runs": 2,
+    "delegate_invoked": false,
+    "cancellation_intent_rows": [
+      {
+        "intent_id": "ci-001",
+        "provider": "claude",
+        "session_id": "session-001",
+        "state": "requested"
+      },
+      {
+        "intent_id": "ci-002",
+        "provider": "codex",
+        "session_id": "session-002",
+        "state": "requested"
+      }
+    ]
+  },
+  "action": {
+    "event": "process_terminated",
+    "signal": "SIGKILL",
+    "source": "os_or_oom",
+    "delegate_callback_received": false
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "SIGKILL: no AppKit delegate assumed",
+    "restart discovers cancellation intent rows in 'requested' state",
+    "recovery issues cancellation for each unresolved intent",
+    "resolved intent rows not re-cancelled",
+    "runs transitioned to appropriate recovery state",
+    "no in-memory state assumed from pre-kill execution"
+  ],
+  "recovery_rules": {
+    "restart_required": true,
+    "recovery_source": "provider_cancellation_intent_rows",
+    "delegate_available": false,
+    "host_budget_honored": false
+  }
+}

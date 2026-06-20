@@ -1,0 +1,29 @@
+{
+  "fixture_id": "crash-durable-intent-before-side-effect",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "shutdown_reliability_contract_v1",
+  "description": "A cancellation intent is written durably before any side-effect is created, ensuring crash recovery can reconstruct the pending action.",
+  "preconditions": {
+    "termination_class": "crash",
+    "crash_window": "before_side_effect_creation",
+    "durable_cancellation_intent": {
+      "intent_id": "ci-crash-001",
+      "state": "requested",
+      "written_at": "2026-06-11T10:20:00Z"
+    },
+    "side_effect_created": false
+  },
+  "action": {
+    "event": "process_restart_after_crash",
+    "recovery_phase": "intent_recovery"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "durable intent row found in DB without corresponding side-effect",
+    "recovery creates the side-effect from the durable intent",
+    "side-effect issued with correct generation",
+    "no data loss from crash window",
+    "intent-before-side-effect ordering invariant verified"
+  ]
+}

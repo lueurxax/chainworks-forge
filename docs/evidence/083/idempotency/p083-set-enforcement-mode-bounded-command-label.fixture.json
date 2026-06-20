@@ -1,0 +1,40 @@
+{
+  "fixture_id": "p083-set-enforcement-mode-bounded-command-label",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "metrics_label_bounds_contract_v1",
+  "description": "SetEnforcementMode command emits a metric with a bounded command label drawn from the approved enumeration, never a free-form string.",
+  "preconditions": {
+    "enforcement_mode": "strict",
+    "approved_command_labels": [
+      "CancelRun",
+      "RetryStage",
+      "ResolveApproval",
+      "ExecuteStage",
+      "SetEnforcementMode",
+      "ForceReconcileSideEffect"
+    ]
+  },
+  "action": {
+    "command": "SetEnforcementMode",
+    "request_id": "req-enforcement-001",
+    "mode": "strict",
+    "intent_hash": "sha256:enforcement-intent-001"
+  },
+  "expected_outcome": "pass",
+  "metric_emission": {
+    "metric_name": "command_journal_writes_total",
+    "label_domains": {
+      "command": "SetEnforcementMode",
+      "status": "committed"
+    },
+    "label_cardinality": "bounded"
+  },
+  "assertions": [
+    "emitted metric label 'command' equals 'SetEnforcementMode'",
+    "command label drawn from approved enumeration",
+    "no free-form or dynamic label value used",
+    "metric cardinality remains bounded",
+    "label domain validation passes"
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "fixture_id": "cap-bounds-enforced",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "late_output_overflow_contract_v1",
+  "description": "The overflow latch enforces a maximum cap on the number of late outputs accepted per slot; outputs beyond the cap are rejected.",
+  "preconditions": {
+    "latch": {
+      "latch_id": "latch-004",
+      "run_id": "run-overflow-004",
+      "stage_id": "stage-d",
+      "artifact_key": "streaming_output",
+      "state": "active",
+      "output_count": 99,
+      "cap_limit": 100
+    }
+  },
+  "action": {
+    "event": "LateOutputArrived",
+    "latch_id": "latch-004",
+    "late_output_index": 101
+  },
+  "expected_outcome": "rejected",
+  "assertions": [
+    "output_count=99, cap_limit=100: 100th output accepted",
+    "101st output rejected with CapExceeded error",
+    "latch state transitions to cap_exceeded after limit hit",
+    "cap_limit configurable per latch type",
+    "operator notified when latch reaches cap"
+  ],
+  "cap_config": {
+    "cap_limit": 100,
+    "overflow_policy": "reject_after_cap"
+  }
+}

@@ -155,7 +155,21 @@ pub fn resolve_paths(mode: DaemonMode) -> Result<ModePaths> {
     std::fs::create_dir_all(&app_support_dir)
         .with_context(|| format!("create app_support_dir {}", app_support_dir.display()))?;
 
-    let database_url = std::env::var("DATABASE_URL").unwrap_or(default_db);
+    // SEC-M002: In packaged modes, ignore DATABASE_URL overrides from the inherited environment.
+    // An attacker-controlled DATABASE_URL could redirect execution-truth storage outside the
+    // intended Application Support directory. Dev/Test/Mcp modes still allow DATABASE_URL for
+    // development and testing flexibility.
+    let database_url = if mode.is_packaged() {
+        if std::env::var("DATABASE_URL").is_ok() {
+            tracing::warn!(
+                mode = %mode,
+                "DATABASE_URL env override ignored in packaged mode; using app-support default"
+            );
+        }
+        default_db
+    } else {
+        std::env::var("DATABASE_URL").unwrap_or(default_db)
+    };
     let bind_addr = std::env::var("GRAPHQL_ADDR").unwrap_or(default_bind);
 
     let principals_path = match std::env::var("CHAINWORKS_AUTH_PRINCIPALS_PATH") {
@@ -245,14 +259,39 @@ pub fn resolve_paths(mode: DaemonMode) -> Result<ModePaths> {
 /// configured `bind_addr` specifies a non-loopback host in a packaged
 /// mode, rewrite it to `127.0.0.1` preserving the port. Dev/test modes
 /// are left unchanged.
+///
+/// Fail-closed: in packaged mode, any address that cannot be parsed as a
+/// numeric `SocketAddr` (e.g. a hostname or bare port) is treated as
+/// non-loopback and rewritten. Callers must not pass wildcard, hostname,
+/// or otherwise non-literal addresses in packaged mode.
 pub fn enforce_loopback(paths: &mut ModePaths) {
     if !paths.mode.is_packaged() {
         return;
     }
-    if let Ok(sock) = SocketAddr::from_str(&paths.bind_addr) {
-        if !sock.ip().is_loopback() {
+    match SocketAddr::from_str(&paths.bind_addr) {
+        Ok(sock) if sock.ip().is_loopback() => {
+            // Already loopback; nothing to rewrite.
+        }
+        Ok(sock) => {
+            // Parseable but non-loopback: rewrite preserving the port.
             let new = SocketAddr::new("127.0.0.1".parse().unwrap(), sock.port());
+            tracing::warn!(
+                original = %paths.bind_addr,
+                rewritten = %new,
+                "packaged mode: non-loopback bind address rewritten to loopback"
+            );
             paths.bind_addr = new.to_string();
+        }
+        Err(_) => {
+            // Unparseable address (hostname, malformed, bare port, etc.).
+            // Fail closed: force loopback on the default port so the daemon
+            // stays local. bind_with_fallback will fall back to :0 if busy.
+            tracing::warn!(
+                original = %paths.bind_addr,
+                "packaged mode: bind address is not a numeric SocketAddr; \
+                 forcing 127.0.0.1:4000 to enforce loopback restriction"
+            );
+            paths.bind_addr = "127.0.0.1:4000".to_string();
         }
     }
 }
@@ -497,6 +536,48 @@ mod tests {
         };
         enforce_loopback(&mut paths);
         assert_eq!(paths.bind_addr, "0.0.0.0:4000");
+    }
+
+    #[test]
+    fn enforce_loopback_hostname_packaged_forces_loopback() {
+        // Hostname addresses (non-numeric) must be rejected fail-closed in packaged mode.
+        for addr in &["localhost:4000", "my-host:4000", "4000", "invalid"] {
+            let mut paths = ModePaths {
+                mode: DaemonMode::PackagedApp,
+                database_url: "sqlite::memory:".into(),
+                principals_path: PathBuf::from("/tmp/p.json"),
+                app_support_dir: PathBuf::from("/tmp"),
+                log_path: None,
+                bind_addr: (*addr).into(),
+            };
+            enforce_loopback(&mut paths);
+            assert!(
+                paths.bind_addr.starts_with("127.0.0.1:"),
+                "expected loopback for {addr}, got {}",
+                paths.bind_addr
+            );
+        }
+    }
+
+    #[test]
+    fn enforce_loopback_wildcard_ipv6_packaged_forces_loopback() {
+        // IPv6 wildcard and non-loopback addresses must be rewritten in packaged mode.
+        for addr in &["[::]:4000", "0.0.0.0:4000", "192.168.1.1:4000"] {
+            let mut paths = ModePaths {
+                mode: DaemonMode::PackagedApp,
+                database_url: "sqlite::memory:".into(),
+                principals_path: PathBuf::from("/tmp/p.json"),
+                app_support_dir: PathBuf::from("/tmp"),
+                log_path: None,
+                bind_addr: (*addr).into(),
+            };
+            enforce_loopback(&mut paths);
+            assert!(
+                paths.bind_addr.starts_with("127.0.0.1:"),
+                "expected loopback for {addr}, got {}",
+                paths.bind_addr
+            );
+        }
     }
 
     #[tokio::test]

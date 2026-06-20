@@ -1841,7 +1841,7 @@ async fn test_cancel_run_phase1_cancels_agent_executions_and_running_work_items(
     let handler = make_command_handler(pool.clone());
     handler
         .handle(
-            Command::CancelRun(domain::commands::CancelRunCmd { run_id }),
+            Command::CancelRun(domain::commands::CancelRunCmd { run_id, request_id: Some(uuid::Uuid::new_v4().to_string()) }),
             CallerContext::test_fixture(),
         )
         .await
@@ -2036,7 +2036,7 @@ async fn test_cancel_run_eventually_finalizes_to_cancelled() {
     let handler = make_command_handler(pool.clone());
     handler
         .handle(
-            Command::CancelRun(domain::commands::CancelRunCmd { run_id }),
+            Command::CancelRun(domain::commands::CancelRunCmd { run_id, request_id: Some(uuid::Uuid::new_v4().to_string()) }),
             CallerContext::test_fixture(),
         )
         .await
@@ -2226,6 +2226,7 @@ async fn test_resolve_approval_rejects_mismatched_command_provenance() {
                 run_id: other_run_id,
                 stage_id: "gated_stage".into(),
                 idempotency_key: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -2280,6 +2281,7 @@ async fn test_resolve_approval_rejection_matches_reject_stage_semantics() {
                 run_id,
                 stage_id: "gated_stage".into(),
                 idempotency_key: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -2345,6 +2347,7 @@ async fn test_resolve_approval_rejects_manual_release_to_implementation_refineme
                 run_id,
                 stage_id: "state_11_manual_release".into(),
                 idempotency_key: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::mcp(
                 "operator-test",
@@ -3557,6 +3560,7 @@ async fn test_retry_stage_creates_new_attempt_and_skips_old() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -4662,6 +4666,7 @@ async fn test_retry_stage_creates_missing_run_meta_root_before_new_attempt() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -4711,6 +4716,7 @@ async fn test_retry_stage_legacy_discovery_override_validation_failure_leaves_no
                 legacy_discovery_override_policy: Some(LegacyBroadDiscoveryPolicy::WorkflowOptIn),
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -5274,6 +5280,7 @@ async fn test_retry_stage_targets_latest_matching_attempt() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -5329,6 +5336,7 @@ async fn test_retry_stage_allows_completed_current_stage_when_run_is_blocked() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -5424,6 +5432,7 @@ async fn test_retry_stage_supersedes_workflow_conflict_cursor() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -5531,6 +5540,7 @@ async fn test_retry_stage_with_agent_execution_id_schedules_single_invoke_attemp
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -5981,6 +5991,7 @@ async fn test_retry_stage_with_dead_target_generation_keeps_targeted_retry() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -6127,6 +6138,7 @@ async fn test_targeted_retry_falls_back_from_gemini_proposal_reviewer_backend() 
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -6259,6 +6271,7 @@ async fn test_targeted_retry_uses_current_catalog_binding_when_agent_profile_cha
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -6396,6 +6409,7 @@ async fn test_targeted_retry_falls_back_from_gemini_docs_guardian_backend() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -6533,6 +6547,7 @@ async fn test_targeted_retry_falls_back_from_claude_security_checker_backend() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -6659,6 +6674,7 @@ async fn test_targeted_retry_falls_back_from_claude_quota_proposal_reviewer_back
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -6791,6 +6807,7 @@ async fn test_targeted_retry_falls_back_from_junie_code_writer_quota_to_sonnet()
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -6922,6 +6939,7 @@ async fn test_targeted_retry_falls_back_from_codex_timeout_proposal_reviewer_bac
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -7052,6 +7070,7 @@ async fn test_targeted_retry_falls_back_from_codex_timeout_proposal_writer_backe
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -7176,6 +7195,7 @@ async fn test_targeted_retry_falls_back_from_claude_quota_proposal_aggregation_b
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -7315,6 +7335,7 @@ async fn test_retry_stage_rejects_active_latest_attempt() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -7576,6 +7597,7 @@ agents:
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -13208,7 +13230,7 @@ sys.exit(0)
     ));
     handler
         .handle(
-            Command::CancelRun(domain::commands::CancelRunCmd { run_id }),
+            Command::CancelRun(domain::commands::CancelRunCmd { run_id, request_id: Some(uuid::Uuid::new_v4().to_string()) }),
             CallerContext::test_fixture(),
         )
         .await
@@ -15959,6 +15981,7 @@ async fn test_post_approval_retry_requires_fresh_approval() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )

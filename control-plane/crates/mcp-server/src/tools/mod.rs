@@ -14,7 +14,7 @@ pub mod storage;
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
 
-pub fn all_capability_tool_ids() -> [CapabilityToolId; 45] {
+pub fn all_capability_tool_ids() -> [CapabilityToolId; 50] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -27,7 +27,6 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 45] {
         CapabilityToolId::RunsMainSyncRepairState,
         CapabilityToolId::RunsMainSyncRecordRecoveryDecision,
         CapabilityToolId::RunsKnowledgeCapsuleIgnore,
-        CapabilityToolId::RunsRetrofitCatalogSnapshot,
         CapabilityToolId::RunsCancel,
         CapabilityToolId::ApprovalsList,
         CapabilityToolId::ApprovalsResolve,
@@ -61,6 +60,12 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 45] {
         CapabilityToolId::AgentsContinuationCandidates,
         CapabilityToolId::AgentsContinueWork,
         CapabilityToolId::AutomationAutoRetryLatest,
+        CapabilityToolId::ProviderSessionShutdown,
+        CapabilityToolId::P083RollbackExecution,
+        CapabilityToolId::P083SetEnforcementMode,
+        CapabilityToolId::RetryRun,
+        CapabilityToolId::SideEffectsForceReconcile,
+        CapabilityToolId::ProviderSessionMarkProcessAbsent,
     ]
 }
 
@@ -93,7 +98,6 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
             Some(CapabilityToolId::RunsMainSyncRecordRecoveryDecision)
         }
         "runs.knowledge_capsule.ignore" => Some(CapabilityToolId::RunsKnowledgeCapsuleIgnore),
-        "runs.retrofit_catalog_snapshot" => Some(CapabilityToolId::RunsRetrofitCatalogSnapshot),
         "runs.cancel" => Some(CapabilityToolId::RunsCancel),
         "approvals.list" => Some(CapabilityToolId::ApprovalsList),
         "approvals.resolve" => Some(CapabilityToolId::ApprovalsResolve),
@@ -135,6 +139,14 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "agents.continuation_candidates" => Some(CapabilityToolId::AgentsContinuationCandidates),
         "agents.continue_work" => Some(CapabilityToolId::AgentsContinueWork),
         "automation.auto_retry.latest" => Some(CapabilityToolId::AutomationAutoRetryLatest),
+        "provider_session.shutdown" => Some(CapabilityToolId::ProviderSessionShutdown),
+        "provider_session.mark_process_absent" => {
+            Some(CapabilityToolId::ProviderSessionMarkProcessAbsent)
+        }
+        "p083.rollback_execution" => Some(CapabilityToolId::P083RollbackExecution),
+        "p083.set_enforcement_mode" => Some(CapabilityToolId::P083SetEnforcementMode),
+        "runs.retry" => Some(CapabilityToolId::RetryRun),
+        "side_effects.force_reconcile" => Some(CapabilityToolId::SideEffectsForceReconcile),
         _ => None,
     }
 }
@@ -152,7 +164,6 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "runs_main_sync_repair_state" => "runs.main_sync.repair_state",
         "runs_main_sync_record_recovery_decision" => "runs.main_sync.record_recovery_decision",
         "runs_knowledge_capsule_ignore" => "runs.knowledge_capsule.ignore",
-        "runs_retrofit_catalog_snapshot" => "runs.retrofit_catalog_snapshot",
         "runs_cancel" => "runs.cancel",
         "approvals_list" => "approvals.list",
         "approvals_resolve" => "approvals.resolve",
@@ -185,6 +196,12 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "agents_continuation_candidates" => "agents.continuation_candidates",
         "agents_continue_work" => "agents.continue_work",
         "automation_auto_retry_latest" => "automation.auto_retry.latest",
+        "provider_session_shutdown" => "provider_session.shutdown",
+        "provider_session_mark_process_absent" => "provider_session.mark_process_absent",
+        "p083_rollback_execution" => "p083.rollback_execution",
+        "p083_set_enforcement_mode" => "p083.set_enforcement_mode",
+        "runs_retry" => "runs.retry",
+        "side_effects_force_reconcile" => "side_effects.force_reconcile",
         _ => tool_name,
     }
 }
@@ -219,9 +236,6 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
         ),
         CapabilityToolId::RunsKnowledgeCapsuleIgnore => {
             tool_spec_by_name(runs::tool_specs(), "runs.knowledge_capsule.ignore")
-        }
-        CapabilityToolId::RunsRetrofitCatalogSnapshot => {
-            tool_spec_by_name(runs::tool_specs(), "runs.retrofit_catalog_snapshot")
         }
         CapabilityToolId::RunsCancel => tool_spec_by_name(runs::tool_specs(), "runs.cancel"),
         CapabilityToolId::ApprovalsList => {
@@ -314,6 +328,24 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
         }
         CapabilityToolId::AutomationAutoRetryLatest => {
             tool_spec_by_name(automation::tool_specs(), "automation.auto_retry.latest")
+        }
+        CapabilityToolId::ProviderSessionShutdown => {
+            tool_spec_by_name(runs::tool_specs(), "provider_session.shutdown")
+        }
+        CapabilityToolId::ProviderSessionMarkProcessAbsent => {
+            tool_spec_by_name(runs::tool_specs(), "provider_session.mark_process_absent")
+        }
+        CapabilityToolId::P083RollbackExecution => {
+            tool_spec_by_name(runs::tool_specs(), "p083.rollback_execution")
+        }
+        CapabilityToolId::P083SetEnforcementMode => {
+            tool_spec_by_name(runs::tool_specs(), "p083.set_enforcement_mode")
+        }
+        CapabilityToolId::RetryRun => {
+            tool_spec_by_name(runs::tool_specs(), "runs.retry")
+        }
+        CapabilityToolId::SideEffectsForceReconcile => {
+            tool_spec_by_name(runs::tool_specs(), "side_effects.force_reconcile")
         }
     }
 }
@@ -445,22 +477,6 @@ mod tests {
         assert_eq!(
             super::mcp_tool_for(CapabilityToolId::StorageMaintenanceRepairSlot).name,
             "storage.maintenance.repair_slot"
-        );
-    }
-
-    #[test]
-    fn governed_snapshot_retrofit_tool_is_registered_for_codex_aliases() {
-        assert_eq!(
-            super::canonical_tool_name("runs_retrofit_catalog_snapshot"),
-            "runs.retrofit_catalog_snapshot"
-        );
-        assert!(
-            super::capability_id_for("runs.retrofit_catalog_snapshot").is_some(),
-            "governed catalog snapshot retrofit must be a known MCP tool"
-        );
-        assert!(
-            super::capability_id_for("runs_retrofit_catalog_snapshot").is_some(),
-            "Codex underscore alias must resolve to the same governed retrofit tool"
         );
     }
 }

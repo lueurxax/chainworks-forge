@@ -1,0 +1,30 @@
+{
+  "fixture_id": "toolbar-menu-keyboard-denial-parity",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "macos_command_routing_contract_v1",
+  "description": "Toolbar button, menu item, and keyboard shortcut all reflect the same enabled/disabled state for lifecycle commands; no surface inconsistency exists.",
+  "preconditions": {
+    "lifecycle_window_state": "not_key",
+    "command": "RetryStage",
+    "surfaces": ["toolbar_button", "menu_item", "keyboard_shortcut"]
+  },
+  "action": {
+    "event": "CommandStateConsistencyCheck",
+    "command": "RetryStage",
+    "window_state": "no_key_lifecycle_window"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "toolbar_button.enabled == false",
+    "menu_item.enabled == false",
+    "keyboard_shortcut activation has no effect (denied)",
+    "all three surfaces show identical disabled state",
+    "when lifecycle window becomes key, all three surfaces enable simultaneously"
+  ],
+  "parity_check": {
+    "surfaces": ["toolbar_button", "menu_item", "keyboard_shortcut"],
+    "expected_state": "disabled",
+    "parity_required": true
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "fixture_id": "metric-mirrors-byte-equal",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "metrics_label_bounds_contract_v1",
+  "description": "Metric values exported by the Rust control-plane daemon are byte-equal to the values observed in the Swift app's mirrored metrics surface for the same event.",
+  "preconditions": {
+    "rust_daemon_running": true,
+    "swift_app_running": true,
+    "metric_name": "command_journal_writes_total",
+    "label_values": {
+      "command": "CancelRun",
+      "status": "committed"
+    },
+    "rust_counter_value": 42,
+    "swift_mirror_value": 42
+  },
+  "action": {
+    "event": "MetricMirrorConsistencyCheck",
+    "metric_name": "command_journal_writes_total"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "rust_counter_value == swift_mirror_value (byte-equal: 42 == 42)",
+    "label sets are identical between rust and swift surfaces",
+    "no label added or dropped by mirror transport",
+    "mirror update latency < 1000ms under normal conditions",
+    "byte-equal check passes after each increment event"
+  ],
+  "metric_name": "command_journal_writes_total",
+  "label_domains": {
+    "command": "bounded_enum",
+    "status": "bounded_enum"
+  }
+}

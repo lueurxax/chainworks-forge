@@ -1569,7 +1569,7 @@ async fn drive_runtime_events_through_executor(
         if expected_run_status == "cancelled" && cancel_requested && expected_stages_settled {
             cancel_handler
                 .handle(
-                    Command::CancelRun(CancelRunCmd { run_id }),
+                    Command::CancelRun(CancelRunCmd { run_id, request_id: Some(uuid::Uuid::new_v4().to_string()) }),
                     CallerContext::mcp("p041-parity", &PrincipalClass::Operator, "runs.cancel"),
                 )
                 .await

@@ -1,3 +1,7 @@
+pub mod cancel_late_output_overflow;
+pub mod command_idempotency;
+pub mod provider_sessions;
+pub mod shutdown_receipts;
 pub mod agent_execution_discovery_diagnostics;
 pub mod agent_execution_runtime_facts;
 pub mod agent_execution_runtime_receipts;

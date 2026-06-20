@@ -1,0 +1,32 @@
+{
+  "fixture_id": "requested-null-epoch-identity-ambiguous-transitions-to-held",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "cancellation_identity_contract_v1",
+  "description": "A cancellation request where the epoch is null (identity cannot be determined) transitions the run to held_identity_ambiguous rather than proceeding.",
+  "preconditions": {
+    "run_id": "run-cancel-001",
+    "run_state": "running",
+    "cancellation_epoch": null,
+    "session_id": "session-cancel-001"
+  },
+  "action": {
+    "command": "RequestCancellation",
+    "run_id": "run-cancel-001",
+    "session_id": "session-cancel-001",
+    "epoch": null
+  },
+  "expected_outcome": "hold",
+  "assertions": [
+    "run transitions to held_identity_ambiguous state",
+    "cancellation NOT issued to provider (epoch unknown)",
+    "operator UI shows identity check banner",
+    "run remains in held_identity_ambiguous until operator resolves",
+    "no auto-retry initiated from held state"
+  ],
+  "cancellation_identity": {
+    "epoch": null,
+    "identity_status": "ambiguous",
+    "held_state": "held_identity_ambiguous"
+  }
+}

@@ -269,6 +269,7 @@ async fn test_command_journal_caller_columns_nullable_for_pre_p029_rows() {
         .handle(
             Command::CancelRun(CancelRunCmd {
                 run_id: RunId::new(),
+            request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             caller,
         )

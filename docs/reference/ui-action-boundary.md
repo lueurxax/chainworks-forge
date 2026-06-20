@@ -97,8 +97,13 @@ diagnostic tools. That does not make MCP part of the governed SwiftUI surface.
 Agents and automations must use MCP/control-plane tools for operational actions.
 They must not use GraphQL mutations or direct SQLite writes as a control path.
 
-GraphQL is for UI reads, UI subscriptions, and the two approval mutations only.
-SQLite is internal daemon storage, not an automation API.
+For governed SwiftUI, GraphQL is for UI reads, UI subscriptions, and the two
+approval mutations only. The P083 operator GraphQL lifecycle mutations
+(`providerSessionShutdown`, `p083MarkProviderSessionProcessAbsent`,
+`p083RollbackExecution`, `p083SetEnforcementMode`, `runsRetry`) are
+non-UI command surface for explicitly authorized operator callers and
+are not accessible from governed SwiftUI. SQLite is internal daemon
+storage, not an automation API.
 
 ## Owner References
 

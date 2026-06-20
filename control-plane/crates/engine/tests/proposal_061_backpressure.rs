@@ -448,6 +448,7 @@ async fn approve_retry_cancel_p95_latency_stays_below_two_seconds_under_twenty_a
                     legacy_discovery_override_policy: None,
                     legacy_discovery_override_reason: None,
                     operator_instruction: None,
+                    request_id: Some(uuid::Uuid::new_v4().to_string()),
                 }),
                 CallerContext::test_fixture(),
             )
@@ -462,6 +463,7 @@ async fn approve_retry_cancel_p95_latency_stays_below_two_seconds_under_twenty_a
             .handle(
                 Command::CancelRun(CancelRunCmd {
                     run_id: cancel_run_id,
+                    request_id: Some(uuid::Uuid::new_v4().to_string()),
                 }),
                 CallerContext::test_fixture(),
             )
@@ -615,7 +617,7 @@ async fn cancel_run_closes_journal_with_cancellation_settlement_and_scheduler_re
     );
     let commanded = handler
         .handle(
-            Command::CancelRun(CancelRunCmd { run_id }),
+            Command::CancelRun(CancelRunCmd { run_id, request_id: Some(uuid::Uuid::new_v4().to_string()) }),
             CallerContext::test_fixture(),
         )
         .await
@@ -1587,6 +1589,7 @@ async fn retry_stage_capacity_refresh_clears_superseded_invoke_backpressure() {
                 legacy_discovery_override_policy: None,
                 legacy_discovery_override_reason: None,
                 operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
             }),
             CallerContext::test_fixture(),
         )
@@ -1728,6 +1731,7 @@ async fn retry_stage_injected_crashes_roll_back_and_startup_repair_clears_stale_
                     legacy_discovery_override_policy: None,
                     legacy_discovery_override_reason: None,
                     operator_instruction: None,
+                    request_id: Some(uuid::Uuid::new_v4().to_string()),
                 }),
                 CallerContext::test_fixture(),
             )

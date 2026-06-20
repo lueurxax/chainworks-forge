@@ -1,0 +1,31 @@
+{
+  "fixture_id": "held-identity-ambiguous-not-retried-on-restart",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "cancellation_identity_contract_v1",
+  "description": "A run in held_identity_ambiguous state survives a process restart in that same held state and is not automatically retried or advanced.",
+  "preconditions": {
+    "run_id": "run-cancel-002",
+    "run_state": "held_identity_ambiguous",
+    "cancellation_epoch": null,
+    "held_since": "2026-06-11T11:00:00Z"
+  },
+  "action": {
+    "event": "process_restart",
+    "recovery_phase": "held_state_restoration"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "run state remains held_identity_ambiguous after restart",
+    "no automatic retry issued on restart",
+    "operator UI re-displays identity check banner after restart",
+    "held_since timestamp preserved from pre-restart value",
+    "run NOT advanced to any execution state automatically"
+  ],
+  "cancellation_identity": {
+    "epoch": null,
+    "identity_status": "ambiguous",
+    "auto_retry_on_restart": false,
+    "held_state_durable": true
+  }
+}

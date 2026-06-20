@@ -61,6 +61,18 @@ pub enum CapabilityToolId {
     AgentsContinueWork,
     /// P076: read latest observe-only auto-retry ledger/catalog state.
     AutomationAutoRetryLatest,
+    /// P083: initiate graceful shutdown of a provider session.
+    ProviderSessionShutdown,
+    /// P083: execute rollback to permissive or disabled enforcement mode.
+    P083RollbackExecution,
+    /// P083: set the P083 enforcement mode (disabled/permissive/enforce).
+    P083SetEnforcementMode,
+    /// P083: re-queue an AdvanceRun work item for a stalled or failed run.
+    RetryRun,
+    /// P083: force-reconcile a side effect to reconciled status with operator decision.
+    SideEffectsForceReconcile,
+    /// P083: operator confirms provider process is absent for identity-ambiguous hold.
+    ProviderSessionMarkProcessAbsent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]

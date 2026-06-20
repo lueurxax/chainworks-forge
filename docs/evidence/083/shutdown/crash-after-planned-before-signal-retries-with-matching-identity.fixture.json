@@ -1,0 +1,34 @@
+{
+  "fixture_id": "crash-after-planned-before-signal-retries-with-matching-identity",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "shutdown_lifecycle_contract_v1",
+  "description": "A crash after a signal was planned but before it was issued causes restart to retry the signal using the same generation identity, not a new one.",
+  "preconditions": {
+    "termination_class": "crash",
+    "crash_window": "after_planned_before_signal",
+    "signal_entry": {
+      "side_effect_id": "se-crash-001",
+      "state": "planned",
+      "signal_generation": 3,
+      "issued": false
+    }
+  },
+  "action": {
+    "event": "process_restart_after_crash",
+    "recovery_phase": "signal_replay"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "recovery detects planned-but-not-issued signal entry",
+    "signal re-issued with original signal_generation=3",
+    "no new generation allocated for replay",
+    "provider receives signal with matching identity",
+    "duplicate detection uses generation+session_id composite key"
+  ],
+  "recovery_rules": {
+    "restart_required": true,
+    "signal_generation_reused": true,
+    "recovery_source": "planned_signal_side_effect_row"
+  }
+}

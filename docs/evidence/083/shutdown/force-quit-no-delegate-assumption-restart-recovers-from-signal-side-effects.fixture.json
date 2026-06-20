@@ -1,0 +1,40 @@
+{
+  "fixture_id": "force-quit-no-delegate-assumption-restart-recovers-from-signal-side-effects",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "shutdown_lifecycle_contract_v1",
+  "description": "Force-quit (SIGTERM via Activity Monitor) bypasses the AppKit delegate; restart recovery reconstructs state from durable signal side-effect rows.",
+  "preconditions": {
+    "termination_class": "force_quit",
+    "active_runs": 1,
+    "delegate_invoked": false,
+    "side_effect_rows_durable": true,
+    "signal_side_effects": [
+      {
+        "side_effect_id": "se-signal-001",
+        "state": "planned",
+        "signal_generation": 1
+      }
+    ]
+  },
+  "action": {
+    "event": "process_terminated",
+    "signal": "SIGTERM",
+    "source": "force_quit",
+    "delegate_callback_received": false
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "AppKit delegate NOT assumed to have been called",
+    "restart detects planned signal side-effect rows",
+    "recovery re-issues signals from planned side-effect rows",
+    "no duplicate signal emitted for already-committed rows",
+    "run state reconstructed from durable DB without in-memory state"
+  ],
+  "recovery_rules": {
+    "restart_required": true,
+    "recovery_source": "signal_side_effect_rows",
+    "delegate_available": false,
+    "host_budget_honored": false
+  }
+}

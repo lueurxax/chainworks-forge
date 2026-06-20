@@ -1,0 +1,22 @@
+{
+  "fixture_id": "rollback-disposition-mcp-extra-property-rejected",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "rollback_disposition_json_v1",
+  "description": "MCP rollout readback uses wrap_rollback_disposition_for_readback which strips extra keys before validate_rollback_disposition_v1. Extra properties in the stored inline object do not propagate through MCP readback.",
+  "input": {
+    "schema_version": "rollback_disposition_v1",
+    "mode": "p083.rollback_execution_to_permissive_or_disabled",
+    "data_loss_risk": "none",
+    "steps": ["Step 1"],
+    "extra_diagnostic": "leaked diagnostic field"
+  },
+  "expected_mcp_output": {
+    "schema_version": "rollback_disposition_v1",
+    "mode": "p083.rollback_execution_to_permissive_or_disabled",
+    "data_loss_risk": "none",
+    "steps": ["Step 1"]
+  },
+  "expected_outcome": "extra_key_stripped_by_whitelist",
+  "validation_point": "wrap_rollback_disposition_for_readback strict key whitelist in mcp-server/src/tools/runs.rs"
+}

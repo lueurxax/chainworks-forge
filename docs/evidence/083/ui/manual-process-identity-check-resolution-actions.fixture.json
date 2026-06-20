@@ -1,0 +1,49 @@
+{
+  "fixture_id": "manual-process-identity-check-resolution-actions",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "manual_process_identity_check_ui_v1",
+  "description": "ManualProcessIdentityCheckBanner renders the four resolution actions required by manual_process_identity_check_ui_v1: Copy Diagnostic, Retry Identity Check, Mark Process Absent, and Open Provider Session Evidence.",
+  "preconditions": {
+    "process_identity_state": "held_identity_ambiguous",
+    "intent_state": "held",
+    "process_fate": "identity_ambiguous",
+    "run_id": "run-ui-004"
+  },
+  "action": {
+    "event": "ManualProcessIdentityCheckBannerDisplayed",
+    "run_id": "run-ui-004"
+  },
+  "expected_outcome": "pass",
+  "component_name": "ManualProcessIdentityCheckBanner",
+  "assertions": [
+    "copy_diagnostic action rendered and invokable: copies provider_session_id, cancellation_epoch, process_fate, last_seen_pid, process_start_identity hash, and latest receipt id with secrets redacted",
+    "retry_identity_check action rendered: runs read-only process identity probe and refreshes readback without issuing shutdown signals",
+    "mark_process_absent action rendered: requires operator confirmation and CallerRequestId; backend confirms absence before setting process_fate to absent_verified",
+    "open_provider_session_evidence action rendered: opens the evidence panel anchored to the focused lifecycle window",
+    "no automatic retry spinner present for held identity_ambiguous state",
+    "no countdown timer displayed",
+    "actions disabled after hold is cleared by backend — banner clears only after backend readback moves intent_state away from held or process_fate away from identity_ambiguous",
+    "VoiceOver announces title, provider display name, reason, and focused action"
+  ],
+  "resolution_actions": [
+    {
+      "action": "copy_diagnostic",
+      "effect": "Copies provider_session_id, cancellation_epoch, process_fate, last_seen_pid, process_start_identity hash, and latest receipt id with secrets redacted"
+    },
+    {
+      "action": "retry_identity_check",
+      "effect": "Runs a read-only process identity probe and refreshes readback; does not issue shutdown signals"
+    },
+    {
+      "action": "mark_process_absent",
+      "effect": "Requires operator confirmation and CallerRequestId; if backend confirms absence, moves process_fate to absent_verified and resumes settlement"
+    },
+    {
+      "action": "open_provider_session_evidence",
+      "effect": "Opens the evidence panel anchored to the focused lifecycle window"
+    }
+  ],
+  "no_auto_spinner": true,
+  "voiceover_readable": true
+}

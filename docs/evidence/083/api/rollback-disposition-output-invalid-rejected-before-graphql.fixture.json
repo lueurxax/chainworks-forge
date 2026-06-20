@@ -1,0 +1,17 @@
+{
+  "fixture_id": "rollback-disposition-output-invalid-rejected-before-graphql",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "rollback_disposition_json_v1",
+  "description": "RollbackDispositionJSON.to_value() re-validates before serialization and returns Null for invalid values.",
+  "input": {
+    "schema_version": "rollback_disposition_v1",
+    "mode": "p083.rollback_execution_to_permissive_or_disabled",
+    "data_loss_risk": "none",
+    "steps": [],
+    "extra_field": "should be rejected by additionalProperties=false"
+  },
+  "expected_outcome": "reject",
+  "expected_error": "rollback_disposition_v1 extra property not allowed (additionalProperties=false): extra_field",
+  "validation_point": "validate_rollback_disposition_v1 called in RollbackDispositionJSON::validated() and to_value()"
+}

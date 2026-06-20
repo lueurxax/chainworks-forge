@@ -1,0 +1,33 @@
+{
+  "fixture_id": "stages-retry-request-intent-mismatch-denied",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "command_idempotency_contract_v1",
+  "description": "A retry command whose request_id matches an existing entry but intent_hash differs is rejected to prevent silent semantic drift.",
+  "preconditions": {
+    "run_id": "run-003",
+    "run_state": "running",
+    "existing_journal_entry": {
+      "request_id": "req-stage-retry-001",
+      "command": "RetryStage",
+      "status": "committed",
+      "intent_hash": "sha256:original-intent",
+      "stage_id": "stage-b"
+    }
+  },
+  "action": {
+    "command": "RetryStage",
+    "request_id": "req-stage-retry-001",
+    "run_id": "run-003",
+    "stage_id": "stage-b",
+    "intent_hash": "sha256:different-intent"
+  },
+  "expected_outcome": "rejected",
+  "assertions": [
+    "command rejected with IntentMismatch error",
+    "existing journal entry unchanged",
+    "no new execution spawned",
+    "error response includes both expected and provided intent_hash",
+    "lease_state not modified"
+  ]
+}

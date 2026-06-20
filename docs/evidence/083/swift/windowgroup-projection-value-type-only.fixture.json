@@ -1,0 +1,26 @@
+{
+  "fixture_id": "windowgroup-projection-value-type-only",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "swift_swiftdata_lifecycle_contract_v1",
+  "description": "WindowGroup content receives only value-type projection data; no reference-typed lifecycle ModelContext or ModelObject is passed directly into the view.",
+  "preconditions": {
+    "p083_enforcement": true,
+    "windowgroup_data_types": ["RunProjection", "StageProjection"],
+    "reference_types_in_windowgroup": false
+  },
+  "action": {
+    "event": "window_content_render",
+    "window": "MainWindowGroup"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "all data passed into WindowGroup content is value-type (struct/enum)",
+    "no ModelObject reference types directly bound in WindowGroup closure",
+    "no lifecycle ModelContext injected via .modelContext modifier in WindowGroup",
+    "projection types (RunProjection, StageProjection) are Sendable structs",
+    "mutations route through service layer, not direct context inside window"
+  ],
+  "model_container_type": "projection_only",
+  "lifecycle_access_allowed": false
+}

@@ -1,0 +1,32 @@
+{
+  "fixture_id": "sigkill-abrupt-restart-recovery-no-delegate-callback",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "contract": "shutdown_reliability_contract_v1",
+  "description": "SIGKILL provides no delegate callback opportunity; restart recovery must not assume any cleanup occurred and reads exclusively from durable storage.",
+  "preconditions": {
+    "termination_class": "sigkill",
+    "delegate_invoked": false,
+    "delegate_callback_received": false,
+    "in_flight_cancellation_intents": [
+      {"intent_id": "ci-010", "state": "requested"},
+      {"intent_id": "ci-011", "state": "requested"}
+    ]
+  },
+  "action": {
+    "event": "process_restart_after_sigkill",
+    "recovery_phase": "cancellation_recovery"
+  },
+  "expected_outcome": "pass",
+  "assertions": [
+    "delegate_callback_received is false and recovery proceeds",
+    "no in-memory state from pre-SIGKILL execution consulted",
+    "cancellation intents ci-010 and ci-011 re-issued",
+    "recovery completes correctly without delegate cleanup assumptions",
+    "run state consistent with last durable checkpoint"
+  ],
+  "host_budget": {
+    "host_total_ms": null,
+    "budget_class": "none_abrupt"
+  }
+}

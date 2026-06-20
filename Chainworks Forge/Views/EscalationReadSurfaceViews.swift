@@ -1203,7 +1203,8 @@ struct EscalationTraceTimeline: View {
 enum EscalationTracePasteboardWriter {
     static func copy(redactedTraceJSON: String, pasteboard: NSPasteboard = .general) {
         let data = Data(redactedTraceJSON.utf8)
-        pasteboard.clearContents()
+        // SEC-P083-MED-002: use currentHostOnly to prevent Universal Clipboard leakage of diagnostic data.
+        pasteboard.prepareForNewContents(with: .currentHostOnly)
         pasteboard.setString(redactedTraceJSON, forType: .string)
         pasteboard.setData(data, forType: NSPasteboard.PasteboardType("public.json"))
     }
