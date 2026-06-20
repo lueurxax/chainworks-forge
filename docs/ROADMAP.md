@@ -70,6 +70,11 @@ Active stabilization and correctness work:
   - Use P082 as the proof harness.
   - Release/publish/git side-effect lanes remain fail-closed and route through durable side-effect reconciliation.
 
+  - P080 implementation refined and underway; active repair remains rollout-gated.
+- **P079** contract-aware output repair and provider fallback.
+  - Keep scoped to contract-output repair/fallback.
+  - Do not include release agents.
+  - Do not bypass durable side-effect safety.
 - **P083** execution-truth ownership invariant model.
   - Move earlier than broad typed-boundary refactor.
   - Name authoritative records for run/stage/agent/approval/artifact/side-effect truth.

@@ -2281,7 +2281,7 @@ Use when:
 - changing auto-retry normative schemas (`auto_retry_observation_v1`, `auto_retry_readback_v1`, `auto_retry_budget_v1`, `auto_retry_known_issues_v1`, `budget_ref_v1`, `observation_summary_v1`, `common_diagnostic_v1`) or their enum domains
 - adding, renaming, or removing retained historical alias negative fixtures or the operator-readback fixture
 - changing the observe-only monitor, JSONL ledger, budget store, MCP readback, or rollup tool
-- referencing the auto-retry observation ledger from dependent proposals (contract-aware repair, stale execution reconciliation, retry test matrix, temporary artifact lifecycle, retry authority)
+- referencing the auto-retry observation ledger from dependent proposals (contract-aware repair, P080 continuous stale execution reconciliation, retry test matrix, temporary artifact lifecycle, retry authority)
 
 Host policy:
 
@@ -2396,6 +2396,64 @@ Important:
 - this gate proves the P081 boundary contract as implemented repository truth: daemon-injected policy wiring, GraphQL/MCP bounded readback, WebSocket close-code enforcement, GraphQL redaction envelopes, Swift redaction/accessibility decoding, approval idempotency, and MCP command idempotency linked to `command_journal`
 - the gate fails closed if the fixture is missing any required row, the doc is missing, the auth/db/readback/WebSocket/idempotency/Swift slices fail, or any of the P081 migrations (`064`–`071`) is absent
 
+### `proposal-080|p080`
+
+Continuous stale execution reconciliation — Phase 1 detection-only scaffolding for the DB migration shape, MCP admission surface (`p080.diagnostics.get.v1`, `p080.reconcile.request.v1` with `requested_action in {diagnose_only, repair_if_safe, hold}`, `p080.clear_permanent_hold.v1`), the rollout-control seed (default-disabled including `live_disable` row and generation counter), the dedup/idempotency repository primitives, the principal-class CHECK constraint vocabulary, and the proposal §3.1 admission matrix as exercised at the handler (`diagnose_only` admitted for ReadOnlyOperator, `repair_if_safe` rejected; `clear_permanent_hold` Operator-only). Full Phase 2+ dedup replay/fingerprint-conflict handling is not enabled in this gate.
+
+Scope:
+
+- `control-plane/crates/db/migrations/086_p080_stale_execution_reconciliation.sql` exists and declares the approved `principal_class IN ('operator','read_only_operator')` check constraint (no `'agent'` admission)
+- `cargo build -p db -p mcp-server` succeeds
+- the DB unit tests under `cargo test -p db` cover the rollout-control seed (all classes inserted, idempotent reseed, includes the detection-only class), the read-side classifier and readback page (empty-DB shape, single-row readback), the dedup-entry roundtrip, the reconciliation event insert, the live-loop diagnose-only path (`stale_suspected` remains `stale_suspected` with `repair_action=diagnose_only`), and the secret-like redaction matrix for embedded secrets in diagnostic strings
+- the MCP unit tests under `cargo test -p mcp-server` cover `p080.diagnostics.get.v1` (rollout-disabled while `detection_only` is off, empty when enabled, read-only, opaque cursor forward-pagination, malformed-cursor rejection with `cursor_reason: malformed`, nested-filter-field validation), schema-version-required errors, `p080.reconcile.request.v1` with `diagnose_only` happy-path (returns `diagnosed`) and dedup-key rejection, `repair_if_safe` while class rollout is disabled (`class_disabled` or `rollout_disabled`), `repair_if_safe` while the class row is enabled but active repair is still phase-gated (`rollout_disabled`), `p080.clear_permanent_hold.v1` (`action_disabled_in_phase` and the P080-specific dedup precheck), ReadOnlyOperator handler admission (can call `diagnose_only`; rejected for `repair_if_safe`), HTTP duplicate-key scanning (before JSON-RPC parse, before auth, with escaped method and Unicode-escaped key canonicalization), fail-closed `tools/list` filtering that omits Codex aliases when the rollout-control row is unreadable, and the current pre-dedup rollout-gate behavior for repeated, changed, fingerprint-mismatch, or `live_disable` generation-mismatch `repair_if_safe` requests
+- the canonical test list lives in `PROPOSAL_080_RUST_TESTS` in `scripts/test-gate.sh`; renamed or missing tests must update both the array and the gate-run grep guard
+
+Use when:
+
+- editing the P080 migration, the `db::repos::p080` repo, the `mcp-server::tools::p080` surface, or the rollout-control seed
+- changing the diagnostic allow-list, dedup principal-class vocabulary, or the rollout fail-closed defaults
+
+Host policy:
+
+- local Rust toolchain only; no UI host, daemon, or network required
+
+### `proposal-086|p086|p086-continuation-preflight`
+
+Retained historical gate alias for agent work continuation: migration shape, MCP/artifact JSON Schemas, Rust domain/DB/MCP unit tests for `agents.continue_work`, `agents.continuation_status`, and `agents.continuation_candidates`, the async MCP admission plus terminal-readback contract, GraphQL continuation readback tests, passive SwiftUI readback source guards plus the dedicated P031 Swift readback test slice, durable metrics checks, orphan ACP reap checks, duplicate prompt reconciliation guards, plus a daemon-level MCP -> worker -> live ACP reuse regression. The stable contract lives in [`agent-work-continuation.md`](agent-work-continuation.md); `proposal-086`, `p086`, and `p086-continuation-*` remain gate names only.
+
+Scope:
+
+- `control-plane/crates/db/migrations/065_p086_agent_work_continuations.sql` exists and declares the tables `agent_work_continuations`, `agent_external_side_effect_ledger`, and `supervised_workers_continuation`, the required indexes (`idx_awc_agent_created_at`, `idx_awc_run_status`, `idx_awc_stage`, `idx_awc_recon`, `idx_awc_admission`, `idx_awc_recovery`, `idx_ledger_cont_seq`, `idx_ledger_unresolved`, `idx_swc_heartbeat`, `idx_swc_generation`, `uniq_swc_active_continuation`), and SHA-256 `NOT GLOB` check constraints
+- `control-plane/crates/db/migrations/066_p086_supervised_worker_provider_process.sql` declares the durable provider pid/process-group/uid binding used by restart recovery, and `067_p086_continuation_metric_events.sql` declares bounded metric events plus the `idx_p086_metric_run_time` index
+- `control-plane/crates/db/migrations/066_p086_supervised_worker_provider_process.sql` exists and declares durable provider process binding fields (`provider_child_pid`, `provider_process_group_id`, `provider_process_uid`) used by restart orphan-reap recovery
+- All six MCP schemas under `docs/reference/p086/schemas/mcp/` parse as Draft 2020-12 JSON Schema; `agents.continue_work.request.schema.json` exposes the full continuation context (`run_id`, `stage_execution_id`, `session_generation_id`, `provider_session_id`, `operator_instruction`, `max_turns`, `max_wall_clock_seconds`, `blockers`), and `agents.continue_work.response.schema.json` requires the `outcome` field
+- `agents.continue_work.response.schema.json` remains a bounded async admission response (`accepted` / `replay` / `rejected`) and does not reintroduce terminal artifact fields that belong to `agents.continuation_status`, `continuations(runId:)`, and `continuationStatus(agentExecutionId:)`
+- `control-plane/crates/engine/src/executor.rs` routes live-handle continuation through ACP `execute(... reuse_existing_session=true ...)`, does not call ACP `start_session` for that path, persists the ACP provider process binding, reconciles duplicate post-`prompt_sent` work only from post-continuation worktree evidence paired with a committed `provider_send` row, records durable continuation metric events for raw counters and KPI rollups (useful progress, validation success, time saved, provider/session budget), and contains the canonical P086 mode-reset prompt guardrails retained by the implementation
+- Admission is catalog-gated and side-effect-safe: `examples/agents/agents.yaml` declares `code_writer.continuation_capability`, the workflow catalog model preserves it in frozen snapshots, MCP admission rejects forbidden release/publish/git-push/upload/distribution lanes, engine-owned lead-auto orchestration validates `lead_continuation_decision_v1` and enqueues `ProcessContinuation`, and admission queries unresolved P078 `side_effects` before accepting a continuation
+- `lead_auto` may enter through Agent principals only for `trigger_kind=lead_auto`; the handler still requires server-side lead decision artifact identity/hash/target/safety validation before admission
+- Startup recovery contains the durable provider process-group reap path and records `orphan_reap_attempted` / `orphan_reap_verified` evidence, signal counts, and TERM/KILL deadlines before releasing stale supervised-worker rows
+- GraphQL exposes `continuationStatus`, `continuationCandidates`, `continuations(runId:)`, and `continuationMetricsSummary(runId:)`; the Swift P031 read model and Runs Overview card consume the history/metrics fields, including P086 rates/time-saved/budget rollups, as passive readback only, and `Proposal031ThinGraphQLReadBoundaryTests` runs inside the P086 gate to prove the Swift decode/presentation path
+- All nine artifact schemas under `docs/reference/p086/schemas/artifacts/` parse as JSON Schema with `additionalProperties=false`
+- Rust tests covering `domain::continuation`, the `agent_work_continuations` repo including metric summaries, the `agents.*` MCP tool surface, auth lead-auto capability, GraphQL continuation history/metrics readback, orphan provider process-group reap, and the daemon-level MCP → continuation worker → live ACP reuse path run green under `cargo test`
+
+Use when:
+
+- Landing or revising the continuation migration, schema artifacts, or Rust admission/repo/MCP/runtime worker surface
+- Verifying that the canonical continuation path still reuses a live ACP session instead of falling back to a fresh-session path
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-080
+./scripts/test-gate.sh p080
+```
+
+Important:
+
+- `p080` is accepted as an alias
+- the gate fails closed if the migration file is absent, the principal-class CHECK constraint deviates from the approved vocabulary, any test in `PROPOSAL_080_RUST_TESTS` returns non-zero, or `cargo test` produces no matching test line for a listed name (rename/typo guard)
+- Phase 1 is detection-only by default: `p080.diagnostics.get.v1` refuses with `rollout_disabled` while `detection_only` is disabled; MCP `repair_if_safe` still refuses with `rollout_disabled` after the class row is enabled because active repair is phase-gated; the live loop records `diagnosed` / `diagnose_only` readback and reconciliation events whenever `live_disable` is off and `detection_only` is enabled (the `acp_startup_stale` class flag only sets `rollout_disablement` to `none` vs `class_disabled` in the readback and does not gate event emission); `clear_permanent_hold` remains `action_disabled_in_phase`; the handler unit tests (`p080_read_only_operator_can_call_diagnose_only`, `p080_read_only_operator_rejected_for_repair_if_safe`) lock in the proposal §3.1 handler-level matrix (`diagnose_only` admitted, `repair_if_safe` rejected with `unauthorized_missing_capability`). The auth capability table admits ReadOnlyOperator for `p080.diagnostics.get.v1` and `p080.reconcile.request.v1`, keeps `p080.clear_permanent_hold.v1` Operator-only, and grants ReadOnlyOperator no MCP resources; those auth-unit regressions are outside this DB/MCP-focused gate.
+
 ### `proposal-086|p086|p086-continuation-preflight`
 
 Retained historical gate alias for agent work continuation: migration shape, MCP/artifact JSON Schemas, Rust domain/DB/MCP unit tests for `agents.continue_work`, `agents.continuation_status`, and `agents.continuation_candidates`, the async MCP admission plus terminal-readback contract, GraphQL continuation readback tests, passive SwiftUI readback source guards plus the dedicated P031 Swift readback test slice, durable metrics checks, orphan ACP reap checks, duplicate prompt reconciliation guards, plus a daemon-level MCP -> worker -> live ACP reuse regression. The stable contract lives in [`agent-work-continuation.md`](agent-work-continuation.md); `proposal-086`, `p086`, and `p086-continuation-*` remain gate names only.
@@ -2429,6 +2487,7 @@ Command:
 ```
 
 Important:
+
 
 - `p086` and `p086-continuation-preflight` are accepted as aliases for the Phase 0 preflight
 - the gate fails closed when any required migration element, SHA-256 constraint, MCP/artifact schema, Rust unit test, passive SwiftUI readback hook, duplicate-send reconciliation guard, or daemon-level live ACP reuse regression is missing or invalid

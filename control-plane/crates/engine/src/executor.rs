@@ -26,7 +26,7 @@ use db::repos::{
     agent_execution_runtime_receipts, agent_executions, agent_retry_budget_ledger,
     artifact_contracts, artifacts, code_writer_completion_receipts, escalation as escalation_repo,
     evidence_spool_refs, ideas, legacy_discovery_overrides, output_contract_repair as ocr_repo,
-    projections, rollout_contract_checks, runs, scheduler, sessions, stages, storage_health,
+    p080, projections, rollout_contract_checks, runs, scheduler, sessions, stages, storage_health,
     validation, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
@@ -671,7 +671,7 @@ fn apply_escalation_backend_override(
     payload["provider"] = serde_json::json!(provider.clone());
     payload["backend_profile_id"] = serde_json::json!(backend_profile_id.clone());
     match backend_override.model.as_deref() {
-        Some(model) => payload["model"] = serde_json::json!(model),
+        Some(m) => payload["model"] = serde_json::json!(m),
         None => {
             if let Some(object) = payload.as_object_mut() {
                 object.remove("model");
@@ -826,11 +826,9 @@ async fn invoke_item_has_start_capacity(
     }
     let mut provider_family =
         ProviderFamily::canonicalize_known_alias(provider).unwrap_or_else(|| provider.to_string());
-    let model = payload
-        .get("model")
-        .and_then(|value| value.as_str())
-        .map(String::from);
-    let model_ref = model.as_deref();
+    let model = payload.get("model").and_then(|value| value.as_str());
+    let model_owned = model.map(String::from);
+    let model_ref = model_owned.as_deref();
     let now = chrono::Utc::now();
     if let Some(wait) =
         provider_quota_retry_wait_active(pool, &provider_family, model_ref, now).await?
@@ -1690,6 +1688,7 @@ impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExe
                 reuse_existing_session: false,
                 session_generation_id: None,
                 provider_session_id: None,
+                provider_runtime_home: None,
                 mcp_servers: mcp_resolution.payloads,
                 chainworks_meta_root: Some(
                     invocation
@@ -5517,6 +5516,13 @@ impl BackgroundExecutor {
                 .await;
         });
 
+        let p080_reconciler = Arc::clone(&self);
+        tokio::spawn(async move {
+            p080_reconciler
+                .run_p080_stale_execution_reconciliation_loop()
+                .await;
+        });
+
         tokio::spawn(async move {
             self.run_loop().await;
         })
@@ -5585,6 +5591,321 @@ impl BackgroundExecutor {
                 }
             }
         }
+    }
+
+    /// P080 Phase 2b: Live-loop automatic stale execution reconciliation.
+    ///
+    /// Classifier/diagnose tick interval and per-tick limits.
+    /// All runtime control is via the durable `p080_rollout_control_v1` table —
+    /// no env-var override path; that was an extra-contract gate removed per
+    /// audit finding (rollout_control is the single authoritative gate).
+    const P080_LOOP_INTERVAL_SECS: u64 = 30;
+    const P080_LOOP_MAX_PER_TICK: usize = 10;
+    const P080_LOOP_TICK_DEADLINE_SECS: u64 = 20;
+
+    /// Periodically classifies running executions and, when the rollout-control
+    /// flag for `acp_startup_stale` is enabled, runs the Phase 0/1/2
+    /// diagnose_only pass. No actual ACP session resets or scheduler capacity
+    /// reclamation happen until Phase 3+ is promoted via rollout_control.
+    ///
+    /// Admission gate: the `acp_startup_stale` rollout_control row must be
+    /// present and enabled (fail-closed: missing or disabled → skip repair).
+    async fn run_p080_stale_execution_reconciliation_loop(self: Arc<Self>) {
+        let interval = Duration::from_secs(Self::P080_LOOP_INTERVAL_SECS);
+        let max_per_tick = Self::P080_LOOP_MAX_PER_TICK;
+        let tick_deadline = Duration::from_secs(Self::P080_LOOP_TICK_DEADLINE_SECS);
+
+        // live_disable is re-read on every tick inside p080_reconciliation_tick so
+        // flipping the flag at runtime resumes the loop without a daemon restart.
+        // Do NOT exit permanently here — fall through to the tick loop.
+
+        info!(
+            interval_secs = interval.as_secs(),
+            max_per_tick,
+            tick_deadline_secs = tick_deadline.as_secs(),
+            "P080 stale-execution reconciliation loop started (rollout_control is the admission gate)"
+        );
+
+        loop {
+            sleep(interval).await;
+
+            let tick_result =
+                tokio::time::timeout(tick_deadline, self.p080_reconciliation_tick(max_per_tick))
+                    .await;
+            match tick_result {
+                Ok(diagnosed) => {
+                    if diagnosed > 0 {
+                        info!(diagnosed, "P080 live loop tick: diagnosed stale executions (Phase 0/1/2 — diagnose_only, no actual ACP reset)");
+                    }
+                }
+                Err(_) => {
+                    warn!(
+                        deadline_secs = tick_deadline.as_secs(),
+                        "P080 reconciliation tick exceeded deadline; backpressure applied"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Single reconciliation tick: classify running executions and, when
+    /// rollout is enabled, emit a `diagnosed` event for each `stale_suspected`
+    /// row (Phase 0/1/2 — diagnose_only; no actual ACP reset or scheduler
+    /// capacity reclamation until Phase 3+ is promoted via rollout_control).
+    /// Returns the number of executions diagnosed this tick.
+    ///
+    /// MISSING-002 fix: detection_only independently enables the classifier and
+    /// heartbeat upserts; acp_startup_stale gates only the reconciliation-event
+    /// emission.  Phase 1 (detection_only=on, acp_startup_stale=off) produces
+    /// readback rows but no reconciliation events.
+    async fn p080_reconciliation_tick(&self, max_per_tick: usize) -> usize {
+        // SEC-HIGH-001 fix: live_disable is the global kill switch — check it FIRST.
+        // Fail-closed: absent row is treated as disabled (kill switch state unknown).
+        match db::repos::p080::get_rollout_control(&self.pool, "live_disable").await {
+            Ok(Some(row)) if row.enabled => {
+                info!("P080 live_disable active; skipping reconciliation tick");
+                db::metrics::increment_counter_with_label(
+                    "p080_reconciliation_deferred_total",
+                    "live_disable",
+                );
+                return 0;
+            }
+            Ok(Some(_)) => {} // row present and disabled → proceed
+            Ok(None) => {
+                warn!("P080 live_disable rollout-control row absent; skipping tick (fail-closed)");
+                db::metrics::increment_counter_with_label(
+                    "p080_reconciliation_deferred_total",
+                    "live_disable",
+                );
+                return 0;
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "P080 failed to read live_disable rollout control; refusing tick (fail-closed)"
+                );
+                db::metrics::increment_counter_with_label(
+                    "p080_reconciliation_deferred_total",
+                    "live_disable",
+                );
+                return 0;
+            }
+        }
+
+        // Fail-closed: detection_only row must be present and enabled before
+        // writing any classifier output.
+        let detection_enabled =
+            match db::repos::p080::get_rollout_control(&self.pool, "detection_only").await {
+                Ok(Some(row)) if row.enabled => true,
+                _ => false,
+            };
+        if !detection_enabled {
+            // detection_only not yet enabled maps to live_disable in the closed
+            // p080_reconciliation_deferred_total reason vocabulary.
+            db::metrics::increment_counter_with_label(
+                "p080_reconciliation_deferred_total",
+                "live_disable",
+            );
+            return 0;
+        }
+
+        // Refresh stale-detection classifier whenever detection_only is on.
+        // This is now independent of whether acp_startup_stale is enabled,
+        // satisfying the Phase 1 detection-only rollout requirement.
+        match db::repos::p080::classify_and_upsert_running_executions(&self.pool).await {
+            Ok(ref counts) if counts.total > 0 => {
+                info!(
+                    classified = counts.total,
+                    acp_startup_stale = counts.acp_startup_stale,
+                    scheduler_ownership_drift = counts.scheduler_ownership_drift,
+                    warmup_pending = counts.warmup_pending,
+                    "P080 classified running executions"
+                );
+                // Emit per-class detection metrics (proposal §7 table).
+                // Labels: class (p080_stale_class), provider (closed set), work_kind (closed set).
+                // Provider and work_kind are unknown in Phase 1 detection-only mode.
+                for _ in 0..counts.acp_startup_stale {
+                    db::metrics::increment_counter_with_label(
+                        "stale_execution_detected_total",
+                        "class=acp_startup_stale,provider=unknown,work_kind=unknown",
+                    );
+                }
+                for _ in 0..counts.scheduler_ownership_drift {
+                    db::metrics::increment_counter_with_label(
+                        "stale_execution_detected_total",
+                        "class=scheduler_ownership_drift,provider=unknown,work_kind=unknown",
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(error = %err, "P080 classifier failed; skipping diagnose this tick");
+                db::metrics::increment_counter_with_label(
+                    "stale_execution_classifier_error_total",
+                    "classifier_db_error",
+                );
+                return 0;
+            }
+        }
+
+        // DEFECT-3 fix: per proposal §Phase0->Phase1 blast-radius cap (L623),
+        // detection-only writes BOTH p080_readback_heartbeats_v1 AND
+        // p080_reconciliation_events_v1 rows with decision=diagnosed, even when
+        // individual repair classes (e.g. acp_startup_stale) remain disabled.
+        // Read acp_startup_stale only to set rollout_disablement in the readback.
+        let (acp_startup_stale_enabled, acp_startup_stale_phase) =
+            match db::repos::p080::get_rollout_control(&self.pool, "acp_startup_stale").await {
+                Ok(Some(row)) => (row.enabled, row.phase),
+                Ok(None) => (false, "phase_0".to_string()),
+                Err(err) => {
+                    warn!(error = %err, "P080 failed to read acp_startup_stale rollout control; using class_disabled disablement");
+                    (false, "phase_0".to_string())
+                }
+            };
+
+        // Fetch stale_suspected rows for this class.
+        let candidates = match db::repos::p080::list_readback_page(
+            &self.pool,
+            db::repos::p080::ReadbackFilter {
+                stale_class: Some("acp_startup_stale".to_string()),
+                ..Default::default()
+            },
+            max_per_tick,
+        )
+        .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                warn!(error = %err, "P080 failed to list stale_suspected rows");
+                return 0;
+            }
+        };
+
+        let mut diagnosed = 0usize;
+        for row in &candidates {
+            // Only diagnose rows still in stale_suspected state.
+            let rb: serde_json::Value =
+                serde_json::from_str(&row.readback_json).unwrap_or_default();
+            let running_truth = rb["running_truth"].as_str().unwrap_or("unknown");
+            if running_truth != "stale_suspected" {
+                continue;
+            }
+
+            let now = chrono::Utc::now();
+            let now_str = now.to_rfc3339();
+
+            let predicate_hash = format!(
+                "{:x}",
+                Sha256::digest(
+                    format!(
+                        "{}:{}:{}:acp_startup_stale",
+                        row.run_id, row.stage_id, row.work_item_id
+                    )
+                    .as_bytes()
+                )
+            );
+
+            // rollout_disablement reflects whether repair is enabled for this class.
+            // In detection-only mode (acp_startup_stale disabled), it is "class_disabled".
+            // Once the class is promoted and enabled, it becomes "none".
+            let rollout_disablement = if acp_startup_stale_enabled {
+                "none"
+            } else {
+                "class_disabled"
+            };
+
+            // Phase 0/1/2 readback: running_truth stays stale_suspected,
+            // repair_action is diagnose_only. No actual ACP reset performed.
+            // repair_idempotency_key is NULL for diagnose_only per proposal §4.3 (L164-168).
+            // Phase 3+: use daemon-keyed HMAC-SHA-256 truncated to p080-rik-<24 hex>.
+            let diagnosed_readback = serde_json::json!({
+                "schema_version": "p080_readback_v1",
+                "run_id": row.run_id,
+                "stage_id": row.stage_id,
+                "work_item_id": row.work_item_id,
+                "stale_class": "acp_startup_stale",
+                "running_truth": "stale_suspected",
+                "repair_action": "diagnose_only",
+                "hold_reason": "none",
+                "hold_age_seconds": null,
+                "next_retry_or_backoff_time": null,
+                "projection_updated_at": now_str,
+                "projection_integrity": "valid",
+                "executor_reregistration_state": "expected",
+                "rollout_disablement": rollout_disablement,
+                "side_effect_status": "not_applicable",
+                "operator_message": "phase=metadata-only: diagnose_only pass, no actual ACP reset performed",
+                "evidence_marker_hash": predicate_hash,
+                "repair_idempotency_key": null
+            });
+
+            let event_id = uuid::Uuid::new_v4().to_string();
+
+            // SEC-H-002 fix: write the reconciliation event and readback update
+            // atomically so a partial failure cannot leave an orphaned event with
+            // a stale readback (or a readback updated without a corresponding event).
+            let diagnosed_readback_str =
+                serde_json::to_string(&diagnosed_readback).unwrap_or_default();
+            if let Err(err) = db::repos::p080::insert_event_and_upsert_readback_atomic(
+                &self.pool,
+                &event_id,
+                &row.run_id,
+                &row.stage_id,
+                &row.work_item_id,
+                "acp_startup_stale",
+                "diagnose_only",
+                "none",
+                &predicate_hash,
+                0,
+                "diagnosed",
+                "live_loop",
+                "system:p080_reconciler",
+                None, // diagnose_only: repair_idempotency_key is NULL per proposal §4.3
+                &diagnosed_readback_str,
+                &now_str,
+            )
+            .await
+            {
+                warn!(
+                    run_id = %row.run_id, stage_id = %row.stage_id,
+                    work_item_id = %row.work_item_id,
+                    error = %err,
+                    "P080 live loop: atomic event+readback write failed; skipping this row"
+                );
+                continue;
+            }
+
+            // Emit readback projection write metric per proposal §7 table.
+            // Labels: lane (mcp|graphql|run_report|release_receipt), status (valid|stale|tamper_detected).
+            db::metrics::increment_counter_with_label(
+                "p080_reconciliation_readback_projection_total",
+                "lane=mcp,status=valid",
+            );
+
+            info!(
+                run_id = %row.run_id, stage_id = %row.stage_id,
+                work_item_id = %row.work_item_id,
+                event_id = %event_id,
+                acp_startup_stale_enabled = %acp_startup_stale_enabled,
+                acp_startup_stale_phase = %acp_startup_stale_phase,
+                "P080 live loop: diagnosed acp_startup_stale execution (Phase 0/1/2 diagnose_only)"
+            );
+            diagnosed += 1;
+        }
+
+        // Retire heartbeat rows for executions that have reached terminal states,
+        // preventing stale diagnostic rows from accumulating indefinitely.
+        match db::repos::p080::retire_terminal_heartbeats(&self.pool).await {
+            Ok(n) if n > 0 => {
+                info!(retired = n, "P080 retired terminal execution heartbeats");
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(error = %err, "P080 retire_terminal_heartbeats failed; continuing");
+            }
+        }
+
+        diagnosed
     }
 
     /// P086 Phase 2: Execute a single continuation row to completion.
@@ -5904,9 +6225,14 @@ You are continuing the same Chainworks agent execution through an existing live 
         provider_result: Option<&acp::ExecutionResult>,
         worktree_root: Option<&str>,
     ) -> anyhow::Result<()> {
-        let transcript_text = provider_result
+        let transcript_text_raw = provider_result
             .and_then(|result| result.transcript_text.as_deref())
             .unwrap_or_default();
+        // SEC-P086-TRANSCRIPT-001: redact secrets (bearer tokens, API keys, local paths)
+        // before persisting any transcript-derived text. Both transcript_preview and
+        // tests_or_gates derive from this and would otherwise persist raw provider output.
+        let transcript_text_owned = redact_runtime_message(transcript_text_raw);
+        let transcript_text: &str = &transcript_text_owned;
         let response_fingerprint = p086_continuation_response_hash(
             &continuation.id,
             terminal_status,
@@ -7399,6 +7725,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                 reuse_existing_session: true,
                 session_generation_id: Some(session_generation_id.clone()),
                 provider_session_id: ctx.provider_session_id.clone(),
+                provider_runtime_home: None,
                 mcp_servers: Vec::new(),
                 chainworks_meta_root: ctx.chainworks_meta_root,
                 legacy_broad_discovery_policy:
@@ -9074,6 +9401,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     provider_session_id: policy_decision
                         .as_ref()
                         .and_then(|decision| decision.generation.provider_session_id.clone()),
+                    provider_runtime_home: None,
                     mcp_servers: mcp_resolution.payloads,
                     chainworks_meta_root: run.chainworks_meta_root.clone(),
                     legacy_broad_discovery_policy: legacy_broad_discovery_policy.clone(),
@@ -10054,11 +10382,18 @@ You are continuing the same Chainworks agent execution through an existing live 
                                         // advisory-only (fail-closed) below.
                                         let p079_unknown_provider = !matches!(
                                             provider_lower.as_str(),
-                                            "claude" | "claude-code" | "anthropic"
-                                            | "codex" | "openai"
-                                            | "gemini" | "google"
-                                            | "junie" | "auggie"
-                                            | "fixture" | "test" | "mock"
+                                            "claude"
+                                                | "claude-code"
+                                                | "anthropic"
+                                                | "codex"
+                                                | "openai"
+                                                | "gemini"
+                                                | "google"
+                                                | "junie"
+                                                | "auggie"
+                                                | "fixture"
+                                                | "test"
+                                                | "mock"
                                         );
                                         let provider_family = match provider_lower.as_str() {
                                             "claude" | "claude-code" | "anthropic" => "claude",
@@ -10079,8 +10414,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                         // SEC-P079-MED-006: unknown providers are also forced advisory
                                         // (fail-closed) to prevent bypass via unrecognized provider aliases.
                                         // Assigned to the outer variable so the dispatch gate can read it.
-                                        p079_permission_enforcement_advisory =
-                                            p079_unknown_provider
+                                        p079_permission_enforcement_advisory = p079_unknown_provider
                                             || !p079_provider_supports_enforced_permissions(
                                                 provider_family,
                                             );
@@ -10323,20 +10657,20 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                 }
                                             };
                                             #[cfg(not(unix))]
-                                            let dir_ok =
-                                                match std::fs::create_dir_all(&plan_ev_dir) {
-                                                    Err(e) => {
-                                                        warn!(
-                                                            run_id = %run_id,
-                                                            repair_attempt_id = %attempt_id,
-                                                            path = %plan_ev_dir.display(),
-                                                            error = %e,
-                                                            "P079: failed to create plan_evidence directory (non-fatal)"
-                                                        );
-                                                        false
-                                                    }
-                                                    Ok(()) => true,
-                                                };
+                                            let dir_ok = match std::fs::create_dir_all(&plan_ev_dir)
+                                            {
+                                                Err(e) => {
+                                                    warn!(
+                                                        run_id = %run_id,
+                                                        repair_attempt_id = %attempt_id,
+                                                        path = %plan_ev_dir.display(),
+                                                        error = %e,
+                                                        "P079: failed to create plan_evidence directory (non-fatal)"
+                                                    );
+                                                    false
+                                                }
+                                                Ok(()) => true,
+                                            };
                                             // P079 MISSING-004 (now implemented): collect plan evidence
                                             // files from provider-specific locations, redact, and store.
                                             if dir_ok && plan_ev_in_boundary {
@@ -12317,20 +12651,42 @@ You are continuing the same Chainworks agent execution through an existing live 
                         // REL-r2-1: status update and lease settlement MUST be atomic.
                         if p079_repair_lease_inserted_outer {
                             if let Some(ref lease_key) = p079_repair_lease_key_outer {
-                                let (ev_status, ev_pres, ev_action, ev_final_settlement, lease_result) =
-                                    if cas_rejected {
-                                        ("blocked", "blocked", "manual_investigation",
-                                         Some("ignored_late_outputs"), "failed_transport")
-                                    } else {
-                                        ("recovered", "recovered", "continue",
-                                         Some("valid_outputs_from_repair"), "accepted")
-                                    };
-                                if let Err(e) = ocr_repo::settle_terminal_event_and_lease(
-                                    &self.pool, attempt_id, lease_key,
-                                    ev_status, ev_pres, ev_action,
+                                let (
+                                    ev_status,
+                                    ev_pres,
+                                    ev_action,
                                     ev_final_settlement,
-                                    lease_result, &p079_post_now,
-                                ).await {
+                                    lease_result,
+                                ) = if cas_rejected {
+                                    (
+                                        "blocked",
+                                        "blocked",
+                                        "manual_investigation",
+                                        Some("ignored_late_outputs"),
+                                        "failed_transport",
+                                    )
+                                } else {
+                                    (
+                                        "recovered",
+                                        "recovered",
+                                        "continue",
+                                        Some("valid_outputs_from_repair"),
+                                        "accepted",
+                                    )
+                                };
+                                if let Err(e) = ocr_repo::settle_terminal_event_and_lease(
+                                    &self.pool,
+                                    attempt_id,
+                                    lease_key,
+                                    ev_status,
+                                    ev_pres,
+                                    ev_action,
+                                    ev_final_settlement,
+                                    lease_result,
+                                    &p079_post_now,
+                                )
+                                .await
+                                {
                                     error!(
                                         repair_attempt_id = %attempt_id,
                                         lease_key = %lease_key,
@@ -12343,17 +12699,31 @@ You are continuing the same Chainworks agent execution through an existing live 
                         } else {
                             let (ev_status, ev_pres, ev_action, ev_final_settlement) =
                                 if cas_rejected {
-                                    ("blocked", "blocked", "manual_investigation",
-                                     Some("ignored_late_outputs"))
+                                    (
+                                        "blocked",
+                                        "blocked",
+                                        "manual_investigation",
+                                        Some("ignored_late_outputs"),
+                                    )
                                 } else {
-                                    ("recovered", "recovered", "continue",
-                                     Some("valid_outputs_from_repair"))
+                                    (
+                                        "recovered",
+                                        "recovered",
+                                        "continue",
+                                        Some("valid_outputs_from_repair"),
+                                    )
                                 };
                             if let Err(e) = ocr_repo::update_repair_event_status(
-                                &self.pool, attempt_id,
-                                ev_status, ev_pres, ev_action,
-                                ev_final_settlement, &p079_post_now,
-                            ).await {
+                                &self.pool,
+                                attempt_id,
+                                ev_status,
+                                ev_pres,
+                                ev_action,
+                                ev_final_settlement,
+                                &p079_post_now,
+                            )
+                            .await
+                            {
                                 error!(
                                     repair_attempt_id = %attempt_id,
                                     cas_rejected,
@@ -15451,6 +15821,12 @@ You are continuing the same Chainworks agent execution through an existing live 
         provider: &str,
         model: Option<String>,
     ) -> Result<Option<Artifact>> {
+        // P080: build the release-receipt reconciliation section separately so it
+        // appears as a top-level field in the receipt JSON, not nested inside
+        // rollout_contract_readback (proposal §8.2 placement requirement).
+        let p080_reconciliation_section =
+            Some(p080::p080_release_receipt_section(&self.pool, &run.id.to_string()).await);
+
         let rollout_contract_readback = {
             let base = rollout_contract_checks::find_terminal_rollout_contract_check_for_run(
                 &self.pool,
@@ -15459,15 +15835,16 @@ You are continuing the same Chainworks agent execution through an existing live 
             .await?
             .map(|check| check.operator_readback_json_for_lane("release_receipt"));
             // Merge live P087 fields into the release_receipt readback lane.
+            // P080 is now a separate top-level field (not merged here).
             match base {
                 Some(base_val) => {
                     let p087 = storage_health::p087_rollout_readback_fields(&self.pool).await;
-                    if let (Some(base_obj), Some(p087_obj)) =
-                        (base_val.as_object(), p087.as_object())
-                    {
+                    if let Some(base_obj) = base_val.as_object() {
                         let mut merged = base_obj.clone();
-                        for (k, v) in p087_obj {
-                            merged.insert(k.clone(), v.clone());
+                        if let Some(p087_obj) = p087.as_object() {
+                            for (k, v) in p087_obj {
+                                merged.insert(k.clone(), v.clone());
+                            }
                         }
                         Some(serde_json::Value::Object(merged))
                     } else {
@@ -15482,6 +15859,7 @@ You are continuing the same Chainworks agent execution through an existing live 
             delivery_config,
             Some(release_result),
             rollout_contract_readback,
+            p080_reconciliation_section,
             idea_title,
             review_status,
         ) {
@@ -18092,6 +18470,12 @@ fn p088_capture_source(source: &acp::AcpCompletionCaptureSource) -> String {
         }
         acp::AcpCompletionCaptureSource::StreamedUpdateTail => "streamed_update_tail".to_string(),
         acp::AcpCompletionCaptureSource::CappedStream => "session_update_stream".to_string(),
+        acp::AcpCompletionCaptureSource::ProviderSessionStoreTaskComplete => {
+            "provider_session_store_task_complete".to_string()
+        }
+        acp::AcpCompletionCaptureSource::ProviderSessionStoreFinalResponse => {
+            "provider_session_store_final_response".to_string()
+        }
     }
 }
 
@@ -18463,7 +18847,7 @@ fn p079_collect_plan_evidence(
 ) -> Option<domain::output_contract_repair::ProviderPlanEvidence> {
     use std::io::Read;
     #[cfg(unix)]
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::MetadataExt;
 
     const PER_FILE_CAP: usize = 262_144; // 256 KiB
     const TOTAL_CAP: usize = 1_048_576; // 1 MiB
@@ -18508,11 +18892,10 @@ fn p079_collect_plan_evidence(
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::io::FromRawFd;
-        let path_cstr =
-            match CString::new(canonical_source_dir.as_os_str().as_bytes()) {
-                Ok(c) => c,
-                Err(_) => return None,
-            };
+        let path_cstr = match CString::new(canonical_source_dir.as_os_str().as_bytes()) {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
         let fd = unsafe {
             libc::open(
                 path_cstr.as_ptr(),
@@ -18680,10 +19063,9 @@ fn p079_collect_plan_evidence(
         // Use write_discovered_output so the destination write goes through the O_NOFOLLOW
         // dirfd walk (SEC-001). This prevents a symlinked dest component from redirecting
         // the write outside the P079-owned directory, and creates the file with mode 0600.
-        if let Err(e) = write_discovered_output(
-            dest_path.to_str().unwrap_or_default(),
-            redacted.as_bytes(),
-        ) {
+        if let Err(e) =
+            write_discovered_output(dest_path.to_str().unwrap_or_default(), redacted.as_bytes())
+        {
             warn!(
                 "P079 plan evidence: failed to write {}: {}",
                 dest_path.display(),
@@ -18695,7 +19077,8 @@ fn p079_collect_plan_evidence(
         // Build meta-root-relative path using agent_execution_id per P079 approved contract.
         // Truncation is tracked via truncated_at_cap bool;
         // do NOT append " [truncated]" to the path string — it breaks Copy Path/Reveal workflows.
-        let relative = format!("output_contract_repair/{agent_execution_id}/plan_evidence/{file_name}");
+        let relative =
+            format!("output_contract_repair/{agent_execution_id}/plan_evidence/{file_name}");
         collected_paths.push(relative);
         total_bytes += content_bytes.len();
     }
@@ -18783,7 +19166,9 @@ fn p079_redact_plan_evidence_content(
             const TOKEN_REPLACEMENT: &str = "CHAINWORKS_MCP_TOKEN=[redacted:credential]";
             let mut scan_offset = 0;
             loop {
-                let Some(rel_idx) = ascii_ci_find(&redacted_line[scan_offset..], TOKEN_KEY) else { break };
+                let Some(rel_idx) = ascii_ci_find(&redacted_line[scan_offset..], TOKEN_KEY) else {
+                    break;
+                };
                 let abs_idx = scan_offset + rel_idx;
                 let key_text = &redacted_line[abs_idx..abs_idx + TOKEN_KEY.len()];
                 let after = &redacted_line[abs_idx + TOKEN_KEY.len()..];
@@ -18818,7 +19203,10 @@ fn p079_redact_plan_evidence_content(
             const BEARER_REPLACEMENT: &str = "Bearer [redacted:credential]";
             let mut scan_offset = 0;
             loop {
-                let Some(rel_idx) = ascii_ci_find(&redacted_line[scan_offset..], AUTH_KEY_BASE) else { break };
+                let Some(rel_idx) = ascii_ci_find(&redacted_line[scan_offset..], AUTH_KEY_BASE)
+                else {
+                    break;
+                };
                 let abs_idx = scan_offset + rel_idx;
                 let after_key = &redacted_line[abs_idx + AUTH_KEY_BASE.len()..];
                 // Skip optional whitespace before the separator.
@@ -18876,7 +19264,10 @@ fn p079_redact_plan_evidence_content(
             const BASIC_REPLACEMENT: &str = "Basic [redacted:credential]";
             let mut scan_offset = 0;
             loop {
-                let Some(rel_idx) = ascii_ci_find(&redacted_line[scan_offset..], "authorization") else { break };
+                let Some(rel_idx) = ascii_ci_find(&redacted_line[scan_offset..], "authorization")
+                else {
+                    break;
+                };
                 let abs_idx = scan_offset + rel_idx;
                 let after_key = &redacted_line[abs_idx + "authorization".len()..];
                 let ws_before = after_key.len()
@@ -18902,11 +19293,8 @@ fn p079_redact_plan_evidence_content(
                         if val_end > 0 {
                             let original_basic_region = &rest[basic_start
                                 ..basic_start + "basic".len() + separator_len + val_end];
-                            redacted_line = redacted_line.replacen(
-                                original_basic_region,
-                                BASIC_REPLACEMENT,
-                                1,
-                            );
+                            redacted_line =
+                                redacted_line.replacen(original_basic_region, BASIC_REPLACEMENT, 1);
                             redactions.push("[redacted:credential]".to_string());
                             scan_offset = abs_idx
                                 + "authorization".len()
@@ -18962,9 +19350,9 @@ fn p079_redact_plan_evidence_content(
                 "access_key",
                 // SEC-P079-MED-001: aliases missed in original pass.
                 "client_secret",
-                "clientsecret",    // matches camelCase clientSecret
-                "accesstoken",     // matches camelCase accessToken
-                "refreshtoken",    // matches camelCase refreshToken
+                "clientsecret", // matches camelCase clientSecret
+                "accesstoken",  // matches camelCase accessToken
+                "refreshtoken", // matches camelCase refreshToken
                 "aws_secret_access_key",
             ];
             for key in JSON_CRED_KEYS {
@@ -18973,22 +19361,38 @@ fn p079_redact_plan_evidence_content(
                 let mut scan_offset = 0;
                 loop {
                     let quoted_key = format!("\"{}\"", key);
-                    let Some(rel_pos) = ascii_ci_find(&redacted_line[scan_offset..], quoted_key.as_str()) else { break };
+                    let Some(rel_pos) =
+                        ascii_ci_find(&redacted_line[scan_offset..], quoted_key.as_str())
+                    else {
+                        break;
+                    };
                     let abs_key_pos = scan_offset + rel_pos;
                     let after_key = &redacted_line[abs_key_pos + quoted_key.len()..];
-                    let after_key_trimmed = after_key.trim_start_matches(|c: char| c == ' ' || c == ':' || c == '\t');
+                    let after_key_trimmed =
+                        after_key.trim_start_matches(|c: char| c == ' ' || c == ':' || c == '\t');
                     // Only redact if value is a non-redacted quoted string (JSON string value shape).
-                    if after_key_trimmed.starts_with('"') && !after_key_trimmed.starts_with("\"[redacted:") {
+                    if after_key_trimmed.starts_with('"')
+                        && !after_key_trimmed.starts_with("\"[redacted:")
+                    {
                         let prefix_len = after_key.len() - after_key_trimmed.len();
                         let val_body = &after_key_trimmed[1..]; // skip opening "
-                        // Find the first unescaped closing quote.
+                                                                // Find the first unescaped closing quote.
                         let val_end = {
                             let mut end = None;
                             let mut escaped = false;
                             for (i, c) in val_body.char_indices() {
-                                if escaped { escaped = false; continue; }
-                                if c == '\\' { escaped = true; continue; }
-                                if c == '"' { end = Some(i); break; }
+                                if escaped {
+                                    escaped = false;
+                                    continue;
+                                }
+                                if c == '\\' {
+                                    escaped = true;
+                                    continue;
+                                }
+                                if c == '"' {
+                                    end = Some(i);
+                                    break;
+                                }
                             }
                             end
                         };
@@ -19048,7 +19452,10 @@ fn p079_redact_plan_evidence_content(
                 for key_name in KV_KEY_NAMES {
                     let mut search_at = 0;
                     while search_at < redacted_line.len() {
-                        let Some(rel_idx) = ascii_ci_find(&redacted_line[search_at..], key_name) else { break };
+                        let Some(rel_idx) = ascii_ci_find(&redacted_line[search_at..], key_name)
+                        else {
+                            break;
+                        };
                         let abs_idx = search_at + rel_idx;
                         if kv_skip.contains(&abs_idx) {
                             search_at = abs_idx + key_name.len();
@@ -19068,8 +19475,7 @@ fn p079_redact_plan_evidence_content(
                                 c == ' ' || c == '\t' || c == '"' || c == '\''
                             });
                             if !val_trimmed.starts_with("[redacted:") {
-                                let val_text_start =
-                                    sep_end + (val_part.len() - val_trimmed.len());
+                                let val_text_start = sep_end + (val_part.len() - val_trimmed.len());
                                 if best.map_or(true, |(b, _)| abs_idx < b) {
                                     best = Some((abs_idx, val_text_start));
                                 }
@@ -19079,7 +19485,9 @@ fn p079_redact_plan_evidence_content(
                         search_at = abs_idx + key_name.len();
                     }
                 }
-                let Some((key_start, val_text_start)) = best else { break };
+                let Some((key_start, val_text_start)) = best else {
+                    break;
+                };
                 let after = &redacted_line[val_text_start..];
                 let val_end = after
                     .find(|c: char| matches!(c, ' ' | '\t' | '"' | '\'' | ',' | '}' | ']'))
@@ -19123,7 +19531,9 @@ fn p079_redact_plan_evidence_content(
             // (SEC-P079-002).
             let mut scan_from: usize = 0;
             loop {
-                let Some(rel_idx) = redacted_line[scan_from..].find(prefix) else { break };
+                let Some(rel_idx) = redacted_line[scan_from..].find(prefix) else {
+                    break;
+                };
                 let idx = scan_from + rel_idx;
                 let after = &redacted_line[idx + prefix.len()..];
                 let key_end = after
@@ -20193,7 +20603,13 @@ plain progress line without gate evidence";
             ),
         };
 
-        let prompt = output_contract_repair_prompt(&validation, &declared_outputs, "test-run-id", "test-stage-exec-id", "test-agent-exec-id");
+        let prompt = output_contract_repair_prompt(
+            &validation,
+            &declared_outputs,
+            "test-run-id",
+            "test-stage-exec-id",
+            "test-agent-exec-id",
+        );
 
         assert!(validation_summary_requires_output_contract_repair(
             &validation
@@ -20213,9 +20629,18 @@ plain progress line without gate evidence";
         assert!(prompt.contains("Use the context from the immediately preceding turn"));
         assert!(prompt.contains("minimal synthesis needed to populate these outputs"));
         // P079 approved contract: runtime identifiers must appear in repair prompt.
-        assert!(prompt.contains("run_id=test-run-id"), "run_id must be in prompt");
-        assert!(prompt.contains("stage_execution_id=test-stage-exec-id"), "stage_execution_id must be in prompt");
-        assert!(prompt.contains("agent_execution_id=test-agent-exec-id"), "agent_execution_id must be in prompt");
+        assert!(
+            prompt.contains("run_id=test-run-id"),
+            "run_id must be in prompt"
+        );
+        assert!(
+            prompt.contains("stage_execution_id=test-stage-exec-id"),
+            "stage_execution_id must be in prompt"
+        );
+        assert!(
+            prompt.contains("agent_execution_id=test-agent-exec-id"),
+            "agent_execution_id must be in prompt"
+        );
     }
 
     #[test]
@@ -20314,7 +20739,13 @@ plain progress line without gate evidence";
             failure_summary: Some("missing required fields".to_string()),
         };
 
-        let prompt = output_contract_repair_prompt(&validation, &declared_outputs, "test-run-id", "test-stage-exec-id", "test-agent-exec-id");
+        let prompt = output_contract_repair_prompt(
+            &validation,
+            &declared_outputs,
+            "test-run-id",
+            "test-stage-exec-id",
+            "test-agent-exec-id",
+        );
 
         assert!(prompt.contains("\"current_phase\":\"\""));
         assert!(prompt.contains("\"completed_items\":[]"));
@@ -24554,10 +24985,7 @@ private-key-body\n\
             !redacted.contains("hunter2secret"),
             "password value must be redacted"
         );
-        assert!(
-            !markers.is_empty(),
-            "redaction markers must be recorded"
-        );
+        assert!(!markers.is_empty(), "redaction markers must be recorded");
     }
 
     #[test]
@@ -24585,33 +25013,76 @@ private-key-body\n\
         let content = "CHAINWORKS_MCP_TOKEN=tok1aaabbbccc CHAINWORKS_MCP_TOKEN=tok2dddeeefff";
         let (redacted, markers) =
             p079_redact_plan_evidence_content(content, "/workspace", std::path::Path::new("/meta"));
-        assert!(!redacted.contains("tok1aaabbbccc"), "first token must be redacted");
-        assert!(!redacted.contains("tok2dddeeefff"), "second token must be redacted");
+        assert!(
+            !redacted.contains("tok1aaabbbccc"),
+            "first token must be redacted"
+        );
+        assert!(
+            !redacted.contains("tok2dddeeefff"),
+            "second token must be redacted"
+        );
         assert!(markers.len() >= 2, "both redactions must be recorded");
 
         // Two Authorization: Bearer tokens on the same line (unusual but must be handled).
-        let content2 = "Authorization: Bearer first_tok_abc123 Authorization: Bearer second_tok_xyz789";
-        let (redacted2, markers2) =
-            p079_redact_plan_evidence_content(content2, "/workspace", std::path::Path::new("/meta"));
-        assert!(!redacted2.contains("first_tok_abc123"), "first bearer must be redacted");
-        assert!(!redacted2.contains("second_tok_xyz789"), "second bearer must be redacted");
-        assert!(markers2.len() >= 2, "both bearer redactions must be recorded");
+        let content2 =
+            "Authorization: Bearer first_tok_abc123 Authorization: Bearer second_tok_xyz789";
+        let (redacted2, markers2) = p079_redact_plan_evidence_content(
+            content2,
+            "/workspace",
+            std::path::Path::new("/meta"),
+        );
+        assert!(
+            !redacted2.contains("first_tok_abc123"),
+            "first bearer must be redacted"
+        );
+        assert!(
+            !redacted2.contains("second_tok_xyz789"),
+            "second bearer must be redacted"
+        );
+        assert!(
+            markers2.len() >= 2,
+            "both bearer redactions must be recorded"
+        );
 
         // Two JSON credential keys on the same line.
         let content3 = r#"{"api_key": "first_secret_value", "api_key": "second_secret_value"}"#;
-        let (redacted3, _markers3) =
-            p079_redact_plan_evidence_content(content3, "/workspace", std::path::Path::new("/meta"));
-        assert!(!redacted3.contains("first_secret_value"), "first json credential must be redacted");
-        assert!(!redacted3.contains("second_secret_value"), "second json credential must be redacted");
+        let (redacted3, _markers3) = p079_redact_plan_evidence_content(
+            content3,
+            "/workspace",
+            std::path::Path::new("/meta"),
+        );
+        assert!(
+            !redacted3.contains("first_secret_value"),
+            "first json credential must be redacted"
+        );
+        assert!(
+            !redacted3.contains("second_secret_value"),
+            "second json credential must be redacted"
+        );
 
         // Multiple different KV credential keys on the same line.
         let content4 = "password: hunter2secret token: abc123defghijklmno api_key: sk12345678901";
-        let (redacted4, markers4) =
-            p079_redact_plan_evidence_content(content4, "/workspace", std::path::Path::new("/meta"));
-        assert!(!redacted4.contains("hunter2secret"), "password value must be redacted");
-        assert!(!redacted4.contains("abc123defghijklmno"), "token value must be redacted");
-        assert!(!redacted4.contains("sk12345678901"), "api_key value must be redacted");
-        assert!(markers4.len() >= 3, "all three KV redactions must be recorded");
+        let (redacted4, markers4) = p079_redact_plan_evidence_content(
+            content4,
+            "/workspace",
+            std::path::Path::new("/meta"),
+        );
+        assert!(
+            !redacted4.contains("hunter2secret"),
+            "password value must be redacted"
+        );
+        assert!(
+            !redacted4.contains("abc123defghijklmno"),
+            "token value must be redacted"
+        );
+        assert!(
+            !redacted4.contains("sk12345678901"),
+            "api_key value must be redacted"
+        );
+        assert!(
+            markers4.len() >= 3,
+            "all three KV redactions must be recorded"
+        );
     }
 
     #[test]
@@ -24664,12 +25135,11 @@ private-key-body\n\
         let content = format!(
             "workspace path: \"{workspace}/src/main.rs\" meta path: \"{meta_root}/evidence/x.json\"",
         );
-        let (redacted, markers) =
-            p079_redact_plan_evidence_content(
-                &content,
-                workspace,
-                std::path::Path::new(&meta_root),
-            );
+        let (redacted, markers) = p079_redact_plan_evidence_content(
+            &content,
+            workspace,
+            std::path::Path::new(&meta_root),
+        );
         assert!(
             !redacted.contains(&format!("{workspace}/src")),
             "workspace path must be redacted, got: {redacted}"
@@ -24696,35 +25166,47 @@ private-key-body\n\
             !redacted.contains("supersecretval12345"),
             "CHAINWORKS_MCP_TOKEN value must be redacted even after non-ASCII prefix: {redacted}"
         );
-        assert!(
-            !markers.is_empty(),
-            "redaction marker must be present"
-        );
+        assert!(!markers.is_empty(), "redaction marker must be present");
 
         // U+0130 before Authorization Bearer.
         let content2 = "\u{0130} Authorization: Bearer some_bearer_token_xyz789 rest";
-        let (redacted2, markers2) =
-            p079_redact_plan_evidence_content(content2, "/workspace", std::path::Path::new("/meta"));
+        let (redacted2, markers2) = p079_redact_plan_evidence_content(
+            content2,
+            "/workspace",
+            std::path::Path::new("/meta"),
+        );
         assert!(
             !redacted2.contains("some_bearer_token_xyz789"),
             "Bearer token must be redacted even after non-ASCII prefix: {redacted2}"
         );
-        assert!(!markers2.is_empty(), "bearer redaction marker must be present");
+        assert!(
+            !markers2.is_empty(),
+            "bearer redaction marker must be present"
+        );
 
         // U+00DF "ß" before a quoted JSON credential key.
         let content3 = "ß {\"api_key\": \"my_secret_key_value_1234\"}";
-        let (redacted3, markers3) =
-            p079_redact_plan_evidence_content(content3, "/workspace", std::path::Path::new("/meta"));
+        let (redacted3, markers3) = p079_redact_plan_evidence_content(
+            content3,
+            "/workspace",
+            std::path::Path::new("/meta"),
+        );
         assert!(
             !redacted3.contains("my_secret_key_value_1234"),
             "JSON api_key value must be redacted even after non-ASCII prefix: {redacted3}"
         );
-        assert!(!markers3.is_empty(), "json credential redaction marker must be present");
+        assert!(
+            !markers3.is_empty(),
+            "json credential redaction marker must be present"
+        );
 
         // Multi-byte emoji before a bare KV credential key.
         let content4 = "🔥 password: flamingsecretvalue123 🔥";
-        let (redacted4, markers4) =
-            p079_redact_plan_evidence_content(content4, "/workspace", std::path::Path::new("/meta"));
+        let (redacted4, markers4) = p079_redact_plan_evidence_content(
+            content4,
+            "/workspace",
+            std::path::Path::new("/meta"),
+        );
         assert!(
             !redacted4.contains("flamingsecretvalue123"),
             "password value must be redacted even surrounded by emoji: {redacted4}"
@@ -24949,11 +25431,18 @@ private-key-body\n\
         // Unknown providers: the p079_unknown_provider flag (computed by the match) must be
         // true for any string that is not a canonical recognized provider.
         let canonical = [
-            "claude", "claude-code", "anthropic",
-            "codex", "openai",
-            "gemini", "google",
-            "junie", "auggie",
-            "fixture", "test", "mock",
+            "claude",
+            "claude-code",
+            "anthropic",
+            "codex",
+            "openai",
+            "gemini",
+            "google",
+            "junie",
+            "auggie",
+            "fixture",
+            "test",
+            "mock",
         ];
         let unknown_cases = ["my_new_provider", "gpt-4o", "llama3", ""];
         for p in &unknown_cases {
@@ -25011,11 +25500,8 @@ private-key-body\n\
     fn p079_plan_evidence_redact_rejects_sibling_prefix_paths() {
         // "/workspace-secret/sensitive" should be redacted even though it string-starts-with "/workspace".
         let content = "output at /workspace-secret/sensitive/credentials.json";
-        let (redacted, markers) = p079_redact_plan_evidence_content(
-            content,
-            "/workspace",
-            std::path::Path::new("/meta"),
-        );
+        let (redacted, markers) =
+            p079_redact_plan_evidence_content(content, "/workspace", std::path::Path::new("/meta"));
         assert!(
             redacted.contains("[redacted:abs_path]"),
             "sibling-prefix absolute path must be redacted: got {redacted:?}"
@@ -25031,11 +25517,8 @@ private-key-body\n\
     #[test]
     fn p079_plan_evidence_redact_rejects_parent_dir_escape() {
         let content = "key at /workspace/../private/secret.pem";
-        let (redacted, markers) = p079_redact_plan_evidence_content(
-            content,
-            "/workspace",
-            std::path::Path::new("/meta"),
-        );
+        let (redacted, markers) =
+            p079_redact_plan_evidence_content(content, "/workspace", std::path::Path::new("/meta"));
         assert!(
             redacted.contains("[redacted:abs_path]"),
             "parent-dir escape path must be redacted: got {redacted:?}"
@@ -25098,8 +25581,12 @@ private-key-body\n\
             failure_class: None,
             failure_summary: None,
         };
-        let result = materialize_validated_discovery_decisions(&[declared], &settlement, &validation);
-        assert!(result.is_err(), "must bail when accepted_payload_ref is absent");
+        let result =
+            materialize_validated_discovery_decisions(&[declared], &settlement, &validation);
+        assert!(
+            result.is_err(),
+            "must bail when accepted_payload_ref is absent"
+        );
         assert!(
             result.unwrap_err().to_string().contains("no payload_ref"),
             "error must name the missing payload_ref"
@@ -25161,10 +25648,14 @@ private-key-body\n\
             failure_class: None,
             failure_summary: None,
         };
-        let result = materialize_validated_discovery_decisions(&[declared], &settlement, &validation);
+        let result =
+            materialize_validated_discovery_decisions(&[declared], &settlement, &validation);
         assert!(result.is_err(), "must bail when payload bytes are absent");
         assert!(
-            result.unwrap_err().to_string().contains("bytes are missing"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("bytes are missing"),
             "error must name the missing bytes"
         );
     }
@@ -25268,8 +25759,14 @@ private-key-body\n\
             workspace,
             &meta,
         );
-        assert!(!out.contains("hunter2"), "password:<value> must be redacted");
-        assert!(!out.contains("abc123xyz"), "secret=<value> must be redacted");
+        assert!(
+            !out.contains("hunter2"),
+            "password:<value> must be redacted"
+        );
+        assert!(
+            !out.contains("abc123xyz"),
+            "secret=<value> must be redacted"
+        );
         assert!(!redactions.is_empty());
     }
 
@@ -25457,7 +25954,10 @@ private-key-body\n\
             workspace,
             meta,
         );
-        assert!(!out.contains("supersecretvalue12345"), "client_secret must be redacted");
+        assert!(
+            !out.contains("supersecretvalue12345"),
+            "client_secret must be redacted"
+        );
         assert!(!markers.is_empty(), "redaction marker must be recorded");
 
         // JSON: clientSecret (camelCase)
@@ -25466,7 +25966,10 @@ private-key-body\n\
             workspace,
             meta,
         );
-        assert!(!out2.contains("my_client_secret_val"), "clientSecret JSON key must be redacted, got: {out2}");
+        assert!(
+            !out2.contains("my_client_secret_val"),
+            "clientSecret JSON key must be redacted, got: {out2}"
+        );
         assert!(!markers2.is_empty());
 
         // JSON: accessToken (camelCase)
@@ -25475,7 +25978,10 @@ private-key-body\n\
             workspace,
             meta,
         );
-        assert!(!out3.contains("ya29.camelCaseToken"), "accessToken JSON key must be redacted, got: {out3}");
+        assert!(
+            !out3.contains("ya29.camelCaseToken"),
+            "accessToken JSON key must be redacted, got: {out3}"
+        );
         assert!(!markers3.is_empty());
 
         // JSON: refreshToken (camelCase)
@@ -25484,7 +25990,10 @@ private-key-body\n\
             workspace,
             meta,
         );
-        assert!(!out4.contains("1//refresh_tok_xyz789"), "refreshToken JSON key must be redacted, got: {out4}");
+        assert!(
+            !out4.contains("1//refresh_tok_xyz789"),
+            "refreshToken JSON key must be redacted, got: {out4}"
+        );
         assert!(!markers4.is_empty());
 
         // Bare KV: aws_secret_access_key
@@ -25493,7 +26002,10 @@ private-key-body\n\
             workspace,
             meta,
         );
-        assert!(!out5.contains("wJalrXUtnFEMI"), "aws_secret_access_key must be redacted, got: {out5}");
+        assert!(
+            !out5.contains("wJalrXUtnFEMI"),
+            "aws_secret_access_key must be redacted, got: {out5}"
+        );
         assert!(!markers5.is_empty());
 
         // JSON: aws_secret_access_key
@@ -25502,7 +26014,10 @@ private-key-body\n\
             workspace,
             meta,
         );
-        assert!(!out6.contains("wJalrXUtnFEMI"), "aws_secret_access_key JSON key must be redacted, got: {out6}");
+        assert!(
+            !out6.contains("wJalrXUtnFEMI"),
+            "aws_secret_access_key JSON key must be redacted, got: {out6}"
+        );
         assert!(!markers6.is_empty());
     }
 

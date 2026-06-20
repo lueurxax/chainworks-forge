@@ -1023,18 +1023,15 @@ async fn p079_sec_mcp001_runtime_receipt_sanitized_for_non_operator() {
     let op_receipt = &operator_exec["agent_executions"][0]["runtime_facts"]["runtime_receipt"];
     let op_roundtrip = &op_receipt["permission_roundtrips"][0];
     assert_eq!(
-        op_roundtrip["p079_normalized_path"],
-        "/Users/test/artifacts/output.json",
+        op_roundtrip["p079_normalized_path"], "/Users/test/artifacts/output.json",
         "Operator must see p079_normalized_path in runtime_receipt"
     );
     assert_eq!(
-        op_roundtrip["p079_matched_canonical_path"],
-        "/Users/test/artifacts/output.json",
+        op_roundtrip["p079_matched_canonical_path"], "/Users/test/artifacts/output.json",
         "Operator must see p079_matched_canonical_path in runtime_receipt"
     );
     assert_eq!(
-        op_receipt["provider_session_id"],
-        "prov-session-secret",
+        op_receipt["provider_session_id"], "prov-session-secret",
         "Operator must see provider_session_id in runtime_receipt"
     );
 

@@ -20,7 +20,7 @@ use crate::protocol::JsonRpcRequest;
 use crate::request_context;
 use crate::server::McpServer;
 
-pub const MCP_HTTP_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+pub const MCP_HTTP_BODY_LIMIT_BYTES: usize = 256 * 1024;
 
 /// Build the axum router for MCP HTTP transport.
 ///
@@ -57,6 +57,59 @@ async fn handle_mcp_post(
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return (StatusCode::BAD_REQUEST, "Empty body").into_response();
+    }
+
+    // SEC-P080-HIGH-001: duplicate-key rejection at the raw-parse boundary for ALL
+    // JSON-RPC requests. Runs before auth and before serde_json typed extraction so
+    // unicode-escaped method/name values cannot bypass last-value-wins rejection.
+    // The body-size cap (MCP_HTTP_BODY_LIMIT_BYTES) bounds the scan work.
+    if let Some(dup_key) = find_duplicate_json_object_key(trimmed) {
+        if dup_key == "__budget_exceeded__" {
+            db::metrics::increment_counter_with_label(
+                "p080_mcp_canonicalization_budget_exceeded_total",
+                "scan_key_budget",
+            );
+            // SEC-P080-HIGH-001: budget exceeded means we cannot guarantee no duplicate keys
+            // exist in the remaining payload. Reject so oversized payloads cannot bypass the
+            // duplicate-key gate by exceeding SCAN_KEY_BUDGET (proposal lines 170-186).
+            db::metrics::increment_counter_with_label(
+                "p080_mcp_parser_rejected_total",
+                "canonicalization_budget_exceeded",
+            );
+            let resp = crate::protocol::JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: None,
+                result: Some(serde_json::json!({
+                    "schema_version": "p080_error_response_v1",
+                    "code": "canonicalization_budget_exceeded",
+                    "message": "JSON request scan budget exceeded; request rejected to prevent duplicate-key bypass",
+                    "retry_after": null,
+                    "readback": null,
+                    "detail": { "limit": SCAN_KEY_BUDGET, "observed": "budget_exceeded" }
+                })),
+                error: None,
+            };
+            return json_response(StatusCode::OK, &resp, None);
+        } else {
+            db::metrics::increment_counter_with_label(
+                "p080_mcp_parser_rejected_total",
+                "duplicate_key",
+            );
+            let resp = crate::protocol::JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: None,
+                result: Some(serde_json::json!({
+                    "schema_version": "p080_error_response_v1",
+                    "code": "duplicate_key",
+                    "message": "JSON request contains duplicate object key; request rejected",
+                    "retry_after": null,
+                    "readback": null,
+                    "detail": { "limit": 1, "observed": 2, "duplicate_key": dup_key }
+                })),
+                error: None,
+            };
+            return json_response(StatusCode::OK, &resp, None);
+        }
     }
 
     // ── Resolve principal from Authorization header ──────────────────────
@@ -163,6 +216,348 @@ async fn handle_mcp_post(
     }
 
     json_response(StatusCode::OK, &response, session_id.as_deref())
+}
+
+/// SEC-P080-HIGH-001: retained for unit tests; the gate was removed (all requests
+/// now go through find_duplicate_json_object_key regardless of tool name).
+///
+/// Returns true when the raw JSON looks like a P080 tools/call by substring match.
+/// This function is NOT the authoritative security gate — see find_duplicate_json_object_key.
+#[allow(dead_code)]
+pub(crate) fn raw_looks_like_p080_tools_call(s: &str) -> bool {
+    let trimmed = s.trim_start();
+    if !trimmed.starts_with('{') {
+        return false;
+    }
+    let mentions_tools_call = trimmed.contains(r#""method":"tools/call""#)
+        || trimmed.contains(r#""method": "tools/call""#)
+        || trimmed.contains(r#""method":"tools\/call""#)
+        || trimmed.contains(r#""method": "tools\/call""#);
+    // Match both "p080." (canonical) and "p080_" (Codex alias prefix) name forms.
+    let mentions_p080_tool = trimmed.contains(r#""name":"p080."#)
+        || trimmed.contains(r#""name": "p080."#)
+        || trimmed.contains(r#""name":"p080_"#)
+        || trimmed.contains(r#""name": "p080_"#);
+    mentions_tools_call && mentions_p080_tool
+}
+
+/// Maximum total keys scanned across all nested objects before stopping early.
+/// Prevents DoS from crafting JSON with unbounded unique keys. Body size limit
+/// (MCP_HTTP_BODY_LIMIT_BYTES) is the primary defense; this is a secondary bound.
+const SCAN_KEY_BUDGET: usize = 2048;
+
+/// SEC-P080-MED-001: Scan raw JSON bytes for duplicate object keys at any nesting depth.
+///
+/// Returns `Some(key)` with the first duplicate key found, `None` if all object keys
+/// are unique, or `Some("__budget_exceeded__")` when the key budget is exhausted.
+/// Returns `None` on any parse ambiguity (conservative: prefers false negatives
+/// over false positives so valid non-P080 requests are never incorrectly rejected).
+///
+/// This function is called at the raw-byte boundary BEFORE serde_json typed extraction,
+/// so duplicate keys that would be silently collapsed by last-value-wins semantics are caught.
+pub(crate) fn find_duplicate_json_object_key(s: &str) -> Option<String> {
+    struct Scanner<'a> {
+        b: &'a [u8],
+        p: usize,
+        keys_scanned: usize,
+    }
+    impl<'a> Scanner<'a> {
+        fn peek(&self) -> Option<u8> {
+            self.b.get(self.p).copied()
+        }
+        fn advance(&mut self) {
+            if self.p < self.b.len() {
+                self.p += 1;
+            }
+        }
+        fn skip_ws(&mut self) {
+            while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                self.advance();
+            }
+        }
+        /// SEC-P080-HIGH-002: read a JSON string with canonical Unicode decoding.
+        /// `\uXXXX` sequences are decoded to the actual Unicode character (not
+        /// replaced with U+FFFD), so `requested_action` and `requested_action`
+        /// produce the same key string as serde_json does, closing the escape bypass.
+        fn read_string(&mut self) -> Option<String> {
+            if self.peek() != Some(b'"') {
+                return None;
+            }
+            self.advance();
+            let mut out = String::new();
+            loop {
+                match self.peek()? {
+                    b'"' => {
+                        self.advance();
+                        return Some(out);
+                    }
+                    b'\\' => {
+                        self.advance();
+                        match self.peek()? {
+                            b'"' | b'\\' | b'/' => {
+                                out.push(self.b[self.p] as char);
+                                self.advance();
+                            }
+                            b'n' => {
+                                out.push('\n');
+                                self.advance();
+                            }
+                            b'r' => {
+                                out.push('\r');
+                                self.advance();
+                            }
+                            b't' => {
+                                out.push('\t');
+                                self.advance();
+                            }
+                            b'b' => {
+                                out.push('\x08');
+                                self.advance();
+                            }
+                            b'f' => {
+                                out.push('\x0C');
+                                self.advance();
+                            }
+                            b'u' => {
+                                self.advance();
+                                match self.read_hex4() {
+                                    None => out.push('\u{FFFD}'),
+                                    Some(cp) if (0xD800..=0xDBFF).contains(&(cp as u32)) => {
+                                        // High surrogate — try to consume the paired \uXXXX.
+                                        let saved = self.p;
+                                        let combined = if self.peek() == Some(b'\\') {
+                                            self.advance();
+                                            if self.peek() == Some(b'u') {
+                                                self.advance();
+                                                match self.read_hex4() {
+                                                    Some(low)
+                                                        if (0xDC00..=0xDFFF)
+                                                            .contains(&(low as u32)) =>
+                                                    {
+                                                        let full = 0x10000u32
+                                                            + ((cp as u32 - 0xD800) << 10)
+                                                            + (low as u32 - 0xDC00);
+                                                        char::from_u32(full)
+                                                    }
+                                                    _ => {
+                                                        self.p = saved;
+                                                        None
+                                                    }
+                                                }
+                                            } else {
+                                                self.p = saved;
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        };
+                                        out.push(combined.unwrap_or('\u{FFFD}'));
+                                    }
+                                    Some(cp) if (0xDC00..=0xDFFF).contains(&(cp as u32)) => {
+                                        // Lone low surrogate — not valid standalone.
+                                        out.push('\u{FFFD}');
+                                    }
+                                    Some(cp) => {
+                                        out.push(char::from_u32(cp as u32).unwrap_or('\u{FFFD}'));
+                                    }
+                                }
+                            }
+                            _ => {
+                                self.advance();
+                                out.push('\u{FFFD}');
+                            }
+                        }
+                    }
+                    b => {
+                        out.push(b as char);
+                        self.advance();
+                    }
+                }
+            }
+        }
+
+        /// Consume exactly 4 hex digits and return the decoded u16 value,
+        /// or None if any digit is missing or not hexadecimal.
+        fn read_hex4(&mut self) -> Option<u16> {
+            let mut val: u16 = 0;
+            for _ in 0..4 {
+                let d: u16 = match self.peek()? {
+                    c @ b'0'..=b'9' => (c - b'0') as u16,
+                    c @ b'a'..=b'f' => (c - b'a') as u16 + 10,
+                    c @ b'A'..=b'F' => (c - b'A') as u16 + 10,
+                    _ => return None,
+                };
+                val = (val << 4) | d;
+                self.advance();
+            }
+            Some(val)
+        }
+        fn skip_value(&mut self) {
+            self.skip_ws();
+            match self.peek() {
+                Some(b'"') => {
+                    let _ = self.read_string();
+                }
+                Some(b'{') => {
+                    self.advance();
+                    self.skip_object_body();
+                }
+                Some(b'[') => {
+                    self.advance();
+                    self.skip_array_body();
+                }
+                Some(b't' | b'f' | b'n') => {
+                    while matches!(self.peek(), Some(b'a'..=b'z')) {
+                        self.advance();
+                    }
+                }
+                _ => {
+                    while !matches!(
+                        self.peek(),
+                        None | Some(b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
+                    ) {
+                        self.advance();
+                    }
+                }
+            }
+        }
+        fn skip_object_body(&mut self) {
+            self.skip_ws();
+            if self.peek() == Some(b'}') {
+                self.advance();
+                return;
+            }
+            loop {
+                self.skip_ws();
+                let _ = self.read_string();
+                self.skip_ws();
+                if self.peek() == Some(b':') {
+                    self.advance();
+                }
+                self.skip_value();
+                self.skip_ws();
+                match self.peek() {
+                    Some(b',') => {
+                        self.advance();
+                    }
+                    Some(b'}') => {
+                        self.advance();
+                        return;
+                    }
+                    _ => return,
+                }
+            }
+        }
+        fn skip_array_body(&mut self) {
+            self.skip_ws();
+            if self.peek() == Some(b']') {
+                self.advance();
+                return;
+            }
+            loop {
+                self.skip_value();
+                self.skip_ws();
+                match self.peek() {
+                    Some(b',') => {
+                        self.advance();
+                    }
+                    Some(b']') => {
+                        self.advance();
+                        return;
+                    }
+                    _ => return,
+                }
+            }
+        }
+        fn scan_value(&mut self) -> Option<String> {
+            self.skip_ws();
+            match self.peek()? {
+                b'{' => {
+                    self.advance();
+                    self.scan_object_body()
+                }
+                b'[' => {
+                    self.advance();
+                    self.scan_array_body()
+                }
+                b'"' => {
+                    let _ = self.read_string();
+                    None
+                }
+                _ => {
+                    self.skip_value();
+                    None
+                }
+            }
+        }
+        fn scan_object_body(&mut self) -> Option<String> {
+            self.skip_ws();
+            if self.peek() == Some(b'}') {
+                self.advance();
+                return None;
+            }
+            let mut seen = std::collections::HashSet::new();
+            loop {
+                self.skip_ws();
+                let key = self.read_string()?;
+                self.keys_scanned += 1;
+                if self.keys_scanned > SCAN_KEY_BUDGET {
+                    // Budget exhausted: stop scanning, return sentinel.
+                    return Some("__budget_exceeded__".to_string());
+                }
+                if !seen.insert(key.clone()) {
+                    return Some(key);
+                }
+                self.skip_ws();
+                if self.peek() == Some(b':') {
+                    self.advance();
+                }
+                if let Some(dup) = self.scan_value() {
+                    return Some(dup);
+                }
+                self.skip_ws();
+                match self.peek() {
+                    Some(b',') => {
+                        self.advance();
+                    }
+                    Some(b'}') => {
+                        self.advance();
+                        return None;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        fn scan_array_body(&mut self) -> Option<String> {
+            self.skip_ws();
+            if self.peek() == Some(b']') {
+                self.advance();
+                return None;
+            }
+            loop {
+                if let Some(dup) = self.scan_value() {
+                    return Some(dup);
+                }
+                self.skip_ws();
+                match self.peek() {
+                    Some(b',') => {
+                        self.advance();
+                    }
+                    Some(b']') => {
+                        self.advance();
+                        return None;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+    let mut scanner = Scanner {
+        b: s.as_bytes(),
+        p: 0,
+        keys_scanned: 0,
+    };
+    scanner.scan_value()
 }
 
 fn json_response(
@@ -393,6 +788,124 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn p080_http_rejects_duplicate_keys_before_jsonrpc_last_wins_parse() {
+        let response = handle_mcp_post(
+            State(test_server().await),
+            operator_auth_header(),
+            None,
+            r#"{
+                "jsonrpc":"2.0",
+                "id":80,
+                "method":"tools/call",
+                "method":"initialize",
+                "params":{
+                    "name":"p080.diagnostics.get.v1",
+                    "arguments":{
+                        "schema_version":"p080_diagnostics_get_request_v1",
+                        "schema_version":"p080_diagnostics_get_request_v1"
+                    }
+                }
+            }"#
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["result"]["schema_version"], "p080_error_response_v1");
+        assert_eq!(json["result"]["code"], "duplicate_key");
+        assert_eq!(json["result"]["detail"]["duplicate_key"], "method");
+    }
+
+    #[tokio::test]
+    async fn p080_http_rejects_duplicate_keys_before_auth_and_with_escaped_method() {
+        let response = handle_mcp_post(
+            State(test_server().await),
+            HeaderMap::new(),
+            None,
+            r#"{
+                "jsonrpc":"2.0",
+                "id":80,
+                "method":"tools\/call",
+                "params":{
+                    "name":"p080.diagnostics.get.v1",
+                    "arguments":{
+                        "schema_version":"p080_diagnostics_get_request_v1",
+                        "schema_version":"p080_diagnostics_get_request_v1"
+                    }
+                }
+            }"#
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["result"]["schema_version"], "p080_error_response_v1");
+        assert_eq!(json["result"]["code"], "duplicate_key");
+        assert_eq!(json["result"]["detail"]["duplicate_key"], "schema_version");
+    }
+
+    #[tokio::test]
+    async fn duplicate_key_preflight_rejects_all_tool_calls_not_just_p080() {
+        // SEC-P080-001 fix: duplicate-key rejection now applies to ALL JSON-RPC requests,
+        // not only P080 tool calls. Non-P080 tools with duplicate keys must also be rejected.
+        let response = handle_mcp_post(
+            State(test_server().await),
+            operator_auth_header(),
+            None,
+            r#"{
+                "jsonrpc":"2.0",
+                "id":80,
+                "method":"tools/call",
+                "params":{
+                    "name":"runtime.health",
+                    "arguments":{
+                        "schema_version":"runtime_health_request_v1",
+                        "schema_version":"runtime_health_request_v1"
+                    }
+                }
+            }"#
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["result"]["code"], "duplicate_key",
+            "all tool calls with duplicate keys must now be rejected"
+        );
+    }
+
+    #[test]
+    fn p080_gate_matches_codex_underscore_alias_names() {
+        // Codex alias p080_diagnostics_get_v1 → p080.diagnostics.get.v1 must trigger the scan.
+        assert!(raw_looks_like_p080_tools_call(
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"p080_diagnostics_get_v1","arguments":{}}}"#
+        ));
+        assert!(raw_looks_like_p080_tools_call(
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"p080_reconcile_request_v1","arguments":{}}}"#
+        ));
+        assert!(raw_looks_like_p080_tools_call(
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"p080_clear_permanent_hold_v1","arguments":{}}}"#
+        ));
+        // Non-P080 tools must not trigger the scan.
+        assert!(!raw_looks_like_p080_tools_call(
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"runtime.health","arguments":{}}}"#
+        ));
+    }
+
+    #[test]
+    fn p080_duplicate_key_scanner_canonicalizes_unicode_escaped_keys() {
+        let dup = find_duplicate_json_object_key(
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"p080.diagnostics.get.v1","arguments":{"requested_action":"diagnose_only","requested\u005faction":"repair_if_safe"}}}"#,
+        );
+
+        assert_eq!(dup.as_deref(), Some("requested_action"));
     }
 
     async fn test_server() -> Arc<McpServer> {

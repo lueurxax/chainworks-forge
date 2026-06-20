@@ -1,0 +1,120 @@
+{
+  "schemaVersion": 39,
+  "uid": "p080-overview",
+  "title": "P080 Continuous Stale Execution Reconciliation Overview",
+  "description": "Grafana model for the rollout-critical metrics pinned by Proposal 080. Labels intentionally exclude run_id, stage_id, work_item_id, paths, operator text, prompt text, principal_id, and provider error text.",
+  "tags": [
+    "chainworks",
+    "p080",
+    "stale-execution"
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Detection Rate By Class",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (class) (rate(stale_execution_detected_total[5m]))"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Repair Rate By Class And Action",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (class, action) (increase(stale_execution_repaired_total[1h]))"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Hold Age P99 By Reason",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, hold_reason) (rate(stale_execution_hold_age_seconds_bucket[15m])))"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Failures By Class And Reason",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (class, reason) (rate(stale_execution_repair_failed_total[5m]))"
+        },
+        {
+          "expr": "sum by (class, reason) (increase(stale_execution_classifier_error_total[24h]))"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Permanent Holds",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(p080_permanent_hold_engaged_total[1h])"
+        },
+        {
+          "expr": "rate(p080_permanent_hold_cleared_total[1h])"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Helper Reap Escalation",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (signal_phase) (rate(helper_reap_signal_escalation_total[5m]))"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Migration Validation Status",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (migration_id, status) (rate(p080_migration_shape_validation_total[1h]))"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "MCP And GraphQL Error Rate",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (tool_name, missing_capability) (rate(p080_mcp_unauthorized_missing_capability_total[5m]))"
+        },
+        {
+          "expr": "sum by (action) (rate(p080_mcp_disabled_action_rejected_total[5m]))"
+        },
+        {
+          "expr": "rate(p080_diagnostics_enumeration_budget_exceeded_total[5m])"
+        },
+        {
+          "expr": "sum by (reason) (rate(p080_reconciliation_deferred_total[5m]))"
+        },
+        {
+          "expr": "sum by (principal_class) (rate(p080_graphql_subscription_rate_shed_total[5m]))"
+        },
+        {
+          "expr": "sum by (reason) (rate(p080_mcp_parser_rejected_total[5m]))"
+        },
+        {
+          "expr": "rate(p080_mcp_canonicalization_budget_exceeded_total[5m])"
+        },
+        {
+          "expr": "sum by (tool_name) (rate(p080_mcp_unsupported_version_total[5m]))"
+        }
+      ]
+    }
+  ]
+}

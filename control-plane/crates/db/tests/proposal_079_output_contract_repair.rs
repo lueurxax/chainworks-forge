@@ -206,13 +206,11 @@ async fn proposal_079_event_row_insert_and_fetch() {
         .await
         .expect("insert_repair_event should succeed");
 
-    let fetched = ocr_repo::get_repair_event_by_agent_execution_id(
-        &pool,
-        &agent_exec_id.to_string(),
-    )
-    .await
-    .expect("get by agent_execution_id should succeed")
-    .expect("row should be present");
+    let fetched =
+        ocr_repo::get_repair_event_by_agent_execution_id(&pool, &agent_exec_id.to_string())
+            .await
+            .expect("get by agent_execution_id should succeed")
+            .expect("row should be present");
 
     assert_eq!(fetched.repair_attempt_id, attempt_id);
     assert_eq!(fetched.status, "in_progress");
@@ -378,7 +376,9 @@ async fn proposal_079_unsafe_continuation_maps_to_approved_settlement() {
         &now,
     )
     .await
-    .expect("blocked_missing_required_outputs must be accepted for unsafe_continuation (EXTRA-003)");
+    .expect(
+        "blocked_missing_required_outputs must be accepted for unsafe_continuation (EXTRA-003)",
+    );
 
     let fetched = ocr_repo::get_repair_event_by_repair_attempt_id(&pool, &attempt_id)
         .await

@@ -32,3 +32,4 @@ tokio-util = "0.7"
 toml = { version = "0.8", features = ["parse"] }
 sha2 = "0.10"
 subtle = "2"
+base64 = "0.22"

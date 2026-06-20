@@ -61,6 +61,12 @@ pub enum CapabilityToolId {
     AgentsContinueWork,
     /// P076: read latest observe-only auto-retry ledger/catalog state.
     AutomationAutoRetryLatest,
+    /// P080: read-only stale execution diagnostics projection.
+    P080DiagnosticsGet,
+    /// P080: request reconciliation or diagnose-only analysis for a stale execution.
+    P080ReconcileRequest,
+    /// P080: clear a permanent hold on a stale execution.
+    P080ClearPermanentHold,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]

@@ -36,6 +36,7 @@ At the current baseline, the product includes:
 - targeted retry authority with exact stage-execution retry settlement, authority-history readback, startup orphan retry repair, and retry payload recovery diagnostics,
 - P082 recovery/retry state-machine matrix readbacks for operator MCP/report/run-report/release diagnostic lanes, covering startup repair, retry rejection, stale ownership, side-effect holds, cancellation interleavings, late-output quarantine, and crash/replay proof gates,
 - observe-only auto-retry observation ledger with JSONL observations, canonical known-issue catalog, MCP readback, and rollup tooling,
+- P080 stale-execution reconciliation Phase 1 detection/readback in the Rust daemon: durable rollout-control seeding with a live-disable gate, a bounded running-execution classifier into `p080_readback_heartbeats_v1`, diagnose-only live-loop readback/events for `acp_startup_stale` candidates when `detection_only` is enabled, read-only GraphQL `p080Diagnostics` plus live polling `p080DiagnosticsUpdates` readback, and MCP `p080.diagnostics.get.v1` plus phase-gated `p080.reconcile.request.v1`/`p080.clear_permanent_hold.v1` surfaces. Active ACP reset, scheduler repair, helper reap, and permanent-hold clear remain disabled in this slice,
 - bounded artifact discovery and engine-owned settlement pipeline,
 - provider toolchain cache mapping for isolated Xcode and Go build roots,
 - per-agent MCP policy resolution with persisted requested/predicted/actual/denied truth,
@@ -96,6 +97,7 @@ Use these reference docs as the current source of truth:
 | Execution truth and recovery | [execution-truth-and-recovery.md](execution-truth-and-recovery.md) |
 | Recovery/retry matrix and proof gate | [recovery-retry-state-machine-test-matrix.md](recovery-retry-state-machine-test-matrix.md) |
 | Rust control plane, scheduler, targeted retry authority, and retry payload recovery | [rust-control-plane.md](rust-control-plane.md) |
+| P080 stale execution diagnostics and MCP admission | [rust-control-plane.md](rust-control-plane.md), [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md), [test-gates.md](test-gates.md#proposal-080p080) |
 | Escalation policy and chain management | [escalation-policies.md](escalation-policies.md) |
 | Auto-retry observation ledger | [auto-retry-observation-ledger.md](auto-retry-observation-ledger.md) |
 | API/auth boundary matrix, audit, and idempotency | [boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md), [swift-macos-boundary-contract.md](swift-macos-boundary-contract.md) |

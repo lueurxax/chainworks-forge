@@ -105,12 +105,10 @@ pub async fn continuation_run_id(
     pool: &SqlitePool,
     continuation_id: &str,
 ) -> Result<Option<String>> {
-    let row = sqlx::query(
-        "SELECT run_id FROM agent_work_continuations WHERE id = ?1",
-    )
-    .bind(continuation_id)
-    .fetch_optional(pool)
-    .await?;
+    let row = sqlx::query("SELECT run_id FROM agent_work_continuations WHERE id = ?1")
+        .bind(continuation_id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(|r| r.get::<String, _>("run_id")))
 }
 
@@ -142,9 +140,7 @@ mod tests {
         assert_eq!(found.raw_receipt_json, raw);
         assert_eq!(found.written_at, "2026-01-01T00:00:00Z");
 
-        let missing = find_by_continuation_id(&pool, "no-such-id")
-            .await
-            .unwrap();
+        let missing = find_by_continuation_id(&pool, "no-such-id").await.unwrap();
         assert!(missing.is_none(), "non-existent id must return None");
     }
 

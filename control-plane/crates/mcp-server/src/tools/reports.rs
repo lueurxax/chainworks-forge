@@ -60,12 +60,20 @@ fn p079_percent_decode_ascii(s: &str) -> String {
             let h = match hi {
                 '0'..='9' => (hi as u8) - b'0',
                 'a'..='f' => (hi as u8) - b'a' + 10,
-                _ => { out.push(bytes[i] as char); i += 1; continue; }
+                _ => {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                    continue;
+                }
             };
             let l = match lo {
                 '0'..='9' => (lo as u8) - b'0',
                 'a'..='f' => (lo as u8) - b'a' + 10,
-                _ => { out.push(bytes[i] as char); i += 1; continue; }
+                _ => {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                    continue;
+                }
             };
             out.push((h << 4 | l) as char);
             i += 3;
@@ -90,15 +98,12 @@ fn p079_safe_relative_path(path: Option<&str>) -> Option<&str> {
     path.filter(|p| {
         let p_lower = p.to_lowercase();
         // SEC-P079-LOW-001: reject fully URL-encoded traversal sequences.
-        let no_encoded = !p_lower.contains("%2e%2e")
-            && !p_lower.contains("%2f")
-            && !p_lower.contains("%5c");
+        let no_encoded =
+            !p_lower.contains("%2e%2e") && !p_lower.contains("%2f") && !p_lower.contains("%5c");
         // SEC-P079-LOW-001: also validate the percent-decoded form to catch mixed
         // literal/encoded traversal such as %2e. or .%2e (e.g. "%2e./etc/passwd").
         let decoded = p079_percent_decode_ascii(p);
-        !p079_path_has_traversal(p)
-            && no_encoded
-            && !p079_path_has_traversal(&decoded)
+        !p079_path_has_traversal(p) && no_encoded && !p079_path_has_traversal(&decoded)
     })
 }
 
@@ -112,9 +117,8 @@ fn p079_sanitize_plan_evidence_paths(evidence: serde_json::Value) -> serde_json:
                     for path_entry in paths.iter_mut() {
                         if let serde_json::Value::String(s) = path_entry {
                             if p079_safe_relative_path(Some(s.as_str())).is_none() {
-                                *path_entry = serde_json::Value::String(
-                                    "[redacted:unsafe_path]".to_string(),
-                                );
+                                *path_entry =
+                                    serde_json::Value::String("[redacted:unsafe_path]".to_string());
                             }
                         }
                     }
@@ -138,7 +142,10 @@ fn p079_sanitize_plan_evidence_paths(evidence: serde_json::Value) -> serde_json:
 /// SEC-P079-MED-001: remove P029 auth-boundary principal identifiers from the
 /// provider_fallback JSON for non-operator MCP callers. Mirrors the gating that
 /// GraphQL applies in p079_gql_provider_fallback.
-fn p079_redact_fallback_principal(fallback: serde_json::Value, include_operator_debug: bool) -> serde_json::Value {
+fn p079_redact_fallback_principal(
+    fallback: serde_json::Value,
+    include_operator_debug: bool,
+) -> serde_json::Value {
     if include_operator_debug {
         return fallback;
     }
@@ -164,6 +171,31 @@ pub fn tool_specs() -> Vec<McpTool> {
             }
         }),
     }]
+}
+
+pub async fn p082_recovery_matrix_readback_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+    principal_class: &auth::PrincipalClass,
+) -> Result<serde_json::Value> {
+    if !matches!(principal_class, auth::PrincipalClass::Operator) {
+        return Ok(serde_json::Value::Null);
+    }
+    db::repos::p082_recovery_matrix::latest_readback_for_run(pool, run_id).await
+}
+
+pub async fn p082_recovery_matrix_readbacks_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+    principal_class: &auth::PrincipalClass,
+    lane: &str,
+) -> Result<serde_json::Value> {
+    if !matches!(principal_class, auth::PrincipalClass::Operator) {
+        return Ok(serde_json::Value::Array(Vec::new()));
+    }
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(pool, run_id).await?;
+    db::repos::p082_recovery_matrix::emit_readback_lane_metrics(&readbacks, lane);
+    Ok(serde_json::Value::Array(readbacks))
 }
 
 pub async fn execute(
@@ -230,6 +262,8 @@ pub async fn execute(
                 "implementation_handoff_status": implementation_handoff_status_json(pool, run_id).await?,
                 "implementation_self_assessment_summary": implementation_self_assessment_summary_json(pool, run_id).await?,
                 "rollout_contract_readback": rollout_contract_readback,
+                // P080: top-level reconciliation section per proposal §8.1 placement.
+                "p080_reconciliation": db::repos::p080::p080_run_report_section_for_report(pool, &run_id.to_string()).await,
                 "implementation_closeout_readiness_summary": closeout_readiness_summary.clone(),
                 "closeout_readiness_summary": closeout_readiness_summary,
             }));
@@ -770,8 +804,9 @@ pub(crate) async fn execution_mcp_truth_json(
         .into_iter()
         .map(|row| (row.agent_execution_id.clone(), row))
         .collect::<HashMap<_, _>>();
-    let repair_leases =
-        output_contract_repair::list_leases_for_run(pool, &run_id_str).await.unwrap_or_default();
+    let repair_leases = output_contract_repair::list_leases_for_run(pool, &run_id_str)
+        .await
+        .unwrap_or_default();
     let repair_leases_by_key: HashMap<_, _> = repair_leases
         .into_iter()
         .map(|lease| (lease.lease_key.clone(), lease))
@@ -1279,11 +1314,14 @@ pub(crate) async fn rollout_contract_readback_json(
         return Ok(base);
     }
     // Merge live P087 fields into the run_report readback lane.
+    // P080 reconciliation is exposed as a separate top-level field (proposal §8.1 placement).
     let p087 = db::repos::storage_health::p087_rollout_readback_fields(pool).await;
-    if let (Some(base_obj), Some(p087_obj)) = (base.as_object(), p087.as_object()) {
+    if let Some(base_obj) = base.as_object() {
         let mut merged = base_obj.clone();
-        for (k, v) in p087_obj {
-            merged.insert(k.clone(), v.clone());
+        if let Some(p087_obj) = p087.as_object() {
+            for (k, v) in p087_obj {
+                merged.insert(k.clone(), v.clone());
+            }
         }
         Ok(serde_json::Value::Object(merged))
     } else {
@@ -3247,7 +3285,10 @@ mod tests {
             !obj.contains_key("version"),
             "version (CAS column) must not appear in MCP lease readback"
         );
-        assert!(obj.contains_key("owner_principal_id"), "owner_principal_id must be present");
+        assert!(
+            obj.contains_key("owner_principal_id"),
+            "owner_principal_id must be present"
+        );
     }
 
     // P079-SEC-LOW-003 parity: p079_safe_relative_path in MCP rejects absolute and traversal paths.
@@ -3255,7 +3296,10 @@ mod tests {
     fn p079_mcp_safe_relative_path_rejects_absolute_and_traversal() {
         assert_eq!(p079_safe_relative_path(Some("/etc/passwd")), None);
         assert_eq!(p079_safe_relative_path(Some("../../secret")), None);
-        assert_eq!(p079_safe_relative_path(Some("output_contract_repair/abc/plan.json")), Some("output_contract_repair/abc/plan.json"));
+        assert_eq!(
+            p079_safe_relative_path(Some("output_contract_repair/abc/plan.json")),
+            Some("output_contract_repair/abc/plan.json")
+        );
         assert_eq!(p079_safe_relative_path(None), None);
     }
 
@@ -3264,13 +3308,29 @@ mod tests {
     #[test]
     fn p079_mcp_safe_relative_path_rejects_url_encoded_traversal() {
         // %2e%2e is URL-encoded ".."
-        assert_eq!(p079_safe_relative_path(Some("%2e%2e/secret")), None, "%2e%2e traversal must be rejected");
+        assert_eq!(
+            p079_safe_relative_path(Some("%2e%2e/secret")),
+            None,
+            "%2e%2e traversal must be rejected"
+        );
         // Mixed case
-        assert_eq!(p079_safe_relative_path(Some("%2E%2E/secret")), None, "uppercase %2E%2E must be rejected");
+        assert_eq!(
+            p079_safe_relative_path(Some("%2E%2E/secret")),
+            None,
+            "uppercase %2E%2E must be rejected"
+        );
         // %2f is URL-encoded "/"
-        assert_eq!(p079_safe_relative_path(Some("foo%2fetc%2fpasswd")), None, "%2f slash must be rejected");
+        assert_eq!(
+            p079_safe_relative_path(Some("foo%2fetc%2fpasswd")),
+            None,
+            "%2f slash must be rejected"
+        );
         // %5c is URL-encoded backslash
-        assert_eq!(p079_safe_relative_path(Some("foo%5csecret")), None, "%5c backslash must be rejected");
+        assert_eq!(
+            p079_safe_relative_path(Some("foo%5csecret")),
+            None,
+            "%5c backslash must be rejected"
+        );
         // Safe path still passes
         assert_eq!(
             p079_safe_relative_path(Some("output_contract_repair/abc/plan.json")),
@@ -3282,11 +3342,31 @@ mod tests {
     // SEC-P079-LOW-001: mixed literal/encoded traversal must also be rejected after percent-decode.
     #[test]
     fn p079_mcp_safe_relative_path_rejects_mixed_encoded_traversal() {
-        assert_eq!(p079_safe_relative_path(Some("%2e./etc/passwd")), None, "%2e. must be rejected");
-        assert_eq!(p079_safe_relative_path(Some(".%2e/etc/passwd")), None, ".%2e must be rejected");
-        assert_eq!(p079_safe_relative_path(Some("%2E./etc/passwd")), None, "%2E. uppercase must be rejected");
-        assert_eq!(p079_safe_relative_path(Some(".%2E/etc/passwd")), None, ".%2E uppercase must be rejected");
-        assert_eq!(p079_safe_relative_path(Some("..%2Fetc%2Fpasswd")), None, "..%2F must be rejected");
+        assert_eq!(
+            p079_safe_relative_path(Some("%2e./etc/passwd")),
+            None,
+            "%2e. must be rejected"
+        );
+        assert_eq!(
+            p079_safe_relative_path(Some(".%2e/etc/passwd")),
+            None,
+            ".%2e must be rejected"
+        );
+        assert_eq!(
+            p079_safe_relative_path(Some("%2E./etc/passwd")),
+            None,
+            "%2E. uppercase must be rejected"
+        );
+        assert_eq!(
+            p079_safe_relative_path(Some(".%2E/etc/passwd")),
+            None,
+            ".%2E uppercase must be rejected"
+        );
+        assert_eq!(
+            p079_safe_relative_path(Some("..%2Fetc%2Fpasswd")),
+            None,
+            "..%2F must be rejected"
+        );
         assert_eq!(
             p079_safe_relative_path(Some("output_contract_repair/plan_evidence/plan.md")),
             Some("output_contract_repair/plan_evidence/plan.md"),
@@ -3305,17 +3385,27 @@ mod tests {
             "deadline_seconds": 30,
         });
         let non_op = p079_redact_fallback_principal(fallback.clone(), false);
-        assert!(non_op.get("fallback_principal_id").is_none(),
-            "fallback_principal_id must be absent for non-operator");
-        assert!(non_op.get("fallback_principal_capability_hash").is_none(),
-            "fallback_principal_capability_hash must be absent for non-operator");
-        assert!(non_op.get("fallback_agent_execution_id").is_some(),
-            "non-sensitive fields must remain");
+        assert!(
+            non_op.get("fallback_principal_id").is_none(),
+            "fallback_principal_id must be absent for non-operator"
+        );
+        assert!(
+            non_op.get("fallback_principal_capability_hash").is_none(),
+            "fallback_principal_capability_hash must be absent for non-operator"
+        );
+        assert!(
+            non_op.get("fallback_agent_execution_id").is_some(),
+            "non-sensitive fields must remain"
+        );
 
         let op = p079_redact_fallback_principal(fallback, true);
-        assert!(op.get("fallback_principal_id").is_some(),
-            "fallback_principal_id must be present for operator");
-        assert!(op.get("fallback_principal_capability_hash").is_some(),
-            "fallback_principal_capability_hash must be present for operator");
+        assert!(
+            op.get("fallback_principal_id").is_some(),
+            "fallback_principal_id must be present for operator"
+        );
+        assert!(
+            op.get("fallback_principal_capability_hash").is_some(),
+            "fallback_principal_capability_hash must be present for operator"
+        );
     }
 }

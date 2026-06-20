@@ -1,0 +1,221 @@
+alerts:
+  - name: P080StaleExecutionRepairFailure
+    description: "Page when P080 repair failures exceed the approved per-class/per-reason threshold."
+    severity: critical
+    for: 5m
+    if: sum by (class, reason) (rate(stale_execution_repair_failed_total[5m])) > 0.1
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: stale execution repair failures above threshold."
+      runbook: "docs/runbooks/p080-stale-execution-repair.md"
+  - name: P080RepairRateHigh
+    description: "Warn when repaired events exceed the approved one-hour class threshold."
+    severity: warning
+    for: 1h
+    if: sum by (class) (increase(stale_execution_repaired_total[1h])) > 50
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: repair volume high for a stale class."
+      runbook: "docs/runbooks/p080-stale-execution-repair.md"
+  - name: P080RepairRatePage
+    description: "Page when repaired events exceed the approved one-hour class page threshold."
+    severity: critical
+    for: 1h
+    if: sum by (class) (increase(stale_execution_repaired_total[1h])) > 200
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: repair volume exceeds page threshold."
+      runbook: "docs/runbooks/p080-stale-execution-repair.md"
+  - name: P080RepairRaceAbortHigh
+    description: "Warn when race-aborted repair attempts exceed the approved class threshold."
+    severity: warning
+    for: 1h
+    if: sum by (class) (increase(stale_execution_repair_race_aborted_total[1h])) > 10
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: repair race aborts above threshold."
+      runbook: "docs/runbooks/p080-stale-execution-repair.md"
+  - name: P080ClassifierErrorDuringSoak
+    description: "Page during Phase 1 soak when any classifier error is observed."
+    severity: critical
+    for: 24h
+    if: sum by (class, reason) (increase(stale_execution_classifier_error_total[24h])) > 0
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: classifier error observed during soak."
+      runbook: "docs/runbooks/p080-stale-execution-repair.md"
+  - name: P080HoldAgeHigh
+    description: "Warn when cooldown or ambiguous-owner holds exceed the approved p99 age."
+    severity: warning
+    for: 15m
+    if: histogram_quantile(0.99, sum by (le, hold_reason) (rate(stale_execution_hold_age_seconds_bucket{hold_reason=~"cooldown_active|ambiguous_owner"}[15m]))) > 3600
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: hold age above threshold."
+      runbook: "docs/runbooks/p080-stale-execution-repair.md"
+  - name: P080UnauthorizedCapabilityHigh
+    description: "Page when unauthorized P080 MCP capability requests exceed the approved threshold."
+    severity: critical
+    for: 5m
+    if: sum by (tool_name, missing_capability) (rate(p080_mcp_unauthorized_missing_capability_total[5m])) > 0.2
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: unauthorized MCP capability requests above threshold."
+      runbook: "docs/runbooks/p080-stale-execution-repair.md"
+  - name: P080DisabledActionRejectedHigh
+    description: "Warn when disabled P080 action requests exceed the approved threshold."
+    severity: warning
+    for: 5m
+    if: sum by (action) (rate(p080_mcp_disabled_action_rejected_total[5m])) > 1
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: disabled action rejection rate high."
+      runbook: "docs/runbooks/p080-stale-execution-repair.md"
+  - name: P080IdempotencyConflictHigh
+    description: "Warn when P080 idempotency conflicts exceed the approved threshold."
+    severity: warning
+    for: 5m
+    if: sum by (tool_name) (rate(p080_operator_request_dedup_idempotency_conflict_total[5m])) > 0.1
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: idempotency conflicts above threshold."
+      runbook: "docs/runbooks/p080-stale-execution-repair.md"
+  - name: P080EnumerationBudgetExceededHigh
+    description: "Warn when diagnostics exact-count requests exceed the enumeration budget too often."
+    severity: warning
+    for: 5m
+    if: rate(p080_diagnostics_enumeration_budget_exceeded_total[5m]) > 1
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: diagnostics enumeration budget exceeded."
+      runbook: "docs/runbooks/p080-stale-execution-repair.md"
+  - name: P080ReconciliationDeferredHigh
+    description: "Warn when reconciliation deferrals exceed the approved threshold."
+    severity: warning
+    for: 5m
+    if: sum by (reason) (rate(p080_reconciliation_deferred_total[5m])) > 5
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: reconciliation deferrals above threshold."
+      runbook: "docs/runbooks/p080-reconciliation-loop-termination.md"
+  - name: P080GraphqlSubscriptionRateShedHigh
+    description: "Warn when P080 GraphQL subscriptions are rate-shed."
+    severity: warning
+    for: 5m
+    if: sum by (principal_class) (rate(p080_graphql_subscription_rate_shed_total[5m])) > 0.1
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: GraphQL diagnostics subscription rate shedding."
+      runbook: "docs/runbooks/p080-stale-execution-repair.md"
+  - name: P080ProjectionTamperDetected
+    description: "Page when any P080 readback lane reports tamper-detected projection integrity."
+    severity: critical
+    for: 5m
+    if: sum by (lane, status) (rate(p080_reconciliation_readback_projection_total{status="tamper_detected"}[5m])) > 0
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: readback projection tamper detected."
+      runbook: "docs/runbooks/p080-stale-execution-repair.md"
+  - name: P080PermanentHoldEngaged
+    description: "Warn when permanent holds are engaged more than once per hour."
+    severity: warning
+    for: 1h
+    if: rate(p080_permanent_hold_engaged_total[1h]) > 1
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: permanent holds engaged above threshold."
+      runbook: "docs/runbooks/p080-stale-execution-repair.md"
+  - name: P080HelperReapFailClosed
+    description: "Page when helper reap signal escalation reaches fail-closed."
+    severity: critical
+    for: 5m
+    if: sum by (signal_phase) (rate(helper_reap_signal_escalation_total{signal_phase="fail_closed"}[5m])) > 0
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: helper reap failed closed."
+      runbook: "docs/runbooks/p080-stale-execution-repair.md"
+  - name: P080ParserRejectedHigh
+    description: "Warn when P080 MCP parser/resource-limit rejections exceed threshold."
+    severity: warning
+    for: 5m
+    if: sum by (reason) (rate(p080_mcp_parser_rejected_total[5m])) > 0.5
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: MCP parser rejections above threshold."
+      runbook: "docs/runbooks/p080-stale-execution-repair.md"
+  - name: P080CanonicalizationBudgetExceededHigh
+    description: "Warn when P080 MCP canonicalization exceeds its approved budget."
+    severity: warning
+    for: 5m
+    if: rate(p080_mcp_canonicalization_budget_exceeded_total[5m]) > 0.1
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: MCP canonicalization budget exceeded."
+      runbook: "docs/runbooks/p080-stale-execution-repair.md"
+  - name: P080UnsupportedVersion
+    description: "Warn after Phase 1 cutover when clients call unsupported P080 schema versions."
+    severity: warning
+    for: 5m
+    if: sum by (tool_name) (rate(p080_mcp_unsupported_version_total[5m])) > 0
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: unsupported MCP schema version requested."
+      runbook: "docs/runbooks/p080-stale-execution-repair.md"
+  - name: P080MigrationShapeFailed
+    description: "Page when any P080 migration shape validation fails."
+    severity: critical
+    for: 1h
+    if: sum by (migration_id, status) (rate(p080_migration_shape_validation_total{status="fail"}[1h])) > 0
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: migration shape validation failed."
+      runbook: "docs/runbooks/p080-stale-execution-repair.md"
+  - name: P080ReconciliationLoopTermination
+    description: "Informational alert for reconciliation loop termination reasons; inspect only if repeated or paired with failures."
+    severity: info
+    for: 5m
+    if: sum by (reason) (rate(p080_reconciliation_loop_termination_total[5m])) > 0
+    labels:
+      team: SRE
+      proposal: P080
+    annotations:
+      summary: "P080: reconciliation loop termination metric observed."
+      runbook: "docs/runbooks/p080-reconciliation-loop-termination.md"

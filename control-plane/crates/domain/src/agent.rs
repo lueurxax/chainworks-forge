@@ -147,8 +147,6 @@ pub enum AgentFailureKind {
     InvalidOutputContract,
     CancelledByOperator,
     SupersededByRetry,
-    ToolOutputBudgetPreflightDenied,
-    ToolOutputBudgetExceeded,
     Unknown,
 }
 
@@ -175,10 +173,6 @@ impl std::fmt::Display for AgentFailureKind {
             AgentFailureKind::InvalidOutputContract => "invalid_output_contract",
             AgentFailureKind::CancelledByOperator => "cancelled_by_operator",
             AgentFailureKind::SupersededByRetry => "superseded_by_retry",
-            AgentFailureKind::ToolOutputBudgetPreflightDenied => {
-                "tool_output_budget_preflight_denied"
-            }
-            AgentFailureKind::ToolOutputBudgetExceeded => "tool_output_budget_exceeded",
             AgentFailureKind::Unknown => "unknown",
         })
     }
@@ -209,10 +203,6 @@ impl std::str::FromStr for AgentFailureKind {
             "invalid_output_contract" => AgentFailureKind::InvalidOutputContract,
             "cancelled_by_operator" => AgentFailureKind::CancelledByOperator,
             "superseded_by_retry" => AgentFailureKind::SupersededByRetry,
-            "tool_output_budget_preflight_denied" => {
-                AgentFailureKind::ToolOutputBudgetPreflightDenied
-            }
-            "tool_output_budget_exceeded" => AgentFailureKind::ToolOutputBudgetExceeded,
             "unknown" => AgentFailureKind::Unknown,
             other => return Err(format!("Unknown AgentFailureKind: {other}")),
         })

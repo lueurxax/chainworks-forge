@@ -828,8 +828,14 @@ mod tests {
             canonical_path: "/tmp/out.json".into(),
         };
         let json = serde_json::to_string(&b).unwrap();
-        assert!(json.contains("\"name\""), "RequiredOutputBinding must use 'name' field");
-        assert!(!json.contains("\"output_name\""), "must not use 'output_name'");
+        assert!(
+            json.contains("\"name\""),
+            "RequiredOutputBinding must use 'name' field"
+        );
+        assert!(
+            !json.contains("\"output_name\""),
+            "must not use 'output_name'"
+        );
     }
 
     #[test]

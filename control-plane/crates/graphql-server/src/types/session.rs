@@ -104,6 +104,51 @@ impl P046LivePrincipalHandle {
             _ => false,
         }
     }
+
+    /// Returns true iff the credential is still valid for a P080 GraphQL subscription.
+    ///
+    /// Performs a full live check: table available, token fingerprint, class/capability/surface
+    /// subscription policy, and run_scope for restricted principals. Fail-closed on any failure.
+    /// This is the per-poll-tick revalidation for SEC-P080-GQL-SUB-AUTH-001.
+    pub async fn auth_ok_for_p080_subscription(
+        &self,
+        credential: &P046LiveCredential,
+        filter_run_id: Option<&str>,
+    ) -> bool {
+        let guard = self.0.read().await;
+        let table = match guard.as_ref() {
+            Some(t) => t,
+            None => return false,
+        };
+        let Some(current_fingerprint) =
+            auth::principal_token_fingerprint_by_id(table, &credential.principal_id)
+        else {
+            return false;
+        };
+        if current_fingerprint != credential.token_fingerprint {
+            return false;
+        }
+        let Some(principal) = auth::find_principal_by_id(table, &credential.principal_id) else {
+            return false;
+        };
+        let surface_ok =
+            auth::is_subscription_allowed_by_surface_policy(table, &credential.principal_id)
+                == Some(true);
+        let class_ok = match principal.class {
+            auth::PrincipalClass::Operator => surface_ok,
+            auth::PrincipalClass::ReadOnlyOperator => {
+                surface_ok
+                    && principal
+                        .tool_capabilities
+                        .contains(&auth::CapabilityToolId::P080DiagnosticsGet)
+            }
+            _ => false,
+        };
+        if !class_ok {
+            return false;
+        }
+        auth::check_p080_run_scope(&principal, filter_run_id).is_ok()
+    }
 }
 
 pub fn p046_visible(ctx: &Context<'_>) -> bool {
@@ -1565,6 +1610,94 @@ mod tests {
         assert_eq!(
             status_event.event_type,
             GqlSessionEventType::GenerationStarted
+        );
+    }
+
+    #[tokio::test]
+    async fn p080_auth_ok_for_subscription_operator_passes() {
+        let table = auth::PrincipalTable::test_fixture();
+        let handle = P046LivePrincipalHandle::new(table.clone());
+        let fingerprint = auth::principal_token_fingerprint_by_id(&table, "test-operator").unwrap();
+        let cred = P046LiveCredential {
+            principal_id: "test-operator".to_string(),
+            token_fingerprint: fingerprint,
+        };
+        assert!(
+            handle.auth_ok_for_p080_subscription(&cred, None).await,
+            "Operator with subscription policy must pass P080 subscription auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn p080_auth_ok_for_subscription_read_only_operator_passes() {
+        // ReadOnlyOperator requires an explicit run_scope binding (fail-closed by design).
+        // Use a scope-bound fixture and provide the matching run_id filter.
+        let table = auth::PrincipalTable::test_fixture_p080_read_only_operator_with_scope(vec![
+            "run-test-123".to_string(),
+        ]);
+        let handle = P046LivePrincipalHandle::new(table.clone());
+        let fp = auth::principal_token_fingerprint_by_id(&table, "test-p080-read-only-operator")
+            .unwrap();
+        let cred = P046LiveCredential {
+            principal_id: "test-p080-read-only-operator".to_string(),
+            token_fingerprint: fp,
+        };
+        assert!(
+            handle
+                .auth_ok_for_p080_subscription(&cred, Some("run-test-123"))
+                .await,
+            "ReadOnlyOperator with P080DiagnosticsGet, subscription policy, and matching run_scope must pass"
+        );
+        assert!(
+            !handle.auth_ok_for_p080_subscription(&cred, None).await,
+            "ReadOnlyOperator with no filter run_id must be denied (fail-closed: scope required)"
+        );
+    }
+
+    #[tokio::test]
+    async fn p080_auth_ok_for_subscription_revoked_fails_closed() {
+        let table = auth::PrincipalTable::test_fixture();
+        let handle = P046LivePrincipalHandle::new(table.clone());
+        let fp = auth::principal_token_fingerprint_by_id(&table, "test-operator").unwrap();
+        let cred = P046LiveCredential {
+            principal_id: "test-operator".to_string(),
+            token_fingerprint: fp,
+        };
+        // Mark unavailable (simulates principals.json reload failure).
+        handle.mark_unavailable().await;
+        assert!(
+            !handle.auth_ok_for_p080_subscription(&cred, None).await,
+            "Unavailable auth source must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn p080_auth_ok_for_subscription_run_scope_restricts_access() {
+        let table = auth::PrincipalTable::test_fixture_p080_read_only_operator_with_scope(vec![
+            "run-allowed".to_string(),
+        ]);
+        let handle = P046LivePrincipalHandle::new(table.clone());
+        let fp = auth::principal_token_fingerprint_by_id(&table, "test-p080-read-only-operator")
+            .unwrap();
+        let cred = P046LiveCredential {
+            principal_id: "test-p080-read-only-operator".to_string(),
+            token_fingerprint: fp,
+        };
+        assert!(
+            handle
+                .auth_ok_for_p080_subscription(&cred, Some("run-allowed"))
+                .await,
+            "run_id in scope must be allowed"
+        );
+        assert!(
+            !handle
+                .auth_ok_for_p080_subscription(&cred, Some("run-other"))
+                .await,
+            "run_id outside scope must be denied"
+        );
+        assert!(
+            !handle.auth_ok_for_p080_subscription(&cred, None).await,
+            "no run_id filter with scope-restricted principal must be denied"
         );
     }
 

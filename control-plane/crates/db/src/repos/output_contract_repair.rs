@@ -9,7 +9,10 @@ use domain::output_contract_repair::{
 // Repair events
 // ---------------------------------------------------------------------------
 
-pub async fn insert_repair_event(pool: &SqlitePool, row: &OutputContractRepairEventRow) -> Result<()> {
+pub async fn insert_repair_event(
+    pool: &SqlitePool,
+    row: &OutputContractRepairEventRow,
+) -> Result<()> {
     sqlx::query(
         r#"
         INSERT INTO output_contract_repair_events (
@@ -117,7 +120,9 @@ pub async fn update_repair_event_status(
     .rows_affected();
 
     if rows_affected == 0 {
-        bail!("output_contract_repair_events: no row found for repair_attempt_id={repair_attempt_id}");
+        bail!(
+            "output_contract_repair_events: no row found for repair_attempt_id={repair_attempt_id}"
+        );
     }
     Ok(())
 }
@@ -209,7 +214,11 @@ pub async fn mark_projection_stale(
     Ok(())
 }
 
-pub async fn mark_projection_fresh(pool: &SqlitePool, repair_attempt_id: &str, updated_at: &str) -> Result<()> {
+pub async fn mark_projection_fresh(
+    pool: &SqlitePool,
+    repair_attempt_id: &str,
+    updated_at: &str,
+) -> Result<()> {
     sqlx::query(
         r#"
         UPDATE output_contract_repair_events
@@ -1059,7 +1068,14 @@ pub async fn reclaim_expired_lease_and_event(
     }
 
     // 2. Settle the lease with reclamation_reason.
-    settle_lease_tx(&mut tx, lease_key, lease_result, Some(reclamation_reason), updated_at).await?;
+    settle_lease_tx(
+        &mut tx,
+        lease_key,
+        lease_result,
+        Some(reclamation_reason),
+        updated_at,
+    )
+    .await?;
 
     tx.commit().await?;
     Ok(())
@@ -1331,9 +1347,14 @@ mod tests {
             updated_at: "2026-05-30T10:00:00Z".into(),
         };
         insert_lease(&pool, &lease).await.unwrap();
-        transition_lease_to_prompt_sent(&pool, "lk-003", "2026-05-30T10:00:01Z", "2026-05-30T10:00:01Z")
-            .await
-            .unwrap();
+        transition_lease_to_prompt_sent(
+            &pool,
+            "lk-003",
+            "2026-05-30T10:00:01Z",
+            "2026-05-30T10:00:01Z",
+        )
+        .await
+        .unwrap();
         settle_lease_pool(&pool, "lk-003", "accepted", None, "2026-05-30T10:01:00Z")
             .await
             .unwrap();
@@ -1344,7 +1365,8 @@ mod tests {
         assert_eq!(found.version, 2);
 
         // Second settle is idempotent-ish (rows_affected=0 -> error, but no panic).
-        let second = settle_lease_pool(&pool, "lk-003", "accepted", None, "2026-05-30T10:02:00Z").await;
+        let second =
+            settle_lease_pool(&pool, "lk-003", "accepted", None, "2026-05-30T10:02:00Z").await;
         assert!(second.is_err());
     }
 
@@ -1397,18 +1419,30 @@ mod tests {
         .await
         .unwrap();
 
-        let found_lease = get_lease_by_key(&pool, "lk-reclaim-reserved").await.unwrap().unwrap();
+        let found_lease = get_lease_by_key(&pool, "lk-reclaim-reserved")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found_lease.lease_state, LeaseState::Settled);
         assert_eq!(found_lease.settled_result.as_deref(), Some("unavailable"));
-        assert_eq!(found_lease.reclamation_reason.as_deref(), Some("ttl_expired_reserved"));
+        assert_eq!(
+            found_lease.reclamation_reason.as_deref(),
+            Some("ttl_expired_reserved")
+        );
 
         let found_event = get_repair_event_by_repair_attempt_id(&pool, "rep-agent-008")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(found_event.status, "blocked");
-        assert!(!found_event.repair_budget_consumed, "reserved lease must not consume repair budget");
-        assert!(!found_event.fallback_budget_consumed, "reserved lease must not consume fallback budget");
+        assert!(
+            !found_event.repair_budget_consumed,
+            "reserved lease must not consume repair budget"
+        );
+        assert!(
+            !found_event.fallback_budget_consumed,
+            "reserved lease must not consume fallback budget"
+        );
     }
 
     #[tokio::test]
@@ -1444,8 +1478,10 @@ mod tests {
         };
         insert_lease(&pool, &lease).await.unwrap();
         transition_lease_to_prompt_sent(
-            &pool, "lk-reclaim-prompt-sent",
-            "2026-05-29T10:00:01Z", "2026-05-29T10:00:01Z",
+            &pool,
+            "lk-reclaim-prompt-sent",
+            "2026-05-29T10:00:01Z",
+            "2026-05-29T10:00:01Z",
         )
         .await
         .unwrap();
@@ -1465,18 +1501,33 @@ mod tests {
         .await
         .unwrap();
 
-        let found_lease = get_lease_by_key(&pool, "lk-reclaim-prompt-sent").await.unwrap().unwrap();
+        let found_lease = get_lease_by_key(&pool, "lk-reclaim-prompt-sent")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found_lease.lease_state, LeaseState::Settled);
-        assert_eq!(found_lease.settled_result.as_deref(), Some("failed_transport"));
-        assert_eq!(found_lease.reclamation_reason.as_deref(), Some("ttl_expired_prompt_sent"));
+        assert_eq!(
+            found_lease.settled_result.as_deref(),
+            Some("failed_transport")
+        );
+        assert_eq!(
+            found_lease.reclamation_reason.as_deref(),
+            Some("ttl_expired_prompt_sent")
+        );
 
         let found_event = get_repair_event_by_repair_attempt_id(&pool, "rep-agent-009")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(found_event.status, "failed");
-        assert!(found_event.repair_budget_consumed, "prompt_sent repair lease must consume repair budget");
-        assert!(!found_event.fallback_budget_consumed, "repair lease reclamation must not consume fallback budget");
+        assert!(
+            found_event.repair_budget_consumed,
+            "prompt_sent repair lease must consume repair budget"
+        );
+        assert!(
+            !found_event.fallback_budget_consumed,
+            "repair lease reclamation must not consume fallback budget"
+        );
     }
 
     #[tokio::test]
@@ -1514,8 +1565,10 @@ mod tests {
         };
         insert_lease(&pool, &lease).await.unwrap();
         transition_lease_to_prompt_sent(
-            &pool, "lk-fallback-prompt-sent",
-            "2026-05-29T10:00:01Z", "2026-05-29T10:00:01Z",
+            &pool,
+            "lk-fallback-prompt-sent",
+            "2026-05-29T10:00:01Z",
+            "2026-05-29T10:00:01Z",
         )
         .await
         .unwrap();
@@ -1535,17 +1588,29 @@ mod tests {
         .await
         .unwrap();
 
-        let found_lease = get_lease_by_key(&pool, "lk-fallback-prompt-sent").await.unwrap().unwrap();
+        let found_lease = get_lease_by_key(&pool, "lk-fallback-prompt-sent")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found_lease.lease_state, LeaseState::Settled);
-        assert_eq!(found_lease.settled_result.as_deref(), Some("failed_transport"));
+        assert_eq!(
+            found_lease.settled_result.as_deref(),
+            Some("failed_transport")
+        );
 
         let found_event = get_repair_event_by_repair_attempt_id(&pool, "rep-agent-010")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(found_event.status, "failed");
-        assert!(!found_event.repair_budget_consumed, "fallback lease reclamation must not consume repair budget");
-        assert!(found_event.fallback_budget_consumed, "prompt_sent fallback lease must consume fallback budget");
+        assert!(
+            !found_event.repair_budget_consumed,
+            "fallback lease reclamation must not consume repair budget"
+        );
+        assert!(
+            found_event.fallback_budget_consumed,
+            "prompt_sent fallback lease must consume fallback budget"
+        );
     }
 
     // SEC-002 integration regression: the advisory-only fail-closed path must settle
@@ -1602,7 +1667,9 @@ mod tests {
             "2026-06-09T10:01:00Z",
         )
         .await
-        .expect("advisory fail-closed settle must succeed against migrated SQLite CHECK constraints");
+        .expect(
+            "advisory fail-closed settle must succeed against migrated SQLite CHECK constraints",
+        );
 
         let found = get_repair_event_by_repair_attempt_id(&pool, "rep-agent-advisory-settle")
             .await
@@ -1611,9 +1678,15 @@ mod tests {
         assert_eq!(found.status, "skipped");
         assert_eq!(found.recommended_next_action, "manual_investigation");
         assert!(found.final_output_settlement.is_none());
-        let found_lease = get_lease_by_key(&pool, "lk-advisory-settle").await.unwrap().unwrap();
+        let found_lease = get_lease_by_key(&pool, "lk-advisory-settle")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found_lease.lease_state, LeaseState::Settled);
-        assert_eq!(found_lease.settled_result.as_deref(), Some("skipped_ineligible"));
+        assert_eq!(
+            found_lease.settled_result.as_deref(),
+            Some("skipped_ineligible")
+        );
     }
 
     // SEC-002 integration regression: update_repair_event_status with "manual_investigation"
@@ -1635,7 +1708,9 @@ mod tests {
             "2026-06-09T10:01:00Z",
         )
         .await
-        .expect("advisory fail-closed update must succeed against migrated SQLite CHECK constraints");
+        .expect(
+            "advisory fail-closed update must succeed against migrated SQLite CHECK constraints",
+        );
 
         let found = get_repair_event_by_repair_attempt_id(&pool, "rep-agent-advisory-update")
             .await
@@ -1722,12 +1797,15 @@ mod tests {
             "2026-06-09T10:01:00Z",
         )
         .await
-        .expect("update_repair_event_status with blocked_provider_mode_mismatch must satisfy CHECK");
+        .expect(
+            "update_repair_event_status with blocked_provider_mode_mismatch must satisfy CHECK",
+        );
 
-        let found2 = get_repair_event_by_repair_attempt_id(&pool, "rep-agent-junie-mismatch-nolease")
-            .await
-            .unwrap()
-            .unwrap();
+        let found2 =
+            get_repair_event_by_repair_attempt_id(&pool, "rep-agent-junie-mismatch-nolease")
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(
             found2.final_output_settlement.as_deref(),
             Some("blocked_provider_mode_mismatch")
@@ -1740,11 +1818,20 @@ mod tests {
         use std::str::FromStr;
 
         let cases = [
-            (LeaseReclamationReason::TtlExpiredReserved, "ttl_expired_reserved"),
-            (LeaseReclamationReason::TtlExpiredPromptSent, "ttl_expired_prompt_sent"),
+            (
+                LeaseReclamationReason::TtlExpiredReserved,
+                "ttl_expired_reserved",
+            ),
+            (
+                LeaseReclamationReason::TtlExpiredPromptSent,
+                "ttl_expired_prompt_sent",
+            ),
             (LeaseReclamationReason::Cancellation, "cancellation"),
             (LeaseReclamationReason::Supersession, "supersession"),
-            (LeaseReclamationReason::PrincipalRevoked, "principal_revoked"),
+            (
+                LeaseReclamationReason::PrincipalRevoked,
+                "principal_revoked",
+            ),
         ];
         for (variant, s) in &cases {
             assert_eq!(variant.to_string(), *s, "Display mismatch for {variant:?}");

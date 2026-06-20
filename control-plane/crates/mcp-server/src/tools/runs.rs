@@ -1410,6 +1410,54 @@ pub async fn build_escalation_readback_summary_json(
     Ok(map)
 }
 
+pub async fn build_escalation_readback_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    build_operator_escalation_readback_json(pool, run_id).await
+}
+
+pub fn redact_run_projection_paths(value: &mut serde_json::Value, is_operator: bool) {
+    if is_operator {
+        return;
+    }
+    redact_path_fields(value);
+}
+
+pub fn redact_run_snapshot_fields(value: &mut serde_json::Value, is_operator: bool) {
+    if is_operator {
+        return;
+    }
+    redact_path_fields(value);
+}
+
+fn redact_path_fields(value: &mut serde_json::Value) {
+    const PATH_FIELDS: &[&str] = &[
+        "workspace_root",
+        "artifact_root",
+        "worktree_root",
+        "chainworks_meta_root",
+        "file_path",
+        "path",
+    ];
+    match value {
+        serde_json::Value::Object(obj) => {
+            for field in PATH_FIELDS {
+                obj.remove(*field);
+            }
+            for child in obj.values_mut() {
+                redact_path_fields(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_path_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn build_operator_escalation_readback_json(
     pool: &SqlitePool,
     run_id: RunId,

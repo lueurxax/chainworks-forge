@@ -58,12 +58,20 @@ fn p079_percent_decode_ascii(s: &str) -> String {
             let h = match hi {
                 '0'..='9' => (hi as u8) - b'0',
                 'a'..='f' => (hi as u8) - b'a' + 10,
-                _ => { out.push(bytes[i] as char); i += 1; continue; }
+                _ => {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                    continue;
+                }
             };
             let l = match lo {
                 '0'..='9' => (lo as u8) - b'0',
                 'a'..='f' => (lo as u8) - b'a' + 10,
-                _ => { out.push(bytes[i] as char); i += 1; continue; }
+                _ => {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                    continue;
+                }
             };
             out.push((h << 4 | l) as char);
             i += 3;
@@ -88,18 +96,14 @@ fn p079_safe_relative_path(path: Option<&str>) -> Option<&str> {
     path.filter(|p| {
         let p_lower = p.to_lowercase();
         // SEC-P079-LOW-001: reject fully URL-encoded traversal sequences.
-        let no_encoded = !p_lower.contains("%2e%2e")
-            && !p_lower.contains("%2f")
-            && !p_lower.contains("%5c");
+        let no_encoded =
+            !p_lower.contains("%2e%2e") && !p_lower.contains("%2f") && !p_lower.contains("%5c");
         // SEC-P079-LOW-001: also validate the percent-decoded form to catch mixed
         // literal/encoded traversal such as %2e. or .%2e (e.g. "%2e./etc/passwd").
         let decoded = p079_percent_decode_ascii(p);
-        !p079_path_has_traversal(p)
-            && no_encoded
-            && !p079_path_has_traversal(&decoded)
+        !p079_path_has_traversal(p) && no_encoded && !p079_path_has_traversal(&decoded)
     })
 }
-
 
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
 #[graphql(name = "AgentFailureKind", rename_items = "SCREAMING_SNAKE_CASE")]
@@ -122,8 +126,6 @@ pub enum AgentFailureKind {
     CancelledByOperator,
     SupersededByRetry,
     HostInterruption,
-    ToolOutputBudgetPreflightDenied,
-    ToolOutputBudgetExceeded,
     Unknown,
 }
 
@@ -730,7 +732,10 @@ fn gql_adapter_family(s: &str) -> GqlAdapterFamily {
 }
 
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
-#[graphql(name = "OutputContractRepairStatus", rename_items = "SCREAMING_SNAKE_CASE")]
+#[graphql(
+    name = "OutputContractRepairStatus",
+    rename_items = "SCREAMING_SNAKE_CASE"
+)]
 pub enum GqlOutputContractRepairStatus {
     NotAttempted,
     InProgress,
@@ -765,7 +770,10 @@ pub enum GqlInitialFailureClass {
 }
 
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
-#[graphql(name = "SameSessionRepairResult", rename_items = "SCREAMING_SNAKE_CASE")]
+#[graphql(
+    name = "SameSessionRepairResult",
+    rename_items = "SCREAMING_SNAKE_CASE"
+)]
 pub enum GqlSameSessionRepairResult {
     NotNeeded,
     Accepted,
@@ -780,7 +788,10 @@ pub enum GqlSameSessionRepairResult {
 }
 
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
-#[graphql(name = "TranscriptRecoveryResult", rename_items = "SCREAMING_SNAKE_CASE")]
+#[graphql(
+    name = "TranscriptRecoveryResult",
+    rename_items = "SCREAMING_SNAKE_CASE"
+)]
 pub enum GqlTranscriptRecoveryResult {
     NotNeeded,
     Accepted,
@@ -792,7 +803,10 @@ pub enum GqlTranscriptRecoveryResult {
 }
 
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
-#[graphql(name = "TranscriptRecoverySource", rename_items = "SCREAMING_SNAKE_CASE")]
+#[graphql(
+    name = "TranscriptRecoverySource",
+    rename_items = "SCREAMING_SNAKE_CASE"
+)]
 pub enum GqlRecoverySource {
     Transcript,
     ProviderEnvelope,
@@ -816,7 +830,10 @@ pub enum GqlProviderFallbackResult {
 }
 
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
-#[graphql(name = "OutputContractRepairLeaseState", rename_items = "SCREAMING_SNAKE_CASE")]
+#[graphql(
+    name = "OutputContractRepairLeaseState",
+    rename_items = "SCREAMING_SNAKE_CASE"
+)]
 pub enum GqlLeaseState {
     Reserved,
     PromptSent,
@@ -824,7 +841,10 @@ pub enum GqlLeaseState {
 }
 
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
-#[graphql(name = "OutputContractRepairLeaseKind", rename_items = "SCREAMING_SNAKE_CASE")]
+#[graphql(
+    name = "OutputContractRepairLeaseKind",
+    rename_items = "SCREAMING_SNAKE_CASE"
+)]
 pub enum GqlLeaseKind {
     Repair,
     Fallback,
@@ -891,7 +911,10 @@ pub enum GqlRecommendedNextAction {
 }
 
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
-#[graphql(name = "PermissionDecisionValue", rename_items = "SCREAMING_SNAKE_CASE")]
+#[graphql(
+    name = "PermissionDecisionValue",
+    rename_items = "SCREAMING_SNAKE_CASE"
+)]
 pub enum GqlPermissionDecisionValue {
     Allowed,
     Denied,
@@ -1150,7 +1173,9 @@ fn gql_initial_failure_subtype(s: &str) -> GqlInitialFailureSubtype {
     match s {
         "plan_event_instead_of_output" => GqlInitialFailureSubtype::PlanEventInsteadOfOutput,
         "empty_submit_after_plan" => GqlInitialFailureSubtype::EmptySubmitAfterPlan,
-        "file_plan_written_instead_of_payload" => GqlInitialFailureSubtype::FilePlanWrittenInsteadOfPayload,
+        "file_plan_written_instead_of_payload" => {
+            GqlInitialFailureSubtype::FilePlanWrittenInsteadOfPayload
+        }
         "repair_repeated_plan_behavior" => GqlInitialFailureSubtype::RepairRepeatedPlanBehavior,
         "malformed_envelope" => GqlInitialFailureSubtype::MalformedEnvelope,
         "wrong_output_key" => GqlInitialFailureSubtype::WrongOutputKey,
@@ -1162,20 +1187,32 @@ fn gql_initial_failure_subtype(s: &str) -> GqlInitialFailureSubtype {
         "unattributable_envelope" => GqlInitialFailureSubtype::UnattributableEnvelope,
         "oversized_fallback_packet" => GqlInitialFailureSubtype::OversizedFallbackPacket,
         "principal_revoked" => GqlInitialFailureSubtype::PrincipalRevoked,
-        "transcript_recovery_flag_missing" => GqlInitialFailureSubtype::TranscriptRecoveryFlagMissing,
+        "transcript_recovery_flag_missing" => {
+            GqlInitialFailureSubtype::TranscriptRecoveryFlagMissing
+        }
         _ => GqlInitialFailureSubtype::UnknownEnumValue,
     }
 }
 
 fn gql_final_output_settlement(s: &str) -> GqlFinalOutputSettlement {
     match s {
-        "valid_outputs_from_completed_execution" => GqlFinalOutputSettlement::ValidOutputsFromCompletedExecution,
+        "valid_outputs_from_completed_execution" => {
+            GqlFinalOutputSettlement::ValidOutputsFromCompletedExecution
+        }
         "valid_outputs_from_repair" => GqlFinalOutputSettlement::ValidOutputsFromRepair,
-        "valid_outputs_from_transcript_recovery" => GqlFinalOutputSettlement::ValidOutputsFromTranscriptRecovery,
-        "valid_outputs_from_provider_envelope" => GqlFinalOutputSettlement::ValidOutputsFromProviderEnvelope,
+        "valid_outputs_from_transcript_recovery" => {
+            GqlFinalOutputSettlement::ValidOutputsFromTranscriptRecovery
+        }
+        "valid_outputs_from_provider_envelope" => {
+            GqlFinalOutputSettlement::ValidOutputsFromProviderEnvelope
+        }
         "valid_outputs_from_fallback" => GqlFinalOutputSettlement::ValidOutputsFromFallback,
-        "blocked_missing_required_outputs" => GqlFinalOutputSettlement::BlockedMissingRequiredOutputs,
-        "blocked_invalid_required_outputs" => GqlFinalOutputSettlement::BlockedInvalidRequiredOutputs,
+        "blocked_missing_required_outputs" => {
+            GqlFinalOutputSettlement::BlockedMissingRequiredOutputs
+        }
+        "blocked_invalid_required_outputs" => {
+            GqlFinalOutputSettlement::BlockedInvalidRequiredOutputs
+        }
         "blocked_provider_mode_mismatch" => GqlFinalOutputSettlement::BlockedProviderModeMismatch,
         "ignored_late_outputs" => GqlFinalOutputSettlement::IgnoredLateOutputs,
         "cancelled" => GqlFinalOutputSettlement::Cancelled,
@@ -1190,7 +1227,9 @@ fn gql_recommended_next_action(s: &str) -> GqlRecommendedNextAction {
         "inspect_repair_evidence" => GqlRecommendedNextAction::InspectRepairEvidence,
         "configure_fallback_policy" => GqlRecommendedNextAction::ConfigureFallbackPolicy,
         "operator_resolve_approval" => GqlRecommendedNextAction::OperatorResolveApproval,
-        "operator_resolve_workflow_conflict" => GqlRecommendedNextAction::OperatorResolveWorkflowConflict,
+        "operator_resolve_workflow_conflict" => {
+            GqlRecommendedNextAction::OperatorResolveWorkflowConflict
+        }
         "retry_after_transport_restored" => GqlRecommendedNextAction::RetryAfterTransportRestored,
         "cancel_acknowledged" => GqlRecommendedNextAction::CancelAcknowledged,
         _ => GqlRecommendedNextAction::ManualInvestigation,
@@ -1234,9 +1273,7 @@ fn p079_gql_transcript_recovery(json: Option<&str>) -> Option<GqlTranscriptRecov
     Some(GqlTranscriptRecovery {
         result: gql_transcript_recovery_result(v["result"].as_str().unwrap_or("unavailable")),
         result_subtype: v["result_subtype"].as_str().map(ToOwned::to_owned),
-        recovery_source: v["recovery_source"]
-            .as_str()
-            .and_then(gql_recovery_source),
+        recovery_source: v["recovery_source"].as_str().and_then(gql_recovery_source),
         bytes_examined: v["bytes_examined"].as_i64(),
         max_recovery_payload_bytes: v["max_recovery_payload_bytes"].as_i64().unwrap_or(262144),
         max_json_depth: v["max_json_depth"].as_i64().unwrap_or(32),
@@ -1344,7 +1381,10 @@ fn p079_gql_required_outputs_with_redaction(
         .collect()
 }
 
-fn p079_gql_permission_decisions(json: &str, _include_operator_debug: bool) -> Vec<GqlPermissionDecision> {
+fn p079_gql_permission_decisions(
+    json: &str,
+    _include_operator_debug: bool,
+) -> Vec<GqlPermissionDecision> {
     p079_parse_json_capped(json)
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default()
@@ -1352,7 +1392,9 @@ fn p079_gql_permission_decisions(json: &str, _include_operator_debug: bool) -> V
         .filter_map(|e| {
             Some(GqlPermissionDecision {
                 method: e["method"].as_str()?.to_owned(),
-                resource_kind: gql_permission_resource_kind(e["resource_kind"].as_str().unwrap_or("tool_custom")),
+                resource_kind: gql_permission_resource_kind(
+                    e["resource_kind"].as_str().unwrap_or("tool_custom"),
+                ),
                 decision: gql_permission_decision_value(e["decision"].as_str().unwrap_or("denied")),
                 reason: e["reason"].as_str().unwrap_or("").to_owned(),
             })
@@ -1522,11 +1564,10 @@ impl GqlAgentExecution {
             .data_opt::<auth::Principal>()
             .is_some_and(|p| p.class == auth::PrincipalClass::Operator);
         let pool = ctx.data::<sqlx::SqlitePool>()?;
-        let Some(row) = output_contract_repair::get_repair_event_by_agent_execution_id(
-            pool,
-            self.id.as_str(),
-        )
-        .await? else {
+        let Some(row) =
+            output_contract_repair::get_repair_event_by_agent_execution_id(pool, self.id.as_str())
+                .await?
+        else {
             return Ok(None);
         };
 
@@ -1574,50 +1615,68 @@ impl GqlAgentExecution {
             adapter_family: gql_adapter_family(&row.adapter_family),
             required_output_mode: gql_required_output_mode(&row.required_output_mode),
             initial_failure_class: gql_initial_failure_class(&row.initial_failure_class),
-            initial_failure_subtype: row.initial_failure_subtype.as_deref().map(gql_initial_failure_subtype),
+            initial_failure_subtype: row
+                .initial_failure_subtype
+                .as_deref()
+                .map(gql_initial_failure_subtype),
             status: gql_output_contract_repair_status(&row.status),
             presentation_category: gql_presentation_category(&row.presentation_category),
             recommended_next_action: gql_recommended_next_action(&row.recommended_next_action),
-            final_output_settlement: row.final_output_settlement.as_deref().map(gql_final_output_settlement),
-            same_session_repair: p079_gql_same_session_repair(row.same_session_repair_json.as_deref())
-                .unwrap_or_else(|| GqlSameSessionRepair {
-                    result: GqlSameSessionRepairResult::NotNeeded,
-                    turn_count: 0,
-                    deadline_seconds: Some(0),
-                    reason: None,
-                    repair_attempt_id: None,
-                }),
-            transcript_recovery: p079_gql_transcript_recovery(row.transcript_recovery_json.as_deref())
-                .unwrap_or_else(|| GqlTranscriptRecovery {
-                    result: GqlTranscriptRecoveryResult::NotNeeded,
-                    result_subtype: None,
-                    recovery_source: None,
-                    bytes_examined: None,
-                    max_recovery_payload_bytes: 262144,
-                    max_json_depth: 32,
-                    max_chunks_examined: 64,
-                    recovery_parser_version: "p079_recovery_v1".to_string(),
-                }),
-            provider_fallback: p079_gql_provider_fallback(row.provider_fallback_json.as_deref(), include_operator_debug)
-                .unwrap_or_else(|| GqlProviderFallback {
-                    result: GqlProviderFallbackResult::NotNeeded,
-                    fallback_profile: None,
-                    fallback_agent_execution_id: None,
-                    parent_failed_agent_execution_id: None,
-                    fallback_packet_hash: None,
-                    fallback_principal_id: None,
-                    fallback_principal_capability_hash: None,
-                    deadline_seconds: Some(0),
-                }),
-            provider_plan_evidence: p079_gql_provider_plan_evidence(row.provider_plan_evidence_json.as_deref())
-                .unwrap_or_else(|| GqlProviderPlanEvidence {
-                    paths: vec![],
-                    redactions_applied: vec![],
-                    truncated_at_cap: false,
-                    accepted_as_output: false,
-                }),
+            final_output_settlement: row
+                .final_output_settlement
+                .as_deref()
+                .map(gql_final_output_settlement),
+            same_session_repair: p079_gql_same_session_repair(
+                row.same_session_repair_json.as_deref(),
+            )
+            .unwrap_or_else(|| GqlSameSessionRepair {
+                result: GqlSameSessionRepairResult::NotNeeded,
+                turn_count: 0,
+                deadline_seconds: Some(0),
+                reason: None,
+                repair_attempt_id: None,
+            }),
+            transcript_recovery: p079_gql_transcript_recovery(
+                row.transcript_recovery_json.as_deref(),
+            )
+            .unwrap_or_else(|| GqlTranscriptRecovery {
+                result: GqlTranscriptRecoveryResult::NotNeeded,
+                result_subtype: None,
+                recovery_source: None,
+                bytes_examined: None,
+                max_recovery_payload_bytes: 262144,
+                max_json_depth: 32,
+                max_chunks_examined: 64,
+                recovery_parser_version: "p079_recovery_v1".to_string(),
+            }),
+            provider_fallback: p079_gql_provider_fallback(
+                row.provider_fallback_json.as_deref(),
+                include_operator_debug,
+            )
+            .unwrap_or_else(|| GqlProviderFallback {
+                result: GqlProviderFallbackResult::NotNeeded,
+                fallback_profile: None,
+                fallback_agent_execution_id: None,
+                parent_failed_agent_execution_id: None,
+                fallback_packet_hash: None,
+                fallback_principal_id: None,
+                fallback_principal_capability_hash: None,
+                deadline_seconds: Some(0),
+            }),
+            provider_plan_evidence: p079_gql_provider_plan_evidence(
+                row.provider_plan_evidence_json.as_deref(),
+            )
+            .unwrap_or_else(|| GqlProviderPlanEvidence {
+                paths: vec![],
+                redactions_applied: vec![],
+                truncated_at_cap: false,
+                accepted_as_output: false,
+            }),
             required_outputs,
-            permission_decisions: p079_gql_permission_decisions(&row.permission_decisions_json, include_operator_debug),
+            permission_decisions: p079_gql_permission_decisions(
+                &row.permission_decisions_json,
+                include_operator_debug,
+            ),
             budget: GqlOutputContractRepairBudget {
                 repair_consumed: row.repair_budget_consumed,
                 fallback_consumed: row.fallback_budget_consumed,
@@ -1724,12 +1783,6 @@ impl GqlAgentExecutionRuntimeFacts {
                 }
                 domain::agent::AgentFailureKind::HostInterruption => {
                     AgentFailureKind::HostInterruption
-                }
-                domain::agent::AgentFailureKind::ToolOutputBudgetPreflightDenied => {
-                    AgentFailureKind::ToolOutputBudgetPreflightDenied
-                }
-                domain::agent::AgentFailureKind::ToolOutputBudgetExceeded => {
-                    AgentFailureKind::ToolOutputBudgetExceeded
                 }
                 domain::agent::AgentFailureKind::Unknown => AgentFailureKind::Unknown,
             }),
@@ -2038,7 +2091,10 @@ mod tests {
         );
         // Allowed fields: key, kind, state, settled_result, reclamation_reason,
         // owner_principal_id, acquired_at, expires_at, lease_seconds.
-        assert!(obj.contains_key("owner_principal_id"), "owner_principal_id must be present");
+        assert!(
+            obj.contains_key("owner_principal_id"),
+            "owner_principal_id must be present"
+        );
         assert!(obj.contains_key("key"), "key must be present");
     }
 
@@ -2047,7 +2103,10 @@ mod tests {
     fn p079_safe_relative_path_rejects_absolute_and_traversal() {
         assert_eq!(p079_safe_relative_path(Some("/etc/passwd")), None);
         assert_eq!(p079_safe_relative_path(Some("../secret")), None);
-        assert_eq!(p079_safe_relative_path(Some("output_contract_repair/abc/plan.json")), Some("output_contract_repair/abc/plan.json"));
+        assert_eq!(
+            p079_safe_relative_path(Some("output_contract_repair/abc/plan.json")),
+            Some("output_contract_repair/abc/plan.json")
+        );
         assert_eq!(p079_safe_relative_path(None), None);
     }
 
@@ -2056,13 +2115,29 @@ mod tests {
     #[test]
     fn p079_safe_relative_path_rejects_url_encoded_traversal() {
         // %2e%2e is URL-encoded ".."
-        assert_eq!(p079_safe_relative_path(Some("%2e%2e/secret")), None, "%2e%2e must be rejected");
+        assert_eq!(
+            p079_safe_relative_path(Some("%2e%2e/secret")),
+            None,
+            "%2e%2e must be rejected"
+        );
         // Mixed case
-        assert_eq!(p079_safe_relative_path(Some("%2E%2E/secret")), None, "uppercase %2E%2E must be rejected");
+        assert_eq!(
+            p079_safe_relative_path(Some("%2E%2E/secret")),
+            None,
+            "uppercase %2E%2E must be rejected"
+        );
         // %2f is URL-encoded "/"
-        assert_eq!(p079_safe_relative_path(Some("foo%2fetc%2fpasswd")), None, "%2f slash must be rejected");
+        assert_eq!(
+            p079_safe_relative_path(Some("foo%2fetc%2fpasswd")),
+            None,
+            "%2f slash must be rejected"
+        );
         // %5c is URL-encoded backslash
-        assert_eq!(p079_safe_relative_path(Some("foo%5csecret")), None, "%5c backslash must be rejected");
+        assert_eq!(
+            p079_safe_relative_path(Some("foo%5csecret")),
+            None,
+            "%5c backslash must be rejected"
+        );
         // Safe path still passes
         assert_eq!(
             p079_safe_relative_path(Some("output_contract_repair/abc/plan.json")),
@@ -2076,13 +2151,33 @@ mod tests {
     #[test]
     fn p079_safe_relative_path_rejects_mixed_encoded_traversal() {
         // %2e. is percent-encoded '.' followed by literal '.' → decoded ".." = traversal
-        assert_eq!(p079_safe_relative_path(Some("%2e./etc/passwd")), None, "%2e. must be rejected");
-        assert_eq!(p079_safe_relative_path(Some(".%2e/etc/passwd")), None, ".%2e must be rejected");
+        assert_eq!(
+            p079_safe_relative_path(Some("%2e./etc/passwd")),
+            None,
+            "%2e. must be rejected"
+        );
+        assert_eq!(
+            p079_safe_relative_path(Some(".%2e/etc/passwd")),
+            None,
+            ".%2e must be rejected"
+        );
         // Uppercase variants
-        assert_eq!(p079_safe_relative_path(Some("%2E./etc/passwd")), None, "%2E. uppercase must be rejected");
-        assert_eq!(p079_safe_relative_path(Some(".%2E/etc/passwd")), None, ".%2E uppercase must be rejected");
+        assert_eq!(
+            p079_safe_relative_path(Some("%2E./etc/passwd")),
+            None,
+            "%2E. uppercase must be rejected"
+        );
+        assert_eq!(
+            p079_safe_relative_path(Some(".%2E/etc/passwd")),
+            None,
+            ".%2E uppercase must be rejected"
+        );
         // Fully encoded / as %2F in a traversal sequence
-        assert_eq!(p079_safe_relative_path(Some("..%2Fetc%2Fpasswd")), None, "..%2F must be rejected");
+        assert_eq!(
+            p079_safe_relative_path(Some("..%2Fetc%2Fpasswd")),
+            None,
+            "..%2F must be rejected"
+        );
         // Double-encoded %252e (decoded once = %2e, still single-encode — not further decoded here, but reject %25)
         // A normal safe path must still pass
         assert_eq!(

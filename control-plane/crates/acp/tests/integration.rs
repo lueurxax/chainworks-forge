@@ -7475,10 +7475,7 @@ mod p079_posture_tests {
     // Denied: create_file tool (in allowlist) but path not in canonical set.
     #[test]
     fn create_file_to_non_canonical_path_denied() {
-        let params = write_params(
-            "create_file",
-            "/tmp/workspace/outside_canonical.md",
-        );
+        let params = write_params("create_file", "/tmp/workspace/outside_canonical.md");
         assert!(
             p079_posture_denied(&params, &canonical_paths()),
             "create_file to a non-canonical path must be denied"
@@ -7562,7 +7559,10 @@ mod p079_posture_tests {
         );
         let (tool_name, path) = p079_extract_decision_fields(&params);
         assert_eq!(tool_name, "write_file");
-        assert_eq!(path, "/tmp/workspace/.chainworks/proposals/current/proposal.md");
+        assert_eq!(
+            path,
+            "/tmp/workspace/.chainworks/proposals/current/proposal.md"
+        );
     }
 
     // Verify extract returns empty path when no structured field present (no title fallback).
@@ -7575,6 +7575,9 @@ mod p079_posture_tests {
             }
         });
         let (_tool_name, path) = p079_extract_decision_fields(&params);
-        assert!(path.is_empty(), "should return empty path when no structured input field present");
+        assert!(
+            path.is_empty(),
+            "should return empty path when no structured input field present"
+        );
     }
 }

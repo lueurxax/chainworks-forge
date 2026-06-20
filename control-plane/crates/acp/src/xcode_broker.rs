@@ -786,7 +786,9 @@ impl XcodeMcpBridgePool {
                 bail!("xcode_mcp_first_connect_timeout: lease '{lease_id}' is not available");
             };
             // SEC-P079-LOW-001: constant-time hash comparison to avoid timing side channels.
-            let hash_match: bool = lease.authorization_hash.as_bytes()
+            let hash_match: bool = lease
+                .authorization_hash
+                .as_bytes()
                 .ct_eq(actual_hash.as_bytes())
                 .into();
             if !hash_match {

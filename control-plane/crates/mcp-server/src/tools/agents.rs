@@ -288,6 +288,16 @@ async fn handle_continuation_status(
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing agent_execution_id"))?;
 
+    // SEC-LOW-001: runtime UUID validation before any DB call.
+    if uuid::Uuid::parse_str(agent_execution_id).is_err() {
+        return Ok(serde_json::json!({
+            "agent_execution_id": agent_execution_id,
+            "active": null,
+            "history": { "items": [] },
+            "error": { "code": -32602, "message": "agent_execution_id is not a valid UUID" }
+        }));
+    }
+
     // P086-SEC-LOW-003: Agent principals cannot read continuation history
     // without per-agent ownership verification. Return empty (no existence leak)
     // until Phase 1 ownership infrastructure is implemented.
@@ -355,6 +365,15 @@ async fn handle_continuation_candidates(
     let run_id = params["run_id"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing run_id"))?;
+
+    // SEC-LOW-001: runtime UUID validation before any DB call.
+    if uuid::Uuid::parse_str(run_id).is_err() {
+        return Ok(serde_json::json!({
+            "run_id": run_id,
+            "candidates": [],
+            "error": { "code": -32602, "message": "run_id is not a valid UUID" }
+        }));
+    }
 
     // P086-SEC-LOW-003: Agent principals cannot enumerate continuation
     // candidates without per-run membership verification. Return empty
@@ -572,13 +591,15 @@ async fn fetch_resurrection_phase(
     pool: &SqlitePool,
     continuation_id: &str,
 ) -> Result<Option<String>> {
-    let row = sqlx::query(
-        "SELECT resurrection_phase FROM agent_work_continuations WHERE id = ?1",
-    )
-    .bind(continuation_id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.and_then(|r| r.try_get::<Option<String>, _>("resurrection_phase").ok().flatten()))
+    let row = sqlx::query("SELECT resurrection_phase FROM agent_work_continuations WHERE id = ?1")
+        .bind(continuation_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.and_then(|r| {
+        r.try_get::<Option<String>, _>("resurrection_phase")
+            .ok()
+            .flatten()
+    }))
 }
 
 /// Build reviewer-redacted projection of a raw receipt JSON.
@@ -623,14 +644,20 @@ fn reviewer_redact_receipt(raw: &serde_json::Value) -> serde_json::Value {
                     .map(|b| format!("{b:02x}"))
                     .collect();
                 let prefix: String = s.chars().take(4).collect();
-                out.insert(k.clone(), serde_json::Value::String(format!("{prefix}...{hash}")));
+                out.insert(
+                    k.clone(),
+                    serde_json::Value::String(format!("{prefix}...{hash}")),
+                );
             } else {
                 out.insert(k.clone(), v.clone());
             }
             continue;
         }
         if k == "identity_proof_artifact_id" {
-            out.insert(k.clone(), serde_json::Value::String("[redacted]".to_string()));
+            out.insert(
+                k.clone(),
+                serde_json::Value::String("[redacted]".to_string()),
+            );
             continue;
         }
         out.insert(k.clone(), v.clone());
@@ -1330,9 +1357,174 @@ async fn verify_lead_auto_artifacts(
         }
     };
 
-    // Read artifact bytes from disk and recompute SHA-256 (P086-SEC-HIGH-001).
-    let bytes = match tokio::fs::read(&artifact.file_path).await {
-        Ok(b) => b,
+    // SEC-HIGH-002: Ownership check — the artifact row must belong to the agent_execution_id
+    // making this request. Prevents one agent from referencing another agent's artifacts.
+    if artifact.agent_execution_id.as_deref() != Some(agent_execution_id) {
+        return Ok(Some(serde_json::json!({
+            "outcome": "rejected",
+            "error": {
+                "code": -32024,
+                "message": "lead_decision_artifact does not belong to this agent_execution",
+                "data": {
+                    "agent_execution_id": agent_execution_id,
+                    "failure_reason": "lead_auto_artifact_ownership_mismatch"
+                }
+            }
+        })));
+    }
+
+    // SEC-HIGH-002: Path containment check — reject paths containing '..' traversal
+    // components to prevent reading outside the run artifact tree.
+    {
+        use std::path::Component;
+        if std::path::Path::new(&artifact.file_path)
+            .components()
+            .any(|c| c == Component::ParentDir)
+        {
+            return Ok(Some(serde_json::json!({
+                "outcome": "rejected",
+                "error": {
+                    "code": -32024,
+                    "message": "lead_decision_artifact path contains directory traversal components",
+                    "data": {
+                        "agent_execution_id": agent_execution_id,
+                        "failure_reason": "lead_auto_artifact_path_traversal"
+                    }
+                }
+            })));
+        }
+    }
+
+    // SEC-HIGH-002: Atomic open with O_NOFOLLOW, fstat the same descriptor for type/size
+    // validation, then read from the same handle. This eliminates the TOCTOU race window
+    // between the old symlink_metadata() check and the separate tokio::fs::read() call.
+    //
+    // O_NOFOLLOW causes open() to fail with ELOOP when the final path component is a symlink,
+    // which is checked by raw_os_error() == ELOOP (62 on macOS, 40 on Linux).
+    const LEAD_AUTO_ARTIFACT_MAX_BYTES: u64 = 1024 * 1024; // 1 MB hard cap
+
+    // O_NOFOLLOW values per platform (no libc dependency required).
+    #[cfg(target_os = "macos")]
+    const O_NOFOLLOW_FLAG: i32 = 0x0000_0100;
+    #[cfg(target_os = "linux")]
+    const O_NOFOLLOW_FLAG: i32 = 0x0002_0000;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    const O_NOFOLLOW_FLAG: i32 = 0;
+
+    // ELOOP errno values (open returns ELOOP when O_NOFOLLOW + path is a symlink).
+    #[cfg(target_os = "macos")]
+    const ELOOP_ERRNO: i32 = 62;
+    #[cfg(target_os = "linux")]
+    const ELOOP_ERRNO: i32 = 40;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    const ELOOP_ERRNO: i32 = -1; // unused
+
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use tokio::io::AsyncReadExt as _;
+
+    let mut open_opts = tokio::fs::OpenOptions::new();
+    open_opts.read(true);
+    #[cfg(unix)]
+    open_opts.custom_flags(O_NOFOLLOW_FLAG);
+
+    let mut file = match open_opts.open(&artifact.file_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            let is_symlink = e.raw_os_error() == Some(ELOOP_ERRNO);
+            if is_symlink {
+                return Ok(Some(serde_json::json!({
+                    "outcome": "rejected",
+                    "error": {
+                        "code": -32024,
+                        "message": "lead_decision_artifact path is a symlink; symlinks are not permitted",
+                        "data": {
+                            "agent_execution_id": agent_execution_id,
+                            "failure_reason": "lead_auto_artifact_symlink"
+                        }
+                    }
+                })));
+            }
+            return Ok(Some(serde_json::json!({
+                "outcome": "rejected",
+                "error": {
+                    "code": -32024,
+                    "message": "lead_decision_artifact file unreadable",
+                    "data": {
+                        "agent_execution_id": agent_execution_id,
+                        "failure_reason": "lead_auto_artifact_unreadable",
+                        "detail": e.to_string()
+                    }
+                }
+            })));
+        }
+    };
+
+    // fstat the opened descriptor — type and size are checked on the same fd we will read from.
+    let meta = match file.metadata().await {
+        Ok(m) => m,
+        Err(e) => {
+            return Ok(Some(serde_json::json!({
+                "outcome": "rejected",
+                "error": {
+                    "code": -32024,
+                    "message": "lead_decision_artifact fstat failed",
+                    "data": {
+                        "agent_execution_id": agent_execution_id,
+                        "failure_reason": "lead_auto_artifact_unreadable",
+                        "detail": e.to_string()
+                    }
+                }
+            })));
+        }
+    };
+
+    if meta.file_type().is_symlink() {
+        return Ok(Some(serde_json::json!({
+            "outcome": "rejected",
+            "error": {
+                "code": -32024,
+                "message": "lead_decision_artifact is a symlink; symlinks are not permitted",
+                "data": {
+                    "agent_execution_id": agent_execution_id,
+                    "failure_reason": "lead_auto_artifact_symlink"
+                }
+            }
+        })));
+    }
+    if !meta.is_file() {
+        return Ok(Some(serde_json::json!({
+            "outcome": "rejected",
+            "error": {
+                "code": -32024,
+                "message": "lead_decision_artifact path is not a regular file",
+                "data": {
+                    "agent_execution_id": agent_execution_id,
+                    "failure_reason": "lead_auto_artifact_not_regular_file"
+                }
+            }
+        })));
+    }
+    if meta.len() > LEAD_AUTO_ARTIFACT_MAX_BYTES {
+        return Ok(Some(serde_json::json!({
+            "outcome": "rejected",
+            "error": {
+                "code": -32024,
+                "message": "lead_decision_artifact exceeds the 1 MB size limit",
+                "data": {
+                    "agent_execution_id": agent_execution_id,
+                    "failure_reason": "lead_auto_artifact_too_large",
+                    "size_bytes": meta.len(),
+                    "max_bytes": LEAD_AUTO_ARTIFACT_MAX_BYTES
+                }
+            }
+        })));
+    }
+
+    // Read from the already-opened and fstat'd descriptor. No second open/path lookup.
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    let bytes = match file.read_to_end(&mut bytes).await {
+        Ok(_) => bytes,
         Err(e) => {
             return Ok(Some(serde_json::json!({
                 "outcome": "rejected",
@@ -1759,8 +1951,8 @@ async fn handle_continue_work(
     // run/stage/session metadata, before the lead artifact is verified.  After
     // verify_lead_auto_artifacts succeeds the artifact itself binds all those IDs, so
     // subsequent checks may return specific errors.
-    let is_agent_lead_auto = matches!(principal.class, auth::PrincipalClass::Agent)
-        && trigger_kind == "lead_auto";
+    let is_agent_lead_auto =
+        matches!(principal.class, auth::PrincipalClass::Agent) && trigger_kind == "lead_auto";
 
     // Check eligibility: agent_role=code_writer, owner_kind=stage_execution, terminal status, run membership.
     // check_eligibility returns Some for any code_writer+stage_execution agent regardless of status;
@@ -1803,6 +1995,32 @@ async fn handle_continue_work(
                 }
             }
         }));
+    }
+
+    // SEC-HIGH-002: Agent principals using lead_auto must be bound to the target run via
+    // run_scope. Artifact content validation (hash, target execution) is not sufficient —
+    // a compromised or unrelated agent token that learns a valid artifact can replay it.
+    // Requiring run_scope membership binds the caller to a specific run.
+    if trigger_kind == "lead_auto" && matches!(principal.class, auth::PrincipalClass::Agent) {
+        let authorized_for_run = principal
+            .run_scope
+            .as_ref()
+            .map(|scope| scope.iter().any(|s| s == &info.run_id))
+            .unwrap_or(false);
+        if !authorized_for_run {
+            return Ok(serde_json::json!({
+                "outcome": "rejected",
+                "error": {
+                    "code": -32001,
+                    "message": "Agent principal run_scope does not include the target run; configure run_scope binding before using lead_auto",
+                    "data": {
+                        "agent_execution_id": agent_execution_id,
+                        "run_id": info.run_id,
+                        "failure_reason": "unauthorized_agent_run_scope"
+                    }
+                }
+            }));
+        }
     }
 
     if let Some(expected) = expected_run_id {
@@ -3170,7 +3388,10 @@ mod tests {
         // already_running, run_id_mismatch, stage_mismatch, session_mismatch, or
         // provider_session_mismatch errors from each other before artifact verification.
         let r = super::lead_auto_agent_opaque_rejection();
-        assert_eq!(r["outcome"], "rejected", "opaque rejection must have outcome=rejected");
+        assert_eq!(
+            r["outcome"], "rejected",
+            "opaque rejection must have outcome=rejected"
+        );
         assert_eq!(
             r["error"]["code"], -32020,
             "opaque rejection must use code -32020 (same as ineligible to avoid a distinct oracle signal)"
@@ -3188,7 +3409,9 @@ mod tests {
             "opaque rejection must not expose actual_run_id"
         );
         assert!(
-            r["error"]["data"].get("actual_stage_execution_id").is_none(),
+            r["error"]["data"]
+                .get("actual_stage_execution_id")
+                .is_none(),
             "opaque rejection must not expose actual_stage_execution_id"
         );
     }

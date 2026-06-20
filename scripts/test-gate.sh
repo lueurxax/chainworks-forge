@@ -314,6 +314,55 @@ PROPOSAL_081_SWIFT_TESTS=(
   "Chainworks ForgeTests/Proposal081GraphQLRedactionTests"
 )
 
+# P080 Rust unit tests (db + mcp-server + graphql-server)
+PROPOSAL_080_RUST_TESTS=(
+  "db p080_seed_rollout_control_inserts_all_classes"
+  "db p080_seed_rollout_control_is_idempotent"
+  "db p080_rollout_control_includes_detection_only_class"
+  "db p080_classify_empty_db_returns_zero"
+  "db p080_list_readback_page_empty_returns_empty"
+  "db p080_get_readback_missing_returns_none"
+  "db p080_get_rollout_control_returns_seeded_row"
+  "db p080_redaction_catches_embedded_secret_matrix"
+  "db p080_dedup_entry_roundtrip"
+  "db p080_insert_reconciliation_event_basic"
+  "db p080_live_loop_repair_path_stale_suspected_to_repaired"
+  "db p080_seed_rollout_control_partial_rows_fail_closed"
+  "db p080_validate_rollout_control_completeness_pass"
+  "db p080_validate_rollout_control_completeness_missing_class_fails"
+  "db p080_run_report_section_redacts_stored_readback_rows"
+  "db p080_reconciliation_summary_counts_repaired_via_decision_column"
+  "mcp-server p080_http_rejects_duplicate_keys_before_jsonrpc_last_wins_parse"
+  "mcp-server p080_http_rejects_duplicate_keys_before_auth_and_with_escaped_method"
+  "mcp-server p080_duplicate_key_scanner_canonicalizes_unicode_escaped_keys"
+  "mcp-server p080_tools_list_omits_codex_aliases_when_rollout_control_unreadable"
+  "mcp-server p080_codex_alias_names_are_identified_for_rollout_fail_closed_filtering"
+  "mcp-server p080_clear_permanent_hold_uses_p080_specific_dedup_not_generic_precheck"
+  "mcp-server p080_diagnostics_get_returns_rollout_disabled_in_phase_0"
+  "mcp-server p080_diagnostics_get_returns_empty_page_when_detection_only_enabled"
+  "mcp-server p080_diagnostics_get_cursor_pages_forward"
+  "mcp-server p080_diagnostics_get_rejects_malformed_cursor"
+  "mcp-server p080_diagnostics_get_rejects_unknown_nested_filter_field"
+  "mcp-server p080_diagnostics_get_rejects_invalid_filter_instead_of_broadening"
+  "mcp-server p080_schema_version_required_returns_error"
+  "mcp-server p080_reconcile_diagnose_only_returns_diagnosed"
+  "mcp-server p080_reconcile_request_rejects_unknown_nested_target_field"
+  "mcp-server p080_reconcile_repair_if_safe_returns_rollout_disabled"
+  "mcp-server p080_diagnose_only_rejects_dedup_key"
+  "mcp-server p080_clear_permanent_hold_returns_action_disabled"
+  "mcp-server p080_repair_if_safe_rollout_disabled_returns_rollout_disabled"
+  "mcp-server p080_repair_if_safe_rollout_enabled_stale_returns_diagnosed"
+  "mcp-server p080_repair_if_safe_dedup_replay_returns_same_response"
+  "mcp-server p080_dedup_repair_phase1_returns_rollout_disabled"
+  "mcp-server p080_diagnostics_get_is_read_only"
+  "mcp-server p080_repair_if_safe_phase1_rollout_disabled_before_fence_check"
+  "mcp-server p080_read_only_operator_can_call_diagnose_only"
+  "mcp-server p080_read_only_operator_rejected_for_repair_if_safe"
+  "mcp-server p080_missing_live_disable_row_returns_live_disabled"
+  "mcp-server p080_deleted_live_disable_row_fails_closed"
+  "graphql-server p080_graphql_read_only_operator_surface_policy_query_denied"
+)
+
 P060_PROPOSAL_REVISION_ID="P060-r16-2026-04-22"
 PROPOSAL_060_CONTROL_ARTIFACT_DIR="docs/proposals/060-control-artifacts"
 PROPOSAL_060_CONTROL_ARTIFACT_SPECS=(
@@ -2521,6 +2570,7 @@ Available gates:
   proposal-054-v1-retirement|p054-v1-retirement
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
   proposal-084|p084  Proposal 084 executable rollout gates and observability contract gate
+  proposal-080|p080  Proposal 080 continuous stale execution reconciliation — DB + MCP + GraphQL unit tests
   proposal-081|p081  Proposal 081 Phase 1 boundary-first API and auth contract matrix gate
   proposal-082|p082  Proposal 082 recovery and retry state-machine matrix proof gate
   proposal-083|p083  Proposal 083 focused code-fix regression gate (main-sync request id)
@@ -7139,6 +7189,46 @@ PY
       cargo test -p mcp-server p076_auto_retry_latest -- --nocapture
     )
     log "Proposal 076 gate passed"
+    ;;
+  proposal-080|p080)
+    log "Proposal 080 gate: continuous stale execution reconciliation — DB, MCP, and GraphQL unit tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      # Verify migration file exists
+      if [[ ! -f "crates/db/migrations/086_p080_stale_execution_reconciliation.sql" ]]; then
+        echo "FAIL: missing control-plane/crates/db/migrations/086_p080_stale_execution_reconciliation.sql"
+        exit 1
+      fi
+      # Verify the principal_class CHECK constraint matches the approved proposal vocabulary:
+      # ck_p080_dedup_principal_class must admit 'operator' and 'read_only_operator' only.
+      if ! grep -q "read_only_operator" "crates/db/migrations/086_p080_stale_execution_reconciliation.sql"; then
+        echo "FAIL: migration must use approved principal_class IN ('operator','read_only_operator') (proposal line 513)"
+        exit 1
+      fi
+      if grep -q "'agent'" "crates/db/migrations/086_p080_stale_execution_reconciliation.sql"; then
+        echo "FAIL: migration must not admit 'agent' in ck_p080_dedup_principal_class"
+        exit 1
+      fi
+      cargo build -p db -p mcp-server -p graphql-server 2>&1
+      tmp_log="$(mktemp)"
+      for spec in "${PROPOSAL_080_RUST_TESTS[@]}"; do
+        crate="${spec%% *}"
+        test_name="${spec#* }"
+        : >"$tmp_log"
+        if ! cargo test -p "$crate" "$test_name" -- --nocapture 2>&1 | tee -a "$tmp_log"; then
+          echo "proposal-080: FAIL — $crate::$test_name returned a non-zero exit"
+          rm -f "$tmp_log"
+          exit 1
+        fi
+        if ! grep -E "^test ([A-Za-z0-9_]+::)*${test_name}[[:space:]]" "$tmp_log" >/dev/null; then
+          echo "proposal-080: FAIL — no test named '$test_name' produced output in crate '$crate' (renamed, deleted, or typo?)"
+          rm -f "$tmp_log"
+          exit 1
+        fi
+      done
+      rm -f "$tmp_log"
+    )
+    log "Proposal 080 gate passed"
     ;;
   proposal-054-v1-retirement|p054-v1-retirement)
     if [[ -z "${DATABASE_URL:-}" ]]; then

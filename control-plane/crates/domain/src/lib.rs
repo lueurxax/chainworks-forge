@@ -20,6 +20,7 @@ pub mod main_sync;
 pub mod mediation;
 pub mod operator_action_routing;
 pub mod output_contract_repair;
+pub mod p080;
 pub mod proposal_gate_result;
 pub mod provider;
 pub mod recovery_matrix;
