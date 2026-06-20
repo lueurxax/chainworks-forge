@@ -1612,6 +1612,8 @@ mod tests {
             mediation_record_id: None,
             toolchain_home: None,
             toolchain_go_scope_enabled: false,
+
+            p079_repair_canonical_paths: None,
         };
 
         let mut spec = AcpLaunchSpec::new(binary.to_string_lossy());
@@ -1759,6 +1761,8 @@ mod tests {
             mediation_record_id: None,
             toolchain_home: None,
             toolchain_go_scope_enabled: false,
+
+            p079_repair_canonical_paths: None,
         };
         let meta_root = workspace_root.join(".chainworks/run-meta");
 
@@ -1871,6 +1875,8 @@ mod tests {
             mediation_record_id: None,
             toolchain_home: None,
             toolchain_go_scope_enabled: false,
+
+            p079_repair_canonical_paths: None,
         };
 
         assert_eq!(provider_execution_root(&req), worktree);

@@ -1,0 +1,33 @@
+{
+  "fixture_id": "p079-v1-cas-reclamation-monotonic",
+  "description": "Asserts CAS (compare-and-swap) reclamation semantics for expired leases. The 'version' column must increment monotonically on each reclamation attempt; a sweep that reads version=N must supply version=N in its UPDATE WHERE version=N to succeed. Stale sweeps (version mismatch) must fail silently (rows_affected=0).",
+  "migration": "079_p079_output_contract_repair.sql",
+  "cas_column": "version INTEGER NOT NULL DEFAULT 0",
+  "reclamation_states": ["reserved_ttl_expired", "prompt_sent_ttl_expired"],
+  "scenarios": [
+    {
+      "name": "successful_cas_reclamation",
+      "description": "Sweep reads lease with version=0, expires_at in the past, state='reserved'; issues UPDATE SET state='settled', version=version+1, reclamation_reason='reserved_ttl_expired' WHERE version=0; rows_affected=1",
+      "precondition": {"lease_state": "reserved", "version": 0, "lease_expires_at": "2026-05-30T09:00:00Z"},
+      "update_where_version": 0,
+      "expected_rows_affected": 1,
+      "post_state": {"version": 1, "lease_state": "settled", "reclamation_reason": "reserved_ttl_expired"}
+    },
+    {
+      "name": "stale_sweep_cas_miss",
+      "description": "Two concurrent sweeps both read version=0; first succeeds (version now=1); second issues UPDATE WHERE version=0; rows_affected=0 (CAS miss) — no double-reclamation",
+      "first_sweep_version": 0,
+      "second_sweep_version": 0,
+      "first_rows_affected": 1,
+      "second_rows_affected": 0
+    },
+    {
+      "name": "dispatch_committed_at_invariant",
+      "description": "A lease in state='reserved' must have dispatch_committed_at=NULL. Transition to 'prompt_sent' must set dispatch_committed_at. The DB CHECK constraint dispatch_committed_at_set_on_send enforces this.",
+      "constraint": "CONSTRAINT dispatch_committed_at_set_on_send CHECK(lease_state = 'reserved' OR dispatch_committed_at IS NOT NULL)",
+      "valid_reserved": {"lease_state": "reserved", "dispatch_committed_at": null},
+      "valid_prompt_sent": {"lease_state": "prompt_sent", "dispatch_committed_at": "2026-05-30T10:00:00Z"},
+      "invalid_prompt_sent_without_dispatch": {"lease_state": "prompt_sent", "dispatch_committed_at": null, "expected": "CHECK constraint violation"}
+    }
+  ]
+}

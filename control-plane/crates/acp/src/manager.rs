@@ -1146,6 +1146,8 @@ mod tests {
             mediation_record_id: None,
             toolchain_home: Some("/tmp/toolchain-home".to_string()),
             toolchain_go_scope_enabled: true,
+
+            p079_repair_canonical_paths: None,
         }
     }
 
@@ -1296,6 +1298,8 @@ mod tests {
             mediation_record_id: None,
             toolchain_home: None,
             toolchain_go_scope_enabled: false,
+
+            p079_repair_canonical_paths: None,
         };
 
         manager
@@ -1365,6 +1369,8 @@ mod tests {
             mediation_record_id: None,
             toolchain_home: None,
             toolchain_go_scope_enabled: false,
+
+            p079_repair_canonical_paths: None,
         };
         let mut launch_spec = crate::adapters::AcpLaunchSpec::new("/bin/sh");
 

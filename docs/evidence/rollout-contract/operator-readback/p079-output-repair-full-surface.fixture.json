@@ -1,128 +1,449 @@
 {
-  "fixture_purpose": "Engine materialized placeholder for a rollout_contract_v1 readback fixture declared by an approved proposal. Implementation must replace or update this fixture with concrete evidence before the proposal gate can be treated as release evidence.",
-  "parity_lanes": {
-    "graphql": {
-      "rolloutContractActionId": null,
-      "rolloutContractCutoverPolicyRevision": null,
-      "rolloutContractDecision": "hold",
-      "rolloutContractDiagnosticRedaction": "none",
-      "rolloutContractDisabledReasonCode": "placeholder_pending_implementation_evidence",
-      "rolloutContractEnabledState": "disabled",
-      "rolloutContractEnforcementMode": "enforce",
-      "rolloutContractEnforcementModeReason": "declared_fixture_placeholder",
-      "rolloutContractFailureReasons": [
-        "placeholder_pending_implementation_evidence"
-      ],
-      "rolloutContractHoldConditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rolloutContractNextSteps": [
-        "Replace placeholder with concrete GraphQL readback evidence."
-      ],
-      "rolloutContractOperatorMessage": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rolloutContractProjectionIntegrity": "stale",
-      "rolloutContractRollbackDisposition": {
-        "dataLossRisk": "none",
-        "mode": "not_applicable"
+  "fixture_id": "p079-output-repair-full-surface",
+  "schema_version": "output_contract_repair.v1",
+  "description": "Parity fixture asserting status->presentation_category projection and full surface readback. One row per closed status value per proposal macos-r3-001.",
+  "rows": [
+    {
+      "status": "not_attempted",
+      "presentation_category": "informational",
+      "repair_attempt_id": "rep-fixture-not-attempted",
+      "agent_execution_id": "agent-fixture-001",
+      "run_id": "run-fixture-p079",
+      "stage_execution_id": "stage-fixture-001",
+      "session_generation_id": "session-fixture-001",
+      "schema_version": "output_contract_repair.v1",
+      "role": "lead_orchestrator",
+      "provider_family": "gemini",
+      "adapter_family": "gemini",
+      "required_output_mode": "strict_structured",
+      "initial_failure_class": "missing_required_outputs",
+      "initial_failure_subtype": null,
+      "recommended_next_action": "continue",
+      "required_outputs": [],
+      "same_session_repair": null,
+      "transcript_recovery": null,
+      "provider_fallback": null,
+      "provider_plan_evidence": null,
+      "permission_decisions": [],
+      "budget": {
+        "repair_consumed": false,
+        "fallback_consumed": false,
+        "repair_max_per_invocation": 1,
+        "fallback_max_per_invocation": 1
       },
-      "rolloutContractSourceLane": "graphql",
-      "rolloutContractStatus": "fail",
-      "rolloutContractWaiverExpiresAt": null,
-      "rolloutContractWaiverState": "none"
+      "lease": null,
+      "policy_feature_flags": [],
+      "repair_prompt_template_version": null,
+      "final_output_settlement": null,
+      "evidence_artifact_path": null,
+      "evidence_version": 1,
+      "projection_integrity": "fresh",
+      "projection_stale_since": null,
+      "created_at": "2026-05-30T10:00:00Z",
+      "updated_at": "2026-05-30T10:00:00Z"
     },
-    "mcp": {
-      "rollout_contract_action_id": null,
-      "rollout_contract_cutover_policy_revision": null,
-      "rollout_contract_decision": "hold",
-      "rollout_contract_diagnostic_redaction": "none",
-      "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-      "rollout_contract_enabled_state": "disabled",
-      "rollout_contract_enforcement_mode": "enforce",
-      "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-      "rollout_contract_failure_reasons": [
-        "placeholder_pending_implementation_evidence"
+    {
+      "status": "in_progress",
+      "presentation_category": "informational",
+      "repair_attempt_id": "rep-fixture-in-progress",
+      "agent_execution_id": "agent-fixture-002",
+      "run_id": "run-fixture-p079",
+      "stage_execution_id": "stage-fixture-001",
+      "session_generation_id": "session-fixture-002",
+      "schema_version": "output_contract_repair.v1",
+      "role": "lead_orchestrator",
+      "provider_family": "gemini",
+      "adapter_family": "gemini",
+      "required_output_mode": "strict_structured",
+      "initial_failure_class": "missing_required_outputs",
+      "initial_failure_subtype": null,
+      "recommended_next_action": "inspect_repair_evidence",
+      "required_outputs": [
+        {
+          "name": "proposal_current",
+          "contract_id": "contract-fixture-001",
+          "canonical_path": "/tmp/.chainworks/proposals/current/proposal.md"
+        }
       ],
-      "rollout_contract_hold_conditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rollout_contract_next_steps": [
-        "Replace placeholder with concrete MCP readback evidence."
-      ],
-      "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rollout_contract_projection_integrity": "stale",
-      "rollout_contract_rollback_disposition": {
-        "data_loss_risk": "none",
-        "mode": "not_applicable"
+      "same_session_repair": null,
+      "transcript_recovery": null,
+      "provider_fallback": null,
+      "provider_plan_evidence": null,
+      "permission_decisions": [],
+      "budget": {
+        "repair_consumed": false,
+        "fallback_consumed": false,
+        "repair_max_per_invocation": 1,
+        "fallback_max_per_invocation": 1
       },
-      "rollout_contract_source_lane": "mcp",
-      "rollout_contract_status": "fail",
-      "rollout_contract_waiver_expires_at": null,
-      "rollout_contract_waiver_state": "none"
+      "lease": {
+        "key": "lk-fixture-in-progress",
+        "kind": "repair",
+        "state": "prompt_sent",
+        "settled_result": null,
+        "reclamation_reason": null,
+        "owner_principal_id": "principal-fixture-001",
+        "acquired_at": "2026-05-30T10:00:00Z",
+        "expires_at": "2026-05-30T10:03:00Z",
+        "lease_seconds": 180
+      },
+      "policy_feature_flags": ["CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED"],
+      "repair_prompt_template_version": "p079_repair_v1",
+      "final_output_settlement": null,
+      "evidence_artifact_path": null,
+      "evidence_version": 2,
+      "projection_integrity": "fresh",
+      "projection_stale_since": null,
+      "created_at": "2026-05-30T10:00:00Z",
+      "updated_at": "2026-05-30T10:00:30Z"
     },
-    "release_receipt": {
-      "rollout_contract_action_id": null,
-      "rollout_contract_cutover_policy_revision": null,
-      "rollout_contract_decision": "hold",
-      "rollout_contract_diagnostic_redaction": "none",
-      "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-      "rollout_contract_enabled_state": "disabled",
-      "rollout_contract_enforcement_mode": "enforce",
-      "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-      "rollout_contract_failure_reasons": [
-        "placeholder_pending_implementation_evidence"
+    {
+      "status": "recovered",
+      "presentation_category": "recovered",
+      "repair_attempt_id": "rep-fixture-recovered",
+      "agent_execution_id": "agent-fixture-003",
+      "run_id": "run-fixture-p079",
+      "stage_execution_id": "stage-fixture-001",
+      "session_generation_id": "session-fixture-003",
+      "schema_version": "output_contract_repair.v1",
+      "role": "lead_orchestrator",
+      "provider_family": "gemini",
+      "adapter_family": "gemini",
+      "required_output_mode": "strict_structured",
+      "initial_failure_class": "missing_required_outputs",
+      "initial_failure_subtype": null,
+      "recommended_next_action": "continue",
+      "required_outputs": [
+        {
+          "name": "proposal_current",
+          "contract_id": "contract-fixture-001",
+          "canonical_path": "/tmp/.chainworks/proposals/current/proposal.md"
+        }
       ],
-      "rollout_contract_hold_conditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rollout_contract_next_steps": [
-        "Replace placeholder with concrete release receipt evidence."
-      ],
-      "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rollout_contract_projection_integrity": "stale",
-      "rollout_contract_rollback_disposition": {
-        "data_loss_risk": "none",
-        "mode": "not_applicable"
+      "same_session_repair": {
+        "result": "accepted",
+        "turn_count": 1,
+        "deadline_seconds": 120,
+        "reason": null,
+        "repair_attempt_id": "rep-fixture-recovered"
       },
-      "rollout_contract_source_lane": "release_receipt",
-      "rollout_contract_status": "fail",
-      "rollout_contract_waiver_expires_at": null,
-      "rollout_contract_waiver_state": "none"
+      "transcript_recovery": null,
+      "provider_fallback": null,
+      "provider_plan_evidence": null,
+      "permission_decisions": [
+        {
+          "method": "session/request_permission",
+          "resource_kind": "fs_write_canonical_output_path",
+          "decision": "allowed",
+          "reason": "canonical_output_path_allowed"
+        }
+      ],
+      "budget": {
+        "repair_consumed": true,
+        "fallback_consumed": false,
+        "repair_max_per_invocation": 1,
+        "fallback_max_per_invocation": 1
+      },
+      "lease": {
+        "key": "lk-fixture-recovered",
+        "kind": "repair",
+        "state": "settled",
+        "settled_result": "accepted",
+        "reclamation_reason": null,
+        "owner_principal_id": "principal-fixture-001",
+        "acquired_at": "2026-05-30T10:00:00Z",
+        "expires_at": "2026-05-30T10:03:00Z",
+        "lease_seconds": 180
+      },
+      "policy_feature_flags": ["CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED"],
+      "repair_prompt_template_version": "p079_repair_v1",
+      "final_output_settlement": "valid_outputs_from_repair",
+      "evidence_artifact_path": "output_contract_repair/agent-fixture-003/evidence.json",
+      "evidence_version": 3,
+      "projection_integrity": "fresh",
+      "projection_stale_since": null,
+      "created_at": "2026-05-30T10:00:00Z",
+      "updated_at": "2026-05-30T10:01:00Z"
+    },
+    {
+      "status": "blocked",
+      "presentation_category": "blocked",
+      "repair_attempt_id": "rep-fixture-blocked",
+      "agent_execution_id": "agent-fixture-004",
+      "run_id": "run-fixture-p079",
+      "stage_execution_id": "stage-fixture-001",
+      "session_generation_id": "session-fixture-004",
+      "schema_version": "output_contract_repair.v1",
+      "role": "lead_orchestrator",
+      "provider_family": "gemini",
+      "adapter_family": "gemini",
+      "required_output_mode": "strict_structured",
+      "initial_failure_class": "missing_required_outputs",
+      "initial_failure_subtype": null,
+      "recommended_next_action": "manual_investigation",
+      "required_outputs": [
+        {
+          "name": "proposal_current",
+          "contract_id": "contract-fixture-001",
+          "canonical_path": "/tmp/.chainworks/proposals/current/proposal.md"
+        }
+      ],
+      "same_session_repair": {
+        "result": "rejected_invalid",
+        "turn_count": 1,
+        "deadline_seconds": 120,
+        "reason": "output_validation_failed",
+        "repair_attempt_id": "rep-fixture-blocked"
+      },
+      "transcript_recovery": null,
+      "provider_fallback": {
+        "result": "unavailable",
+        "fallback_profile": null,
+        "fallback_agent_execution_id": null,
+        "parent_failed_agent_execution_id": "agent-fixture-004",
+        "fallback_packet_hash": null,
+        "fallback_principal_id": null,
+        "fallback_principal_capability_hash": null,
+        "deadline_seconds": null
+      },
+      "provider_plan_evidence": null,
+      "permission_decisions": [
+        {
+          "method": "session/request_permission",
+          "resource_kind": "shell",
+          "decision": "denied",
+          "reason": "repair_turn_denies_shell_execution"
+        }
+      ],
+      "budget": {
+        "repair_consumed": true,
+        "fallback_consumed": false,
+        "repair_max_per_invocation": 1,
+        "fallback_max_per_invocation": 1
+      },
+      "lease": {
+        "key": "lk-fixture-blocked",
+        "kind": "repair",
+        "state": "settled",
+        "settled_result": "rejected_invalid",
+        "reclamation_reason": null,
+        "owner_principal_id": "principal-fixture-001",
+        "acquired_at": "2026-05-30T10:00:00Z",
+        "expires_at": "2026-05-30T10:03:00Z",
+        "lease_seconds": 180
+      },
+      "policy_feature_flags": ["CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED"],
+      "repair_prompt_template_version": "p079_repair_v1",
+      "final_output_settlement": "blocked_missing_required_outputs",
+      "evidence_artifact_path": "output_contract_repair/agent-fixture-004/evidence.json",
+      "evidence_version": 4,
+      "projection_integrity": "fresh",
+      "projection_stale_since": null,
+      "created_at": "2026-05-30T10:00:00Z",
+      "updated_at": "2026-05-30T10:01:30Z"
+    },
+    {
+      "status": "skipped",
+      "presentation_category": "skipped",
+      "repair_attempt_id": "rep-fixture-skipped",
+      "agent_execution_id": "agent-fixture-005",
+      "run_id": "run-fixture-p079",
+      "stage_execution_id": "stage-fixture-001",
+      "session_generation_id": "session-fixture-005",
+      "schema_version": "output_contract_repair.v1",
+      "role": "lead_orchestrator",
+      "provider_family": "gemini",
+      "adapter_family": "gemini",
+      "required_output_mode": "strict_structured",
+      "initial_failure_class": "provider_mode_mismatch",
+      "initial_failure_subtype": "plan_event_instead_of_output",
+      "recommended_next_action": "operator_resolve_approval",
+      "required_outputs": [],
+      "same_session_repair": {
+        "result": "skipped_ineligible",
+        "turn_count": 0,
+        "deadline_seconds": null,
+        "reason": "approval_pending",
+        "repair_attempt_id": "rep-fixture-skipped"
+      },
+      "transcript_recovery": null,
+      "provider_fallback": null,
+      "provider_plan_evidence": null,
+      "permission_decisions": [],
+      "budget": {
+        "repair_consumed": false,
+        "fallback_consumed": false,
+        "repair_max_per_invocation": 1,
+        "fallback_max_per_invocation": 1
+      },
+      "lease": {
+        "key": "lk-fixture-skipped",
+        "kind": "repair",
+        "state": "settled",
+        "settled_result": "skipped_ineligible",
+        "reclamation_reason": null,
+        "owner_principal_id": "principal-fixture-001",
+        "acquired_at": "2026-05-30T10:00:00Z",
+        "expires_at": "2026-05-30T10:03:00Z",
+        "lease_seconds": 180
+      },
+      "policy_feature_flags": ["CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED"],
+      "repair_prompt_template_version": null,
+      "final_output_settlement": "blocked_provider_mode_mismatch",
+      "evidence_artifact_path": null,
+      "evidence_version": 2,
+      "projection_integrity": "fresh",
+      "projection_stale_since": null,
+      "created_at": "2026-05-30T10:00:00Z",
+      "updated_at": "2026-05-30T10:00:05Z"
+    },
+    {
+      "status": "cancelled",
+      "presentation_category": "cancelled",
+      "repair_attempt_id": "rep-fixture-cancelled",
+      "agent_execution_id": "agent-fixture-006",
+      "run_id": "run-fixture-p079",
+      "stage_execution_id": "stage-fixture-001",
+      "session_generation_id": "session-fixture-006",
+      "schema_version": "output_contract_repair.v1",
+      "role": "lead_orchestrator",
+      "provider_family": "gemini",
+      "adapter_family": "gemini",
+      "required_output_mode": "strict_structured",
+      "initial_failure_class": "empty_output",
+      "initial_failure_subtype": null,
+      "recommended_next_action": "cancel_acknowledged",
+      "required_outputs": [],
+      "same_session_repair": {
+        "result": "cancelled",
+        "turn_count": 0,
+        "deadline_seconds": 120,
+        "reason": "operator_cancelled",
+        "repair_attempt_id": "rep-fixture-cancelled"
+      },
+      "transcript_recovery": null,
+      "provider_fallback": null,
+      "provider_plan_evidence": null,
+      "permission_decisions": [],
+      "budget": {
+        "repair_consumed": false,
+        "fallback_consumed": false,
+        "repair_max_per_invocation": 1,
+        "fallback_max_per_invocation": 1
+      },
+      "lease": {
+        "key": "lk-fixture-cancelled",
+        "kind": "repair",
+        "state": "settled",
+        "settled_result": "cancelled",
+        "reclamation_reason": null,
+        "owner_principal_id": "principal-fixture-001",
+        "acquired_at": "2026-05-30T10:00:00Z",
+        "expires_at": "2026-05-30T10:03:00Z",
+        "lease_seconds": 180
+      },
+      "policy_feature_flags": ["CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED"],
+      "repair_prompt_template_version": null,
+      "final_output_settlement": "cancelled",
+      "evidence_artifact_path": null,
+      "evidence_version": 2,
+      "projection_integrity": "fresh",
+      "projection_stale_since": null,
+      "created_at": "2026-05-30T10:00:00Z",
+      "updated_at": "2026-05-30T10:00:10Z"
+    },
+    {
+      "status": "failed",
+      "presentation_category": "failed",
+      "repair_attempt_id": "rep-fixture-failed",
+      "agent_execution_id": "agent-fixture-007",
+      "run_id": "run-fixture-p079",
+      "stage_execution_id": "stage-fixture-001",
+      "session_generation_id": "session-fixture-007",
+      "schema_version": "output_contract_repair.v1",
+      "role": "lead_orchestrator",
+      "provider_family": "gemini",
+      "adapter_family": "gemini",
+      "required_output_mode": "strict_structured",
+      "initial_failure_class": "output_contract_mismatch",
+      "initial_failure_subtype": null,
+      "recommended_next_action": "manual_investigation",
+      "required_outputs": [],
+      "same_session_repair": {
+        "result": "failed_transport",
+        "turn_count": 1,
+        "deadline_seconds": 120,
+        "reason": "acp_transport_error",
+        "repair_attempt_id": "rep-fixture-failed"
+      },
+      "transcript_recovery": {
+        "result": "unavailable",
+        "result_subtype": "unattributable_envelope",
+        "recovery_source": null,
+        "bytes_examined": null,
+        "max_recovery_payload_bytes": 262144,
+        "max_json_depth": 32,
+        "max_chunks_examined": 64,
+        "recovery_parser_version": "p079_recovery_v1"
+      },
+      "provider_fallback": {
+        "result": "unavailable",
+        "fallback_profile": null,
+        "fallback_agent_execution_id": null,
+        "parent_failed_agent_execution_id": "agent-fixture-007",
+        "fallback_packet_hash": null,
+        "fallback_principal_id": null,
+        "fallback_principal_capability_hash": null,
+        "deadline_seconds": null
+      },
+      "provider_plan_evidence": null,
+      "permission_decisions": [],
+      "budget": {
+        "repair_consumed": true,
+        "fallback_consumed": false,
+        "repair_max_per_invocation": 1,
+        "fallback_max_per_invocation": 1
+      },
+      "lease": {
+        "key": "lk-fixture-failed",
+        "kind": "repair",
+        "state": "settled",
+        "settled_result": "failed_transport",
+        "reclamation_reason": null,
+        "owner_principal_id": "principal-fixture-001",
+        "acquired_at": "2026-05-30T10:00:00Z",
+        "expires_at": "2026-05-30T10:03:00Z",
+        "lease_seconds": 180
+      },
+      "policy_feature_flags": ["CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED"],
+      "repair_prompt_template_version": "p079_repair_v1",
+      "final_output_settlement": "failed_transport",
+      "evidence_artifact_path": null,
+      "evidence_version": 3,
+      "projection_integrity": "fresh",
+      "projection_stale_since": null,
+      "created_at": "2026-05-30T10:00:00Z",
+      "updated_at": "2026-05-30T10:01:00Z"
     }
-  },
-  "placeholder": {
-    "materialized_by": "chainworks_engine",
-    "path": "docs/evidence/rollout-contract/operator-readback/p079-output-repair-full-surface.fixture.json",
-    "status": "pending_implementation_evidence"
-  },
-  "proposal_id": "unknown",
-  "proposal_revision_id": "p079-contract-aware-output-repair-and-provider-fallback-r5",
-  "rollout_contract_action_id": null,
-  "rollout_contract_cutover_policy_revision": null,
-  "rollout_contract_decision": "hold",
-  "rollout_contract_diagnostic_redaction": "none",
-  "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-  "rollout_contract_enabled_state": "disabled",
-  "rollout_contract_enforcement_mode": "enforce",
-  "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-  "rollout_contract_failure_reasons": [
-    "placeholder_pending_implementation_evidence"
   ],
-  "rollout_contract_hold_conditions": [
-    "Replace engine materialized placeholder with proposal-specific rollout evidence."
-  ],
-  "rollout_contract_next_steps": [
-    "Replace placeholder with concrete operator readback evidence."
-  ],
-  "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-  "rollout_contract_projection_integrity": "stale",
-  "rollout_contract_rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "rollout_contract_source_lane": "run_report",
-  "rollout_contract_status": "fail",
-  "rollout_contract_waiver_expires_at": null,
-  "rollout_contract_waiver_state": "none",
-  "schema_version": "operator_readback_v1",
-  "source_lane": "run_report"
+  "parity_assertions": {
+    "status_to_presentation_category": {
+      "not_attempted": "informational",
+      "in_progress": "informational",
+      "recovered": "recovered",
+      "blocked": "blocked",
+      "skipped": "skipped",
+      "cancelled": "cancelled",
+      "failed": "failed"
+    },
+    "schema_version": "output_contract_repair.v1",
+    "pk_field": "repair_attempt_id",
+    "required_output_binding_field": "name",
+    "budget_max_repair": 1,
+    "budget_max_fallback": 1,
+    "transcript_recovery_subtype_field": "result_subtype",
+    "sdl_parity_assertions_api_contract_r4_002": {
+      "no_redeclared_builtin_scalars": true
+    }
+  }
 }

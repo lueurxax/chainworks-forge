@@ -1,0 +1,39 @@
+{
+  "fixture_id": "p079-swift-identity-stable",
+  "description": "Asserts that OutputContractRepairEvidence.id = (repairAttemptId:agentExecutionId) is stable across evidence_version updates (APPLE-R3-001). A content change (evidence_version bump) must not change the SwiftUI row identity.",
+  "contract": "api-contract-r2-001, APPLE-R3-001",
+  "cases": [
+    {
+      "description": "Same repairAttemptId + agentExecutionId, different evidenceVersion -> same id, not equal",
+      "baseline": {
+        "repair_attempt_id": "rep-identity-001",
+        "agent_execution_id": "agent-identity-001",
+        "evidence_version": 1,
+        "status": "in_progress"
+      },
+      "updated": {
+        "repair_attempt_id": "rep-identity-001",
+        "agent_execution_id": "agent-identity-001",
+        "evidence_version": 2,
+        "status": "recovered"
+      },
+      "assertions": {
+        "ids_equal": true,
+        "records_equal": false,
+        "evidence_version_changed": true
+      }
+    },
+    {
+      "description": "lease reserved->prompt_sent->settled preserves row identity across three snapshots",
+      "snapshots": [
+        {"repair_attempt_id": "rep-identity-001", "agent_execution_id": "agent-identity-001", "evidence_version": 1, "lease_state": "reserved"},
+        {"repair_attempt_id": "rep-identity-001", "agent_execution_id": "agent-identity-001", "evidence_version": 2, "lease_state": "prompt_sent"},
+        {"repair_attempt_id": "rep-identity-001", "agent_execution_id": "agent-identity-001", "evidence_version": 3, "lease_state": "settled"}
+      ],
+      "assertions": {
+        "all_ids_equal": true,
+        "sequential_snapshots_not_equal": true
+      }
+    }
+  ]
+}

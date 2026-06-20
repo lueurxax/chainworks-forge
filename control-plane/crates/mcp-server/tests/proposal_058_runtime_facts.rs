@@ -397,7 +397,7 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
     .await
     .unwrap();
 
-    let canonical = payload["reports"]
+    let canonical = payload
         .as_array()
         .unwrap()
         .iter()
@@ -459,7 +459,10 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
     assert!(runtime_facts["created_at"].is_string());
     assert!(runtime_facts["updated_at"].is_string());
 
-    let observer_payload = mcp_server::tools::reports::execute(
+    // SEC-REPORTS-AUTHZ-001: Observer must be denied reports.get entirely.
+    // failure_kind_raw_debug and other operator-grade fields are inaccessible
+    // because non-operators are rejected at the authorization gate.
+    let observer_err = mcp_server::tools::reports::execute(
         "reports.get",
         serde_json::json!({ "run_id": run_id.to_string() }),
         &pool,
@@ -467,16 +470,10 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
         &auth::Principal::new("observer", auth::PrincipalClass::Observer),
     )
     .await
-    .unwrap();
-    let observer_canonical = observer_payload["reports"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|item| item["report_kind"] == serde_json::json!("mcp_execution_truth"))
-        .expect("observer mcp execution truth report");
-    assert_eq!(
-        observer_canonical["agent_executions"][0]["runtime_facts"]["failure_kind_raw_debug"],
-        serde_json::Value::Null
+    .expect_err("Observer must be denied reports.get (SEC-REPORTS-AUTHZ-001)");
+    assert!(
+        observer_err.to_string().contains("requires Operator"),
+        "denial message must identify Operator requirement; got: {observer_err}"
     );
 
     let server = McpServer::new(
@@ -484,6 +481,7 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
         Arc::new(make_command_handler(pool.clone())),
         auth::PrincipalTable::test_fixture(),
     );
+    // HIGH-001: report:// exposes execution evidence; Operator-only.
     let resource_response = server
         .handle_request(
             JsonRpcRequest {
@@ -497,6 +495,7 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
             &auth::Principal::new("operator", auth::PrincipalClass::Operator),
         )
         .await;
+    // HIGH-001: report:// is Operator-only; Observer must be denied.
     let observer_server = McpServer::new(
         pool.clone(),
         Arc::new(make_command_handler(pool.clone())),
@@ -514,20 +513,8 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
         )
         .await;
     assert!(
-        observer_resource_response.error.is_none(),
-        "Observer report:// read should succeed with redacted payload: {:?}",
-        observer_resource_response.error
-    );
-    let observer_resource_text = observer_resource_response.result.as_ref().unwrap()["contents"][0]
-        ["text"]
-        .as_str()
-        .expect("observer resource text");
-    let observer_resource_payload: serde_json::Value =
-        serde_json::from_str(observer_resource_text).unwrap();
-    assert_eq!(
-        observer_resource_payload["agent_executions"][0]["runtime_facts"]["failure_kind_raw_debug"],
-        serde_json::Value::Null,
-        "Observer report:// payload must redact raw runtime facts"
+        observer_resource_response.error.is_some(),
+        "Observer must NOT be able to read report:// (HIGH-001 regression)"
     );
 
     assert!(
@@ -602,7 +589,7 @@ async fn proposal_053_reports_get_projects_discovery_reconciliation_pending() {
     .await
     .unwrap();
 
-    let canonical = payload["reports"]
+    let canonical = payload
         .as_array()
         .unwrap()
         .iter()
@@ -924,5 +911,217 @@ async fn p058_sec001_run_resource_agent_cannot_see_snapshot_fields() {
     assert!(
         operator_run.get("chainworks_meta_root").is_some(),
         "Operator must receive chainworks_meta_root via run://"
+    );
+}
+
+// ── SEC-P079-MCP-001: runtime_receipt p079 path fields must not reach non-operators ───────────
+
+/// SEC-P079-MCP-001: non-operator callers must not see p079_normalized_path,
+/// p079_matched_canonical_path, or permission payload fields in runtime_receipt.
+/// Operators must still see the full receipt.
+#[tokio::test]
+async fn p079_sec_mcp001_runtime_receipt_sanitized_for_non_operator() {
+    use db::repos::agent_execution_runtime_facts;
+    use db::repos::agent_execution_runtime_receipts;
+    use domain::agent::{AgentExecutionRuntimeFacts, AgentExecutionRuntimeReceiptRecord};
+
+    let pool = test_pool().await;
+    let (run_id, _stage_execution_id, agent_execution_id) = seed_execution(&pool).await;
+
+    // Insert runtime facts so runtime_facts_json is produced.
+    let now = Utc::now();
+    let facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+    agent_execution_runtime_facts::upsert(&pool, &facts)
+        .await
+        .unwrap();
+
+    // Insert a runtime receipt that contains P079 path fields in permission_roundtrips.
+    let receipt_json = serde_json::json!({
+        "schema_version": 1,
+        "transport_family": "acp",
+        "provider": "claude",
+        "provider_session_id": "prov-session-secret",
+        "session_generation_id": "gen-1",
+        "status": "completed",
+        "started_at": "2026-01-01T00:00:00Z",
+        "xcode_shim_injected": false,
+        "requires_xcode_host_execution": false,
+        "handshake": {},
+        "counters": {
+            "total_messages": 10,
+            "session_update_count": 2,
+            "permission_request_count": 1,
+            "permission_grant_sent_count": 1,
+            "permission_grant_failed_count": 0,
+            "agent_message_chunk_count": 5,
+            "agent_thought_chunk_count": 0,
+            "tool_call_count": 1,
+            "tool_call_update_count": 0,
+            "plan_update_count": 0,
+            "meaningful_progress_count": 3,
+            "unknown_notification_count": 0
+        },
+        "permission_roundtrips": [{
+            "request_id": "req-1",
+            "requested_at_ms": 100,
+            "request_summary": "Write to /Users/test/artifacts/output.json",
+            "request_payload": r#"{"tool":"write_file","path":"/Users/test/artifacts/output.json"}"#,
+            "grant_sent_at_ms": 110,
+            "grant_summary": "Granted write to /Users/test/artifacts",
+            "grant_payload": r#"{"granted":true,"path":"/Users/test/artifacts/output.json"}"#,
+            "first_post_grant_event_at_ms": 120,
+            "first_post_grant_event_kind": "tool_result",
+            "first_post_grant_event_detail": "wrote /Users/test/artifacts/output.json",
+            "outcome": "post_grant_activity_observed",
+            "p079_tool_name": "write_file",
+            "p079_normalized_path": "/Users/test/artifacts/output.json",
+            "p079_matched_canonical_path": "/Users/test/artifacts/output.json",
+            "p079_decision_reason": "canonical_path_allowed: /Users/test/artifacts/output.json",
+            "p079_resource_kind": "file"
+        }],
+        "first_events": [{"at_ms": 50, "kind": "initialize", "detail": "/Users/test/artifacts"}],
+        "last_events": [{"at_ms": 200, "kind": "completed", "detail": "done /Users/test/artifacts/output.json"}],
+        "p079_unsafe_continuation": false
+    })
+    .to_string();
+
+    agent_execution_runtime_receipts::upsert(
+        &pool,
+        &AgentExecutionRuntimeReceiptRecord {
+            agent_execution_id,
+            provider: "claude".into(),
+            transport_family: "acp".into(),
+            status: "completed".into(),
+            failure_phase: None,
+            event_count: 10,
+            last_event_kind: Some("completed".into()),
+            last_event_at_ms: Some(200),
+            receipt_json,
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Operator sees full receipt including p079 path fields.
+    let operator_payload = mcp_server::tools::reports::execute(
+        "reports.get",
+        serde_json::json!({ "run_id": run_id.to_string() }),
+        &pool,
+        &make_command_handler(pool.clone()),
+        &auth::Principal::new("operator", auth::PrincipalClass::Operator),
+    )
+    .await
+    .unwrap();
+    let operator_exec = operator_payload
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["report_kind"] == "mcp_execution_truth")
+        .unwrap();
+    let op_receipt = &operator_exec["agent_executions"][0]["runtime_facts"]["runtime_receipt"];
+    let op_roundtrip = &op_receipt["permission_roundtrips"][0];
+    assert_eq!(
+        op_roundtrip["p079_normalized_path"],
+        "/Users/test/artifacts/output.json",
+        "Operator must see p079_normalized_path in runtime_receipt"
+    );
+    assert_eq!(
+        op_roundtrip["p079_matched_canonical_path"],
+        "/Users/test/artifacts/output.json",
+        "Operator must see p079_matched_canonical_path in runtime_receipt"
+    );
+    assert_eq!(
+        op_receipt["provider_session_id"],
+        "prov-session-secret",
+        "Operator must see provider_session_id in runtime_receipt"
+    );
+
+    // SEC-REPORTS-AUTHZ-001: Observer/Agent must be denied reports.get entirely.
+    // The p079 runtime_receipt path fields are operator-grade data; non-operators
+    // are blocked at the authorization gate before any report data is read.
+    for (principal_id, class) in [
+        ("observer", auth::PrincipalClass::Observer),
+        ("agent-sec-p079-mcp001", auth::PrincipalClass::Agent),
+    ] {
+        let err = mcp_server::tools::reports::execute(
+            "reports.get",
+            serde_json::json!({ "run_id": run_id.to_string() }),
+            &pool,
+            &make_command_handler(pool.clone()),
+            &auth::Principal::new(principal_id, class),
+        )
+        .await
+        .expect_err("non-Operator reports.get must be denied (SEC-REPORTS-AUTHZ-001)");
+        assert!(
+            err.to_string().contains("requires Operator"),
+            "denial message must identify Operator requirement; got: {err}"
+        );
+    }
+}
+
+// ── SEC-P079-MCP-001: invocation_owner_key must be gated on operator-debug ───────────────────────
+
+/// SEC-P079-MCP-001 regression: Observer/Agent callers of reports.get must NOT see
+/// runtime_facts.invocation_owner_key, which is a stable cross-report correlation value
+/// encoding run/stage/task/session lineage. Operator callers retain the field.
+#[tokio::test]
+async fn p079_sec_mcp_001_non_operator_reports_get_hides_invocation_owner_key() {
+    let pool = setup_pool().await;
+
+    // seed_execution sets invocation_owner_key = Some("owner-key")
+    let (run_id, _stage_execution_id, agent_execution_id) = seed_execution(&pool).await;
+    let now = Utc::now();
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+    facts.output_settlement = AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+    facts.valid_required_outputs = true;
+    agent_execution_runtime_facts::upsert(&pool, &facts)
+        .await
+        .unwrap();
+
+    // SEC-REPORTS-AUTHZ-001: Observer/Agent must be denied reports.get entirely.
+    // invocation_owner_key (and all other operator-grade fields) are inaccessible
+    // because non-operators are rejected at the authorization gate.
+    for (principal_id, class) in [
+        ("observer-sec-p079", auth::PrincipalClass::Observer),
+        ("agent-sec-p079", auth::PrincipalClass::Agent),
+    ] {
+        let err = mcp_server::tools::reports::execute(
+            "reports.get",
+            serde_json::json!({ "run_id": run_id.to_string() }),
+            &pool,
+            &make_command_handler(pool.clone()),
+            &auth::Principal::new(principal_id, class),
+        )
+        .await
+        .expect_err("non-Operator reports.get must be denied (SEC-REPORTS-AUTHZ-001)");
+        assert!(
+            err.to_string().contains("requires Operator"),
+            "denial message must identify Operator requirement; got: {err}"
+        );
+    }
+
+    // Operator MUST see invocation_owner_key.
+    let operator_payload = mcp_server::tools::reports::execute(
+        "reports.get",
+        serde_json::json!({ "run_id": run_id.to_string() }),
+        &pool,
+        &make_command_handler(pool.clone()),
+        &auth::Principal::new("operator-sec-p079", auth::PrincipalClass::Operator),
+    )
+    .await
+    .unwrap();
+    let operator_canonical = operator_payload
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["report_kind"] == serde_json::json!("mcp_execution_truth"))
+        .expect("operator mcp execution truth report");
+    let operator_runtime_facts = &operator_canonical["agent_executions"][0]["runtime_facts"];
+    assert_eq!(
+        operator_runtime_facts["invocation_owner_key"],
+        serde_json::json!("owner-key"),
+        "Operator must still see invocation_owner_key (SEC-P079-MCP-001 regression)"
     );
 }

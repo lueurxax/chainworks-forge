@@ -1,0 +1,26 @@
+{
+  "fixture_id": "p079-v1-old-run-rowset",
+  "description": "Verifies that runs created before migration 079 have no rows in output_contract_repair_events and that reads return nil without error (forward-compatibility: pre-P079 runs decode as nil in Swift DTO).",
+  "migration": "079_p079_output_contract_repair.sql",
+  "scenario": "old_run_no_p079_events",
+  "given": {
+    "run_id": "run-pre-p079-001",
+    "run_created_before_migration_079": true,
+    "output_contract_repair_events_rows": 0
+  },
+  "assertions": [
+    {
+      "query": "SELECT COUNT(*) FROM output_contract_repair_events WHERE run_id = 'run-pre-p079-001'",
+      "expected_count": 0,
+      "description": "No P079 evidence rows for pre-migration runs"
+    },
+    {
+      "behavior": "graphql_mcp_output_contract_repair_null",
+      "description": "GraphQL/MCP run readback returns null for output_contract_repair when no row exists"
+    },
+    {
+      "behavior": "swift_dto_decodes_as_nil",
+      "description": "Swift OutputContractRepairEvidence? decodes null or missing field as nil without throwing"
+    }
+  ]
+}

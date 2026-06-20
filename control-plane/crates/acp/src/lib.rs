@@ -167,6 +167,11 @@ pub struct ExecutionRequest {
     /// Requires toolchain_home + session_generation_id to be set.
     #[serde(default)]
     pub toolchain_go_scope_enabled: bool,
+    /// P079: When set, this is a contract-repair turn. The transport applies the
+    /// P079 repair permission posture: grant only `fs.write` requests whose target
+    /// byte-matches a path in this set; deny everything else (unsafe_continuation).
+    #[serde(default)]
+    pub p079_repair_canonical_paths: Option<Vec<String>>,
 }
 
 fn default_owner_kind() -> String {
@@ -450,6 +455,12 @@ pub struct AcpRuntimeReceipt {
     pub first_events: Vec<AcpRuntimeReceiptEvent>,
     #[serde(default)]
     pub last_events: Vec<AcpRuntimeReceiptEvent>,
+    /// P079-SEC-HIGH-001: set when the repair turn was terminated because
+    /// the transport denied a non-canonical permission request. Any outputs
+    /// from this turn must be discarded and the repair settled as
+    /// `rejected_invalid` with `initial_failure_subtype = unsafe_continuation`.
+    #[serde(default)]
+    pub p079_unsafe_continuation: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -514,6 +525,18 @@ pub struct AcpRuntimeReceiptPermissionRoundtrip {
     pub first_post_grant_event_detail: Option<String>,
     #[serde(default)]
     pub outcome: Option<String>,
+    /// P079-SEC-MED-001: structured decision fields captured at evaluation time.
+    /// Only populated when P079 repair posture is active for this session.
+    #[serde(default)]
+    pub p079_tool_name: Option<String>,
+    #[serde(default)]
+    pub p079_normalized_path: Option<String>,
+    #[serde(default)]
+    pub p079_matched_canonical_path: Option<String>,
+    #[serde(default)]
+    pub p079_decision_reason: Option<String>,
+    #[serde(default)]
+    pub p079_resource_kind: Option<String>,
 }
 
 #[derive(Debug)]

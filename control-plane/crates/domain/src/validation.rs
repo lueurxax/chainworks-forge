@@ -28,6 +28,9 @@ pub enum ValidationFailureClass {
     NoOutputProduced,
     EmptyOutput,
     PersistenceFailure,
+    MissingRequiredOutputs,
+    InvalidRequiredOutputs,
+    ProviderModeMismatch,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

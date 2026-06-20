@@ -1,0 +1,31 @@
+{
+  "fixture_id": "p079-v1-single-flight-uniqueness",
+  "description": "Asserts the single-flight lease guarantee: a deterministic composite lease_key (hash of run_id + stage_execution_id + parent_agent_execution_id + schema_version + frozen_fallback_policy_hash + lease_kind) prevents duplicate repair/fallback dispatch for the same invocation.",
+  "migration": "079_p079_output_contract_repair.sql",
+  "guarantee": "single-flight dispatch via PRIMARY KEY on lease_key",
+  "key_derivation": {
+    "inputs": ["run_id", "stage_execution_id", "parent_agent_execution_id", "schema_version", "frozen_fallback_policy_hash", "lease_kind"],
+    "algorithm": "sha256 of concatenated inputs (deterministic)",
+    "uniqueness_column": "lease_key TEXT NOT NULL PRIMARY KEY"
+  },
+  "scenarios": [
+    {
+      "name": "concurrent_repair_dispatch",
+      "description": "Two concurrent orchestrators attempt to insert the same lease_key; the second INSERT must fail with UNIQUE constraint violation",
+      "first_insert": "succeeds",
+      "second_insert": "fails with UNIQUE constraint on PRIMARY KEY",
+      "outcome": "only one repair dispatched"
+    },
+    {
+      "name": "idempotent_retry_after_lost_ack",
+      "description": "Orchestrator retries after a transport failure but the same lease_key already exists in 'prompt_sent' state; lookup returns existing lease without double-dispatch",
+      "existing_lease_state": "prompt_sent",
+      "retry_behavior": "lookup existing lease, do not re-insert",
+      "outcome": "idempotency preserved via idempotency_token"
+    }
+  ],
+  "schema_constraints": [
+    "output_contract_repair_leases PRIMARY KEY (lease_key)",
+    "output_contract_repair_events UNIQUE (agent_execution_id)"
+  ]
+}

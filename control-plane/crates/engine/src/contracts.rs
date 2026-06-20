@@ -247,9 +247,12 @@ pub fn validate_output(
             if let Some(raw_status) = obj.get("status").and_then(|value| value.as_str()) {
                 if let Some(allowed) = contract_status_allowed_values(&schema.contract_id) {
                     if !allowed.contains(&raw_status) {
+                        // P079-SEC-HIGH-003: truncate provider-controlled status to a fixed length
+                        // so it cannot be used to inflate or inject into validation error messages.
+                        let safe_status: String = raw_status.chars().take(64).collect();
                         validation_errors.push(format!(
-                            "Invalid status `{}` for contract `{}`; allowed values for status: {}",
-                            raw_status,
+                            "Invalid status (truncated) `{}` for contract `{}`; allowed values for status: {}",
+                            safe_status,
                             schema.contract_id,
                             allowed
                                 .iter()
@@ -409,13 +412,18 @@ pub fn build_validation_failure_record(
         .clone()
         .context("validation failure record requires a failure summary")?;
     let recovery_recommendation = match failure_class {
-        ValidationFailureClass::NoOutputProduced | ValidationFailureClass::PersistenceFailure => {
+        ValidationFailureClass::NoOutputProduced
+        | ValidationFailureClass::PersistenceFailure
+        | ValidationFailureClass::MissingRequiredOutputs => {
             RecoveryRecommendation {
                 action: "operator_inspection".to_string(),
                 explanation: "Inspect the agent transcript, receipt, and declared output contract before deciding whether to retry; do not perform a blind identical retry after missing required outputs.".to_string(),
             }
         }
-        ValidationFailureClass::EmptyOutput | ValidationFailureClass::OutputContractMismatch => {
+        ValidationFailureClass::EmptyOutput
+        | ValidationFailureClass::OutputContractMismatch
+        | ValidationFailureClass::InvalidRequiredOutputs
+        | ValidationFailureClass::ProviderModeMismatch => {
             RecoveryRecommendation {
                 action: "retry_failed_agent".to_string(),
                 explanation: "Retry the failed agent with the same declared outputs and inspect the validation failure payload.".to_string(),

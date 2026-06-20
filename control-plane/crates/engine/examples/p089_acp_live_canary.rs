@@ -272,6 +272,8 @@ tests_result={}
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let started_at = Utc::now();

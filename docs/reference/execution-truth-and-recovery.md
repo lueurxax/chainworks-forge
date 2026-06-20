@@ -176,6 +176,8 @@ Current `AgentFailureKind` values include:
 - `cancelled_by_operator`
 - `superseded_by_retry`
 - `host_interruption`
+- `tool_output_budget_preflight_denied`
+- `tool_output_budget_exceeded`
 - `unknown`
 
 Rules:

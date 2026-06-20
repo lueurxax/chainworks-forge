@@ -14,6 +14,7 @@ use domain::xcode_runtime::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, Notify};
@@ -784,7 +785,11 @@ impl XcodeMcpBridgePool {
             let Some(lease) = state.leases.get_mut(lease_id) else {
                 bail!("xcode_mcp_first_connect_timeout: lease '{lease_id}' is not available");
             };
-            if lease.authorization_hash != actual_hash {
+            // SEC-P079-LOW-001: constant-time hash comparison to avoid timing side channels.
+            let hash_match: bool = lease.authorization_hash.as_bytes()
+                .ct_eq(actual_hash.as_bytes())
+                .into();
+            if !hash_match {
                 bail!("xcode_mcp_unauthorized: bearer token does not match lease '{lease_id}'");
             }
             if lease.state == XcodeMcpLeaseState::Closing {

@@ -147,6 +147,8 @@ pub enum AgentFailureKind {
     InvalidOutputContract,
     CancelledByOperator,
     SupersededByRetry,
+    ToolOutputBudgetPreflightDenied,
+    ToolOutputBudgetExceeded,
     Unknown,
 }
 
@@ -173,6 +175,10 @@ impl std::fmt::Display for AgentFailureKind {
             AgentFailureKind::InvalidOutputContract => "invalid_output_contract",
             AgentFailureKind::CancelledByOperator => "cancelled_by_operator",
             AgentFailureKind::SupersededByRetry => "superseded_by_retry",
+            AgentFailureKind::ToolOutputBudgetPreflightDenied => {
+                "tool_output_budget_preflight_denied"
+            }
+            AgentFailureKind::ToolOutputBudgetExceeded => "tool_output_budget_exceeded",
             AgentFailureKind::Unknown => "unknown",
         })
     }
@@ -203,6 +209,10 @@ impl std::str::FromStr for AgentFailureKind {
             "invalid_output_contract" => AgentFailureKind::InvalidOutputContract,
             "cancelled_by_operator" => AgentFailureKind::CancelledByOperator,
             "superseded_by_retry" => AgentFailureKind::SupersededByRetry,
+            "tool_output_budget_preflight_denied" => {
+                AgentFailureKind::ToolOutputBudgetPreflightDenied
+            }
+            "tool_output_budget_exceeded" => AgentFailureKind::ToolOutputBudgetExceeded,
             "unknown" => AgentFailureKind::Unknown,
             other => return Err(format!("Unknown AgentFailureKind: {other}")),
         })
@@ -218,6 +228,9 @@ pub enum AgentOutputSettlement {
     ValidOutputsFromCompletedExecution,
     ValidOutputsFromFailedExecution,
     IgnoredLateOutputs,
+    /// P079: output was not produced by the original turn but was recovered via a
+    /// same-session repair turn. The P079 evidence row carries the typed settlement.
+    ValidOutputsFromRepair,
 }
 
 impl Default for AgentOutputSettlement {
@@ -239,6 +252,7 @@ impl std::fmt::Display for AgentOutputSettlement {
                 "valid_outputs_from_failed_execution"
             }
             AgentOutputSettlement::IgnoredLateOutputs => "ignored_late_outputs",
+            AgentOutputSettlement::ValidOutputsFromRepair => "valid_outputs_from_repair",
         })
     }
 }
@@ -258,6 +272,7 @@ impl std::str::FromStr for AgentOutputSettlement {
                 AgentOutputSettlement::ValidOutputsFromFailedExecution
             }
             "ignored_late_outputs" => AgentOutputSettlement::IgnoredLateOutputs,
+            "valid_outputs_from_repair" => AgentOutputSettlement::ValidOutputsFromRepair,
             other => return Err(format!("Unknown AgentOutputSettlement: {other}")),
         })
     }
