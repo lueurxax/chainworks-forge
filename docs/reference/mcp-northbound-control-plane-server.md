@@ -146,6 +146,8 @@ and operators use that readback to distinguish preflight-denied safe-search
 commands from post-output budget failures. The full contract is
 [bounded-tool-output-and-safe-search-policy.md](bounded-tool-output-and-safe-search-policy.md).
 
+The `agents.attach_receipt.get` tool (fetches the `provider_session_attach_receipt_v2` body for a `provider_session_resurrection` continuation) is also dispatched through the same `agents.*` prefix route. It is advertised in `tools::agents::tool_specs()` but does not currently have a `CapabilityToolId` variant; its access matrix (Operator → raw, Observer → reviewer-redacted, Agent → minimal existence + `resurrection_phase`, wrong-run Operator → `auth_failure`) is enforced inside the handler. Every access path writes a row to `p086_receipt_access_audit`. See [`agent-work-continuation.md`](agent-work-continuation.md#resurrection-durable-state-and-readback-infrastructure) for the full principal access matrix and response shapes.
+
 ### MCP tool payloads
 
 #### `approvals.resolve`

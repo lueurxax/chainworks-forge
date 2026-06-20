@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents.attach_receipt.get.response.schema.json",
+  "title": "agents.attach_receipt.get response",
+  "description": "P086: MCP response schema for agents.attach_receipt.get. The shape varies by principal class; Operator-only fields are absent (not null) for non-Operator principals to prevent field-presence side-channel inference.",
+  "oneOf": [
+    {"$ref": "#/$defs/operator_raw_response"},
+    {"$ref": "#/$defs/reviewer_projection_response"},
+    {"$ref": "#/$defs/guest_redacted_response"},
+    {"$ref": "#/$defs/not_found_response"},
+    {"$ref": "#/$defs/not_available_response"},
+    {"$ref": "#/$defs/error_response"}
+  ],
+  "$defs": {
+    "operator_raw_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "continuation_id", "run_id", "attach_receipt_artifact_id", "receipt"],
+      "properties": {
+        "outcome": {"type": "string", "const": "ok"},
+        "continuation_id": {"type": "string"},
+        "run_id": {"type": "string"},
+        "attach_receipt_artifact_id": {"type": "string"},
+        "receipt": {
+          "type": "object",
+          "description": "Full ProviderSessionAttachReceiptV2 JSON. Raw fields include requested/actual provider_session_id, managed_child_pid/pgid/start_time, adapter_runtime_home_realpath/dev_ino, identity_proof_artifact_id."
+        }
+      }
+    },
+    "reviewer_projection_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "outcome", "schema_version",
+        "failure_class", "resurrection_phase",
+        "attach_started_at", "attach_completed_at",
+        "output_only", "source_edit_allowance",
+        "changed_source_files_count", "orphan_reap_verified",
+        "identity_proof_source"
+      ],
+      "properties": {
+        "outcome": {"type": "string", "const": "reviewer_projection"},
+        "schema_version": {"type": "integer"},
+        "failure_class": {"type": ["string", "null"]},
+        "resurrection_phase": {"type": ["string", "null"]},
+        "attach_started_at": {"type": ["string", "null"]},
+        "attach_completed_at": {"type": ["string", "null"]},
+        "output_only": {"type": ["boolean", "null"]},
+        "source_edit_allowance": {"type": ["boolean", "null"]},
+        "changed_source_files_count": {"type": ["integer", "null"], "minimum": 0},
+        "orphan_reap_verified": {"type": "boolean"},
+        "identity_proof_source": {"type": ["string", "null"]}
+      }
+    },
+    "guest_redacted_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "attach_receipt_artifact_present", "resurrection_phase"],
+      "properties": {
+        "outcome": {"type": "string", "const": "redacted"},
+        "attach_receipt_artifact_present": {"type": "boolean"},
+        "resurrection_phase": {"type": ["string", "null"]}
+      }
+    },
+    "not_found_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "error"],
+      "properties": {
+        "outcome": {"type": "string", "const": "not_found"},
+        "error": {
+          "type": "object",
+          "required": ["code", "message", "data"],
+          "properties": {
+            "code": {"type": "integer"},
+            "message": {"type": "string"},
+            "data": {
+              "type": "object",
+              "required": ["failure_reason"],
+              "properties": {
+                "failure_reason": {"type": "string", "const": "not_found_or_access_denied"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "not_available_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "message"],
+      "properties": {
+        "outcome": {"type": "string", "const": "not_available"},
+        "message": {"type": "string"},
+        "continuation_id": {"type": "string"},
+        "mode": {"type": "string"}
+      }
+    },
+    "error_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "error"],
+      "properties": {
+        "outcome": {"type": "string", "const": "error"},
+        "error": {
+          "type": "object",
+          "required": ["code", "message", "data"],
+          "properties": {
+            "code": {"type": "integer"},
+            "message": {"type": "string"},
+            "data": {"type": "object"}
+          }
+        }
+      }
+    }
+  }
+}

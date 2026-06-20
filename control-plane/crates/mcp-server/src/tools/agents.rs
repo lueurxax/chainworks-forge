@@ -1,6 +1,6 @@
 use anyhow::Result;
 use sha2::{Digest, Sha256};
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use std::collections::BTreeMap;
 
 use crate::protocol::McpTool;
@@ -51,6 +51,34 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 },
                 "required": ["run_id"]
+            }),
+        },
+        McpTool {
+            name: "agents.attach_receipt.get".to_string(),
+            description: concat!(
+                "P086: Fetch the provider_session_attach_receipt_v2 for a resurrection continuation. ",
+                "Operator (run-scoped) receives the full raw receipt body. ",
+                "Observer principals receive a reviewer-redacted projection (session ids hashed, ",
+                "process identifiers absent). Agent principals receive only existence confirmation ",
+                "and resurrection_phase. Wrong-run operators and unauthenticated callers are rejected ",
+                "without exposing existence of receipts from other runs."
+            ).to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "continuation_id": {
+                        "type": "string",
+                        "description": "UUID of the continuation whose attach receipt to fetch.",
+                        "maxLength": 200
+                    },
+                    "run_id": {
+                        "type": "string",
+                        "description": "Run id that the caller is authorized for. Operators must supply this for run-scope verification.",
+                        "maxLength": 200
+                    }
+                },
+                "required": ["continuation_id"],
+                "additionalProperties": false
             }),
         },
         McpTool {
@@ -174,6 +202,7 @@ pub async fn execute(
             handle_continuation_candidates(&params, pool, principal).await
         }
         "agents.continue_work" => handle_continue_work(&params, pool, principal).await,
+        "agents.attach_receipt.get" => handle_attach_receipt_get(&params, pool, principal).await,
         _ => Err(anyhow::anyhow!("Unknown agents tool: {tool_name}")),
     }
 }
@@ -353,6 +382,260 @@ async fn handle_continuation_candidates(
             "candidates": redacted
         }))
     }
+}
+
+/// P086: Fetch provider_session_attach_receipt_v2 with principal-access-matrix enforcement.
+///
+/// Operator (run-scoped) → full raw JSON body, audit row outcome=raw_read
+/// Observer (Reviewer)   → reviewer-redacted projection, audit row outcome=reviewer_projection
+/// Agent (Guest)         → minimal projection (continuation_id + resurrection_phase), denied in audit
+/// Wrong-run Operator    → auth_failure, audit row outcome=denied, no existence oracle
+async fn handle_attach_receipt_get(
+    params: &serde_json::Value,
+    pool: &SqlitePool,
+    principal: &auth::Principal,
+) -> Result<serde_json::Value> {
+    let continuation_id = params["continuation_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing continuation_id"))?;
+    let requested_run_id = params["run_id"].as_str();
+    let now = chrono::Utc::now().to_rfc3339();
+    let audit_id = uuid::Uuid::new_v4().to_string();
+
+    // Unauthenticated requests are rejected by the MCP auth layer before reaching here.
+    // Agent (Guest) principal gets minimal projection only — no raw receipt access.
+    if matches!(principal.class, auth::PrincipalClass::Agent) {
+        // Return minimal: continuation existence + resurrection_phase (no raw data).
+        let resurrection_phase = fetch_resurrection_phase(pool, continuation_id).await?;
+        let _ = db::repos::p086_resurrection_raw_receipts::record_access_audit(
+            pool,
+            &db::repos::p086_resurrection_raw_receipts::ReceiptAccessAuditRow {
+                id: audit_id,
+                principal_id: principal.id.clone(),
+                principal_class: "agent".to_string(),
+                continuation_id: continuation_id.to_string(),
+                run_id: requested_run_id.unwrap_or("").to_string(),
+                requested_at: now,
+                source_channel: "mcp".to_string(),
+                outcome: "denied".to_string(),
+                denial_reason: Some("agent_principal_minimal_only".to_string()),
+            },
+        )
+        .await;
+        return Ok(serde_json::json!({
+            "principal_class": "agent",
+            "continuation_id": continuation_id,
+            "resurrection_phase": resurrection_phase,
+            "access_level": "minimal"
+        }));
+    }
+
+    // Look up which run owns this continuation (needed for run-scope authorization).
+    let actual_run_id =
+        db::repos::p086_resurrection_raw_receipts::continuation_run_id(pool, continuation_id)
+            .await?;
+
+    // Operator principals: verify run scope. Wrong-run returns auth_failure (no existence oracle).
+    if matches!(principal.class, auth::PrincipalClass::Operator) {
+        if let Some(req_run) = requested_run_id {
+            let matches = actual_run_id
+                .as_deref()
+                .map(|actual| actual == req_run)
+                .unwrap_or(false);
+            if !matches {
+                let _ = db::repos::p086_resurrection_raw_receipts::record_access_audit(
+                    pool,
+                    &db::repos::p086_resurrection_raw_receipts::ReceiptAccessAuditRow {
+                        id: audit_id,
+                        principal_id: principal.id.clone(),
+                        principal_class: "operator".to_string(),
+                        continuation_id: continuation_id.to_string(),
+                        run_id: req_run.to_string(),
+                        requested_at: now,
+                        source_channel: "mcp".to_string(),
+                        outcome: "denied".to_string(),
+                        denial_reason: Some("wrong_run_or_not_found".to_string()),
+                    },
+                )
+                .await;
+                return Ok(serde_json::json!({
+                    "outcome": "rejected",
+                    "error": {
+                        "code": -32001,
+                        "message": "auth_failure: run_id does not match or continuation not found",
+                        "data": { "failure_reason": "auth_failure" }
+                    }
+                }));
+            }
+        }
+
+        // Operator with matching run_id → return full raw receipt.
+        let raw = db::repos::p086_resurrection_raw_receipts::find_by_continuation_id(
+            pool,
+            continuation_id,
+        )
+        .await?;
+        let run_id_for_audit = actual_run_id.as_deref().unwrap_or("").to_string();
+        match raw {
+            Some(row) => {
+                let _ = db::repos::p086_resurrection_raw_receipts::record_access_audit(
+                    pool,
+                    &db::repos::p086_resurrection_raw_receipts::ReceiptAccessAuditRow {
+                        id: audit_id,
+                        principal_id: principal.id.clone(),
+                        principal_class: "operator".to_string(),
+                        continuation_id: continuation_id.to_string(),
+                        run_id: run_id_for_audit,
+                        requested_at: now,
+                        source_channel: "mcp".to_string(),
+                        outcome: "raw_read".to_string(),
+                        denial_reason: None,
+                    },
+                )
+                .await;
+                let raw_json: serde_json::Value =
+                    serde_json::from_str(&row.raw_receipt_json).unwrap_or(serde_json::json!({}));
+                Ok(serde_json::json!({
+                    "principal_class": "operator",
+                    "access_level": "raw",
+                    "continuation_id": continuation_id,
+                    "receipt": raw_json
+                }))
+            }
+            None => {
+                let _ = db::repos::p086_resurrection_raw_receipts::record_access_audit(
+                    pool,
+                    &db::repos::p086_resurrection_raw_receipts::ReceiptAccessAuditRow {
+                        id: audit_id,
+                        principal_id: principal.id.clone(),
+                        principal_class: "operator".to_string(),
+                        continuation_id: continuation_id.to_string(),
+                        run_id: run_id_for_audit,
+                        requested_at: now,
+                        source_channel: "mcp".to_string(),
+                        outcome: "denied".to_string(),
+                        denial_reason: Some("receipt_not_found".to_string()),
+                    },
+                )
+                .await;
+                Ok(serde_json::json!({
+                    "outcome": "not_found",
+                    "continuation_id": continuation_id
+                }))
+            }
+        }
+    } else {
+        // Observer (Reviewer) principal: return redacted projection.
+        let raw = db::repos::p086_resurrection_raw_receipts::find_by_continuation_id(
+            pool,
+            continuation_id,
+        )
+        .await?;
+        let run_id_for_audit = actual_run_id.as_deref().unwrap_or("").to_string();
+        let _ = db::repos::p086_resurrection_raw_receipts::record_access_audit(
+            pool,
+            &db::repos::p086_resurrection_raw_receipts::ReceiptAccessAuditRow {
+                id: audit_id,
+                principal_id: principal.id.clone(),
+                principal_class: "observer".to_string(),
+                continuation_id: continuation_id.to_string(),
+                run_id: run_id_for_audit,
+                requested_at: now.clone(),
+                source_channel: "mcp".to_string(),
+                outcome: "reviewer_projection".to_string(),
+                denial_reason: None,
+            },
+        )
+        .await;
+        match raw {
+            Some(row) => {
+                let raw_json: serde_json::Value =
+                    serde_json::from_str(&row.raw_receipt_json).unwrap_or(serde_json::json!({}));
+                let redacted = reviewer_redact_receipt(&raw_json);
+                Ok(serde_json::json!({
+                    "principal_class": "observer",
+                    "access_level": "reviewer_redacted",
+                    "continuation_id": continuation_id,
+                    "receipt": redacted
+                }))
+            }
+            None => Ok(serde_json::json!({
+                "outcome": "not_found",
+                "continuation_id": continuation_id
+            })),
+        }
+    }
+}
+
+/// Fetch resurrection_phase from agent_work_continuations for minimal projections.
+async fn fetch_resurrection_phase(
+    pool: &SqlitePool,
+    continuation_id: &str,
+) -> Result<Option<String>> {
+    let row = sqlx::query(
+        "SELECT resurrection_phase FROM agent_work_continuations WHERE id = ?1",
+    )
+    .bind(continuation_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|r| r.try_get::<Option<String>, _>("resurrection_phase").ok().flatten()))
+}
+
+/// Build reviewer-redacted projection of a raw receipt JSON.
+///
+/// Redaction rules per proposal access matrix:
+/// - requested_provider_session_id → prefix + sha256 hash (never raw value)
+/// - actual_provider_session_id    → prefix + sha256 hash
+/// - identity_proof_artifact_id    → replaced with constant redaction marker
+/// - adapter_runtime_home_realpath → ABSENT (not present, not null)
+/// - adapter_runtime_home_dev_ino  → ABSENT
+/// - managed_child_pid             → ABSENT
+/// - managed_process_group_id      → ABSENT (alias: managed_child_process_group_id)
+/// - managed_child_start_time      → ABSENT
+/// All other fields pass through unchanged.
+fn reviewer_redact_receipt(raw: &serde_json::Value) -> serde_json::Value {
+    let Some(obj) = raw.as_object() else {
+        return serde_json::json!({});
+    };
+    // Fields that must be entirely absent (not null-set) to defeat field-presence side channels.
+    const ABSENT_FIELDS: &[&str] = &[
+        "adapter_runtime_home_realpath",
+        "adapter_runtime_home_dev_ino",
+        "managed_child_pid",
+        "managed_process_group_id",
+        "managed_child_process_group_id",
+        "managed_child_start_time",
+    ];
+    // Fields whose values are replaced with prefix+hash to redact provider session ids.
+    const SESSION_ID_FIELDS: &[&str] = &[
+        "requested_provider_session_id",
+        "actual_provider_session_id",
+    ];
+    let mut out = serde_json::Map::new();
+    for (k, v) in obj {
+        if ABSENT_FIELDS.contains(&k.as_str()) {
+            continue;
+        }
+        if SESSION_ID_FIELDS.contains(&k.as_str()) {
+            if let Some(s) = v.as_str() {
+                let hash: String = Sha256::digest(s.as_bytes())
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                let prefix: String = s.chars().take(4).collect();
+                out.insert(k.clone(), serde_json::Value::String(format!("{prefix}...{hash}")));
+            } else {
+                out.insert(k.clone(), v.clone());
+            }
+            continue;
+        }
+        if k == "identity_proof_artifact_id" {
+            out.insert(k.clone(), serde_json::Value::String("[redacted]".to_string()));
+            continue;
+        }
+        out.insert(k.clone(), v.clone());
+    }
+    serde_json::Value::Object(out)
 }
 
 /// Compute canonical request fingerprint: SHA-256 of sorted-key JSON (BTreeMap ensures ordering),
@@ -1116,6 +1399,21 @@ async fn verify_lead_auto_artifacts(
     Ok(None)
 }
 
+/// SEC-P086-MED-002: Constant-shape opaque rejection for Agent lead_auto requests
+/// that fail target-discovery checks before artifact verification.  Returning a
+/// uniform not_found_or_access_denied hides whether the supplied agent_execution_id
+/// exists, what role/status it has, or what run/stage it belongs to.
+fn lead_auto_agent_opaque_rejection() -> serde_json::Value {
+    serde_json::json!({
+        "outcome": "rejected",
+        "error": {
+            "code": -32020,
+            "message": "agent_execution not found or access denied",
+            "data": { "failure_reason": "not_found_or_access_denied" }
+        }
+    })
+}
+
 async fn handle_continue_work(
     params: &serde_json::Value,
     pool: &SqlitePool,
@@ -1456,12 +1754,23 @@ async fn handle_continue_work(
         None
     };
 
+    // SEC-P086-MED-002: For Agent principals in lead_auto, target-specific errors must not
+    // reveal whether agent_execution_id exists, what role/status it has, or associated
+    // run/stage/session metadata, before the lead artifact is verified.  After
+    // verify_lead_auto_artifacts succeeds the artifact itself binds all those IDs, so
+    // subsequent checks may return specific errors.
+    let is_agent_lead_auto = matches!(principal.class, auth::PrincipalClass::Agent)
+        && trigger_kind == "lead_auto";
+
     // Check eligibility: agent_role=code_writer, owner_kind=stage_execution, terminal status, run membership.
     // check_eligibility returns Some for any code_writer+stage_execution agent regardless of status;
     // terminal-status check is done here so we can return the correct failure_reason.
     let eligibility =
         db::repos::agent_work_continuations::check_eligibility(pool, agent_execution_id).await?;
     let Some(info) = eligibility else {
+        if is_agent_lead_auto {
+            return Ok(lead_auto_agent_opaque_rejection());
+        }
         return Ok(serde_json::json!({
             "outcome": "rejected",
             "error": {
@@ -1479,6 +1788,9 @@ async fn handle_continue_work(
     // The proposal distinguishes this from ineligible_agent_execution: an in-progress
     // AgentExecution cannot receive a continuation until it settles to completed/failed.
     if !matches!(info.agent_status.as_str(), "completed" | "failed") {
+        if is_agent_lead_auto {
+            return Ok(lead_auto_agent_opaque_rejection());
+        }
         return Ok(serde_json::json!({
             "outcome": "rejected",
             "error": {
@@ -1495,6 +1807,9 @@ async fn handle_continue_work(
 
     if let Some(expected) = expected_run_id {
         if expected != info.run_id {
+            if is_agent_lead_auto {
+                return Ok(lead_auto_agent_opaque_rejection());
+            }
             return Ok(serde_json::json!({
                 "outcome": "rejected",
                 "error": {
@@ -1512,6 +1827,9 @@ async fn handle_continue_work(
     }
     if let Some(expected) = expected_stage_execution_id {
         if expected != info.stage_execution_id {
+            if is_agent_lead_auto {
+                return Ok(lead_auto_agent_opaque_rejection());
+            }
             return Ok(serde_json::json!({
                 "outcome": "rejected",
                 "error": {
@@ -1529,6 +1847,9 @@ async fn handle_continue_work(
     }
     if let Some(expected) = expected_session_generation_id {
         if info.session_generation_id.as_deref() != Some(expected) {
+            if is_agent_lead_auto {
+                return Ok(lead_auto_agent_opaque_rejection());
+            }
             return Ok(serde_json::json!({
                 "outcome": "rejected",
                 "error": {
@@ -1546,6 +1867,9 @@ async fn handle_continue_work(
     }
     if let Some(expected) = expected_provider_session_id {
         if info.provider_session_id.as_deref() != Some(expected) {
+            if is_agent_lead_auto {
+                return Ok(lead_auto_agent_opaque_rejection());
+            }
             return Ok(serde_json::json!({
                 "outcome": "rejected",
                 "error": {
@@ -2834,6 +3158,58 @@ mod tests {
             assert!(
                 uuid::Uuid::parse_str(id).is_err(),
                 "invalid id {id:?} must fail UUID format check"
+            );
+        }
+    }
+
+    #[test]
+    fn sec_med_002_agent_lead_auto_opaque_rejection_has_constant_shape() {
+        // SEC-P086-MED-002: lead_auto_agent_opaque_rejection() must always return the same
+        // failure_reason and error code regardless of which check triggered it.
+        // This is a regression guard: callers must not be able to distinguish eligibility,
+        // already_running, run_id_mismatch, stage_mismatch, session_mismatch, or
+        // provider_session_mismatch errors from each other before artifact verification.
+        let r = super::lead_auto_agent_opaque_rejection();
+        assert_eq!(r["outcome"], "rejected", "opaque rejection must have outcome=rejected");
+        assert_eq!(
+            r["error"]["code"], -32020,
+            "opaque rejection must use code -32020 (same as ineligible to avoid a distinct oracle signal)"
+        );
+        assert_eq!(
+            r["error"]["data"]["failure_reason"], "not_found_or_access_denied",
+            "opaque rejection must use failure_reason=not_found_or_access_denied"
+        );
+        assert!(
+            r["error"]["data"].get("agent_status").is_none(),
+            "opaque rejection must not expose agent_status"
+        );
+        assert!(
+            r["error"]["data"].get("actual_run_id").is_none(),
+            "opaque rejection must not expose actual_run_id"
+        );
+        assert!(
+            r["error"]["data"].get("actual_stage_execution_id").is_none(),
+            "opaque rejection must not expose actual_stage_execution_id"
+        );
+    }
+
+    #[test]
+    fn sec_med_002_is_agent_lead_auto_predicate_covers_exact_class_and_trigger() {
+        // SEC-P086-MED-002: the opaque path must activate for Agent+lead_auto only,
+        // not for Operator+lead_auto or Agent+operator_mcp.
+        let cases: &[(auth::PrincipalClass, &str, bool)] = &[
+            (auth::PrincipalClass::Agent, "lead_auto", true),
+            (auth::PrincipalClass::Operator, "lead_auto", false),
+            (auth::PrincipalClass::Agent, "operator_mcp", false),
+            (auth::PrincipalClass::Operator, "operator_mcp", false),
+        ];
+        for (class, trigger_kind, expect_opaque) in cases {
+            let principal = auth::Principal::new("p", class.clone());
+            let is_agent_lead_auto = matches!(principal.class, auth::PrincipalClass::Agent)
+                && *trigger_kind == "lead_auto";
+            assert_eq!(
+                is_agent_lead_auto, *expect_opaque,
+                "is_agent_lead_auto must be {expect_opaque} for class={class:?} trigger={trigger_kind}"
             );
         }
     }

@@ -299,6 +299,38 @@ impl From<db::repos::agent_work_continuations::P086ContinuationMetricsSummary>
     }
 }
 
+/// P086: Operator-only raw access to the provider_session_attach_receipt_v2.
+/// All Operator-only fields are present; lower principals receive separate types.
+#[derive(async_graphql::SimpleObject, Clone, Debug, serde::Serialize)]
+#[graphql(name = "ProviderSessionAttachReceiptOperator")]
+pub struct GqlAttachReceiptOperator {
+    pub continuation_id: String,
+    pub access_level: String,
+    /// Full raw receipt JSON as a JSON string for forward-compatibility.
+    pub receipt_json: Option<String>,
+}
+
+/// P086: Reviewer-redacted projection of the attach receipt.
+/// Provider session ids are replaced with prefix+hash. Process identifiers and
+/// runtime paths are absent (not null-set) to defeat field-presence side-channels.
+#[derive(async_graphql::SimpleObject, Clone, Debug, serde::Serialize)]
+#[graphql(name = "ProviderSessionAttachReceiptReviewer")]
+pub struct GqlAttachReceiptReviewer {
+    pub continuation_id: String,
+    pub access_level: String,
+    /// Redacted receipt JSON with session ids hashed and pids/runtime paths absent.
+    pub redacted_receipt_json: Option<String>,
+}
+
+/// P086: Guest (Agent) minimal projection. Only confirms existence and resurrection_phase.
+/// No artifact identifiers, session ids, or process information.
+#[derive(async_graphql::SimpleObject, Clone, Debug, serde::Serialize)]
+#[graphql(name = "ProviderSessionAttachReceiptGuest")]
+pub struct GqlAttachReceiptGuest {
+    pub continuation_id: String,
+    pub resurrection_phase: Option<String>,
+}
+
 /// Compute freshness and lag from an RFC-3339 updated_at timestamp.
 /// Returns (state, Some(lag_ms)). Lag > 5000 ms → ProjectionLag; otherwise Live.
 pub fn compute_continuation_freshness(updated_at: &str) -> (GqlFreshnessState, Option<i64>) {
