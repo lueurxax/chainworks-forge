@@ -1,7 +1,7 @@
 {
   "fixture_id": "manual-process-identity-check-banner",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "manual_process_identity_check_ui_v1",
   "description": "When a provider cancellation intent is held with process_fate=identity_ambiguous, ManualProcessIdentityCheckBanner appears with title 'Process identity needs review', body copy, and disabled automatic retry.",
   "preconditions": {

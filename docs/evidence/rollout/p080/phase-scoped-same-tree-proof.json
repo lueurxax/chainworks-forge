@@ -1,0 +1,51 @@
+{
+  "disabled_classes": [
+    "scheduler_ownership_drift",
+    "helper_orphan_drift",
+    "release_side_effect_drift",
+    "permanent_hold_clear"
+  ],
+  "evidence_id": "p080-phase-scoped-same-tree-proof-2026-06-20",
+  "gate": "./scripts/test-gate.sh proposal-080",
+  "implemented_classes": [
+    "detection_only",
+    "acp_startup_stale"
+  ],
+  "proof": {
+    "db_tests": [
+      "p080_seed_rollout_control_inserts_all_classes",
+      "p080_seed_rollout_control_is_idempotent",
+      "p080_rollout_control_includes_detection_only_class",
+      "p080_repair_acp_startup_stale_requeues_running_invoke_agent",
+      "p080_run_report_section_redacts_stored_readback_rows"
+    ],
+    "graphql_tests": [
+      "p080_diagnostics_graphql_returns_page"
+    ],
+    "mcp_tests": [
+      "p080_diagnostics_get_rollout_disabled_until_detection_enabled",
+      "p080_reconcile_diagnose_only_happy_path",
+      "p080_repair_if_safe_requeues_acp_startup_stale_when_phase_enabled",
+      "p080_repair_if_safe_dedup_replay_returns_same_response",
+      "p080_repair_if_safe_dedup_conflict_returns_idempotency_conflict",
+      "p080_clear_permanent_hold_action_disabled_in_phase"
+    ],
+    "negative_fixture_directory": "docs/evidence/rollout-contract/negative",
+    "operator_readback_fixture": "docs/evidence/rollout-contract/operator-readback/p080-full-surface.fixture.json"
+  },
+  "proposal_id": "080",
+  "proposal_revision_id": "p080-refined-2026-06-02-r28",
+  "recorded_at": "2026-06-20T00:00:00Z",
+  "rollout_phase": "phase_scoped_detection_and_acp_startup_repair",
+  "safety_assertions": {
+    "acp_startup_repair_requeues_invoke_agent": true,
+    "clear_permanent_hold_not_enabled": true,
+    "diagnose_only_has_no_dedup_write": true,
+    "repair_if_safe_dedup_replay_fenced_before_mutation": true,
+    "helper_process_signal_not_enabled": true,
+    "read_only_operator_repair_rejected": true,
+    "side_effect_adjacent_repair_not_enabled_without_p076_retry_safe_truth": true
+  },
+  "schema_version": "p080_rollout_evidence_v1",
+  "status": "passed"
+}

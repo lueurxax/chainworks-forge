@@ -124,6 +124,66 @@ struct Proposal079ContractRepairReadbackTests {
         #expect(ev.budget?.fallbackConsumed == true)
     }
 
+    @Test("GraphQL-style enum casing decodes into canonical P079 presentation values")
+    func graphQLEnumCasingDecodes() throws {
+        let json = P079Fixtures.recoveredFallback
+            .replacingOccurrences(of: #""status": "recovered""#, with: #""status": "RECOVERED""#)
+            .replacingOccurrences(of: #""presentation_category": "recovered""#, with: #""presentation_category": "RECOVERED""#)
+            .replacingOccurrences(of: #""recommended_next_action": null"#, with: #""recommended_next_action": "MANUAL_INVESTIGATION""#)
+            .replacingOccurrences(of: #""provider_family": "gemini""#, with: #""provider_family": "GEMINI""#)
+            .replacingOccurrences(of: #""adapter_family": "gemini""#, with: #""adapter_family": "GEMINI""#)
+            .replacingOccurrences(of: #""initial_failure_class": "missing_required_outputs""#, with: #""initial_failure_class": "MISSING_REQUIRED_OUTPUTS""#)
+            .replacingOccurrences(of: #""result": "accepted""#, with: #""result": "ACCEPTED""#)
+
+        let ev = try decode(json)
+        #expect(ev.status == .recovered)
+        #expect(ev.presentationCategory == .recovered)
+        #expect(ev.recommendedNextAction == .manualInvestigation)
+        #expect(ev.providerFamily == .gemini)
+        #expect(ev.adapterFamily == .gemini)
+        #expect(ev.initialFailureClass == .missingRequiredOutputs)
+        #expect(ev.providerFallback?.result == .accepted)
+    }
+
+    @Test("Run detail presentation surfaces P079 stage execution evidence for inspector")
+    @MainActor
+    func runDetailPresentationSurfacesOutputContractRepair() throws {
+        let evidence = try decode(P079Fixtures.blocked)
+        let stage = P031StageReadModel(
+            id: "stage-exec-001",
+            runID: "run-p079-fixture",
+            stageID: "implementation",
+            label: "Implementation",
+            status: "failed",
+            iteration: nil,
+            attemptNumber: nil,
+            settlementKind: nil,
+            hasArtifacts: nil,
+            hasPendingApproval: nil,
+            hasValidationFailure: true,
+            projectionPresent: true,
+            projectionUpdatedAt: nil,
+            projectionLag: false,
+            freshnessState: .live,
+            executions: [
+                P031StageAgentExecutionReadModel(
+                    id: "agent-exec-001",
+                    outputContractRepair: evidence
+                )
+            ]
+        )
+        let detail = P031RunDetailReadModel(run: nil, stages: [stage], artifacts: [])
+        let presentation = P031RunDetailPresenter.presentation(
+            for: detail,
+            currentFreshness: P031FreshnessSnapshot(state: .live),
+            checkedAt: Date(timeIntervalSince1970: 0)
+        )
+
+        #expect(presentation.outputContractRepair?.category == .blocked)
+        #expect(presentation.outputContractRepair?.repairAttemptId == "rep-001")
+        #expect(presentation.outputContractRepair?.diagnosticRows.contains(where: { $0.contains("Repair") }) == true)
+    }
+
     // MARK: - blocked
 
     @Test("Blocked evidence decodes with manual_investigation recommended action")
@@ -158,6 +218,7 @@ struct Proposal079ContractRepairReadbackTests {
         let p = OutputContractRepairPresenter.presentation(for: ev)
         #expect(p.isStale == true)
         #expect(p.staleSinceLabel != nil)
+        #expect(p.staleSinceLabel?.contains("2026-05-30T09:55:00Z") == true)
         #expect(p.diagnosticRows.contains(where: { $0.contains("Stale") }))
     }
 

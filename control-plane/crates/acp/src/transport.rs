@@ -2215,7 +2215,7 @@ fn observe_mcp_actuals(
     })
 }
 
-pub(crate) fn extract_output_envelopes(
+pub fn extract_output_envelopes(
     stream_text: &str,
     expected_outputs: &[ExpectedOutputSpec],
 ) -> Vec<DiscoveredArtifact> {

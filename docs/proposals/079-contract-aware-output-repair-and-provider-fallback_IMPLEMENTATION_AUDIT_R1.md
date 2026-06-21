@@ -1,8 +1,8 @@
 # P079 Implementation Audit R1
 
-Proposal: `docs/proposals/079-contract-aware-output-repair-and-provider-fallback.md`  
-Report path: `docs/proposals/079-contract-aware-output-repair-and-provider-fallback_IMPLEMENTATION_AUDIT_R1.md`  
-Generated: 2026-06-20  
+Proposal: `docs/proposals/079-contract-aware-output-repair-and-provider-fallback.md`
+Report path: `docs/proposals/079-contract-aware-output-repair-and-provider-fallback_IMPLEMENTATION_AUDIT_R1.md`
+Generated: 2026-06-20
 Head audited: `4c3dce2c5f70cd7dc540887979d399f7d354c59d`
 
 ## Verdict
@@ -112,80 +112,80 @@ Specialist coverage hard gate:
 
 ### READY-001: Unresolved conflicts make the audited tree unshippable
 
-Severity: Critical  
-Track: Readiness  
+Severity: Critical
+Track: Readiness
 Files: `control-plane/crates/engine/src/executor.rs`, `control-plane/crates/graphql-server/src/schema.rs`, `control-plane/crates/mcp-server/src/tools/reports.rs`, `control-plane/crates/auth/src/lib.rs`, `scripts/test-gate.sh`, `docs/reference/test-gates.md`
 
 The current tree contains unresolved merge conflict markers in implementation, auth, GraphQL, MCP, docs, and the gate script. `git diff --check` fails, and several public ingress surfaces are among the conflicted files. No P079 readiness verdict can pass until the branch is merged cleanly and the canonical gate can run.
 
 ### OPS-001: The canonical P079 acceptance gate is absent
 
-Severity: Critical  
-Track: Readiness  
+Severity: Critical
+Track: Readiness
 Files: `scripts/test-gate.sh`, `docs/reference/test-gates.md`
 
 The proposal makes `./scripts/test-gate.sh proposal-079` and `./scripts/test-gate.sh p079` the primary acceptance gates. The current script reports `Unknown gate: proposal-079`, and text search finds no P079 gate alias. The conflicted `docs/reference/test-gates.md` also describes P079 as a partial-acceptance gate with multiple deferred acceptance items. This blocks both conformance and closeout.
 
 ### REL-001: Production same-session repair is not implemented beyond fail-closed posture
 
-Severity: Major  
-Track: Conformance / Readiness  
+Severity: Major
+Track: Conformance / Readiness
 Files: `control-plane/crates/engine/src/executor.rs`, `docs/reference/output-contracts-failure-evidence-and-recovery.md`
 
 The proposal requires at most one same-session repair turn for eligible output-contract failures. The implementation has fixture/domain support and lease scaffolding, but production providers are classified as advisory-only and the engine fails closed rather than dispatching repair. This is a safer partial state, but it is not the accepted P079 behavior.
 
 ### REL-002: Transcript/provider-envelope recovery never accepts recovered output
 
-Severity: Major  
-Track: Conformance  
+Severity: Major
+Track: Conformance
 Files: `control-plane/crates/engine/src/executor.rs`, `docs/reference/output-contracts-failure-evidence-and-recovery.md`
 
 P079 requires recovery of contract-valid output already present in the current invocation transcript/provider envelope when transport-allocated attribution proves ownership. The current implementation records bounded unavailable evidence and returns `unattributable_envelope`; docs state accepted recovery remains deferred. This is a direct missing goal.
 
 ### REL-003: Controlled provider fallback dispatch and frozen policy binding are missing
 
-Severity: Major  
-Track: Conformance  
+Severity: Major
+Track: Conformance
 Files: `control-plane/crates/domain/src/output_contract_repair.rs`, `control-plane/crates/db/src/repos/output_contract_repair.rs`, `control-plane/crates/engine/src/executor.rs`, `docs/reference/output-contracts-failure-evidence-and-recovery.md`
 
 P079 requires one controlled fallback attempt from a frozen fallback policy. Domain types, DB fields, and fallback packet structures exist, but the engine does not parse frozen `output_repair_policies`, does not dispatch fallback, and persists no active `provider_fallback_json` for the attempted repair path. This is schema scaffolding without the required behavior.
 
 ### API-001: Readback parity is incomplete and unverified
 
-Severity: Major  
-Track: Readiness  
+Severity: Major
+Track: Readiness
 Files: `control-plane/crates/graphql-server/src/schema.rs`, `control-plane/crates/mcp-server/src/tools/reports.rs`, `Chainworks Forge/Engine/Readback/OutputContractRepair/OutputContractRepairEvidence.swift`, `Chainworks Forge/Engine/Readback/OutputContractRepair/OutputContractRepairPresenter.swift`
 
 The Swift DTO and presenter exist and use stable identity, closed enums, and optional parent decode helpers. However, no `p079-swift-readback` gate exists, no decode tests were found under `Chainworks Forge/Tests/Engine/Readback/`, and the GraphQL/MCP report files are conflicted. The proposal's compiled DTO/decode-test requirement is therefore not met.
 
 ### UI-001: Required macOS operator diagnostic surface is deferred
 
-Severity: Major  
-Track: Conformance / Readiness  
+Severity: Major
+Track: Conformance / Readiness
 Files: `Chainworks Forge/Engine/Readback/OutputContractRepair/OutputContractRepairPresenter.swift`, `docs/reference/output-contracts-failure-evidence-and-recovery.md`
 
 The proposal requires passive read-only operator diagnostics in the macOS shell, including progress chips, grouping, unknown diagnostic states, accessibility labels, copy behavior, stale projection handling, and notification affordances. Only DTO/presenter infrastructure was found; reference docs still list the macOS inspector UI as deferred.
 
 ### OPS-002: Rollout evidence is placeholder-heavy and required reference docs are missing
 
-Severity: Major  
-Track: Readiness  
+Severity: Major
+Track: Readiness
 Files: `docs/evidence/rollout-contract/p079/**`, `docs/reference/`
 
 The rollout-contract directory contains many P079 fixture files, but numerous files still include `placeholder_fixture_kind`, including Swift DTO fixtures, fallback packet fixtures, metric-label fixtures, repair prompt fixtures, permission fixtures, and recovery/idempotency fixtures. The required reference docs `p079-repair-prompt-template.md`, `p079-recovery-attribution.md`, and `p079-adapter-idempotency.md` are not present.
 
 ### OPS-003: P079 metrics are not implemented
 
-Severity: Major  
-Track: Conformance / Readiness  
+Severity: Major
+Track: Conformance / Readiness
 Files: `docs/evidence/rollout-contract/p079/negative/metric-label-cardinality-violation.json`, `docs/evidence/rollout-contract/p079/negative/metric-label-enum-drift-rejected.json`
 
 The proposal requires a concrete metric inventory with bounded labels and no sensitive/high-cardinality values. I found placeholder metric fixtures but no active P079 metric emission or gate evidence. This leaves rollout monitoring and production safety unproven.
 
 ### SEC-001: Security pass cannot be conclusive on a conflicted public-ingress/auth tree
 
-Severity: Major  
-Track: Readiness  
+Severity: Major
+Track: Readiness
 Files: `control-plane/crates/auth/src/lib.rs`, `control-plane/crates/graphql-server/src/schema.rs`, `control-plane/crates/mcp-server/src/server.rs`, `control-plane/crates/mcp-server/src/tools/*.rs`, `control-plane/crates/engine/src/executor.rs`
 
 P079 is security-sensitive: it handles untrusted provider content, permission requests, filesystem materialization, redaction, principal binding, public MCP/GraphQL readback, and subprocess recovery/fallback behavior. The production fail-closed posture is the correct safe default for advisory providers, but unresolved conflicts in auth and public ingress prevent a conclusive security review or readiness approval.

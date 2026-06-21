@@ -1,7 +1,7 @@
 {
   "fixture_id": "pre-p083-store-launches-with-projection-only-container",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "swift_swiftdata_lifecycle_contract_v1",
   "description": "Before P083 enforcement, the app store initializes using a projection-only ModelContainer that does not expose mutable lifecycle ModelContext.",
   "preconditions": {

@@ -1,7 +1,7 @@
 {
   "fixture_id": "logout-system-shutdown-delegate-invoked",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "shutdown_lifecycle_contract_v1",
   "description": "System logout or shutdown triggers the AppKit delegate path, ensuring the graceful shutdown protocol is invoked with a host budget.",
   "preconditions": {

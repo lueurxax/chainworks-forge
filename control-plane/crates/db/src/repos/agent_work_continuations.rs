@@ -100,9 +100,9 @@ pub struct P086ContinuationMetricsSummary {
 }
 
 const SELECT_COLS: &str = r#"
-    id, run_id, stage_execution_id, agent_execution_id,
+    id, run_id, stage_execution_id, agent_execution_id, command_journal_id,
     mode, trigger_kind, status,
-    failure_reason, reconciliation_status,
+    failure_reason, reconciliation_status, resurrection_phase,
     idempotency_scope, idempotency_key, request_fingerprint_sha256,
     canonical_request_artifact_id,
     attach_receipt_artifact_id,
@@ -124,11 +124,13 @@ fn row_to_record(r: &sqlx::sqlite::SqliteRow) -> ContinuationRecord {
         run_id: r.get("run_id"),
         stage_execution_id: r.get("stage_execution_id"),
         agent_execution_id: r.get("agent_execution_id"),
+        command_journal_id: r.get("command_journal_id"),
         mode: r.get("mode"),
         trigger_kind: r.get("trigger_kind"),
         status: r.get("status"),
         failure_reason: r.get("failure_reason"),
         reconciliation_status: r.get("reconciliation_status"),
+        resurrection_phase: r.get("resurrection_phase"),
         idempotency_scope: r.get("idempotency_scope"),
         idempotency_key: r.get("idempotency_key"),
         request_fingerprint_sha256: r.get("request_fingerprint_sha256"),
@@ -1101,10 +1103,14 @@ pub async fn admit_continuation_atomic(
           lead_decision_artifact_id, lead_decision_artifact_sha256,
           continuation_instruction_sha256,
           budget_json,
-          created_at, updated_at)
+          created_at, updated_at,
+          resurrection_phase, resurrection_deadline_at, resurrection_last_heartbeat_at)
          VALUES
          (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'accepted', ?8, ?9, ?10, 0,
-          ?11, ?12, ?13, ?14, ?15, ?15)",
+          ?11, ?12, ?13, ?14, ?15, ?15,
+          CASE WHEN ?6 = 'provider_session_resurrection' THEN 'admitted' ELSE NULL END,
+          CASE WHEN ?6 = 'provider_session_resurrection' THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+300 seconds') ELSE NULL END,
+          CASE WHEN ?6 = 'provider_session_resurrection' THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE NULL END)",
     )
     .bind(&admission.continuation_id)
     .bind(&admission.run_id)
@@ -1277,6 +1283,41 @@ pub async fn insert_side_effect_ledger_row(
     .execute(pool)
     .await
     .context("insert side-effect ledger row")?;
+    Ok(rows.rows_affected())
+}
+
+/// P086: advance the provider-session resurrection phase and heartbeat.
+/// Terminal phases must clear the active deadline to satisfy the DB invariant.
+pub async fn update_resurrection_phase(
+    pool: &SqlitePool,
+    continuation_id: &str,
+    phase: &str,
+    timeout_class: Option<&str>,
+) -> Result<u64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let deadline = if matches!(phase, "completed" | "failed_closed") {
+        None
+    } else {
+        Some((chrono::Utc::now() + chrono::Duration::seconds(300)).to_rfc3339())
+    };
+    let rows = sqlx::query(
+        "UPDATE agent_work_continuations
+         SET resurrection_phase = ?,
+             resurrection_deadline_at = ?,
+             resurrection_last_heartbeat_at = ?,
+             resurrection_timeout_class = ?,
+             updated_at = ?
+         WHERE id = ? AND mode = 'provider_session_resurrection'",
+    )
+    .bind(phase)
+    .bind(deadline)
+    .bind(&now)
+    .bind(timeout_class)
+    .bind(&now)
+    .bind(continuation_id)
+    .execute(pool)
+    .await
+    .context("update_resurrection_phase")?;
     Ok(rows.rows_affected())
 }
 

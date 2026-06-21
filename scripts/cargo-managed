@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Run Cargo under the Chainworks shared cache policy.
+#
+# External agents should prefer this wrapper over raw `cargo` so ad-hoc
+# `CARGO_TARGET_DIR=target/...` invocations are remapped into the bounded
+# shared cache and sccache is enabled when available.
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CHAINWORKS_CARGO_CACHE_REPO_ROOT="$ROOT_DIR"
+# shellcheck source=scripts/cargo-cache-env.sh
+source "$ROOT_DIR/scripts/cargo-cache-env.sh"
+
+if [[ "${1:-}" == "--print-env" ]]; then
+    printf 'CARGO_TARGET_DIR=%s\n' "${CARGO_TARGET_DIR:-}"
+    printf 'CHAINWORKS_SHARED_CARGO_TARGET_DIR=%s\n' "${CHAINWORKS_SHARED_CARGO_TARGET_DIR:-}"
+    printf 'CHAINWORKS_GATE_CARGO_TARGET_ROOT=%s\n' "${CHAINWORKS_GATE_CARGO_TARGET_ROOT:-}"
+    printf 'CHAINWORKS_CARGO_WRAPPER_DIR=%s\n' "${CHAINWORKS_CARGO_WRAPPER_DIR:-}"
+    printf 'CHAINWORKS_REAL_CARGO=%s\n' "${CHAINWORKS_REAL_CARGO:-}"
+    printf 'RUSTC_WRAPPER=%s\n' "${RUSTC_WRAPPER:-}"
+    printf 'SCCACHE_DIR=%s\n' "${SCCACHE_DIR:-}"
+    exit 0
+fi
+
+exec cargo "$@"

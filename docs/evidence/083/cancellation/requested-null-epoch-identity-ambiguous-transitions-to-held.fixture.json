@@ -1,7 +1,7 @@
 {
   "fixture_id": "requested-null-epoch-identity-ambiguous-transitions-to-held",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "cancellation_identity_contract_v1",
   "description": "A cancellation request where the epoch is null (identity cannot be determined) transitions the run to held_identity_ambiguous rather than proceeding.",
   "preconditions": {

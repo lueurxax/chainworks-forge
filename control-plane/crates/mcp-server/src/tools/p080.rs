@@ -16,6 +16,213 @@ use sqlx::SqlitePool;
 
 use crate::protocol::McpTool;
 
+const P080_STALE_CLASS_ENUM: &[&str] = &[
+    "warmup_pending",
+    "acp_startup_stale",
+    "scheduler_ownership_drift",
+    "acp_prompt_stale",
+    "helper_orphan_drift",
+    "release_side_effect_drift",
+    "ambiguous_owner",
+    "useful",
+    "unknown",
+];
+
+const P080_HOLD_REASON_ENUM: &[&str] = &[
+    "none",
+    "cooldown_active",
+    "permanent_hold_active",
+    "ambiguous_owner",
+    "side_effect_drift_unsafe",
+    "dependency_read_failure",
+    "gateway_saturated",
+    "live_disable",
+    "warmup_pending",
+    "rollout_disabled",
+    "unknown",
+];
+
+const P080_ERROR_CODE_ENUM: &[&str] = &[
+    "action_disabled_in_phase",
+    "array_length_exceeded",
+    "canonicalization_budget_exceeded",
+    "class_disabled",
+    "duplicate_key",
+    "enumeration_budget_exceeded",
+    "idempotency_conflict",
+    "internal_error",
+    "invalid_cursor",
+    "invalid_dedup_key",
+    "invalid_field",
+    "json_depth_exceeded",
+    "live_disabled",
+    "operator_message_too_large",
+    "permanent_hold_active",
+    "predicate_revalidation_failed",
+    "request_too_large",
+    "rollout_disabled",
+    "side_effect_unsafe",
+    "string_too_large",
+    "unauthenticated",
+    "unauthorized_missing_capability",
+    "unsupported_version",
+    "version_mismatch",
+];
+
+fn p080_readback_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "required": [
+            "schema_version", "run_id", "stage_id", "work_item_id", "stale_class",
+            "running_truth", "repair_action", "hold_reason", "projection_updated_at",
+            "projection_integrity", "executor_reregistration_state", "rollout_disablement",
+            "side_effect_status", "operator_message", "evidence_marker_hash",
+            "repair_idempotency_key"
+        ],
+        "additionalProperties": false,
+        "properties": {
+            "schema_version": { "type": "string", "enum": ["p080_readback_v1"] },
+            "run_id": { "type": "string" },
+            "stage_id": { "type": "string" },
+            "work_item_id": { "type": "string" },
+            "stale_class": { "type": "string", "enum": P080_STALE_CLASS_ENUM },
+            "running_truth": {
+                "type": "string",
+                "enum": ["useful", "warmup_pending", "stale_suspected", "needs_operator", "needs_effect_reconciliation", "stale_repaired", "unknown"]
+            },
+            "repair_action": {
+                "type": "string",
+                "enum": ["none", "diagnose_only", "acp_session_reset", "scheduler_lease_reclaim", "helper_reap", "delegated_to_p037", "delegated_to_p076", "hold", "clear_permanent_hold"]
+            },
+            "hold_reason": { "type": "string", "enum": P080_HOLD_REASON_ENUM },
+            "hold_age_seconds": { "type": ["integer", "null"], "minimum": 0 },
+            "next_retry_or_backoff_time": { "type": ["string", "null"] },
+            "projection_updated_at": { "type": "string" },
+            "projection_integrity": { "type": "string", "enum": ["valid", "stale", "tamper_detected"] },
+            "executor_reregistration_state": { "type": "string", "enum": ["expected", "seen", "missing", "stale", "recovered"] },
+            "rollout_disablement": { "type": "string", "enum": ["none", "phase_not_reached", "class_disabled", "live_disabled"] },
+            "side_effect_status": { "type": "string", "enum": ["not_applicable", "retry_safe", "unsafe", "unknown"] },
+            "operator_message": { "type": "string" },
+            "evidence_marker_hash": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+            "repair_idempotency_key": { "type": ["string", "null"], "pattern": "^p080-rik-[0-9a-f]{24}$" }
+        }
+    })
+}
+
+fn p080_error_response_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["schema_version", "code", "message", "detail"],
+        "additionalProperties": false,
+        "properties": {
+            "schema_version": { "type": "string", "enum": ["p080_error_response_v1"] },
+            "code": { "type": "string", "enum": P080_ERROR_CODE_ENUM },
+            "message": { "type": "string" },
+            "detail": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "accepted_schema_versions": { "type": "array", "items": { "type": "string" } },
+                    "current_phase": { "type": "string" },
+                    "cursor_reason": { "type": "string", "enum": ["expired", "version_mismatch", "malformed", "filter_changed", "projection_generation_mismatch"] },
+                    "field_path": { "type": "string" },
+                    "limit": { "type": "integer" },
+                    "observed": { "type": ["integer", "null"] },
+                    "reason": { "type": "string" },
+                    "requested_action": { "type": "string", "enum": ["diagnose_only", "repair_if_safe", "hold"] },
+                    "requested_schema_version": { "type": ["string", "null"] },
+                    "required_capability": { "type": "string" },
+                    "retry_after": { "type": ["integer", "null"] },
+                    "rollout_disablement": { "type": "string", "enum": ["phase_not_reached", "class_disabled", "live_disabled"] }
+                }
+            }
+        }
+    })
+}
+
+fn p080_diagnostics_output_schema() -> serde_json::Value {
+    serde_json::json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "required": ["schema_version", "items", "page_info", "projection_integrity"],
+                "additionalProperties": false,
+                "properties": {
+                    "schema_version": { "type": "string", "enum": ["p080_diagnostics_get_response_v1"] },
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["readback", "last_repair_event_id", "last_event_at", "recurrence_epoch"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "readback": p080_readback_schema(),
+                                "last_repair_event_id": { "type": ["string", "null"] },
+                                "last_event_at": { "type": ["string", "null"] },
+                                "recurrence_epoch": { "type": "integer" }
+                            }
+                        }
+                    },
+                    "page_info": {
+                        "type": "object",
+                        "required": ["next_cursor", "cursor_version", "cursor_expires_at", "has_next_page", "total_count_exact"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "next_cursor": { "type": ["string", "null"] },
+                            "cursor_version": { "type": "integer", "enum": [1] },
+                            "cursor_expires_at": { "type": ["string", "null"] },
+                            "has_next_page": { "type": "boolean" },
+                            "total_count_exact": { "type": ["integer", "null"] }
+                        }
+                    },
+                    "projection_integrity": { "type": "string", "enum": ["valid", "stale", "tamper_detected"] }
+                }
+            },
+            p080_error_response_schema()
+        ]
+    })
+}
+
+fn p080_reconcile_output_schema() -> serde_json::Value {
+    serde_json::json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "required": ["schema_version", "decision", "event_id", "operator_message", "readback"],
+                "additionalProperties": false,
+                "properties": {
+                    "schema_version": { "type": "string", "enum": ["p080_reconcile_response_v1"] },
+                    "decision": { "type": "string", "enum": ["diagnosed", "repaired", "race_aborted", "held", "delegated", "cleared"] },
+                    "event_id": { "type": ["string", "null"] },
+                    "operator_message": { "type": "string" },
+                    "readback": p080_readback_schema()
+                }
+            },
+            p080_error_response_schema()
+        ]
+    })
+}
+
+fn p080_clear_permanent_hold_output_schema() -> serde_json::Value {
+    serde_json::json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "required": ["schema_version", "decision", "event_id", "operator_message", "readback"],
+                "additionalProperties": false,
+                "properties": {
+                    "schema_version": { "type": "string", "enum": ["p080_clear_permanent_hold_response_v1"] },
+                    "decision": { "type": "string", "enum": ["cleared", "race_aborted"] },
+                    "event_id": { "type": ["string", "null"] },
+                    "operator_message": { "type": "string" },
+                    "readback": p080_readback_schema()
+                }
+            },
+            p080_error_response_schema()
+        ]
+    })
+}
+
 pub fn tool_specs() -> Vec<McpTool> {
     vec![
         McpTool {
@@ -40,8 +247,8 @@ pub fn tool_specs() -> Vec<McpTool> {
                             "run_id":        { "type": ["string", "null"] },
                             "stage_id":      { "type": ["string", "null"] },
                             "work_item_id":  { "type": ["string", "null"] },
-                            "stale_class":   { "type": ["string", "null"] },
-                            "hold_reason":   { "type": ["string", "null"] },
+                            "stale_class":   { "type": ["string", "null"], "enum": [null, "warmup_pending", "acp_startup_stale", "scheduler_ownership_drift", "acp_prompt_stale", "helper_orphan_drift", "release_side_effect_drift", "ambiguous_owner", "useful", "unknown"] },
+                            "hold_reason":   { "type": ["string", "null"], "enum": [null, "none", "cooldown_active", "permanent_hold_active", "ambiguous_owner", "side_effect_drift_unsafe", "dependency_read_failure", "gateway_saturated", "live_disable", "warmup_pending", "rollout_disabled", "unknown"] },
                             "include_recent_repaired": { "type": "boolean" }
                         }
                     },
@@ -61,7 +268,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
-            output_schema: None,
+            output_schema: Some(p080_diagnostics_output_schema()),
         },
         McpTool {
             name: "p080.reconcile.request.v1".to_string(),
@@ -87,7 +294,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                             "run_id":       { "type": "string" },
                             "stage_id":     { "type": "string" },
                             "work_item_id": { "type": "string" },
-                            "stale_class":  { "type": "string" }
+                            "stale_class":  { "type": "string", "enum": P080_STALE_CLASS_ENUM }
                         }
                     },
                     "requested_action": {
@@ -110,7 +317,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
-            output_schema: None,
+            output_schema: Some(p080_reconcile_output_schema()),
         },
         McpTool {
             name: "p080.clear_permanent_hold.v1".to_string(),
@@ -135,7 +342,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                             "run_id":       { "type": "string" },
                             "stage_id":     { "type": "string" },
                             "work_item_id": { "type": "string" },
-                            "stale_class":  { "type": "string" }
+                            "stale_class":  { "type": "string", "enum": P080_STALE_CLASS_ENUM }
                         }
                     },
                     "operator_request_dedup_key": {
@@ -148,7 +355,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
-            output_schema: None,
+            output_schema: Some(p080_clear_permanent_hold_output_schema()),
         },
     ]
 }
@@ -941,37 +1148,321 @@ async fn handle_reconcile_request(
             ));
         }
 
-        // Audit defect 1 fix: determine the disablement reason from rollout state
-        // instead of returning the non-vocabulary action_disabled_in_phase code.
-        // Proposal line 610 requires class_disabled / live_disabled / rollout_disabled
-        // with rollout_disablement detail.
-        //   class_disabled  = the specific stale class row has enabled=false
-        //   rollout_disabled = class is enabled but the repair phase has not been reached
-        // Proposal §6.2 (line 311): rollout_disablement must be from the closed
-        // enum {none, phase_not_reached, class_disabled, live_disabled}.
-        // Error code mirrors the disablement: class_disabled → "class_disabled",
-        // phase mismatch → "rollout_disabled" with rollout_disablement=phase_not_reached.
-        let (error_code, disablement_detail) =
-            match db::repos::p080::get_rollout_control(pool, "acp_startup_stale").await {
-                Ok(Some(row)) if !row.enabled => ("class_disabled", "class_disabled"),
-                Ok(Some(_)) => ("rollout_disabled", "phase_not_reached"),
-                Ok(None) => ("rollout_disabled", "phase_not_reached"),
-                Err(_) => ("rollout_disabled", "phase_not_reached"),
+        let target = &params["target"];
+        let run_id = match target["run_id"].as_str().and_then(|s| sanitize_identifier(s)) {
+            Some(s) => s,
+            None => {
+                return Ok(p080_error_detail(
+                    "invalid_field",
+                    "target.run_id is required, must be non-empty, <= 256 bytes, and contain no control characters",
+                    serde_json::json!({"field_path": "target.run_id"}),
+                    None,
+                ))
+            }
+        };
+        let stage_id = match target["stage_id"].as_str().and_then(|s| sanitize_identifier(s)) {
+            Some(s) => s,
+            None => return Ok(p080_error_detail(
+                "invalid_field",
+                "target.stage_id is required, must be non-empty, <= 256 bytes, and contain no control characters",
+                serde_json::json!({"field_path": "target.stage_id"}),
+                None,
+            )),
+        };
+        let work_item_id = match target["work_item_id"]
+            .as_str()
+            .and_then(|s| sanitize_identifier(s))
+        {
+            Some(s) => s,
+            None => {
+                return Ok(p080_error_detail(
+                    "invalid_field",
+                    "target.work_item_id is required, must be non-empty, <= 256 bytes, and contain no control characters",
+                    serde_json::json!({"field_path": "target.work_item_id"}),
+                    None,
+                ))
+            }
+        };
+        let stale_class = match target["stale_class"].as_str() {
+            Some("acp_startup_stale") => "acp_startup_stale",
+            Some(_) => {
+                return Ok(p080_error_detail(
+                    "rollout_disabled",
+                    "repair_if_safe currently supports only acp_startup_stale; other classes remain fail-closed",
+                    serde_json::json!({
+                        "rollout_disablement": "class_disabled",
+                        "requested_action": "repair_if_safe"
+                    }),
+                    None,
+                ))
+            }
+            None => {
+                return Ok(p080_error_detail(
+                    "invalid_field",
+                    "target.stale_class is required",
+                    serde_json::json!({"field_path": "target.stale_class"}),
+                    None,
+                ))
+            }
+        };
+        let dedup_key = match params["operator_request_dedup_key"]
+            .as_str()
+            .and_then(sanitize_identifier)
+        {
+            Some(s) => s,
+            None => {
+                return Ok(p080_error_detail(
+                    "invalid_dedup_key",
+                    "operator_request_dedup_key is required for repair_if_safe",
+                    serde_json::json!({
+                        "field_path": "operator_request_dedup_key",
+                        "requested_action": "repair_if_safe"
+                    }),
+                    None,
+                ))
+            }
+        };
+
+        let rollout = db::repos::p080::get_rollout_control(pool, stale_class).await;
+        let rollout = match rollout {
+            Ok(Some(row)) => row,
+            Ok(None) | Err(_) => {
+                return Ok(p080_error_detail(
+                    "rollout_disabled",
+                    "repair_if_safe rollout row is missing or unreadable",
+                    serde_json::json!({
+                        "rollout_disablement": "phase_not_reached",
+                        "requested_action": "repair_if_safe"
+                    }),
+                    None,
+                ))
+            }
+        };
+        if !rollout.enabled {
+            return Ok(p080_error_detail(
+                "class_disabled",
+                "repair_if_safe is disabled for acp_startup_stale",
+                serde_json::json!({
+                    "rollout_disablement": "class_disabled",
+                    "requested_action": "repair_if_safe"
+                }),
+                None,
+            ));
+        }
+        if !matches!(
+            rollout.phase.as_str(),
+            "phase_2" | "phase_3" | "phase_4" | "phase_5"
+        ) {
+            return Ok(p080_error_detail(
+                "rollout_disabled",
+                "repair_if_safe is not yet enabled (rollout phase not reached for this class)",
+                serde_json::json!({
+                    "rollout_disablement": "phase_not_reached",
+                    "requested_action": "repair_if_safe"
+                }),
+                None,
+            ));
+        }
+
+        let now = chrono::Utc::now();
+        let now_str = now.to_rfc3339();
+        let expires_at = (now + chrono::Duration::hours(24)).to_rfc3339();
+        let live_disable_generation =
+            match db::repos::p080::get_rollout_control(pool, "live_disable").await {
+                Ok(Some(row)) => row.generation,
+                _ => {
+                    return Ok(p080_error_detail(
+                        "live_disabled",
+                        "P080 rollout-control row (live_disable) is absent; refusing to dispatch (fail-closed)",
+                        serde_json::json!({
+                            "rollout_disablement": "live_disabled"
+                        }),
+                        None,
+                    ))
+                }
             };
-        return Ok(p080_error_detail(
-            error_code,
-            "repair_if_safe is not yet enabled (rollout phase not reached for this class)",
-            serde_json::json!({
-                "rollout_disablement": disablement_detail,
-                "requested_action": "repair_if_safe"
-            }),
-            None,
-        ));
+        let principal_class = principal.class.to_string();
+        let request_fingerprint = compute_p080_operator_request_fingerprint(
+            &run_id,
+            &stage_id,
+            &work_item_id,
+            stale_class,
+            requested_action,
+            params["operator_message"].as_str(),
+            params["expected_predicate_hash"].as_str(),
+        );
+        let repair_class_enabled_hash = compute_p080_repair_class_enabled_hash(&rollout);
+        const P080_AUTH_POLICY_GENERATION: i64 = 1;
+        const P080_SECRET_GENERATION_ID: &str = "principal-table-v1";
+
+        if let Some(entry) = db::repos::p080::get_dedup_entry(
+            pool,
+            &principal.id,
+            "p080.reconcile.request.v1",
+            &dedup_key,
+            &now_str,
+        )
+        .await?
+        {
+            let same_fence = entry.request_fingerprint == request_fingerprint
+                && entry.requested_action == requested_action
+                && entry.principal_class == principal_class
+                && entry.auth_policy_generation == P080_AUTH_POLICY_GENERATION
+                && entry.secret_generation_id == P080_SECRET_GENERATION_ID
+                && entry.rollout_phase == rollout.phase
+                && entry.repair_class_enabled_hash == repair_class_enabled_hash
+                && entry.live_disable_generation == live_disable_generation;
+            if same_fence {
+                return serde_json::from_str(&entry.response_json)
+                    .map_err(|err| anyhow::anyhow!("p080 dedup response_json invalid: {err}"));
+            }
+            return Ok(p080_error_detail(
+                "idempotency_conflict",
+                "operator_request_dedup_key was already used for a different P080 repair request or rollout/auth fence",
+                serde_json::json!({
+                    "field_path": "operator_request_dedup_key",
+                    "requested_action": "repair_if_safe",
+                    "reason": "dedup replay fence mismatch"
+                }),
+                None,
+            ));
+        }
+
+        let dedup_commit = db::repos::p080::P080OperatorDedupCommit {
+            principal_id: principal.id.clone(),
+            principal_class: principal_class.clone(),
+            tool_name: "p080.reconcile.request.v1".to_string(),
+            dedup_key: dedup_key.clone(),
+            requested_action: requested_action.to_string(),
+            rollout_phase: rollout.phase.clone(),
+            auth_policy_generation: P080_AUTH_POLICY_GENERATION,
+            secret_generation_id: P080_SECRET_GENERATION_ID.to_string(),
+            repair_class_enabled_hash: repair_class_enabled_hash.clone(),
+            live_disable_generation,
+            request_fingerprint: request_fingerprint.clone(),
+            now_str: now_str.clone(),
+            expires_at: expires_at.clone(),
+        };
+
+        let response = match db::repos::p080::repair_acp_startup_stale_requeue_invoke_agent_checked(
+            pool,
+            &run_id,
+            &stage_id,
+            &work_item_id,
+            &principal.id,
+            params["expected_predicate_hash"].as_str(),
+            Some(&dedup_commit),
+        )
+        .await?
+        {
+            db::repos::p080::P080RepairRequeueResult::Repaired(outcome) => {
+                serde_json::json!({
+                    "schema_version": "p080_reconcile_response_v1",
+                    "decision": "repaired",
+                    "event_id": outcome.event_id,
+                    "operator_message": format!("repair_if_safe accepted for {stale_class}; request fingerprint was consumed"),
+                    "readback": redact_readback(outcome.readback)
+                })
+            }
+            db::repos::p080::P080RepairRequeueResult::RaceAborted => {
+                serde_json::json!({
+                    "schema_version": "p080_reconcile_response_v1",
+                    "decision": "race_aborted",
+                    "event_id": null,
+                    "operator_message": "repair_if_safe found no stale running InvokeAgent to requeue",
+                    "readback": fallback_readback(&run_id, &stage_id, &work_item_id, stale_class)
+                })
+            }
+            db::repos::p080::P080RepairRequeueResult::PredicateRevalidationFailed {
+                expected,
+                actual,
+            } => {
+                return Ok(p080_error_detail(
+                    "predicate_revalidation_failed",
+                    "expected_predicate_hash no longer matches the current P080 stale predicate",
+                    serde_json::json!({
+                        "requested_action": "repair_if_safe",
+                        "field_path": "expected_predicate_hash",
+                        "expected_predicate_hash": expected,
+                        "actual_predicate_hash": actual
+                    }),
+                    None,
+                ));
+            }
+            db::repos::p080::P080RepairRequeueResult::DedupAlreadyReserved => {
+                if let Some(entry) = db::repos::p080::get_dedup_entry(
+                    pool,
+                    &principal.id,
+                    "p080.reconcile.request.v1",
+                    &dedup_key,
+                    &now_str,
+                )
+                .await?
+                {
+                    return serde_json::from_str(&entry.response_json).map_err(|err| {
+                        anyhow::anyhow!("p080 concurrent dedup response_json invalid: {err}")
+                    });
+                }
+                return Ok(p080_error_detail(
+                    "idempotency_conflict",
+                    "operator_request_dedup_key was reserved by another P080 repair request",
+                    serde_json::json!({
+                        "field_path": "operator_request_dedup_key",
+                        "requested_action": "repair_if_safe",
+                        "reason": "dedup reservation conflict"
+                    }),
+                    None,
+                ));
+            }
+        };
+
+        return Ok(response);
     }
 
     // All three closed-enum actions are handled above; this is unreachable
     // due to the closed-enum validation at requested_action extraction.
     unreachable!("requested_action was validated to closed enum; all arms handled")
+}
+
+fn compute_p080_operator_request_fingerprint(
+    run_id: &str,
+    stage_id: &str,
+    work_item_id: &str,
+    stale_class: &str,
+    requested_action: &str,
+    operator_message: Option<&str>,
+    expected_predicate_hash: Option<&str>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = [
+        ("schema_version", "p080_reconcile_request_v1"),
+        ("run_id", run_id),
+        ("stage_id", stage_id),
+        ("work_item_id", work_item_id),
+        ("stale_class", stale_class),
+        ("requested_action", requested_action),
+        ("operator_message", operator_message.unwrap_or("")),
+        (
+            "expected_predicate_hash",
+            expected_predicate_hash.unwrap_or(""),
+        ),
+    ]
+    .into_iter()
+    .map(|(key, value)| format!("{}:{key}:{}:{value}", key.len(), value.len()))
+    .collect::<Vec<_>>()
+    .join("\0");
+    let digest = Sha256::digest(canonical.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn compute_p080_repair_class_enabled_hash(row: &db::repos::p080::RolloutControlRow) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = format!(
+        "class:{}\0enabled:{}\0phase:{}\0generation:{}",
+        row.class, row.enabled, row.phase, row.generation
+    );
+    let digest = Sha256::digest(canonical.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 async fn handle_clear_permanent_hold(
@@ -1269,6 +1760,18 @@ fn strip_control_and_truncate(s: &str, max_bytes: usize) -> String {
         .collect()
 }
 
+fn is_valid_sha256_hex_hash(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_valid_p080_repair_idempotency_key_str(s: &str) -> bool {
+    s.starts_with("p080-rik-")
+        && s.len() == 9 + 24
+        && s[9..]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
 /// Sanitize a readback string field: strip control/bidi characters first,
 /// then redact if the normalized string looks like a secret.
 ///
@@ -1279,7 +1782,12 @@ fn strip_control_and_truncate(s: &str, max_bytes: usize) -> String {
 fn sanitize_readback_string(key: &str, s: &str) -> String {
     let max_bytes = if key == "operator_message" { 240 } else { 4096 };
     let stripped = strip_control_and_truncate(s, max_bytes);
-    if looks_like_secret(&stripped) {
+    let public_safe = match key {
+        "evidence_marker_hash" => is_valid_sha256_hex_hash(&stripped),
+        "repair_idempotency_key" => is_valid_p080_repair_idempotency_key_str(&stripped),
+        _ => false,
+    };
+    if !public_safe && looks_like_secret(&stripped) {
         return "[redacted]".to_string();
     }
     stripped
@@ -1335,11 +1843,7 @@ fn redact_readback(v: serde_json::Value) -> serde_json::Value {
     if let Some(rik) = obj.get("repair_idempotency_key") {
         if !rik.is_null() {
             if let Some(rik_str) = rik.as_str() {
-                let valid = rik_str.starts_with("p080-rik-")
-                    && rik_str.len() == 9 + 24
-                    && rik_str[9..]
-                        .chars()
-                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase());
+                let valid = is_valid_p080_repair_idempotency_key_str(rik_str);
                 if !valid {
                     return serde_json::json!({
                         "schema_version": "p080_readback_v1",
@@ -1963,6 +2467,14 @@ fn p080_error_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn p080_test_predicate_hash(run_id: &str, stage_id: &str, work_item_id: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(format!(
+            "{run_id}:{stage_id}:{work_item_id}:acp_startup_stale"
+        ));
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
 
     // ── SEC-HIGH-002: live_disable kill switch fail-closed tests ─────────────
 
@@ -2715,6 +3227,83 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn p080_diagnose_only_preserves_public_safe_hash_and_repair_key() {
+        let pool = db::pool::create_pool("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        db::repos::p080::seed_rollout_control_if_absent(&pool)
+            .await
+            .unwrap();
+        db::repos::p080::set_rollout_control(
+            &pool,
+            "detection_only",
+            true,
+            "operator_change",
+            "test",
+        )
+        .await
+        .unwrap();
+
+        let now_str = chrono::Utc::now().to_rfc3339();
+        let marker_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let repair_key = "p080-rik-0123456789abcdef01234567";
+        let readback_json = serde_json::to_string(&serde_json::json!({
+            "schema_version": "p080_readback_v1",
+            "run_id": "00000000-0000-0000-0000-000000000105",
+            "stage_id": "s-public-safe",
+            "work_item_id": "00000000-0000-0000-0000-000000000106",
+            "stale_class": "acp_startup_stale",
+            "running_truth": "stale_suspected",
+            "repair_action": "diagnose_only",
+            "hold_reason": "rollout_disabled",
+            "projection_updated_at": now_str,
+            "projection_integrity": "valid",
+            "executor_reregistration_state": "expected",
+            "operator_message": "diagnostic hash/key should remain readable",
+            "evidence_marker_hash": marker_hash,
+            "repair_idempotency_key": repair_key
+        }))
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO p080_readback_heartbeats_v1
+             (run_id, stage_id, work_item_id, stale_class, projection_generation,
+              projection_updated_at, projection_integrity, readback_json, updated_at)
+             VALUES ('00000000-0000-0000-0000-000000000105', 's-public-safe',
+                     '00000000-0000-0000-0000-000000000106', 'acp_startup_stale', 1,
+                     ?1, 'valid', ?2, ?3)",
+        )
+        .bind(&now_str)
+        .bind(&readback_json)
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let principal = auth::Principal::new("test-operator", auth::PrincipalClass::Operator);
+        let result = execute(
+            "p080.reconcile.request.v1",
+            serde_json::json!({
+                "schema_version": "p080_reconcile_request_v1",
+                "target": {
+                    "run_id": "00000000-0000-0000-0000-000000000105",
+                    "stage_id": "s-public-safe",
+                    "work_item_id": "00000000-0000-0000-0000-000000000106",
+                    "stale_class": "acp_startup_stale"
+                },
+                "requested_action": "diagnose_only"
+            }),
+            &pool,
+            &principal,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["schema_version"], "p080_reconcile_response_v1");
+        assert_eq!(result["readback"]["evidence_marker_hash"], marker_hash);
+        assert_eq!(result["readback"]["repair_idempotency_key"], repair_key);
+    }
+
     /// SEC-HIGH-001: a readback row where an allowed key holds a nested Object
     /// must return tamper_detected rather than preserving the nested structure.
     ///
@@ -3156,12 +3745,23 @@ mod tests {
     }
 
     async fn enable_rollout_class(pool: &sqlx::SqlitePool, class: &str) {
+        enable_rollout_class_with_phase(pool, class, "phase_2", 1).await;
+    }
+
+    async fn enable_rollout_class_with_phase(
+        pool: &sqlx::SqlitePool,
+        class: &str,
+        phase: &str,
+        generation: i64,
+    ) {
         sqlx::query(
             "INSERT OR REPLACE INTO p080_rollout_control_v1
              (class, enabled, phase, generation, updated_at, updated_by_principal_id, reason)
-             VALUES (?1, 1, 'phase_2', 1, '2026-01-01T00:00:00Z', 'system', 'operator_change')",
+             VALUES (?1, 1, ?2, ?3, '2026-01-01T00:00:00Z', 'system', 'operator_change')",
         )
         .bind(class)
+        .bind(phase)
+        .bind(generation)
         .execute(pool)
         .await
         .unwrap();
@@ -3201,6 +3801,83 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    async fn insert_running_invoke_agent_for_repair(
+        pool: &sqlx::SqlitePool,
+        run_id: &str,
+        stage_id: &str,
+        work_item_id: &str,
+    ) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let idea_id = format!("idea-{work_item_id}");
+        let stage_execution_id = format!("stage-exec-{work_item_id}");
+        let agent_execution_id = format!("agent-exec-{work_item_id}");
+        sqlx::query(
+            "INSERT INTO ideas (id, title, body, status, created_at)
+             VALUES (?1, 'P080 repair', 'body', 'draft', ?2)",
+        )
+        .bind(&idea_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs
+             (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at)
+             VALUES (?1, ?2, 'running', 'wf', 'Workflow', '/tmp/ws', '/tmp/artifacts', ?3)",
+        )
+        .bind(run_id)
+        .bind(&idea_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO stage_executions
+             (id, run_id, stage_id, label, status, started_at)
+             VALUES (?1, ?2, ?3, 'Stage', 'running', ?4)",
+        )
+        .bind(&stage_execution_id)
+        .bind(run_id)
+        .bind(stage_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_executions
+             (id, stage_execution_id, agent_id, provider, model, status, started_at)
+             VALUES (?1, ?2, 'agent', 'codex', 'model', 'running', ?3)",
+        )
+        .bind(&agent_execution_id)
+        .bind(&stage_execution_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO work_items
+             (id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, started_at)
+             VALUES (?1, 'invoke_agent', ?2, 'running', ?3, ?4, ?5, ?5, ?5)",
+        )
+        .bind(work_item_id)
+        .bind(
+            serde_json::json!({
+                "stage_execution_id": stage_execution_id,
+                "p058_claimed": {
+                    "agent_execution_id": agent_execution_id
+                }
+            })
+            .to_string(),
+        )
+        .bind(run_id)
+        .bind(stage_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+        insert_stale_readback(pool, run_id, stage_id, work_item_id).await;
     }
 
     #[tokio::test]
@@ -3378,8 +4055,9 @@ mod tests {
         );
     }
 
-    /// Phase 1: repair_if_safe returns action_disabled_in_phase even when rollout is enabled.
-    /// Operator gets action_disabled_in_phase; auth check fires before phase check.
+    /// Phase 2: repair_if_safe is admitted for acp_startup_stale once the class is enabled.
+    /// If the stale readback exists but the running InvokeAgent row is gone, the request
+    /// settles as race_aborted rather than a phase-denial.
     #[tokio::test]
     async fn p080_repair_if_safe_rollout_enabled_stale_returns_diagnosed() {
         let pool = db::pool::create_pool("sqlite::memory:")
@@ -3413,14 +4091,198 @@ mod tests {
         .await
         .unwrap();
 
-        // acp_startup_stale is enabled but repair phase not yet reached → rollout_disabled.
-        assert_eq!(result["schema_version"], "p080_error_response_v1");
-        assert_eq!(result["code"], "rollout_disabled");
-        assert_eq!(result["detail"]["rollout_disablement"], "phase_not_reached");
+        assert_eq!(result["schema_version"], "p080_reconcile_response_v1");
+        assert_eq!(result["decision"], "race_aborted");
     }
 
-    /// Phase 1: repair_if_safe consistently returns rollout_disabled on every call
-    /// when the class is enabled.  The dedup/fingerprint fence only applies in Phase 2+.
+    #[tokio::test]
+    async fn p080_repair_if_safe_phase2_requeues_acp_startup_stale() {
+        let pool = db::pool::create_pool("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        db::repos::p080::seed_rollout_control_if_absent(&pool)
+            .await
+            .unwrap();
+        enable_rollout_class(&pool, "detection_only").await;
+        sqlx::query(
+            "INSERT OR REPLACE INTO p080_rollout_control_v1
+             (class, enabled, phase, generation, updated_at, updated_by_principal_id, reason)
+             VALUES ('acp_startup_stale', 1, 'phase_2', 2, '2026-01-01T00:00:00Z', 'system', 'phase_promotion')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO ideas (id, title, body, status, created_at)
+             VALUES ('idea-p080-mcp-repair', 'P080 repair', 'body', 'draft', ?1)",
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs
+             (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at)
+             VALUES ('run-p080-mcp-repair', 'idea-p080-mcp-repair', 'running', 'wf', 'Workflow', '/tmp/ws', '/tmp/artifacts', ?1)",
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO stage_executions
+             (id, run_id, stage_id, label, status, started_at)
+             VALUES ('stage-exec-p080-mcp-repair', 'run-p080-mcp-repair', 'stage-p080-mcp-repair', 'Stage', 'running', ?1)",
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_executions
+             (id, stage_execution_id, agent_id, provider, model, status, started_at)
+             VALUES ('agent-exec-p080-mcp-repair', 'stage-exec-p080-mcp-repair', 'agent', 'codex', 'model', 'running', ?1)",
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO work_items
+             (id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, started_at)
+             VALUES ('work-p080-mcp-repair', 'invoke_agent', ?1, 'running', 'run-p080-mcp-repair', 'stage-p080-mcp-repair', ?2, ?2, ?2)",
+        )
+        .bind(
+            serde_json::json!({
+                "stage_execution_id": "stage-exec-p080-mcp-repair",
+                "p058_claimed": {
+                    "agent_execution_id": "agent-exec-p080-mcp-repair"
+                }
+            })
+            .to_string(),
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        insert_stale_readback(
+            &pool,
+            "run-p080-mcp-repair",
+            "stage-p080-mcp-repair",
+            "work-p080-mcp-repair",
+        )
+        .await;
+
+        let principal = auth::Principal::new("test-operator", auth::PrincipalClass::Operator);
+        let result = execute(
+            "p080.reconcile.request.v1",
+            serde_json::json!({
+                "schema_version": "p080_reconcile_request_v1",
+                "target": {
+                    "run_id": "run-p080-mcp-repair",
+                    "stage_id": "stage-p080-mcp-repair",
+                    "work_item_id": "work-p080-mcp-repair",
+                    "stale_class": "acp_startup_stale"
+                },
+                "requested_action": "repair_if_safe",
+                "operator_request_dedup_key": "dedup-p080-mcp-repair"
+            }),
+            &pool,
+            &principal,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["schema_version"], "p080_reconcile_response_v1");
+        assert_eq!(result["decision"], "repaired");
+        assert_eq!(result["readback"]["running_truth"], "stale_repaired");
+        assert_eq!(result["readback"]["repair_action"], "acp_session_reset");
+
+        let work_status: String =
+            sqlx::query_scalar("SELECT status FROM work_items WHERE id = 'work-p080-mcp-repair'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(work_status, "pending");
+        let agent_status: String = sqlx::query_scalar(
+            "SELECT status FROM agent_executions WHERE id = 'agent-exec-p080-mcp-repair'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(agent_status, "cancelled");
+
+        let dedup_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM p080_operator_request_dedup_v1
+             WHERE operator_request_dedup_key = 'dedup-p080-mcp-repair'
+               AND response_json LIKE '%\"decision\":\"repaired\"%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            dedup_count, 1,
+            "repair mutation and replay response must commit atomically"
+        );
+    }
+
+    #[test]
+    fn p080_tool_specs_publish_closed_input_output_error_schemas() {
+        let specs = tool_specs();
+        let mut names = std::collections::HashSet::new();
+        for spec in specs {
+            names.insert(spec.name.clone());
+            assert_eq!(
+                spec.input_schema["additionalProperties"], false,
+                "{} input schema must be closed",
+                spec.name
+            );
+            let output = spec
+                .output_schema
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} must publish output_schema", spec.name));
+            let serialized = output.to_string();
+            assert!(
+                serialized.contains("\"additionalProperties\":false"),
+                "{} output schema must contain closed envelopes",
+                spec.name
+            );
+            assert!(
+                serialized.contains("p080_error_response_v1"),
+                "{} output schema must declare the shared error envelope",
+                spec.name
+            );
+            assert!(
+                serialized.contains("p080_readback_v1"),
+                "{} output schema must declare p080_readback_v1",
+                spec.name
+            );
+            assert!(
+                serialized.contains("acp_startup_stale")
+                    && serialized.contains("scheduler_ownership_drift")
+                    && serialized.contains("helper_orphan_drift")
+                    && serialized.contains("release_side_effect_drift"),
+                "{} schemas must expose the closed stale_class vocabulary",
+                spec.name
+            );
+        }
+
+        for expected in [
+            "p080.diagnostics.get.v1",
+            "p080.reconcile.request.v1",
+            "p080.clear_permanent_hold.v1",
+        ] {
+            assert!(
+                names.contains(expected),
+                "missing P080 tool spec {expected}"
+            );
+        }
+    }
+
+    /// Phase 2: a replayed repair_if_safe request returns the originally stored
+    /// response before it can mutate the already-repaired work item again.
     #[tokio::test]
     async fn p080_repair_if_safe_dedup_replay_returns_same_response() {
         let pool = db::pool::create_pool("sqlite::memory:")
@@ -3429,9 +4291,9 @@ mod tests {
         db::repos::p080::seed_rollout_control_if_absent(&pool)
             .await
             .unwrap();
-        enable_rollout_class(&pool, "acp_startup_stale").await;
+        enable_rollout_class_with_phase(&pool, "acp_startup_stale", "phase_2", 2).await;
         enable_rollout_class(&pool, "detection_only").await;
-        insert_stale_readback(&pool, "run-p2-03", "stage-p2-03", "wi-p2-03").await;
+        insert_running_invoke_agent_for_repair(&pool, "run-p2-03", "stage-p2-03", "wi-p2-03").await;
 
         let principal = auth::Principal::new("test-operator", auth::PrincipalClass::Operator);
         let req = serde_json::json!({
@@ -3449,13 +4311,162 @@ mod tests {
         let first = execute("p080.reconcile.request.v1", req.clone(), &pool, &principal)
             .await
             .unwrap();
-        // acp_startup_stale enabled but Phase 2+ not reached → rollout_disabled.
-        assert_eq!(first["code"], "rollout_disabled");
+        assert_eq!(first["schema_version"], "p080_reconcile_response_v1");
+        assert_eq!(first["decision"], "repaired");
 
         let second = execute("p080.reconcile.request.v1", req.clone(), &pool, &principal)
             .await
             .unwrap();
-        assert_eq!(second["code"], "rollout_disabled");
+        assert_eq!(second, first);
+
+        let repaired_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM p080_reconciliation_events_v1
+             WHERE run_id='run-p2-03' AND work_item_id='wi-p2-03' AND decision='repaired'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            repaired_events, 1,
+            "dedup replay must not write a second repair event"
+        );
+    }
+
+    #[tokio::test]
+    async fn p080_repair_if_safe_dedup_conflict_returns_idempotency_conflict() {
+        let pool = db::pool::create_pool("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        db::repos::p080::seed_rollout_control_if_absent(&pool)
+            .await
+            .unwrap();
+        enable_rollout_class_with_phase(&pool, "acp_startup_stale", "phase_2", 2).await;
+        enable_rollout_class(&pool, "detection_only").await;
+        insert_running_invoke_agent_for_repair(&pool, "run-fp-01", "stage-fp-01", "wi-fp-01").await;
+        insert_running_invoke_agent_for_repair(&pool, "run-fp-02", "stage-fp-02", "wi-fp-02").await;
+
+        let principal = auth::Principal::new("test-operator", auth::PrincipalClass::Operator);
+        let dedup_key = "dedup-fp-conflict-01";
+        let first = execute(
+            "p080.reconcile.request.v1",
+            serde_json::json!({
+                "schema_version": "p080_reconcile_request_v1",
+                "target": {
+                    "run_id": "run-fp-01",
+                    "stage_id": "stage-fp-01",
+                    "work_item_id": "wi-fp-01",
+                    "stale_class": "acp_startup_stale"
+                },
+                "requested_action": "repair_if_safe",
+                "operator_request_dedup_key": dedup_key
+            }),
+            &pool,
+            &principal,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first["decision"], "repaired");
+
+        let second = execute(
+            "p080.reconcile.request.v1",
+            serde_json::json!({
+                "schema_version": "p080_reconcile_request_v1",
+                "target": {
+                    "run_id": "run-fp-02",
+                    "stage_id": "stage-fp-02",
+                    "work_item_id": "wi-fp-02",
+                    "stale_class": "acp_startup_stale"
+                },
+                "requested_action": "repair_if_safe",
+                "operator_request_dedup_key": dedup_key
+            }),
+            &pool,
+            &principal,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second["schema_version"], "p080_error_response_v1");
+        assert_eq!(second["code"], "idempotency_conflict");
+
+        let second_work_status: String =
+            sqlx::query_scalar("SELECT status FROM work_items WHERE id = 'wi-fp-02'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            second_work_status, "running",
+            "conflicting dedup key must fail before mutating the second target"
+        );
+    }
+
+    #[tokio::test]
+    async fn p080_repair_if_safe_expected_predicate_hash_mismatch_rejects_before_mutation() {
+        let pool = db::pool::create_pool("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        db::repos::p080::seed_rollout_control_if_absent(&pool)
+            .await
+            .unwrap();
+        enable_rollout_class_with_phase(&pool, "acp_startup_stale", "phase_2", 2).await;
+        enable_rollout_class(&pool, "detection_only").await;
+        insert_running_invoke_agent_for_repair(
+            &pool,
+            "run-predicate-01",
+            "stage-predicate-01",
+            "wi-predicate-01",
+        )
+        .await;
+
+        let principal = auth::Principal::new("test-operator", auth::PrincipalClass::Operator);
+        let wrong_hash = p080_test_predicate_hash(
+            "run-predicate-01",
+            "stage-predicate-01",
+            "different-work-item",
+        );
+        let result = execute(
+            "p080.reconcile.request.v1",
+            serde_json::json!({
+                "schema_version": "p080_reconcile_request_v1",
+                "target": {
+                    "run_id": "run-predicate-01",
+                    "stage_id": "stage-predicate-01",
+                    "work_item_id": "wi-predicate-01",
+                    "stale_class": "acp_startup_stale"
+                },
+                "requested_action": "repair_if_safe",
+                "operator_request_dedup_key": "dedup-predicate-mismatch-01",
+                "expected_predicate_hash": wrong_hash
+            }),
+            &pool,
+            &principal,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["schema_version"], "p080_error_response_v1");
+        assert_eq!(result["code"], "predicate_revalidation_failed");
+
+        let work_status: String =
+            sqlx::query_scalar("SELECT status FROM work_items WHERE id = 'wi-predicate-01'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            work_status, "running",
+            "stale predicate mismatch must reject before requeue mutation"
+        );
+
+        let dedup_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM p080_operator_request_dedup_v1
+             WHERE operator_request_dedup_key = 'dedup-predicate-mismatch-01'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            dedup_count, 0,
+            "failed predicate revalidation must not consume the operator dedup key"
+        );
     }
 
     /// Phase 1: repair_if_safe returns rollout_disabled before dedup/fingerprint checks
@@ -3468,7 +4479,7 @@ mod tests {
         db::repos::p080::seed_rollout_control_if_absent(&pool)
             .await
             .unwrap();
-        enable_rollout_class(&pool, "acp_startup_stale").await;
+        enable_rollout_class_with_phase(&pool, "acp_startup_stale", "phase_1", 1).await;
         enable_rollout_class(&pool, "detection_only").await;
         insert_stale_readback(&pool, "run-fp-01", "stage-fp-01", "wi-fp-01").await;
         insert_stale_readback(&pool, "run-fp-02", "stage-fp-02", "wi-fp-02").await;
@@ -3533,7 +4544,7 @@ mod tests {
         db::repos::p080::seed_rollout_control_if_absent(&pool)
             .await
             .unwrap();
-        enable_rollout_class(&pool, "acp_startup_stale").await;
+        enable_rollout_class_with_phase(&pool, "acp_startup_stale", "phase_1", 1).await;
         enable_rollout_class(&pool, "detection_only").await;
         insert_stale_readback(&pool, "run-fp-01", "stage-fp-01", "wi-fp-01").await;
         insert_stale_readback(&pool, "run-fp-02", "stage-fp-02", "wi-fp-02").await;
@@ -3595,7 +4606,7 @@ mod tests {
         let pool = db::pool::create_pool("sqlite::memory:")
             .await
             .expect("in-memory pool");
-        enable_rollout_class(&pool, "acp_startup_stale").await;
+        enable_rollout_class_with_phase(&pool, "acp_startup_stale", "phase_1", 1).await;
         enable_rollout_class(&pool, "detection_only").await;
         sqlx::query(
             "INSERT OR REPLACE INTO p080_rollout_control_v1 \

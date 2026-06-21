@@ -5,6 +5,27 @@ use domain::output_contract_repair::{
     FallbackParentLink, LeaseState, OutputContractRepairEventRow, OutputContractRepairLeaseRow,
 };
 
+fn record_transcript_recovery_metrics(transcript_recovery_json: Option<&str>) {
+    let Some(raw) = transcript_recovery_json else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return;
+    };
+    let result = value.get("result").and_then(serde_json::Value::as_str);
+    let result_subtype = value
+        .get("result_subtype")
+        .and_then(serde_json::Value::as_str);
+    if matches!(
+        result_subtype,
+        Some("oversized_payload" | "unattributable_envelope")
+    ) {
+        crate::metrics::record_p079_transcript_recovery(result_subtype.unwrap());
+    } else if let Some(result) = result {
+        crate::metrics::record_p079_transcript_recovery(result);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Repair events
 // ---------------------------------------------------------------------------
@@ -85,6 +106,11 @@ pub async fn insert_repair_event(
     .bind(&row.updated_at)
     .execute(pool)
     .await?;
+    crate::metrics::record_p079_output_repair_attempt(
+        &row.provider_family,
+        &row.initial_failure_class,
+    );
+    record_transcript_recovery_metrics(row.transcript_recovery_json.as_deref());
     Ok(())
 }
 
@@ -124,6 +150,11 @@ pub async fn update_repair_event_status(
             "output_contract_repair_events: no row found for repair_attempt_id={repair_attempt_id}"
         );
     }
+    crate::metrics::record_p079_repair_terminal(
+        status,
+        final_output_settlement,
+        recommended_next_action,
+    );
     Ok(())
 }
 
@@ -138,7 +169,7 @@ pub async fn update_repair_event_subobjects(
     fallback_budget_consumed: bool,
     updated_at: &str,
 ) -> Result<()> {
-    sqlx::query(
+    let rows_affected = sqlx::query(
         r#"
         UPDATE output_contract_repair_events
         SET same_session_repair_json = COALESCE(?, same_session_repair_json),
@@ -161,7 +192,17 @@ pub async fn update_repair_event_subobjects(
     .bind(updated_at)
     .bind(repair_attempt_id)
     .execute(pool)
-    .await?;
+    .await?
+    .rows_affected();
+    if rows_affected > 0 {
+        record_transcript_recovery_metrics(transcript_recovery_json);
+        if repair_budget_consumed {
+            crate::metrics::record_p079_repair_lease("repair", "budget_exhausted");
+        }
+        if fallback_budget_consumed {
+            crate::metrics::record_p079_repair_lease("fallback", "budget_exhausted");
+        }
+    }
     Ok(())
 }
 
@@ -595,6 +636,11 @@ pub async fn insert_repair_event_and_lease(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    crate::metrics::record_p079_output_repair_attempt(
+        &event.provider_family,
+        &event.initial_failure_class,
+    );
+    record_transcript_recovery_metrics(event.transcript_recovery_json.as_deref());
     Ok(())
 }
 
@@ -725,6 +771,12 @@ pub async fn settle_terminal_event_and_lease(
     settle_lease_tx(&mut tx, lease_key, lease_result, None, updated_at).await?;
 
     tx.commit().await?;
+    crate::metrics::record_p079_repair_terminal(
+        status,
+        final_output_settlement,
+        recommended_next_action,
+    );
+    crate::metrics::record_p079_repair_lease("repair", lease_result);
     Ok(())
 }
 
@@ -761,6 +813,7 @@ pub async fn settle_lease_pool(
     if rows_affected == 0 {
         bail!("settle_lease_pool: lease_key={lease_key} not found or already settled");
     }
+    crate::metrics::record_p079_repair_lease("repair", settled_result);
     Ok(())
 }
 
@@ -1202,6 +1255,51 @@ mod tests {
             .expect("should find event");
         assert_eq!(found.status, "recovered");
         assert_eq!(found.evidence_version, 2);
+    }
+
+    #[tokio::test]
+    async fn proposal_079_repair_repo_emits_operational_metrics() {
+        crate::metrics::reset_for_tests();
+        let pool = make_pool().await;
+        let row = sample_event_row("agent-metrics");
+        insert_repair_event(&pool, &row).await.unwrap();
+
+        update_repair_event_subobjects(
+            &pool,
+            "rep-agent-metrics",
+            None,
+            Some(r#"{"result":"unavailable","result_subtype":"oversized_payload"}"#),
+            None,
+            None,
+            true,
+            true,
+            "2026-05-30T10:00:30Z",
+        )
+        .await
+        .unwrap();
+
+        update_repair_event_status(
+            &pool,
+            "rep-agent-metrics",
+            "recovered",
+            "recovered",
+            "continue",
+            Some("valid_outputs_from_repair"),
+            "2026-05-30T10:01:00Z",
+        )
+        .await
+        .unwrap();
+
+        assert!(crate::metrics::get_counter("p079_output_repair_attempt_total") > 0);
+        assert!(crate::metrics::get_counter("p079_repair_transport_outcome_total") > 0);
+        assert!(crate::metrics::get_counter("p079_transcript_recovery_total") > 0);
+        assert!(crate::metrics::get_counter("p079_repair_budget_exhausted_total") > 0);
+        assert!(crate::metrics::get_counter("p079_fallback_budget_exhausted_total") > 0);
+        assert!(crate::metrics::get_counter("p079_recovery_bound_exceeded_total") > 0);
+        assert_eq!(
+            crate::metrics::get_gauge("p079_eligible_output_failures_recovered_percent"),
+            Some(100)
+        );
     }
 
     #[tokio::test]

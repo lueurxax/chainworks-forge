@@ -8,6 +8,7 @@ domain = { path = "../domain" }
 db = { path = "../db" }
 engine = { path = "../engine" }
 auth = { path = "../auth" }
+acp = { path = "../acp" }
 # P042 §9.3: share the `RequestId` axum Extension + middleware helpers
 # so MCP HTTP reads the same type the middleware inserts.
 graphql-server = { path = "../graphql-server" }

@@ -1,40 +1,16 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "attach_receipt_unauthenticated_rejected",
+  "fixture_purpose": "Unauthenticated callers must not read P086 attach receipts from MCP or GraphQL report surfaces.",
+  "status": "pass",
+  "evidence_kind": "contract_fixture",
+  "evidence": {
+    "surface": "MCP and GraphQL report readback",
+    "guard": "principal extraction is required before report artifact lookup",
+    "expected_rejection": "unauthenticated",
+    "readback_lane": "auth_boundary"
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "proposal-086-resurrection"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:attach_receipt_fetch_unauthenticated_rejected",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "unauthenticated_readback_rejected"
 }

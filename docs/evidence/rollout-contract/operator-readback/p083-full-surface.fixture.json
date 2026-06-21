@@ -2,7 +2,7 @@
   "fixture_purpose": "P083 rollout_contract_v1 operator readback fixture placeholder for proposal freeze. Implementation must replace with concrete same-tree run evidence before release.",
   "schema_version": "operator_readback_v1",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r64-refined-3da64326",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "source_lane": "run_report",
   "rollout_contract_status": "fail",
   "rollout_contract_decision": "hold",
@@ -36,28 +36,28 @@
   "parity_lanes": {
     "run_report": {
       "proposal_id": "P083",
-      "proposal_revision_id": "P083-r64-refined-3da64326",
+      "proposal_revision_id": "P083-r70-refined-r69-score-lift",
       "rollout_contract_status": "fail",
       "rollout_contract_decision": "hold",
       "proposalRevisionId": null
     },
     "mcp": {
       "proposal_id": "P083",
-      "proposal_revision_id": "P083-r64-refined-3da64326",
+      "proposal_revision_id": "P083-r70-refined-r69-score-lift",
       "rollout_contract_status": "fail",
       "rollout_contract_decision": "hold",
       "proposalRevisionId": null
     },
     "release_receipt": {
       "proposal_id": "P083",
-      "proposal_revision_id": "P083-r64-refined-3da64326",
+      "proposal_revision_id": "P083-r70-refined-r69-score-lift",
       "rollout_contract_status": "fail",
       "rollout_contract_decision": "hold",
       "proposalRevisionId": null
     },
     "graphql": {
       "proposalId": "P083",
-      "proposalRevisionId": "P083-r64-refined-3da64326",
+      "proposalRevisionId": "P083-r70-refined-r69-score-lift",
       "rolloutContractStatus": "fail",
       "rolloutContractDecision": "hold",
       "proposal_revision_id": null

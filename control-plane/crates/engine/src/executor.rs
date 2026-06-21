@@ -5897,6 +5897,62 @@ impl BackgroundExecutor {
         ))
     }
 
+    fn p086_redacted_resurrection_attach_receipt(raw: &serde_json::Value) -> serde_json::Value {
+        let mut redacted = raw.clone();
+        redacted["requested_provider_session_id"] =
+            serde_json::Value::String("[redacted]".to_string());
+        redacted["actual_provider_session_id"] =
+            serde_json::Value::String("[redacted]".to_string());
+        redacted["managed_child_pid"] = serde_json::Value::Null;
+        redacted["managed_process_group_id"] = serde_json::Value::Null;
+        redacted["adapter_runtime_home_realpath"] = serde_json::Value::Null;
+        redacted["adapter_runtime_home_dev_ino"] = serde_json::Value::Null;
+        redacted["session_store_transcript_path"] = serde_json::Value::Null;
+        redacted
+    }
+
+    async fn refresh_p086_resurrection_attach_receipt(
+        &self,
+        continuation_id: &str,
+        attach_receipt_artifact_id: Option<&str>,
+        raw_receipt_json: &serde_json::Value,
+        written_at: &str,
+    ) -> anyhow::Result<Option<String>> {
+        db::repos::p086_resurrection_raw_receipts::upsert(
+            &self.pool,
+            continuation_id,
+            &serde_json::to_string(raw_receipt_json)?,
+            written_at,
+        )
+        .await?;
+
+        let Some(artifact_id) = attach_receipt_artifact_id else {
+            return Ok(None);
+        };
+        let artifact_uuid = uuid::Uuid::parse_str(artifact_id)
+            .with_context(|| format!("parse P086 attach receipt artifact id {artifact_id}"))?;
+        let Some(artifact) = artifacts::find_by_id(&self.pool, artifact_uuid.into()).await? else {
+            return Ok(None);
+        };
+        let redacted = Self::p086_redacted_resurrection_attach_receipt(raw_receipt_json);
+        let bytes = serde_json::to_vec_pretty(&redacted)?;
+        let checksum = sha256_digest(&bytes);
+        std::fs::write(&artifact.file_path, &bytes).with_context(|| {
+            format!(
+                "refresh P086 resurrection attach receipt artifact {}",
+                artifact.file_path
+            )
+        })?;
+        sqlx::query("UPDATE artifacts SET checksum_sha256 = ?1, size_bytes = ?2 WHERE id = ?3")
+            .bind(&checksum)
+            .bind(bytes.len() as i64)
+            .bind(artifact_id)
+            .execute(&self.pool)
+            .await
+            .context("refresh P086 attach receipt artifact metadata")?;
+        Ok(Some(checksum))
+    }
+
     fn p086_continuation_request_context(
         continuation: &domain::continuation::ContinuationRecord,
     ) -> serde_json::Value {
@@ -5950,18 +6006,31 @@ impl BackgroundExecutor {
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(900);
         let provider_session_id = provider_session_id.unwrap_or("unknown");
+        let output_only = continuation.mode == "output_only_recovery";
+        let mode_summary = if output_only {
+            "You are recovering missing or malformed required outputs through an existing live ACP session. This is not a retry, source-editing pass, checkpoint rehydration, or fresh implementation attempt."
+        } else {
+            "You are continuing the same Chainworks agent execution through an existing live ACP session. This is not a retry, output-contract repair, or checkpoint rehydration."
+        };
+        let output_only_rule = if output_only {
+            "- Output-only recovery is active: do not edit source files. Only create or correct required output artifacts."
+        } else {
+            "- Continue from the current worktree state; do not restart the task from scratch."
+        };
 
         format!(
             "\
 # P086 Continuation Mode Reset
 
-You are continuing the same Chainworks agent execution through an existing live ACP session. This is not a retry, output-contract repair, or checkpoint rehydration.
+{mode_summary}
 
 ## Runtime identity
 - Run id: {run_id}
 - Stage execution id: {stage_execution_id}
 - Agent execution id: {agent_execution_id}
 - Continuation id: {continuation_id}
+- Request fingerprint sha256: {request_fingerprint_sha256}
+- Prompt turn marker id: p086-prompt-turn:{continuation_id}:provider_session_attach
 - Session generation id: {session_generation_id}
 - Provider session id: {provider_session_id}
 - Worktree root: {worktree_root}
@@ -5977,7 +6046,7 @@ You are continuing the same Chainworks agent execution through an existing live 
 - Maximum wall-clock seconds: {max_wall_clock_seconds}
 
 ## Safety rules
-- Continue from the current worktree state; do not restart the task from scratch.
+{output_only_rule}
 - Do not commit, push, release, publish, upload, or perform external side effects.
 - Do not overwrite settled output truth unless the current continuation explicitly produces fresher evidence.
 - If there is no concrete implementation progress to make, stop and report no progress with evidence.
@@ -5986,14 +6055,96 @@ You are continuing the same Chainworks agent execution through an existing live 
             stage_execution_id = continuation.stage_execution_id,
             agent_execution_id = continuation.agent_execution_id,
             continuation_id = continuation.id,
+            request_fingerprint_sha256 = continuation.request_fingerprint_sha256,
             session_generation_id = session_generation_id,
             provider_session_id = provider_session_id,
             worktree_root = worktree_root,
+            mode_summary = mode_summary,
             operator_instruction = operator_instruction,
             blockers_text = blockers_text,
             max_turns = max_turns,
             max_wall_clock_seconds = max_wall_clock_seconds,
+            output_only_rule = output_only_rule,
         )
+    }
+
+    fn p086_result_contains_all_correlation_terms(
+        result: &acp::ExecutionResult,
+        terms: &[&str],
+    ) -> bool {
+        let mut evidence = String::new();
+        if let Some(transcript_text) = &result.transcript_text {
+            evidence.push_str(transcript_text);
+            evidence.push('\n');
+        }
+        for artifact in &result.discovered_artifacts {
+            evidence.push_str(&String::from_utf8_lossy(&artifact.content));
+            evidence.push('\n');
+        }
+        terms.iter().all(|term| evidence.contains(term))
+    }
+
+    async fn fail_close_p086_resurrection_attach_receipt_persistence(
+        &self,
+        run: &domain::run::Run,
+        stage_id: &str,
+        provider: &str,
+        model: Option<String>,
+        continuation: &domain::continuation::ContinuationRecord,
+        session_generation_id: &str,
+        worktree_root: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let _ = self.acp.close_session(session_generation_id).await;
+        db::repos::agent_work_continuations::update_resurrection_phase(
+            &self.pool,
+            &continuation.id,
+            "failed_closed",
+            None,
+        )
+        .await?;
+        db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+            &self.pool,
+            Some(&continuation.run_id),
+            Some(&continuation.stage_execution_id),
+            Some(&continuation.agent_execution_id),
+            Some(&continuation.id),
+            "provider_session_resurrection_attach_failure_total",
+            serde_json::json!({
+                "mode": continuation.mode,
+                "failure_class": "attach_receipt_persist_failed",
+                "outcome": "failed_closed"
+            }),
+            1,
+        )
+        .await?;
+        db::repos::agent_work_continuations::update_continuation_status(
+            &self.pool,
+            &continuation.id,
+            "failed",
+            Some("attach_receipt_persist_failed"),
+        )
+        .await?;
+        if let Err(error) = self
+            .settle_p086_continuation_with_materialized_artifacts(
+                run,
+                stage_id,
+                provider,
+                model,
+                continuation,
+                "failed",
+                Some("attach_receipt_persist_failed"),
+                None,
+                worktree_root,
+            )
+            .await
+        {
+            warn!(
+                continuation_id = %continuation.id,
+                error = %error,
+                "P086 failed to materialize attach-receipt failure artifacts after fail-closed cleanup"
+            );
+        }
+        Ok(())
     }
 
     async fn persist_p086_canonical_request_artifact(
@@ -6122,17 +6273,6 @@ You are continuing the same Chainworks agent execution through an existing live 
         // tests_or_gates derive from this and would otherwise persist raw provider output.
         let transcript_text_owned = redact_runtime_message(transcript_text_raw);
         let transcript_text: &str = &transcript_text_owned;
-        let response_fingerprint = p086_continuation_response_hash(
-            &continuation.id,
-            terminal_status,
-            failure_reason.or_else(|| {
-                if transcript_text.is_empty() {
-                    None
-                } else {
-                    Some("provider_transcript_captured")
-                }
-            }),
-        );
         let created_at = chrono::Utc::now().to_rfc3339();
 
         let worktree_readback = Self::p086_worktree_readback(worktree_root);
@@ -6140,6 +6280,31 @@ You are continuing the same Chainworks agent execution through an existing live 
             .as_array()
             .cloned()
             .unwrap_or_default();
+        let output_only_changed_source_files =
+            Self::p086_output_only_changed_source_files(&changed_files);
+        let output_only_source_edit_violation = continuation.mode == "output_only_recovery"
+            && !output_only_changed_source_files.is_empty();
+        let effective_terminal_status = if output_only_source_edit_violation {
+            "failed"
+        } else {
+            terminal_status
+        };
+        let effective_failure_reason = if output_only_source_edit_violation {
+            Some("output_only_source_edit_violation")
+        } else {
+            failure_reason
+        };
+        let response_fingerprint = p086_continuation_response_hash(
+            &continuation.id,
+            effective_terminal_status,
+            effective_failure_reason.or_else(|| {
+                if transcript_text.is_empty() {
+                    None
+                } else {
+                    Some("provider_transcript_captured")
+                }
+            }),
+        );
         let tests_or_gates = Self::p086_extract_test_gate_lines(transcript_text);
 
         let worktree_readback_json = serde_json::json!({
@@ -6180,13 +6345,18 @@ You are continuing the same Chainworks agent execution through an existing live 
             "redaction_tier": "partial",
             "retention_policy": "retain_with_run",
             "payload": {
-                "terminal_status": terminal_status,
-                "failure_reason": failure_reason,
+                "terminal_status": effective_terminal_status,
+                "failure_reason": effective_failure_reason,
                 "provider_status": provider_result.map(|result| result.status.to_string()),
                 "reused_existing_session": provider_result.map(|result| result.reused_existing_session).unwrap_or(false),
                 "session_generation_id": provider_result.and_then(|result| result.session_generation_id.clone()).or_else(|| continuation.budget_json.as_deref().and_then(|_| None)),
                 "provider_session_id": provider_result.and_then(|result| result.provider_session_id.clone()),
                 "changed_files": changed_files,
+                "output_only": continuation.mode == "output_only_recovery",
+                "source_edit_allowance": continuation.mode != "output_only_recovery",
+                "changed_source_files": output_only_changed_source_files,
+                "changed_source_files_count": output_only_changed_source_files.len(),
+                "output_only_source_edit_violation": output_only_source_edit_violation,
                 "tests_or_gates": tests_or_gates,
                 "transcript_bytes": transcript_text.as_bytes().len(),
                 "transcript_sha256": if transcript_text.is_empty() { None } else { Some(sha256_digest(transcript_text.as_bytes())) },
@@ -6211,7 +6381,7 @@ You are continuing the same Chainworks agent execution through an existing live 
         let response_artifact_uuid = domain::ids::ArtifactId::new();
         let response_artifact_id = response_artifact_uuid.to_string();
         let response_payload = serde_json::json!({
-            "status": terminal_status,
+            "status": effective_terminal_status,
             "lifecycle_status": "terminal",
             "response_fingerprint_sha256": response_fingerprint,
             "response_artifact_id": response_artifact_id,
@@ -6254,7 +6424,7 @@ You are continuing the same Chainworks agent execution through an existing live 
             .await?;
 
         let (result_name, result_contract, result_kind, result_payload) =
-            if terminal_status == "succeeded" {
+            if effective_terminal_status == "succeeded" {
                 (
                     "continuation_result",
                     "continuation_result_v1",
@@ -6262,6 +6432,9 @@ You are continuing the same Chainworks agent execution through an existing live 
                     serde_json::json!({
                         "summary": "P086 continuation settled as succeeded",
                         "changed_files": changed_files,
+                        "changed_source_files": output_only_changed_source_files,
+                        "changed_source_files_count": output_only_changed_source_files.len(),
+                        "output_only_source_edit_violation": output_only_source_edit_violation,
                         "tests_or_gates": Self::p086_extract_test_gate_lines(transcript_text),
                         "response_fingerprint_sha256": response_fingerprint,
                         "provider_transcript_artifact_ids": [response_artifact_id]
@@ -6273,9 +6446,12 @@ You are continuing the same Chainworks agent execution through an existing live 
                     "continuation_no_progress_report_v1",
                     "continuation_no_progress_report",
                     serde_json::json!({
-                        "no_progress_reason": "other",
-                        "evidence": [failure_reason.unwrap_or("provider_incomplete")],
+                        "no_progress_reason": effective_failure_reason.unwrap_or("provider_incomplete"),
+                        "evidence": [effective_failure_reason.unwrap_or("provider_incomplete")],
                         "budget_spent": {"wall_clock_seconds": 0},
+                        "changed_source_files": output_only_changed_source_files,
+                        "changed_source_files_count": output_only_changed_source_files.len(),
+                        "output_only_source_edit_violation": output_only_source_edit_violation,
                         "response_fingerprint_sha256": response_fingerprint,
                         "provider_transcript_artifact_ids": [response_artifact_id]
                     }),
@@ -6319,8 +6495,8 @@ You are continuing the same Chainworks agent execution through an existing live 
             "redaction_tier": "partial",
             "retention_policy": "retain_with_run",
             "payload": {
-                "status": terminal_status,
-                "failure_reason": failure_reason,
+                "status": effective_terminal_status,
+                "failure_reason": effective_failure_reason,
                 "mode": continuation.mode,
                 "trigger_kind": continuation.trigger_kind,
                 "canonical_request_artifact_id": continuation.canonical_request_artifact_id,
@@ -6328,6 +6504,9 @@ You are continuing the same Chainworks agent execution through an existing live 
                 "result_or_no_progress_artifact_id": result_artifact_id,
                 "evidence_bundle_artifact_id": evidence_bundle_artifact_id,
                 "worktree_readback_artifact_id": worktree_readback_artifact_id,
+                "changed_source_files": output_only_changed_source_files,
+                "changed_source_files_count": output_only_changed_source_files.len(),
+                "output_only_source_edit_violation": output_only_source_edit_violation,
                 "response_fingerprint_sha256": response_fingerprint
             }
         });
@@ -6346,12 +6525,12 @@ You are continuing the same Chainworks agent execution through an existing live 
             )
             .await?;
 
-        let settled = if terminal_status == "cancelled" {
+        let settled = if effective_terminal_status == "cancelled" {
             db::repos::agent_work_continuations::settle_with_artifacts(
                 &self.pool,
                 &continuation.id,
-                terminal_status,
-                failure_reason,
+                effective_terminal_status,
+                effective_failure_reason,
                 &response_artifact_id,
                 &response_fingerprint,
                 &result_artifact_id,
@@ -6361,20 +6540,20 @@ You are continuing the same Chainworks agent execution through an existing live 
             db::repos::agent_work_continuations::settle_with_artifacts_unless_cancelling(
                 &self.pool,
                 &continuation.id,
-                terminal_status,
-                failure_reason,
+                effective_terminal_status,
+                effective_failure_reason,
                 &response_artifact_id,
                 &response_fingerprint,
                 &result_artifact_id,
             )
             .await?
         };
-        let mut release_reason = if terminal_status == "cancelled" {
+        let mut release_reason = if effective_terminal_status == "cancelled" {
             "cancelled"
         } else {
             "completed"
         };
-        if settled == 0 && terminal_status != "cancelled" {
+        if settled == 0 && effective_terminal_status != "cancelled" {
             let latest =
                 db::repos::agent_work_continuations::find_by_id(&self.pool, &continuation.id)
                     .await?;
@@ -6436,8 +6615,8 @@ You are continuing the same Chainworks agent execution through an existing live 
             serde_json::json!({
                 "mode": continuation.mode,
                 "trigger_kind": continuation.trigger_kind,
-                "terminal_status": if release_reason == "cancelled" { "cancelled" } else { terminal_status },
-                "failure_reason": failure_reason.unwrap_or("none")
+                "terminal_status": if release_reason == "cancelled" { "cancelled" } else { effective_terminal_status },
+                "failure_reason": effective_failure_reason.unwrap_or("none")
             }),
             1,
         )
@@ -6472,7 +6651,7 @@ You are continuing the same Chainworks agent execution through an existing live 
             serde_json::json!({
                 "mode": continuation.mode,
                 "trigger_kind": continuation.trigger_kind,
-                "terminal_status": terminal_status
+                "terminal_status": effective_terminal_status
             }),
             changed_files.len() as i64,
         )
@@ -6487,7 +6666,7 @@ You are continuing the same Chainworks agent execution through an existing live 
             serde_json::json!({
                 "mode": continuation.mode,
                 "trigger_kind": continuation.trigger_kind,
-                "terminal_status": terminal_status
+                "terminal_status": effective_terminal_status
             }),
             tests_or_gates.len() as i64,
         )
@@ -6776,6 +6955,49 @@ You are continuing the same Chainworks agent execution through an existing live 
                 "readback_failure": error.to_string()
             }),
         }
+    }
+
+    fn p086_output_only_changed_source_files(changed_files: &[serde_json::Value]) -> Vec<String> {
+        changed_files
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(Self::p086_normalize_changed_path)
+            .filter(|path| Self::p086_is_source_path(path))
+            .collect()
+    }
+
+    fn p086_normalize_changed_path(path: &str) -> String {
+        let trimmed = path.trim().trim_matches('"');
+        trimmed
+            .rsplit_once(" -> ")
+            .map(|(_, new_path)| new_path.trim().trim_matches('"').to_string())
+            .unwrap_or_else(|| trimmed.to_string())
+    }
+
+    fn p086_is_source_path(path: &str) -> bool {
+        if path.starts_with("docs/evidence/")
+            || path.starts_with("docs/proposals/")
+            || path.starts_with(".chainworks/")
+        {
+            return false;
+        }
+        let source_root = path.starts_with("control-plane/")
+            || path.starts_with("Chainworks Forge/")
+            || path.starts_with("Chainworks ForgeTests/")
+            || path.starts_with("examples/")
+            || path.starts_with("scripts/");
+        if !source_root {
+            return false;
+        }
+        Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                matches!(
+                    ext,
+                    "rs" | "swift" | "sh" | "py" | "yaml" | "yml" | "toml" | "sql"
+                )
+            })
     }
 
     fn p086_worktree_has_post_continuation_change(
@@ -7114,7 +7336,7 @@ You are continuing the same Chainworks agent execution through an existing live 
         use db::repos::agent_work_continuations::{
             claim_for_continuation_worker, find_by_id, find_continuation_execution_context,
             insert_side_effect_ledger_row, update_continuation_session, update_continuation_status,
-            ContinuationClaimOutcome,
+            update_resurrection_phase, ContinuationClaimOutcome,
         };
 
         // 1. Load the continuation row.
@@ -7262,25 +7484,51 @@ You are continuing the same Chainworks agent execution through an existing live 
             return Ok(());
         }
 
-        // 4. If the agent execution has no recorded session, we cannot continue.
-        let Some(session_generation_id) = ctx.session_generation_id else {
-            info!(
-                continuation_id,
-                "ProcessContinuation: no session_generation_id; settling no_progress"
-            );
-            self.settle_p086_continuation_with_materialized_artifacts(
-                &run,
-                &stage_id,
-                &provider,
-                model,
-                &cont,
-                "no_progress",
-                Some("no_session_generation_id"),
-                None,
-                worktree_root.as_deref().or(Some(workspace_root.as_str())),
-            )
-            .await?;
-            return Ok(());
+        // 4. Live-handle continuation needs the original runtime generation id.
+        // Provider-session resurrection owns a new attach process, then proves
+        // the requested provider session id before sending any prompt. P086 also
+        // permits output-only recovery over resurrection when the live ACP handle
+        // is already gone; output-only semantics are retained for settlement.
+        let output_only_recovery = cont.mode == "output_only_recovery";
+        let output_only_resurrection = if output_only_recovery {
+            match ctx.session_generation_id.as_deref() {
+                Some(generation_id) => {
+                    !self
+                        .acp
+                        .has_live_session(generation_id, ctx.provider_session_id.as_deref())
+                        .await
+                        && ctx.provider_session_id.is_some()
+                }
+                None => ctx.provider_session_id.is_some(),
+            }
+        } else {
+            false
+        };
+        let is_provider_session_resurrection =
+            cont.mode == "provider_session_resurrection" || output_only_resurrection;
+        let session_generation_id = if is_provider_session_resurrection {
+            format!("p086-resurrection-{}", cont.id)
+        } else {
+            let Some(session_generation_id) = ctx.session_generation_id.clone() else {
+                info!(
+                    continuation_id,
+                    "ProcessContinuation: no session_generation_id; settling no_progress"
+                );
+                self.settle_p086_continuation_with_materialized_artifacts(
+                    &run,
+                    &stage_id,
+                    &provider,
+                    model,
+                    &cont,
+                    "no_progress",
+                    Some("no_session_generation_id"),
+                    None,
+                    worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                )
+                .await?;
+                return Ok(());
+            };
+            session_generation_id
         };
 
         // 5. Atomically claim the row and register supervised-worker
@@ -7356,6 +7604,773 @@ You are continuing the same Chainworks agent execution through an existing live 
             &daemon_generation_id,
         )
         .await?;
+
+        if is_provider_session_resurrection {
+            let Some(provider_session_id) = ctx
+                .provider_session_id
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+            else {
+                update_resurrection_phase(
+                    &self.pool,
+                    continuation_id,
+                    "failed_closed",
+                    Some("attach_timeout"),
+                )
+                .await?;
+                self.settle_p086_continuation_with_materialized_artifacts(
+                    &run,
+                    &stage_id,
+                    &provider,
+                    model,
+                    &cont,
+                    "failed",
+                    Some("provider_session_id_required"),
+                    None,
+                    worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                )
+                .await?;
+                return Ok(());
+            };
+
+            update_resurrection_phase(&self.pool, continuation_id, "launching", None).await?;
+            let canonical_worktree_root =
+                worktree_root.as_deref().unwrap_or(workspace_root.as_str());
+            let attach_started_at = chrono::Utc::now().to_rfc3339();
+            let attach_result = self
+                .acp
+                .attach_provider_session_for_resurrection(acp::ExecutionRequest {
+                    agent_execution_id: None,
+                    run_id,
+                    stage_execution_id: Some(cont.stage_execution_id.clone()),
+                    stage_id: format!(
+                        "resurrection_attach_{}",
+                        &continuation_id[..8.min(continuation_id.len())]
+                    ),
+                    attempt_number: 1,
+                    agent_id: "code_writer".to_string(),
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    effort: None,
+                    workspace_root: workspace_root.clone(),
+                    prompt: String::new(),
+                    worktree_root: worktree_root.clone(),
+                    worktree_write_enabled: worktree_root.is_some(),
+                    worktree_strategy: None,
+                    expected_output_paths: Vec::new(),
+                    expected_outputs: Vec::new(),
+                    keep_session_alive: true,
+                    reuse_existing_session: false,
+                    session_generation_id: Some(session_generation_id.clone()),
+                    provider_session_id: Some(provider_session_id.clone()),
+                    provider_runtime_home: None,
+                    mcp_servers: Vec::new(),
+                    chainworks_meta_root: ctx.chainworks_meta_root.clone(),
+                    legacy_broad_discovery_policy:
+                        domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+                    xcode_shim_injection_signal: false,
+                    requires_xcode_host_execution: false,
+                    owner_kind: "stage_execution".to_string(),
+                    owner_id: Some(cont.stage_execution_id.clone()),
+                    origin_stage_id: None,
+                    origin_stage_execution_id: None,
+                    mediation_record_id: None,
+                    toolchain_home: None,
+                    toolchain_go_scope_enabled: false,
+                    p079_repair_canonical_paths: None,
+                })
+                .await;
+
+            let attach_result = match attach_result {
+                Ok(result) => result,
+                Err(err) => {
+                    let err_text = err.to_string();
+                    let failure_class = if err_text.contains("identity_mismatch") {
+                        "actual_session_mismatch"
+                    } else if err_text.contains("unsupported") {
+                        "unsupported"
+                    } else if err_text.contains("provider_session_id_required") {
+                        "expired_or_missing_session"
+                    } else if err_text.contains("auth") {
+                        "auth_failure"
+                    } else {
+                        "provider_rejected"
+                    };
+                    update_resurrection_phase(
+                        &self.pool,
+                        continuation_id,
+                        "failed_closed",
+                        Some("attach_timeout"),
+                    )
+                    .await?;
+                    db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+                        &self.pool,
+                        Some(&cont.run_id),
+                        Some(&cont.stage_execution_id),
+                        Some(&cont.agent_execution_id),
+                        Some(&cont.id),
+                        "provider_session_resurrection_attach_failure_total",
+                        serde_json::json!({
+                            "mode": cont.mode,
+                            "failure_class": failure_class,
+                            "outcome": "failed_closed"
+                        }),
+                        1,
+                    )
+                    .await?;
+                    self.settle_p086_continuation_with_materialized_artifacts(
+                        &run,
+                        &stage_id,
+                        &provider,
+                        model,
+                        &cont,
+                        "failed",
+                        Some(failure_class),
+                        None,
+                        worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            update_resurrection_phase(&self.pool, continuation_id, "attached_unprompted", None)
+                .await?;
+
+            if let (Some(child_pid), Some(process_group_id)) = (
+                attach_result.managed_child_pid,
+                attach_result.managed_process_group_id,
+            ) {
+                let process_uid = unsafe { libc::getuid() } as i64;
+                db::repos::agent_work_continuations::set_supervised_worker_provider_process(
+                    &self.pool,
+                    continuation_id,
+                    worker_pid,
+                    &daemon_generation_id,
+                    child_pid as i64,
+                    process_group_id as i64,
+                    process_uid,
+                )
+                .await?;
+            }
+
+            insert_side_effect_ledger_row(
+                &self.pool,
+                continuation_id,
+                &cont.idempotency_key,
+                "provider_session_attach",
+                0,
+                "committed",
+                Some(&cont.request_fingerprint_sha256),
+                None,
+            )
+            .await?;
+
+            let attach_completed_at = chrono::Utc::now().to_rfc3339();
+            let prompt_turn_marker_id =
+                format!("p086-prompt-turn:{continuation_id}:provider_session_attach");
+            let target_agent_execution_id = cont.agent_execution_id.clone();
+            let target_stage_execution_id = cont.stage_execution_id.clone();
+            let request_fingerprint_sha256 = cont.request_fingerprint_sha256.clone();
+            let mut raw_receipt = serde_json::Map::new();
+            raw_receipt.insert("schema_version".into(), serde_json::Value::from(2));
+            raw_receipt.insert(
+                "continuation_id".into(),
+                serde_json::Value::String(cont.id.clone()),
+            );
+            raw_receipt.insert(
+                "agent_execution_id".into(),
+                serde_json::Value::String(cont.agent_execution_id.clone()),
+            );
+            raw_receipt.insert(
+                "run_id".into(),
+                serde_json::Value::String(cont.run_id.clone()),
+            );
+            raw_receipt.insert(
+                "requested_provider_session_id".into(),
+                serde_json::Value::String(attach_result.requested_provider_session_id.clone()),
+            );
+            raw_receipt.insert(
+                "actual_provider_session_id".into(),
+                serde_json::Value::String(attach_result.actual_provider_session_id.clone()),
+            );
+            raw_receipt.insert(
+                "identity_proof_source".into(),
+                serde_json::Value::String("provider_attach_response".into()),
+            );
+            raw_receipt.insert(
+                "identity_proof_observed_at".into(),
+                serde_json::Value::String(attach_result.identity_proof_observed_at.clone()),
+            );
+            raw_receipt.insert("identity_proof_artifact_id".into(), serde_json::Value::Null);
+            raw_receipt.insert(
+                "adapter_id".into(),
+                serde_json::Value::String(attach_result.adapter_id.clone()),
+            );
+            raw_receipt.insert(
+                "adapter_capability_version".into(),
+                serde_json::Value::String(attach_result.adapter_capability_version.clone()),
+            );
+            raw_receipt.insert(
+                "attach_request_id".into(),
+                serde_json::Value::String(cont.idempotency_key.clone()),
+            );
+            raw_receipt.insert(
+                "managed_child_pid".into(),
+                serde_json::to_value(attach_result.managed_child_pid)?,
+            );
+            raw_receipt.insert(
+                "managed_process_group_id".into(),
+                serde_json::to_value(attach_result.managed_process_group_id)?,
+            );
+            raw_receipt.insert(
+                "managed_child_start_time".into(),
+                serde_json::Value::String(attach_completed_at.clone()),
+            );
+            raw_receipt.insert(
+                "adapter_runtime_home_realpath".into(),
+                serde_json::Value::Null,
+            );
+            raw_receipt.insert(
+                "adapter_runtime_home_dev_ino".into(),
+                serde_json::Value::Null,
+            );
+            raw_receipt.insert(
+                "process_started_at".into(),
+                serde_json::Value::String(attach_started_at.clone()),
+            );
+            raw_receipt.insert(
+                "attach_started_at".into(),
+                serde_json::Value::String(attach_started_at.clone()),
+            );
+            raw_receipt.insert(
+                "attach_completed_at".into(),
+                serde_json::Value::String(attach_completed_at.clone()),
+            );
+            raw_receipt.insert("prompt_sent_at".into(), serde_json::Value::Null);
+            raw_receipt.insert(
+                "resurrection_phase".into(),
+                serde_json::Value::String("attached_unprompted".into()),
+            );
+            raw_receipt.insert(
+                "orphan_reap_required".into(),
+                serde_json::Value::Bool(false),
+            );
+            raw_receipt.insert("orphan_reap_verified".into(), serde_json::Value::Bool(true));
+            raw_receipt.insert(
+                "output_only".into(),
+                serde_json::Value::Bool(output_only_recovery),
+            );
+            raw_receipt.insert(
+                "source_edit_allowance".into(),
+                serde_json::Value::Bool(!output_only_recovery),
+            );
+            raw_receipt.insert(
+                "changed_source_files_count".into(),
+                serde_json::Value::from(0),
+            );
+            raw_receipt.insert("failure_class".into(), serde_json::Value::Null);
+            raw_receipt.insert("resurrection_deadline_at".into(), serde_json::Value::Null);
+            raw_receipt.insert(
+                "resurrection_last_heartbeat_at".into(),
+                serde_json::Value::String(attach_completed_at.clone()),
+            );
+            raw_receipt.insert("resurrection_timeout_class".into(), serde_json::Value::Null);
+            raw_receipt.insert("timeout_settled_at".into(), serde_json::Value::Null);
+            raw_receipt.insert(
+                "target_agent_execution_id".into(),
+                serde_json::Value::String(target_agent_execution_id),
+            );
+            raw_receipt.insert(
+                "target_stage_execution_id".into(),
+                serde_json::Value::String(target_stage_execution_id),
+            );
+            raw_receipt.insert(
+                "request_fingerprint_sha256".into(),
+                serde_json::Value::String(request_fingerprint_sha256),
+            );
+            raw_receipt.insert(
+                "prompt_turn_marker_id".into(),
+                serde_json::Value::String(prompt_turn_marker_id),
+            );
+            raw_receipt.insert("provider_request_id".into(), serde_json::Value::Null);
+            raw_receipt.insert("provider_turn_id".into(), serde_json::Value::Null);
+            raw_receipt.insert(
+                "session_store_transcript_path".into(),
+                serde_json::Value::Null,
+            );
+            raw_receipt.insert(
+                "session_store_transcript_digest".into(),
+                serde_json::Value::Null,
+            );
+            raw_receipt.insert(
+                "session_store_recovery_result".into(),
+                serde_json::Value::String("not_attempted".into()),
+            );
+            raw_receipt.insert("session_store_read_at".into(), serde_json::Value::Null);
+            raw_receipt.insert(
+                "session_store_ownership_source".into(),
+                serde_json::Value::Null,
+            );
+            raw_receipt.insert(
+                "session_store_latest_turn_id".into(),
+                serde_json::Value::Null,
+            );
+            raw_receipt.insert(
+                "session_store_latest_tool_activity_at".into(),
+                serde_json::Value::Null,
+            );
+            let raw_receipt_json = serde_json::Value::Object(raw_receipt);
+            let mut current_receipt_json = raw_receipt_json.clone();
+            if let Err(error) = db::repos::p086_resurrection_raw_receipts::upsert(
+                &self.pool,
+                continuation_id,
+                &serde_json::to_string(&raw_receipt_json)?,
+                &attach_completed_at,
+            )
+            .await
+            {
+                warn!(
+                    continuation_id,
+                    error = %error,
+                    "P086 provider-session resurrection raw attach receipt persistence failed; closing attached session"
+                );
+                self.fail_close_p086_resurrection_attach_receipt_persistence(
+                    &run,
+                    &stage_id,
+                    &provider,
+                    model.clone(),
+                    &cont,
+                    &session_generation_id,
+                    worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                )
+                .await?;
+                return Ok(());
+            }
+
+            let redacted_receipt_json =
+                Self::p086_redacted_resurrection_attach_receipt(&current_receipt_json);
+            let (attach_receipt_artifact_id, attach_receipt_sha256) = match self
+                .persist_p086_continuation_json_artifact(
+                    &run,
+                    &stage_id,
+                    "code_writer",
+                    &provider,
+                    model.clone(),
+                    &cont.agent_execution_id,
+                    &cont.id,
+                    "provider_session_attach_receipt",
+                    "provider_session_attach_receipt_v2",
+                    &redacted_receipt_json,
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(
+                        continuation_id,
+                        error = %error,
+                        "P086 provider-session resurrection redacted attach receipt persistence failed; closing attached session"
+                    );
+                    self.fail_close_p086_resurrection_attach_receipt_persistence(
+                        &run,
+                        &stage_id,
+                        &provider,
+                        model.clone(),
+                        &cont,
+                        &session_generation_id,
+                        worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            db::repos::agent_work_continuations::set_evidence_artifact_ids(
+                &self.pool,
+                continuation_id,
+                Some(&attach_receipt_artifact_id),
+                None,
+                None,
+                None,
+            )
+            .await?;
+            info!(
+                continuation_id,
+                attach_receipt_artifact_id,
+                attach_receipt_sha256,
+                "P086 provider-session resurrection attach receipt persisted"
+            );
+
+            let has_pending = db::repos::agent_work_continuations::has_pending_approval_for_run(
+                &self.pool,
+                &cont.run_id,
+            )
+            .await?;
+            if has_pending {
+                let _ = self.acp.close_session(&session_generation_id).await;
+                update_resurrection_phase(
+                    &self.pool,
+                    continuation_id,
+                    "failed_closed",
+                    Some("unprompted_timeout"),
+                )
+                .await?;
+                self.settle_p086_continuation_with_materialized_artifacts(
+                    &run,
+                    &stage_id,
+                    &provider,
+                    model,
+                    &cont,
+                    "failed",
+                    Some("approval_required"),
+                    None,
+                    worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                )
+                .await?;
+                return Ok(());
+            }
+
+            insert_side_effect_ledger_row(
+                &self.pool,
+                continuation_id,
+                &cont.idempotency_key,
+                "runtime_lease",
+                1,
+                "committed",
+                Some(&cont.request_fingerprint_sha256),
+                None,
+            )
+            .await?;
+            insert_side_effect_ledger_row(
+                &self.pool,
+                continuation_id,
+                &cont.idempotency_key,
+                "worktree_lease",
+                2,
+                "committed",
+                Some(&cont.request_fingerprint_sha256),
+                None,
+            )
+            .await?;
+            update_continuation_status(&self.pool, continuation_id, "running", None).await?;
+            db::repos::agent_work_continuations::refresh_supervised_worker_heartbeat(
+                &self.pool,
+                continuation_id,
+                worker_pid,
+                &daemon_generation_id,
+            )
+            .await?;
+
+            let inserted = insert_side_effect_ledger_row(
+                &self.pool,
+                continuation_id,
+                &cont.idempotency_key,
+                "provider_send",
+                3,
+                "committed",
+                Some(&cont.request_fingerprint_sha256),
+                None,
+            )
+            .await?;
+            if inserted == 0 {
+                let _ = self.acp.close_session(&session_generation_id).await;
+                update_resurrection_phase(
+                    &self.pool,
+                    continuation_id,
+                    "failed_closed",
+                    Some("prompt_timeout"),
+                )
+                .await?;
+                update_continuation_status(
+                    &self.pool,
+                    continuation_id,
+                    "needs_continuation_reconciliation",
+                    Some("duplicate_prompt_prevented"),
+                )
+                .await?;
+                return Ok(());
+            }
+
+            self.persist_p086_canonical_request_artifact(
+                &run,
+                &stage_id,
+                &provider,
+                model.clone(),
+                &cont,
+                &session_generation_id,
+                canonical_worktree_root,
+            )
+            .await?;
+            let prompt_sent_at = chrono::Utc::now().to_rfc3339();
+            update_resurrection_phase(&self.pool, continuation_id, "prompting", None).await?;
+            update_continuation_status(&self.pool, continuation_id, "prompt_sent", None).await?;
+            current_receipt_json["prompt_sent_at"] =
+                serde_json::Value::String(prompt_sent_at.clone());
+            current_receipt_json["resurrection_phase"] =
+                serde_json::Value::String("prompting".to_string());
+            current_receipt_json["resurrection_last_heartbeat_at"] =
+                serde_json::Value::String(prompt_sent_at.clone());
+            self.refresh_p086_resurrection_attach_receipt(
+                continuation_id,
+                Some(&attach_receipt_artifact_id),
+                &current_receipt_json,
+                &prompt_sent_at,
+            )
+            .await?;
+            db::repos::agent_work_continuations::refresh_supervised_worker_heartbeat(
+                &self.pool,
+                continuation_id,
+                worker_pid,
+                &daemon_generation_id,
+            )
+            .await?;
+
+            let continuation_prompt = Self::p086_continuation_prompt(
+                &cont,
+                &session_generation_id,
+                Some(&provider_session_id),
+                canonical_worktree_root,
+            );
+            let exec_result = self
+                .acp
+                .execute(acp::ExecutionRequest {
+                    agent_execution_id: None,
+                    run_id,
+                    stage_execution_id: Some(cont.stage_execution_id.clone()),
+                    stage_id: format!(
+                        "continuation_{}",
+                        &continuation_id[..8.min(continuation_id.len())]
+                    ),
+                    attempt_number: 1,
+                    agent_id: "code_writer".to_string(),
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    effort: None,
+                    workspace_root: workspace_root.clone(),
+                    prompt: continuation_prompt,
+                    worktree_root: worktree_root.clone(),
+                    worktree_write_enabled: worktree_root.is_some(),
+                    worktree_strategy: None,
+                    expected_output_paths: Vec::new(),
+                    expected_outputs: Vec::new(),
+                    keep_session_alive: false,
+                    reuse_existing_session: true,
+                    session_generation_id: Some(session_generation_id.clone()),
+                    provider_session_id: Some(provider_session_id.clone()),
+                    provider_runtime_home: None,
+                    mcp_servers: Vec::new(),
+                    chainworks_meta_root: ctx.chainworks_meta_root,
+                    legacy_broad_discovery_policy:
+                        domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+                    xcode_shim_injection_signal: false,
+                    requires_xcode_host_execution: false,
+                    owner_kind: "stage_execution".to_string(),
+                    owner_id: Some(cont.stage_execution_id.clone()),
+                    origin_stage_id: None,
+                    origin_stage_execution_id: None,
+                    mediation_record_id: None,
+                    toolchain_home: None,
+                    toolchain_go_scope_enabled: false,
+                    p079_repair_canonical_paths: None,
+                })
+                .await;
+            let _ = self.acp.close_session(&session_generation_id).await;
+            let settling_at = chrono::Utc::now().to_rfc3339();
+            update_resurrection_phase(&self.pool, continuation_id, "settling", None).await?;
+            current_receipt_json["resurrection_phase"] =
+                serde_json::Value::String("settling".to_string());
+            current_receipt_json["resurrection_last_heartbeat_at"] =
+                serde_json::Value::String(settling_at.clone());
+            self.refresh_p086_resurrection_attach_receipt(
+                continuation_id,
+                Some(&attach_receipt_artifact_id),
+                &current_receipt_json,
+                &settling_at,
+            )
+            .await?;
+
+            match exec_result {
+                Ok(result) => {
+                    if let Some(recovery) = result.provider_session_store_recovery.as_ref() {
+                        current_receipt_json["session_store_recovery_result"] =
+                            serde_json::Value::String(recovery.result.clone());
+                        current_receipt_json["session_store_transcript_path"] = recovery
+                            .transcript_path
+                            .as_ref()
+                            .map(|value| serde_json::Value::String(value.clone()))
+                            .unwrap_or(serde_json::Value::Null);
+                        current_receipt_json["session_store_transcript_digest"] = recovery
+                            .transcript_digest
+                            .as_ref()
+                            .map(|value| serde_json::Value::String(value.clone()))
+                            .unwrap_or(serde_json::Value::Null);
+                        current_receipt_json["session_store_read_at"] = recovery
+                            .read_at
+                            .as_ref()
+                            .map(|value| serde_json::Value::String(value.clone()))
+                            .unwrap_or(serde_json::Value::Null);
+                        current_receipt_json["session_store_ownership_source"] = recovery
+                            .ownership_source
+                            .as_ref()
+                            .map(|value| serde_json::Value::String(value.clone()))
+                            .unwrap_or(serde_json::Value::Null);
+                        current_receipt_json["session_store_latest_turn_id"] = recovery
+                            .latest_turn_id
+                            .as_ref()
+                            .map(|value| serde_json::Value::String(value.clone()))
+                            .unwrap_or(serde_json::Value::Null);
+                        current_receipt_json["session_store_latest_tool_activity_at"] = recovery
+                            .latest_tool_activity_at
+                            .as_ref()
+                            .map(|value| serde_json::Value::String(value.clone()))
+                            .unwrap_or(serde_json::Value::Null);
+                        self.refresh_p086_resurrection_attach_receipt(
+                            continuation_id,
+                            Some(&attach_receipt_artifact_id),
+                            &current_receipt_json,
+                            &chrono::Utc::now().to_rfc3339(),
+                        )
+                        .await?;
+                    }
+                    if result.status == AgentStatus::Completed
+                        && !Self::p086_result_contains_all_correlation_terms(
+                            &result,
+                            &[
+                                &format!(
+                                    "p086-prompt-turn:{continuation_id}:provider_session_attach"
+                                ),
+                                &cont.request_fingerprint_sha256,
+                                &cont.stage_execution_id,
+                                &cont.agent_execution_id,
+                            ],
+                        )
+                    {
+                        warn!(
+                            continuation_id,
+                            stage_execution_id = %cont.stage_execution_id,
+                            agent_execution_id = %cont.agent_execution_id,
+                            "P086 provider-session resurrection terminal response missing prompt correlation proof"
+                        );
+                        self.settle_p086_continuation_with_materialized_artifacts(
+                            &run,
+                            &stage_id,
+                            &provider,
+                            model.clone(),
+                            &cont,
+                            "failed",
+                            Some("terminal_response_uncorrelated"),
+                            None,
+                            worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                        )
+                        .await?;
+                        update_resurrection_phase(
+                            &self.pool,
+                            continuation_id,
+                            "failed_closed",
+                            None,
+                        )
+                        .await?;
+                        let failed_at = chrono::Utc::now().to_rfc3339();
+                        current_receipt_json["resurrection_phase"] =
+                            serde_json::Value::String("failed_closed".to_string());
+                        current_receipt_json["failure_class"] =
+                            serde_json::Value::String("provider_rejected".to_string());
+                        current_receipt_json["resurrection_last_heartbeat_at"] =
+                            serde_json::Value::String(failed_at.clone());
+                        self.refresh_p086_resurrection_attach_receipt(
+                            continuation_id,
+                            Some(&attach_receipt_artifact_id),
+                            &current_receipt_json,
+                            &failed_at,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    for next_status in ["observing", "worktree_observed", "finalizing"] {
+                        db::repos::agent_work_continuations::update_continuation_status_unless_cancelling(
+                            &self.pool,
+                            continuation_id,
+                            next_status,
+                            None,
+                        )
+                        .await?;
+                    }
+                    let (final_status, failure_reason) = if result.status == AgentStatus::Completed
+                    {
+                        ("succeeded", None)
+                    } else {
+                        ("no_progress", Some("provider_incomplete"))
+                    };
+                    self.settle_p086_continuation_with_materialized_artifacts(
+                        &run,
+                        &stage_id,
+                        &provider,
+                        model.clone(),
+                        &cont,
+                        final_status,
+                        failure_reason,
+                        Some(&result),
+                        worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                    )
+                    .await?;
+                    let completed_at = chrono::Utc::now().to_rfc3339();
+                    update_resurrection_phase(&self.pool, continuation_id, "completed", None)
+                        .await?;
+                    current_receipt_json["resurrection_phase"] =
+                        serde_json::Value::String("completed".to_string());
+                    current_receipt_json["resurrection_last_heartbeat_at"] =
+                        serde_json::Value::String(completed_at.clone());
+                    self.refresh_p086_resurrection_attach_receipt(
+                        continuation_id,
+                        Some(&attach_receipt_artifact_id),
+                        &current_receipt_json,
+                        &completed_at,
+                    )
+                    .await?;
+                }
+                Err(err) => {
+                    warn!(
+                        continuation_id,
+                        provider = provider,
+                        error = %err,
+                        "P086 provider-session resurrection prompt failed"
+                    );
+                    self.settle_p086_continuation_with_materialized_artifacts(
+                        &run,
+                        &stage_id,
+                        &provider,
+                        model,
+                        &cont,
+                        "failed",
+                        Some("provider_error"),
+                        None,
+                        worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                    )
+                    .await?;
+                    update_resurrection_phase(
+                        &self.pool,
+                        continuation_id,
+                        "failed_closed",
+                        Some("settle_timeout"),
+                    )
+                    .await?;
+                    let failed_at = chrono::Utc::now().to_rfc3339();
+                    current_receipt_json["resurrection_phase"] =
+                        serde_json::Value::String("failed_closed".to_string());
+                    current_receipt_json["failure_class"] =
+                        serde_json::Value::String("provider_rejected".to_string());
+                    current_receipt_json["resurrection_last_heartbeat_at"] =
+                        serde_json::Value::String(failed_at.clone());
+                    self.refresh_p086_resurrection_attach_receipt(
+                        continuation_id,
+                        Some(&attach_receipt_artifact_id),
+                        &current_receipt_json,
+                        &failed_at,
+                    )
+                    .await?;
+                }
+            }
+            return Ok(());
+        }
 
         // 7. Check live session — live_handle_continuation requires the session handle to exist.
         let has_live = self
@@ -7436,7 +8451,10 @@ You are continuing the same Chainworks agent execution through an existing live 
                 "runtime_profile_id": provider,
                 "orphan_reap_required": false,
                 "orphan_reap_verified": true,
-                "managed_process_reused": true
+                "managed_process_reused": true,
+                "output_only": cont.mode == "output_only_recovery",
+                "source_edit_allowance": cont.mode != "output_only_recovery",
+                "changed_source_files_count": 0
             }
         });
         let (attach_receipt_artifact_id, attach_receipt_sha256) = self
@@ -10030,6 +11048,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                 let mut p079_repair_lease_key_outer: Option<String> = None;
                 let mut p079_repair_lease_inserted_outer = false;
                 let mut p079_repair_materialized_outer = false;
+                let mut p079_recovered_final_settlement_outer = "valid_outputs_from_repair";
                 let mut p088_completion_turn_attempted = false;
                 let mut p088_completion_turn_result: Option<String> = None;
                 let mut p088_completion_repair_text_capture: Option<
@@ -10219,23 +11238,101 @@ You are continuing the same Chainworks agent execution through an existing live 
                                         || p079_run_is_waiting_approval
                                         || p079_has_blocking_conflict;
 
-                                    // P079 MISSING-001/002 (partial): transcript/provider-envelope
-                                    // recovery step — establishes the correct ordered lane:
-                                    //   transcript recovery → same-session repair → provider fallback
-                                    // Records recovery result (bounds-checked) in the evidence row.
-                                    // Conservative: returns Unavailable until transport-attributed
-                                    // chunk scanning is fully implemented (future iteration).
-                                    let p079_transcript_recovery_obj =
+                                    // P079 recovery step: parse current-invocation transcript output
+                                    // with the ACP envelope parser, then route candidates through the
+                                    // same settlement and validation path as normal provider output.
+                                    let mut p079_transcript_recovery_obj =
                                         p079_attempt_transcript_recovery(
                                             result.transcript_text.as_deref(),
-                                            &declared_outputs,
+                                            &expected_outputs,
+                                            &result.pre_prompt_expected_outputs,
                                         );
+                                    let mut p079_transcript_recovery_settlement: Option<
+                                        DeclaredOutputDiscoverySettlement,
+                                    > = None;
+                                    let mut p079_transcript_recovery_validation: Option<
+                                        TaskValidationSummary,
+                                    > = None;
+                                    if let Some(transcript_settlement) =
+                                        p079_transcript_recovery_obj.settlement.clone()
+                                    {
+                                        let merged_transcript_settlement =
+                                            declared_output_settlement
+                                                .as_ref()
+                                                .map(|original_settlement| {
+                                                    merge_repair_discovery_settlements(
+                                                        original_settlement,
+                                                        &transcript_settlement,
+                                                    )
+                                                })
+                                                .unwrap_or_else(|| transcript_settlement.clone());
+                                        let transcript_captured =
+                                            build_captured_outputs_from_discovery_decisions(
+                                                &declared_outputs,
+                                                &merged_transcript_settlement.decisions,
+                                                &merged_transcript_settlement.accepted_payloads,
+                                            );
+                                        let transcript_validation = self
+                                            .validate_task_outputs_with_conflict_resolution_context(
+                                                run_id,
+                                                &stage_id,
+                                                &agent_id,
+                                                &transcript_captured,
+                                            )
+                                            .await?;
+                                        if transcript_validation.failure_class.is_none() {
+                                            p079_transcript_recovery_obj.evidence.result =
+                                                domain::output_contract_repair::TranscriptRecoveryResult::Accepted;
+                                            p079_transcript_recovery_obj.evidence.result_subtype =
+                                                None;
+                                            p079_transcript_recovery_obj.evidence.recovery_source =
+                                                Some(domain::output_contract_repair::RecoverySource::Transcript);
+                                            p079_transcript_recovery_settlement =
+                                                Some(merged_transcript_settlement);
+                                            p079_transcript_recovery_validation =
+                                                Some(transcript_validation);
+                                        } else {
+                                            p079_transcript_recovery_obj.evidence.result =
+                                                domain::output_contract_repair::TranscriptRecoveryResult::RejectedInvalid;
+                                            p079_transcript_recovery_obj.evidence.result_subtype =
+                                                transcript_validation.failure_class.as_ref().map(
+                                                    |failure| match failure {
+                                                        domain::validation::ValidationFailureClass::NoOutputProduced => {
+                                                            "no_output_produced"
+                                                        }
+                                                        domain::validation::ValidationFailureClass::EmptyOutput => {
+                                                            "empty_output"
+                                                        }
+                                                        domain::validation::ValidationFailureClass::MissingRequiredOutputs => {
+                                                            "missing_required_outputs"
+                                                        }
+                                                        domain::validation::ValidationFailureClass::InvalidRequiredOutputs => {
+                                                            "invalid_required_outputs"
+                                                        }
+                                                        domain::validation::ValidationFailureClass::ProviderModeMismatch => {
+                                                            "provider_mode_mismatch"
+                                                        }
+                                                        domain::validation::ValidationFailureClass::OutputContractMismatch => {
+                                                            "output_contract_mismatch"
+                                                        }
+                                                        domain::validation::ValidationFailureClass::PersistenceFailure => {
+                                                            "persistence_failure"
+                                                        }
+                                                    }
+                                                    .to_string(),
+                                                );
+                                            p079_transcript_recovery_obj.evidence.recovery_source =
+                                                Some(domain::output_contract_repair::RecoverySource::Transcript);
+                                        }
+                                    }
                                     let p079_transcript_recovery_succeeded = matches!(
-                                        p079_transcript_recovery_obj.result,
+                                        p079_transcript_recovery_obj.evidence.result,
                                         domain::output_contract_repair::TranscriptRecoveryResult::Accepted
                                     );
-                                    let p079_transcript_recovery_json_str =
-                                        serde_json::to_string(&p079_transcript_recovery_obj).ok();
+                                    let p079_transcript_recovery_json_str = serde_json::to_string(
+                                        &p079_transcript_recovery_obj.evidence,
+                                    )
+                                    .ok();
 
                                     // P079: repair_attempt_id is threaded out of the insert block so
                                     // update functions can record the final outcome after the repair turn.
@@ -10250,7 +11347,6 @@ You are continuing the same Chainworks agent execution through an existing live 
                                     // import_declared_contract_outputs commits the CAS. Without this
                                     // deferral, P079 evidence can be marked recovered while the CAS
                                     // rejects outputs as ignored_late.
-                                    let mut p079_repair_materialized = false;
                                     // SEC-P079-001: set inside the inner block once provider_family
                                     // is known. The block unconditionally assigns this before any
                                     // conditional paths, so no initializer is needed here.
@@ -10992,36 +12088,60 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                     "P079 transcript recovery accepted; skipping same-session repair turn"
                                                 );
                                                 p079_repair_succeeded = true;
-                                                let recover_ts = chrono::Utc::now().to_rfc3339();
-                                                if let Some(ref attempt_id) = p079_repair_attempt_id
-                                                {
-                                                    if let Some(ref lease_key) = p079_repair_lease_key {
-                                                if let Err(e) = ocr_repo::settle_terminal_event_and_lease(
-                                                    &self.pool, attempt_id, lease_key,
-                                                    "recovered", "recovered",
-                                                    "continue",
-                                                    Some("valid_outputs_from_transcript_recovery"),
-                                                    "accepted", &recover_ts,
-                                                ).await {
-                                                    error!(
-                                                        repair_attempt_id = %attempt_id,
-                                                        error = %e,
-                                                        "P079: failed to settle transcript recovery event"
-                                                    );
-                                                }
-                                            } else if let Err(e) = ocr_repo::update_repair_event_status(
-                                                &self.pool, attempt_id,
-                                                "recovered", "recovered",
-                                                "continue",
-                                                Some("valid_outputs_from_transcript_recovery"),
-                                                &recover_ts,
-                                            ).await {
-                                                error!(
-                                                    repair_attempt_id = %attempt_id,
-                                                    error = %e,
-                                                    "P079: failed to update transcript recovery event"
-                                                );
-                                            }
+                                                if let (
+                                                    Some(transcript_settlement),
+                                                    Some(transcript_validation),
+                                                ) = (
+                                                    p079_transcript_recovery_settlement.take(),
+                                                    p079_transcript_recovery_validation.take(),
+                                                ) {
+                                                    materialize_validated_discovery_decisions(
+                                                        &declared_outputs,
+                                                        &transcript_settlement,
+                                                        &transcript_validation,
+                                                    )?;
+                                                    declared_output_settlement =
+                                                        Some(transcript_settlement);
+                                                    p079_repair_materialized_outer = true;
+                                                    p079_recovered_final_settlement_outer =
+                                                        "valid_outputs_from_transcript_recovery";
+                                                    p079_repair_attempt_id_outer =
+                                                        p079_repair_attempt_id.clone();
+                                                    p079_repair_lease_key_outer =
+                                                        p079_repair_lease_key.clone();
+                                                    p079_repair_lease_inserted_outer =
+                                                        p079_repair_lease_inserted;
+                                                    if let Some(ref attempt_id) =
+                                                        p079_repair_attempt_id
+                                                    {
+                                                        let p079_now =
+                                                            chrono::Utc::now().to_rfc3339();
+                                                        let transcript_json = serde_json::json!({
+                                                            "result": "accepted",
+                                                            "recovery_source": "transcript",
+                                                            "recovery_parser_version": domain::output_contract_repair::OutputContractRepairEvidence::RECOVERY_PARSER_VERSION,
+                                                        }).to_string();
+                                                        if let Err(e) =
+                                                            ocr_repo::update_repair_event_subobjects(
+                                                                &self.pool,
+                                                                attempt_id,
+                                                                None,
+                                                                Some(&transcript_json),
+                                                                None,
+                                                                None,
+                                                                false,
+                                                                false,
+                                                                &p079_now,
+                                                            )
+                                                            .await
+                                                        {
+                                                            error!(
+                                                                repair_attempt_id = %attempt_id,
+                                                                error = %e,
+                                                                "P079: failed to persist accepted transcript recovery subobject"
+                                                            );
+                                                        }
+                                                    }
                                                 }
                                                 break 'p079_repair_dispatch;
                                             }
@@ -11452,7 +12572,6 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                                 // if the CAS later rejects with IgnoredLateOutputs.
                                                                 // Outer vars are set so the post-import settle
                                                                 // block (outside this nested scope) can access them.
-                                                                p079_repair_materialized = true;
                                                                 p079_repair_materialized_outer = true;
                                                                 p079_repair_attempt_id_outer = p079_repair_attempt_id.clone();
                                                                 p079_repair_lease_key_outer = p079_repair_lease_key.clone();
@@ -12579,7 +13698,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                         "recovered",
                                         "recovered",
                                         "continue",
-                                        Some("valid_outputs_from_repair"),
+                                        Some(p079_recovered_final_settlement_outer),
                                         "accepted",
                                     )
                                 };
@@ -12619,7 +13738,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                         "recovered",
                                         "recovered",
                                         "continue",
-                                        Some("valid_outputs_from_repair"),
+                                        Some(p079_recovered_final_settlement_outer),
                                     )
                                 };
                             if let Err(e) = ocr_repo::update_repair_event_status(
@@ -19835,10 +20954,27 @@ fn p079_read_transcript_recovery_max_bytes() -> usize {
         .unwrap_or(DEFAULT)
 }
 
+fn p079_transcript_recovery_enabled() -> bool {
+    matches!(
+        std::env::var(domain::output_contract_repair::FLAG_TRANSCRIPT_RECOVERY_ENABLED)
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("True")
+    )
+}
+
+#[derive(Clone)]
+struct P079TranscriptRecoveryAttempt {
+    evidence: domain::output_contract_repair::TranscriptRecovery,
+    settlement: Option<DeclaredOutputDiscoverySettlement>,
+}
+
 fn p079_attempt_transcript_recovery(
     transcript_text: Option<&str>,
-    declared_outputs: &[DeclaredOutput],
-) -> domain::output_contract_repair::TranscriptRecovery {
+    expected_outputs: &[ExpectedOutputSpec],
+    pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
+) -> P079TranscriptRecoveryAttempt {
+    let _ = pre_prompt_expected_outputs;
     let max_bytes = p079_read_transcript_recovery_max_bytes();
     const MAX_DEPTH: u32 = 32;
     const MAX_CHUNKS: u32 = 64;
@@ -19857,7 +20993,10 @@ fn p079_attempt_transcript_recovery(
     // No transcript available — Unavailable with no subtype (no_transcript is not an approved enum value).
     let transcript = match transcript_text {
         None | Some("") => {
-            return base;
+            return P079TranscriptRecoveryAttempt {
+                evidence: base,
+                settlement: None,
+            };
         }
         Some(t) => t,
     };
@@ -19866,29 +21005,80 @@ fn p079_attempt_transcript_recovery(
 
     // SEC-002: fail-closed for oversized transcripts. Do not attempt partial scans.
     if transcript.len() > max_bytes {
-        return domain::output_contract_repair::TranscriptRecovery {
-            result_subtype: Some("oversized_payload".to_string()),
-            bytes_examined: Some(bytes_examined),
-            ..base
+        return P079TranscriptRecoveryAttempt {
+            evidence: domain::output_contract_repair::TranscriptRecovery {
+                result_subtype: Some("oversized_payload".to_string()),
+                bytes_examined: Some(bytes_examined),
+                ..base
+            },
+            settlement: None,
         };
     }
 
     // No declared outputs to recover — not needed.
-    if declared_outputs.is_empty() {
-        return domain::output_contract_repair::TranscriptRecovery {
-            result: domain::output_contract_repair::TranscriptRecoveryResult::NotNeeded,
-            bytes_examined: Some(bytes_examined),
-            ..base
+    if expected_outputs.is_empty() {
+        return P079TranscriptRecoveryAttempt {
+            evidence: domain::output_contract_repair::TranscriptRecovery {
+                result: domain::output_contract_repair::TranscriptRecoveryResult::NotNeeded,
+                bytes_examined: Some(bytes_examined),
+                ..base
+            },
+            settlement: None,
         };
     }
 
-    // Conservative: return Unavailable/unattributable_envelope until transport-derived
-    // attribution is implemented. Full implementation must verify chunk identifiers
-    // allocated by the ACP transport before accepting any recovered output.
-    domain::output_contract_repair::TranscriptRecovery {
-        result_subtype: Some("unattributable_envelope".to_string()),
-        bytes_examined: Some(bytes_examined),
-        ..base
+    let artifacts = acp::transport::extract_output_envelopes(transcript, expected_outputs);
+    if artifacts.is_empty() {
+        return P079TranscriptRecoveryAttempt {
+            evidence: domain::output_contract_repair::TranscriptRecovery {
+                result_subtype: Some("unattributable_envelope".to_string()),
+                bytes_examined: Some(bytes_examined),
+                ..base
+            },
+            settlement: None,
+        };
+    }
+
+    if !p079_transcript_recovery_enabled() {
+        return P079TranscriptRecoveryAttempt {
+            evidence: domain::output_contract_repair::TranscriptRecovery {
+                result_subtype: Some("feature_flag_disabled".to_string()),
+                bytes_examined: Some(bytes_examined),
+                ..base
+            },
+            settlement: None,
+        };
+    }
+
+    let transport_attributed = artifacts.iter().all(|artifact| {
+        artifact.source_kind == acp::DiscoveredArtifactSourceKind::ProviderEnvelope
+    });
+    if !transport_attributed {
+        // Raw JSON `CHAINWORKS_OUTPUT` in transcript text is not enough proof that
+        // the provider owned the payload. Only transport-owned provider envelope
+        // markers are accepted for P079 recovery.
+        return P079TranscriptRecoveryAttempt {
+            evidence: domain::output_contract_repair::TranscriptRecovery {
+                result_subtype: Some("attribution_not_verified".to_string()),
+                bytes_examined: Some(bytes_examined),
+                ..base
+            },
+            settlement: None,
+        };
+    }
+
+    P079TranscriptRecoveryAttempt {
+        evidence: domain::output_contract_repair::TranscriptRecovery {
+            result: domain::output_contract_repair::TranscriptRecoveryResult::Accepted,
+            recovery_source: Some(domain::output_contract_repair::RecoverySource::Transcript),
+            bytes_examined: Some(bytes_examined),
+            ..base
+        },
+        settlement: Some(build_declared_output_discovery_settlement(
+            expected_outputs,
+            &artifacts,
+            pre_prompt_expected_outputs,
+        )),
     }
 }
 
@@ -20150,11 +21340,13 @@ mod tests {
             run_id: "run-1".to_string(),
             stage_execution_id: "stage-exec-1".to_string(),
             agent_execution_id: "agent-exec-1".to_string(),
+            command_journal_id: "journal-1".to_string(),
             mode: "live_handle_continuation".to_string(),
             trigger_kind: "operator_mcp".to_string(),
             status: "accepted".to_string(),
             failure_reason: None,
             reconciliation_status: None,
+            resurrection_phase: None,
             idempotency_scope: "agent-exec-1".to_string(),
             idempotency_key: "key-1".to_string(),
             request_fingerprint_sha256: "a".repeat(64),
@@ -20194,6 +21386,9 @@ mod tests {
         assert!(prompt.contains("not a retry"));
         assert!(prompt.contains("Fix only the observed blocker."));
         assert!(prompt.contains("- missing live reuse proof"));
+        assert!(prompt.contains(&format!("Request fingerprint sha256: {}", "a".repeat(64))));
+        assert!(prompt
+            .contains("Prompt turn marker id: p086-prompt-turn:cont-1:provider_session_attach"));
         assert!(prompt.contains("Session generation id: session-gen-1"));
         assert!(prompt.contains("Provider session id: provider-session-1"));
         assert!(prompt.contains("Do not commit, push, release, publish, upload"));
@@ -20304,6 +21499,43 @@ plain progress line without gate evidence";
     }
 
     #[test]
+    fn p086_resurrection_attach_receipt_redaction_preserves_fresh_phase_fields() {
+        let raw = serde_json::json!({
+            "schema_version": "provider_session_attach_receipt_v2",
+            "continuation_id": "cont-1",
+            "requested_provider_session_id": "provider-session-secret",
+            "actual_provider_session_id": "provider-session-secret",
+            "managed_child_pid": 12345,
+            "managed_process_group_id": 12345,
+            "adapter_runtime_home_realpath": "/tmp/runtime-home",
+            "adapter_runtime_home_dev_ino": "1:2",
+            "session_store_transcript_path": "/tmp/runtime-home/transcript.jsonl",
+            "resurrection_phase": "completed",
+            "prompt_sent_at": "2026-06-20T00:00:01Z",
+            "resurrection_last_heartbeat_at": "2026-06-20T00:00:02Z",
+            "identity_proof_source": "session_store"
+        });
+
+        let redacted = BackgroundExecutor::p086_redacted_resurrection_attach_receipt(&raw);
+
+        assert_eq!(redacted["schema_version"], raw["schema_version"]);
+        assert_eq!(redacted["resurrection_phase"], "completed");
+        assert_eq!(redacted["prompt_sent_at"], "2026-06-20T00:00:01Z");
+        assert_eq!(
+            redacted["resurrection_last_heartbeat_at"],
+            "2026-06-20T00:00:02Z"
+        );
+        assert_eq!(redacted["identity_proof_source"], "session_store");
+        assert_eq!(redacted["requested_provider_session_id"], "[redacted]");
+        assert_eq!(redacted["actual_provider_session_id"], "[redacted]");
+        assert!(redacted["managed_child_pid"].is_null());
+        assert!(redacted["managed_process_group_id"].is_null());
+        assert!(redacted["adapter_runtime_home_realpath"].is_null());
+        assert!(redacted["adapter_runtime_home_dev_ino"].is_null());
+        assert!(redacted["session_store_transcript_path"].is_null());
+    }
+
+    #[test]
     fn p086_reconciliation_requires_post_continuation_worktree_change() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("changed.txt"), "changed").unwrap();
@@ -20326,6 +21558,31 @@ plain progress line without gate evidence";
                 Some(temp.path().to_str().unwrap()),
                 &after,
             )
+        );
+    }
+
+    #[test]
+    fn p086_output_only_recovery_classifies_source_edits() {
+        let changed = vec![
+            serde_json::json!("control-plane/crates/engine/src/executor.rs"),
+            serde_json::json!("Chainworks Forge/Views/RunsHomeView.swift"),
+            serde_json::json!("scripts/test-gate.sh"),
+            serde_json::json!("docs/evidence/rollout-contract/p086/result.fixture.json"),
+            serde_json::json!("docs/proposals/086-agent-work-continuation-and-lead-directed-session-resumption.md"),
+            serde_json::json!("old.rs -> examples/agents/agents.yaml"),
+            serde_json::json!("README.md"),
+        ];
+
+        let source_edits = BackgroundExecutor::p086_output_only_changed_source_files(&changed);
+
+        assert_eq!(
+            source_edits,
+            vec![
+                "control-plane/crates/engine/src/executor.rs",
+                "Chainworks Forge/Views/RunsHomeView.swift",
+                "scripts/test-gate.sh",
+                "examples/agents/agents.yaml",
+            ]
         );
     }
 
@@ -24554,65 +25811,222 @@ plain progress line without gate evidence";
 
     #[test]
     fn p079_transcript_recovery_no_transcript_returns_unavailable() {
-        let result = p079_attempt_transcript_recovery(None, &[]);
+        let result = p079_attempt_transcript_recovery(None, &[], &[]);
         assert!(matches!(
-            result.result,
+            result.evidence.result,
             domain::output_contract_repair::TranscriptRecoveryResult::Unavailable
         ));
         // no_transcript is not an approved InitialFailureSubtype enum value; None is correct.
-        assert_eq!(result.result_subtype.as_deref(), None);
-        assert_eq!(result.bytes_examined, Some(0));
-        assert_eq!(result.max_recovery_payload_bytes, 262144);
+        assert_eq!(result.evidence.result_subtype.as_deref(), None);
+        assert_eq!(result.evidence.bytes_examined, Some(0));
+        assert_eq!(result.evidence.max_recovery_payload_bytes, 262144);
+        assert!(result.settlement.is_none());
     }
 
     #[test]
     fn p079_transcript_recovery_oversized_fails_closed() {
         let big = "x".repeat(300_000);
-        let result = p079_attempt_transcript_recovery(Some(&big), &[]);
+        let result = p079_attempt_transcript_recovery(Some(&big), &[], &[]);
         assert!(matches!(
-            result.result,
+            result.evidence.result,
             domain::output_contract_repair::TranscriptRecoveryResult::Unavailable
         ));
-        assert_eq!(result.result_subtype.as_deref(), Some("oversized_payload"));
+        assert_eq!(
+            result.evidence.result_subtype.as_deref(),
+            Some("oversized_payload")
+        );
         // bytes_examined capped at MAX_BYTES
-        assert!(result.bytes_examined.unwrap_or(0) <= 262_144);
+        assert!(result.evidence.bytes_examined.unwrap_or(0) <= 262_144);
+        assert!(result.settlement.is_none());
     }
 
     #[test]
     fn p079_transcript_recovery_no_declared_outputs_is_not_needed() {
-        let result = p079_attempt_transcript_recovery(Some("some transcript text"), &[]);
+        let result = p079_attempt_transcript_recovery(Some("some transcript text"), &[], &[]);
         assert!(matches!(
-            result.result,
+            result.evidence.result,
             domain::output_contract_repair::TranscriptRecoveryResult::NotNeeded
         ));
+        assert!(result.settlement.is_none());
     }
 
     #[test]
-    fn p079_transcript_recovery_with_outputs_returns_unavailable_unattributable_envelope() {
-        // With declared outputs present, conservatively returns Unavailable/unattributable_envelope
-        // until transport-attributed chunk scanning is implemented (attribution_not_verified
-        // was not an approved InitialFailureSubtype value).
+    fn p079_transcript_recovery_without_chainworks_output_returns_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("report.json");
         let output = DeclaredOutput {
             output_name: "report".to_string(),
-            target_path: "/tmp/test/report.md".to_string(),
+            target_path: output_path.to_string_lossy().into_owned(),
             schema: None,
             reuse_policy: None,
             companion_output_name: None,
             companion_path: None,
         };
-        let result = p079_attempt_transcript_recovery(Some("{\"report\": \"content\"}"), &[output]);
+        let specs =
+            build_expected_output_specs(&[output], tmp.path().to_str().unwrap(), None, None, false);
+        let result =
+            p079_attempt_transcript_recovery(Some("{\"report\": \"content\"}"), &specs, &[]);
         assert!(matches!(
-            result.result,
+            result.evidence.result,
             domain::output_contract_repair::TranscriptRecoveryResult::Unavailable
         ));
         assert_eq!(
-            result.result_subtype.as_deref(),
+            result.evidence.result_subtype.as_deref(),
             Some("unattributable_envelope")
         );
-        assert_eq!(result.recovery_parser_version, "p079_recovery_v1");
-        assert_eq!(result.max_json_depth, 32);
-        assert_eq!(result.max_chunks_examined, 64);
+        assert_eq!(result.evidence.recovery_parser_version, "p079_recovery_v1");
+        assert_eq!(result.evidence.max_json_depth, 32);
+        assert_eq!(result.evidence.max_chunks_examined, 64);
+        assert!(result.settlement.is_none());
     }
+
+    #[test]
+    fn p079_transcript_recovery_without_feature_flag_is_unavailable() {
+        let _guard = P079_TRANSCRIPT_RECOVERY_ENV_LOCK.lock().unwrap();
+        let old =
+            std::env::var(domain::output_contract_repair::FLAG_TRANSCRIPT_RECOVERY_ENABLED).ok();
+        std::env::remove_var(domain::output_contract_repair::FLAG_TRANSCRIPT_RECOVERY_ENABLED);
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("report.json");
+        let output = DeclaredOutput {
+            output_name: "report".to_string(),
+            target_path: output_path.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let specs = build_expected_output_specs(
+            &[output.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            None,
+            false,
+        );
+        let transcript =
+            r#"final: {"CHAINWORKS_OUTPUT":{"report":{"status":"green","summary":"ok"}}}"#;
+
+        let result = p079_attempt_transcript_recovery(Some(transcript), &specs, &[]);
+        assert!(matches!(
+            result.evidence.result,
+            domain::output_contract_repair::TranscriptRecoveryResult::Unavailable
+        ));
+        assert_eq!(
+            result.evidence.result_subtype.as_deref(),
+            Some("feature_flag_disabled")
+        );
+        assert!(result.settlement.is_none());
+        match old {
+            Some(v) => std::env::set_var(
+                domain::output_contract_repair::FLAG_TRANSCRIPT_RECOVERY_ENABLED,
+                v,
+            ),
+            None => std::env::remove_var(
+                domain::output_contract_repair::FLAG_TRANSCRIPT_RECOVERY_ENABLED,
+            ),
+        }
+    }
+
+    #[test]
+    fn p079_transcript_recovery_without_transport_attribution_fails_closed() {
+        let _guard = P079_TRANSCRIPT_RECOVERY_ENV_LOCK.lock().unwrap();
+        let old =
+            std::env::var(domain::output_contract_repair::FLAG_TRANSCRIPT_RECOVERY_ENABLED).ok();
+        std::env::set_var(
+            domain::output_contract_repair::FLAG_TRANSCRIPT_RECOVERY_ENABLED,
+            "1",
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("report.json");
+        let output = DeclaredOutput {
+            output_name: "report".to_string(),
+            target_path: output_path.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let specs =
+            build_expected_output_specs(&[output], tmp.path().to_str().unwrap(), None, None, false);
+        let transcript =
+            r#"final: {"CHAINWORKS_OUTPUT":{"report":{"status":"green","summary":"ok"}}}"#;
+
+        let result = p079_attempt_transcript_recovery(Some(transcript), &specs, &[]);
+        assert!(matches!(
+            result.evidence.result,
+            domain::output_contract_repair::TranscriptRecoveryResult::Unavailable
+        ));
+        assert_eq!(
+            result.evidence.result_subtype.as_deref(),
+            Some("attribution_not_verified")
+        );
+        assert_eq!(result.evidence.recovery_source, None);
+        assert!(result.settlement.is_none());
+        match old {
+            Some(v) => std::env::set_var(
+                domain::output_contract_repair::FLAG_TRANSCRIPT_RECOVERY_ENABLED,
+                v,
+            ),
+            None => std::env::remove_var(
+                domain::output_contract_repair::FLAG_TRANSCRIPT_RECOVERY_ENABLED,
+            ),
+        }
+    }
+
+    #[test]
+    fn p079_transcript_recovery_accepts_transport_attributed_provider_envelope() {
+        let _guard = P079_TRANSCRIPT_RECOVERY_ENV_LOCK.lock().unwrap();
+        let old =
+            std::env::var(domain::output_contract_repair::FLAG_TRANSCRIPT_RECOVERY_ENABLED).ok();
+        std::env::set_var(
+            domain::output_contract_repair::FLAG_TRANSCRIPT_RECOVERY_ENABLED,
+            "1",
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("report.json");
+        let output = DeclaredOutput {
+            output_name: "report".to_string(),
+            target_path: output_path.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let specs =
+            build_expected_output_specs(&[output], tmp.path().to_str().unwrap(), None, None, false);
+        let transcript = r#"final: <<<CHAINWORKS_OUTPUT:report>>>{"status":"green","summary":"ok"}<<<END_CHAINWORKS_OUTPUT>>>"#;
+
+        let result = p079_attempt_transcript_recovery(Some(transcript), &specs, &[]);
+        assert!(matches!(
+            result.evidence.result,
+            domain::output_contract_repair::TranscriptRecoveryResult::Accepted
+        ));
+        assert_eq!(result.evidence.result_subtype, None);
+        assert_eq!(
+            result.evidence.recovery_source,
+            Some(domain::output_contract_repair::RecoverySource::Transcript)
+        );
+        let settlement = result
+            .settlement
+            .expect("transport-attributed envelope must produce a settlement");
+        assert_eq!(settlement.accepted_payloads.len(), 1);
+        assert!(settlement
+            .accepted_payloads
+            .keys()
+            .any(|payload_ref| payload_ref.ends_with("report")));
+
+        match old {
+            Some(v) => std::env::set_var(
+                domain::output_contract_repair::FLAG_TRANSCRIPT_RECOVERY_ENABLED,
+                v,
+            ),
+            None => std::env::remove_var(
+                domain::output_contract_repair::FLAG_TRANSCRIPT_RECOVERY_ENABLED,
+            ),
+        }
+    }
+
+    static P079_TRANSCRIPT_RECOVERY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[cfg(unix)]
     #[test]

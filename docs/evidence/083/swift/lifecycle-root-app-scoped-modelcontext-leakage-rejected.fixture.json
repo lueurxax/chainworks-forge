@@ -1,7 +1,7 @@
 {
   "fixture_id": "lifecycle-root-app-scoped-modelcontext-leakage-rejected",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "swift_swiftdata_lifecycle_contract_v1",
   "description": "Any attempt to expose a root-app-scoped lifecycle ModelContext into the SwiftUI WindowGroup or view tree is statically or dynamically rejected.",
   "preconditions": {

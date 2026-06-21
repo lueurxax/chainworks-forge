@@ -10,6 +10,7 @@ use domain::xcode_runtime::{
     McpBrokerObservation, XcodeRuntimeFailureClass, XcodeRuntimeObservationUpdate, XcodeShimEvent,
     XcodeShimRuntimeAttachedEvent,
 };
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -20,7 +21,7 @@ use crate::adapters::gemini::GeminiCliAdapter;
 use crate::adapters::junie::JunieAdapter;
 use crate::adapters::{
     AcpAdapter, AcpProviderLaunchGate, LaunchResourceGuard, NoopAcpProviderLaunchGate,
-    ProviderCapabilityCache, XcodeShimLaunchRuntime,
+    ProviderCapabilityCache, ProviderSessionResurrectionCapability, XcodeShimLaunchRuntime,
 };
 use crate::session::{
     AcpSessionCloseBehavior, AcpSessionHandle, ProviderSessionStoreArchiveContext,
@@ -102,6 +103,39 @@ pub struct AcpRuntimeManager {
 pub struct AcpLiveSessionProcessBinding {
     pub child_pid: u32,
     pub process_group_id: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderSessionResurrectionAttachResult {
+    pub provider: String,
+    pub adapter_id: String,
+    pub adapter_capability_version: String,
+    pub requested_provider_session_id: String,
+    pub actual_provider_session_id: String,
+    pub identity_proof_source: String,
+    pub identity_proof_observed_at: String,
+    pub session_generation_id: String,
+    pub managed_child_pid: Option<u32>,
+    pub managed_process_group_id: Option<u32>,
+}
+
+fn provider_session_id_ref(provider_session_id: &str) -> String {
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(provider_session_id.as_bytes())
+    )
+}
+
+fn provider_session_identity_mismatch_message(
+    context: &str,
+    expected: &str,
+    actual: &str,
+) -> String {
+    format!(
+        "{context}: expected_ref '{}', actual_ref '{}'",
+        provider_session_id_ref(expected),
+        provider_session_id_ref(actual)
+    )
 }
 
 #[derive(Clone)]
@@ -325,7 +359,24 @@ impl AcpRuntimeManager {
         let runtime_tool_path_preflight_json = opened.runtime_tool_path_preflight_json.clone();
         let session = opened.session;
         let session_req = opened.session_req;
-        let lease_cleanup = opened.lease_cleanup;
+        let mut lease_cleanup = opened.lease_cleanup;
+        if let Some(expected_provider_session_id) = req.provider_session_id.as_deref() {
+            let actual_provider_session_id = session.provider_session_id().await;
+            if actual_provider_session_id != expected_provider_session_id {
+                let _ = session
+                    .close_with_behavior(AcpSessionCloseBehavior::Delete)
+                    .await;
+                self.release_xcode_leases(lease_cleanup.take()).await;
+                bail!(
+                    "{}",
+                    provider_session_identity_mismatch_message(
+                        "ACP provider_session_id mismatch before prompt",
+                        expected_provider_session_id,
+                        &actual_provider_session_id,
+                    )
+                );
+            }
+        }
         let registered_generation_id = req.session_generation_id.clone();
         if let Some(generation_id) = registered_generation_id.as_ref() {
             self.live_sessions
@@ -430,6 +481,96 @@ impl AcpRuntimeManager {
         self.record_xcode_prompt_observations(&session_req, &result)
             .await;
         Ok(result)
+    }
+
+    pub async fn provider_session_resurrection_capability(
+        &self,
+        provider: &str,
+    ) -> Result<Option<ProviderSessionResurrectionCapability>> {
+        let provider = canonical_acp_provider(provider);
+        let adapter = self.adapter_for(&provider).await?;
+        Ok(adapter.provider_session_resurrection_capability())
+    }
+
+    pub async fn attach_provider_session_for_resurrection(
+        &self,
+        mut req: ExecutionRequest,
+    ) -> Result<ProviderSessionResurrectionAttachResult> {
+        req.provider = canonical_acp_provider(&req.provider);
+        let provider = req.provider.clone();
+        let adapter = self.adapter_for(&provider).await?;
+        let capability = adapter
+            .provider_session_resurrection_capability()
+            .filter(|capability| {
+                capability.attach_resume_supported && capability.identity_proof_supported
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "provider_session_resurrection_unsupported: adapter '{}' does not support provider-session resurrection",
+                    provider
+                )
+            })?;
+        let requested_provider_session_id = req
+            .provider_session_id
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("provider_session_id_required"))?;
+        let session_generation_id = req.session_generation_id.clone().ok_or_else(|| {
+            anyhow::anyhow!("session_generation_id_required_for_resurrection_attach")
+        })?;
+
+        info!(
+            provider = %provider,
+            run_id = %req.run_id,
+            stage_id = %req.stage_id,
+            session_generation_id = %session_generation_id,
+            requested_provider_session_ref = %provider_session_id_ref(&requested_provider_session_id),
+            "AcpRuntimeManager: attaching provider session for resurrection"
+        );
+
+        let opened = self.open_ordered_session(adapter, &req).await?;
+        let actual_provider_session_id = opened.session.provider_session_id().await;
+        if actual_provider_session_id != requested_provider_session_id {
+            let _ = opened
+                .session
+                .close_with_behavior(AcpSessionCloseBehavior::Delete)
+                .await;
+            self.release_xcode_leases(opened.lease_cleanup).await;
+            bail!(
+                "{}",
+                provider_session_identity_mismatch_message(
+                    "provider_session_resurrection_identity_mismatch",
+                    &requested_provider_session_id,
+                    &actual_provider_session_id,
+                )
+            );
+        }
+
+        let managed_child_pid = opened.session.child_pid().await;
+        let managed_process_group_id = managed_child_pid;
+        self.live_sessions
+            .lock()
+            .await
+            .insert(session_generation_id.clone(), opened.session);
+        if let Some(cleanup) = opened.lease_cleanup {
+            self.live_xcode_leases
+                .lock()
+                .await
+                .insert(session_generation_id.clone(), cleanup);
+        }
+
+        Ok(ProviderSessionResurrectionAttachResult {
+            provider,
+            adapter_id: capability.adapter_id,
+            adapter_capability_version: capability.capability_version,
+            requested_provider_session_id,
+            actual_provider_session_id,
+            identity_proof_source: capability.identity_proof_source,
+            identity_proof_observed_at: chrono::Utc::now().to_rfc3339(),
+            session_generation_id,
+            managed_child_pid,
+            managed_process_group_id,
+        })
     }
 
     async fn open_ordered_session(
@@ -648,10 +789,13 @@ impl AcpRuntimeManager {
             let actual_provider_session_id = session.provider_session_id().await;
             if actual_provider_session_id != expected_provider_session_id {
                 return Err(anyhow::anyhow!(
-                    "Live ACP session provider_session_id mismatch for generation id '{}': expected '{}', got '{}'",
-                    session_generation_id,
-                    expected_provider_session_id,
-                    actual_provider_session_id
+                    "{} for generation id '{}'",
+                    provider_session_identity_mismatch_message(
+                        "Live ACP session provider_session_id mismatch",
+                        expected_provider_session_id,
+                        &actual_provider_session_id,
+                    ),
+                    session_generation_id
                 ));
             }
         }
@@ -1067,6 +1211,40 @@ mod tests {
             false,
             &AgentStatus::Failed
         ));
+    }
+
+    #[test]
+    fn provider_session_id_ref_is_stable_and_redacted() {
+        let raw = "claude-provider-session-secret-123";
+        let first = provider_session_id_ref(raw);
+        let second = provider_session_id_ref(raw);
+
+        assert_eq!(first, second);
+        assert!(first.starts_with("sha256:"));
+        assert_eq!(first.len(), "sha256:".len() + 64);
+        assert!(
+            !first.contains(raw),
+            "provider session refs must not expose the raw continuation handle"
+        );
+    }
+
+    #[test]
+    fn provider_session_identity_mismatch_message_omits_raw_handles() {
+        let expected = "claude-expected-session-secret";
+        let actual = "claude-actual-session-secret";
+        let message = provider_session_identity_mismatch_message(
+            "provider_session_resurrection_identity_mismatch",
+            expected,
+            actual,
+        );
+
+        assert!(message.contains("provider_session_resurrection_identity_mismatch"));
+        assert!(message.contains("expected_ref 'sha256:"));
+        assert!(message.contains("actual_ref 'sha256:"));
+        assert!(
+            !message.contains(expected) && !message.contains(actual),
+            "mismatch diagnostics must not leak raw provider session ids: {message}"
+        );
     }
 
     struct RecordingLeaseAttacher {

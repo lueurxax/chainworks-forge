@@ -14,13 +14,13 @@ use tracing::{debug, info, warn};
 use db::repos::{
     agent_work_continuations, approvals, artifact_contracts, artifacts, audit_log, closeout,
     code_writer_completion_receipts, ideas, projections, rollout_contract_checks, runs,
-    sessions as session_repo, steward as steward_repo, workflow_conflicts,
+    sessions as session_repo, stages, steward as steward_repo, workflow_conflicts,
 };
 use db::writer::DbWriterHeartbeat;
 use domain::commands::{
-    ApprovalResolutionDecision, CallerContext, Command, MarkProviderSessionProcessAbsentCmd,
-    P083RollbackExecutionCmd, P083SetEnforcementModeCmd, ResolveApprovalCmd, RetryRunCmd,
-    ShutdownProviderSessionCmd,
+    ApprovalResolutionDecision, CallerContext, CancelRunCmd, Command, ForceReconcileSideEffectCmd,
+    MarkProviderSessionProcessAbsentCmd, P083RollbackExecutionCmd, P083SetEnforcementModeCmd,
+    ResolveApprovalCmd, RetryRunCmd, RetryStageCmd, ShutdownProviderSessionCmd,
 };
 use domain::events::DomainEvent;
 use domain::ids::{ArtifactId, IdeaId, RunId};
@@ -44,9 +44,14 @@ use crate::types::p031::{
     GqlMutationConflictResultCode, GqlPayloadAvailabilityState, GqlPayloadUnavailableReasonCode,
 };
 use crate::types::p083::{
-    GqlP083EnforcementMode, GqlP083MarkProcessAbsentPayload, GqlP083ProviderSessionShutdownPayload,
-    GqlP083RollbackExecutionPayload, GqlP083RollbackTargetMode, GqlP083SetEnforcementModePayload,
-    GqlRetryRunPayload,
+    CallerRequestId, DenialPayload, GqlP083EnforcementMode, GqlP083IdentityHoldSession,
+    GqlP083MarkProcessAbsentPayload, GqlP083MarkProcessAbsentSuccess,
+    GqlP083ProviderSessionShutdownPayload, GqlP083ProviderSessionShutdownSuccess,
+    GqlP083RollbackExecutionPayload, GqlP083RollbackExecutionSuccess, GqlP083RollbackTargetMode,
+    GqlP083SetEnforcementModePayload, GqlP083SetEnforcementModeSuccess, GqlRetryRunPayload,
+    GqlRetryRunSuccess, GqlRunsCancelPayload, GqlRunsCancelSuccess,
+    GqlSideEffectsForceReconcilePayload, GqlSideEffectsForceReconcileSuccess,
+    GqlStagesRetryPayload, GqlStagesRetrySuccess,
 };
 use crate::types::run::GqlRun;
 use crate::types::scheduler::{GqlStartupRecoverySummary, GqlToolchainCacheHousekeepingSummary};
@@ -1951,6 +1956,49 @@ impl QueryRoot {
         run_from_projection_or_canonical(pool, run_id).await
     }
 
+    /// P083 manual identity-check readback.
+    ///
+    /// The macOS shell uses this read-only query to render identity-ambiguous
+    /// provider-session holds. Raw process_start_identity never leaves the
+    /// control plane; callers receive only a run-scoped hash reference.
+    async fn p083_identity_hold_sessions(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<Vec<GqlP083IdentityHoldSession>> {
+        require_operator_read(ctx).await?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let parsed_run_id: RunId = run_id
+            .as_str()
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let run_id_string = parsed_run_id.to_string();
+        let rows =
+            db::repos::provider_sessions::find_identity_ambiguous_for_run(pool, &run_id_string)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let live_probe =
+                    p083_live_identity_probe(row.process_id, row.process_start_identity.as_deref());
+                GqlP083IdentityHoldSession {
+                    provider_session_id: row.provider_session_id,
+                    provider_name: row.provider,
+                    cancellation_epoch: row.cancellation_epoch,
+                    last_seen_pid: row.process_id,
+                    process_start_identity_hash: row
+                        .process_start_identity
+                        .as_deref()
+                        .map(|raw| derive_p083_process_identity_ref(&run_id_string, raw)),
+                    live_probe_status: live_probe.status.to_string(),
+                    live_probe_detail: live_probe.detail.to_string(),
+                    latest_receipt_id: row.latest_receipt_id,
+                    reason_detail: row.held_reason,
+                }
+            })
+            .collect())
+    }
+
     async fn approval_inbox(
         &self,
         ctx: &Context<'_>,
@@ -3244,35 +3292,42 @@ impl QueryRoot {
         let cont_id = continuation_id.as_str();
         let req_run_id = run_id.as_str();
 
+        let actual_run = p086_resurrection_raw_receipts::continuation_run_id(pool, cont_id)
+            .await
+            .map_err(|e| Error::new(e.to_string()))?;
+        let authorized = actual_run.as_deref() == Some(req_run_id);
+        if !authorized {
+            let audit_id = uuid::Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            let principal_class = match principal.class {
+                auth::PrincipalClass::Operator => "operator",
+                auth::PrincipalClass::Observer | auth::PrincipalClass::ReadOnlyOperator => {
+                    "observer"
+                }
+                auth::PrincipalClass::Agent => "agent",
+            };
+            let _ = p086_resurrection_raw_receipts::record_access_audit(
+                pool,
+                &p086_resurrection_raw_receipts::ReceiptAccessAuditRow {
+                    id: audit_id,
+                    principal_id: principal.id.clone(),
+                    principal_class: principal_class.to_string(),
+                    continuation_id: cont_id.to_string(),
+                    run_id: req_run_id.to_string(),
+                    requested_at: now,
+                    source_channel: "graphql".to_string(),
+                    outcome: "denied".to_string(),
+                    denial_reason: Some("wrong_run_or_not_found".to_string()),
+                },
+            )
+            .await;
+            return Err(Error::new(
+                "auth_failure: run_id does not match or not found",
+            ));
+        }
+
         match &principal.class {
             auth::PrincipalClass::Operator => {
-                // Verify run scope before any DB read (no existence oracle for wrong-run).
-                let actual_run = p086_resurrection_raw_receipts::continuation_run_id(pool, cont_id)
-                    .await
-                    .map_err(|e| Error::new(e.to_string()))?;
-                let authorized = actual_run.as_deref() == Some(req_run_id);
-                if !authorized {
-                    let audit_id = uuid::Uuid::new_v4().to_string();
-                    let now = chrono::Utc::now().to_rfc3339();
-                    let _ = p086_resurrection_raw_receipts::record_access_audit(
-                        pool,
-                        &p086_resurrection_raw_receipts::ReceiptAccessAuditRow {
-                            id: audit_id,
-                            principal_id: principal.id.clone(),
-                            principal_class: "operator".to_string(),
-                            continuation_id: cont_id.to_string(),
-                            run_id: req_run_id.to_string(),
-                            requested_at: now,
-                            source_channel: "graphql".to_string(),
-                            outcome: "denied".to_string(),
-                            denial_reason: Some("wrong_run_or_not_found".to_string()),
-                        },
-                    )
-                    .await;
-                    return Err(Error::new(
-                        "auth_failure: run_id does not match or not found",
-                    ));
-                }
                 let raw = p086_resurrection_raw_receipts::find_by_continuation_id(pool, cont_id)
                     .await
                     .map_err(|e| Error::new(e.to_string()))?;
@@ -3344,9 +3399,10 @@ impl QueryRoot {
             auth::PrincipalClass::Agent => {
                 // Guest/Agent: minimal projection — existence + resurrection_phase only.
                 let phase = sqlx::query(
-                    "SELECT resurrection_phase FROM agent_work_continuations WHERE id = ?1",
+                    "SELECT resurrection_phase FROM agent_work_continuations WHERE id = ?1 AND run_id = ?2",
                 )
                 .bind(cont_id)
+                .bind(req_run_id)
                 .fetch_optional(pool)
                 .await
                 .map_err(|e| Error::new(e.to_string()))?
@@ -3511,6 +3567,7 @@ fn reviewer_redact_receipt_gql(raw: &serde_json::Value) -> serde_json::Value {
         "managed_process_group_id",
         "managed_child_process_group_id",
         "managed_child_start_time",
+        "session_store_transcript_path",
     ];
     const SESSION_ID_FIELDS: &[&str] = &[
         "requested_provider_session_id",
@@ -5170,6 +5227,10 @@ pub enum MutationName {
     ApproveApproval,
     /// P072: Converged rejection mutation by approval_id.
     RejectApproval,
+    /// P083 R70: Unified approval resolver surface.
+    ApprovalsResolve,
+    /// P083: Cancel a run through the lifecycle authority.
+    RunsCancel,
     /// P083: Graceful shutdown of a provider session.
     ProviderSessionShutdown,
     /// P083: Rollback execution to permissive or disabled mode.
@@ -5178,6 +5239,10 @@ pub enum MutationName {
     P083SetEnforcementMode,
     /// P083: Re-queue AdvanceRun for a stalled or failed run.
     RetryRun,
+    /// P083: Retry a stage by authoritative stage execution id.
+    StagesRetry,
+    /// P083: Force-reconcile a pending side effect.
+    SideEffectsForceReconcile,
     /// P083: Operator confirms provider process is absent for identity-ambiguous hold.
     P083MarkProviderSessionProcessAbsent,
 }
@@ -5187,10 +5252,14 @@ impl MutationName {
         match self {
             MutationName::ApproveApproval => "approveApproval",
             MutationName::RejectApproval => "rejectApproval",
+            MutationName::ApprovalsResolve => "approvalsResolve",
+            MutationName::RunsCancel => "runsCancel",
             MutationName::ProviderSessionShutdown => "providerSessionShutdown",
             MutationName::P083RollbackExecution => "p083RollbackExecution",
             MutationName::P083SetEnforcementMode => "p083SetEnforcementMode",
             MutationName::RetryRun => "runsRetry",
+            MutationName::StagesRetry => "stagesRetry",
+            MutationName::SideEffectsForceReconcile => "sideEffectsForceReconcile",
             MutationName::P083MarkProviderSessionProcessAbsent => {
                 "p083MarkProviderSessionProcessAbsent"
             }
@@ -5200,13 +5269,18 @@ impl MutationName {
 
 pub fn capability_id_for(mutation: MutationName) -> domain::CapabilityToolId {
     match mutation {
-        MutationName::ApproveApproval | MutationName::RejectApproval => {
-            domain::CapabilityToolId::ApprovalsResolve
-        }
+        MutationName::ApproveApproval
+        | MutationName::RejectApproval
+        | MutationName::ApprovalsResolve => domain::CapabilityToolId::ApprovalsResolve,
         MutationName::ProviderSessionShutdown => domain::CapabilityToolId::ProviderSessionShutdown,
+        MutationName::RunsCancel => domain::CapabilityToolId::RunsCancel,
         MutationName::P083RollbackExecution => domain::CapabilityToolId::P083RollbackExecution,
         MutationName::P083SetEnforcementMode => domain::CapabilityToolId::P083SetEnforcementMode,
         MutationName::RetryRun => domain::CapabilityToolId::RetryRun,
+        MutationName::StagesRetry => domain::CapabilityToolId::StagesRetry,
+        MutationName::SideEffectsForceReconcile => {
+            domain::CapabilityToolId::SideEffectsForceReconcile
+        }
         MutationName::P083MarkProviderSessionProcessAbsent => {
             domain::CapabilityToolId::ProviderSessionMarkProcessAbsent
         }
@@ -5392,28 +5466,6 @@ fn validate_caller_request_id_graphql(request_id: &str) -> Result<()> {
         .map_err(|e| Error::new(format!("P083_INVALID_ARG: {e}")))
 }
 
-/// SEC-P083-MED-001: Validate a P083 operator-supplied reason field before persistence.
-/// Reasons are stored verbatim in p083_enforcement_mode_state.mode_reason and
-/// p083_rollback_audit.reason. Reject oversized inputs and control characters.
-/// Mirrors the same check in mcp-server/src/tools/runs.rs validate_p083_reason.
-fn validate_p083_reason_graphql(reason: &str, max_bytes: usize) -> Result<()> {
-    if reason.len() > max_bytes {
-        return Err(Error::new(format!(
-            "P083_INVALID_ARG: reason exceeds maximum length of {max_bytes} bytes (got {})",
-            reason.len()
-        )));
-    }
-    for (i, ch) in reason.char_indices() {
-        if ch.is_control() && !matches!(ch, ' ' | '\t' | '\n' | '\r') {
-            return Err(Error::new(format!(
-                "P083_INVALID_ARG: reason contains a disallowed control character at byte offset {i} (U+{:04X})",
-                ch as u32
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// SEC-P083-MED-001: Derive a non-reversible run-scoped display reference for a raw
 /// process_start_identity value. The raw value is never returned to callers; only this
 /// derived reference is serialized into GraphQL/UI payloads.
@@ -5426,6 +5478,111 @@ fn derive_p083_process_identity_ref(run_id: &str, raw: &str) -> String {
     hasher.update(b"|");
     hasher.update(raw.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+#[derive(Clone, Debug)]
+struct P083LiveIdentityProbe {
+    status: &'static str,
+    detail: &'static str,
+}
+
+/// P083 manual_process_identity_check_ui_v1: read-only process identity probe.
+/// This must not mutate SQLite or issue provider shutdown signals; it only reports
+/// current OS evidence to help the operator decide whether to keep holding or use
+/// the MCP-only mark-process-absent command.
+fn p083_live_identity_probe(
+    pid: Option<i64>,
+    stored_process_start_identity: Option<&str>,
+) -> P083LiveIdentityProbe {
+    let Some(pid) = pid.filter(|pid| *pid > 0) else {
+        return P083LiveIdentityProbe {
+            status: "unverifiable",
+            detail: "no positive process id recorded",
+        };
+    };
+    let Some(stored) = stored_process_start_identity.filter(|value| !value.is_empty()) else {
+        return P083LiveIdentityProbe {
+            status: "unverifiable",
+            detail: "no stored process start identity recorded",
+        };
+    };
+    if !p083_process_alive(pid) {
+        return P083LiveIdentityProbe {
+            status: "absent",
+            detail: "process id is not live",
+        };
+    }
+    match p083_process_start_identity_from_os(pid) {
+        Some(current) if current == stored => P083LiveIdentityProbe {
+            status: "match",
+            detail: "live process identity matches stored identity",
+        },
+        Some(_) => P083LiveIdentityProbe {
+            status: "mismatch",
+            detail: "live process identity differs from stored identity",
+        },
+        None => P083LiveIdentityProbe {
+            status: "unverifiable",
+            detail: "process is live but start identity could not be read",
+        },
+    }
+}
+
+fn p083_process_alive(pid: i64) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if ret == 0 {
+            return true;
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+        errno != libc::ESRCH
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn p083_process_start_identity_from_os(pid: i64) -> Option<String> {
+    if pid <= 0 {
+        return None;
+    }
+    let mut bsdinfo: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let expected = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut bsdinfo as *mut _ as *mut libc::c_void,
+            expected,
+        )
+    };
+    if ret < expected {
+        return None;
+    }
+    Some(format!(
+        "{}.{:06}",
+        bsdinfo.pbi_start_tvsec, bsdinfo.pbi_start_tvusec
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn p083_process_start_identity_from_os(pid: i64) -> Option<String> {
+    if pid <= 0 {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let paren_end = stat.rfind(')')?;
+    let after_comm = stat[paren_end + 1..].trim();
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    fields.get(19).map(|value| (*value).to_string())
 }
 
 /// P083: Convert a command-handler error into a GraphQL error with a bounded P083LifecycleDenialCode.
@@ -5504,6 +5661,30 @@ pub struct RejectApprovalPayload {
     pub approval: GqlApproval,
     pub journal_id: ID,
     pub conflict_result_code: Option<GqlMutationConflictResultCode>,
+}
+
+/// P083 R70: Unified approval resolution enum for approvalsResolve.
+#[derive(Enum, Copy, Clone, Eq, PartialEq)]
+#[graphql(rename_items = "snake_case")]
+pub enum ApprovalResolution {
+    Approve,
+    Reject,
+}
+
+/// P083 R70: Payload for approvalsResolve mutation.
+#[derive(SimpleObject)]
+#[graphql(name = "ApprovalsResolveSuccess")]
+pub struct ApprovalsResolveSuccess {
+    pub approval: GqlApproval,
+    pub journal_id: ID,
+    pub conflict_result_code: Option<GqlMutationConflictResultCode>,
+}
+
+#[derive(Union)]
+#[graphql(name = "ApprovalsResolvePayload")]
+pub enum ApprovalsResolvePayload {
+    Success(ApprovalsResolveSuccess),
+    Denial(DenialPayload),
 }
 
 fn approval_resolution_conflict_code(
@@ -5719,17 +5900,155 @@ impl MutationRoot {
         }
     }
 
+    /// P083 R70: Unified approval resolver. `approve` and `reject` route through
+    /// the durable `approvals.resolve` command path.
+    async fn approvals_resolve(
+        &self,
+        ctx: &Context<'_>,
+        approval_id: ID,
+        resolution: ApprovalResolution,
+        caller_request_id: CallerRequestId,
+        comment: Option<String>,
+    ) -> Result<ApprovalsResolvePayload> {
+        let pool = ctx.data::<SqlitePool>()?;
+        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
+        let caller_request_id = caller_request_id.to_string();
+
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
+            .clone();
+
+        mutation_allowed(ctx, &principal, MutationName::ApprovalsResolve).await?;
+        validate_caller_request_id_graphql(&caller_request_id)?;
+
+        let caller = graphql_caller_with_request_id(ctx, &principal, "approvalsResolve");
+        let http_request_id = caller.request_id.clone();
+
+        let aid: domain::ids::ApprovalId = approval_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let approval = approvals::find_by_id(pool, aid)
+            .await?
+            .ok_or_else(|| Error::new(format!("Approval {aid} not found")))?;
+
+        let decision = match resolution {
+            ApprovalResolution::Approve => ApprovalResolutionDecision::Approved,
+            ApprovalResolution::Reject => ApprovalResolutionDecision::Rejected,
+        };
+
+        let cmd = Command::ResolveApproval(ResolveApprovalCmd {
+            approval_id: aid,
+            decision,
+            rationale: comment,
+            run_id: approval.run_id,
+            stage_id: approval.stage_id.clone(),
+            idempotency_key: None,
+            request_id: Some(caller_request_id.clone()),
+        });
+
+        let result = cmd_handler.handle(cmd, caller).await;
+        match result {
+            Ok(commanded) => {
+                let jid = ID::from(commanded.journal_id);
+                let updated = approvals::find_by_id(pool, aid)
+                    .await?
+                    .ok_or_else(|| Error::new("Approval not found after update"))?;
+                Ok(ApprovalsResolvePayload::Success(ApprovalsResolveSuccess {
+                    approval: GqlApproval::from(updated),
+                    journal_id: jid,
+                    conflict_result_code: None,
+                }))
+            }
+            Err(e) => {
+                if let Some((journal_id, conflict_result_code)) =
+                    approval_resolution_conflict_code(&e)
+                {
+                    let current = approvals::find_by_id(pool, aid)
+                        .await?
+                        .ok_or_else(|| Error::new(format!("Approval {aid} not found")))?;
+                    Ok(ApprovalsResolvePayload::Success(ApprovalsResolveSuccess {
+                        approval: GqlApproval::from(current),
+                        journal_id,
+                        conflict_result_code: Some(conflict_result_code),
+                    }))
+                } else if e.to_string().contains("IDEMPOTENCY_CONFLICT") {
+                    Err(idempotency_conflict_gql_error(&http_request_id))
+                } else {
+                    tracing::error!(error = %e, request_id = %caller_request_id, "approvalsResolve: internal command error");
+                    let mut gql_err = Error::new("INTERNAL");
+                    gql_err = gql_err.extend_with(|_, ext| ext.set("code", "INTERNAL"));
+                    gql_err = gql_err
+                        .extend_with(|_, ext| ext.set("requestId", caller_request_id.clone()));
+                    Err(gql_err)
+                }
+            }
+        }
+    }
+
+    /// P083: Cancel a run through the lifecycle authority.
+    /// Requires Operator principal. caller_request_id is a CallerRequestId (lowercase UUIDv4).
+    async fn runs_cancel(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+        caller_request_id: CallerRequestId,
+    ) -> Result<GqlRunsCancelPayload> {
+        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
+        let caller_request_id = caller_request_id.to_string();
+
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
+            .clone();
+
+        mutation_allowed(ctx, &principal, MutationName::RunsCancel).await?;
+        validate_caller_request_id_graphql(&caller_request_id)?;
+
+        let run_id_parsed: RunId = run_id
+            .as_str()
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let caller =
+            graphql_caller(&ctx, &principal, "runsCancel").with_request_id(&caller_request_id);
+        let commanded = cmd_handler
+            .handle(
+                Command::CancelRun(CancelRunCmd {
+                    run_id: run_id_parsed,
+                    request_id: Some(caller_request_id.clone()),
+                }),
+                caller,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "runsCancel: command error");
+                p083_command_error("runsCancel", &e.to_string())
+            })?;
+
+        match commanded.result {
+            engine::command_handler::CommandResult::RunCancelled { run_id } => {
+                Ok(GqlRunsCancelPayload::Success(GqlRunsCancelSuccess {
+                    run_id: run_id.to_string(),
+                    cancellation_epoch: None,
+                    journal_id: commanded.journal_id,
+                    request_id: caller_request_id,
+                }))
+            }
+            _ => Err(Error::new("INTERNAL: unexpected command result")),
+        }
+    }
+
     /// P083: Initiate graceful shutdown of a provider session.
-    /// Requires Operator principal. request_id is a CallerRequestId (lowercase UUIDv4)
+    /// Requires Operator principal. caller_request_id is a CallerRequestId (lowercase UUIDv4)
     /// used by command_idempotency_contract_v1 for replay-safe deduplication.
     async fn provider_session_shutdown(
         &self,
         ctx: &Context<'_>,
         provider_session_id: String,
-        reason: String,
-        request_id: String,
+        caller_request_id: CallerRequestId,
     ) -> Result<GqlP083ProviderSessionShutdownPayload> {
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
+        let caller_request_id = caller_request_id.to_string();
 
         let principal = ctx
             .data::<auth::Principal>()
@@ -5738,15 +6057,14 @@ impl MutationRoot {
 
         mutation_allowed(ctx, &principal, MutationName::ProviderSessionShutdown).await?;
 
-        validate_caller_request_id_graphql(&request_id)?;
-        validate_p083_reason_graphql(&reason, 1024)?;
+        validate_caller_request_id_graphql(&caller_request_id)?;
 
         let caller = graphql_caller(&ctx, &principal, "providerSessionShutdown")
-            .with_request_id(&request_id);
+            .with_request_id(&caller_request_id);
         let cmd = Command::ShutdownProviderSession(ShutdownProviderSessionCmd {
             provider_session_id: provider_session_id.clone(),
-            request_id: request_id.clone(),
-            reason,
+            request_id: caller_request_id.clone(),
+            reason: "operator_requested_provider_session_shutdown".to_string(),
         });
 
         let commanded = cmd_handler.handle(cmd, caller).await.map_err(|e| {
@@ -5761,14 +6079,16 @@ impl MutationRoot {
                 idempotency_request_id,
                 cancellation_epoch,
                 dispatched_count,
-            } => Ok(GqlP083ProviderSessionShutdownPayload {
-                scheduled: dispatched_count > 0,
-                provider_session_id: ps_id,
-                cancellation_epoch,
-                journal_id,
-                request_id: idempotency_request_id,
-                operator_next_step_code: None,
-            }),
+            } => Ok(GqlP083ProviderSessionShutdownPayload::Success(
+                GqlP083ProviderSessionShutdownSuccess {
+                    scheduled: dispatched_count > 0,
+                    provider_session_id: ps_id,
+                    cancellation_epoch,
+                    journal_id,
+                    request_id: idempotency_request_id,
+                    operator_next_step_code: None,
+                },
+            )),
             // SEC-P083-HIGH-001: process_id was null at command time; intent held pending operator action.
             engine::command_handler::CommandResult::ProviderSessionShutdownHeld {
                 provider_session_id: ps_id,
@@ -5776,14 +6096,16 @@ impl MutationRoot {
                 idempotency_request_id,
                 cancellation_epoch,
                 operator_next_step_code,
-            } => Ok(GqlP083ProviderSessionShutdownPayload {
-                scheduled: false,
-                provider_session_id: ps_id,
-                cancellation_epoch,
-                journal_id,
-                request_id: idempotency_request_id,
-                operator_next_step_code: Some(operator_next_step_code),
-            }),
+            } => Ok(GqlP083ProviderSessionShutdownPayload::Success(
+                GqlP083ProviderSessionShutdownSuccess {
+                    scheduled: false,
+                    provider_session_id: ps_id,
+                    cancellation_epoch,
+                    journal_id,
+                    request_id: idempotency_request_id,
+                    operator_next_step_code: Some(operator_next_step_code),
+                },
+            )),
             _ => Err(Error::new("INTERNAL: unexpected command result")),
         }
     }
@@ -5794,9 +6116,10 @@ impl MutationRoot {
         &self,
         ctx: &Context<'_>,
         target_enforcement_mode: GqlP083RollbackTargetMode,
-        caller_request_id: String,
+        caller_request_id: CallerRequestId,
     ) -> Result<GqlP083RollbackExecutionPayload> {
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
+        let caller_request_id = caller_request_id.to_string();
 
         let principal = ctx
             .data::<auth::Principal>()
@@ -5825,12 +6148,14 @@ impl MutationRoot {
                 rollback_mode: mode,
                 journal_id,
                 idempotency_request_id,
-            } => Ok(GqlP083RollbackExecutionPayload {
-                committed: true,
-                target_enforcement_mode: mode,
-                journal_id,
-                request_id: idempotency_request_id,
-            }),
+            } => Ok(GqlP083RollbackExecutionPayload::Success(
+                GqlP083RollbackExecutionSuccess {
+                    committed: true,
+                    target_enforcement_mode: mode,
+                    journal_id,
+                    request_id: idempotency_request_id,
+                },
+            )),
             _ => Err(Error::new("INTERNAL: unexpected command result")),
         }
     }
@@ -5841,9 +6166,10 @@ impl MutationRoot {
         &self,
         ctx: &Context<'_>,
         target_mode: GqlP083EnforcementMode,
-        caller_request_id: String,
+        caller_request_id: CallerRequestId,
     ) -> Result<GqlP083SetEnforcementModePayload> {
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
+        let caller_request_id = caller_request_id.to_string();
 
         let principal = ctx
             .data::<auth::Principal>()
@@ -5872,25 +6198,28 @@ impl MutationRoot {
                 enforcement_mode: mode,
                 journal_id,
                 idempotency_request_id,
-            } => Ok(GqlP083SetEnforcementModePayload {
-                committed: true,
-                enforcement_mode: mode,
-                journal_id,
-                request_id: idempotency_request_id,
-            }),
+            } => Ok(GqlP083SetEnforcementModePayload::Success(
+                GqlP083SetEnforcementModeSuccess {
+                    committed: true,
+                    enforcement_mode: mode,
+                    journal_id,
+                    request_id: idempotency_request_id,
+                },
+            )),
             _ => Err(Error::new("INTERNAL: unexpected command result")),
         }
     }
 
     /// P083: Re-queue an AdvanceRun work item for a run that has failed or stalled.
-    /// Requires Operator principal. request_id is a CallerRequestId (lowercase UUIDv4).
+    /// Requires Operator principal. caller_request_id is a CallerRequestId (lowercase UUIDv4).
     async fn runs_retry(
         &self,
         ctx: &Context<'_>,
         run_id: ID,
-        request_id: String,
+        caller_request_id: CallerRequestId,
     ) -> Result<GqlRetryRunPayload> {
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
+        let caller_request_id = caller_request_id.to_string();
 
         let principal = ctx
             .data::<auth::Principal>()
@@ -5899,17 +6228,18 @@ impl MutationRoot {
 
         mutation_allowed(ctx, &principal, MutationName::RetryRun).await?;
 
-        validate_caller_request_id_graphql(&request_id)?;
+        validate_caller_request_id_graphql(&caller_request_id)?;
 
         let run_id_parsed: RunId = run_id
             .as_str()
             .parse()
             .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
 
-        let caller = graphql_caller(&ctx, &principal, "runsRetry").with_request_id(&request_id);
+        let caller =
+            graphql_caller(&ctx, &principal, "runsRetry").with_request_id(&caller_request_id);
         let cmd = Command::RetryRun(RetryRunCmd {
             run_id: run_id_parsed,
-            request_id: request_id.clone(),
+            request_id: caller_request_id.clone(),
         });
 
         let commanded = cmd_handler.handle(cmd, caller).await.map_err(|e| {
@@ -5922,12 +6252,133 @@ impl MutationRoot {
                 run_id: result_run_id,
                 journal_id,
                 idempotency_request_id,
-            } => Ok(GqlRetryRunPayload {
+            } => Ok(GqlRetryRunPayload::Success(GqlRetryRunSuccess {
                 queued: true,
                 run_id: result_run_id.to_string(),
                 journal_id,
                 request_id: idempotency_request_id,
-            }),
+            })),
+            _ => Err(Error::new("INTERNAL: unexpected command result")),
+        }
+    }
+
+    /// P083: Retry a stage by authoritative stage execution id.
+    /// Requires Operator principal. caller_request_id is a CallerRequestId (lowercase UUIDv4).
+    async fn stages_retry(
+        &self,
+        ctx: &Context<'_>,
+        stage_execution_id: ID,
+        caller_request_id: CallerRequestId,
+    ) -> Result<GqlStagesRetryPayload> {
+        let pool = ctx.data::<SqlitePool>()?;
+        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
+        let caller_request_id = caller_request_id.to_string();
+
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
+            .clone();
+
+        mutation_allowed(ctx, &principal, MutationName::StagesRetry).await?;
+        validate_caller_request_id_graphql(&caller_request_id)?;
+
+        let stage_execution_id_parsed: domain::ids::StageExecutionId = stage_execution_id
+            .as_str()
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let stage = stages::find_by_id(pool, stage_execution_id_parsed)
+            .await?
+            .ok_or_else(|| {
+                Error::new(format!(
+                    "Stage execution {} not found",
+                    stage_execution_id.as_str()
+                ))
+            })?;
+        let caller =
+            graphql_caller(&ctx, &principal, "stagesRetry").with_request_id(&caller_request_id);
+        let commanded = cmd_handler
+            .handle(
+                Command::RetryStage(RetryStageCmd {
+                    run_id: stage.run_id,
+                    stage_id: stage.stage_id.clone(),
+                    consume_quota_budget_now: false,
+                    agent_execution_id: None,
+                    legacy_discovery_override_policy: None,
+                    legacy_discovery_override_reason: None,
+                    operator_instruction: None,
+                    request_id: Some(caller_request_id.clone()),
+                }),
+                caller,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "stagesRetry: command error");
+                p083_command_error("stagesRetry", &e.to_string())
+            })?;
+
+        match commanded.result {
+            engine::command_handler::CommandResult::StageRetryScheduled { stage_id, .. } => {
+                Ok(GqlStagesRetryPayload::Success(GqlStagesRetrySuccess {
+                    stage_execution_id: stage_execution_id.to_string(),
+                    stage_id,
+                    journal_id: commanded.journal_id,
+                    request_id: caller_request_id,
+                }))
+            }
+            _ => Err(Error::new("INTERNAL: unexpected command result")),
+        }
+    }
+
+    /// P083: Force-reconcile a side effect through the lifecycle authority.
+    /// Requires Operator principal. caller_request_id is a CallerRequestId (lowercase UUIDv4).
+    async fn side_effects_force_reconcile(
+        &self,
+        ctx: &Context<'_>,
+        side_effect_id: ID,
+        decision_json: String,
+        caller_request_id: CallerRequestId,
+    ) -> Result<GqlSideEffectsForceReconcilePayload> {
+        let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
+        let caller_request_id = caller_request_id.to_string();
+
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
+            .clone();
+
+        mutation_allowed(ctx, &principal, MutationName::SideEffectsForceReconcile).await?;
+        validate_caller_request_id_graphql(&caller_request_id)?;
+
+        let side_effect_id = side_effect_id.to_string();
+        let caller = graphql_caller(&ctx, &principal, "sideEffectsForceReconcile")
+            .with_request_id(&caller_request_id);
+        let commanded = cmd_handler
+            .handle(
+                Command::ForceReconcileSideEffect(ForceReconcileSideEffectCmd {
+                    effect_id: side_effect_id.clone(),
+                    request_id: caller_request_id.clone(),
+                    decision_json,
+                }),
+                caller,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "sideEffectsForceReconcile: command error");
+                p083_command_error("sideEffectsForceReconcile", &e.to_string())
+            })?;
+
+        match commanded.result {
+            engine::command_handler::CommandResult::SideEffectForceReconciled {
+                effect_id,
+                journal_id,
+                idempotency_request_id,
+            } => Ok(GqlSideEffectsForceReconcilePayload::Success(
+                GqlSideEffectsForceReconcileSuccess {
+                    side_effect_id: effect_id,
+                    journal_id,
+                    request_id: idempotency_request_id,
+                },
+            )),
             _ => Err(Error::new("INTERNAL: unexpected command result")),
         }
     }
@@ -5941,9 +6392,10 @@ impl MutationRoot {
         ctx: &Context<'_>,
         provider_session_id: String,
         cancellation_epoch: i64,
-        request_id: String,
+        caller_request_id: CallerRequestId,
     ) -> Result<GqlP083MarkProcessAbsentPayload> {
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
+        let request_id = caller_request_id.to_string();
 
         let principal = ctx
             .data::<auth::Principal>()
@@ -5978,13 +6430,15 @@ impl MutationRoot {
                 cancellation_epoch: epoch,
                 journal_id,
                 idempotency_request_id,
-            } => Ok(GqlP083MarkProcessAbsentPayload {
-                marked_absent: true,
-                provider_session_id: ps_id,
-                cancellation_epoch: epoch,
-                journal_id,
-                request_id: idempotency_request_id,
-            }),
+            } => Ok(GqlP083MarkProcessAbsentPayload::Success(
+                GqlP083MarkProcessAbsentSuccess {
+                    marked_absent: true,
+                    provider_session_id: ps_id,
+                    cancellation_epoch: epoch,
+                    journal_id,
+                    request_id: idempotency_request_id,
+                },
+            )),
             _ => Err(Error::new("INTERNAL: unexpected command result")),
         }
     }
@@ -7723,8 +8177,8 @@ mod tests {
     use chrono::Utc;
     use db::pool::create_pool;
     use db::repos::{
-        artifact_contracts, artifacts, audit_log, ideas, projections, rollout_contract_checks,
-        runs, stages, steward, workflow_conflicts,
+        artifact_contracts, artifacts, audit_log, ideas, projections, provider_sessions,
+        rollout_contract_checks, runs, stages, steward, workflow_conflicts,
     };
     use db::write_class::{ReplayPolicy, WriteClass, WriteLane, WriteOperation, WriteResult};
     use domain::artifact::{Artifact, ArtifactFormat};
@@ -7800,6 +8254,10 @@ mod tests {
             capability_id_for(MutationName::RejectApproval),
             domain::CapabilityToolId::ApprovalsResolve
         );
+        assert_eq!(
+            capability_id_for(MutationName::ApprovalsResolve),
+            domain::CapabilityToolId::ApprovalsResolve
+        );
     }
 
     #[tokio::test]
@@ -7816,6 +8274,8 @@ mod tests {
 
         assert!(sdl.contains("approveApproval("));
         assert!(sdl.contains("rejectApproval("));
+        assert!(sdl.contains("approvalsResolve("));
+        assert!(sdl.contains("enum ApprovalResolution"));
         for mutation in [
             "startRun(",
             "approveStage(",
@@ -7829,6 +8289,179 @@ mod tests {
                 "{mutation} must not be present on GraphQL MutationRoot"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn p083_graphql_sdl_exposes_caller_request_id_scalar_and_identity_hold_query() {
+        let pool = test_pool().await;
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let sdl = schema.sdl();
+
+        assert!(
+            sdl.contains("scalar CallerRequestId"),
+            "P083 lifecycle schema must expose CallerRequestId as a scalar"
+        );
+        assert!(
+            sdl.contains("type DenialPayload"),
+            "P083 lifecycle schema must expose shared DenialPayload"
+        );
+        assert!(
+            sdl.contains("enum DenialReason"),
+            "P083 lifecycle schema must expose shared DenialReason"
+        );
+        for union in [
+            "union RunsCancelPayload = RunsCancelSuccess | DenialPayload",
+            "union ApprovalsResolvePayload = ApprovalsResolveSuccess | DenialPayload",
+            "union ProviderSessionShutdownPayload = ProviderSessionShutdownSuccess | DenialPayload",
+            "union P083RollbackExecutionPayload = P083RollbackExecutionSuccess | DenialPayload",
+            "union P083SetEnforcementModePayload = P083SetEnforcementModeSuccess | DenialPayload",
+            "union RunsRetryPayload = RunsRetrySuccess | DenialPayload",
+            "union StagesRetryPayload = StagesRetrySuccess | DenialPayload",
+            "union SideEffectsForceReconcilePayload = SideEffectsForceReconcileSuccess | DenialPayload",
+        ] {
+            assert!(sdl.contains(union), "{union} missing from SDL");
+        }
+        for fragment in [
+            "runsCancel(",
+            "approvalsResolve(",
+            "providerSessionShutdown(",
+            "p083RollbackExecution(",
+            "p083SetEnforcementMode(",
+            "runsRetry(",
+            "stagesRetry(",
+            "sideEffectsForceReconcile(",
+            "p083MarkProviderSessionProcessAbsent(",
+        ] {
+            assert!(sdl.contains(fragment), "{fragment} missing from SDL");
+        }
+        assert!(
+            sdl.contains("callerRequestId: CallerRequestId!"),
+            "P083 lifecycle mutations must not fall back to plain String request ids"
+        );
+        assert!(
+            !sdl.contains("callerRequestId: String!"),
+            "P083 lifecycle mutations must use CallerRequestId, not String"
+        );
+        assert!(
+            sdl.contains("p083IdentityHoldSessions("),
+            "manual identity-check UI readback query must be in the schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn p083_identity_hold_sessions_query_returns_authoritative_redacted_readback() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+
+        let provider_session_id = "p083-held-session-1";
+        provider_sessions::insert(
+            &pool,
+            provider_session_id,
+            &run_id.to_string(),
+            None,
+            "claude",
+        )
+        .await
+        .unwrap();
+        provider_sessions::set_process_identity(
+            &pool,
+            provider_session_id,
+            4242,
+            "raw-process-start-identity",
+        )
+        .await
+        .unwrap();
+        provider_sessions::insert_cancellation_intent(
+            &pool,
+            provider_session_id,
+            7,
+            "operator_cancel",
+            1234,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            provider_sessions::hold_identity_ambiguous(&pool, provider_session_id, 7)
+                .await
+                .unwrap()
+        );
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query P083IdentityHoldSessions {{
+                      p083IdentityHoldSessions(runId: "{run_id}") {{
+                        providerSessionId
+                        providerName
+                        cancellationEpoch
+                        lastSeenPid
+                        processStartIdentityHash
+                        liveProbeStatus
+                        liveProbeDetail
+                        latestReceiptId
+                        reasonDetail
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "identity hold query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let sessions = json["p083IdentityHoldSessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(
+            session["providerSessionId"],
+            serde_json::json!(provider_session_id)
+        );
+        assert_eq!(session["providerName"], serde_json::json!("claude"));
+        assert_eq!(session["cancellationEpoch"], serde_json::json!(7));
+        assert_eq!(session["lastSeenPid"], serde_json::json!(4242));
+        assert_eq!(
+            session["reasonDetail"],
+            serde_json::json!("operator_cancel")
+        );
+        let identity_ref = session["processStartIdentityHash"].as_str().unwrap();
+        assert_eq!(identity_ref.len(), 64);
+        assert_ne!(identity_ref, "raw-process-start-identity");
+        assert!(
+            matches!(
+                session["liveProbeStatus"].as_str(),
+                Some("match" | "mismatch" | "absent" | "unverifiable")
+            ),
+            "identity hold readback must include bounded live probe status: {session:?}"
+        );
+        let probe_detail = session["liveProbeDetail"].as_str().unwrap();
+        assert!(
+            !probe_detail.is_empty(),
+            "identity hold readback must include live probe detail"
+        );
     }
 
     #[tokio::test]

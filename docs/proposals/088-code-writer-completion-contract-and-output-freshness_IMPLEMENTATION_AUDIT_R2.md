@@ -300,11 +300,11 @@ Evidence: Receipts improve debug data for completed result paths. The missing P0
 
 ### REL-001 / CHAINWORKS-001: P087 active handoff can still miss P088 entirely
 
-Reviewer: `rust_reliability_reviewer`, `chainworks_execution_truth_reviewer`  
-Severity: Critical  
-Confidence: High  
-Related requirements: REQ-001, REQ-004, REQ-017, REQ-022  
-Evidence types: proposal, code, tests-found, tests-run  
+Reviewer: `rust_reliability_reviewer`, `chainworks_execution_truth_reviewer`
+Severity: Critical
+Confidence: High
+Related requirements: REQ-001, REQ-004, REQ-017, REQ-022
+Evidence types: proposal, code, tests-found, tests-run
 Evidence references: proposal lines 271-317 and 1011; `executor.rs:4430-4468`, `executor.rs:4837-4868`, `executor.rs:6053-6078`; `scripts/test-gate.sh:6190-6275`
 
 Why it matters: The proposal exists to close the active completion-handoff gap, especially P087-like `implementation_active` attempts where useful work exists but outputs never settle. The current implementation records P088 evidence only after `acp.execute(...)` returns a normal result and the import path runs. Provider timeout/no-terminal-response paths return through error/runtime-facts handling before post-fingerprint capture, receipt creation, and completion readback. The 70c9 canary is represented as a JSON fixture, not as executed settlement behavior.
@@ -319,11 +319,11 @@ Acceptance criteria:
 
 ### API-001: Public readback contract is the wrong shape
 
-Reviewer: `api_contract_reviewer`  
-Severity: Major  
-Confidence: High  
-Related requirements: REQ-014, REQ-015, REQ-022  
-Evidence types: proposal, code, tests-found, tests-run  
+Reviewer: `api_contract_reviewer`
+Severity: Major
+Confidence: High
+Related requirements: REQ-014, REQ-015, REQ-022
+Evidence types: proposal, code, tests-found, tests-run
 Evidence references: proposal lines 778-863; `graphql-server/src/types/run.rs:68-69`, `graphql-server/src/types/run.rs:210-242`; `mcp-server/src/tools/runs.rs:825-840`; `mcp-server/src/tools/reports.rs:78-104`, `mcp-server/src/tools/reports.rs:649-660`
 
 Why it matters: Operators and clients were promised a stable additive `implementationCompletion` summary with closed known values and forward-compatible unknown handling. Instead GraphQL and MCP expose raw `code_writer_completion_receipts` arrays with unwrapped strings. The seeded tests even assert an unknown future string round-trips as a raw value, which contradicts the required GraphQL `UNKNOWN` fallback or string-preserving wrapper and MCP/run-report `known=false` metadata.
@@ -338,11 +338,11 @@ Acceptance criteria:
 
 ### REL-002: Receipt persistence is not the atomic replay-safe owner promised by P088
 
-Reviewer: `rust_reliability_reviewer`, `observability_rollout_reviewer`, `chainworks_execution_truth_reviewer`  
-Severity: Major  
-Confidence: High  
-Related requirements: REQ-005, REQ-009, REQ-012, REQ-022  
-Evidence types: proposal, migration, code  
+Reviewer: `rust_reliability_reviewer`, `observability_rollout_reviewer`, `chainworks_execution_truth_reviewer`
+Severity: Major
+Confidence: High
+Related requirements: REQ-005, REQ-009, REQ-012, REQ-022
+Evidence types: proposal, migration, code
 Evidence references: proposal lines 717-729; migration lines 65-144; `code_writer_completion_receipts.rs:11-31`, `code_writer_completion_receipts.rs:34-155`; `executor.rs:5137-5172`, `executor.rs:8547-8715`
 
 Why it matters: P088 requires the completion receipt, text captures, output decisions, prompt-level runtime links, agent execution linkage, and artifact-contract projection to land in one DB transaction, with crash-safe partial-write behavior. Current code writes repair runtime receipts separately, writes completion text artifacts before DB upsert, persists receipts in an isolated repository transaction, has no `agent_executions` completion receipt FK/link, and leaves receipt/failed-stage artifact paths unset. Replay conflict detection checks only id and output decisions, allowing receipt and text-capture drift to overwrite prior evidence.
@@ -358,11 +358,11 @@ Acceptance criteria:
 
 ### API-002 / REL-003: Completion text evidence vocabulary is incomplete and storage failures are hidden
 
-Reviewer: `api_contract_reviewer`, `rust_reliability_reviewer`  
-Severity: Major  
-Confidence: High  
-Related requirements: REQ-010, REQ-011  
-Evidence types: proposal, code  
+Reviewer: `api_contract_reviewer`, `rust_reliability_reviewer`
+Severity: Major
+Confidence: High
+Related requirements: REQ-010, REQ-011
+Evidence types: proposal, code
 Evidence references: proposal lines 511-549; `acp/src/lib.rs:315-351`; `acp/src/transport.rs:1032-1068`; `executor.rs:8571-8591`, `executor.rs:8806-8831`
 
 Why it matters: Completion text diagnostics are intended to make missing transcripts non-blocking for investigation. The implementation captures useful text in happy paths, but its status/source/absence vocabularies do not match the public contract: no `redacted_only`, no `session_update_stream`, no required absence reasons such as `provider_did_not_emit_text`, `redaction_failed`, or `storage_write_failed`. Artifact write errors are swallowed via `.ok().flatten()`, so a storage failure can degrade into missing paths rather than a typed absence reason.
@@ -378,11 +378,11 @@ Acceptance criteria:
 
 ### OPS-001: The P088 gate passes while not proving the documented contract
 
-Reviewer: `observability_rollout_reviewer`  
-Severity: Major  
-Confidence: High  
-Related requirements: REQ-014, REQ-017, REQ-021, REQ-022  
-Evidence types: config, tests-found, tests-run  
+Reviewer: `observability_rollout_reviewer`
+Severity: Major
+Confidence: High
+Related requirements: REQ-014, REQ-017, REQ-021, REQ-022
+Evidence types: config, tests-found, tests-run
 Evidence references: `docs/reference/test-gates.md:1894-1908`; `scripts/test-gate.sh:6190-6275`; GraphQL/MCP P088 tests
 
 Why it matters: `docs/reference/test-gates.md` says the gate covers GraphQL/MCP/run-report `implementationCompletion` parity, but the tests only assert raw receipt exposure. The static fixture checks validate JSON seeds, not that the P087 active handoff is terminalized into runtime P088 diagnosis. This creates a false readiness signal: the gate passed in this audit, but the implementation is still missing major proposal commitments.
@@ -397,11 +397,11 @@ Acceptance criteria:
 
 ### ARCH-001: Worktree fingerprint edge cases can turn inherited deletes/renames into current-attempt work
 
-Reviewer: `rust_arch_reviewer`, `rust_reliability_reviewer`  
-Severity: Minor  
-Confidence: Medium  
-Related requirements: REQ-003, REQ-004, REQ-013  
-Evidence types: code  
+Reviewer: `rust_arch_reviewer`, `rust_reliability_reviewer`
+Severity: Minor
+Confidence: Medium
+Related requirements: REQ-003, REQ-004, REQ-013
+Evidence types: code
 Evidence references: proposal lines 342-359; `worktree_fingerprint.rs:183-209`, `worktree_fingerprint.rs:349-356`
 
 Why it matters: The classifier checks `entry.is_renamed` and `entry.is_deleted` before comparing to the baseline. A file already deleted or renamed before the original prompt can therefore be counted as `DeletedAfterPrompt` or `RenamedAfterPrompt` in the post fingerprint, which contributes to `current_attempt_changed_path_count`. That weakens the core current-attempt vs inherited-dirty boundary.

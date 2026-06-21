@@ -1,8 +1,8 @@
-# Recovery and Retry State-Machine Test Matrix (P082)
+# Recovery and Retry State-Machine Test Matrix
 
 ## Introduction
 
-P082 establishes the single authoritative recovery/retry state-machine matrix and its associated proof gate for Chainworks Forge. Before this document, recovery fixes across P045, P065, P076, and P080 addressed the same fault zone independently—restart-mid-command, stale execution truth, duplicate mediation, late output, and ACP startup recovery—without a shared matrix that every recovery change must extend.
+This reference is the single authoritative recovery/retry state-machine matrix and proof gate for Chainworks Forge. Recovery fixes across restart-mid-command, stale execution truth, duplicate mediation, late output, ACP startup recovery, and cancellation must use this matrix as the shared contract.
 
 This reference defines:
 
@@ -15,10 +15,10 @@ This reference defines:
 - the late-output quarantine semantics;
 - the approval restart, cancellation, and startup-requeue-exhausted semantics;
 - the long-held observability thresholds;
-- the live-principal authorization boundary for P082 operator-only diagnostics;
+- the live-principal authorization boundary for recovery operator-only diagnostics;
 - the gate ownership.
 
-**Rule**: Future recovery behavior changes must add or update matrix rows before the behavior change lands. No recovery mutation may ship without a corresponding row in this document.
+**Rule**: Recovery behavior changes add or update matrix rows before the behavior change lands. No recovery mutation may ship without a corresponding row in this document.
 
 ---
 
@@ -370,9 +370,9 @@ Provider subprocess cleanup evidence must be tied to durable `session_generation
 
 ## Swift/macOS Boundary
 
-The app-local `RecoveryCoordinator.swift` is **not** the P082 authority. P082 is implemented entirely in the Rust control-plane engine and exposed through the MCP northbound surface. The Swift app reads recovery readbacks as projections; it does not own recovery decisions.
+The app-local `RecoveryCoordinator.swift` is **not** the recovery-matrix authority. The matrix is implemented in the Rust control-plane engine and exposed through the MCP northbound surface. The Swift app reads recovery readbacks as projections; it does not own recovery decisions.
 
-Future UI integration requires a separate proposal. Prerequisites for that proposal include:
+Any later UI integration requires a separate proposal. Prerequisites include:
 
 - Reason-code display names and severity levels
 - `ForgeStatusColor` mappings for each reason code
@@ -402,7 +402,7 @@ The code owner for the P082 startup grace values is `control-plane/crates/domain
 
 ## Dependency Audit Pinned Risk
 
-`proposal-082` records dependency-audit availability as a gate-owned concern. When `cargo audit` or `cargo deny` is available in the local Rust toolchain, operators should run it before sign-off. If those tools are unavailable in the execution environment, the accepted pinned-risk item is the workflow parser dependency chain `serde_yaml` -> `unsafe-libyaml`: it remains present because workflow and agent catalog files are YAML contracts, and replacement requires a separate parser migration slice with fixture parity. This pinned-risk acceptance must stay visible in this document until advisory monitoring or a replacement parser lands.
+The retained `proposal-082` gate records dependency-audit availability as a gate-owned concern. When `cargo audit` or `cargo deny` is available in the local Rust toolchain, operators run it before sign-off. If those tools are unavailable in the execution environment, the accepted pinned-risk item is the workflow parser dependency chain `serde_yaml` -> `unsafe-libyaml`: it remains present because workflow and agent catalog files are YAML contracts, and replacement requires a separate parser migration slice with fixture parity. This pinned-risk acceptance stays visible in this document until advisory monitoring or a replacement parser lands.
 
 ---
 
@@ -426,4 +426,4 @@ Active tests for gate passage:
 - `p082_recovery_matrix_gate_result_total{scenario_id,status}` is gate-harness telemetry and must be emitted by the retained DB harness test after scenario assertion groups. Runtime readback accessors emit readback and state-age telemetry, not gate-result counts.
 - The P082 Python static checklist runs inside `scripts/test-gate.sh` before the focused Rust suites. It validates the reference matrix, positive fixture, all 16 negative fixtures, source-wiring expectations, metric ownership, and required proof-test names. Provider cleanup proof remains required by the matrix semantics and is covered by focused Rust tests.
 
-Future recovery proposals must add or update matrix rows before the behavior change lands. PRs that change recovery behavior without a corresponding matrix row update will fail the `proposal-082` gate.
+Recovery proposals and implementation PRs add or update matrix rows before the behavior change lands. PRs that change recovery behavior without a corresponding matrix row update fail the retained `proposal-082` gate.

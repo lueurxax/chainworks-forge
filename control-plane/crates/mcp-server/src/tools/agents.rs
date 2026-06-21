@@ -1,6 +1,6 @@
 use anyhow::Result;
 use sha2::{Digest, Sha256};
-use sqlx::{Row, SqlitePool};
+use sqlx::SqlitePool;
 use std::collections::BTreeMap;
 
 use crate::protocol::McpTool;
@@ -17,6 +17,88 @@ const MAX_IDEMPOTENCY_KEY_LEN: usize = 256;
 const MAX_OPERATOR_INSTRUCTION_LEN: usize = 8_000;
 const MAX_BLOCKER_LEN: usize = 1_000;
 const MAX_BLOCKERS: usize = 20;
+
+fn attach_receipt_get_output_schema() -> serde_json::Value {
+    serde_json::json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["outcome", "continuation_id", "run_id", "attach_receipt_artifact_id", "receipt"],
+                "properties": {
+                    "outcome": { "type": "string", "const": "ok" },
+                    "continuation_id": { "type": "string" },
+                    "run_id": { "type": "string" },
+                    "attach_receipt_artifact_id": { "type": "string" },
+                    "receipt": { "type": "object" }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "outcome", "schema_version",
+                    "failure_class", "resurrection_phase",
+                    "attach_started_at", "attach_completed_at",
+                    "output_only", "source_edit_allowance",
+                    "changed_source_files_count", "orphan_reap_verified",
+                    "identity_proof_source"
+                ],
+                "properties": {
+                    "outcome": { "type": "string", "const": "reviewer_projection" },
+                    "schema_version": { "type": "integer" },
+                    "failure_class": { "type": ["string", "null"] },
+                    "resurrection_phase": { "type": ["string", "null"] },
+                    "attach_started_at": { "type": ["string", "null"] },
+                    "attach_completed_at": { "type": ["string", "null"] },
+                    "output_only": { "type": ["boolean", "null"] },
+                    "source_edit_allowance": { "type": ["boolean", "null"] },
+                    "changed_source_files_count": { "type": ["integer", "null"], "minimum": 0 },
+                    "orphan_reap_verified": { "type": "boolean" },
+                    "identity_proof_source": { "type": ["string", "null"] }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["outcome", "attach_receipt_artifact_present", "resurrection_phase"],
+                "properties": {
+                    "outcome": { "type": "string", "const": "redacted" },
+                    "attach_receipt_artifact_present": { "type": "boolean" },
+                    "resurrection_phase": { "type": ["string", "null"] }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["outcome", "error"],
+                "properties": {
+                    "outcome": { "type": "string", "enum": ["not_found", "error"] },
+                    "error": {
+                        "type": "object",
+                        "required": ["code", "message", "data"],
+                        "properties": {
+                            "code": { "type": "integer" },
+                            "message": { "type": "string" },
+                            "data": { "type": "object" }
+                        }
+                    }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["outcome", "message"],
+                "properties": {
+                    "outcome": { "type": "string", "const": "not_available" },
+                    "message": { "type": "string" },
+                    "continuation_id": { "type": "string" },
+                    "mode": { "type": "string" }
+                }
+            }
+        ]
+    })
+}
 
 pub fn tool_specs() -> Vec<McpTool> {
     vec![
@@ -82,7 +164,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "required": ["continuation_id", "run_id"],
                 "additionalProperties": false
             }),
-            output_schema: None,
+            output_schema: Some(attach_receipt_get_output_schema()),
         },
         McpTool {
             name: "agents.continue_work".to_string(),
@@ -90,6 +172,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "P086: Issue a continuation command for an eligible code_writer AgentExecution. ",
                 "Phase 2+: live_handle_continuation is enabled for operator_mcp trigger. ",
                 "provider_session_resurrection requires Phase 4 adapter enablement. ",
+                "output_only_recovery forbids source edits and repairs required outputs only. ",
                 "lead_auto requires Phase 3 enablement with decision artifact validation."
             )
             .to_string(),
@@ -123,12 +206,12 @@ pub fn tool_specs() -> Vec<McpTool> {
                     },
                     "continuation_mode": {
                         "type": "string",
-                        "enum": ["live_handle_continuation", "provider_session_resurrection"],
+                        "enum": ["live_handle_continuation", "provider_session_resurrection", "output_only_recovery"],
                         "description": "Continuation mode. This is the canonical P086 external field."
                     },
                     "mode": {
                         "type": "string",
-                        "enum": ["live_handle_continuation", "provider_session_resurrection"],
+                        "enum": ["live_handle_continuation", "provider_session_resurrection", "output_only_recovery"],
                         "description": "Deprecated compatibility alias for continuation_mode."
                     },
                     "trigger_kind": {
@@ -199,13 +282,14 @@ pub async fn execute(
     params: serde_json::Value,
     pool: &SqlitePool,
     principal: &auth::Principal,
+    acp_runtime: Option<&acp::AcpRuntimeManager>,
 ) -> Result<serde_json::Value> {
     match tool_name {
         "agents.continuation_status" => handle_continuation_status(&params, pool, principal).await,
         "agents.continuation_candidates" => {
             handle_continuation_candidates(&params, pool, principal).await
         }
-        "agents.continue_work" => handle_continue_work(&params, pool, principal).await,
+        "agents.continue_work" => handle_continue_work(&params, pool, principal, acp_runtime).await,
         "agents.attach_receipt.get" => handle_attach_receipt_get(&params, pool, principal).await,
         _ => Err(anyhow::anyhow!("Unknown agents tool: {tool_name}")),
     }
@@ -226,6 +310,7 @@ fn redacted_record(r: &domain::continuation::ContinuationRecord) -> serde_json::
         "status": r.status,
         "failure_reason": r.failure_reason,
         "reconciliation_status": r.reconciliation_status,
+        "resurrection_phase": r.resurrection_phase,
         "request_fingerprint_sha256": r.request_fingerprint_sha256,
         "canonical_request_artifact_id": r.canonical_request_artifact_id,
         "attach_receipt_artifact_id": r.attach_receipt_artifact_id,
@@ -270,6 +355,7 @@ fn continuation_status_schema() -> serde_json::Value {
                     "mode": {"type": "string"},
                     "trigger_kind": {"type": "string"},
                     "request_fingerprint_sha256": {"type": "string"},
+                    "resurrection_phase": {"type": ["string", "null"]},
                     "created_at": {"type": "string"},
                     "updated_at": {"type": "string"}
                 }
@@ -423,7 +509,7 @@ async fn handle_attach_receipt_get(
         .ok_or_else(|| anyhow::anyhow!("Missing continuation_id"))?;
     let Some(requested_run_id) = params["run_id"].as_str() else {
         return Ok(serde_json::json!({
-            "outcome": "rejected",
+            "outcome": "error",
             "error": {
                 "code": -32001,
                 "message": "auth_failure: run_id is required for provider session attach receipt access",
@@ -433,12 +519,62 @@ async fn handle_attach_receipt_get(
     };
     let now = chrono::Utc::now().to_rfc3339();
     let audit_id = uuid::Uuid::new_v4().to_string();
+    let context = db::repos::p086_resurrection_raw_receipts::continuation_receipt_readback_context(
+        pool,
+        continuation_id,
+    )
+    .await?;
 
     // Unauthenticated requests are rejected by the MCP auth layer before reaching here.
+    // All principal classes must pass the same run-scope check before any projection
+    // is returned; otherwise wrong-run requests become an existence oracle.
+    let actual_run_id = context.as_ref().map(|ctx| ctx.run_id.clone());
+    let matches_requested_run = actual_run_id
+        .as_deref()
+        .map(|actual| actual == requested_run_id)
+        .unwrap_or(false);
+    if !matches_requested_run {
+        let principal_class = match principal.class {
+            auth::PrincipalClass::Operator => "operator",
+            auth::PrincipalClass::Observer | auth::PrincipalClass::ReadOnlyOperator => "observer",
+            auth::PrincipalClass::Agent => "agent",
+        };
+        let _ = db::repos::p086_resurrection_raw_receipts::record_access_audit(
+            pool,
+            &db::repos::p086_resurrection_raw_receipts::ReceiptAccessAuditRow {
+                id: audit_id,
+                principal_id: principal.id.clone(),
+                principal_class: principal_class.to_string(),
+                continuation_id: continuation_id.to_string(),
+                run_id: requested_run_id.to_string(),
+                requested_at: now,
+                source_channel: "mcp".to_string(),
+                outcome: "denied".to_string(),
+                denial_reason: Some("wrong_run_or_not_found".to_string()),
+            },
+        )
+        .await;
+        return Ok(serde_json::json!({
+            "outcome": "error",
+            "error": {
+                "code": -32001,
+                "message": "auth_failure: run_id does not match or continuation not found",
+                "data": { "failure_reason": "auth_failure" }
+            }
+        }));
+    }
+
     // Agent (Guest) principal gets minimal projection only — no raw receipt access.
     if matches!(principal.class, auth::PrincipalClass::Agent) {
         // Return minimal: continuation existence + resurrection_phase (no raw data).
-        let resurrection_phase = fetch_resurrection_phase(pool, continuation_id).await?;
+        let resurrection_phase = context
+            .as_ref()
+            .and_then(|ctx| ctx.resurrection_phase.clone());
+        let attach_receipt_artifact_present = context
+            .as_ref()
+            .and_then(|ctx| ctx.attach_receipt_artifact_id.as_deref())
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
         let _ = db::repos::p086_resurrection_raw_receipts::record_access_audit(
             pool,
             &db::repos::p086_resurrection_raw_receipts::ReceiptAccessAuditRow {
@@ -455,50 +591,13 @@ async fn handle_attach_receipt_get(
         )
         .await;
         return Ok(serde_json::json!({
-            "principal_class": "agent",
-            "continuation_id": continuation_id,
-            "resurrection_phase": resurrection_phase,
-            "access_level": "minimal"
+            "outcome": "redacted",
+            "attach_receipt_artifact_present": attach_receipt_artifact_present,
+            "resurrection_phase": resurrection_phase
         }));
     }
 
-    // Look up which run owns this continuation (needed for run-scope authorization).
-    let actual_run_id =
-        db::repos::p086_resurrection_raw_receipts::continuation_run_id(pool, continuation_id)
-            .await?;
-
-    // Operator principals: verify run scope. Wrong-run returns auth_failure (no existence oracle).
     if matches!(principal.class, auth::PrincipalClass::Operator) {
-        let matches = actual_run_id
-            .as_deref()
-            .map(|actual| actual == requested_run_id)
-            .unwrap_or(false);
-        if !matches {
-            let _ = db::repos::p086_resurrection_raw_receipts::record_access_audit(
-                pool,
-                &db::repos::p086_resurrection_raw_receipts::ReceiptAccessAuditRow {
-                    id: audit_id,
-                    principal_id: principal.id.clone(),
-                    principal_class: "operator".to_string(),
-                    continuation_id: continuation_id.to_string(),
-                    run_id: requested_run_id.to_string(),
-                    requested_at: now,
-                    source_channel: "mcp".to_string(),
-                    outcome: "denied".to_string(),
-                    denial_reason: Some("wrong_run_or_not_found".to_string()),
-                },
-            )
-            .await;
-            return Ok(serde_json::json!({
-                "outcome": "rejected",
-                "error": {
-                    "code": -32001,
-                    "message": "auth_failure: run_id does not match or continuation not found",
-                    "data": { "failure_reason": "auth_failure" }
-                }
-            }));
-        }
-
         // Operator with matching run_id → return full raw receipt.
         let raw = db::repos::p086_resurrection_raw_receipts::find_by_continuation_id(
             pool,
@@ -515,7 +614,7 @@ async fn handle_attach_receipt_get(
                         principal_id: principal.id.clone(),
                         principal_class: "operator".to_string(),
                         continuation_id: continuation_id.to_string(),
-                        run_id: run_id_for_audit,
+                        run_id: run_id_for_audit.clone(),
                         requested_at: now,
                         source_channel: "mcp".to_string(),
                         outcome: "raw_read".to_string(),
@@ -526,9 +625,13 @@ async fn handle_attach_receipt_get(
                 let raw_json: serde_json::Value =
                     serde_json::from_str(&row.raw_receipt_json).unwrap_or(serde_json::json!({}));
                 Ok(serde_json::json!({
-                    "principal_class": "operator",
-                    "access_level": "raw",
+                    "outcome": "ok",
                     "continuation_id": continuation_id,
+                    "run_id": run_id_for_audit,
+                    "attach_receipt_artifact_id": context
+                        .as_ref()
+                        .and_then(|ctx| ctx.attach_receipt_artifact_id.clone())
+                        .unwrap_or_default(),
                     "receipt": raw_json
                 }))
             }
@@ -550,7 +653,11 @@ async fn handle_attach_receipt_get(
                 .await;
                 Ok(serde_json::json!({
                     "outcome": "not_found",
-                    "continuation_id": continuation_id
+                    "error": {
+                        "code": -32004,
+                        "message": "provider session attach receipt not found or access denied",
+                        "data": { "failure_reason": "not_found_or_access_denied" }
+                    }
                 }))
             }
         }
@@ -581,36 +688,18 @@ async fn handle_attach_receipt_get(
             Some(row) => {
                 let raw_json: serde_json::Value =
                     serde_json::from_str(&row.raw_receipt_json).unwrap_or(serde_json::json!({}));
-                let redacted = reviewer_redact_receipt(&raw_json);
-                Ok(serde_json::json!({
-                    "principal_class": "observer",
-                    "access_level": "reviewer_redacted",
-                    "continuation_id": continuation_id,
-                    "receipt": redacted
-                }))
+                Ok(reviewer_attach_receipt_projection(&raw_json))
             }
             None => Ok(serde_json::json!({
                 "outcome": "not_found",
-                "continuation_id": continuation_id
+                "error": {
+                    "code": -32004,
+                    "message": "provider session attach receipt not found or access denied",
+                    "data": { "failure_reason": "not_found_or_access_denied" }
+                }
             })),
         }
     }
-}
-
-/// Fetch resurrection_phase from agent_work_continuations for minimal projections.
-async fn fetch_resurrection_phase(
-    pool: &SqlitePool,
-    continuation_id: &str,
-) -> Result<Option<String>> {
-    let row = sqlx::query("SELECT resurrection_phase FROM agent_work_continuations WHERE id = ?1")
-        .bind(continuation_id)
-        .fetch_optional(pool)
-        .await?;
-    Ok(row.and_then(|r| {
-        r.try_get::<Option<String>, _>("resurrection_phase")
-            .ok()
-            .flatten()
-    }))
 }
 
 /// Build reviewer-redacted projection of a raw receipt JSON.
@@ -637,6 +726,7 @@ fn reviewer_redact_receipt(raw: &serde_json::Value) -> serde_json::Value {
         "managed_process_group_id",
         "managed_child_process_group_id",
         "managed_child_start_time",
+        "session_store_transcript_path",
     ];
     // Fields whose values are replaced with prefix+hash to redact provider session ids.
     const SESSION_ID_FIELDS: &[&str] = &[
@@ -674,6 +764,22 @@ fn reviewer_redact_receipt(raw: &serde_json::Value) -> serde_json::Value {
         out.insert(k.clone(), v.clone());
     }
     serde_json::Value::Object(out)
+}
+
+fn reviewer_attach_receipt_projection(raw: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "outcome": "reviewer_projection",
+        "schema_version": raw.get("schema_version").and_then(serde_json::Value::as_i64).unwrap_or(2),
+        "failure_class": raw.get("failure_class").cloned().unwrap_or(serde_json::Value::Null),
+        "resurrection_phase": raw.get("resurrection_phase").cloned().unwrap_or(serde_json::Value::Null),
+        "attach_started_at": raw.get("attach_started_at").cloned().unwrap_or(serde_json::Value::Null),
+        "attach_completed_at": raw.get("attach_completed_at").cloned().unwrap_or(serde_json::Value::Null),
+        "output_only": raw.get("output_only").cloned().unwrap_or(serde_json::Value::Null),
+        "source_edit_allowance": raw.get("source_edit_allowance").cloned().unwrap_or(serde_json::Value::Null),
+        "changed_source_files_count": raw.get("changed_source_files_count").cloned().unwrap_or(serde_json::Value::Null),
+        "orphan_reap_verified": raw.get("orphan_reap_verified").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        "identity_proof_source": raw.get("identity_proof_source").cloned().unwrap_or(serde_json::Value::Null)
+    })
 }
 
 /// Compute canonical request fingerprint: SHA-256 of sorted-key JSON (BTreeMap ensures ordering),
@@ -1097,8 +1203,17 @@ fn forbidden_stage_kind(
     for (needle, reason) in [
         ("release", "release"),
         ("publish", "publish"),
+        ("commit", "commit"),
         ("git_push", "git_push"),
         ("git-push", "git_push"),
+        ("push", "push"),
+        ("security", "security"),
+        ("prepush_review", "prepush_review"),
+        ("prepush-review", "prepush_review"),
+        ("prepush review", "prepush_review"),
+        ("lead_orchestration", "lead_orchestration"),
+        ("lead-orchestration", "lead_orchestration"),
+        ("lead orchestration", "lead_orchestration"),
         ("upload", "upload"),
         ("distribution", "distribution"),
         ("distribute", "distribution"),
@@ -1111,16 +1226,24 @@ fn forbidden_stage_kind(
     None
 }
 
-fn provider_session_resurrection_adapter_supported(provider: Option<&str>) -> bool {
+async fn provider_session_resurrection_adapter_supported(
+    provider: Option<&str>,
+    acp_runtime: Option<&acp::AcpRuntimeManager>,
+) -> bool {
     let Some(provider) = provider else {
         return false;
     };
-    match provider {
-        // Adapter support is intentionally fail-closed until the provider can
-        // prove requested-session attachment before prompt send.
-        "claude" | "claude_acp" | "claude_code" | "codex" | "gemini" | "auggie" | "junie" => false,
-        _ => false,
-    }
+    let Some(acp_runtime) = acp_runtime else {
+        return false;
+    };
+    acp_runtime
+        .provider_session_resurrection_capability(provider)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|capability| {
+            capability.attach_resume_supported && capability.identity_proof_supported
+        })
 }
 
 fn continuation_capability_rejection(
@@ -1238,6 +1361,76 @@ fn continuation_capability_rejection(
                     "data": {
                         "agent_execution_id": agent_execution_id,
                         "failure_reason": "live_session_required"
+                    }
+                }
+            })));
+        }
+    }
+    if mode == "output_only_recovery" {
+        let output_only = &capability["output_only_recovery"];
+        let output_only_enabled = output_only["enabled"].as_bool() == Some(true);
+        if !output_only_enabled {
+            return Ok(Some(serde_json::json!({
+                "outcome": "rejected",
+                "error": {
+                    "code": -32033,
+                    "message": "output_only_recovery is disabled by code_writer continuation_capability",
+                    "data": {
+                        "agent_execution_id": agent_execution_id,
+                        "failure_reason": "output_only_recovery_disabled"
+                    }
+                }
+            })));
+        }
+        let output_only_trigger_allowed = output_only["allowed_triggers"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(trigger_kind)));
+        if !output_only_trigger_allowed {
+            return Ok(Some(serde_json::json!({
+                "outcome": "rejected",
+                "error": {
+                    "code": -32033,
+                    "message": "trigger_kind is not allowed by output_only_recovery capability",
+                    "data": {
+                        "agent_execution_id": agent_execution_id,
+                        "trigger_kind": trigger_kind,
+                        "failure_reason": "output_only_recovery_trigger_not_allowed"
+                    }
+                }
+            })));
+        }
+        let require_live_session = output_only["require_live_session"]
+            .as_bool()
+            .unwrap_or(true);
+        let resurrection = &capability["provider_session_resurrection"];
+        let output_only_can_resurrect = resurrection["enabled"].as_bool() == Some(true)
+            && provider_session_id_present
+            && provider_session_resurrection_supported;
+        if require_live_session && !live_session_present && !output_only_can_resurrect {
+            return Ok(Some(serde_json::json!({
+                "outcome": "rejected",
+                "error": {
+                    "code": -32034,
+                    "message": "output_only_recovery requires a live session or a supported provider-session resurrection target",
+                    "data": {
+                        "agent_execution_id": agent_execution_id,
+                        "failure_reason": "live_session_required"
+                    }
+                }
+            })));
+        }
+        if output_only["source_edit_allowance"]
+            .as_bool()
+            .unwrap_or(false)
+        {
+            return Ok(Some(serde_json::json!({
+                "outcome": "rejected",
+                "error": {
+                    "code": -32033,
+                    "message": "output_only_recovery must forbid source edits unless a separate operator override is implemented",
+                    "data": {
+                        "agent_execution_id": agent_execution_id,
+                        "failure_reason": "output_only_source_edit_allowance_not_supported"
                     }
                 }
             })));
@@ -1430,8 +1623,6 @@ async fn verify_lead_auto_artifacts(
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     const ELOOP_ERRNO: i32 = -1; // unused
 
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt as _;
     use tokio::io::AsyncReadExt as _;
 
     let mut open_opts = tokio::fs::OpenOptions::new();
@@ -1621,6 +1812,7 @@ async fn handle_continue_work(
     params: &serde_json::Value,
     pool: &SqlitePool,
     principal: &auth::Principal,
+    acp_runtime: Option<&acp::AcpRuntimeManager>,
 ) -> Result<serde_json::Value> {
     // P086-SEC-MED-001 server-side additionalProperties=false enforcement.
     // The MCP tool schema declares additionalProperties=false; mirror that here so unknown
@@ -1789,13 +1981,13 @@ async fn handle_continue_work(
     // relying on SQLite CHECK constraint failures.
     if !matches!(
         mode,
-        "live_handle_continuation" | "provider_session_resurrection"
+        "live_handle_continuation" | "provider_session_resurrection" | "output_only_recovery"
     ) {
         return Ok(serde_json::json!({
             "outcome": "rejected",
             "error": {
                 "code": -32027,
-                "message": "mode must be live_handle_continuation or provider_session_resurrection",
+                "message": "mode must be live_handle_continuation, provider_session_resurrection, or output_only_recovery",
                 "data": { "failure_reason": "invalid_mode", "mode": mode }
             }
         }));
@@ -2170,7 +2362,9 @@ async fn handle_continue_work(
             info.provider_family
                 .as_deref()
                 .or(Some(info.provider.as_str())),
-        ),
+            acp_runtime,
+        )
+        .await,
     )? {
         if mode == "provider_session_resurrection"
             && rejection["error"]["data"]["failure_reason"].as_str()
@@ -2326,8 +2520,8 @@ async fn handle_continue_work(
     .await?
     {
         // Strict schema compliance (additionalProperties=false): only declared fields are returned.
-        // Extra fields (run_id, mode, command_journal_id, created_at) are omitted from the
-        // wire response; they remain in the durable agent_work_continuations row.
+        // run_id/mode/created_at stay in durable readback; journal_id is surfaced so the
+        // shared MCP idempotency layer can link the committed response to the command journal.
         AtomicAdmissionOutcome::Accepted => {
             // P086 Phase 2: enqueue the background worker work item.
             // Non-fatal: if enqueue fails, the admission-timeout sweeper will
@@ -2362,6 +2556,7 @@ async fn handle_continue_work(
                 "outcome": "accepted",
                 "continuation_id": continuation_id,
                 "status": "accepted",
+                "journal_id": command_journal_id,
                 "request_fingerprint_sha256": fingerprint
             }))
         }
@@ -2370,6 +2565,7 @@ async fn handle_continue_work(
             "outcome": "replay",
             "continuation_id": existing.id,
             "status": existing.status,
+            "journal_id": existing.command_journal_id,
             "request_fingerprint_sha256": fingerprint
         })),
 
@@ -2477,6 +2673,10 @@ mod tests {
                 .any(|value| value.as_str() == Some("run_id")),
             "run_id must be required for run-scoped raw attach receipt access"
         );
+        assert!(
+            tool.output_schema.is_some(),
+            "agents.attach_receipt.get must publish the P086 response contract"
+        );
     }
 
     #[tokio::test]
@@ -2488,11 +2688,12 @@ mod tests {
             serde_json::json!({ "continuation_id": "known-continuation-id" }),
             &pool,
             &principal,
+            None,
         )
         .await
         .expect("runtime rejection should be a structured tool response");
 
-        assert_eq!(result["outcome"], "rejected");
+        assert_eq!(result["outcome"], "error");
         assert_eq!(result["error"]["data"]["failure_reason"], "auth_failure");
         assert!(
             result["error"]["message"]
@@ -2501,6 +2702,205 @@ mod tests {
                 .contains("run_id is required"),
             "missing run_id must be explicit in the denial: {result:?}"
         );
+    }
+
+    async fn attach_receipt_test_pool() -> SqlitePool {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("../db/migrations").run(&pool).await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool
+    }
+
+    async fn seed_attach_receipt_row(pool: &SqlitePool) {
+        let now = "2026-01-01T00:00:00Z";
+        sqlx::query(
+            r#"INSERT INTO agent_work_continuations
+               (id, run_id, stage_execution_id, agent_execution_id, command_journal_id,
+                mode, trigger_kind, status, idempotency_scope, idempotency_key,
+                request_fingerprint_sha256, attach_receipt_artifact_id,
+                created_at, updated_at, resurrection_phase, resurrection_deadline_at,
+                resurrection_last_heartbeat_at)
+               VALUES
+               ('cont-attach-1', 'run-attach-1', 'stage-exec-1', 'agent-exec-1', NULL,
+                'provider_session_resurrection', 'operator_mcp', 'succeeded',
+                'scope', 'key', ?1, 'artifact-attach-1',
+                ?2, ?2, 'completed', NULL, ?2)"#,
+        )
+        .bind("a".repeat(64))
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+        let receipt = serde_json::json!({
+            "schema_version": 2,
+            "continuation_id": "cont-attach-1",
+            "run_id": "run-attach-1",
+            "failure_class": null,
+            "resurrection_phase": "completed",
+            "attach_started_at": now,
+            "attach_completed_at": now,
+            "prompt_sent_at": now,
+            "output_only": true,
+            "source_edit_allowance": false,
+            "changed_source_files_count": 0,
+            "orphan_reap_verified": true,
+            "identity_proof_source": "provider_attach_response",
+            "requested_provider_session_id": "provider-secret-requested",
+            "actual_provider_session_id": "provider-secret-actual",
+            "managed_child_pid": 12345,
+            "managed_process_group_id": 12345,
+            "adapter_runtime_home_realpath": "/private/tmp/runtime",
+            "adapter_runtime_home_dev_ino": "1:2"
+        });
+        db::repos::p086_resurrection_raw_receipts::upsert(
+            pool,
+            "cont-attach-1",
+            &receipt.to_string(),
+            now,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn attach_receipt_get_operator_matches_response_schema_shape() {
+        let pool = attach_receipt_test_pool().await;
+        seed_attach_receipt_row(&pool).await;
+        let principal = auth::Principal::new("operator", auth::PrincipalClass::Operator);
+        let result = execute(
+            "agents.attach_receipt.get",
+            serde_json::json!({
+                "continuation_id": "cont-attach-1",
+                "run_id": "run-attach-1"
+            }),
+            &pool,
+            &principal,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["outcome"], "ok");
+        assert_eq!(result["continuation_id"], "cont-attach-1");
+        assert_eq!(result["run_id"], "run-attach-1");
+        assert_eq!(result["attach_receipt_artifact_id"], "artifact-attach-1");
+        assert_eq!(result["receipt"]["resurrection_phase"], "completed");
+        assert_eq!(result["receipt"]["prompt_sent_at"], "2026-01-01T00:00:00Z");
+        assert!(result.get("access_level").is_none());
+        assert!(result.get("principal_class").is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_receipt_get_observer_matches_reviewer_projection_shape() {
+        let pool = attach_receipt_test_pool().await;
+        seed_attach_receipt_row(&pool).await;
+        let principal = auth::Principal::new("observer", auth::PrincipalClass::Observer);
+        let result = execute(
+            "agents.attach_receipt.get",
+            serde_json::json!({
+                "continuation_id": "cont-attach-1",
+                "run_id": "run-attach-1"
+            }),
+            &pool,
+            &principal,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["outcome"], "reviewer_projection");
+        assert_eq!(result["schema_version"], 2);
+        assert_eq!(result["resurrection_phase"], "completed");
+        assert_eq!(result["prompt_sent_at"], serde_json::Value::Null);
+        assert_eq!(result["attach_started_at"], "2026-01-01T00:00:00Z");
+        assert_eq!(result["output_only"], true);
+        assert_eq!(result["orphan_reap_verified"], true);
+        assert!(result.get("receipt").is_none());
+        assert!(result.get("requested_provider_session_id").is_none());
+        assert!(result.get("managed_child_pid").is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_receipt_get_agent_matches_redacted_shape() {
+        let pool = attach_receipt_test_pool().await;
+        seed_attach_receipt_row(&pool).await;
+        let principal = auth::Principal::new("agent", auth::PrincipalClass::Agent);
+        let result = execute(
+            "agents.attach_receipt.get",
+            serde_json::json!({
+                "continuation_id": "cont-attach-1",
+                "run_id": "run-attach-1"
+            }),
+            &pool,
+            &principal,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["outcome"], "redacted");
+        assert_eq!(result["attach_receipt_artifact_present"], true);
+        assert_eq!(result["resurrection_phase"], "completed");
+        assert!(result.get("continuation_id").is_none());
+        assert!(result.get("receipt").is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_receipt_get_operator_wrong_run_uses_error_shape() {
+        let pool = attach_receipt_test_pool().await;
+        seed_attach_receipt_row(&pool).await;
+        let principal = auth::Principal::new("operator", auth::PrincipalClass::Operator);
+        let result = execute(
+            "agents.attach_receipt.get",
+            serde_json::json!({
+                "continuation_id": "cont-attach-1",
+                "run_id": "wrong-run"
+            }),
+            &pool,
+            &principal,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["outcome"], "error");
+        assert_eq!(result["error"]["data"]["failure_reason"], "auth_failure");
+        assert!(result.get("continuation_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_receipt_get_non_operator_wrong_run_uses_error_shape() {
+        let pool = attach_receipt_test_pool().await;
+        seed_attach_receipt_row(&pool).await;
+
+        for principal in [
+            auth::Principal::new("observer", auth::PrincipalClass::Observer),
+            auth::Principal::new("readonly", auth::PrincipalClass::ReadOnlyOperator),
+            auth::Principal::new("agent", auth::PrincipalClass::Agent),
+        ] {
+            let result = execute(
+                "agents.attach_receipt.get",
+                serde_json::json!({
+                    "continuation_id": "cont-attach-1",
+                    "run_id": "wrong-run"
+                }),
+                &pool,
+                &principal,
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(result["outcome"], "error");
+            assert_eq!(result["error"]["data"]["failure_reason"], "auth_failure");
+            assert!(result.get("resurrection_phase").is_none());
+            assert!(result.get("attach_receipt_artifact_present").is_none());
+            assert!(result.get("redacted_receipt_json").is_none());
+            assert!(result.get("receipt").is_none());
+        }
     }
 
     #[test]
@@ -2871,13 +3271,19 @@ mod tests {
     fn invalid_mode_produces_typed_rejection_not_db_error() {
         // Typed mode validation must return a structured -32027 rejection,
         // not rely on SQLite CHECK constraint failures (audit defect).
-        let valid_modes = ["live_handle_continuation", "provider_session_resurrection"];
+        let valid_modes = [
+            "live_handle_continuation",
+            "provider_session_resurrection",
+            "output_only_recovery",
+        ];
         let invalid_modes = ["unknown_mode", "", "LIVE_HANDLE"];
         for m in &valid_modes {
             assert!(
                 matches!(
                     *m,
-                    "live_handle_continuation" | "provider_session_resurrection"
+                    "live_handle_continuation"
+                        | "provider_session_resurrection"
+                        | "output_only_recovery"
                 ),
                 "valid mode {m} must be accepted"
             );
@@ -2886,7 +3292,9 @@ mod tests {
             assert!(
                 !matches!(
                     *m,
-                    "live_handle_continuation" | "provider_session_resurrection"
+                    "live_handle_continuation"
+                        | "provider_session_resurrection"
+                        | "output_only_recovery"
                 ),
                 "invalid mode {m} must be rejected"
             );
@@ -2917,6 +3325,11 @@ mod tests {
             "state_11_manual_release",
             "build_and_publish",
             "commit_and_push_release_candidate",
+            "commit_artifacts",
+            "push_changes",
+            "security_review",
+            "prepush-review",
+            "lead-orchestration",
             "connect_upload",
             "external_distribution",
         ] {
@@ -2996,6 +3409,107 @@ mod tests {
         assert_eq!(
             no_live["error"]["data"]["failure_reason"],
             "live_session_required"
+        );
+    }
+
+    #[test]
+    fn continuation_capability_gates_output_only_recovery() {
+        let catalog = serde_json::json!({
+            "agents": [{
+                "id": "code_writer",
+                "continuation_capability": {
+                    "enabled": true,
+                    "allowed_triggers": ["operator_mcp", "lead_auto"],
+                    "output_only_recovery": {
+                        "enabled": true,
+                        "allowed_triggers": ["operator_mcp"],
+                        "require_live_session": true,
+                        "source_edit_allowance": false
+                    },
+                    "provider_session_resurrection": {
+                        "enabled": true,
+                        "require_recorded_provider_session_id": true
+                    }
+                }
+            }]
+        })
+        .to_string();
+
+        let accepted = continuation_capability_rejection(
+            "ae-id",
+            Some(&catalog),
+            "output_only_recovery",
+            "operator_mcp",
+            true,
+            true,
+            false,
+        )
+        .expect("output-only capability check should parse");
+        assert!(
+            accepted.is_none(),
+            "catalog + live session + source-edit ban must pass output-only admission"
+        );
+
+        let no_live = continuation_capability_rejection(
+            "ae-id",
+            Some(&catalog),
+            "output_only_recovery",
+            "operator_mcp",
+            false,
+            true,
+            false,
+        )
+        .expect("missing live session should reject")
+        .expect("missing live session must reject");
+        assert_eq!(
+            no_live["error"]["data"]["failure_reason"],
+            "live_session_required"
+        );
+        let resurrection_backed_output_only = continuation_capability_rejection(
+            "ae-id",
+            Some(&catalog),
+            "output_only_recovery",
+            "operator_mcp",
+            false,
+            true,
+            true,
+        )
+        .expect("output-only over provider-session resurrection should parse");
+        assert!(
+            resurrection_backed_output_only.is_none(),
+            "output_only_recovery must allow provider-session resurrection when live handle is gone"
+        );
+
+        let source_edit_catalog = serde_json::json!({
+            "agents": [{
+                "id": "code_writer",
+                "continuation_capability": {
+                    "enabled": true,
+                    "allowed_triggers": ["operator_mcp"],
+                    "output_only_recovery": {
+                        "enabled": true,
+                        "allowed_triggers": ["operator_mcp"],
+                        "require_live_session": true,
+                        "source_edit_allowance": true
+                    }
+                }
+            }]
+        })
+        .to_string();
+        let source_edit = continuation_capability_rejection(
+            "ae-id",
+            Some(&source_edit_catalog),
+            "output_only_recovery",
+            "operator_mcp",
+            true,
+            true,
+            false,
+        )
+        .expect("source-edit output-only catalog should reject")
+        .expect("source-edit output-only must reject until override exists");
+        assert_eq!(
+            source_edit["error"]["data"]["failure_reason"],
+            "output_only_source_edit_allowance_not_supported"
         );
     }
 
@@ -3099,18 +3613,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn provider_session_resurrection_adapter_support_fails_closed_until_attach_is_proven() {
-        for provider in ["claude", "claude_acp", "codex", "gemini", "auggie", "junie"] {
+    #[tokio::test]
+    async fn provider_session_resurrection_adapter_support_uses_runtime_manager() {
+        let runtime = acp::AcpRuntimeManager::new();
+        for provider in ["claude", "claude_acp"] {
             assert!(
-                !provider_session_resurrection_adapter_supported(Some(provider)),
+                provider_session_resurrection_adapter_supported(Some(provider), Some(&runtime))
+                    .await,
+                "{provider} should allow provider-session resurrection after attach-before-prompt proof"
+            );
+        }
+        for provider in ["codex", "gemini", "auggie", "junie", "claude_code"] {
+            assert!(
+                !provider_session_resurrection_adapter_supported(Some(provider), Some(&runtime))
+                    .await,
                 "{provider} must remain disabled until requested-session attach is proven before prompt send"
             );
         }
-        assert!(!provider_session_resurrection_adapter_supported(None));
-        assert!(!provider_session_resurrection_adapter_supported(Some(
-            "unknown"
-        )));
+        assert!(!provider_session_resurrection_adapter_supported(None, Some(&runtime)).await);
+        assert!(
+            !provider_session_resurrection_adapter_supported(Some("unknown"), Some(&runtime)).await
+        );
+        assert!(!provider_session_resurrection_adapter_supported(Some("claude"), None).await);
     }
 
     #[test]
@@ -3218,11 +3742,13 @@ mod tests {
             run_id: "run-id".to_string(),
             stage_execution_id: "se-id".to_string(),
             agent_execution_id: "ae-id".to_string(),
+            command_journal_id: "journal-id".to_string(),
             mode: "live_handle_continuation".to_string(),
             trigger_kind: "operator_mcp".to_string(),
             status: "accepted".to_string(),
             failure_reason: None,
             reconciliation_status: None,
+            resurrection_phase: Some("prompting".to_string()),
             idempotency_scope: "scope-secret".to_string(),
             idempotency_key: "key-secret".to_string(),
             request_fingerprint_sha256: "a".repeat(64),

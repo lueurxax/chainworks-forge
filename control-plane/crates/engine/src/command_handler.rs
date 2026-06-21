@@ -7367,8 +7367,9 @@ impl CommandHandler {
         validate_p083_reason(&c.reason, 1024)?;
         let principal_id = &caller.principal_id;
 
-        // Compute intent hash: canonical JSON of (command, provider_session_id, reason)
-        // sorted-key deterministic serialization.
+        // Compute intent hash from caller-owned logical identity only.
+        // The shutdown reason is service-owned diagnostic metadata and must not
+        // split same-intent idempotency aliases.
         let intent_hash = canonical_intent_hash(&[
             (
                 "command",
@@ -7378,7 +7379,6 @@ impl CommandHandler {
                 "provider_session_id",
                 serde_json::Value::String(c.provider_session_id.clone()),
             ),
-            ("reason", serde_json::Value::String(c.reason.clone())),
         ]);
 
         // Fast-path replay check (read-only, before opening transaction).

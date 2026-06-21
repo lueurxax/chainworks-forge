@@ -1,0 +1,29 @@
+{
+  "$id": "https://chainworks.local/schemas/mcp/p083/p083.set_enforcement_mode.input.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "caller_request_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "reason": {
+      "maxLength": 2048,
+      "type": "string"
+    },
+    "target_mode": {
+      "enum": [
+        "disabled",
+        "permissive",
+        "enforce"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "target_mode",
+    "caller_request_id"
+  ],
+  "title": "p083.set_enforcement_mode input",
+  "type": "object"
+}

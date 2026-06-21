@@ -1,7 +1,7 @@
 {
   "fixture_id": "all-operational-label-domains-bounded",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "metrics_label_bounds_contract_v1",
   "description": "All operational metrics emit labels drawn exclusively from pre-declared bounded enumerations; no unbounded or dynamic label values are permitted.",
   "preconditions": {

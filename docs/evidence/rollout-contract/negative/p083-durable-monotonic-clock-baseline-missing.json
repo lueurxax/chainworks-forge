@@ -1,0 +1,17 @@
+{
+  "assertions": [
+    "p083-durable-monotonic-clock-baseline-missing is part of the current-revision P083 evidence corpus.",
+    "The canonical proposal-083 gate must keep this path present before running executable checks."
+  ],
+  "contract": "rollout_contract_negative_fixture_v1",
+  "description": "P083 R70 declared evidence fixture for p083-durable-monotonic-clock-baseline-missing.",
+  "evidence_path": "docs/evidence/rollout-contract/negative/p083-durable-monotonic-clock-baseline-missing.json",
+  "expected_outcome": "fail",
+  "fixture_id": "p083-durable-monotonic-clock-baseline-missing",
+  "negative_case": true,
+  "operator_message": "P083 R70 negative fixture: p083-durable-monotonic-clock-baseline-missing must be rejected by rollout-contract validation.",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
+  "schema_version": "p083_evidence_fixture_v1",
+  "verification_type": "contract_fixture"
+}

@@ -6,7 +6,10 @@
 //!   - Readback heartbeat page reader for the diagnostics MCP tool
 use anyhow::{Context, Result};
 use chrono::Utc;
+use rand::RngCore;
+use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, SqlitePool, Transaction};
+use std::path::PathBuf;
 use tracing::warn;
 
 /// Feature classes registered in `p080_rollout_control_v1`.
@@ -1321,6 +1324,125 @@ pub async fn insert_dedup_entry(
     Ok(result.rows_affected())
 }
 
+#[derive(Debug, Clone)]
+pub struct P080OperatorDedupCommit {
+    pub principal_id: String,
+    pub principal_class: String,
+    pub tool_name: String,
+    pub dedup_key: String,
+    pub requested_action: String,
+    pub rollout_phase: String,
+    pub auth_policy_generation: i64,
+    pub secret_generation_id: String,
+    pub repair_class_enabled_hash: String,
+    pub live_disable_generation: i64,
+    pub request_fingerprint: String,
+    pub now_str: String,
+    pub expires_at: String,
+}
+
+async fn reserve_dedup_entry_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    dedup: &P080OperatorDedupCommit,
+) -> Result<u64> {
+    let pending_response = serde_json::json!({
+        "schema_version": "p080_reconcile_response_v1",
+        "decision": "pending_commit"
+    })
+    .to_string();
+    let result = sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO p080_operator_request_dedup_v1
+          (principal_id, principal_class, tool_name, operator_request_dedup_key,
+           requested_action, auth_policy_generation, secret_generation_id,
+           rollout_phase, repair_class_enabled_hash, live_disable_generation,
+           request_fingerprint, response_json, created_at, expires_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        "#,
+    )
+    .bind(&dedup.principal_id)
+    .bind(&dedup.principal_class)
+    .bind(&dedup.tool_name)
+    .bind(&dedup.dedup_key)
+    .bind(&dedup.requested_action)
+    .bind(dedup.auth_policy_generation)
+    .bind(&dedup.secret_generation_id)
+    .bind(&dedup.rollout_phase)
+    .bind(&dedup.repair_class_enabled_hash)
+    .bind(dedup.live_disable_generation)
+    .bind(&dedup.request_fingerprint)
+    .bind(pending_response)
+    .bind(&dedup.now_str)
+    .bind(&dedup.expires_at)
+    .execute(&mut **tx)
+    .await
+    .context("p080 reserve operator-request dedup entry")?;
+    Ok(result.rows_affected())
+}
+
+async fn update_reserved_dedup_response_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    dedup: &P080OperatorDedupCommit,
+    response_json: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE p080_operator_request_dedup_v1
+        SET response_json = ?1
+        WHERE principal_id = ?2
+          AND tool_name = ?3
+          AND operator_request_dedup_key = ?4
+          AND request_fingerprint = ?5
+        "#,
+    )
+    .bind(response_json)
+    .bind(&dedup.principal_id)
+    .bind(&dedup.tool_name)
+    .bind(&dedup.dedup_key)
+    .bind(&dedup.request_fingerprint)
+    .execute(&mut **tx)
+    .await
+    .context("p080 update reserved operator-request dedup response")?;
+    Ok(())
+}
+
+fn p080_race_aborted_response_json(
+    run_id: &str,
+    stage_id: &str,
+    work_item_id: &str,
+    stale_class: &str,
+    now_str: &str,
+    predicate_hash: &str,
+) -> Result<String> {
+    let response = serde_json::json!({
+        "schema_version": "p080_reconcile_response_v1",
+        "decision": "race_aborted",
+        "event_id": null,
+        "operator_message": "repair_if_safe found no stale running InvokeAgent to requeue",
+        "readback": {
+            "schema_version": "p080_readback_v1",
+            "run_id": run_id,
+            "stage_id": stage_id,
+            "work_item_id": work_item_id,
+            "stale_class": stale_class,
+            "running_truth": "race_aborted",
+            "repair_action": "none",
+            "hold_reason": "unknown",
+            "hold_age_seconds": null,
+            "next_retry_or_backoff_time": null,
+            "projection_updated_at": now_str,
+            "projection_integrity": "valid",
+            "executor_reregistration_state": "expected",
+            "rollout_disablement": "none",
+            "side_effect_status": "not_applicable",
+            "operator_message": "no stale running InvokeAgent was available at repair commit time",
+            "evidence_marker_hash": predicate_hash,
+            "repair_idempotency_key": null
+        }
+    });
+    serde_json::to_string(&response).context("p080 serialize race-aborted response")
+}
+
 /// Insert a reconciliation event into the append-only event log.
 /// Uses `INSERT OR IGNORE` on the PK so idempotent retries are safe.
 /// `repair_idempotency_key` is NULL for diagnose_only/delegated/none actions
@@ -1732,6 +1854,438 @@ pub async fn insert_event_and_upsert_readback_atomic(
 
     tx.commit().await.context("p080 atomic write: commit")?;
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct P080RepairOutcome {
+    pub event_id: String,
+    pub repair_idempotency_key: String,
+    pub readback: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub enum P080RepairRequeueResult {
+    Repaired(P080RepairOutcome),
+    RaceAborted,
+    PredicateRevalidationFailed { expected: String, actual: String },
+    DedupAlreadyReserved,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn repair_acp_startup_stale_requeue_invoke_agent(
+    pool: &SqlitePool,
+    run_id: &str,
+    stage_id: &str,
+    work_item_id: &str,
+    initiating_principal_id: &str,
+) -> Result<Option<P080RepairOutcome>> {
+    match repair_acp_startup_stale_requeue_invoke_agent_checked(
+        pool,
+        run_id,
+        stage_id,
+        work_item_id,
+        initiating_principal_id,
+        None,
+        None,
+    )
+    .await?
+    {
+        P080RepairRequeueResult::Repaired(outcome) => Ok(Some(outcome)),
+        _ => Ok(None),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn repair_acp_startup_stale_requeue_invoke_agent_checked(
+    pool: &SqlitePool,
+    run_id: &str,
+    stage_id: &str,
+    work_item_id: &str,
+    initiating_principal_id: &str,
+    expected_predicate_hash: Option<&str>,
+    dedup_commit: Option<&P080OperatorDedupCommit>,
+) -> Result<P080RepairRequeueResult> {
+    let now = Utc::now();
+    let now_str = now.to_rfc3339();
+    let predicate_hash = lower_hex_sha256(&format!(
+        "{run_id}:{stage_id}:{work_item_id}:acp_startup_stale"
+    ));
+
+    if let Some(expected) = expected_predicate_hash {
+        if expected != predicate_hash {
+            return Ok(P080RepairRequeueResult::PredicateRevalidationFailed {
+                expected: expected.to_string(),
+                actual: predicate_hash,
+            });
+        }
+    }
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("p080 repair_acp_startup_stale: begin tx")?;
+
+    if let Some(dedup) = dedup_commit {
+        let reserved = reserve_dedup_entry_tx(&mut tx, dedup).await?;
+        if reserved == 0 {
+            tx.commit()
+                .await
+                .context("p080 repair_acp_startup_stale: commit dedup race no-op")?;
+            return Ok(P080RepairRequeueResult::DedupAlreadyReserved);
+        }
+    }
+
+    let existing: Option<String> = sqlx::query_scalar(
+        r#"SELECT json_extract(readback_json, '$.running_truth')
+           FROM p080_readback_heartbeats_v1
+           WHERE run_id = ?1
+             AND stage_id = ?2
+             AND work_item_id = ?3
+             AND stale_class = 'acp_startup_stale'"#,
+    )
+    .bind(run_id)
+    .bind(stage_id)
+    .bind(work_item_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("p080 repair_acp_startup_stale: load target readback")?;
+    if existing.as_deref() != Some("stale_suspected") {
+        if let Some(dedup) = dedup_commit {
+            let response_json = p080_race_aborted_response_json(
+                run_id,
+                stage_id,
+                work_item_id,
+                "acp_startup_stale",
+                &now_str,
+                &predicate_hash,
+            )?;
+            update_reserved_dedup_response_tx(&mut tx, dedup, &response_json).await?;
+        }
+        tx.commit()
+            .await
+            .context("p080 repair_acp_startup_stale: commit no-op")?;
+        return Ok(P080RepairRequeueResult::RaceAborted);
+    }
+
+    let requeued = super::work_items::p080_requeue_running_invoke_agent_by_id_tx(
+        &mut tx,
+        work_item_id,
+        run_id,
+        stage_id,
+        now,
+        "p080_acp_startup_stale_repair",
+    )
+    .await?;
+    if !requeued {
+        if let Some(dedup) = dedup_commit {
+            let response_json = p080_race_aborted_response_json(
+                run_id,
+                stage_id,
+                work_item_id,
+                "acp_startup_stale",
+                &now_str,
+                &predicate_hash,
+            )?;
+            update_reserved_dedup_response_tx(&mut tx, dedup, &response_json).await?;
+        }
+        tx.commit()
+            .await
+            .context("p080 repair_acp_startup_stale: commit race no-op")?;
+        return Ok(P080RepairRequeueResult::RaceAborted);
+    }
+
+    let current_epoch: i64 = sqlx::query_scalar(
+        r#"SELECT COALESCE(epoch, 0)
+           FROM p080_recurrence_epoch_v1
+           WHERE run_id = ?1
+             AND stage_id = ?2
+             AND work_item_id = ?3
+             AND stale_class = 'acp_startup_stale'"#,
+    )
+    .bind(run_id)
+    .bind(stage_id)
+    .bind(work_item_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("p080 repair_acp_startup_stale: read recurrence epoch")?
+    .unwrap_or(0);
+    let next_epoch = current_epoch + 1;
+    sqlx::query(
+        r#"INSERT INTO p080_recurrence_epoch_v1
+             (run_id, stage_id, work_item_id, stale_class, epoch, last_advance_reason, updated_at)
+           VALUES (?1, ?2, ?3, 'acp_startup_stale', ?4, 'repaired', ?5)
+           ON CONFLICT(run_id, stage_id, work_item_id, stale_class) DO UPDATE SET
+             epoch = excluded.epoch,
+             last_advance_reason = 'repaired',
+             updated_at = excluded.updated_at"#,
+    )
+    .bind(run_id)
+    .bind(stage_id)
+    .bind(work_item_id)
+    .bind(next_epoch)
+    .bind(&now_str)
+    .execute(&mut *tx)
+    .await
+    .context("p080 repair_acp_startup_stale: update recurrence epoch")?;
+
+    let repair_idempotency_key = derive_p080_repair_idempotency_key(
+        next_epoch,
+        run_id,
+        stage_id,
+        work_item_id,
+        "acp_startup_stale",
+        "acp_session_reset",
+    )
+    .context("p080 repair_acp_startup_stale: derive repair idempotency key")?;
+    let event_id = format!(
+        "p080-repair-{}",
+        repair_idempotency_key.trim_start_matches("p080-rik-")
+    );
+
+    let readback = serde_json::json!({
+        "schema_version": "p080_readback_v1",
+        "run_id": run_id,
+        "stage_id": stage_id,
+        "work_item_id": work_item_id,
+        "stale_class": "acp_startup_stale",
+        "running_truth": "stale_repaired",
+        "repair_action": "acp_session_reset",
+        "hold_reason": "none",
+        "hold_age_seconds": null,
+        "next_retry_or_backoff_time": now_str,
+        "projection_updated_at": now_str,
+        "projection_integrity": "valid",
+        "executor_reregistration_state": "expected",
+        "rollout_disablement": "none",
+        "side_effect_status": "not_applicable",
+        "operator_message": "acp startup stale execution was requeued for a fresh provider session",
+        "evidence_marker_hash": predicate_hash,
+        "repair_idempotency_key": repair_idempotency_key.clone()
+    });
+    let readback_json = serde_json::to_string(&readback)?;
+    validate_readback_json_for_write(&readback_json)
+        .context("p080 repair_acp_startup_stale: readback validation failed")?;
+
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO p080_reconciliation_events_v1
+          (id, run_id, stage_id, work_item_id, stale_class, repair_action, hold_reason,
+           predicate_hash, recurrence_epoch, decision, event_source, created_at,
+           details_json, initiating_principal_id, repair_idempotency_key)
+        VALUES (?1, ?2, ?3, ?4, 'acp_startup_stale', 'acp_session_reset', 'none',
+                ?5, ?6, 'repaired', 'operator_request', ?7, '{}', ?8, ?9)
+        "#,
+    )
+    .bind(&event_id)
+    .bind(run_id)
+    .bind(stage_id)
+    .bind(work_item_id)
+    .bind(&predicate_hash)
+    .bind(next_epoch)
+    .bind(&now_str)
+    .bind(initiating_principal_id)
+    .bind(&repair_idempotency_key)
+    .execute(&mut *tx)
+    .await
+    .context("p080 repair_acp_startup_stale: insert repair event")?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO p080_readback_heartbeats_v1
+          (run_id, stage_id, work_item_id, stale_class,
+           projection_generation, projection_updated_at, projection_integrity,
+           readback_json, updated_at)
+        VALUES (?1, ?2, ?3, 'acp_startup_stale', 1, ?4, 'valid', ?5, ?6)
+        ON CONFLICT(run_id, stage_id, work_item_id, stale_class) DO UPDATE SET
+          projection_generation = projection_generation + 1,
+          projection_updated_at = excluded.projection_updated_at,
+          projection_integrity  = 'valid',
+          readback_json         = excluded.readback_json,
+          updated_at            = excluded.updated_at
+        "#,
+    )
+    .bind(run_id)
+    .bind(stage_id)
+    .bind(work_item_id)
+    .bind(&now_str)
+    .bind(&readback_json)
+    .bind(&now_str)
+    .execute(&mut *tx)
+    .await
+    .context("p080 repair_acp_startup_stale: upsert repaired readback")?;
+
+    if let Some(dedup) = dedup_commit {
+        let response_json = serde_json::json!({
+            "schema_version": "p080_reconcile_response_v1",
+            "decision": "repaired",
+            "event_id": event_id,
+            "operator_message": "repair_if_safe accepted for acp_startup_stale; request fingerprint was consumed",
+            "readback": readback.clone()
+        })
+        .to_string();
+        update_reserved_dedup_response_tx(&mut tx, dedup, &response_json).await?;
+    }
+
+    tx.commit()
+        .await
+        .context("p080 repair_acp_startup_stale: commit tx")?;
+
+    Ok(P080RepairRequeueResult::Repaired(P080RepairOutcome {
+        event_id,
+        repair_idempotency_key,
+        readback,
+    }))
+}
+
+pub fn derive_p080_repair_idempotency_key(
+    recurrence_epoch: i64,
+    run_id: &str,
+    stage_id: &str,
+    work_item_id: &str,
+    stale_class: &str,
+    repair_action: &str,
+) -> Result<String> {
+    let key = p080_repair_hmac_key_material()?;
+    let message = canonical_p080_repair_key_message(
+        recurrence_epoch,
+        run_id,
+        stage_id,
+        work_item_id,
+        stale_class,
+        repair_action,
+    );
+    let digest = hmac_sha256(&key, message.as_bytes());
+    let suffix: String = digest[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(format!("p080-rik-{suffix}"))
+}
+
+fn canonical_p080_repair_key_message(
+    recurrence_epoch: i64,
+    run_id: &str,
+    stage_id: &str,
+    work_item_id: &str,
+    stale_class: &str,
+    repair_action: &str,
+) -> String {
+    [
+        "p080_repair_idempotency_key_v1".to_string(),
+        recurrence_epoch.to_string(),
+        run_id.to_string(),
+        stage_id.to_string(),
+        work_item_id.to_string(),
+        stale_class.to_string(),
+        repair_action.to_string(),
+    ]
+    .into_iter()
+    .map(|field| format!("{}:{field}", field.len()))
+    .collect::<Vec<_>>()
+    .join("\0")
+}
+
+fn p080_repair_hmac_key_material() -> Result<Vec<u8>> {
+    if let Ok(value) = std::env::var("CHAINWORKS_P080_REPAIR_HMAC_KEY") {
+        if value.len() >= 32 {
+            return Ok(value.into_bytes());
+        }
+        return Err(anyhow::anyhow!(
+            "CHAINWORKS_P080_REPAIR_HMAC_KEY must be at least 32 bytes"
+        ));
+    }
+
+    let path = p080_repair_hmac_key_path()?;
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if trimmed.len() >= 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(trimmed.as_bytes().to_vec());
+        }
+        return Err(anyhow::anyhow!(
+            "P080 repair HMAC key file exists but is malformed: {}",
+            path.display()
+        ));
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("create P080 repair HMAC key directory {}", parent.display())
+        })?;
+    }
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let encoded: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    write_p080_repair_hmac_key_file(&path, &encoded)?;
+    Ok(encoded.into_bytes())
+}
+
+fn p080_repair_hmac_key_path() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("CHAINWORKS_P080_REPAIR_HMAC_KEY_FILE") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        anyhow::anyhow!("HOME is not set and CHAINWORKS_P080_REPAIR_HMAC_KEY_FILE was not provided")
+    })?;
+    Ok(PathBuf::from(home)
+        .join(".chainworks")
+        .join("p080-repair-hmac-key"))
+}
+
+#[cfg(unix)]
+fn write_p080_repair_hmac_key_file(path: &std::path::Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("create P080 repair HMAC key file {}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("write P080 repair HMAC key file {}", path.display()))?;
+    file.write_all(b"\n")
+        .with_context(|| format!("write P080 repair HMAC key file {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_p080_repair_hmac_key_file(path: &std::path::Path, contents: &str) -> Result<()> {
+    std::fs::write(path, format!("{contents}\n"))
+        .with_context(|| format!("write P080 repair HMAC key file {}", path.display()))
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    const BLOCK_SIZE: usize = 64;
+    let mut key_block = [0u8; BLOCK_SIZE];
+    if key.len() > BLOCK_SIZE {
+        let digest = Sha256::digest(key);
+        key_block[..32].copy_from_slice(&digest);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0x36u8; BLOCK_SIZE];
+    let mut opad = [0x5cu8; BLOCK_SIZE];
+    for i in 0..BLOCK_SIZE {
+        ipad[i] ^= key_block[i];
+        opad[i] ^= key_block[i];
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_digest);
+    outer.finalize().into()
+}
+
+fn lower_hex_sha256(input: &str) -> String {
+    let digest = Sha256::digest(input.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 // ── Egress sanitization (HIGH-003): shared across all read lanes ─────────────
@@ -2509,6 +3063,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn p080_repair_acp_startup_stale_requeues_running_invoke_agent() {
+        let pool = setup_db().await;
+        seed_rollout_control_if_absent(&pool).await.unwrap();
+
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO ideas (id, title, body, status, created_at)
+             VALUES ('idea-p080-repair', 'P080 repair', 'body', 'draft', ?1)",
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs
+             (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at)
+             VALUES ('run-p080-repair', 'idea-p080-repair', 'running', 'wf', 'Workflow', '/tmp/ws', '/tmp/artifacts', ?1)",
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO stage_executions
+             (id, run_id, stage_id, label, status, started_at)
+             VALUES ('stage-exec-p080-repair', 'run-p080-repair', 'stage-p080-repair', 'Stage', 'running', ?1)",
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_executions
+             (id, stage_execution_id, agent_id, provider, model, status, started_at)
+             VALUES ('agent-exec-p080-repair', 'stage-exec-p080-repair', 'agent', 'codex', 'model', 'running', ?1)",
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let payload = serde_json::json!({
+            "stage_execution_id": "stage-exec-p080-repair",
+            "p058_claimed": {
+                "agent_execution_id": "agent-exec-p080-repair"
+            }
+        });
+        sqlx::query(
+            "INSERT INTO work_items
+             (id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, started_at)
+             VALUES ('work-p080-repair', 'invoke_agent', ?1, 'running', 'run-p080-repair', 'stage-p080-repair', ?2, ?2, ?2)",
+        )
+        .bind(payload.to_string())
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let stale_json = serde_json::json!({
+            "schema_version": "p080_readback_v1",
+            "run_id": "run-p080-repair",
+            "stage_id": "stage-p080-repair",
+            "work_item_id": "work-p080-repair",
+            "stale_class": "acp_startup_stale",
+            "running_truth": "stale_suspected",
+            "repair_action": "diagnose_only",
+            "hold_reason": "rollout_disabled"
+        });
+        sqlx::query(
+            "INSERT INTO p080_readback_heartbeats_v1
+             (run_id, stage_id, work_item_id, stale_class, projection_generation,
+              projection_updated_at, projection_integrity, readback_json, updated_at)
+             VALUES ('run-p080-repair', 'stage-p080-repair', 'work-p080-repair',
+                     'acp_startup_stale', 1, ?1, 'valid', ?2, ?1)",
+        )
+        .bind(&now)
+        .bind(stale_json.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let outcome = repair_acp_startup_stale_requeue_invoke_agent(
+            &pool,
+            "run-p080-repair",
+            "stage-p080-repair",
+            "work-p080-repair",
+            "operator-p080",
+        )
+        .await
+        .unwrap()
+        .expect("stale running invoke should be repaired");
+
+        assert_eq!(outcome.readback["running_truth"], "stale_repaired");
+        assert_eq!(outcome.readback["repair_action"], "acp_session_reset");
+
+        let work_row: (String, String) = sqlx::query_as(
+            "SELECT status, payload_json FROM work_items WHERE id = 'work-p080-repair'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(work_row.0, "pending");
+        let payload_after: serde_json::Value = serde_json::from_str(&work_row.1).unwrap();
+        assert!(payload_after.get("p058_claimed").is_none());
+        assert_eq!(
+            payload_after["p080_reconciliation"]["stale_class"],
+            "acp_startup_stale"
+        );
+
+        let agent_status: String = sqlx::query_scalar(
+            "SELECT status FROM agent_executions WHERE id = 'agent-exec-p080-repair'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(agent_status, "cancelled");
+
+        let repaired_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM p080_reconciliation_events_v1 WHERE decision = 'repaired'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(repaired_events, 1);
+    }
+
+    #[tokio::test]
     async fn p080_insert_reconciliation_event_basic() {
         let pool = setup_db().await;
         let now_str = Utc::now().to_rfc3339();
@@ -2915,6 +3594,71 @@ mod tests {
         assert!(
             result.is_ok(),
             "valid p080-rik-<24hex> repair_idempotency_key must be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn p080_repair_idempotency_key_uses_daemon_hmac_tuple() {
+        std::env::set_var(
+            "CHAINWORKS_P080_REPAIR_HMAC_KEY",
+            "test-p080-hmac-key-material-32-bytes-minimum",
+        );
+
+        let first = derive_p080_repair_idempotency_key(
+            7,
+            "run-1",
+            "stage-1",
+            "work-1",
+            "acp_startup_stale",
+            "acp_session_reset",
+        )
+        .unwrap();
+        let replay = derive_p080_repair_idempotency_key(
+            7,
+            "run-1",
+            "stage-1",
+            "work-1",
+            "acp_startup_stale",
+            "acp_session_reset",
+        )
+        .unwrap();
+        let different_epoch = derive_p080_repair_idempotency_key(
+            8,
+            "run-1",
+            "stage-1",
+            "work-1",
+            "acp_startup_stale",
+            "acp_session_reset",
+        )
+        .unwrap();
+        let different_action = derive_p080_repair_idempotency_key(
+            7,
+            "run-1",
+            "stage-1",
+            "work-1",
+            "acp_startup_stale",
+            "scheduler_lease_reclaim",
+        )
+        .unwrap();
+        let unkeyed_predicate = lower_hex_sha256("run-1:stage-1:work-1:acp_startup_stale");
+
+        assert_eq!(first, replay, "same tuple and daemon key must be stable");
+        assert_ne!(
+            first, different_epoch,
+            "recurrence_epoch must participate in repair_idempotency_key"
+        );
+        assert_ne!(
+            first, different_action,
+            "repair_action must participate in repair_idempotency_key"
+        );
+        assert!(
+            is_valid_p080_repair_idempotency_key(&serde_json::Value::String(first.clone())),
+            "derived key must retain the public p080-rik-<24hex> format"
+        );
+        assert_ne!(
+            &first["p080-rik-".len()..],
+            &unkeyed_predicate[..24],
+            "repair key must not be the public unkeyed predicate hash prefix"
         );
     }
 

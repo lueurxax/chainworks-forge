@@ -748,6 +748,9 @@ Use:
 - [workflow-execution-engine.md](workflow-execution-engine.md) for orchestrator and executor topology,
 - [runtime-contract.md](runtime-contract.md) for frozen snapshot and artifact boundaries,
 - [operator-experience.md](operator-experience.md) for shell and recovery presentation rules,
+- [p079-repair-prompt-template.md](p079-repair-prompt-template.md) for the pinned `p079_repair_v1` prompt contract,
+- [p079-recovery-attribution.md](p079-recovery-attribution.md) for bounded transcript/provider-envelope recovery attribution,
+- [p079-adapter-idempotency.md](p079-adapter-idempotency.md) for lease, restart, and adapter idempotency rules,
 - [test-gates.md](test-gates.md) for the current verification lanes.
 
 ## P079: Output Contract Repair and Fallback Details
@@ -756,13 +759,13 @@ Operator guidance for inspecting and rolling back P079 lives in [../runbooks/orc
 
 ### Implementation status
 
-P079 is partially implemented. Wired today: the SQLite migration, domain schema/enums, repair-event and lease repositories, GraphQL/MCP/run-report readback, Swift DTO decode/presentation helpers, deterministic fixture same-session repair with lease/evidence lifecycle, MCP runtime receipt sanitization (SEC-P079-MCP-001), crash-consistent materialization (SEC-P079-SETTLEMENT-001), and Junie plan-evidence capture/redaction. The transcript-recovery lane now records bounded evidence in the correct order, but it still fails closed as `unavailable` until transport-attributed chunk scanning can prove current-execution ownership.
+P079 is partially implemented. Wired today: the SQLite migration, domain schema/enums, repair-event and lease repositories, GraphQL/MCP/run-report readback, Swift DTO decode/presentation helpers, read-only macOS inspector surfacing, deterministic fixture same-session repair with lease/evidence lifecycle, MCP runtime receipt sanitization (SEC-P079-MCP-001), crash-consistent materialization (SEC-P079-SETTLEMENT-001), Junie plan-evidence capture/redaction, and bounded transcript/provider-envelope recovery for transport-attributed current-execution output. Raw transcript JSON and unattributed provider envelopes fail closed with typed evidence.
 
 Current hardening includes component-aware plan-evidence path containment (`p079_path_inside_root` rejects sibling-prefix paths and `..` escapes), GraphQL/MCP readback rejection of URL-encoded traversal in evidence and plan-evidence paths (including mixed literal/encoded forms validated after percent-decode), broader redaction for embedded absolute paths and common token prefixes in JSON-RPC method names and persisted transport/settlement errors, explicit permission-denial responses in P079 repair mode when no safe `allow_once` option exists, multi-path ambiguity rejection in the posture check (`p079_posture_denied` denies tool calls that present more than one distinct structured target path), fail-closed advisory posture for unknown provider strings, and dirfd/openat materialization that rejects symlinked parent or final output components at depth >= 2 while allowing OS-managed first-level symlinks. Plan-evidence collection canonicalizes the source `.junie` directory, rejects sources that escape the workspace, rejects symlinks and hard-linked entries, writes through the dirfd `O_NOFOLLOW` materializer, and creates the P079-owned `plan_evidence` directory through `sec001_mkdirall_dirfd_unix`.
 
 Per SEC-P079-HIGH-003, production same-session repair remains fail-closed for advisory-only providers until enforceable sandbox/permission restrictions exist; `p079_advisory_posture_opt_in` is currently hard-wired to `false`. Junie provider-mode mismatch skips persist `blocked_provider_mode_mismatch` as `final_output_settlement` and `manual_investigation` as `recommended_next_action`. Advisory fail-closed skips record `final_output_settlement = NULL` rather than an unchecked synthetic enum value so SQLite CHECK constraints remain authoritative.
 
-Deferred lanes remain: accepted transcript/provider-envelope recovery, controlled provider fallback dispatch from frozen YAML policy, full projection artifact rebuild with the bounded background sweep, release-lane and source-generation supersession eligibility exclusions, the Swift macOS inspector UI, P079 operational metric emission, the required reference docs `p079-repair-prompt-template.md`, `p079-recovery-attribution.md`, and `p079-adapter-idempotency.md`, and the full `proposal-079`/`p079` acceptance gate.
+Deferred lanes remain: controlled provider fallback dispatch from frozen YAML policy, full projection artifact rebuild with the bounded background sweep, release-lane and source-generation supersession eligibility exclusions, full rollout metric readback for provider fallback lanes, and the full `proposal-079`/`p079` acceptance gate. The implemented repair prompt, recovery attribution, and adapter idempotency/readback contracts are now split into [p079-repair-prompt-template.md](p079-repair-prompt-template.md), [p079-recovery-attribution.md](p079-recovery-attribution.md), and [p079-adapter-idempotency.md](p079-adapter-idempotency.md).
 
 ### Problem
 
@@ -771,7 +774,7 @@ Chainworks can complete useful provider work and still block a run because the f
 ### Goals
 
 - Attempt at most one same-session corrective output repair turn for eligible missing, empty, invalid, or mode-mismatched required outputs.
-- Recover contract-valid output already present in the current invocation transcript or provider result envelope (deferred — see implementation status above).
+- Recover contract-valid output already present in the current invocation transcript or provider result envelope when it is transport-attributed to the current execution.
 - Allow at most one controlled provider fallback attempt after repair or recovery is unavailable or unsuccessful (deferred — see implementation status above).
 
 This section provides an in-depth reference for P079, detailing the schema, contracts, and operational aspects of the contract-aware output repair and provider fallback mechanism. This mechanism allows the system to attempt to correct agent output failures (e.g., missing, invalid, or malformed outputs) or invoke fallback strategies before blocking a run.
@@ -784,7 +787,7 @@ P079's rollout contract specifies its applicability and enforcement mechanisms. 
 -   **Gate Aliases**: `proposal-079` and `p079`.
 -   **Commands**: Allowlisted commands for gate checks, such as `./scripts/test-gate.sh proposal-079`.
 -   **Migrations**: Requires a SQLite migration (`p079_output_contract_repair_v1`) to create tables for events, leases, and fallback parent links.
--   **Metrics**: Defines the contract inventory for adoption and operational monitoring. P079 metric emission remains deferred.
+-   **Metrics**: Defines the contract inventory for adoption and operational monitoring. Core DB repair lifecycle events emit bounded P079 counters/gauges for repair attempts, terminal outcomes, transcript-recovery evidence, repair/fallback budget exhaustion, invalid repairs, provider-mode mismatch, and recovery-bound exceedance. Full rollout readback for future controlled provider-fallback dispatch remains deferred with that dispatch lane.
 
 ### Key Schema Purposes
 
@@ -920,7 +923,7 @@ The following conditions are strictly enforced to prevent unintended behavior an
 -   **Repair Turn Posture**: Repair and fallback turns run under a server-side permission posture allowlisting only `fs.write` to frozen canonical output paths.
 -   **Principal Binding**: Fallback inherits the failed execution's principal; revocation aborts fallback.
 -   **Auto-Retry Observe Only**: The auto-retry ledger may classify P079 terminal states but remains observe-only, debounced per (`parent_agent_execution_id`, `terminal_class`).
--   **Swift Client Decode**: The macOS app's DTO module decodes the v1 readback surface and unknown-enum future values, verified at the proposal-079 gate.
+-   **Swift Client Decode and Inspector Surface**: The macOS app's DTO module decodes the v1 readback surface, handles GraphQL enum casing plus unknown future values, and exposes the selected run's highest-severity P079 evidence in the read-only inspector.
 
 ### P079 Rollback Disposition
 

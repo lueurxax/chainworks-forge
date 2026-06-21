@@ -13,6 +13,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use domain::provider::ProviderFamily;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -25,6 +26,80 @@ use crate::transport::AcpSessionConfig;
 #[cfg(unix)]
 use crate::{current_process_uid, inspect_xcode_shim_process_binding};
 use crate::{ExecutionRequest, ExecutionResult, XcodeShimGrantRecord, XcodeShimGrantStore};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSessionResurrectionCapability {
+    pub provider_family: String,
+    pub adapter_id: String,
+    pub capability_version: String,
+    pub attach_resume_supported: bool,
+    pub session_new_fields: Vec<String>,
+    pub attach_request_shape: String,
+    pub attach_result_shape: String,
+    pub identity_proof_supported: bool,
+    pub identity_proof_source: String,
+    pub write_enabled_safe: bool,
+    pub failure_classes: Vec<String>,
+}
+
+impl ProviderSessionResurrectionCapability {
+    pub fn unsupported(provider_family: impl Into<String>, adapter_id: impl Into<String>) -> Self {
+        Self {
+            provider_family: provider_family.into(),
+            adapter_id: adapter_id.into(),
+            capability_version: "provider_session_resurrection_v1".to_string(),
+            attach_resume_supported: false,
+            session_new_fields: Vec::new(),
+            attach_request_shape: "unsupported".to_string(),
+            attach_result_shape: "unsupported".to_string(),
+            identity_proof_supported: false,
+            identity_proof_source: "none".to_string(),
+            write_enabled_safe: false,
+            failure_classes: provider_session_resurrection_failure_classes(),
+        }
+    }
+}
+
+pub fn provider_session_resurrection_failure_classes() -> Vec<String> {
+    [
+        "unsupported",
+        "provider_rejected",
+        "expired_or_missing_session",
+        "actual_session_mismatch",
+        "identity_unverifiable",
+        "quota_hold",
+        "auth_failure",
+        "launch_failed",
+        "orphan_reap_failed",
+        "attach_receipt_persist_failed",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+pub fn provider_session_resurrection_capability_for_provider(
+    provider: &str,
+) -> Option<ProviderSessionResurrectionCapability> {
+    let normalized = ProviderFamily::canonicalize_known_alias(provider).unwrap_or_else(|| {
+        provider
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', ' '], "_")
+    });
+    match normalized.as_str() {
+        "claude" | "claude_code" => Some(claude::claude_provider_session_resurrection_capability()),
+        _ => None,
+    }
+}
+
+pub fn provider_session_resurrection_supported_for_provider(provider: Option<&str>) -> bool {
+    provider
+        .and_then(provider_session_resurrection_capability_for_provider)
+        .is_some_and(|capability| {
+            capability.attach_resume_supported && capability.identity_proof_supported
+        })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -807,7 +882,16 @@ pub trait AcpAdapter: Send + Sync {
     /// recorded provider-native session id and prove the requested session
     /// before a prompt is sent. Default is fail-closed.
     fn supports_provider_session_resurrection(&self) -> bool {
-        false
+        self.provider_session_resurrection_capability()
+            .is_some_and(|capability| {
+                capability.attach_resume_supported && capability.identity_proof_supported
+            })
+    }
+
+    fn provider_session_resurrection_capability(
+        &self,
+    ) -> Option<ProviderSessionResurrectionCapability> {
+        None
     }
 
     fn capability_probe_timeout(&self) -> Duration {
@@ -1412,8 +1496,9 @@ fn env_nonempty(name: &str) -> Option<String> {
 mod tests {
     use super::{
         default_provider_path_dirs, ensure_chainworks_meta_root_launch_dir,
-        provider_execution_root, AcpAdapter, AcpLaunchSpec, ProbeKey, ProviderCapabilities,
-        ProviderCapabilityCache, XcodeShimLaunchRuntime,
+        provider_execution_root, provider_session_resurrection_capability_for_provider,
+        provider_session_resurrection_supported_for_provider, AcpAdapter, AcpLaunchSpec, ProbeKey,
+        ProviderCapabilities, ProviderCapabilityCache, XcodeShimLaunchRuntime,
     };
     use crate::{XcodeShimGrantRecord, XcodeShimGrantStore};
     use std::sync::{Arc, Mutex};
@@ -1464,6 +1549,27 @@ mod tests {
             ProbeTimeoutAdapter("claude").capability_probe_timeout(),
             Duration::from_secs(90)
         );
+    }
+
+    #[test]
+    fn provider_session_resurrection_support_is_adapter_capability_owned() {
+        let capability = provider_session_resurrection_capability_for_provider("claude_acp")
+            .expect("claude aliases should resolve to adapter capability");
+        assert_eq!(capability.provider_family, "claude");
+        assert_eq!(capability.adapter_id, "claude-agent-acp");
+        assert!(capability.attach_resume_supported);
+        assert!(capability.identity_proof_supported);
+
+        assert!(provider_session_resurrection_supported_for_provider(Some(
+            "claude_code"
+        )));
+        for provider in ["codex", "gemini", "auggie", "junie", "unknown"] {
+            assert!(
+                !provider_session_resurrection_supported_for_provider(Some(provider)),
+                "{provider} must fail closed until its ACP adapter exposes attach identity proof"
+            );
+        }
+        assert!(!provider_session_resurrection_supported_for_provider(None));
     }
 
     #[test]

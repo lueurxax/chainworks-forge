@@ -1,7 +1,7 @@
 {
   "fixture_id": "held-identity-ambiguous-not-retried-on-restart",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "cancellation_identity_contract_v1",
   "description": "A run in held_identity_ambiguous state survives a process restart in that same held state and is not automatically retried or advanced.",
   "preconditions": {

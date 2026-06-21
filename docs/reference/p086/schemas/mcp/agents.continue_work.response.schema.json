@@ -25,6 +25,10 @@
       "type": "string",
       "description": "Current status of the continuation row."
     },
+    "journal_id": {
+      "type": "string",
+      "description": "Command journal linkage required by the shared MCP idempotency layer. This is not terminal execution output; terminal artifact fields remain readback-only."
+    },
     "error": {
       "type": "object",
       "description": "Present on rejected outcome.",

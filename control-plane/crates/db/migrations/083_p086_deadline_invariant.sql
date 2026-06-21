@@ -23,7 +23,8 @@ CREATE TABLE agent_work_continuations_new2 (
   mode                            TEXT    NOT NULL
                                     CHECK (mode IN (
                                       'live_handle_continuation',
-                                      'provider_session_resurrection'
+                                      'provider_session_resurrection',
+                                      'output_only_recovery'
                                     )),
   trigger_kind                    TEXT    NOT NULL
                                     CHECK (trigger_kind IN ('operator_mcp', 'lead_auto')),

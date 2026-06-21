@@ -310,6 +310,127 @@ fn sec_high_001_mcp_stdio_revalidates_session_after_principal_revocation() {
 }
 
 #[test]
+fn sec_high_001_mcp_stdio_revalidates_session_after_principal_disabled() {
+    let binary = control_plane_binary();
+
+    let db_path = temp_db_path("mcp-stdio-live-disable");
+    let database_url = format!("sqlite://{}?mode=rwc", db_path.display());
+    let principal_path = write_principal_fixture("mcp-stdio-live-disable-principals");
+
+    let mut child = Command::new(binary)
+        .env("MODE", "mcp")
+        .env("DATABASE_URL", database_url)
+        .env("CHAINWORKS_AUTH_PRINCIPALS_PATH", &principal_path)
+        .env("CHAINWORKS_PRINCIPALS_RELOAD_SECS", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn control-plane in mcp mode");
+
+    let mut stdin = child.stdin.take().expect("stdin should be piped");
+    let stdout = child.stdout.take().expect("stdout should be piped");
+    let mut stdout_reader = BufReader::new(stdout);
+
+    writeln!(
+        stdin,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"clientInfo\":{{\"principal_token\":\"known-mcp-token-xxxxxxxxxxxxxxxx\"}}}}}}"
+    )
+    .expect("write initialize request");
+    stdin.flush().expect("flush initialize request");
+    let init_response = read_json_line(&mut stdout_reader);
+    assert!(init_response["result"]["serverInfo"]["name"]
+        .as_str()
+        .is_some());
+
+    fs::write(&principal_path, disabled_principal_fixture_json()).expect("write disabled fixture");
+    set_owner_only_permissions(&principal_path);
+    std::thread::sleep(Duration::from_millis(1500));
+
+    writeln!(
+        stdin,
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{{}}}}"
+    )
+    .expect("write tools/list request after disable");
+    stdin
+        .flush()
+        .expect("flush tools/list request after disable");
+    let response = read_json_line(&mut stdout_reader);
+    assert_eq!(response["error"]["code"], -32000);
+    assert_eq!(response["error"]["message"], "unauthorized");
+
+    assert_child_exits(&mut child, Duration::from_secs(2));
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(principal_path);
+}
+
+#[test]
+fn sec_high_001_mcp_stdio_revalidates_session_after_principal_rescope() {
+    let binary = control_plane_binary();
+
+    let db_path = temp_db_path("mcp-stdio-live-rescope");
+    let database_url = format!("sqlite://{}?mode=rwc", db_path.display());
+    let principal_path = write_principal_fixture("mcp-stdio-live-rescope-principals");
+
+    let mut child = Command::new(binary)
+        .env("MODE", "mcp")
+        .env("DATABASE_URL", database_url)
+        .env("CHAINWORKS_AUTH_PRINCIPALS_PATH", &principal_path)
+        .env("CHAINWORKS_PRINCIPALS_RELOAD_SECS", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn control-plane in mcp mode");
+
+    let mut stdin = child.stdin.take().expect("stdin should be piped");
+    let stdout = child.stdout.take().expect("stdout should be piped");
+    let mut stdout_reader = BufReader::new(stdout);
+
+    writeln!(
+        stdin,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"clientInfo\":{{\"principal_token\":\"known-mcp-token-xxxxxxxxxxxxxxxx\"}}}}}}"
+    )
+    .expect("write initialize request");
+    stdin.flush().expect("flush initialize request");
+    let init_response = read_json_line(&mut stdout_reader);
+    assert!(init_response["result"]["serverInfo"]["name"]
+        .as_str()
+        .is_some());
+
+    fs::write(&principal_path, observer_rescoped_principal_fixture_json())
+        .expect("write re-scoped fixture");
+    set_owner_only_permissions(&principal_path);
+    std::thread::sleep(Duration::from_millis(1500));
+
+    writeln!(
+        stdin,
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{{}}}}"
+    )
+    .expect("write tools/list request after rescope");
+    stdin
+        .flush()
+        .expect("flush tools/list request after rescope");
+    let response = read_json_line(&mut stdout_reader);
+    assert!(
+        response.get("error").is_none(),
+        "re-scoped stdio principal should remain authorized with current scope: {response}"
+    );
+    let tools = response["result"]["tools"]
+        .as_array()
+        .expect("tools/list result");
+    assert!(
+        !tools.iter().any(|tool| tool["name"] == "runs_start"),
+        "re-scoped Observer principal must not retain stale Operator runs.start capability"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(principal_path);
+}
+
+#[test]
 fn test_mcp_stdio_rejects_reinitialize_mid_session() {
     let binary = control_plane_binary();
 
@@ -414,6 +535,53 @@ fn revoked_principal_fixture_json() -> &'static str {
     r#"{
       "schema_version": 2,
       "principals": []
+    }"#
+}
+
+fn disabled_principal_fixture_json() -> &'static str {
+    r#"{
+      "schema_version": 2,
+      "principals": [
+        {
+          "token": "known-mcp-token-xxxxxxxxxxxxxxxx",
+          "id": "default-operator",
+          "class": "operator",
+          "disabled": true,
+          "surface_policies": {
+            "graphql": {
+              "allow_queries": true,
+              "allow_subscriptions": true,
+              "allowed_mutations": ["approveApproval", "rejectApproval"]
+            },
+            "mcp": {
+              "allowed_tools": ["runs.start"]
+            }
+          }
+        }
+      ]
+    }"#
+}
+
+fn observer_rescoped_principal_fixture_json() -> &'static str {
+    r#"{
+      "schema_version": 2,
+      "principals": [
+        {
+          "token": "known-mcp-token-xxxxxxxxxxxxxxxx",
+          "id": "default-operator",
+          "class": "observer",
+          "surface_policies": {
+            "graphql": {
+              "allow_queries": true,
+              "allow_subscriptions": true,
+              "allowed_mutations": ["approveApproval", "rejectApproval"]
+            },
+            "mcp": {
+              "allowed_tools": ["runs.start"]
+            }
+          }
+        }
+      ]
     }"#
 }
 

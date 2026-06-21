@@ -223,7 +223,7 @@ async fn seed_continuation_readback(
         run_id: run_id.to_string(),
         stage_execution_id: stage_execution_id.to_string(),
         agent_execution_id: agent_execution_id.to_string(),
-        mode: "live_handle_continuation".into(),
+        mode: "provider_session_resurrection".into(),
         trigger_kind: "operator_mcp".into(),
         idempotency_scope: format!("{}:{agent_execution_id}", run_id),
         idempotency_key: "p086-readback-key".into(),
@@ -278,6 +278,9 @@ async fn seed_continuation_readback(
     )
     .await
     .unwrap();
+    agent_work_continuations::update_resurrection_phase(pool, &continuation_id, "completed", None)
+        .await
+        .unwrap();
     agent_work_continuations::record_p086_continuation_metric_event(
         pool,
         Some(&run_id.to_string()),
@@ -286,7 +289,7 @@ async fn seed_continuation_readback(
         Some(&continuation_id),
         "continuation_settlement_total",
         serde_json::json!({
-            "mode": "live_handle_continuation",
+            "mode": "provider_session_resurrection",
             "trigger_kind": "operator_mcp",
             "terminal_status": "succeeded"
         }),
@@ -429,6 +432,7 @@ async fn p086_graphql_continuation_readback_exposes_terminal_fields_without_muta
                       statusRaw
                       statusDisplay
                       isTerminal
+                      resurrectionPhase
                       requestFingerprintSha256
                       canonicalRequestArtifactId
                       attachReceiptArtifactId
@@ -513,13 +517,14 @@ async fn p086_graphql_continuation_readback_exposes_terminal_fields_without_muta
     );
     let row = &status["history"][0];
     assert_eq!(row["id"], continuation_id);
-    assert_eq!(row["modeRaw"], "live_handle_continuation");
-    assert_eq!(row["modeDisplay"], "Live Handle Continuation");
+    assert_eq!(row["modeRaw"], "provider_session_resurrection");
+    assert_eq!(row["modeDisplay"], "Provider Session Resurrection");
     assert_eq!(row["triggerKindRaw"], "operator_mcp");
     assert_eq!(row["triggerKindDisplay"], "Operator MCP");
     assert_eq!(row["statusRaw"], "succeeded");
     assert_eq!(row["statusDisplay"], "Succeeded");
     assert_eq!(row["isTerminal"], true);
+    assert_eq!(row["resurrectionPhase"], "completed");
     assert_eq!(
         row["requestFingerprintSha256"],
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -638,4 +643,54 @@ async fn p086_graphql_attach_receipt_requires_run_id_for_raw_readback_scope() {
         !response.errors.is_empty(),
         "GraphQL must reject attach receipt readback when runId is omitted"
     );
+}
+
+#[tokio::test]
+async fn p086_graphql_attach_receipt_wrong_run_rejects_non_operator_projections() {
+    let pool = test_pool().await;
+    let (_run_id, _stage_execution_id, _agent_execution_id, continuation_id) =
+        seed_continuation_readback(&pool).await;
+    let events = event_bus::new_bus(16);
+    let handler = Arc::new(CommandHandler::new(
+        pool.clone(),
+        events.clone(),
+        WorkQueue::new(pool.clone()),
+    ));
+    let schema = build_schema(
+        pool,
+        handler,
+        events.clone(),
+        auth::PrincipalTable::test_fixture(),
+        LifecycleReporter::new(15, "test-build", events.clone()),
+    );
+
+    for principal_class in [
+        auth::PrincipalClass::Observer,
+        auth::PrincipalClass::ReadOnlyOperator,
+        auth::PrincipalClass::Agent,
+    ] {
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"{{
+                      providerSessionAttachReceipt(
+                        continuationId: "{continuation_id}",
+                        runId: "wrong-run"
+                      )
+                    }}"#
+                ))
+                .data(auth::Principal::new("non-operator", principal_class)),
+            )
+            .await;
+
+        assert!(
+            !response.errors.is_empty(),
+            "non-Operator wrong-run attach receipt access must be rejected before projection"
+        );
+        let message = response.errors[0].message.as_str();
+        assert!(
+            message.contains("auth_failure"),
+            "wrong-run denial should use the no-oracle auth failure: {message}"
+        );
+    }
 }

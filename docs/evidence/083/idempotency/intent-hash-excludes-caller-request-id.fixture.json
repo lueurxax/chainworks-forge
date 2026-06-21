@@ -1,0 +1,15 @@
+{
+  "assertions": [
+    "intent-hash-excludes-caller-request-id is part of the current-revision P083 evidence corpus.",
+    "The canonical proposal-083 gate must keep this path present before running executable checks."
+  ],
+  "contract": "command_idempotency_contract_v1",
+  "description": "P083 R70 declared evidence fixture for intent-hash-excludes-caller-request-id.",
+  "evidence_path": "docs/evidence/083/idempotency/intent-hash-excludes-caller-request-id.fixture.json",
+  "expected_outcome": "pass",
+  "fixture_id": "intent-hash-excludes-caller-request-id",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
+  "schema_version": "p083_evidence_fixture_v1",
+  "verification_type": "contract_fixture"
+}

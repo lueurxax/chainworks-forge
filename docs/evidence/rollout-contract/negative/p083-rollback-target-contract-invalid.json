@@ -1,0 +1,17 @@
+{
+  "assertions": [
+    "p083-rollback-target-contract-invalid is part of the current-revision P083 evidence corpus.",
+    "The canonical proposal-083 gate must keep this path present before running executable checks."
+  ],
+  "contract": "rollout_contract_negative_fixture_v1",
+  "description": "P083 R70 declared evidence fixture for p083-rollback-target-contract-invalid.",
+  "evidence_path": "docs/evidence/rollout-contract/negative/p083-rollback-target-contract-invalid.json",
+  "expected_outcome": "fail",
+  "fixture_id": "p083-rollback-target-contract-invalid",
+  "negative_case": true,
+  "operator_message": "P083 R70 negative fixture: p083-rollback-target-contract-invalid must be rejected by rollout-contract validation.",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
+  "schema_version": "p083_evidence_fixture_v1",
+  "verification_type": "contract_fixture"
+}

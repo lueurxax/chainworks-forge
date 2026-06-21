@@ -1,40 +1,16 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "stale_orphan_reap_unverifiable_fail_closed",
+  "fixture_purpose": "The worker must not claim successful orphan cleanup when provider process ownership cannot be verified.",
+  "status": "pass",
+  "evidence_kind": "code_and_regression_test",
+  "evidence": {
+    "test": "cargo test -p engine --lib p086_reap_registered_provider_process_group_fails_closed_on_uid_mismatch",
+    "guard": "reap checks process uid before signalling a recorded provider process group",
+    "expected_failure_reason": "orphan_reap_unverified",
+    "readback_lane": "continuation_report"
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "proposal-086-resurrection"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:stale_orphan_reap_unverifiable_fail_closed",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "unverified_reap_fails_closed"
 }

@@ -1,0 +1,15 @@
+{
+  "assertions": [
+    "rollback-target-enforcement-mode-invalid-enum-rejected is part of the current-revision P083 evidence corpus.",
+    "The canonical proposal-083 gate must keep this path present before running executable checks."
+  ],
+  "contract": "graphql_mcp_lifecycle_contract_v1",
+  "description": "P083 R70 declared evidence fixture for rollback-target-enforcement-mode-invalid-enum-rejected.",
+  "evidence_path": "docs/evidence/083/api/rollback-target-enforcement-mode-invalid-enum-rejected.fixture.json",
+  "expected_outcome": "pass",
+  "fixture_id": "rollback-target-enforcement-mode-invalid-enum-rejected",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
+  "schema_version": "p083_evidence_fixture_v1",
+  "verification_type": "contract_fixture"
+}

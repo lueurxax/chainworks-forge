@@ -2458,6 +2458,7 @@ struct P031StageReadModel: Decodable, Equatable, Sendable {
   let projectionUpdatedAt: String?
   let projectionLag: Bool
   let freshnessState: P031FreshnessState
+  let executions: [P031StageAgentExecutionReadModel]
 
   nonisolated init(
     id: String,
@@ -2476,7 +2477,8 @@ struct P031StageReadModel: Decodable, Equatable, Sendable {
     projectionPresent: Bool,
     projectionUpdatedAt: String?,
     projectionLag: Bool,
-    freshnessState: P031FreshnessState
+    freshnessState: P031FreshnessState,
+    executions: [P031StageAgentExecutionReadModel] = []
   ) {
     self.id = id
     self.runID = runID
@@ -2495,6 +2497,7 @@ struct P031StageReadModel: Decodable, Equatable, Sendable {
     self.projectionUpdatedAt = projectionUpdatedAt
     self.projectionLag = projectionLag
     self.freshnessState = freshnessState
+    self.executions = executions
   }
 
   enum CodingKeys: String, CodingKey {
@@ -2515,6 +2518,44 @@ struct P031StageReadModel: Decodable, Equatable, Sendable {
     case projectionUpdatedAt
     case projectionLag
     case freshnessState
+    case executions
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(
+      id: try container.decode(String.self, forKey: .id),
+      runID: try container.decode(String.self, forKey: .runID),
+      stageID: try container.decode(String.self, forKey: .stageID),
+      label: try container.decode(String.self, forKey: .label),
+      status: try container.decode(String.self, forKey: .status),
+      iteration: try container.decodeIfPresent(Int.self, forKey: .iteration),
+      attemptNumber: try container.decodeIfPresent(Int.self, forKey: .attemptNumber),
+      startedAt: try container.decodeIfPresent(String.self, forKey: .startedAt),
+      completedAt: try container.decodeIfPresent(String.self, forKey: .completedAt),
+      settlementKind: try container.decodeIfPresent(String.self, forKey: .settlementKind),
+      hasArtifacts: try container.decodeIfPresent(Bool.self, forKey: .hasArtifacts),
+      hasPendingApproval: try container.decodeIfPresent(Bool.self, forKey: .hasPendingApproval),
+      hasValidationFailure: try container.decodeIfPresent(Bool.self, forKey: .hasValidationFailure),
+      projectionPresent: try container.decode(Bool.self, forKey: .projectionPresent),
+      projectionUpdatedAt: try container.decodeIfPresent(String.self, forKey: .projectionUpdatedAt),
+      projectionLag: try container.decode(Bool.self, forKey: .projectionLag),
+      freshnessState: try container.decode(P031FreshnessState.self, forKey: .freshnessState),
+      executions: try container.decodeIfPresent(
+        [P031StageAgentExecutionReadModel].self,
+        forKey: .executions
+      ) ?? []
+    )
+  }
+}
+
+struct P031StageAgentExecutionReadModel: Decodable, Equatable, Sendable {
+  let id: String
+  let outputContractRepair: OutputContractRepairEvidence?
+
+  enum CodingKeys: String, CodingKey {
+    case id
+    case outputContractRepair = "output_contract_repair"
   }
 }
 
@@ -3240,6 +3281,98 @@ enum P031GraphQLDocuments {
         projectionUpdatedAt
         projectionLag
         freshnessState
+        executions {
+          id
+          output_contract_repair: outputContractRepair {
+            schema_version: schemaVersion
+            repair_attempt_id: repairAttemptId
+            run_id: runId
+            stage_execution_id: stageExecutionId
+            agent_execution_id: agentExecutionId
+            session_generation_id: sessionGenerationId
+            role
+            provider_family: providerFamily
+            adapter_family: adapterFamily
+            required_output_mode: requiredOutputMode
+            initial_failure_class: initialFailureClass
+            initial_failure_subtype: initialFailureSubtype
+            status
+            presentation_category: presentationCategory
+            recommended_next_action: recommendedNextAction
+            required_outputs: requiredOutputs {
+              name
+              contract_id: contractId
+              canonical_path: canonicalPath
+            }
+            same_session_repair: sameSessionRepair {
+              result
+              turn_count: turnCount
+              deadline_seconds: deadlineSeconds
+              reason
+              repair_attempt_id: repairAttemptId
+            }
+            transcript_recovery: transcriptRecovery {
+              result
+              result_subtype: resultSubtype
+              recovery_source: recoverySource
+              bytes_examined: bytesExamined
+              max_recovery_payload_bytes: maxRecoveryPayloadBytes
+              max_json_depth: maxJsonDepth
+              max_chunks_examined: maxChunksExamined
+              recovery_parser_version: recoveryParserVersion
+            }
+            provider_fallback: providerFallback {
+              result
+              fallback_profile: fallbackProfile
+              fallback_agent_execution_id: fallbackAgentExecutionId
+              parent_failed_agent_execution_id: parentFailedAgentExecutionId
+              fallback_packet_hash: fallbackPacketHash
+              fallback_principal_id: fallbackPrincipalId
+              fallback_principal_capability_hash: fallbackPrincipalCapabilityHash
+              deadline_seconds: deadlineSeconds
+            }
+            provider_plan_evidence: providerPlanEvidence {
+              paths
+              redactions_applied: redactionsApplied
+              truncated_at_cap: truncatedAtCap
+              accepted_as_output: acceptedAsOutput
+            }
+            permission_decisions: permissionDecisions {
+              method
+              resource_kind: resourceKind
+              decision
+              reason
+            }
+            budget {
+              repair_consumed: repairConsumed
+              fallback_consumed: fallbackConsumed
+              repair_max_per_invocation: repairMaxPerInvocation
+              fallback_max_per_invocation: fallbackMaxPerInvocation
+            }
+            lease {
+              key
+              kind
+              state
+              settled_result: settledResult
+              reclamation_reason: reclamationReason
+              owner_principal_id: ownerPrincipalId
+              acquired_at: acquiredAt
+              expires_at: expiresAt
+              lease_seconds: leaseSeconds
+            }
+            policy_feature_flags: policyFeatureFlags
+            repair_prompt_template_version: repairPromptTemplateVersion
+            recovery_parser_version: recoveryParserVersion
+            final_output_settlement: finalOutputSettlement
+            evidence_artifact_path: evidenceArtifactPath
+            evidence_version: evidenceVersion
+            projection_integrity: projectionIntegrity
+            projection_stale_since: projectionStaleSince
+            recorded_at: recordedAt
+            created_at: createdAt
+            updated_at: updatedAt
+          }
+        }
       }
       runStageTopology(runId: $runId) {
         stageId
@@ -5713,6 +5846,7 @@ struct P031RunDetailPresentation: Equatable, Sendable {
   let implementationCompletion: P088ImplementationCompletionPresentation?
   let sideEffectReadback: P078SideEffectReadbackPresentation?
   let continuationReadback: P086ContinuationReadbackPresentation?
+  let outputContractRepair: OutputContractRepairPresentation?
   let escalationChains: [EscalationChainStateDTO]
   let escalationTraceJSONRedacted: String?
   let freshness: P031FreshnessSnapshot
@@ -5744,6 +5878,7 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     implementationCompletion: P088ImplementationCompletionPresentation? = nil,
     sideEffectReadback: P078SideEffectReadbackPresentation? = nil,
     continuationReadback: P086ContinuationReadbackPresentation? = nil,
+    outputContractRepair: OutputContractRepairPresentation? = nil,
     escalationChains: [EscalationChainStateDTO] = [],
     escalationTraceJSONRedacted: String? = nil,
     freshness: P031FreshnessSnapshot,
@@ -5773,6 +5908,7 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     self.implementationCompletion = implementationCompletion
     self.sideEffectReadback = sideEffectReadback
     self.continuationReadback = continuationReadback
+    self.outputContractRepair = outputContractRepair
     self.escalationChains = escalationChains
     self.escalationTraceJSONRedacted = escalationTraceJSONRedacted
     self.freshness = freshness
@@ -6683,6 +6819,9 @@ enum P031RunDetailPresenter {
       records: detail.continuations,
       metrics: detail.continuationMetricsSummary
     )
+    let outputContractRepair = P031OutputContractRepairReadbackPresenter.presentationIfPresent(
+      from: detail.stages
+    )
     let escalationChains = detail.runEscalationReadback?.chains ?? []
     let escalationTraceJSONRedacted = detail.runEscalationReadback?.chains.compactMap {
       $0.escalationTraceJSONRedacted
@@ -6716,6 +6855,7 @@ enum P031RunDetailPresenter {
       implementationCompletion: implementationCompletion,
       sideEffectReadback: sideEffectReadback,
       continuationReadback: continuationReadback,
+      outputContractRepair: outputContractRepair,
       escalationChains: escalationChains,
       escalationTraceJSONRedacted: escalationTraceJSONRedacted,
       freshness: P031ThinPresentationFormatting.freshnessSnapshot(
@@ -6729,6 +6869,34 @@ enum P031RunDetailPresenter {
       rawStatus: run?.status ?? "unavailable",
       failedStages: run?.failedStages ?? 0
     )
+  }
+
+  nonisolated private enum P031OutputContractRepairReadbackPresenter {
+    static func presentationIfPresent(
+      from stages: [P031StageReadModel]
+    ) -> OutputContractRepairPresentation? {
+      stages
+        .flatMap(\.executions)
+        .compactMap { $0.outputContractRepair }
+        .sorted { lhs, rhs in
+          severityRank(lhs.status) < severityRank(rhs.status)
+        }
+        .first
+        .map(OutputContractRepairPresenter.presentation)
+    }
+
+    private static func severityRank(_ status: OutputContractRepairStatus) -> Int {
+      switch status {
+      case .blocked: return 0
+      case .failed: return 1
+      case .inProgress: return 2
+      case .recovered: return 3
+      case .skipped: return 4
+      case .cancelled: return 5
+      case .notAttempted: return 6
+      case .unknownDiagnostic: return 7
+      }
+    }
   }
 
   nonisolated private static func activeAgentTimelineEntries(

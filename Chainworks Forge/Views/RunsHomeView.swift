@@ -15,6 +15,8 @@ struct RunsHomeView: View {
     @State private var selectedRunDetailTab: P031RunDetailTab = .overview
     @State private var focusedArtifactStageID: String?
     @State private var closeoutReadinessScrollRequest = 0
+    // Full-chrome redesign (macOS 27): trailing Inspector pane visibility.
+    @State private var isInspectorPresented = false
     @FocusState private var closeoutReadinessFocus: P077CloseoutReadinessFocus?
     // PC-003: sidebar lane filter context — set when a deep-link or banner routes here
     // specifically to surface waiting approvals. Cleared when the user manually selects any run.
@@ -60,6 +62,17 @@ struct RunsHomeView: View {
         } detail: {
             runDetailPane
         }
+        .inspector(isPresented: $isInspectorPresented) {
+            RunInspectorView(
+                model: model,
+                workbench: workbench,
+                onOpenRecovery: {
+                    selectedRunDetailTab = .system
+                    closeoutReadinessScrollRequest += 1
+                }
+            )
+            .inspectorColumnWidth(min: 280, ideal: 320, max: 420)
+        }
         .accessibilityIdentifier("runs-home-owner-view")
         .task {
             await model.loadIfNeeded()
@@ -73,18 +86,95 @@ struct RunsHomeView: View {
             p083SessionsModel.updateSelectedRun(newRunID)
         }
         .toolbar {
-            Button {
-                Task { await model.refreshAll() }
-            } label: {
-                if model.isLoading {
-                    ProgressView()
-                        .controlSize(.small)
-                } else {
-                    Label("Refresh", systemImage: "arrow.clockwise")
+            // Section switcher — centered in the window toolbar. High effective priority
+            // (principal) so it never collapses into the overflow as the window narrows.
+            if model.runDetail != nil {
+                ToolbarItem(placement: .principal) {
+                    Picker("Run section", selection: $selectedRunDetailTab) {
+                        ForEach(P031RunDetailTab.allCases) { tab in
+                            Text(tab.title).tag(tab)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(maxWidth: 520)
+                    .accessibilityIdentifier("run-detail-section-picker")
                 }
             }
-            .disabled(model.isLoading)
+
+            // Full-chrome redesign (macOS 27): "New run" routes to the Ideas tab, the
+            // real run-compilation entry point. Default (.automatic) priority so it
+            // overflows after freshness but before the critical operator actions.
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    NotificationCenter.default.post(
+                        name: .chainworksSelectTab,
+                        object: nil,
+                        userInfo: ["tab": "Ideas"]
+                    )
+                } label: {
+                    Label("New run", systemImage: "plus")
+                }
+                .help("Capture an idea and compile a new run")
+                .accessibilityIdentifier("runs-new-run-button")
+            }
+
+            // P0XX (macOS 27 toolbar): freshness is a low-priority status item — when the
+            // window narrows it is the first to collapse into the system overflow menu,
+            // leaving the primary action in place. `contentMarginsRemoved()` lets the
+            // capsule sit flush in the bar.
+            if let freshness = model.runsHome?.freshness {
+                ToolbarItem(placement: .automatic) {
+                    P031FreshnessBadge(snapshot: freshness)
+                        .help(model.runsHome?.refreshFeedbackText ?? "Read freshness")
+                }
+                .visibilityPriority(.low)
+                .contentMarginsRemoved()
+            }
+
+            // Primary action — high priority so it always stays in the bar regardless of
+            // how far the window is resized. Keeps the "Refresh" label that UI tests query.
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    Task { await model.refreshAll() }
+                } label: {
+                    if model.isLoading {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                }
+                .disabled(model.isLoading)
+            }
+            .visibilityPriority(.high)
+
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    runCommandButtons
+                } label: {
+                    Label("Run Actions", systemImage: "play.circle")
+                }
+                .disabled(!p083RunCommandState.hasSelectedRun)
+                .accessibilityLabel("Run actions")
+            }
+            .visibilityPriority(.high)
+
+            // Full-chrome redesign (macOS 27): toggle the trailing Inspector pane.
+            // High priority so it never collapses into the overflow menu.
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    isInspectorPresented.toggle()
+                } label: {
+                    Label("Inspector", systemImage: "sidebar.trailing")
+                }
+                .help("Toggle the run inspector")
+                .accessibilityIdentifier("run-inspector-toggle-button")
+            }
+            .visibilityPriority(.high)
         }
+        .focusedSceneValue(\.p083RunCommandState, p083RunCommandState)
+        .focusedSceneValue(\.p083RunCommandActions, p083RunCommandActions)
         .onReceive(NotificationCenter.default.publisher(for: Notification.Name("chainworks.selectRunDetailTab"))) { notification in
             guard
                 let userInfo = notification.userInfo,
@@ -102,16 +192,105 @@ struct RunsHomeView: View {
         }
     }
 
+    private var p083RunCommandState: P083RunCommandState {
+        P083RunCommandState(
+            hasSelectedRun: model.selectedRunID != nil,
+            hasPendingApproval: !workbench.inlineApprovals.isEmpty,
+            hasIdentityHold: !p083SessionsModel.sessions.isEmpty
+        )
+    }
+
+    private var p083RunCommandActions: P083RunCommandActions {
+        P083RunCommandActions(
+            cancelRun: { p083CopyLifecycleCommandGuidance("runs.cancel") },
+            retryRun: { p083CopyLifecycleCommandGuidance("runs.retry") },
+            retryStage: { p083CopyLifecycleCommandGuidance("stages.retry") },
+            resolveApproval: { selectedRunDetailTab = .approvals },
+            shutdownProviderSession: { p083CopyLifecycleCommandGuidance("provider_session.shutdown") },
+            retryIdentityCheck: { p083SessionsModel.refreshCurrentRun() },
+            copyDiagnostic: { p083CopyIdentityDiagnosticGuidance() },
+            exportText: { p083CopyLifecycleCommandGuidance("runs.export_text") }
+        )
+    }
+
+    @ViewBuilder
+    private var runCommandButtons: some View {
+        Menu("Lifecycle") {
+            Button("Cancel Run") { p083RunCommandActions.cancelRun() }
+                .disabled(!p083RunCommandState.canUseSelectedRunCommand)
+                .help("Cancel the selected run through the backend lifecycle authority")
+            Button("Retry Run") { p083RunCommandActions.retryRun() }
+                .disabled(!p083RunCommandState.canUseSelectedRunCommand)
+                .help("Retry the selected run through the backend lifecycle authority")
+            Button("Retry Stage") { p083RunCommandActions.retryStage() }
+                .disabled(!p083RunCommandState.canUseSelectedRunCommand)
+                .help("Retry the focused stage through the backend lifecycle authority")
+            Button("Resolve Approval") { p083RunCommandActions.resolveApproval() }
+                .disabled(!p083RunCommandState.canResolveApproval)
+                .help("Open the approval lane for the focused run")
+            Button("Shutdown Provider Session") { p083RunCommandActions.shutdownProviderSession() }
+                .disabled(!p083RunCommandState.canUseSelectedRunCommand)
+                .help("Request provider session shutdown through the backend lifecycle authority")
+        }
+
+        Menu("Recovery") {
+            Button("Retry Identity Check") { p083RunCommandActions.retryIdentityCheck() }
+                .disabled(!p083RunCommandState.canRetryIdentityCheck)
+                .help("Refresh process identity evidence for held provider sessions")
+            Button("Copy Diagnostic") { p083RunCommandActions.copyDiagnostic() }
+                .disabled(!p083RunCommandState.canCopyDiagnostic)
+                .help("Copy the focused provider-session diagnostic")
+            Button("Export Text") { p083RunCommandActions.exportText() }
+                .disabled(!p083RunCommandState.canExportText)
+                .help("Copy a text export command for the selected run")
+        }
+    }
+
     /// P083 UI action boundary: Mark Process Absent is an MCP-only lifecycle command.
     /// Copies operator guidance to the pasteboard so the operator can issue the command
     /// through the approved MCP tool path rather than through governed SwiftUI.
     private func p083CopyMarkProcessAbsentGuidance(providerSessionId: String) {
+        let session = p083SessionsModel.sessions.first { $0.id == providerSessionId }
+        let cancellationEpoch = session?.cancellationEpoch.map(String.init) ?? "<cancellation-epoch>"
         let guidance = """
             P083 Mark Process Absent — use the MCP tool:
-            Tool: p083.markProviderSessionProcessAbsent
+            Tool: provider_session.mark_process_absent
             provider_session_id: \(providerSessionId)
+            cancellation_epoch: \(cancellationEpoch)
+            caller_request_id: <lowercase-uuidv4>
 
             This command must be issued through the approved MCP operator command path.
+            """
+        #if canImport(AppKit)
+        let pasteboard = NSPasteboard.general
+        pasteboard.prepareForNewContents(with: .currentHostOnly)
+        pasteboard.setString(guidance, forType: .string)
+        #endif
+    }
+
+    private func p083CopyLifecycleCommandGuidance(_ toolName: String) {
+        let runID = model.selectedRunID ?? "<select-run>"
+        let guidance = """
+            P083 lifecycle command — use the approved operator command path:
+            Tool: \(toolName)
+            run_id: \(runID)
+
+            The SwiftUI shell exposes this command placement but does not bypass the backend lifecycle authority.
+            """
+        #if canImport(AppKit)
+        let pasteboard = NSPasteboard.general
+        pasteboard.prepareForNewContents(with: .currentHostOnly)
+        pasteboard.setString(guidance, forType: .string)
+        #endif
+    }
+
+    private func p083CopyIdentityDiagnosticGuidance() {
+        let sessionID = p083SessionsModel.sessions.first?.id ?? "<select-provider-session>"
+        let guidance = """
+            P083 Copy Diagnostic — use the focused provider-session diagnostic:
+            provider_session_id: \(sessionID)
+
+            Select the held provider session banner to copy the full process identity payload.
             """
         #if canImport(AppKit)
         let pasteboard = NSPasteboard.general
@@ -312,17 +491,8 @@ struct RunsHomeView: View {
             runDetailAlert
 
             if let runDetail = model.runDetail {
-                Picker("Run section", selection: $selectedRunDetailTab) {
-                    ForEach(P031RunDetailTab.allCases) { tab in
-                        Text(tab.title).tag(tab)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(maxWidth: 720)
-                .padding(.horizontal, 20)
-                .padding(.top, 20)
-
+                // Section switcher migrated to the window toolbar (.principal) as part of the
+                // macOS 27 chrome redesign; the detail pane now renders content directly.
                 runDetailTabContent(runDetail)
             } else {
                 ScrollView {
@@ -536,6 +706,9 @@ struct RunsHomeView: View {
                 .padding(.bottom, 20)
                 .frame(maxWidth: .infinity, alignment: .topLeading)
             }
+            // macOS 27: enables `swipeActions` on rows that live outside a List
+            // (e.g. the approval workbench cards in this scroll view).
+            .swipeActionsContainer()
             .onChange(of: closeoutReadinessScrollRequest) {
                 guard selectedRunDetailTab == .overview else { return }
                 withAnimation(.easeInOut(duration: 0.16)) {
@@ -6412,6 +6585,21 @@ private struct P036ApprovalWorkbenchCard: View {
     let onReject: (String) async -> Void
     let resolvingIDs: Set<String>
 
+    // Operator-local priority order for the approval queue (macOS 27 drag-to-reorder).
+    // Ephemeral, view-side only — never written back to the server; reconciled against the
+    // latest `rows` on every refresh so it survives projection updates by approval ID.
+    @State private var orderedRows: [RunsWorkbenchPresentationModel.ApprovalRow] = []
+
+    private func reconcileOrder() {
+        let incomingByID = Dictionary(rows.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+        var next = orderedRows.compactMap { incomingByID[$0.id] }
+        let known = Set(next.map(\.id))
+        for row in rows where !known.contains(row.id) {
+            next.append(row)
+        }
+        orderedRows = next
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Pending approvals")
@@ -6422,8 +6610,13 @@ private struct P036ApprovalWorkbenchCard: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             } else {
+                if orderedRows.count > 1 {
+                    Label("Drag to prioritize · swipe for actions", systemImage: "arrow.up.arrow.down")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
                 VStack(spacing: 8) {
-                    ForEach(rows) { row in
+                    ForEach(orderedRows) { row in
                         HStack(alignment: .top) {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(row.title)
@@ -6494,11 +6687,32 @@ private struct P036ApprovalWorkbenchCard: View {
                         .background(Color.primary.opacity(0.04))
                         .cornerRadius(8)
                         .accessibilityLabel(row.accessibilityLabel)
+                        // macOS 27 swipe actions outside List — quick approve/reject.
+                        // Full-swipe disabled: these are consequential, require a tap on
+                        // the revealed action rather than a single fling.
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            Button("Reject", role: .destructive) {
+                                Task { await onReject(row.id) }
+                            }
+                            .disabled(!row.canReject || resolvingIDs.contains(row.id))
+
+                            Button("Approve") {
+                                Task { await onApprove(row.id) }
+                            }
+                            .tint(ForgeStatusColor.success)
+                            .disabled(!row.canApprove || resolvingIDs.contains(row.id))
+                        }
                     }
+                    .reorderable()
+                }
+                .reorderContainer(for: RunsWorkbenchPresentationModel.ApprovalRow.self) { difference in
+                    difference.apply(to: &orderedRows)
                 }
             }
         }
         .forgePanel(tint: rows.isEmpty ? ForgeColor.Surface.border : ForgeStatusColor.approval)
+        .onAppear { reconcileOrder() }
+        .onChange(of: rows.map(\.id)) { reconcileOrder() }
     }
 }
 

@@ -1,7 +1,7 @@
 {
   "fixture_id": "operator-resolves-held-identity-ambiguous",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "cancellation_identity_contract_v1",
   "description": "An operator action to resolve the held_identity_ambiguous state either confirms or abandons the cancellation, transitioning the run to the correct next state.",
   "preconditions": {

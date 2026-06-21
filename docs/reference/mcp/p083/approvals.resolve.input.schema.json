@@ -1,0 +1,34 @@
+{
+  "$id": "https://chainworks.local/schemas/mcp/p083/approvals.resolve.input.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "approval_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "type": "string"
+    },
+    "caller_request_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "reason": {
+      "maxLength": 2048,
+      "type": "string"
+    },
+    "resolution": {
+      "enum": [
+        "approve",
+        "reject"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "approval_id",
+    "resolution",
+    "caller_request_id"
+  ],
+  "title": "approvals.resolve input",
+  "type": "object"
+}

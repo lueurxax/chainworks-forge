@@ -40,7 +40,7 @@ struct Chainworks_ForgeApp: App {
     var body: some Scene {
         WindowGroup {
             if Self.isTestHost {
-                EmptyView()
+                UnitTestHostRootView()
             } else {
                 ContentView(notificationService: notificationService)
             }
@@ -81,6 +81,7 @@ struct Chainworks_ForgeApp: App {
                 }
                 .keyboardShortcut("4", modifiers: .command)
             }
+            P083RunCommands()
         }
         MenuBarExtra {
             EscalationMenuBarList(snapshots: notificationService.p058EscalationSnapshots) { runID in
@@ -285,6 +286,14 @@ struct Chainworks_ForgeApp: App {
     #endif
 }
 
+private struct UnitTestHostRootView: View {
+    var body: some View {
+        Color.clear
+            .frame(width: 1, height: 1)
+            .accessibilityIdentifier("unit-test-host-root")
+    }
+}
+
 #if os(macOS) && DEBUG
 private actor DebugPackagedDaemonProcess {
     static let shared = DebugPackagedDaemonProcess()
@@ -447,6 +456,96 @@ private actor DebugPackagedDaemonProcess {
             return true
         }
         .joined(separator: ":")
+    }
+}
+
+struct P083RunCommandState: Equatable {
+    let hasSelectedRun: Bool
+    let hasPendingApproval: Bool
+    let hasIdentityHold: Bool
+
+    var canUseSelectedRunCommand: Bool { hasSelectedRun }
+    var canResolveApproval: Bool { hasPendingApproval }
+    var canRetryIdentityCheck: Bool { hasIdentityHold }
+    var canCopyDiagnostic: Bool { hasIdentityHold }
+    var canExportText: Bool { hasSelectedRun }
+}
+
+struct P083RunCommandActions {
+    var cancelRun: () -> Void = {}
+    var retryRun: () -> Void = {}
+    var retryStage: () -> Void = {}
+    var resolveApproval: () -> Void = {}
+    var shutdownProviderSession: () -> Void = {}
+    var retryIdentityCheck: () -> Void = {}
+    var copyDiagnostic: () -> Void = {}
+    var exportText: () -> Void = {}
+}
+
+private struct P083RunCommandStateKey: FocusedValueKey {
+    typealias Value = P083RunCommandState
+}
+
+private struct P083RunCommandActionsKey: FocusedValueKey {
+    typealias Value = P083RunCommandActions
+}
+
+extension FocusedValues {
+    var p083RunCommandState: P083RunCommandState? {
+        get { self[P083RunCommandStateKey.self] }
+        set { self[P083RunCommandStateKey.self] = newValue }
+    }
+
+    var p083RunCommandActions: P083RunCommandActions? {
+        get { self[P083RunCommandActionsKey.self] }
+        set { self[P083RunCommandActionsKey.self] = newValue }
+    }
+}
+
+struct P083RunCommands: Commands {
+    @FocusedValue(\.p083RunCommandState) private var state
+    @FocusedValue(\.p083RunCommandActions) private var actions
+
+    var body: some Commands {
+        CommandMenu("Run") {
+            Menu("Lifecycle") {
+                Button("Cancel Run") { actions?.cancelRun() }
+                    .keyboardShortcut(".", modifiers: .command)
+                    .disabled(!(state?.canUseSelectedRunCommand ?? false))
+                    .help("Cancel the selected run through the backend lifecycle authority")
+                Button("Retry Run") { actions?.retryRun() }
+                    .keyboardShortcut("r", modifiers: .command)
+                    .disabled(!(state?.canUseSelectedRunCommand ?? false))
+                    .help("Retry the selected run through the backend lifecycle authority")
+                Button("Retry Stage") { actions?.retryStage() }
+                    .keyboardShortcut("r", modifiers: [.command, .shift])
+                    .disabled(!(state?.canUseSelectedRunCommand ?? false))
+                    .help("Retry the focused stage through the backend lifecycle authority")
+                Button("Resolve Approval") { actions?.resolveApproval() }
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .disabled(!(state?.canResolveApproval ?? false))
+                    .help("Open the approval lane for the focused run")
+                Button("Shutdown Provider Session") { actions?.shutdownProviderSession() }
+                    .keyboardShortcut("k", modifiers: [.command, .shift])
+                    .disabled(!(state?.canUseSelectedRunCommand ?? false))
+                    .help("Request provider session shutdown through the backend lifecycle authority")
+            }
+
+            Menu("Recovery") {
+                Button("Retry Identity Check") { actions?.retryIdentityCheck() }
+                    .keyboardShortcut("i", modifiers: .command)
+                    .disabled(!(state?.canRetryIdentityCheck ?? false))
+                    .help("Refresh process identity evidence for held provider sessions")
+                Button("Copy Diagnostic") { actions?.copyDiagnostic() }
+                    .keyboardShortcut("c", modifiers: [.command, .shift])
+                    .disabled(!(state?.canCopyDiagnostic ?? false))
+                    .help("Copy the focused provider-session diagnostic")
+                Button("Export Text") { actions?.exportText() }
+                    .keyboardShortcut("e", modifiers: [.command, .shift])
+                    .disabled(!(state?.canExportText ?? false))
+                    .help("Copy a text export command for the selected run")
+            }
+        }
     }
 }
 

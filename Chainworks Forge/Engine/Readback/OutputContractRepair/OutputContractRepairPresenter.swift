@@ -48,7 +48,9 @@ nonisolated enum OutputContractRepairPresenter {
             (evidence.lease?.state == .reserved || evidence.lease?.state == .promptSent)
         let isStale = evidence.projectionIntegrity == "stale" ||
             evidence.projectionIntegrity == "permanently_stale"
-        let staleSinceLabel: String? = isStale ? evidence.projectionStaleSince : nil
+        let staleSinceLabel: String? = isStale
+            ? staleSinceDisplayLabel(evidence.projectionStaleSince)
+            : nil
 
         var diagnosticRows: [String] = []
         diagnosticRows.append("Failure: \(evidence.initialFailureClass.rawValue)")
@@ -157,6 +159,23 @@ nonisolated enum OutputContractRepairPresenter {
         case .unknownDiagnostic(_):
             return "Unknown repair state"
         }
+    }
+
+    private static func staleSinceDisplayLabel(_ rawValue: String?) -> String? {
+        guard let rawValue, !rawValue.isEmpty else { return nil }
+        let parser = ISO8601DateFormatter()
+        parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let parsed = parser.date(from: rawValue) ?? {
+            let fallback = ISO8601DateFormatter()
+            fallback.formatOptions = [.withInternetDateTime]
+            return fallback.date(from: rawValue)
+        }()
+        guard let parsed else { return rawValue }
+
+        let relative = RelativeDateTimeFormatter()
+        relative.unitsStyle = .full
+        let relativeLabel = relative.localizedString(for: parsed, relativeTo: Date())
+        return "\(relativeLabel) · \(rawValue)"
     }
 }
 

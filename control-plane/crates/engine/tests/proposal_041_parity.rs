@@ -1677,6 +1677,7 @@ impl acp::adapters::AcpAdapter for FixtureAcpAdapter {
             xcode_shim_warning_events: Vec::new(),
             close_diagnostic: None,
             provider_session_store_capture: None,
+            provider_session_store_recovery: None,
             acp_pre_initialize_local_latency_ms: None,
             acp_initialize_latency_ms: None,
             acp_session_new_latency_ms: None,

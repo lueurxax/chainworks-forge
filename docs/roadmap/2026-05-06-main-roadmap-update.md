@@ -313,7 +313,7 @@ Required integration:
 
 #### Step 7 - P082 recovery/retry test matrix
 
-Use [P082](../proposals/082-recovery-retry-state-machine-test-matrix.md) as the proof layer before enabling broader retry automation.
+Use the [recovery/retry state-machine matrix](../reference/recovery-retry-state-machine-test-matrix.md) as the proof layer before enabling broader retry automation.
 
 Minimum rows:
 

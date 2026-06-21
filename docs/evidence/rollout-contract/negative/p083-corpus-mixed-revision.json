@@ -1,0 +1,17 @@
+{
+  "assertions": [
+    "p083-corpus-mixed-revision is part of the current-revision P083 evidence corpus.",
+    "The canonical proposal-083 gate must keep this path present before running executable checks."
+  ],
+  "contract": "rollout_contract_negative_fixture_v1",
+  "description": "P083 R70 declared evidence fixture for p083-corpus-mixed-revision.",
+  "evidence_path": "docs/evidence/rollout-contract/negative/p083-corpus-mixed-revision.json",
+  "expected_outcome": "fail",
+  "fixture_id": "p083-corpus-mixed-revision",
+  "negative_case": true,
+  "operator_message": "P083 R70 negative fixture: p083-corpus-mixed-revision must be rejected by rollout-contract validation.",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
+  "schema_version": "p083_evidence_fixture_v1",
+  "verification_type": "contract_fixture"
+}

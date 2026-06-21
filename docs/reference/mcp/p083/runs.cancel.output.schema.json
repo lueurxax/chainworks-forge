@@ -1,0 +1,47 @@
+{
+  "$id": "https://chainworks.local/schemas/mcp/p083/runs.cancel.output.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "denial": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "next_action": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "accepted",
+        "replayed",
+        "aliased",
+        "denied"
+      ],
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "status"
+  ],
+  "title": "runs.cancel output",
+  "type": "object"
+}

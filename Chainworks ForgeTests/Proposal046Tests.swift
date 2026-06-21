@@ -17,7 +17,7 @@ struct Proposal046Tests {
 
     @Test("P046SessionObservabilityModel transitions to unavailable on disabled-schema error")
     func disabledSchemaTransitionsToUnavailable() async throws {
-        var queriesFired: [String] = []
+        let queriesFired = P046StringRecorder()
         let model = P046SessionObservabilityModel(
             checkCapability: {
                 queriesFired.append("capability")
@@ -49,13 +49,13 @@ struct Proposal046Tests {
 
         #expect(model.availability == .unavailable,
             "Model must report unavailable when capability probe fails with disabled-schema error")
-        #expect(queriesFired == ["capability"],
-            "Only capability probe must fire on disabled-schema error; fired: \(queriesFired)")
+        #expect(queriesFired.snapshot == ["capability"],
+            "Only capability probe must fire on disabled-schema error; fired: \(queriesFired.snapshot)")
     }
 
     @Test("P046SessionObservabilityModel transitions to unavailable when capability returns false")
     func capabilityFalseTransitionsToUnavailable() async throws {
-        var queriesFired: [String] = []
+        let queriesFired = P046StringRecorder()
         let model = P046SessionObservabilityModel(
             checkCapability: {
                 queriesFired.append("capability")
@@ -84,13 +84,13 @@ struct Proposal046Tests {
 
         #expect(model.availability == .unavailable,
             "Model must report unavailable when capability returns false")
-        #expect(queriesFired == ["capability"],
-            "Only capability probe must fire when capability returns false; fired: \(queriesFired)")
+        #expect(queriesFired.snapshot == ["capability"],
+            "Only capability probe must fire when capability returns false; fired: \(queriesFired.snapshot)")
     }
 
     @Test("P046SessionObservabilityModel does not fire any P046 docs when run is nil")
     func nilRunFiresNoQueries() async throws {
-        var queriesFired: [String] = []
+        let queriesFired = P046StringRecorder()
         let model = P046SessionObservabilityModel(
             checkCapability: { queriesFired.append("capability"); return true },
             fetchLineages: { _ in queriesFired.append("lineages"); throw P031GraphQLReadBoundaryError.graphqlErrors([""]) },
@@ -102,7 +102,7 @@ struct Proposal046Tests {
         model.updateSelectedRun(nil)
         try await Task.sleep(nanoseconds: 50_000_000)
 
-        #expect(queriesFired.isEmpty, "No P046 documents must be issued when runID is nil")
+        #expect(queriesFired.snapshot.isEmpty, "No P046 documents must be issued when runID is nil")
         #expect(model.availability == .unknown)
     }
 
@@ -188,26 +188,25 @@ struct Proposal046Tests {
 
     @Test("Resync refresh failure keeps P046 session readback stale")
     func resyncRefreshFailureKeepsSessionReadbackStale() async throws {
-        var fetchCount = 0
-        var continuation: AsyncThrowingStream<P046SessionStatusChangedReadModel, Error>.Continuation?
+        let fetchCount = P046Counter()
+        let continuation = P046StatusContinuationBox()
         let model = Self.makeModel(
             fetchLineages: { runID in
-                fetchCount += 1
-                if fetchCount == 1 {
+                if fetchCount.increment() == 1 {
                     return Self.lineageConnection(runID: runID, marker: "initial")
                 }
                 throw P031GraphQLReadBoundaryError.graphqlErrors(["refresh failed"])
             },
             subscribeStatus: { _ in
                 AsyncThrowingStream { streamContinuation in
-                    continuation = streamContinuation
+                    continuation.set(streamContinuation)
                 }
             }
         )
 
         model.updateSelectedRun("run-1")
         try await Task.sleep(nanoseconds: 100_000_000)
-        continuation?.yield(Self.statusEvent(runID: "run-1", eventID: nil, status: "RESYNC_REQUIRED", resyncRequired: true))
+        continuation.yield(Self.statusEvent(runID: "run-1", eventID: nil, status: "RESYNC_REQUIRED", resyncRequired: true))
         try await Task.sleep(nanoseconds: 100_000_000)
 
         #expect(model.isStale, "stale must remain true until a full fresh readback succeeds")
@@ -216,11 +215,11 @@ struct Proposal046Tests {
 
     @Test("Normal subscription completion refreshes before clearing stale state")
     func subscriptionCompletionRefreshesBeforeClearingStaleState() async throws {
-        var fetchCount = 0
+        let fetchCount = P046Counter()
         let model = Self.makeModel(
             fetchLineages: { runID in
-                fetchCount += 1
-                return Self.lineageConnection(runID: runID, marker: "fetch-\(fetchCount)")
+                let count = fetchCount.increment()
+                return Self.lineageConnection(runID: runID, marker: "fetch-\(count)")
             },
             subscribeStatus: { _ in
                 AsyncThrowingStream { streamContinuation in
@@ -232,7 +231,7 @@ struct Proposal046Tests {
         model.updateSelectedRun("run-1")
         try await Task.sleep(nanoseconds: 150_000_000)
 
-        #expect(fetchCount >= 2, "stream completion must trigger a fresh readback")
+        #expect(fetchCount.value >= 2, "stream completion must trigger a fresh readback")
         #expect(!model.isStale, "successful completion refresh may clear stale state")
         #expect(model.lineages.first?.lineageKey == "fetch-2")
     }
@@ -240,11 +239,11 @@ struct Proposal046Tests {
     @Test("Subscription error attempts fresh readback before staying stale")
     func subscriptionErrorAttemptsFreshReadback() async throws {
         struct SubscriptionClosed: Error {}
-        var fetchCount = 0
+        let fetchCount = P046Counter()
         let model = Self.makeModel(
             fetchLineages: { runID in
-                fetchCount += 1
-                return Self.lineageConnection(runID: runID, marker: "fetch-\(fetchCount)")
+                let count = fetchCount.increment()
+                return Self.lineageConnection(runID: runID, marker: "fetch-\(count)")
             },
             subscribeStatus: { _ in
                 AsyncThrowingStream { streamContinuation in
@@ -256,34 +255,34 @@ struct Proposal046Tests {
         model.updateSelectedRun("run-1")
         try await Task.sleep(nanoseconds: 150_000_000)
 
-        #expect(fetchCount >= 2, "subscription error must attempt a fresh readback")
+        #expect(fetchCount.value >= 2, "subscription error must attempt a fresh readback")
         #expect(!model.isStale, "successful error refresh may clear stale state")
         #expect(model.lineages.first?.lineageKey == "fetch-2")
     }
 
     @Test("Duplicate subscription events are ignored by event id")
     func duplicateSubscriptionEventsAreIgnored() async throws {
-        var fetchCount = 0
-        var continuation: AsyncThrowingStream<P046SessionStatusChangedReadModel, Error>.Continuation?
+        let fetchCount = P046Counter()
+        let continuation = P046StatusContinuationBox()
         let model = Self.makeModel(
             fetchLineages: { runID in
-                fetchCount += 1
-                return Self.lineageConnection(runID: runID, marker: "fetch-\(fetchCount)")
+                let count = fetchCount.increment()
+                return Self.lineageConnection(runID: runID, marker: "fetch-\(count)")
             },
             subscribeStatus: { _ in
                 AsyncThrowingStream { streamContinuation in
-                    continuation = streamContinuation
+                    continuation.set(streamContinuation)
                 }
             }
         )
 
         model.updateSelectedRun("run-1")
         try await Task.sleep(nanoseconds: 100_000_000)
-        continuation?.yield(Self.statusEvent(runID: "run-1", eventID: "event-1"))
-        continuation?.yield(Self.statusEvent(runID: "run-1", eventID: "event-1"))
+        continuation.yield(Self.statusEvent(runID: "run-1", eventID: "event-1"))
+        continuation.yield(Self.statusEvent(runID: "run-1", eventID: "event-1"))
         try await Task.sleep(nanoseconds: 150_000_000)
 
-        #expect(fetchCount == 2, "initial read plus one unique event refresh expected; got \(fetchCount)")
+        #expect(fetchCount.value == 2, "initial read plus one unique event refresh expected; got \(fetchCount.value)")
         model.updateSelectedRun(nil)
     }
 
@@ -355,5 +354,54 @@ struct Proposal046Tests {
             recordedAt: "2026-05-24T00:00:00Z",
             resyncRequired: resyncRequired
         )
+    }
+}
+
+private final class P046StringRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String] = []
+
+    func append(_ value: String) {
+        lock.withLock {
+            values.append(value)
+        }
+    }
+
+    var snapshot: [String] {
+        lock.withLock { values }
+    }
+}
+
+private final class P046Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    @discardableResult
+    func increment() -> Int {
+        lock.withLock {
+            count += 1
+            return count
+        }
+    }
+
+    var value: Int {
+        lock.withLock { count }
+    }
+}
+
+private final class P046StatusContinuationBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: AsyncThrowingStream<P046SessionStatusChangedReadModel, Error>.Continuation?
+
+    func set(
+        _ continuation: AsyncThrowingStream<P046SessionStatusChangedReadModel, Error>.Continuation
+    ) {
+        lock.withLock {
+            self.continuation = continuation
+        }
+    }
+
+    func yield(_ value: P046SessionStatusChangedReadModel) {
+        lock.withLock { continuation }?.yield(value)
     }
 }

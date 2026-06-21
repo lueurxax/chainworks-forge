@@ -102,6 +102,243 @@ while True:
     script.to_string_lossy().into_owned()
 }
 
+fn make_resurrection_fixture_script(tmpdir: &std::path::Path, actual_session_id: &str) -> String {
+    let script = tmpdir.join(format!("p086_acp_resurrection_{actual_session_id}.py"));
+    let marker = tmpdir.join("markers.jsonl");
+    let code = format!(
+        r#"#!/usr/bin/env python3
+import json, os, sys
+
+marker_path = {marker_path:?}
+actual_session_id = {actual_session_id:?}
+
+def mark(obj):
+    with open(marker_path, "a") as f:
+        f.write(json.dumps(obj, sort_keys=True) + "\n")
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    return json.loads(line)
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"protocolVersion": 1}}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+params = msg.get("params", {{}})
+cwd = params.get("cwd", "/tmp")
+extra = params.get("sessionMode", {{}})
+resume_session_id = params.get("resumeSessionId")
+if resume_session_id is None:
+    # Some ACP clients may nest adapter extras under config.
+    resume_session_id = params.get("config", {{}}).get("resumeSessionId")
+mark({{"event": "session_new", "cwd": cwd, "resumeSessionId": resume_session_id, "actualSessionId": actual_session_id}})
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"sessionId": actual_session_id}}}})
+
+while True:
+    msg = recv()
+    if msg is None:
+        sys.exit(0)
+    if msg.get("method") == "session/close":
+        mark({{"event": "close"}})
+        send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{}}}})
+        sys.exit(0)
+    if msg.get("method") != "session/prompt":
+        if "id" in msg:
+            send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{}}}})
+        continue
+    prompt_obj = msg.get("params", {{}}).get("prompt", "")
+    if isinstance(prompt_obj, list):
+        prompt = "\n".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in prompt_obj
+        )
+    elif isinstance(prompt_obj, dict):
+        prompt = prompt_obj.get("text", json.dumps(prompt_obj, sort_keys=True))
+    else:
+        prompt = str(prompt_obj)
+    mark({{"event": "prompt", "prompt": prompt}})
+    prompt_marker = ""
+    request_fingerprint = ""
+    target_stage_execution_id = ""
+    target_agent_execution_id = ""
+    for line in prompt.splitlines():
+        if line.startswith("- Prompt turn marker id: "):
+            prompt_marker = line.split(": ", 1)[1]
+        if line.startswith("- Request fingerprint sha256: "):
+            request_fingerprint = line.split(": ", 1)[1]
+        if line.startswith("- Stage execution id: "):
+            target_stage_execution_id = line.split(": ", 1)[1]
+        if line.startswith("- Agent execution id: "):
+            target_agent_execution_id = line.split(": ", 1)[1]
+    with open(os.path.join(cwd, "p086-resurrection-turn.txt"), "w") as f:
+        f.write("resurrection continuation wrote this file\n")
+    send({{"jsonrpc": "2.0", "method": "session/update", "params": {{"update": {{"sessionUpdate": "agent_message_chunk", "content": "resurrection turn marker " + prompt_marker + " request " + request_fingerprint + " stage " + target_stage_execution_id + " agent " + target_agent_execution_id + " ran ./scripts/test-gate.sh proposal-086 passed"}}}}}})
+    send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"stopReason": "end_turn", "sessionId": actual_session_id}}}})
+"#,
+        marker_path = marker.to_string_lossy(),
+        actual_session_id = actual_session_id
+    );
+    std::fs::write(&script, code).unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    script.to_string_lossy().into_owned()
+}
+
+fn make_uncorrelated_resurrection_fixture_script(
+    tmpdir: &std::path::Path,
+    actual_session_id: &str,
+) -> String {
+    let script = tmpdir.join(format!(
+        "p086_acp_resurrection_uncorrelated_{actual_session_id}.py"
+    ));
+    let marker = tmpdir.join("markers.jsonl");
+    let code = format!(
+        r#"#!/usr/bin/env python3
+import json, os, sys
+
+marker_path = {marker_path:?}
+actual_session_id = {actual_session_id:?}
+
+def mark(obj):
+    with open(marker_path, "a") as f:
+        f.write(json.dumps(obj, sort_keys=True) + "\n")
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    return json.loads(line)
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"protocolVersion": 1}}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+params = msg.get("params", {{}})
+cwd = params.get("cwd", "/tmp")
+resume_session_id = params.get("resumeSessionId")
+if resume_session_id is None:
+    resume_session_id = params.get("config", {{}}).get("resumeSessionId")
+mark({{"event": "session_new", "cwd": cwd, "resumeSessionId": resume_session_id, "actualSessionId": actual_session_id}})
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"sessionId": actual_session_id}}}})
+
+while True:
+    msg = recv()
+    if msg is None:
+        sys.exit(0)
+    if msg.get("method") == "session/close":
+        mark({{"event": "close"}})
+        send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{}}}})
+        sys.exit(0)
+    if msg.get("method") != "session/prompt":
+        if "id" in msg:
+            send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{}}}})
+        continue
+    prompt = msg.get("params", {{}}).get("prompt", "")
+    mark({{"event": "prompt", "prompt": prompt}})
+    with open(os.path.join(cwd, "p086-resurrection-turn.txt"), "w") as f:
+        f.write("uncorrelated resurrection continuation wrote this file\n")
+    send({{"jsonrpc": "2.0", "method": "session/update", "params": {{"update": {{"sessionUpdate": "agent_message_chunk", "content": "uncorrelated resurrection turn ran ./scripts/test-gate.sh proposal-086 passed"}}}}}})
+    send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"stopReason": "end_turn", "sessionId": actual_session_id}}}})
+"#,
+        marker_path = marker.to_string_lossy(),
+        actual_session_id = actual_session_id
+    );
+    std::fs::write(&script, code).unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    script.to_string_lossy().into_owned()
+}
+
+fn make_lost_terminal_resurrection_fixture_script(
+    tmpdir: &std::path::Path,
+    actual_session_id: &str,
+) -> String {
+    let script = tmpdir.join(format!(
+        "p086_acp_resurrection_lost_terminal_{actual_session_id}.py"
+    ));
+    let marker = tmpdir.join("markers.jsonl");
+    let code = format!(
+        r#"#!/usr/bin/env python3
+import json, sys
+
+marker_path = {marker_path:?}
+actual_session_id = {actual_session_id:?}
+
+def mark(obj):
+    with open(marker_path, "a") as f:
+        f.write(json.dumps(obj, sort_keys=True) + "\n")
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    return json.loads(line)
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"protocolVersion": 1}}}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+params = msg.get("params", {{}})
+cwd = params.get("cwd", "/tmp")
+resume_session_id = params.get("resumeSessionId")
+if resume_session_id is None:
+    resume_session_id = params.get("config", {{}}).get("resumeSessionId")
+mark({{"event": "session_new", "cwd": cwd, "resumeSessionId": resume_session_id, "actualSessionId": actual_session_id}})
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"sessionId": actual_session_id}}}})
+
+while True:
+    msg = recv()
+    if msg is None:
+        sys.exit(0)
+    if msg.get("method") == "session/close":
+        mark({{"event": "close"}})
+        send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{}}}})
+        sys.exit(0)
+    if msg.get("method") != "session/prompt":
+        if "id" in msg:
+            send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{}}}})
+        continue
+    mark({{"event": "prompt_then_drop"}})
+    sys.exit(42)
+"#,
+        marker_path = marker.to_string_lossy(),
+        actual_session_id = actual_session_id
+    );
+    std::fs::write(&script, code).unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    script.to_string_lossy().into_owned()
+}
+
 fn continuation_catalog_snapshot_json() -> String {
     serde_json::json!({
         "agents": [{
@@ -112,6 +349,12 @@ fn continuation_catalog_snapshot_json() -> String {
                 "live_handle_continuation": {
                     "enabled": true,
                     "require_no_unresolved_side_effects": true
+                },
+                "provider_session_resurrection": {
+                    "enabled": true,
+                    "allowed_triggers": ["operator_mcp"],
+                    "require_recorded_provider_session_id": true,
+                    "fail_closed_when_unsupported": true
                 }
             }
         }]
@@ -332,11 +575,57 @@ async fn call_continue_work(
                 "provider_session_id": "fixture-session-reuse",
                 "mode": "live_handle_continuation",
                 "trigger_kind": "operator_mcp",
-                "idempotency_key": "p086-e2e-key",
+                "idempotency_key": "01890f3d-7df9-7cc8-98c4-dc0c0c073981",
                 "operator_instruction": "Continue the same live ACP session and report test-gate evidence.",
                 "max_turns": 2,
                 "max_wall_clock_seconds": 120,
                 "blockers": ["need live continuation proof"]
+            }
+        })),
+    };
+    let principal = auth::Principal::new("test-operator", auth::PrincipalClass::Operator);
+    let response = server.handle_request(req, &principal).await;
+    assert!(
+        response.error.is_none(),
+        "MCP response must not be JSON-RPC error: {:?}",
+        response.error
+    );
+    let result = response.result.expect("tools/call should return result");
+    serde_json::from_str(
+        result["content"][0]["text"]
+            .as_str()
+            .expect("content text should be JSON string"),
+    )
+    .expect("inner tools/call payload should parse")
+}
+
+async fn call_continue_work_with_mode(
+    server: &McpServer,
+    agent_execution_id: AgentExecutionId,
+    run_id: RunId,
+    stage_execution_id: StageExecutionId,
+    mode: &str,
+    idempotency_key: &str,
+) -> serde_json::Value {
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(serde_json::json!(1)),
+        method: "tools/call".into(),
+        params: Some(serde_json::json!({
+            "name": "agents.continue_work",
+            "arguments": {
+                "agent_execution_id": agent_execution_id.to_string(),
+                "run_id": run_id.to_string(),
+                "stage_execution_id": stage_execution_id.to_string(),
+                "session_generation_id": "p086-generation",
+                "provider_session_id": "fixture-session-reuse",
+                "mode": mode,
+                "trigger_kind": "operator_mcp",
+                "idempotency_key": idempotency_key,
+                "operator_instruction": "Continue from the recorded provider session and report test-gate evidence.",
+                "max_turns": 2,
+                "max_wall_clock_seconds": 120,
+                "blockers": ["need provider session resurrection proof"]
             }
         })),
     };
@@ -361,8 +650,9 @@ async fn call_continue_work(
 async fn p086_mcp_continue_work_reuses_live_acp_session_and_materializes_terminal_artifacts() {
     let pool = test_pool().await;
     let tmp = tempfile::tempdir().unwrap();
-    let workspace_root = tmp.path().to_string_lossy().into_owned();
-    let script = make_reuse_fixture_script(tmp.path());
+    let workspace_root_path = tmp.path().canonicalize().unwrap();
+    let workspace_root = workspace_root_path.to_string_lossy().into_owned();
+    let script = make_reuse_fixture_script(&workspace_root_path);
     let adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(script)) as Arc<dyn AcpAdapter>;
     let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![adapter]));
     let events = event_bus::new_bus(64);
@@ -431,7 +721,8 @@ async fn p086_mcp_continue_work_reuses_live_acp_session_and_materializes_termina
         pool.clone(),
         command_handler,
         auth::PrincipalTable::test_fixture(),
-    );
+    )
+    .with_acp_runtime(Arc::clone(&acp));
     let admitted =
         call_continue_work(&server, agent_execution_id, run_id, stage_execution_id).await;
     assert_eq!(admitted["outcome"], "accepted");
@@ -593,4 +884,602 @@ async fn p086_mcp_continue_work_reuses_live_acp_session_and_materializes_termina
     );
 
     acp.close_session("p086-generation").await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn p086_mcp_continue_work_resurrects_provider_session_and_records_v2_receipt() {
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root_path = tmp.path().canonicalize().unwrap();
+    let workspace_root = workspace_root_path.to_string_lossy().into_owned();
+    let script = make_resurrection_fixture_script(&workspace_root_path, "fixture-session-reuse");
+    let adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(script)) as Arc<dyn AcpAdapter>;
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![adapter]));
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+
+    let (run_id, stage_execution_id, agent_execution_id) =
+        seed_run_with_completed_code_writer(&pool, &workspace_root).await;
+    let command_handler = Arc::new(CommandHandler::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let server = McpServer::new(
+        pool.clone(),
+        command_handler,
+        auth::PrincipalTable::test_fixture(),
+    )
+    .with_acp_runtime(Arc::clone(&acp));
+    let admitted = call_continue_work_with_mode(
+        &server,
+        agent_execution_id,
+        run_id,
+        stage_execution_id,
+        "provider_session_resurrection",
+        "01890f3d-7df9-7cc8-98c4-dc0c0c073982",
+    )
+    .await;
+    assert_eq!(admitted["outcome"], "accepted");
+    let continuation_id = admitted["continuation_id"]
+        .as_str()
+        .expect("accepted response must include continuation_id")
+        .to_string();
+
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        acp.clone(),
+        events,
+    );
+    let processed = timeout(Duration::from_secs(10), executor.process_next_item())
+        .await
+        .unwrap_or_else(|_| {
+            let markers_path = workspace_root_path.join("markers.jsonl");
+            panic!(
+                "P086 resurrection worker timed out; fixture markers:\n{}",
+                std::fs::read_to_string(markers_path).unwrap_or_else(|error| error.to_string())
+            )
+        })
+        .unwrap();
+    assert!(processed);
+
+    let markers_path = workspace_root_path.join("markers.jsonl");
+    let markers = std::fs::read_to_string(markers_path).unwrap();
+    assert!(
+        markers.contains(r#""resumeSessionId": "fixture-session-reuse""#),
+        "session/new must carry requested provider session id: {markers}"
+    );
+    assert!(
+        markers.contains("# P086 Continuation Mode Reset"),
+        "resurrection prompt must use canonical mode-reset text: {markers}"
+    );
+    let session_new_count = markers
+        .lines()
+        .filter(|line| line.contains(r#""event": "session_new""#))
+        .count();
+    let prompt_count = markers
+        .lines()
+        .filter(|line| line.contains(r#""event": "prompt""#))
+        .count();
+    assert_eq!(session_new_count, 1);
+    assert_eq!(prompt_count, 1);
+
+    let row = db::repos::agent_work_continuations::find_by_id(&pool, &continuation_id)
+        .await
+        .unwrap()
+        .expect("continuation row should exist");
+    assert_eq!(row.mode, "provider_session_resurrection");
+    assert_eq!(
+        row.status, "succeeded",
+        "unexpected resurrection status: failure_reason={:?}; markers={markers}",
+        row.failure_reason
+    );
+    assert!(row.canonical_request_artifact_id.is_some());
+    assert!(row.attach_receipt_artifact_id.is_some());
+    assert!(row.response_artifact_id.is_some());
+    assert!(row.result_or_no_progress_artifact_id.is_some());
+
+    let receipt =
+        db::repos::p086_resurrection_raw_receipts::find_by_continuation_id(&pool, &continuation_id)
+            .await
+            .unwrap()
+            .expect("raw v2 receipt should be stored in DB");
+    let receipt_json: serde_json::Value = serde_json::from_str(&receipt.raw_receipt_json).unwrap();
+    assert_eq!(receipt_json["schema_version"], 2);
+    assert_eq!(
+        receipt_json["requested_provider_session_id"],
+        "fixture-session-reuse"
+    );
+    assert_eq!(
+        receipt_json["actual_provider_session_id"],
+        "fixture-session-reuse"
+    );
+    assert_eq!(receipt_json["resurrection_phase"], "completed");
+    assert!(
+        receipt_json["prompt_sent_at"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "successful resurrection receipt must be refreshed after prompt send: {receipt_json}"
+    );
+
+    let phase: String =
+        sqlx::query_scalar("SELECT resurrection_phase FROM agent_work_continuations WHERE id = ?")
+            .bind(&continuation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(phase, "completed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn p086_resurrection_rejects_uncorrelated_terminal_response() {
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root_path = tmp.path().canonicalize().unwrap();
+    let workspace_root = workspace_root_path.to_string_lossy().into_owned();
+    let script = make_uncorrelated_resurrection_fixture_script(
+        &workspace_root_path,
+        "fixture-session-reuse",
+    );
+    let adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(script)) as Arc<dyn AcpAdapter>;
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![adapter]));
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+
+    let (run_id, stage_execution_id, agent_execution_id) =
+        seed_run_with_completed_code_writer(&pool, &workspace_root).await;
+    let command_handler = Arc::new(CommandHandler::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let server = McpServer::new(
+        pool.clone(),
+        command_handler,
+        auth::PrincipalTable::test_fixture(),
+    )
+    .with_acp_runtime(Arc::clone(&acp));
+    let admitted = call_continue_work_with_mode(
+        &server,
+        agent_execution_id,
+        run_id,
+        stage_execution_id,
+        "provider_session_resurrection",
+        "01890f3d-7df9-7cc8-98c4-dc0c0c073984",
+    )
+    .await;
+    assert_eq!(admitted["outcome"], "accepted");
+    let continuation_id = admitted["continuation_id"]
+        .as_str()
+        .expect("accepted response must include continuation_id")
+        .to_string();
+
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        acp.clone(),
+        events,
+    );
+    let processed = timeout(Duration::from_secs(10), executor.process_next_item())
+        .await
+        .unwrap_or_else(|_| {
+            let markers_path = workspace_root_path.join("markers.jsonl");
+            panic!(
+                "P086 resurrection worker timed out; fixture markers:\n{}",
+                std::fs::read_to_string(markers_path).unwrap_or_else(|error| error.to_string())
+            )
+        })
+        .unwrap();
+    assert!(processed);
+
+    let markers = std::fs::read_to_string(workspace_root_path.join("markers.jsonl")).unwrap();
+    assert!(
+        markers.contains(r#""event": "prompt""#),
+        "negative fixture must prove the prompt was sent before terminal correlation failed: {markers}"
+    );
+
+    let row = db::repos::agent_work_continuations::find_by_id(&pool, &continuation_id)
+        .await
+        .unwrap()
+        .expect("continuation row should exist");
+    assert_eq!(row.status, "failed");
+    assert_eq!(
+        row.failure_reason.as_deref(),
+        Some("terminal_response_uncorrelated")
+    );
+    let response_artifact = artifacts::find_by_id(
+        &pool,
+        row.response_artifact_id.as_ref().unwrap().parse().unwrap(),
+    )
+    .await
+    .unwrap()
+    .expect("failure response snapshot should exist");
+    let response_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&response_artifact.file_path).unwrap())
+            .unwrap();
+    assert_eq!(response_json["payload"]["status"], "failed");
+    assert_eq!(
+        response_json["payload"]["provider_status"],
+        serde_json::Value::Null
+    );
+
+    let no_progress_artifact = artifacts::find_by_id(
+        &pool,
+        row.result_or_no_progress_artifact_id
+            .as_ref()
+            .unwrap()
+            .parse()
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+    .expect("failure no-progress artifact should exist");
+    assert_eq!(
+        no_progress_artifact.contract_id,
+        "continuation_no_progress_report_v1"
+    );
+    let no_progress_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&no_progress_artifact.file_path).unwrap())
+            .unwrap();
+    assert_eq!(
+        no_progress_json["payload"]["no_progress_reason"],
+        "terminal_response_uncorrelated"
+    );
+
+    let phase: String =
+        sqlx::query_scalar("SELECT resurrection_phase FROM agent_work_continuations WHERE id = ?")
+            .bind(&continuation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(phase, "failed_closed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn p086_resurrection_fail_closes_when_attach_receipt_persistence_fails() {
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root_path = tmp.path().canonicalize().unwrap();
+    let workspace_root = workspace_root_path.to_string_lossy().into_owned();
+    let script = make_resurrection_fixture_script(&workspace_root_path, "fixture-session-reuse");
+    let adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(script)) as Arc<dyn AcpAdapter>;
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![adapter]));
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+
+    let (run_id, stage_execution_id, agent_execution_id) =
+        seed_run_with_completed_code_writer(&pool, &workspace_root).await;
+    let command_handler = Arc::new(CommandHandler::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let server = McpServer::new(
+        pool.clone(),
+        command_handler,
+        auth::PrincipalTable::test_fixture(),
+    )
+    .with_acp_runtime(Arc::clone(&acp));
+    let admitted = call_continue_work_with_mode(
+        &server,
+        agent_execution_id,
+        run_id,
+        stage_execution_id,
+        "provider_session_resurrection",
+        "01890f3d-7df9-7cc8-98c4-dc0c0c073985",
+    )
+    .await;
+    assert_eq!(admitted["outcome"], "accepted");
+    let continuation_id = admitted["continuation_id"]
+        .as_str()
+        .expect("accepted response must include continuation_id")
+        .to_string();
+
+    sqlx::query("DROP TABLE p086_resurrection_raw_receipts")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        acp.clone(),
+        events,
+    );
+    let processed = timeout(Duration::from_secs(10), executor.process_next_item())
+        .await
+        .unwrap_or_else(|_| {
+            let markers_path = workspace_root_path.join("markers.jsonl");
+            panic!(
+                "P086 resurrection worker timed out; fixture markers:\n{}",
+                std::fs::read_to_string(markers_path).unwrap_or_else(|error| error.to_string())
+            )
+        })
+        .unwrap();
+    assert!(processed);
+
+    let markers = std::fs::read_to_string(workspace_root_path.join("markers.jsonl")).unwrap();
+    assert!(
+        markers.contains(r#""event": "session_new""#),
+        "negative fixture must attach before receipt persistence fails: {markers}"
+    );
+    assert!(
+        markers.contains(r#""event": "close""#),
+        "receipt persistence failure must close the attached provider session: {markers}"
+    );
+    assert!(
+        !markers.contains(r#""event": "prompt""#),
+        "receipt persistence failure must fail closed before prompt: {markers}"
+    );
+
+    let row = db::repos::agent_work_continuations::find_by_id(&pool, &continuation_id)
+        .await
+        .unwrap()
+        .expect("continuation row should exist");
+    assert_eq!(row.status, "failed");
+    assert_eq!(
+        row.failure_reason.as_deref(),
+        Some("attach_receipt_persist_failed")
+    );
+    assert!(row.attach_receipt_artifact_id.is_none());
+
+    let phase: String =
+        sqlx::query_scalar("SELECT resurrection_phase FROM agent_work_continuations WHERE id = ?")
+            .bind(&continuation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(phase, "failed_closed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn p086_resurrection_records_claude_session_store_recovery_in_raw_receipt() {
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root_path = tmp.path().canonicalize().unwrap();
+    let workspace_root = workspace_root_path.to_string_lossy().into_owned();
+    let claude_projects_root = workspace_root_path.join("claude-projects");
+    let script = make_lost_terminal_resurrection_fixture_script(
+        &workspace_root_path,
+        "fixture-session-reuse",
+    );
+    let adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(script)) as Arc<dyn AcpAdapter>;
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![adapter]));
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+
+    let (run_id, stage_execution_id, agent_execution_id) =
+        seed_run_with_completed_code_writer(&pool, &workspace_root).await;
+    let command_handler = Arc::new(CommandHandler::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let server = McpServer::new(
+        pool.clone(),
+        command_handler,
+        auth::PrincipalTable::test_fixture(),
+    )
+    .with_acp_runtime(Arc::clone(&acp));
+    let admitted = call_continue_work_with_mode(
+        &server,
+        agent_execution_id,
+        run_id,
+        stage_execution_id,
+        "provider_session_resurrection",
+        "01890f3d-7df9-7cc8-98c4-dc0c0c073986",
+    )
+    .await;
+    assert_eq!(admitted["outcome"], "accepted");
+    let continuation_id = admitted["continuation_id"]
+        .as_str()
+        .expect("accepted response must include continuation_id")
+        .to_string();
+    let continuation = db::repos::agent_work_continuations::find_by_id(&pool, &continuation_id)
+        .await
+        .unwrap()
+        .expect("continuation row should exist");
+    let prompt_marker = format!("p086-prompt-turn:{continuation_id}:provider_session_attach");
+    let recovered_text = format!(
+        "{prompt_marker} {} {} {} CHAINWORKS_OUTPUT {{\"continuation\":\"recovered\"}} ./scripts/test-gate.sh proposal-086 passed",
+        continuation.request_fingerprint_sha256,
+        continuation.stage_execution_id,
+        continuation.agent_execution_id
+    );
+    let session_line = serde_json::json!({
+        "type": "assistant",
+        "message": {
+            "id": "msg-recovered-p086",
+            "stop_reason": "end_turn",
+            "content": [{
+                "type": "text",
+                "text": recovered_text
+            }]
+        }
+    });
+    let transcript_path = claude_projects_root
+        .join("-workspace")
+        .join("fixture-session-reuse.jsonl");
+    std::fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+    std::fs::write(&transcript_path, format!("{session_line}\n")).unwrap();
+
+    std::env::set_var(
+        "CHAINWORKS_CLAUDE_SESSION_STORE_ROOT",
+        claude_projects_root.to_string_lossy().as_ref(),
+    );
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        acp.clone(),
+        events,
+    );
+    let processed = timeout(Duration::from_secs(10), executor.process_next_item())
+        .await
+        .unwrap_or_else(|_| {
+            let markers_path = workspace_root_path.join("markers.jsonl");
+            panic!(
+                "P086 resurrection worker timed out; fixture markers:\n{}",
+                std::fs::read_to_string(markers_path).unwrap_or_else(|error| error.to_string())
+            )
+        })
+        .unwrap();
+    std::env::remove_var("CHAINWORKS_CLAUDE_SESSION_STORE_ROOT");
+    assert!(processed);
+
+    let markers = std::fs::read_to_string(workspace_root_path.join("markers.jsonl")).unwrap();
+    assert!(markers.contains(r#""event": "prompt_then_drop""#));
+
+    let row = db::repos::agent_work_continuations::find_by_id(&pool, &continuation_id)
+        .await
+        .unwrap()
+        .expect("continuation row should exist");
+    assert_eq!(
+        row.status, "succeeded",
+        "session-store recovery should settle succeeded: {:?}",
+        row.failure_reason
+    );
+
+    let receipt =
+        db::repos::p086_resurrection_raw_receipts::find_by_continuation_id(&pool, &continuation_id)
+            .await
+            .unwrap()
+            .expect("raw v2 receipt should be stored in DB");
+    let receipt_json: serde_json::Value = serde_json::from_str(&receipt.raw_receipt_json).unwrap();
+    assert_eq!(
+        receipt_json["session_store_recovery_result"],
+        "recovered_task_complete"
+    );
+    assert_eq!(
+        receipt_json["session_store_transcript_path"],
+        transcript_path.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        receipt_json["session_store_ownership_source"],
+        "provider_session_id"
+    );
+    assert_eq!(
+        receipt_json["session_store_transcript_digest"]
+            .as_str()
+            .map(str::len),
+        Some(64)
+    );
+    assert!(receipt_json["session_store_read_at"].as_str().is_some());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn p086_mcp_continue_work_rejects_resurrection_identity_mismatch_before_prompt() {
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace_root_path = tmp.path().canonicalize().unwrap();
+    let workspace_root = workspace_root_path.to_string_lossy().into_owned();
+    let script = make_resurrection_fixture_script(&workspace_root_path, "different-session");
+    let adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(script)) as Arc<dyn AcpAdapter>;
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![adapter]));
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+
+    let (run_id, stage_execution_id, agent_execution_id) =
+        seed_run_with_completed_code_writer(&pool, &workspace_root).await;
+    let command_handler = Arc::new(CommandHandler::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let server = McpServer::new(
+        pool.clone(),
+        command_handler,
+        auth::PrincipalTable::test_fixture(),
+    )
+    .with_acp_runtime(Arc::clone(&acp));
+    let admitted = call_continue_work_with_mode(
+        &server,
+        agent_execution_id,
+        run_id,
+        stage_execution_id,
+        "provider_session_resurrection",
+        "01890f3d-7df9-7cc8-98c4-dc0c0c073983",
+    )
+    .await;
+    assert_eq!(admitted["outcome"], "accepted");
+    let continuation_id = admitted["continuation_id"]
+        .as_str()
+        .expect("accepted response must include continuation_id")
+        .to_string();
+
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        acp.clone(),
+        events,
+    );
+    let processed = timeout(Duration::from_secs(10), executor.process_next_item())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(processed);
+
+    let markers = std::fs::read_to_string(workspace_root_path.join("markers.jsonl")).unwrap();
+    assert!(
+        !markers.contains(r#""event": "prompt""#),
+        "identity mismatch must fail before prompt: {markers}"
+    );
+
+    let row = db::repos::agent_work_continuations::find_by_id(&pool, &continuation_id)
+        .await
+        .unwrap()
+        .expect("continuation row should exist");
+    assert_eq!(row.status, "failed");
+    assert_eq!(
+        row.failure_reason.as_deref(),
+        Some("actual_session_mismatch")
+    );
+    let receipt =
+        db::repos::p086_resurrection_raw_receipts::find_by_continuation_id(&pool, &continuation_id)
+            .await
+            .unwrap();
+    assert!(receipt.is_none(), "mismatch must not persist a raw receipt");
+
+    let phase: String =
+        sqlx::query_scalar("SELECT resurrection_phase FROM agent_work_continuations WHERE id = ?")
+            .bind(&continuation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(phase, "failed_closed");
 }

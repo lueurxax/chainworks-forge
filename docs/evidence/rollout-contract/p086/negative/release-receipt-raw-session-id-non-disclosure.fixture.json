@@ -1,40 +1,16 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "release_receipt_raw_session_id_non_disclosure",
+  "fixture_purpose": "Release receipts must not publish raw provider-session ids collected during resurrection.",
+  "status": "pass",
+  "evidence_kind": "contract_fixture",
+  "evidence": {
+    "surface": "release receipt / operator report export",
+    "guard": "provider-native session ids are redacted outside operator raw receipt readback",
+    "forbidden_fields": ["requested_provider_session_id", "actual_provider_session_id", "provider_session_id"],
+    "readback_lane": "release_report"
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "proposal-086-resurrection"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:release_receipt_raw_session_id_non_disclosure",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "provider_session_identity_not_exported"
 }

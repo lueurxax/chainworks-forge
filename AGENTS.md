@@ -36,13 +36,31 @@ To open the project in Xcode: `open "Chainworks Forge.xcodeproj"` (target deploy
 
 ### Rust control-plane daemon
 
+Use the managed Cargo policy for all Rust work. Do **not** run raw `cargo`
+with a local `control-plane/target` or worktree-local target unless you are
+doing one-off cache diagnosis and explicitly set
+`CHAINWORKS_ALLOW_LOCAL_CARGO_TARGET_DIR=1`.
+
 ```bash
 cd control-plane
-cargo build
-cargo test                                 # full workspace tests
-cargo test -p engine <test_name>           # single test
+../scripts/cargo-managed build
+../scripts/cargo-managed test              # full workspace tests
+../scripts/cargo-managed test -p engine <test_name>  # single test
 cd .. && ./scripts/test-gate.sh proposal-027   # canonical P027 regression gate
 ```
+
+For longer interactive sessions, external agents may instead source the policy
+once before running Cargo:
+
+```bash
+source scripts/cargo-cache-env.sh
+cd control-plane
+cargo test -p engine <test_name>
+```
+
+The policy sets a shared bounded `CARGO_TARGET_DIR`, enables `sccache` when
+available, and installs a `cargo` wrapper that remaps accidental
+`CARGO_TARGET_DIR=target/...` gate commands into the shared gate cache.
 
 Run the daemon (GraphQL on `:4000/graphql`, MCP Streamable HTTP on `:4000/mcp`, logs to stderr):
 
@@ -51,7 +69,7 @@ cd control-plane
 DATABASE_URL="sqlite:///Users/user/Documents/Chainworks Forge/.chainworks/control-plane.db?mode=rwc" 
 GRAPHQL_ADDR="127.0.0.1:4000" 
 RUST_LOG=info,acp=debug 
-./target/debug/control-plane 2>/tmp/cw.log &
+"${CARGO_TARGET_DIR:-$HOME/Library/Caches/Chainworks Forge/cargo-target}/debug/control-plane" 2>/tmp/cw.log &
 ```
 
 Connect Claude Code to the running daemon as an MCP server via `.mcp.json` at repo root (`"type": "http"`, `"url": "http://127.0.0.1:4000/mcp"`).

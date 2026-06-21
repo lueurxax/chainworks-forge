@@ -1,7 +1,7 @@
 {
   "fixture_id": "restart-alone-does-not-increment-generation",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "shutdown_signal_generation_contract_v1",
   "description": "A plain process restart without a new signal wave does not increment the signal generation counter.",
   "preconditions": {

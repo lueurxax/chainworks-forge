@@ -161,11 +161,11 @@ Overall conformance is Partial because multiple in-scope requirements are still 
 
 ### REL-001: No worker-level proof that P086 continuation reuses the live ACP session end to end
 
-Reviewer: `rust_reliability_reviewer`  
-Severity: Major  
-Confidence: Medium  
-Related requirements: REQ-002, REQ-015  
-Evidence types: code, tests-run  
+Reviewer: `rust_reliability_reviewer`
+Severity: Major
+Confidence: Medium
+Related requirements: REQ-002, REQ-015
+Evidence types: code, tests-run
 Evidence references: `engine/src/executor.rs:4682-4736`; `acp/src/manager.rs:603-681`, `:733-746`
 
 Why it matters: The R1 architectural defect is fixed in code, and ACP manager reuse is tested. The remaining readiness gap is that no test drives `agents.continue_work` admission through `ProcessContinuation` into a live fake ACP session and asserts no fresh session is opened.
@@ -176,11 +176,11 @@ Acceptance criteria: Test proves reused provider session id, `reused_existing_se
 
 ### API-001: `agents.continue_work` response/readback contract is still narrower than the proposal output
 
-Reviewer: `api_contract_reviewer`  
-Severity: Major  
-Confidence: High  
-Related requirements: REQ-006, REQ-010, REQ-011  
-Evidence types: proposal, schema, code  
+Reviewer: `api_contract_reviewer`
+Severity: Major
+Confidence: High
+Related requirements: REQ-006, REQ-010, REQ-011
+Evidence types: proposal, schema, code
 Evidence references: proposal `:637-654`; `docs/reference/p086/schemas/mcp/agents.continue_work.response.schema.json:1-44`; `graphql-server/src/types/continuation.rs:57-155`
 
 Why it matters: The request side now matches the proposal much better, but callers still do not receive or read the full proposal output shape: session generation id, provider session id, attach receipt, evidence bundle, worktree readback, and continuation report ids are not first-class in the command response and are only partly visible through GraphQL.
@@ -191,11 +191,11 @@ Acceptance criteria: Contract tests validate the accepted/replay response and re
 
 ### REL-002: Lead-directed continuation is validated but not automatic
 
-Reviewer: `rust_reliability_reviewer`  
-Severity: Major  
-Confidence: High  
-Related requirements: REQ-004, REQ-015  
-Evidence types: proposal, code  
+Reviewer: `rust_reliability_reviewer`
+Severity: Major
+Confidence: High
+Related requirements: REQ-004, REQ-015
+Evidence types: proposal, code
 Evidence references: proposal `:297-331`, `:721-762`; `mcp-server/src/tools/agents.rs:676-825`, `:827-1128`
 
 Why it matters: The implementation now validates lead decision artifacts when `trigger_kind=lead_auto` is supplied to MCP, but the proposal describes a lead emitting a decision artifact and the server validating it before execution. There is no orchestration path that watches/consumes the lead artifact automatically and enqueues continuation without an Operator MCP command.
@@ -206,11 +206,11 @@ Acceptance criteria: A test shows a lead-produced `lead_continuation_decision_v1
 
 ### REL-003: Recovery/reconciliation/cancellation lifecycle remains incomplete
 
-Reviewer: `rust_reliability_reviewer`  
-Severity: Major  
-Confidence: High  
-Related requirements: REQ-003, REQ-009, REQ-014, REQ-015  
-Evidence types: code, docs, tests-run  
+Reviewer: `rust_reliability_reviewer`
+Severity: Major
+Confidence: High
+Related requirements: REQ-003, REQ-009, REQ-014, REQ-015
+Evidence types: code, docs, tests-run
 Evidence references: `docs/reference/proposal-086-api-contracts.md:71-75`; `db/src/repos/agent_work_continuations.rs:580-633`; `engine/src/executor.rs:4640-4665`
 
 Why it matters: P086 explicitly includes crash windows, no-resend reconciliation, orphan ACP recovery, and cancellation proof. The no-resend guard exists, but the durable evidence-window settlement, heartbeat refresh/release, cancellation worktree-lease termination proof, and orphan-reap/attach path are still pending.
@@ -221,11 +221,11 @@ Acceptance criteria: Tests cover crash after prompt delivery, prompt-sent replay
 
 ### OPS-001: Evidence artifacts are materialized but still synthetic
 
-Reviewer: `observability_rollout_reviewer`  
-Severity: Major  
-Confidence: High  
-Related requirements: REQ-010, REQ-014, REQ-015  
-Evidence types: code, tests-run  
+Reviewer: `observability_rollout_reviewer`
+Severity: Major
+Confidence: High
+Related requirements: REQ-010, REQ-014, REQ-015
+Evidence types: code, tests-run
 Evidence references: proposal `:551-583`; `engine/src/executor.rs:4181-4302`
 
 Why it matters: P086's value depends on Chainworks truth being more than a lifecycle receipt. The current success artifact writes generic summary text and empty changed-files/tests/provider-transcript lists. That does not prove the continuation captured the actual worktree diff, tool trace, transcript, tests, or generated artifacts.
@@ -236,11 +236,11 @@ Acceptance criteria: A live or integration continuation produces non-empty evide
 
 ### OPS-002: Rollout fixtures/docs are stale relative to the current code
 
-Reviewer: `observability_rollout_reviewer`  
-Severity: Minor  
-Confidence: High  
-Related requirements: REQ-004, REQ-015  
-Evidence types: docs, code  
+Reviewer: `observability_rollout_reviewer`
+Severity: Minor
+Confidence: High
+Related requirements: REQ-004, REQ-015
+Evidence types: docs, code
 Evidence references: `docs/evidence/rollout-contract/p086/negative/lead-decision-missing-or-changed.json:5-18`; `mcp-server/src/tools/agents.rs:1042-1128`; `docs/reference/proposal-086-api-contracts.md:63-75`
 
 Why it matters: The gate still passes because it checks fixture presence/shape, but at least one fixture describes a pre-change behavior: unconditional `lead_auto_unsupported`. The code now validates lead artifacts. Stale evidence can make closeout look stronger or weaker than the actual implementation.
@@ -251,11 +251,11 @@ Acceptance criteria: Fixture text names current failure modes, includes a valid 
 
 ### READY-001: P086 is not ready for closeout despite major R1 fixes
 
-Reviewer: `observability_rollout_reviewer`  
-Severity: Critical  
-Confidence: High  
-Related requirements: REQ-003, REQ-004, REQ-009, REQ-010, REQ-014, REQ-015  
-Evidence types: code, docs, tests-run  
+Reviewer: `observability_rollout_reviewer`
+Severity: Critical
+Confidence: High
+Related requirements: REQ-003, REQ-004, REQ-009, REQ-010, REQ-014, REQ-015
+Evidence types: code, docs, tests-run
 Evidence references: `docs/reference/proposal-086-api-contracts.md:63-75`; verification log below
 
 Why it matters: The core live-session dispatch issue is fixed, but P086 still lacks full lead automation, live evidence capture, reconciliation/recovery/cancellation proof, metrics, provider resurrection attach/orphan behavior, and full regression evidence.

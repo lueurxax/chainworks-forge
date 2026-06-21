@@ -51,14 +51,19 @@ final class P083IdentityHoldSessionsModel: ObservableObject {
             )
             guard !Task.isCancelled else { return }
             sessions = result.p083IdentityHoldSessions.map { gql in
-                P083IdentityAmbiguousInboxView.IdentityAmbiguousSession(
+                let reasonDetail = Self.reasonDetail(
+                    base: gql.reasonDetail,
+                    liveProbeStatus: gql.liveProbeStatus,
+                    liveProbeDetail: gql.liveProbeDetail
+                )
+                return P083IdentityAmbiguousInboxView.IdentityAmbiguousSession(
                     id: gql.providerSessionId,
                     providerName: gql.providerName,
                     cancellationEpoch: gql.cancellationEpoch,
                     lastSeenPid: gql.lastSeenPid.map { Int($0) },
                     processStartIdentityHash: gql.processStartIdentityHash,
                     latestReceiptId: gql.latestReceiptId,
-                    reasonDetail: gql.reasonDetail
+                    reasonDetail: reasonDetail
                 )
             }
         } catch {
@@ -78,6 +83,8 @@ final class P083IdentityHoldSessionsModel: ObservableObject {
                 cancellationEpoch
                 lastSeenPid
                 processStartIdentityHash
+                liveProbeStatus
+                liveProbeDetail
                 latestReceiptId
                 reasonDetail
             }
@@ -93,8 +100,28 @@ final class P083IdentityHoldSessionsModel: ObservableObject {
             let cancellationEpoch: Int?
             let lastSeenPid: Int?
             let processStartIdentityHash: String?
+            let liveProbeStatus: String?
+            let liveProbeDetail: String?
             let latestReceiptId: String?
             let reasonDetail: String?
         }
+    }
+
+    private static func reasonDetail(
+        base: String?,
+        liveProbeStatus: String?,
+        liveProbeDetail: String?
+    ) -> String? {
+        let probe = [liveProbeStatus, liveProbeDetail]
+            .compactMap { value in
+                guard let value, !value.isEmpty else { return nil }
+                return value
+            }
+            .joined(separator: ": ")
+        guard !probe.isEmpty else { return base }
+        if let base, !base.isEmpty {
+            return "\(base)\nLive identity probe: \(probe)"
+        }
+        return "Live identity probe: \(probe)"
     }
 }

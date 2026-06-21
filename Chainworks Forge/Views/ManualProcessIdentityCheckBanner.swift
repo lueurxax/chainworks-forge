@@ -31,13 +31,18 @@ struct ManualProcessIdentityCheckBanner: View {
     let onMarkProcessAbsent: () -> Void
     let onOpenProviderSessionEvidence: () -> Void
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var copyConfirmed = false
+    @State private var isRetryChecking = false
+    @State private var retryStatusText: String?
+    @State private var showingMarkAbsentConfirmation = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             headerRow
             reasonRow
             actionRow
+            feedbackRow
             disabledCommandNote
         }
         .padding(12)
@@ -79,50 +84,100 @@ struct ManualProcessIdentityCheckBanner: View {
     }
 
     private var actionRow: some View {
-        HStack(spacing: 8) {
-            copyDiagnosticButton
+        HStack(alignment: .center, spacing: 8) {
             retryIdentityCheckButton
             markProcessAbsentButton
+            Spacer(minLength: 8)
             openEvidenceButton
+            copyDiagnosticButton
         }
-        .buttonStyle(.plain)
     }
 
     private var copyDiagnosticButton: some View {
-        Button(action: copyDiagnostic) {
-            Label(
-                copyConfirmed ? "Copied" : "Copy Diagnostic",
-                systemImage: copyConfirmed ? "checkmark" : "doc.on.clipboard"
-            )
-            .font(.caption.weight(.medium))
-            .foregroundStyle(copyConfirmed ? Color.green : Color.accentColor)
+        HStack(spacing: 4) {
+            Button(action: copyDiagnostic) {
+                Image(systemName: copyConfirmed ? "checkmark.circle.fill" : "doc.on.clipboard")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(copyConfirmed ? Color.green : Color.secondary)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(copyConfirmed ? "Diagnostic copied" : "Copy Diagnostic")
+            .accessibilityHint("Copies the provider session diagnostic payload to the clipboard for sharing")
+
+            if copyConfirmed {
+                Text("Copied")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(Color.green)
+                    .accessibilityHidden(true)
+            }
         }
-        .accessibilityLabel(copyConfirmed ? "Diagnostic copied" : "Copy diagnostic to clipboard")
-        .accessibilityHint("Copies the provider session diagnostic payload to the clipboard for sharing")
     }
 
     private var retryIdentityCheckButton: some View {
-        Button("Retry Identity Check", action: onRetryIdentityCheck)
+        Button(action: retryIdentityCheck) {
+            HStack(spacing: 6) {
+                Text(isRetryChecking ? "Checking identity..." : "Retry Identity Check")
+                if isRetryChecking {
+                    ProgressView(value: 0.55)
+                        .controlSize(.mini)
+                        .frame(width: 34)
+                        .accessibilityHidden(true)
+                }
+            }
             .font(.caption.weight(.medium))
-            .foregroundStyle(Color.accentColor)
+        }
+            .buttonStyle(.borderedProminent)
+            .disabled(isRetryChecking)
             .accessibilityLabel("Retry identity check for \(providerName)")
             .accessibilityHint("Attempts to re-verify that the provider process identity matches the stored record")
     }
 
     private var markProcessAbsentButton: some View {
-        Button("Mark Process Absent", action: onMarkProcessAbsent)
-            .font(.caption.weight(.medium))
-            .foregroundStyle(.red)
+        Button(role: .destructive) {
+            showingMarkAbsentConfirmation = true
+        } label: {
+            Label("Mark Process Absent", systemImage: "person.crop.circle.badge.xmark")
+                .font(.caption.weight(.medium))
+        }
+            .buttonStyle(.bordered)
+            .confirmationDialog(
+                "Mark provider process absent?",
+                isPresented: $showingMarkAbsentConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button("Mark Process Absent", role: .destructive) {
+                    onMarkProcessAbsent()
+                    showingMarkAbsentConfirmation = false
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This copies the approved MCP operator command for \(providerName). It does not bypass backend lifecycle authority.")
+            }
             .accessibilityLabel("Mark \(providerName) process as absent")
             .accessibilityHint("Records that the provider process is no longer running and clears the identity hold")
     }
 
     private var openEvidenceButton: some View {
-        Button("Open Provider Session Evidence", action: onOpenProviderSessionEvidence)
-            .font(.caption.weight(.medium))
-            .foregroundStyle(Color.secondary)
-            .accessibilityLabel("Open provider session evidence panel for \(providerName)")
-            .accessibilityHint("Opens the full provider session evidence panel including process identity history")
+        Menu {
+            Button("Open Provider Session Evidence", action: onOpenProviderSessionEvidence)
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(Color.secondary)
+        }
+        .menuStyle(.borderlessButton)
+        .accessibilityLabel("More process identity actions")
+        .accessibilityHint("Opens recovery actions including provider session evidence")
+    }
+
+    @ViewBuilder
+    private var feedbackRow: some View {
+        if let retryStatusText {
+            Text(retryStatusText)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.secondary)
+                .accessibilityLabel(retryStatusText)
+        }
     }
 
     private var disabledCommandNote: some View {
@@ -148,13 +203,38 @@ struct ManualProcessIdentityCheckBanner: View {
         pasteboard.prepareForNewContents(with: .currentHostOnly)
         pasteboard.setString(payload, forType: .string)
         #endif
-        withAnimation(.easeInOut(duration: 0.2)) {
-            copyConfirmed = true
-        }
+        setCopyConfirmed(true)
         Task {
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
             await MainActor.run {
-                withAnimation { copyConfirmed = false }
+                setCopyConfirmed(false)
+            }
+        }
+    }
+
+    private func retryIdentityCheck() {
+        isRetryChecking = true
+        retryStatusText = nil
+        onRetryIdentityCheck()
+        Task {
+            try? await Task.sleep(nanoseconds: 650_000_000)
+            await MainActor.run {
+                isRetryChecking = false
+                retryStatusText = "Identity refresh requested."
+            }
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            await MainActor.run {
+                retryStatusText = nil
+            }
+        }
+    }
+
+    private func setCopyConfirmed(_ value: Bool) {
+        if reduceMotion {
+            copyConfirmed = value
+        } else {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                copyConfirmed = value
             }
         }
     }

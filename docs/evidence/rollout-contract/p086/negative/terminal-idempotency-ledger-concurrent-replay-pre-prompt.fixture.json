@@ -1,40 +1,15 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "terminal_idempotency_ledger_concurrent_replay_pre_prompt",
+  "fixture_purpose": "Concurrent workers before prompt dispatch must converge to one claimed continuation owner.",
+  "status": "pass",
+  "evidence_kind": "code_and_regression_test",
+  "evidence": {
+    "test": "cargo test -p db --test proposal_086_continuation_lifecycle p086_claim_refuses_prompt_sent_replay_before_provider_io",
+    "guard": "claim_for_continuation_worker uses compare-and-set lifecycle transition before side effects",
+    "readback_lane": "side_effect_ledger"
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "proposal-086-resurrection"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:terminal_idempotency_ledger_concurrent_replay_pre_prompt",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "single_worker_owner"
 }

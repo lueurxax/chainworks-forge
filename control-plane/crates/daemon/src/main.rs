@@ -795,7 +795,35 @@ async fn run_daemon() -> Result<()> {
                 principal_table,
                 db_writer.heartbeat.clone(),
                 Arc::clone(&boundary_policy),
-            );
+            )
+            .with_acp_runtime(Arc::clone(&acp));
+            let mcp_live_source = mcp.live_principal_source();
+            let principals_reload_secs: u64 = std::env::var("CHAINWORKS_PRINCIPALS_RELOAD_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2);
+            let principals_path_for_reload = paths.principals_path.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(principals_reload_secs))
+                        .await;
+                    match auth::PrincipalTable::load_or_bootstrap(&principals_path_for_reload) {
+                        Ok(new_table) => {
+                            mcp_live_source.update(new_table);
+                            tracing::debug!(
+                                "MCP stdio principal table reloaded for live revocation"
+                            );
+                        }
+                        Err(e) => {
+                            mcp_live_source.mark_unavailable();
+                            tracing::warn!(
+                                "MCP stdio principal reload failed; auth source marked unavailable \
+                                 (requests will fail-closed): {e:#}"
+                            );
+                        }
+                    }
+                }
+            });
             mcp.run_stdio().await?;
         }
         _ => {
@@ -808,8 +836,10 @@ async fn run_daemon() -> Result<()> {
                     principal_table.clone(),
                     db_writer.heartbeat.clone(),
                     Arc::clone(&boundary_policy),
-                ),
+                )
+                .with_acp_runtime(Arc::clone(&acp)),
             );
+            let mcp_live_source = mcp.live_principal_source();
             let mcp_routes = mcp_server::http::routes(mcp);
             info!("MCP HTTP transport mounted at /mcp");
 
@@ -837,18 +867,20 @@ async fn run_daemon() -> Result<()> {
                         .await;
                     match auth::PrincipalTable::load_or_bootstrap(&principals_path_for_reload) {
                         Ok(new_table) => {
+                            mcp_live_source.update(new_table.clone());
                             p046_live_handle.update(new_table).await;
-                            tracing::debug!("P046 principal table reloaded for live revocation");
+                            tracing::debug!("principal table reloaded for live revocation");
                         }
                         Err(e) => {
                             // Mark the auth source unavailable so running subscriptions
                             // terminate fail-closed (authorization_recheck_failed) rather
                             // than continuing under stale grants after a revocation write
                             // that we could not observe.
+                            mcp_live_source.mark_unavailable();
                             p046_live_handle.mark_unavailable().await;
                             tracing::warn!(
-                                "P046 principal reload failed; auth source marked unavailable \
-                                 (subscriptions will fail-closed): {e:#}"
+                                "principal reload failed; auth source marked unavailable \
+                                 (MCP requests and subscriptions will fail-closed): {e:#}"
                             );
                         }
                     }

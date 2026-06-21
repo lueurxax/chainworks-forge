@@ -25,6 +25,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
     @Published private(set) var closeoutReadiness: P077CloseoutReadinessPresentation?
     @Published private(set) var implementationCompletion: P088ImplementationCompletionPresentation?
     @Published private(set) var sideEffectReadback: P078SideEffectReadbackPresentation?
+    @Published private(set) var outputContractRepair: OutputContractRepairPresentation?
 
     // PC-003 routing: set true when ContentView routes approvals → Runs. RunsHomeView
     // reads this on mount (initial: true) so the flag survives the tab-switch render cycle
@@ -297,6 +298,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
         closeoutReadiness = detail.closeoutReadiness
         implementationCompletion = detail.implementationCompletion
         sideEffectReadback = detail.sideEffectReadback
+        outputContractRepair = detail.outputContractRepair
         activeTimelineAgents = detail.activeAgentTimelineEntries.map { entry in
             ActiveTimelineAgent(
                 id: entry.agentID,

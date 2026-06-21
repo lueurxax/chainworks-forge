@@ -1,7 +1,7 @@
 {
   "fixture_id": "provider-session-shutdown-side-effect-receipt-settles",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "side_effect_idempotency_contract_v1",
   "description": "A provider session that was shut down mid-execution settles its side-effect row when the receipt arrives on restart, preventing re-execution.",
   "preconditions": {

@@ -1,7 +1,7 @@
 {
   "fixture_id": "p083-set-enforcement-mode-bounded-command-label",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "metrics_label_bounds_contract_v1",
   "description": "SetEnforcementMode command emits a metric with a bounded command label drawn from the approved enumeration, never a free-form string.",
   "preconditions": {

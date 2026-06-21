@@ -1,7 +1,7 @@
 {
   "fixture_id": "crash-after-planned-before-signal-retries-with-matching-identity",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "shutdown_lifecycle_contract_v1",
   "description": "A crash after a signal was planned but before it was issued causes restart to retry the signal using the same generation identity, not a new one.",
   "preconditions": {

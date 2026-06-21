@@ -1,7 +1,7 @@
 {
   "fixture_id": "crash-after-issued-reuses-generation-and-suppresses-duplicate",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "shutdown_signal_generation_contract_v1",
   "description": "After a crash where a signal was already issued, restart detects the issued state and suppresses any duplicate signal emission.",
   "preconditions": {

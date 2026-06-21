@@ -31,7 +31,7 @@
       "additionalProperties": true,
       "required": ["mode", "attach_kind", "orphan_reap_verified"],
       "properties": {
-        "mode": { "enum": ["live_handle_continuation", "provider_session_resurrection"] },
+        "mode": { "enum": ["live_handle_continuation", "provider_session_resurrection", "output_only_recovery"] },
         "attach_kind": { "type": "string" },
         "session_generation_id": { "type": "string" },
         "provider_session_id": { "type": ["string", "null"] },

@@ -1,7 +1,7 @@
 {
   "fixture_id": "force-quit-abrupt-restart-recovery-no-host-budget-claim",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "shutdown_reliability_contract_v1",
   "description": "Force-quit is abrupt with no host budget window; restart recovery proceeds without claiming a host budget and relies entirely on durable rows.",
   "preconditions": {

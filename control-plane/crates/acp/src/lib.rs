@@ -10,7 +10,7 @@ pub mod xcode_target;
 
 pub use manager::{
     AcpLiveSessionProcessBinding, AcpRuntimeManager, BrokeredXcodeLeaseAttachment,
-    XcodeBrokerLeaseAttacher,
+    ProviderSessionResurrectionAttachResult, XcodeBrokerLeaseAttacher,
 };
 pub use session::{AcpSession, AcpSessionHandle};
 pub use xcode_broker::{
@@ -316,6 +316,10 @@ pub struct ExecutionResult {
     /// overall success or archives them durably when settlement later fails.
     #[serde(default)]
     pub provider_session_store_capture: Option<ProviderSessionStoreCapture>,
+    /// Metadata for a prompt result recovered from a provider-native session
+    /// store after the ACP terminal response failed or disappeared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_store_recovery: Option<ProviderSessionStoreRecoveryMetadata>,
     #[serde(default)]
     pub acp_pre_initialize_local_latency_ms: Option<u64>,
     #[serde(default)]
@@ -346,6 +350,23 @@ pub struct ProviderSessionStoreCapture {
     pub staging_root: String,
     #[serde(default)]
     pub captured_subdirs: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSessionStoreRecoveryMetadata {
+    pub result: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_tool_activity_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

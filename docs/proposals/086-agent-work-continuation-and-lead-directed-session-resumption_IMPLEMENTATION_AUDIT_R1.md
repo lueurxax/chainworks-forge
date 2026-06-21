@@ -161,11 +161,11 @@ Overall conformance is Not Implemented because in-scope requirements are Missing
 
 ### ARCH-001: Worker uses the fresh ACP session path for live-handle continuation
 
-Reviewer: `rust_arch_reviewer`  
-Severity: Critical  
-Confidence: High  
-Related requirements: REQ-002, REQ-015  
-Evidence types: code, tests-run  
+Reviewer: `rust_arch_reviewer`
+Severity: Critical
+Confidence: High
+Related requirements: REQ-002, REQ-015
+Evidence types: code, tests-run
 Evidence references: `engine/src/executor.rs:4452-4620`; `acp/src/manager.rs:271-315`, `:603-681`, `:733-746`; proposal `:90-101`, `:1193`
 
 Why it matters: P086's primary purpose is same-provider-session continuation. The worker validates that a live handle exists, but then calls `start_session`, which opens/registers a fresh session. The ACP manager already has the intended reuse path through `execute(...reuse_existing_session=true...)` and `prompt_session`, but the P086 worker bypasses it.
@@ -176,11 +176,11 @@ Acceptance criteria: A worker-level integration/unit test proves `agents.continu
 
 ### API-001: MCP `agents.continue_work` contract does not accept required operator/session/budget fields
 
-Reviewer: `api_contract_reviewer`  
-Severity: Major  
-Confidence: High  
-Related requirements: REQ-006, REQ-007, REQ-015  
-Evidence types: proposal, code, schema  
+Reviewer: `api_contract_reviewer`
+Severity: Major
+Confidence: High
+Related requirements: REQ-006, REQ-007, REQ-015
+Evidence types: proposal, code, schema
 Evidence references: proposal `:273-293`, `:609-654`; `mcp-server/src/tools/agents.rs:62-105`, `:534-559`
 
 Why it matters: The operator cannot provide the proposal-required instruction, explicit session identifiers, budgets, or blockers. The server also rejects unknown fields, so callers following the proposal contract will fail admission. This prevents canonical fingerprinting and prompt construction from matching the intended operation.
@@ -191,11 +191,11 @@ Acceptance criteria: Contract tests submit the proposal-shaped request, prove `o
 
 ### REL-001: Eligibility and side-effect safety are incomplete
 
-Reviewer: `rust_reliability_reviewer`  
-Severity: Major  
-Confidence: High  
-Related requirements: REQ-005, REQ-012, REQ-013  
-Evidence types: proposal, code  
+Reviewer: `rust_reliability_reviewer`
+Severity: Major
+Confidence: High
+Related requirements: REQ-005, REQ-012, REQ-013
+Evidence types: proposal, code
 Evidence references: proposal `:205-244`, `:587-605`, `:1038-1075`; `mcp-server/src/tools/agents.rs:791-845`
 
 Why it matters: Continuation can mutate the worktree and potentially touch external-effect lanes. The current checks prove role/status/pending approval, but not the full fail-closed policy promised by P086. Hard-coding `code_writer` is not equivalent to catalog opt-in or stage-kind/side-effect safety.
@@ -206,11 +206,11 @@ Acceptance criteria: Negative tests cover wrong run/generation, wrong agent/fami
 
 ### REL-002: Reconciliation, cancellation, and recovery paths remain partial
 
-Reviewer: `rust_reliability_reviewer`  
-Severity: Major  
-Confidence: High  
-Related requirements: REQ-003, REQ-009, REQ-014, REQ-015  
-Evidence types: code, docs, tests-run  
+Reviewer: `rust_reliability_reviewer`
+Severity: Major
+Confidence: High
+Related requirements: REQ-003, REQ-009, REQ-014, REQ-015
+Evidence types: code, docs, tests-run
 Evidence references: `engine/src/executor.rs:4524-4549`; `db/src/repos/agent_work_continuations.rs:551-633`; `docs/reference/proposal-086-api-contracts.md:69-73`
 
 Why it matters: The no-resend guard is the beginning of the crash-window story, but the proposal also requires reconciliation from worktree/transcript evidence, orphan ACP reap evidence, cancellation/worktree-lease termination proof, and restart-safe settlement. The current docs explicitly list several of these as pending.
@@ -221,11 +221,11 @@ Acceptance criteria: Tests cover crash after prompt delivery, daemon restart wit
 
 ### OPS-001: Evidence/readback gates are not live continuation proof
 
-Reviewer: `observability_rollout_reviewer`  
-Severity: Major  
-Confidence: High  
-Related requirements: REQ-010, REQ-014, REQ-015  
-Evidence types: code, tests-run, docs  
+Reviewer: `observability_rollout_reviewer`
+Severity: Major
+Confidence: High
+Related requirements: REQ-010, REQ-014, REQ-015
+Evidence types: code, tests-run, docs
 Evidence references: proposal `:551-583`, `:1120-1137`; `engine/src/executor.rs:4075-4115`; `docs/reference/proposal-086-api-contracts.md:69-75`
 
 Why it matters: P086 requires Chainworks truth for transcript, tool trace, worktree diff, changed files, tests, artifacts, and continuation summary. The current success artifact contains empty lists and generic text. Passing JSON fixture gates proves schema shape, not live readback fidelity.
@@ -236,11 +236,11 @@ Acceptance criteria: A live or integration proof produces non-synthetic continua
 
 ### READY-001: The implemented slice is explicitly phase-gated and not ready for P086 closeout
 
-Reviewer: `observability_rollout_reviewer`  
-Severity: Critical  
-Confidence: High  
-Related requirements: REQ-002, REQ-004, REQ-007, REQ-013, REQ-015  
-Evidence types: docs, code, tests-run  
+Reviewer: `observability_rollout_reviewer`
+Severity: Critical
+Confidence: High
+Related requirements: REQ-002, REQ-004, REQ-007, REQ-013, REQ-015
+Evidence types: docs, code, tests-run
 Evidence references: proposal `:10-11`, `:1189-1208`; `docs/reference/proposal-086-api-contracts.md:63-75`; `README.md:111`
 
 Why it matters: P086 closeout requires phases 1-4, but the implementation docs say `lead_auto` is blocked behind Phase 3, provider-session resurrection behind Phase 4, and several Phase 2 recovery/settlement pieces remain pending. The core live-handle path is also incorrect in code.

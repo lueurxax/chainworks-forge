@@ -20,6 +20,12 @@ pub struct RawReceiptRow {
     pub written_at: String,
 }
 
+pub struct ReceiptReadbackContext {
+    pub run_id: String,
+    pub attach_receipt_artifact_id: Option<String>,
+    pub resurrection_phase: Option<String>,
+}
+
 /// Persist or replace the raw receipt JSON for a resurrection continuation.
 pub async fn upsert(
     pool: &SqlitePool,
@@ -110,6 +116,27 @@ pub async fn continuation_run_id(
         .fetch_optional(pool)
         .await?;
     Ok(row.map(|r| r.get::<String, _>("run_id")))
+}
+
+/// Fetch the run-scoping and public-artifact context needed to shape
+/// `agents.attach_receipt.get` responses without exposing raw receipt fields.
+pub async fn continuation_receipt_readback_context(
+    pool: &SqlitePool,
+    continuation_id: &str,
+) -> Result<Option<ReceiptReadbackContext>> {
+    let row = sqlx::query(
+        "SELECT run_id, attach_receipt_artifact_id, resurrection_phase \
+         FROM agent_work_continuations \
+         WHERE id = ?1",
+    )
+    .bind(continuation_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| ReceiptReadbackContext {
+        run_id: r.get("run_id"),
+        attach_receipt_artifact_id: r.get("attach_receipt_artifact_id"),
+        resurrection_phase: r.get("resurrection_phase"),
+    }))
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 {
   "fixture_id": "focused-lifecycle-window-command-routing",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "macos_command_routing_contract_v1",
   "description": "When the lifecycle window is key and focused, lifecycle commands route correctly through it and are enabled in the menu and toolbar.",
   "preconditions": {

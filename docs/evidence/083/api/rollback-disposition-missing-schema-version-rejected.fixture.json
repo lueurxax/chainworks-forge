@@ -1,7 +1,7 @@
 {
   "fixture_id": "rollback-disposition-missing-schema-version-rejected",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "rollback_disposition_json_v1",
   "description": "validate_rollback_disposition_v1 rejects a disposition object that lacks schema_version.",
   "input": {

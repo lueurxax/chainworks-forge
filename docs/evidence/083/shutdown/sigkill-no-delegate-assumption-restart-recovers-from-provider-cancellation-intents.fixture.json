@@ -1,7 +1,7 @@
 {
   "fixture_id": "sigkill-no-delegate-assumption-restart-recovers-from-provider-cancellation-intents",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "shutdown_lifecycle_contract_v1",
   "description": "SIGKILL allows no delegate or cleanup; restart recovery uses durable provider cancellation intent rows to reconstruct and resume safe state.",
   "preconditions": {

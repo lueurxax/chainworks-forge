@@ -22,6 +22,7 @@ use domain::ResourceTemplateId;
 pub struct McpServer {
     pool: SqlitePool,
     cmd_handler: Arc<CommandHandler>,
+    acp_runtime: Option<Arc<acp::AcpRuntimeManager>>,
     pub principal_table: auth::PrincipalTable,
     live_principal_source: auth::LivePrincipalSource,
     events: Option<EventSender>,
@@ -140,6 +141,7 @@ impl McpServer {
         Self {
             pool,
             cmd_handler,
+            acp_runtime: None,
             live_principal_source: auth::LivePrincipalSource::new(principal_table.clone()),
             principal_table,
             events: None,
@@ -157,6 +159,7 @@ impl McpServer {
         Self {
             pool,
             cmd_handler,
+            acp_runtime: None,
             live_principal_source: auth::LivePrincipalSource::new(principal_table.clone()),
             principal_table,
             events: None,
@@ -175,6 +178,7 @@ impl McpServer {
         Self {
             pool,
             cmd_handler,
+            acp_runtime: None,
             live_principal_source: auth::LivePrincipalSource::new(principal_table.clone()),
             principal_table,
             events: None,
@@ -192,6 +196,7 @@ impl McpServer {
         Self {
             pool,
             cmd_handler,
+            acp_runtime: None,
             live_principal_source: auth::LivePrincipalSource::new(principal_table.clone()),
             principal_table,
             events: Some(events),
@@ -204,6 +209,13 @@ impl McpServer {
     /// Call this after construction; the daemon chains it on the existing constructor.
     pub fn with_boundary_policy(mut self, policy: Arc<auth::boundary::BoundaryPolicy>) -> Self {
         self.boundary_policy = Some(policy);
+        self
+    }
+
+    /// P086: Provider-session resurrection admission needs the actual selected
+    /// ACP adapter capability, not provider-family string matching.
+    pub fn with_acp_runtime(mut self, acp_runtime: Arc<acp::AcpRuntimeManager>) -> Self {
+        self.acp_runtime = Some(acp_runtime);
         self
     }
 
@@ -223,6 +235,7 @@ impl McpServer {
         let mut reader = BufReader::new(stdin);
         let mut line = String::new();
         let mut session_principal: Option<auth::Principal> = None;
+        let mut session_token_fingerprint: Option<String> = None;
         let mut notification_task: Option<tokio::task::JoinHandle<()>> = None;
 
         loop {
@@ -372,6 +385,7 @@ impl McpServer {
                     Some(t) => match self.resolve_current_bearer(t) {
                         Ok(p) => {
                             let is_operator = matches!(p.class, auth::PrincipalClass::Operator);
+                            session_token_fingerprint = Some(auth::token_fingerprint(t));
                             session_principal = Some(p);
                             // Return normal initialize response
                             let resp = self
@@ -417,9 +431,26 @@ impl McpServer {
             }
 
             // For all other methods, require session_principal
-            let principal = match session_principal.as_ref() {
-                Some(p) => p,
-                None => {
+            let principal = match (
+                session_principal.as_ref(),
+                session_token_fingerprint.as_ref(),
+            ) {
+                (Some(p), Some(fingerprint)) => match self
+                    .live_principal_source
+                    .resolve_principal_by_id_and_token_fingerprint(&p.id, fingerprint)
+                {
+                    Ok(current) => current,
+                    Err(_) => {
+                        let resp = JsonRpcResponse::error(
+                            request.id.clone(),
+                            -32000,
+                            "unauthorized".to_string(),
+                        );
+                        write_json_line(&stdout, &resp).await;
+                        break;
+                    }
+                },
+                _ => {
                     let resp = JsonRpcResponse::error(
                         request.id.clone(),
                         -32002,
@@ -432,9 +463,9 @@ impl McpServer {
 
             if is_notification {
                 // Fire-and-forget: process but don't reply.
-                let _ = self.handle_request(request, principal).await;
+                let _ = self.handle_request(request, &principal).await;
             } else {
-                let response = self.handle_request(request, principal).await;
+                let response = self.handle_request(request, &principal).await;
                 write_json_line(&stdout, &response).await;
             }
         }
@@ -1789,7 +1820,14 @@ impl McpServer {
             // Box::pin isolates the agents future from dispatch_tool_internal's state machine,
             // preventing the large agents executor from inflating the state machine of all
             // non-agents paths (storage, runs, runtime, etc.) in debug builds.
-            Box::pin(tools::agents::execute(tool_name, params, pool, principal)).await
+            Box::pin(tools::agents::execute(
+                tool_name,
+                params,
+                pool,
+                principal,
+                self.acp_runtime.as_deref(),
+            ))
+            .await
         } else if tool_name.starts_with("automation.") {
             tools::automation::execute(tool_name, params, principal).await
         } else if tool_name.starts_with("p080.") {
@@ -1910,7 +1948,6 @@ fn is_state_changing_tool(tool_name: &str) -> bool {
             | "workflow_loop_budget.extend"
             | "artifacts.override_contract"
             | "steward.run_analysis"
-            | "agents.continue_work"
             | "effects.mark_conflict"
             | "effects.mark_unrecoverable"
             | "effects.clear_after_manual_verification"
@@ -4450,7 +4487,7 @@ mod tests {
             "runs.cancel",
             serde_json::json!({
                 "run_id": run_id.to_string(),
-                "idempotency_key": uuid::Uuid::now_v7().to_string(),
+                "caller_request_id": uuid::Uuid::new_v4().to_string(),
             }),
         )
         .await;

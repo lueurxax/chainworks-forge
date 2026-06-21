@@ -2033,9 +2033,9 @@ Scope (what this gate proves today):
 - the `p079_output_contract_repair_v1` SQLite migration creates `output_contract_repair_events`, `output_contract_repair_leases`, and `output_contract_repair_fallback_parent_links` with the required columns, uniqueness, and dispatch-commit invariants
 - domain types, enums, presentation projection, and SCHEMA/flag constants exposed by `crates/domain/src/output_contract_repair.rs`
 - DB repository slices for repair events and leases
-- engine fail-closed advisory posture, provider-support checks, plan-evidence redaction, and SEC-002 transcript-recovery bounds
+- engine fail-closed advisory posture, provider-support checks, plan-evidence redaction, SEC-002 transcript-recovery bounds, and accepted transport-attributed provider-envelope recovery
 - deterministic fixture same-session repair dispatch through `invoke_agent_repairs_missing_required_output_in_same_live_session` with `CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED` and `CHAINWORKS_P079_ACCEPT_ADVISORY_REPAIR_POSTURE`
-- Swift DTO build + the `Proposal079ContractRepairReadbackTests` fixture-decode slice (also runnable standalone via `./scripts/test-gate.sh p079-swift-readback`)
+- Swift DTO build + the `Proposal079ContractRepairReadbackTests` fixture-decode and run-detail presenter slice, including GraphQL enum casing and inspector readback selection (also runnable standalone via `./scripts/test-gate.sh p079-swift-readback`)
 
 Command:
 
@@ -2047,7 +2047,8 @@ Command:
 
 Important:
 
-- this gate is a partial-acceptance proof; accepted transcript/provider-envelope recovery, controlled provider fallback dispatch, full projection rebuild + recovery sweep, the macOS inspector UI, P079 operational metric emission, and the required reference docs (`p079-repair-prompt-template.md`, `p079-recovery-attribution.md`, `p079-adapter-idempotency.md`) remain deferred
+- this gate is a partial-acceptance proof; controlled provider fallback dispatch, full projection rebuild + recovery sweep, and full provider-fallback rollout metric readback remain deferred
+- the gate requires the durable P079 reference docs for the implemented lanes: [p079-repair-prompt-template.md](p079-repair-prompt-template.md), [p079-recovery-attribution.md](p079-recovery-attribution.md), and [p079-adapter-idempotency.md](p079-adapter-idempotency.md)
 - production same-session repair is fail-closed for advisory-only providers per SEC-P079-HIGH-003; `CHAINWORKS_P079_ACCEPT_ADVISORY_REPAIR_POSTURE=1` is for gate fixtures only, not production
 - the gate is local and deterministic: no live providers, network access, or remote macOS host required
 
@@ -2396,16 +2397,53 @@ Important:
 - this gate proves the P081 boundary contract as implemented repository truth: daemon-injected policy wiring, GraphQL/MCP bounded readback, WebSocket close-code enforcement, GraphQL redaction envelopes, Swift redaction/accessibility decoding, approval idempotency, and MCP command idempotency linked to `command_journal`
 - the gate fails closed if the fixture is missing any required row, the doc is missing, the auth/db/readback/WebSocket/idempotency/Swift slices fail, or any of the P081 migrations (`064`–`071`) is absent
 
+### `proposal-082|p082`
+
+Recovery and retry state-machine matrix gate for cancellation convergence, startup repair readback, cancel-late-output quarantine, provider subprocess cleanup, production R08 wrong-identifier no-mutation behavior, non-Operator report redaction, and live principal reload boundaries.
+
+Scope:
+
+- static matrix checks require every P082 scenario id (`P082-R01` through `P082-R17`) to have named tests and retained recovery-matrix/readback evidence hooks
+- DB and engine recovery matrix tests cover durable readback and scenario evidence
+- engine integration tests cover P082 production behavior, including cancellation convergence, startup repair cancellation convergence, cancel-late-output quarantine, provider cleanup, and R08 no-mutation validation
+- auth tests cover live principal revalidation for revoked, disabled, and re-scoped credentials
+- MCP server tests cover P082 report/readback redaction, MCP HTTP live-principal revocation, and recovery readback resources
+- daemon tests cover failed-serve live-principal revocation and MCP stdio live-principal reload after revocation, disable, and re-scope
+- GraphQL server tests cover live-principal updates on HTTP bearer calls
+
+Use when:
+
+- editing P082 recovery/retry state-machine code, report/readback redaction, cancellation repair, provider cleanup, command identifier validation, or any auth surface that uses the reloadable principal table
+- changing `scripts/test-gate.sh` P082 checks or the P082 retained scenario matrix
+
+Host policy:
+
+- local Rust toolchain and Python 3 required; no UI host, daemon, or network required
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-082
+./scripts/test-gate.sh p082
+```
+
+Important:
+
+- `p082` is accepted as an alias
+- this gate is behavioral, not only a static test-name inventory; a zero-test cargo filter is a gate failure
+- live-auth coverage must include MCP HTTP, MCP stdio, GraphQL HTTP bearer, and failed-serve paths
+
 ### `proposal-080|p080`
 
-Continuous stale execution reconciliation — Phase 1 detection-only scaffolding for the DB migration shape, MCP admission surface (`p080.diagnostics.get.v1`, `p080.reconcile.request.v1` with `requested_action in {diagnose_only, repair_if_safe, hold}`, `p080.clear_permanent_hold.v1`), the rollout-control seed (default-disabled including `live_disable` row and generation counter), the dedup/idempotency repository primitives, the principal-class CHECK constraint vocabulary, and the proposal §3.1 admission matrix as exercised at the handler (`diagnose_only` admitted for ReadOnlyOperator, `repair_if_safe` rejected; `clear_permanent_hold` Operator-only). Full Phase 2+ dedup replay/fingerprint-conflict handling is not enabled in this gate.
+Continuous stale execution reconciliation — phase-scoped detection plus Phase 2 `acp_startup_stale` repair proof for the DB migration shape, MCP admission surface (`p080.diagnostics.get.v1`, `p080.reconcile.request.v1` with `requested_action in {diagnose_only, repair_if_safe, hold}`, `p080.clear_permanent_hold.v1`), rollout-control seed (default-disabled including `live_disable` row and generation counter), durable operator-request dedup replay, principal-class CHECK constraint vocabulary, and the proposal §3.1 admission matrix as exercised at the handler (`diagnose_only` admitted for ReadOnlyOperator, `repair_if_safe` rejected; `clear_permanent_hold` Operator-only).
 
 Scope:
 
 - `control-plane/crates/db/migrations/086_p080_stale_execution_reconciliation.sql` exists and declares the approved `principal_class IN ('operator','read_only_operator')` check constraint (no `'agent'` admission)
 - `cargo build -p db -p mcp-server` succeeds
 - the DB unit tests under `cargo test -p db` cover the rollout-control seed (all classes inserted, idempotent reseed, includes the detection-only class), the read-side classifier and readback page (empty-DB shape, single-row readback), the dedup-entry roundtrip, the reconciliation event insert, the live-loop diagnose-only path (`stale_suspected` remains `stale_suspected` with `repair_action=diagnose_only`), and the secret-like redaction matrix for embedded secrets in diagnostic strings
-- the MCP unit tests under `cargo test -p mcp-server` cover `p080.diagnostics.get.v1` (rollout-disabled while `detection_only` is off, empty when enabled, read-only, opaque cursor forward-pagination, malformed-cursor rejection with `cursor_reason: malformed`, nested-filter-field validation), schema-version-required errors, `p080.reconcile.request.v1` with `diagnose_only` happy-path (returns `diagnosed`) and dedup-key rejection, `repair_if_safe` while class rollout is disabled (`class_disabled` or `rollout_disabled`), `repair_if_safe` while the class row is enabled but active repair is still phase-gated (`rollout_disabled`), `p080.clear_permanent_hold.v1` (`action_disabled_in_phase` and the P080-specific dedup precheck), ReadOnlyOperator handler admission (can call `diagnose_only`; rejected for `repair_if_safe`), HTTP duplicate-key scanning (before JSON-RPC parse, before auth, with escaped method and Unicode-escaped key canonicalization), fail-closed `tools/list` filtering that omits Codex aliases when the rollout-control row is unreadable, and the current pre-dedup rollout-gate behavior for repeated, changed, fingerprint-mismatch, or `live_disable` generation-mismatch `repair_if_safe` requests
+- the MCP unit tests under `cargo test -p mcp-server` cover `p080.diagnostics.get.v1` (rollout-disabled while `detection_only` is off, empty when enabled, read-only, opaque cursor forward-pagination, malformed-cursor rejection with `cursor_reason: malformed`, nested-filter-field validation), schema-version-required errors, `p080.reconcile.request.v1` with `diagnose_only` happy-path (returns `diagnosed`) and dedup-key rejection, `repair_if_safe` while class rollout is disabled (`class_disabled` or `rollout_disabled`), `repair_if_safe` while the class row is enabled but active repair is still phase-gated (`rollout_disabled`), Phase 2 `repair_if_safe` requeue for `acp_startup_stale`, durable replay of the same operator-request dedup key, `idempotency_conflict` before mutation when the same dedup key is reused for a different target, `p080.clear_permanent_hold.v1` (`action_disabled_in_phase` and the P080-specific dedup precheck), ReadOnlyOperator handler admission (can call `diagnose_only`; rejected for `repair_if_safe`), HTTP duplicate-key scanning (before JSON-RPC parse, before auth, with escaped method and Unicode-escaped key canonicalization), and fail-closed `tools/list` filtering that omits Codex aliases when the rollout-control row is unreadable
+- the rollout-contract inventory must contain the P080 operator-readback fixture, at least twenty P080 negative fixtures bound to both `proposal-080` and `p080`, and concrete rollout evidence JSON under `docs/evidence/rollout/p080`; the gate rejects placeholder evidence markers before running Rust tests
 - the canonical test list lives in `PROPOSAL_080_RUST_TESTS` in `scripts/test-gate.sh`; renamed or missing tests must update both the array and the gate-run grep guard
 
 Use when:
@@ -2452,7 +2490,7 @@ Important:
 
 - `p080` is accepted as an alias
 - the gate fails closed if the migration file is absent, the principal-class CHECK constraint deviates from the approved vocabulary, any test in `PROPOSAL_080_RUST_TESTS` returns non-zero, or `cargo test` produces no matching test line for a listed name (rename/typo guard)
-- Phase 1 is detection-only by default: `p080.diagnostics.get.v1` refuses with `rollout_disabled` while `detection_only` is disabled; MCP `repair_if_safe` still refuses with `rollout_disabled` after the class row is enabled because active repair is phase-gated; the live loop records `diagnosed` / `diagnose_only` readback and reconciliation events whenever `live_disable` is off and `detection_only` is enabled (the `acp_startup_stale` class flag only sets `rollout_disablement` to `none` vs `class_disabled` in the readback and does not gate event emission); `clear_permanent_hold` remains `action_disabled_in_phase`; the handler unit tests (`p080_read_only_operator_can_call_diagnose_only`, `p080_read_only_operator_rejected_for_repair_if_safe`) lock in the proposal §3.1 handler-level matrix (`diagnose_only` admitted, `repair_if_safe` rejected with `unauthorized_missing_capability`). The auth capability table admits ReadOnlyOperator for `p080.diagnostics.get.v1` and `p080.reconcile.request.v1`, keeps `p080.clear_permanent_hold.v1` Operator-only, and grants ReadOnlyOperator no MCP resources; those auth-unit regressions are outside this DB/MCP-focused gate.
+- Phase-scoped behavior: `p080.diagnostics.get.v1` refuses with `rollout_disabled` while `detection_only` is disabled; `diagnose_only` remains read-only; `repair_if_safe` is enabled only for `acp_startup_stale` when that rollout row is enabled in Phase 2+ and otherwise refuses with the typed rollout/class error; scheduler ownership, helper reap, side-effect-adjacent repair, manual hold, and `clear_permanent_hold` remain disabled. The live loop still records diagnostic readback/events rather than mutating repair state. Durable operator-request dedup is enforced for the Phase 2 mutating repair path: same fence replays the stored response, while changed request/auth/rollout/live-disable fences return `idempotency_conflict` before mutation. The handler unit tests (`p080_read_only_operator_can_call_diagnose_only`, `p080_read_only_operator_rejected_for_repair_if_safe`) lock in the proposal §3.1 handler-level matrix (`diagnose_only` admitted, `repair_if_safe` rejected with `unauthorized_missing_capability`). The auth capability table admits ReadOnlyOperator for `p080.diagnostics.get.v1` and `p080.reconcile.request.v1`, keeps `p080.clear_permanent_hold.v1` Operator-only, and grants ReadOnlyOperator no MCP resources; those auth-unit regressions are outside this DB/MCP-focused gate.
 
 ### `proposal-086|p086|p086-continuation-preflight`
 

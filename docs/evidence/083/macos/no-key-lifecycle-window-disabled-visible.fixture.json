@@ -1,7 +1,7 @@
 {
   "fixture_id": "no-key-lifecycle-window-disabled-visible",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "macos_command_routing_contract_v1",
   "description": "When no lifecycle window is key, lifecycle commands appear in the menu and toolbar as disabled (visible but not interactive).",
   "preconditions": {

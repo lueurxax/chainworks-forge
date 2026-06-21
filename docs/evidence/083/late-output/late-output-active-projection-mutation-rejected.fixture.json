@@ -1,7 +1,7 @@
 {
   "fixture_id": "late-output-active-projection-mutation-rejected",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "late_output_overflow_contract_v1",
   "description": "Late output arriving after a stage has moved to an active projection state is rejected to prevent backward mutation of committed projections.",
   "preconditions": {

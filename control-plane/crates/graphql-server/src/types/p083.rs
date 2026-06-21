@@ -6,9 +6,101 @@
 //! the inline rollout_contract_v1 rollback_disposition object does not carry it.
 
 use async_graphql::{
-    Enum, InputValueError, InputValueResult, Json, Scalar, ScalarType, SimpleObject, Value,
+    Enum, InputValueError, InputValueResult, Json, Scalar, ScalarType, SimpleObject, Union, Value,
 };
 use serde::{Deserialize, Serialize};
+
+/// P083 CallerRequestId input scalar.
+///
+/// The public GraphQL SDL must expose this as a distinct scalar rather than a
+/// plain String so lifecycle callers cannot accidentally treat request ids as
+/// free-form diagnostic text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallerRequestId(String);
+
+impl CallerRequestId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CallerRequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+fn validate_caller_request_id_scalar(raw: &str) -> Result<(), String> {
+    if raw.trim() != raw {
+        return Err("CallerRequestId must not include leading or trailing whitespace".into());
+    }
+    if raw.to_ascii_lowercase() != raw {
+        return Err("CallerRequestId must be lowercase".into());
+    }
+    let parsed = uuid::Uuid::parse_str(raw)
+        .map_err(|_| "CallerRequestId must be a dashed UUID".to_string())?;
+    if parsed.get_version_num() != 4 {
+        return Err("CallerRequestId must be a UUIDv4".into());
+    }
+    if parsed.hyphenated().to_string() != raw {
+        return Err("CallerRequestId must use canonical dashed UUID form".into());
+    }
+    Ok(())
+}
+
+#[Scalar(name = "CallerRequestId")]
+impl ScalarType for CallerRequestId {
+    fn parse(value: Value) -> InputValueResult<Self> {
+        match value {
+            Value::String(raw) => {
+                validate_caller_request_id_scalar(&raw).map_err(InputValueError::custom)?;
+                Ok(Self(raw))
+            }
+            _ => Err(InputValueError::expected_type(value)),
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        Value::String(self.0.clone())
+    }
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+#[graphql(name = "DenialReason", rename_items = "snake_case")]
+pub enum DenialReason {
+    MissingCallerRequestId,
+    MalformedRequestId,
+    PrincipalClassNotAllowed,
+    LifecycleStateInvalid,
+    SchemaInvalid,
+    AdditionalPropertiesRejected,
+    RollbackTargetRequired,
+    RollbackTargetInvalid,
+    RequestIntentMismatch,
+    IdempotencyInFlight,
+    IdempotencyReplayed,
+    IdempotencyExpiredReacquired,
+    OperatorRequired,
+    P083OperatorRequired,
+    ProviderSessionNotFound,
+    RunNotFound,
+    StageNotRetryable,
+    ApprovalNotActionable,
+    SideEffectNotReconcilable,
+    EnforcementModeTransitionDenied,
+    IdentityAmbiguous,
+    IdempotencyReplayCorrupt,
+    IdempotencyTerminalFailure,
+    Internal,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "DenialPayload")]
+pub struct DenialPayload {
+    pub reason: DenialReason,
+    pub message: String,
+    pub retry_after_seconds: Option<i32>,
+}
 
 /// Required fields in a rollback_disposition_v1 value.
 /// Per rollback_disposition_json_v1.required_fields (schema_version, mode, data_loss_risk, steps).
@@ -731,13 +823,16 @@ pub struct GqlP083IdentityHoldSession {
     pub cancellation_epoch: Option<i64>,
     pub last_seen_pid: Option<i64>,
     pub process_start_identity_hash: Option<String>,
+    pub live_probe_status: String,
+    pub live_probe_detail: String,
     pub latest_receipt_id: Option<String>,
     pub reason_detail: Option<String>,
 }
 
 /// P083: GraphQL payload returned by the providerSessionShutdown mutation.
 #[derive(SimpleObject, Clone, Debug)]
-pub struct GqlP083ProviderSessionShutdownPayload {
+#[graphql(name = "ProviderSessionShutdownSuccess")]
+pub struct GqlP083ProviderSessionShutdownSuccess {
     /// true when process signal dispatch is active (process_id was known at command time).
     /// false means the intent is held pending manual identity check (ProviderSessionShutdownHeld).
     pub scheduled: bool,
@@ -752,6 +847,63 @@ pub struct GqlP083ProviderSessionShutdownPayload {
     /// Non-null when process_id was unknown at command time (SEC-P083-HIGH-001).
     /// Value: "manual_process_identity_check". Null when scheduled=true.
     pub operator_next_step_code: Option<String>,
+}
+
+#[derive(Union, Clone, Debug)]
+#[graphql(name = "ProviderSessionShutdownPayload")]
+pub enum GqlP083ProviderSessionShutdownPayload {
+    Success(GqlP083ProviderSessionShutdownSuccess),
+    Denial(DenialPayload),
+}
+
+/// P083: GraphQL payload returned by the runsCancel mutation.
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "RunsCancelSuccess")]
+pub struct GqlRunsCancelSuccess {
+    pub run_id: String,
+    pub cancellation_epoch: Option<i64>,
+    pub journal_id: String,
+    pub request_id: String,
+}
+
+#[derive(Union, Clone, Debug)]
+#[graphql(name = "RunsCancelPayload")]
+pub enum GqlRunsCancelPayload {
+    Success(GqlRunsCancelSuccess),
+    Denial(DenialPayload),
+}
+
+/// P083: GraphQL payload returned by the stagesRetry mutation.
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "StagesRetrySuccess")]
+pub struct GqlStagesRetrySuccess {
+    pub stage_execution_id: String,
+    pub stage_id: String,
+    pub journal_id: String,
+    pub request_id: String,
+}
+
+#[derive(Union, Clone, Debug)]
+#[graphql(name = "StagesRetryPayload")]
+pub enum GqlStagesRetryPayload {
+    Success(GqlStagesRetrySuccess),
+    Denial(DenialPayload),
+}
+
+/// P083: GraphQL payload returned by the sideEffectsForceReconcile mutation.
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "SideEffectsForceReconcileSuccess")]
+pub struct GqlSideEffectsForceReconcileSuccess {
+    pub side_effect_id: String,
+    pub journal_id: String,
+    pub request_id: String,
+}
+
+#[derive(Union, Clone, Debug)]
+#[graphql(name = "SideEffectsForceReconcilePayload")]
+pub enum GqlSideEffectsForceReconcilePayload {
+    Success(GqlSideEffectsForceReconcileSuccess),
+    Denial(DenialPayload),
 }
 
 /// P083: GraphQL payload returned by the p083RollbackExecution mutation.
@@ -791,7 +943,8 @@ impl GqlP083EnforcementMode {
 
 /// P083: GraphQL payload returned by the p083RollbackExecution mutation.
 #[derive(SimpleObject, Clone, Debug)]
-pub struct GqlP083RollbackExecutionPayload {
+#[graphql(name = "P083RollbackExecutionSuccess")]
+pub struct GqlP083RollbackExecutionSuccess {
     /// true when the rollback was durably committed to the audit table.
     pub committed: bool,
     /// The rollback target mode: permissive or disabled.
@@ -802,9 +955,17 @@ pub struct GqlP083RollbackExecutionPayload {
     pub request_id: String,
 }
 
+#[derive(Union, Clone, Debug)]
+#[graphql(name = "P083RollbackExecutionPayload")]
+pub enum GqlP083RollbackExecutionPayload {
+    Success(GqlP083RollbackExecutionSuccess),
+    Denial(DenialPayload),
+}
+
 /// P083: GraphQL payload returned by the p083SetEnforcementMode mutation.
 #[derive(SimpleObject, Clone, Debug)]
-pub struct GqlP083SetEnforcementModePayload {
+#[graphql(name = "P083SetEnforcementModeSuccess")]
+pub struct GqlP083SetEnforcementModeSuccess {
     /// true when the mode change was durably committed.
     pub committed: bool,
     /// The new enforcement mode: disabled, permissive, or enforce.
@@ -815,9 +976,17 @@ pub struct GqlP083SetEnforcementModePayload {
     pub request_id: String,
 }
 
+#[derive(Union, Clone, Debug)]
+#[graphql(name = "P083SetEnforcementModePayload")]
+pub enum GqlP083SetEnforcementModePayload {
+    Success(GqlP083SetEnforcementModeSuccess),
+    Denial(DenialPayload),
+}
+
 /// P083: GraphQL payload returned by the runsRetry mutation.
 #[derive(SimpleObject, Clone, Debug)]
-pub struct GqlRetryRunPayload {
+#[graphql(name = "RunsRetrySuccess")]
+pub struct GqlRetryRunSuccess {
     /// true when the AdvanceRun work item was durably enqueued.
     pub queued: bool,
     /// Run ID that was re-queued.
@@ -828,12 +997,20 @@ pub struct GqlRetryRunPayload {
     pub request_id: String,
 }
 
+#[derive(Union, Clone, Debug)]
+#[graphql(name = "RunsRetryPayload")]
+pub enum GqlRetryRunPayload {
+    Success(GqlRetryRunSuccess),
+    Denial(DenialPayload),
+}
+
 /// P083: GraphQL payload returned by the p083MarkProviderSessionProcessAbsent mutation.
 /// Per manual_process_identity_check_ui_v1.available_actions.mark_process_absent:
 /// operator has confirmed the process is absent; process_fate=absent_verified and
 /// held intent is re-opened to requested so settlement can resume.
 #[derive(SimpleObject, Clone, Debug)]
-pub struct GqlP083MarkProcessAbsentPayload {
+#[graphql(name = "P083MarkProcessAbsentSuccess")]
+pub struct GqlP083MarkProcessAbsentSuccess {
     /// true when process_fate was successfully moved to absent_verified.
     pub marked_absent: bool,
     /// Authoritative provider session ID.
@@ -844,6 +1021,13 @@ pub struct GqlP083MarkProcessAbsentPayload {
     pub journal_id: String,
     /// Replayed CallerRequestId confirming idempotency lease.
     pub request_id: String,
+}
+
+#[derive(Union, Clone, Debug)]
+#[graphql(name = "P083MarkProcessAbsentPayload")]
+pub enum GqlP083MarkProcessAbsentPayload {
+    Success(GqlP083MarkProcessAbsentSuccess),
+    Denial(DenialPayload),
 }
 
 /// P083: GraphQL readback row for a cancel_late_output_overflow latch.

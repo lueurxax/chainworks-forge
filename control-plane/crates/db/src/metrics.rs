@@ -129,6 +129,31 @@ pub const P082_REQUIRED_METRICS: &[&str] = &[
     "p082_recovery_state_age_seconds",
 ];
 
+/// P079: contract-aware output repair and provider fallback rollout metrics.
+pub const P079_REQUIRED_METRICS: &[&str] = &[
+    "p079_output_repair_attempt_total",
+    "p079_repair_transport_outcome_total",
+    "p079_transcript_recovery_total",
+    "p079_provider_fallback_attempt_total",
+    "p079_repair_budget_exhausted_total",
+    "p079_fallback_budget_exhausted_total",
+    "p079_lease_reclamation_total",
+    "p079_invalid_repair_rejected_total",
+    "p079_provider_mode_mismatch_total",
+    "p079_plan_evidence_only_total",
+    "p079_plan_evidence_redaction_total",
+    "p079_recovery_bound_exceeded_total",
+    "p079_release_lane_exclusion_total",
+    "p079_principal_revoked_total",
+    "p079_unsafe_continuation_total",
+    "p079_fallback_lease_total",
+    "p079_fallback_packet_assembly_total",
+    "p079_repair_inflight_total",
+    "p079_eligible_output_failures_recovered_percent",
+    "auto_retry_output_contract_classification_total",
+    "recovery_sweep_total",
+];
+
 pub const P094_REQUIRED_METRICS: &[&str] = &[
     "quality_gate_blocker_assessments_total",
     "quality_gate_blocker_validation_rejections_total",
@@ -841,6 +866,188 @@ pub fn record_p082_recovery_matrix_gate_result(scenario_id: &str, status: &str) 
         "p082_recovery_matrix_gate_result_total",
         &format!("{scenario_id}:{status}"),
     );
+}
+
+fn p079_bounded_label(value: &str, allowed: &[&str]) -> String {
+    allowed
+        .iter()
+        .find(|candidate| **candidate == value)
+        .copied()
+        .unwrap_or("other")
+        .to_string()
+}
+
+pub fn record_p079_output_repair_attempt(provider_family: &str, initial_failure_class: &str) {
+    let provider = p079_bounded_label(
+        provider_family,
+        &["codex", "claude", "gemini", "junie", "auggie", "fixture"],
+    );
+    let failure_class = p079_bounded_label(
+        initial_failure_class,
+        &[
+            "no_output_produced",
+            "empty_output",
+            "missing_required_outputs",
+            "invalid_required_outputs",
+            "output_contract_mismatch",
+            "provider_mode_mismatch",
+        ],
+    );
+    increment_counter("p079_output_repair_attempt_total");
+    increment_counter_with_label(
+        "p079_output_repair_attempt_total",
+        &format!("provider_family={provider},initial_failure_class={failure_class}"),
+    );
+    if failure_class == "provider_mode_mismatch" {
+        increment_counter("p079_provider_mode_mismatch_total");
+        increment_counter_with_label(
+            "p079_provider_mode_mismatch_total",
+            &format!("provider_family={provider}"),
+        );
+    }
+    increment_counter("p079_repair_inflight_total");
+    increment_counter_with_label(
+        "p079_repair_inflight_total",
+        &format!("provider_family={provider}"),
+    );
+}
+
+pub fn record_p079_repair_terminal(
+    status: &str,
+    final_output_settlement: Option<&str>,
+    recommended_next_action: &str,
+) {
+    let status = p079_bounded_label(
+        status,
+        &[
+            "not_attempted",
+            "in_progress",
+            "recovered",
+            "blocked",
+            "skipped",
+            "cancelled",
+            "failed",
+        ],
+    );
+    let settlement = p079_bounded_label(
+        final_output_settlement.unwrap_or("none"),
+        &[
+            "none",
+            "valid_outputs_from_completed_execution",
+            "valid_outputs_from_repair",
+            "valid_outputs_from_transcript_recovery",
+            "valid_outputs_from_provider_envelope",
+            "valid_outputs_from_fallback",
+            "blocked_missing_required_outputs",
+            "blocked_invalid_required_outputs",
+            "blocked_provider_mode_mismatch",
+            "ignored_late_outputs",
+            "cancelled",
+            "failed_transport",
+            "deadline_exceeded",
+        ],
+    );
+    let action = p079_bounded_label(
+        recommended_next_action,
+        &[
+            "continue",
+            "inspect_repair_evidence",
+            "configure_fallback_policy",
+            "operator_resolve_approval",
+            "operator_resolve_workflow_conflict",
+            "retry_after_transport_restored",
+            "cancel_acknowledged",
+            "manual_investigation",
+        ],
+    );
+    increment_counter("p079_repair_transport_outcome_total");
+    increment_counter_with_label(
+        "p079_repair_transport_outcome_total",
+        &format!(
+            "status={status},final_output_settlement={settlement},recommended_next_action={action}"
+        ),
+    );
+    match settlement.as_str() {
+        "valid_outputs_from_repair"
+        | "valid_outputs_from_transcript_recovery"
+        | "valid_outputs_from_provider_envelope"
+        | "valid_outputs_from_fallback" => {
+            set_gauge("p079_eligible_output_failures_recovered_percent", 100);
+        }
+        "blocked_missing_required_outputs" | "blocked_invalid_required_outputs" => {
+            set_gauge("p079_eligible_output_failures_recovered_percent", 0);
+            increment_counter("p079_invalid_repair_rejected_total");
+        }
+        "blocked_provider_mode_mismatch" => {
+            set_gauge("p079_eligible_output_failures_recovered_percent", 0);
+            increment_counter("p079_provider_mode_mismatch_total");
+        }
+        _ => {}
+    }
+}
+
+pub fn record_p079_repair_lease(lease_kind: &str, result: &str) {
+    let lease_kind = p079_bounded_label(lease_kind, &["repair", "fallback"]);
+    let result = p079_bounded_label(
+        result,
+        &[
+            "accepted",
+            "rejected_invalid",
+            "skipped_ineligible",
+            "unavailable",
+            "failed_transport",
+            "deadline_exceeded",
+            "cancelled",
+            "superseded_ignored",
+            "lease_contended",
+            "budget_exhausted",
+        ],
+    );
+    if lease_kind == "fallback" {
+        increment_counter("p079_fallback_lease_total");
+        increment_counter_with_label("p079_fallback_lease_total", &format!("result={result}"));
+    }
+    if result == "budget_exhausted" {
+        let metric = if lease_kind == "fallback" {
+            "p079_fallback_budget_exhausted_total"
+        } else {
+            "p079_repair_budget_exhausted_total"
+        };
+        increment_counter(metric);
+        increment_counter_with_label(metric, &format!("lease_kind={lease_kind}"));
+    }
+}
+
+pub fn record_p079_transcript_recovery(result: &str) {
+    let result = p079_bounded_label(
+        result,
+        &[
+            "not_needed",
+            "accepted",
+            "rejected_invalid",
+            "skipped_ineligible",
+            "failed_transport",
+            "cancelled",
+            "unavailable",
+            "oversized_payload",
+            "unattributable_envelope",
+        ],
+    );
+    increment_counter("p079_transcript_recovery_total");
+    increment_counter_with_label(
+        "p079_transcript_recovery_total",
+        &format!("result={result}"),
+    );
+    if matches!(
+        result.as_str(),
+        "oversized_payload" | "unattributable_envelope"
+    ) {
+        increment_counter("p079_recovery_bound_exceeded_total");
+        increment_counter_with_label(
+            "p079_recovery_bound_exceeded_total",
+            &format!("result={result}"),
+        );
+    }
 }
 
 /// Emit `p082_recovery_state_age_seconds{scenario_id,reason_code}`.
@@ -2016,5 +2223,69 @@ mod tests {
                 "missing required P082 metric declaration: {metric}"
             );
         }
+    }
+
+    #[test]
+    fn proposal_079_required_metric_names_are_declared_and_recordable() {
+        reset_for_tests();
+
+        for metric in [
+            "p079_output_repair_attempt_total",
+            "p079_repair_transport_outcome_total",
+            "p079_transcript_recovery_total",
+            "p079_provider_fallback_attempt_total",
+            "p079_repair_budget_exhausted_total",
+            "p079_fallback_budget_exhausted_total",
+            "p079_lease_reclamation_total",
+            "p079_invalid_repair_rejected_total",
+            "p079_provider_mode_mismatch_total",
+            "p079_plan_evidence_only_total",
+            "p079_plan_evidence_redaction_total",
+            "p079_recovery_bound_exceeded_total",
+            "p079_release_lane_exclusion_total",
+            "p079_principal_revoked_total",
+            "p079_unsafe_continuation_total",
+            "p079_fallback_lease_total",
+            "p079_fallback_packet_assembly_total",
+            "p079_repair_inflight_total",
+            "p079_eligible_output_failures_recovered_percent",
+            "auto_retry_output_contract_classification_total",
+            "recovery_sweep_total",
+        ] {
+            assert!(
+                P079_REQUIRED_METRICS.contains(&metric),
+                "missing required P079 metric declaration: {metric}"
+            );
+        }
+
+        record_p079_output_repair_attempt("claude", "missing_required_outputs");
+        record_p079_repair_terminal(
+            "recovered",
+            Some("valid_outputs_from_transcript_recovery"),
+            "continue",
+        );
+        record_p079_repair_terminal(
+            "blocked",
+            Some("blocked_invalid_required_outputs"),
+            "manual_investigation",
+        );
+        record_p079_repair_lease("repair", "budget_exhausted");
+        record_p079_repair_lease("fallback", "budget_exhausted");
+        record_p079_transcript_recovery("oversized_payload");
+
+        assert!(get_counter("p079_output_repair_attempt_total") > 0);
+        assert!(get_counter("p079_repair_transport_outcome_total") > 0);
+        assert!(get_counter("p079_transcript_recovery_total") > 0);
+        assert!(get_counter("p079_invalid_repair_rejected_total") > 0);
+        assert!(get_counter("p079_repair_budget_exhausted_total") > 0);
+        assert!(get_counter("p079_fallback_budget_exhausted_total") > 0);
+        assert!(get_counter("p079_recovery_bound_exceeded_total") > 0);
+        assert!(get_counter_prefix_sum("p079_output_repair_attempt_total") > 0);
+        assert!(get_counter_prefix_sum("p079_repair_transport_outcome_total") > 0);
+        assert!(get_counter_prefix_sum("p079_transcript_recovery_total") > 0);
+        assert_eq!(
+            get_gauge("p079_eligible_output_failures_recovered_percent"),
+            Some(0)
+        );
     }
 }

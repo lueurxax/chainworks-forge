@@ -728,6 +728,85 @@ async fn supersede_abandoned_preclaim_for_retry_tx(
     Ok(())
 }
 
+pub async fn p080_requeue_running_invoke_agent_by_id_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item_id: &str,
+    run_id: &str,
+    stage_id: &str,
+    scheduled_at: DateTime<Utc>,
+    reason: &str,
+) -> Result<bool> {
+    let Some(row) = sqlx::query(
+        r#"SELECT payload_json
+           FROM work_items
+           WHERE id = ?1
+             AND run_id = ?2
+             AND stage_id = ?3
+             AND kind = ?4
+             AND status = ?5"#,
+    )
+    .bind(work_item_id)
+    .bind(run_id)
+    .bind(stage_id)
+    .bind(WorkItemKind::InvokeAgent.to_string())
+    .bind(WorkItemStatus::Running.to_string())
+    .fetch_optional(&mut **tx)
+    .await
+    .context("p080 load running InvokeAgent work item for repair")?
+    else {
+        return Ok(false);
+    };
+
+    let payload_json: String = row.get("payload_json");
+    let mut payload = serde_json::from_str::<serde_json::Value>(&payload_json)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    supersede_abandoned_preclaim_for_retry_tx(tx, work_item_id, &payload, scheduled_at).await?;
+
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("p058_claimed");
+        object.insert(
+            "p080_reconciliation".to_string(),
+            serde_json::json!({
+                "requeued_at": scheduled_at.to_rfc3339(),
+                "reason": reason,
+                "source_work_item_id": work_item_id,
+                "stale_class": "acp_startup_stale"
+            }),
+        );
+    }
+
+    let updated = sqlx::query(
+        r#"UPDATE work_items
+           SET status = ?1,
+               payload_json = ?2,
+               scheduled_at = ?3,
+               started_at = NULL,
+               completed_at = NULL,
+               failed_at = NULL,
+               last_error = ?4
+           WHERE id = ?5
+             AND run_id = ?6
+             AND stage_id = ?7
+             AND kind = ?8
+             AND status = ?9"#,
+    )
+    .bind(WorkItemStatus::Pending.to_string())
+    .bind(serde_json::to_string(&payload)?)
+    .bind(scheduled_at.to_rfc3339())
+    .bind(reason)
+    .bind(work_item_id)
+    .bind(run_id)
+    .bind(stage_id)
+    .bind(WorkItemKind::InvokeAgent.to_string())
+    .bind(WorkItemStatus::Running.to_string())
+    .execute(&mut **tx)
+    .await
+    .context("p080 requeue running InvokeAgent work item")?
+    .rows_affected();
+
+    Ok(updated == 1)
+}
+
 pub async fn requeue_running_advance_by_run(
     pool: &SqlitePool,
     run_id: RunId,

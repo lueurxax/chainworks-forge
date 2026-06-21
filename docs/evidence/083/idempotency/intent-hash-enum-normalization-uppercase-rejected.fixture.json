@@ -1,0 +1,15 @@
+{
+  "assertions": [
+    "intent-hash-enum-normalization-uppercase-rejected is part of the current-revision P083 evidence corpus.",
+    "The canonical proposal-083 gate must keep this path present before running executable checks."
+  ],
+  "contract": "command_idempotency_contract_v1",
+  "description": "P083 R70 declared evidence fixture for intent-hash-enum-normalization-uppercase-rejected.",
+  "evidence_path": "docs/evidence/083/idempotency/intent-hash-enum-normalization-uppercase-rejected.fixture.json",
+  "expected_outcome": "pass",
+  "fixture_id": "intent-hash-enum-normalization-uppercase-rejected",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
+  "schema_version": "p083_evidence_fixture_v1",
+  "verification_type": "contract_fixture"
+}

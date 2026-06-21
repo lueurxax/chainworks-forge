@@ -1,40 +1,16 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "attach_receipt_reviewer_redacted",
+  "fixture_purpose": "Reviewer-class callers may inspect continuation state but not raw provider-session identity.",
+  "status": "pass",
+  "evidence_kind": "contract_fixture",
+  "evidence": {
+    "surface": "reports.get / continuation status",
+    "guard": "reviewer readback uses partial receipt projection and keeps provider-native session ids redacted",
+    "expected_redactions": ["requested_provider_session_id", "actual_provider_session_id", "adapter_runtime_home_realpath"],
+    "readback_lane": "redacted_report"
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "proposal-086-resurrection"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:attach_receipt_fetch_reviewer_redacted",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "reviewer_receipt_redacted"
 }

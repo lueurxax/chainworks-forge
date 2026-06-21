@@ -1,40 +1,16 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "active_idempotency_cross_run_no_existence_oracle",
+  "fixture_purpose": "A caller must not learn whether another run owns a matching active idempotency key.",
+  "status": "pass",
+  "evidence_kind": "contract_fixture",
+  "evidence": {
+    "surface": "agents.continue_work",
+    "guard": "cross-run lookups use the caller-visible run scope and return the same opaque denial class for missing and unauthorized targets",
+    "expected_rejection": "not_found_or_unauthorized",
+    "readback_lane": "mcp_error"
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "proposal-086-resurrection"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:active_idempotency_cross_run_no_existence_oracle",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "existence_oracle_prevented"
 }

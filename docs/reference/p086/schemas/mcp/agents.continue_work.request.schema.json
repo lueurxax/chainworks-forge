@@ -42,12 +42,12 @@
     },
     "continuation_mode": {
       "type": "string",
-      "enum": ["live_handle_continuation", "provider_session_resurrection"],
+      "enum": ["live_handle_continuation", "provider_session_resurrection", "output_only_recovery"],
       "description": "Canonical P086 continuation mode."
     },
     "mode": {
       "type": "string",
-      "enum": ["live_handle_continuation", "provider_session_resurrection"],
+      "enum": ["live_handle_continuation", "provider_session_resurrection", "output_only_recovery"],
       "description": "Deprecated compatibility alias for continuation_mode."
     },
     "trigger_kind": {

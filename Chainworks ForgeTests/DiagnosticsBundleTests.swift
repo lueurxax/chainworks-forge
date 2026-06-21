@@ -11,11 +11,12 @@
 //      `URLSession` suspended via a strict ephemeral config (no proxies,
 //      no background URL session, no tasks).
 
-import XCTest
+import Foundation
+import Testing
 @testable import Chainworks_Forge
 
 @MainActor
-final class DiagnosticsBundleTests: XCTestCase {
+struct DiagnosticsBundleTests {
 
     // MARK: - Fixtures
 
@@ -72,7 +73,7 @@ final class DiagnosticsBundleTests: XCTestCase {
 
     // MARK: - Tests
 
-    func test_diagnostics_bundle_includes_every_present_component() throws {
+    @Test func `Diagnostics bundle includes every present component`() throws {
         let stage = try stageTmp()
         defer { stage.cleanup() }
         try Data("dead-beef".utf8)
@@ -96,16 +97,16 @@ final class DiagnosticsBundleTests: XCTestCase {
             ),
             to: out
         )
-        XCTAssertTrue(result.hasStatusSnapshot)
-        XCTAssertTrue(result.hasBuildSha)
-        XCTAssertTrue(result.hasDaemonLog)
-        XCTAssertTrue(result.hasPortFile)
-        XCTAssertTrue(result.hasCrashBudget)
-        XCTAssertGreaterThan(result.sizeBytes, 0)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: out.path))
+        #expect(result.hasStatusSnapshot)
+        #expect(result.hasBuildSha)
+        #expect(result.hasDaemonLog)
+        #expect(result.hasPortFile)
+        #expect(result.hasCrashBudget)
+        #expect(result.sizeBytes > 0)
+        #expect(FileManager.default.fileExists(atPath: out.path))
     }
 
-    func test_diagnostics_bundle_works_when_daemon_is_failed() throws {
+    @Test func `Diagnostics bundle works when daemon is failed`() throws {
         // Only the status snapshot exists; no files on disk because the
         // daemon never came up. Bundle must still produce a usable zip.
         // system_info.txt is always produced (the producer closure is
@@ -124,19 +125,18 @@ final class DiagnosticsBundleTests: XCTestCase {
             ),
             to: out
         )
-        XCTAssertTrue(result.hasStatusSnapshot)
-        XCTAssertFalse(result.hasBuildSha)
-        XCTAssertFalse(result.hasDaemonLog)
-        XCTAssertTrue(result.hasSystemInfo)
-        XCTAssertEqual(
-            result.buildShaReported,
-            "unknown",
+        #expect(result.hasStatusSnapshot)
+        #expect(!result.hasBuildSha)
+        #expect(!result.hasDaemonLog)
+        #expect(result.hasSystemInfo)
+        #expect(
+            result.buildShaReported == "unknown",
             "missing build-sha.txt must produce the 'unknown' fallback (§9.4)"
         )
-        XCTAssertTrue(FileManager.default.fileExists(atPath: out.path))
+        #expect(FileManager.default.fileExists(atPath: out.path))
     }
 
-    func test_diagnostics_bundle_redacts_principals_tokens_in_place() throws {
+    @Test func `Diagnostics bundle redacts principals tokens in place`() throws {
         let stage = try stageTmp()
         defer { stage.cleanup() }
         // Write a principals file with two tokens.
@@ -163,7 +163,7 @@ final class DiagnosticsBundleTests: XCTestCase {
             ),
             to: out
         )
-        XCTAssertTrue(result.hasPrincipalsRedacted)
+        #expect(result.hasPrincipalsRedacted)
 
         // Unzip the result to a scratch dir and inspect the redacted
         // principals file directly.
@@ -172,21 +172,21 @@ final class DiagnosticsBundleTests: XCTestCase {
         let redactedURL = unzipped.appendingPathComponent("principals.redacted.json")
         let redactedData = try Data(contentsOf: redactedURL)
         let redactedStr = String(data: redactedData, encoding: .utf8) ?? ""
-        XCTAssertFalse(
-            redactedStr.contains("sk-OPERATOR-SECRET"),
+        #expect(
+            !redactedStr.contains("sk-OPERATOR-SECRET"),
             "operator token must not leak: \(redactedStr)"
         )
-        XCTAssertFalse(
-            redactedStr.contains("sk-AGENT-SECRET"),
+        #expect(
+            !redactedStr.contains("sk-AGENT-SECRET"),
             "agent token must not leak: \(redactedStr)"
         )
-        XCTAssertTrue(
+        #expect(
             redactedStr.contains("[REDACTED]"),
             "placeholder must be present: \(redactedStr)"
         )
     }
 
-    func test_diagnostics_bundle_reports_build_sha_from_file_when_present() throws {
+    @Test func `Diagnostics bundle reports build sha from file when present`() throws {
         let stage = try stageTmp()
         defer { stage.cleanup() }
         try Data("cafebabe1234\n".utf8)
@@ -203,11 +203,11 @@ final class DiagnosticsBundleTests: XCTestCase {
             ),
             to: out
         )
-        XCTAssertTrue(result.hasBuildSha)
-        XCTAssertEqual(result.buildShaReported, "cafebabe1234")
+        #expect(result.hasBuildSha)
+        #expect(result.buildShaReported == "cafebabe1234")
     }
 
-    func test_diagnostics_bundle_compresses_daemon_log_to_gz() throws {
+    @Test func `Diagnostics bundle compresses daemon log to gz`() throws {
         let stage = try stageTmp()
         defer { stage.cleanup() }
         // 16 KB of lorem ipsum compresses well and proves gzip ran.
@@ -229,16 +229,16 @@ final class DiagnosticsBundleTests: XCTestCase {
         let unzipped = try unzipToScratch(bundle: out)
         defer { try? FileManager.default.removeItem(at: unzipped) }
         let gz = unzipped.appendingPathComponent("daemon.log.gz")
-        XCTAssertTrue(
+        #expect(
             FileManager.default.fileExists(atPath: gz.path),
             "daemon log must be shipped as daemon.log.gz per §9.4"
         )
         // Verify gzip signature (1f 8b).
         let data = try Data(contentsOf: gz)
-        XCTAssertEqual(data.prefix(2), Data([0x1f, 0x8b]))
+        #expect(data.prefix(2) == Data([0x1f, 0x8b]))
     }
 
-    func test_diagnostics_bundle_includes_system_info_txt() throws {
+    @Test func `Diagnostics bundle includes system info txt`() throws {
         let stage = try stageTmp()
         defer { stage.cleanup() }
         let out = FileManager.default.temporaryDirectory
@@ -253,16 +253,16 @@ final class DiagnosticsBundleTests: XCTestCase {
             ),
             to: out
         )
-        XCTAssertTrue(result.hasSystemInfo)
+        #expect(result.hasSystemInfo)
         let unzipped = try unzipToScratch(bundle: out)
         defer { try? FileManager.default.removeItem(at: unzipped) }
         let info = try String(
             contentsOf: unzipped.appendingPathComponent("system_info.txt")
         )
-        XCTAssertTrue(info.contains("macOS 15.5"))
+        #expect(info.contains("macOS 15.5"))
     }
 
-    func test_diagnostics_bundle_includes_p075_storage_snapshots_when_supplied() throws {
+    @Test func `Diagnostics bundle includes p075 storage snapshots when supplied`() throws {
         let stage = try stageTmp()
         defer { stage.cleanup() }
         let out = FileManager.default.temporaryDirectory
@@ -278,14 +278,14 @@ final class DiagnosticsBundleTests: XCTestCase {
             ),
             to: out
         )
-        XCTAssertTrue(result.hasStorageHealth)
-        XCTAssertTrue(result.hasEvidenceSpoolSummary)
+        #expect(result.hasStorageHealth)
+        #expect(result.hasEvidenceSpoolSummary)
         let unzipped = try unzipToScratch(bundle: out)
         defer { try? FileManager.default.removeItem(at: unzipped) }
-        XCTAssertTrue(FileManager.default.fileExists(
+        #expect(FileManager.default.fileExists(
             atPath: unzipped.appendingPathComponent("storage_health.json").path
         ))
-        XCTAssertTrue(FileManager.default.fileExists(
+        #expect(FileManager.default.fileExists(
             atPath: unzipped.appendingPathComponent("evidence_spool_summary.json").path
         ))
     }
@@ -301,11 +301,11 @@ final class DiagnosticsBundleTests: XCTestCase {
         proc.standardError = Pipe()
         try proc.run()
         proc.waitUntilExit()
-        XCTAssertEqual(proc.terminationStatus, 0, "unzip must succeed for inspection")
+        #expect(proc.terminationStatus == 0, "unzip must succeed for inspection")
         return scratch
     }
 
-    func test_diagnostics_bundle_minimum_contains_only_system_info_and_manifest() throws {
+    @Test func `Diagnostics bundle minimum contains only system info and manifest`() throws {
         // No status, no files, but the system_info.txt producer always
         // succeeds so we get a minimum viable bundle. P042 §9.4 is
         // explicit: diagnostics export must work even when everything
@@ -326,14 +326,14 @@ final class DiagnosticsBundleTests: XCTestCase {
             ),
             to: out
         )
-        XCTAssertTrue(result.hasSystemInfo)
-        XCTAssertFalse(result.hasStatusSnapshot)
-        XCTAssertFalse(result.hasBuildSha)
-        XCTAssertFalse(result.hasDaemonLog)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: out.path))
+        #expect(result.hasSystemInfo)
+        #expect(!result.hasStatusSnapshot)
+        #expect(!result.hasBuildSha)
+        #expect(!result.hasDaemonLog)
+        #expect(FileManager.default.fileExists(atPath: out.path))
     }
 
-    func test_diagnostics_bundle_fails_when_every_producer_is_empty() throws {
+    @Test func `Diagnostics bundle fails when every producer is empty`() throws {
         // Pathological stub — system_info producer returns empty and
         // every other input is absent. This is the only path that
         // still raises `.noComponentsFound`, preserved so misconfigured
@@ -343,7 +343,7 @@ final class DiagnosticsBundleTests: XCTestCase {
         let out = FileManager.default.temporaryDirectory
             .appendingPathComponent("\(UUID().uuidString).zip")
         defer { try? FileManager.default.removeItem(at: out) }
-        XCTAssertThrowsError(
+        let error = #expect(throws: (any Error).self) {
             try DiagnosticsBundleBuilder.export(
                 inputs: makeInputs(
                     appSupport: stage.appSupport,
@@ -353,14 +353,13 @@ final class DiagnosticsBundleTests: XCTestCase {
                 ),
                 to: out
             )
-        ) { err in
-            guard case DiagnosticsBundleError.noComponentsFound = err else {
-                return XCTFail("expected .noComponentsFound, got \(err)")
-            }
+        }
+        if case DiagnosticsBundleError.noComponentsFound? = error {} else {
+            Issue.record("expected .noComponentsFound, got \(String(describing: error))")
         }
     }
 
-    func test_diagnostics_bundle_does_not_invoke_network() throws {
+    @Test func `Diagnostics bundle does not invoke network`() throws {
         // Pin the zero-network contract: the export path must not touch
         // URLSession. We approximate this by running with a
         // delegate-mandated URLSession that records any request. If the
@@ -391,9 +390,8 @@ final class DiagnosticsBundleTests: XCTestCase {
             ),
             to: out
         )
-        XCTAssertEqual(
-            recorder.requests.count,
-            0,
+        #expect(
+            recorder.requests.count == 0,
             "diagnostics export must not invoke URLSession"
         )
     }

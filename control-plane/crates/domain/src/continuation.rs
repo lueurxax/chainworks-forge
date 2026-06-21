@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum ContinuationMode {
     LiveHandleContinuation,
     ProviderSessionResurrection,
+    OutputOnlyRecovery,
 }
 
 impl std::fmt::Display for ContinuationMode {
@@ -15,6 +16,7 @@ impl std::fmt::Display for ContinuationMode {
             ContinuationMode::ProviderSessionResurrection => {
                 write!(f, "provider_session_resurrection")
             }
+            ContinuationMode::OutputOnlyRecovery => write!(f, "output_only_recovery"),
         }
     }
 }
@@ -25,6 +27,7 @@ impl std::str::FromStr for ContinuationMode {
         match s {
             "live_handle_continuation" => Ok(ContinuationMode::LiveHandleContinuation),
             "provider_session_resurrection" => Ok(ContinuationMode::ProviderSessionResurrection),
+            "output_only_recovery" => Ok(ContinuationMode::OutputOnlyRecovery),
             other => Err(format!("unknown ContinuationMode: {other}")),
         }
     }
@@ -149,11 +152,13 @@ pub struct ContinuationRecord {
     pub run_id: String,
     pub stage_execution_id: String,
     pub agent_execution_id: String,
+    pub command_journal_id: String,
     pub mode: String,
     pub trigger_kind: String,
     pub status: String,
     pub failure_reason: Option<String>,
     pub reconciliation_status: Option<String>,
+    pub resurrection_phase: Option<String>,
     pub idempotency_scope: String,
     pub idempotency_key: String,
     pub request_fingerprint_sha256: String,
@@ -229,7 +234,11 @@ mod tests {
 
     #[test]
     fn continuation_mode_roundtrip() {
-        for s in &["live_handle_continuation", "provider_session_resurrection"] {
+        for s in &[
+            "live_handle_continuation",
+            "provider_session_resurrection",
+            "output_only_recovery",
+        ] {
             let m: ContinuationMode = s.parse().expect("parse");
             assert_eq!(m.to_string(), *s);
         }

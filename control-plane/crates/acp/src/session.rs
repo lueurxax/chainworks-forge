@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,7 @@ use crate::transport::{AcpSessionConfig, AcpTransportSession};
 use crate::{
     AcpCloseDiagnostic, AcpCompletionCaptureSource, AcpExecutionError, AcpPromptProgressSink,
     AcpRuntimeReceipt, AcpRuntimeReceiptEvent, ExecutionRequest, ExecutionResult,
-    NoopAcpPromptProgressSink, ProviderSessionStoreCapture,
+    NoopAcpPromptProgressSink, ProviderSessionStoreCapture, ProviderSessionStoreRecoveryMetadata,
 };
 use domain::ids::AgentExecutionId;
 
@@ -253,6 +254,7 @@ impl AcpSession {
             xcode_shim_warning_events,
             close_diagnostic: None,
             provider_session_store_capture: None,
+            provider_session_store_recovery: None,
             acp_pre_initialize_local_latency_ms: Some(acp_pre_initialize_local_latency_ms),
             acp_initialize_latency_ms: Some(acp_initialize_latency_ms),
             acp_session_new_latency_ms: Some(acp_session_new_latency_ms),
@@ -407,6 +409,7 @@ impl AcpSession {
             xcode_shim_warning_events: Vec::new(),
             close_diagnostic: None,
             provider_session_store_capture: None,
+            provider_session_store_recovery: recovery.metadata,
             acp_pre_initialize_local_latency_ms: Some(
                 self.transport.acp_pre_initialize_local_latency_ms(),
             ),
@@ -436,10 +439,12 @@ impl AcpSession {
             .filter(|value| !value.trim().is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| self.transport.session_id().to_string());
+        let recovery_target = claude_session_store_recovery_target_from_request(req);
         let recovery = recover_claude_task_complete_from_projects_root(
             &claude_projects_root(),
             &provider_session_id,
             &req.expected_outputs,
+            recovery_target.as_ref(),
         )?;
         let mcp_observation = self.transport.mcp_observation();
         let actual_mcp_extensions = mcp_observation
@@ -475,6 +480,7 @@ impl AcpSession {
             xcode_shim_warning_events: Vec::new(),
             close_diagnostic: None,
             provider_session_store_capture: None,
+            provider_session_store_recovery: recovery.metadata,
             acp_pre_initialize_local_latency_ms: Some(
                 self.transport.acp_pre_initialize_local_latency_ms(),
             ),
@@ -734,6 +740,21 @@ struct ProviderSessionStoreTaskCompleteRecovery {
     text: String,
     discovered_artifacts: Vec<crate::DiscoveredArtifact>,
     completion_text_capture: crate::AcpCompletionTextCaptureMetadata,
+    metadata: Option<ProviderSessionStoreRecoveryMetadata>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ClaudeSessionStoreRecoveryTarget {
+    prompt_turn_marker_id: Option<String>,
+    request_fingerprint_sha256: Option<String>,
+    stage_execution_id: Option<String>,
+    agent_execution_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ProviderSessionStoreRecoveredText {
+    text: String,
+    path: PathBuf,
 }
 
 fn recover_codex_task_complete_from_cleanup_paths(
@@ -764,6 +785,7 @@ fn recover_codex_task_complete_from_runtime_home(
         text,
         discovered_artifacts,
         completion_text_capture,
+        metadata: None,
     })
 }
 
@@ -772,10 +794,12 @@ fn recover_claude_task_complete_from_projects_root(
     projects_root: &Path,
     provider_session_id: &str,
     expected_outputs: &[domain::discovery::ExpectedOutputSpec],
+    target: Option<&ClaudeSessionStoreRecoveryTarget>,
 ) -> Option<ProviderSessionStoreTaskCompleteRecovery> {
-    let text = latest_claude_task_complete_text(projects_root, provider_session_id)?;
+    let recovered = latest_claude_task_complete_text(projects_root, provider_session_id, target)?;
+    let text = recovered.text;
     let discovered_artifacts = crate::transport::extract_output_envelopes(&text, expected_outputs);
-    if discovered_artifacts.is_empty() {
+    if discovered_artifacts.is_empty() && target.is_none() {
         return None;
     }
     let completion_text_capture = crate::transport::recovered_completion_text_capture_metadata(
@@ -783,6 +807,15 @@ fn recover_claude_task_complete_from_projects_root(
         AcpCompletionCaptureSource::ProviderSessionStoreFinalResponse,
     );
     Some(ProviderSessionStoreTaskCompleteRecovery {
+        metadata: Some(ProviderSessionStoreRecoveryMetadata {
+            result: "recovered_task_complete".to_string(),
+            transcript_path: Some(recovered.path.to_string_lossy().into_owned()),
+            transcript_digest: Some(format!("{:x}", Sha256::digest(text.as_bytes()))),
+            ownership_source: Some("provider_session_id".to_string()),
+            latest_turn_id: None,
+            latest_tool_activity_at: None,
+            read_at: Some(Utc::now().to_rfc3339()),
+        }),
         text,
         discovered_artifacts,
         completion_text_capture,
@@ -807,7 +840,8 @@ fn latest_codex_task_complete_text(runtime_home: &Path) -> Option<String> {
 fn latest_claude_task_complete_text(
     projects_root: &Path,
     provider_session_id: &str,
-) -> Option<String> {
+    target: Option<&ClaudeSessionStoreRecoveryTarget>,
+) -> Option<ProviderSessionStoreRecoveredText> {
     let provider_session_id = provider_session_id.trim();
     if provider_session_id.is_empty() || !projects_root.exists() {
         return None;
@@ -818,9 +852,69 @@ fn latest_claude_task_complete_text(
         if file.file_name().and_then(|name| name.to_str()) != Some(expected_file_name.as_str()) {
             continue;
         }
-        latest = latest_claude_task_complete_text_in_file(&file).or(latest);
+        latest = latest_claude_task_complete_text_in_file(&file, target)
+            .map(|text| ProviderSessionStoreRecoveredText {
+                text,
+                path: file.clone(),
+            })
+            .or(latest);
     }
     latest
+}
+
+fn claude_session_store_recovery_target_from_request(
+    req: &ExecutionRequest,
+) -> Option<ClaudeSessionStoreRecoveryTarget> {
+    if !req.prompt.contains("# P086 Continuation Mode Reset") {
+        return None;
+    }
+    let target = ClaudeSessionStoreRecoveryTarget {
+        prompt_turn_marker_id: prompt_line_value(&req.prompt, "- Prompt turn marker id: "),
+        request_fingerprint_sha256: prompt_line_value(
+            &req.prompt,
+            "- Request fingerprint sha256: ",
+        ),
+        stage_execution_id: prompt_line_value(&req.prompt, "- Stage execution id: "),
+        agent_execution_id: prompt_line_value(&req.prompt, "- Agent execution id: "),
+    };
+    if target.prompt_turn_marker_id.is_none()
+        && target.request_fingerprint_sha256.is_none()
+        && target.stage_execution_id.is_none()
+        && target.agent_execution_id.is_none()
+    {
+        None
+    } else {
+        Some(target)
+    }
+}
+
+fn prompt_line_value(prompt: &str, prefix: &str) -> Option<String> {
+    prompt.lines().find_map(|line| {
+        let value = line.trim().strip_prefix(prefix)?.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    })
+}
+
+fn claude_session_store_text_matches_target(
+    text: &str,
+    target: Option<&ClaudeSessionStoreRecoveryTarget>,
+) -> bool {
+    let Some(target) = target else {
+        return true;
+    };
+    [
+        target.prompt_turn_marker_id.as_deref(),
+        target.request_fingerprint_sha256.as_deref(),
+        target.stage_execution_id.as_deref(),
+        target.agent_execution_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .all(|needle| text.contains(needle))
 }
 
 fn jsonl_files_under(root: &Path) -> Vec<PathBuf> {
@@ -881,7 +975,10 @@ fn latest_codex_task_complete_text_in_file(path: &Path) -> Option<String> {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn latest_claude_task_complete_text_in_file(path: &Path) -> Option<String> {
+fn latest_claude_task_complete_text_in_file(
+    path: &Path,
+    target: Option<&ClaudeSessionStoreRecoveryTarget>,
+) -> Option<String> {
     let file = fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(file);
     let mut latest = None;
@@ -898,6 +995,9 @@ fn latest_claude_task_complete_text_in_file(path: &Path) -> Option<String> {
             continue;
         };
         if let Some(text) = claude_session_line_assistant_terminal_text(&value) {
+            if !claude_session_store_text_matches_target(&text, target) {
+                continue;
+            }
             latest = Some(text);
         }
     }
@@ -1506,6 +1606,7 @@ mod tests {
             &projects_root,
             "provider-session-1",
             &expected_outputs,
+            None,
         )
         .expect("Claude recovery expected");
 
@@ -1524,6 +1625,91 @@ mod tests {
             recovery.completion_text_capture.capture_source,
             Some(AcpCompletionCaptureSource::ProviderSessionStoreFinalResponse)
         );
+    }
+
+    #[test]
+    fn claude_session_store_recovery_requires_matching_p086_target() {
+        let temp = tempdir().unwrap();
+        let projects_root = temp.path().join("claude-projects");
+        let expected_outputs = vec![expected_output("implementation_report")];
+        let target = ClaudeSessionStoreRecoveryTarget {
+            prompt_turn_marker_id: Some(
+                "p086-prompt-turn:cont-expected:provider_session_attach".to_string(),
+            ),
+            request_fingerprint_sha256: Some("f".repeat(64)),
+            stage_execution_id: Some("stage-exec-expected".to_string()),
+            agent_execution_id: Some("agent-exec-expected".to_string()),
+        };
+        let wrong_target_line = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg-wrong-target",
+                "stop_reason": "end_turn",
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "{}\n{}\n{}\n{}\n{}",
+                        "p086-prompt-turn:cont-other:provider_session_attach",
+                        "0".repeat(64),
+                        "stage-exec-other",
+                        "agent-exec-other",
+                        r#"{"CHAINWORKS_OUTPUT":{"implementation_report":{"status":"wrong-target"}}}"#
+                    )
+                }]
+            }
+        });
+        let matching_line = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg-matching-target",
+                "stop_reason": "end_turn",
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "{}\n{}\n{}\n{}\n{}",
+                        target.prompt_turn_marker_id.as_deref().unwrap(),
+                        target.request_fingerprint_sha256.as_deref().unwrap(),
+                        target.stage_execution_id.as_deref().unwrap(),
+                        target.agent_execution_id.as_deref().unwrap(),
+                        r#"{"CHAINWORKS_OUTPUT":{"implementation_report":{"status":"ready"}}}"#
+                    )
+                }]
+            }
+        });
+        write_file(
+            &projects_root
+                .join("-workspace")
+                .join("provider-session-1.jsonl"),
+            &format!("{wrong_target_line}\n{matching_line}\n"),
+        );
+
+        let recovery = recover_claude_task_complete_from_projects_root(
+            &projects_root,
+            "provider-session-1",
+            &expected_outputs,
+            Some(&target),
+        )
+        .expect("Claude target-bound recovery expected");
+
+        assert!(
+            std::str::from_utf8(&recovery.discovered_artifacts[0].content)
+                .unwrap()
+                .contains("\"ready\"")
+        );
+        assert!(!recovery.text.contains("wrong-target"));
+
+        let mismatched_target = ClaudeSessionStoreRecoveryTarget {
+            request_fingerprint_sha256: Some("1".repeat(64)),
+            ..target
+        };
+        let recovery = recover_claude_task_complete_from_projects_root(
+            &projects_root,
+            "provider-session-1",
+            &expected_outputs,
+            Some(&mismatched_target),
+        );
+
+        assert!(recovery.is_none());
     }
 
     #[test]
@@ -1552,6 +1738,7 @@ mod tests {
             &projects_root,
             "provider-session-1",
             &expected_outputs,
+            None,
         );
 
         assert!(recovery.is_none());
@@ -1583,6 +1770,7 @@ mod tests {
             &projects_root,
             "provider-session-1",
             &expected_outputs,
+            None,
         );
 
         assert!(recovery.is_none());

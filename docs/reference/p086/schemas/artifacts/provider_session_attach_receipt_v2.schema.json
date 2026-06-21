@@ -9,7 +9,13 @@
     "schema_version",
     "continuation_id",
     "agent_execution_id",
+    "target_agent_execution_id",
+    "target_stage_execution_id",
     "run_id",
+    "request_fingerprint_sha256",
+    "prompt_turn_marker_id",
+    "provider_request_id",
+    "provider_turn_id",
     "requested_provider_session_id",
     "actual_provider_session_id",
     "identity_proof_source",
@@ -34,6 +40,13 @@
     "source_edit_allowance",
     "changed_source_files_count",
     "failure_class",
+    "session_store_transcript_path",
+    "session_store_transcript_digest",
+    "session_store_recovery_result",
+    "session_store_read_at",
+    "session_store_ownership_source",
+    "session_store_latest_turn_id",
+    "session_store_latest_tool_activity_at",
     "resurrection_deadline_at",
     "resurrection_last_heartbeat_at",
     "resurrection_timeout_class",
@@ -43,7 +56,16 @@
     "schema_version": { "const": 2 },
     "continuation_id": { "type": "string" },
     "agent_execution_id": { "type": "string" },
+    "target_agent_execution_id": { "type": "string" },
+    "target_stage_execution_id": { "type": "string" },
     "run_id": { "type": "string" },
+    "request_fingerprint_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "prompt_turn_marker_id": { "type": "string" },
+    "provider_request_id": { "type": ["string", "null"] },
+    "provider_turn_id": { "type": ["string", "null"] },
     "requested_provider_session_id": { "type": ["string", "null"] },
     "actual_provider_session_id": { "type": ["string", "null"] },
     "identity_proof_source": {
@@ -53,7 +75,7 @@
     "identity_proof_observed_at": { "type": ["string", "null"], "format": "date-time" },
     "identity_proof_artifact_id": { "type": ["string", "null"] },
     "adapter_id": { "type": "string" },
-    "adapter_capability_version": { "type": "integer", "minimum": 1 },
+    "adapter_capability_version": { "type": "string", "minLength": 1 },
     "attach_request_id": { "type": "string" },
     "managed_child_pid": { "type": ["integer", "null"] },
     "managed_process_group_id": { "type": ["integer", "null"] },
@@ -107,6 +129,33 @@
         null
       ]
     },
+    "session_store_transcript_path": { "type": ["string", "null"] },
+    "session_store_transcript_digest": {
+      "type": ["string", "null"],
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "session_store_recovery_result": {
+      "type": "string",
+      "enum": [
+        "not_attempted",
+        "recovered_terminal_output",
+        "no_matching_transcript",
+        "ambiguous_transcript",
+        "read_failed"
+      ]
+    },
+    "session_store_read_at": { "type": ["string", "null"], "format": "date-time" },
+    "session_store_ownership_source": {
+      "type": ["string", "null"],
+      "enum": [
+        "provider_session_id",
+        "session_generation_id",
+        "transcript_metadata",
+        null
+      ]
+    },
+    "session_store_latest_turn_id": { "type": ["string", "null"] },
+    "session_store_latest_tool_activity_at": { "type": ["string", "null"], "format": "date-time" },
     "resurrection_deadline_at": { "type": ["string", "null"], "format": "date-time" },
     "resurrection_last_heartbeat_at": { "type": ["string", "null"], "format": "date-time" },
     "resurrection_timeout_class": {

@@ -29,6 +29,56 @@ chainworks_default_sccache_dir() {
     fi
 }
 
+chainworks_default_cargo_wrapper_dir() {
+    if [[ -n "${HOME:-}" ]]; then
+        printf '%s\n' "${HOME}/Library/Caches/Chainworks Forge/bin"
+    else
+        printf '%s\n' "${chainworks_cargo_cache_repo_root}/control-plane/target/bin"
+    fi
+}
+
+chainworks_path_has_dir() {
+    local needle="$1"
+    local part
+    IFS=':' read -r -a _chainworks_path_parts <<< "${PATH:-}"
+    for part in "${_chainworks_path_parts[@]:-}"; do
+        if [[ "$part" == "$needle" ]]; then
+            unset _chainworks_path_parts
+            return 0
+        fi
+    done
+    unset _chainworks_path_parts
+    return 1
+}
+
+chainworks_find_real_cargo() {
+    local explicit="${CHAINWORKS_REAL_CARGO:-}"
+    local wrapper_dir="${CHAINWORKS_CARGO_WRAPPER_DIR:-$(chainworks_default_cargo_wrapper_dir)}"
+    local wrapper_path="${wrapper_dir%/}/cargo"
+    if [[ -n "$explicit" && -x "$explicit" && "$explicit" != "$wrapper_path" ]]; then
+        printf '%s\n' "$explicit"
+        return 0
+    fi
+
+    local part candidate
+    IFS=':' read -r -a _chainworks_path_parts <<< "${PATH:-}"
+    for part in "${_chainworks_path_parts[@]:-}"; do
+        [[ -n "$part" ]] || continue
+        if [[ "$part" == "$wrapper_dir" ]]; then
+            continue
+        fi
+        candidate="${part%/}/cargo"
+        if [[ -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            unset _chainworks_path_parts
+            return 0
+        fi
+    done
+    unset _chainworks_path_parts
+
+    command -v cargo 2>/dev/null || true
+}
+
 chainworks_effective_sccache_dir() {
     local candidate="${SCCACHE_DIR:-$(chainworks_default_sccache_dir)}"
     if [[ -n "${SCCACHE_DIR:-}" ]]; then
@@ -131,6 +181,82 @@ chainworks_gate_cargo_target_dir() {
     printf '%s/%s\n' "$(chainworks_gate_cargo_target_root)" "${safe_suffix}"
 }
 
+chainworks_install_cargo_wrapper() {
+    if [[ "${CHAINWORKS_CARGO_WRAPPER:-1}" =~ ^(0|false|FALSE|off|OFF|no|NO)$ ]]; then
+        return 0
+    fi
+
+    local real_cargo
+    real_cargo="$(chainworks_find_real_cargo)"
+    if [[ -z "$real_cargo" || ! -x "$real_cargo" ]]; then
+        return 0
+    fi
+
+    export CHAINWORKS_REAL_CARGO="$real_cargo"
+    export CHAINWORKS_CARGO_WRAPPER_DIR="${CHAINWORKS_CARGO_WRAPPER_DIR:-$(chainworks_default_cargo_wrapper_dir)}"
+    mkdir -p "$CHAINWORKS_CARGO_WRAPPER_DIR" 2>/dev/null || return 0
+
+    local wrapper_path="${CHAINWORKS_CARGO_WRAPPER_DIR%/}/cargo"
+    cat > "$wrapper_path" <<'CHAINWORKS_CARGO_WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+
+real_cargo="${CHAINWORKS_REAL_CARGO:-}"
+if [[ -z "$real_cargo" || ! -x "$real_cargo" ]]; then
+  echo "chainworks cargo wrapper: CHAINWORKS_REAL_CARGO is not executable" >&2
+  exit 127
+fi
+
+if [[ ! "${CHAINWORKS_ALLOW_LOCAL_CARGO_TARGET_DIR:-0}" =~ ^(1|true|TRUE|yes|YES)$ ]]; then
+  requested="${CARGO_TARGET_DIR:-}"
+  suffix=""
+  case "$requested" in
+    target)
+      suffix="default"
+      ;;
+    target/*)
+      suffix="${requested#target/}"
+      ;;
+    control-plane/target)
+      suffix="default"
+      ;;
+    control-plane/target/*)
+      suffix="${requested#control-plane/target/}"
+      ;;
+    */control-plane/target)
+      suffix="default"
+      ;;
+    */control-plane/target/*)
+      suffix="${requested#*/control-plane/target/}"
+      ;;
+  esac
+
+  if [[ -n "$suffix" ]]; then
+    if [[ -z "$suffix" || "$suffix" == "." ]]; then
+      suffix="default"
+    fi
+    safe_suffix="$(printf '%s' "$suffix" | sed -E 's#[/[:space:]]+#-#g; s#[^A-Za-z0-9._-]#_#g; s#^[-.]+##; s#[-.]+$##')"
+    if [[ -z "$safe_suffix" ]]; then
+      safe_suffix="default"
+    fi
+    gate_root="${CHAINWORKS_GATE_CARGO_TARGET_ROOT:-${CHAINWORKS_SHARED_CARGO_TARGET_DIR:-}/gates}"
+    if [[ "$gate_root" == "/gates" || -z "$gate_root" ]]; then
+      gate_root="${HOME:-/tmp}/Library/Caches/Chainworks Forge/cargo-target/gates"
+    fi
+    export CARGO_TARGET_DIR="${gate_root}/${safe_suffix}"
+    mkdir -p "$CARGO_TARGET_DIR"
+  fi
+fi
+
+exec "$real_cargo" "$@"
+CHAINWORKS_CARGO_WRAPPER
+    chmod +x "$wrapper_path" 2>/dev/null || return 0
+
+    if ! chainworks_path_has_dir "$CHAINWORKS_CARGO_WRAPPER_DIR"; then
+        export PATH="${CHAINWORKS_CARGO_WRAPPER_DIR}:${PATH:-}"
+    fi
+}
+
 # Worktrees used to default to a local `control-plane/target`, which made
 # every active run allocate tens of GiB. The default is now shared. A local
 # target remains available as an explicit escape hatch for one-off diagnosis.
@@ -152,6 +278,8 @@ elif [[ -z "${CARGO_TARGET_DIR:-}" ]]; then
     export CARGO_TARGET_DIR="$(chainworks_default_cargo_target_dir)"
 fi
 
+export CHAINWORKS_SHARED_CARGO_TARGET_DIR="${CHAINWORKS_SHARED_CARGO_TARGET_DIR:-$(chainworks_default_cargo_target_dir)}"
+export CHAINWORKS_GATE_CARGO_TARGET_ROOT="${CHAINWORKS_GATE_CARGO_TARGET_ROOT:-${CHAINWORKS_SHARED_CARGO_TARGET_DIR}/gates}"
 mkdir -p "${CARGO_TARGET_DIR}"
 
 _chainworks_sccache_mode="${CHAINWORKS_CARGO_SCCACHE:-auto}"
@@ -170,3 +298,5 @@ case "${_chainworks_sccache_mode}" in
         ;;
 esac
 unset _chainworks_sccache_mode
+
+chainworks_install_cargo_wrapper

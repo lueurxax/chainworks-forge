@@ -16,10 +16,11 @@
 // they are intentionally out of scope here because a dev workstation
 // produces only ad-hoc signatures.
 
-import XCTest
+import Foundation
+import Testing
 @testable import Chainworks_Forge
 
-final class PackagedBinaryTests: XCTestCase {
+struct PackagedBinaryTests {
 
     /// Path the embed phase writes to inside `Bundle.main`.
     private static let binaryName = "chainworks-forge-daemon"
@@ -43,34 +44,32 @@ final class PackagedBinaryTests: XCTestCase {
         #endif
     }
 
-    func test_bundled_daemon_binary_is_present_and_executable() throws {
-        // Dev-workstation Debug runs of the XCTest target do NOT
-        // install the release daemon into `Contents/MacOS/` until the
-        // operator has wired up the Embed Control-Plane Daemon build
-        // phase. In that narrow case we still emit an `XCTSkip` so the
-        // focused lane can run green. In Release we promote the same
-        // absence to a hard `XCTFail`: the release bundle MUST ship
-        // the daemon (AC-9a / §7.2).
+    @Test func `Bundled daemon binary is present and executable`() throws {
+        // Dev-workstation Debug runs of the test target do NOT install
+        // the release daemon into `Contents/MacOS/` until the operator
+        // has wired up the Embed Control-Plane Daemon build phase. In
+        // that narrow case we cancel the test so the focused lane can run
+        // green. In Release we promote the same absence to a hard failure:
+        // the release bundle MUST ship the daemon (AC-9a / §7.2).
         guard let url = bundledDaemonURL() else {
             if Self.isReleaseLikeBuild {
-                XCTFail(
-                    "\(Self.binaryName) MUST be embedded in Release configurations (P042 AC-9a). "
-                    + "Check the Embed Control-Plane Daemon build phase output."
+                Issue.record(
+                    "\(Self.binaryName) MUST be embedded in Release configurations (P042 AC-9a). Check the Embed Control-Plane Daemon build phase output."
                 )
-                return
+            } else {
+                try Test.cancel(
+                    "\(Self.binaryName) not embedded in this Debug configuration; run the release build or wire the Embed Control-Plane Daemon build phase"
+                )
             }
-            throw XCTSkip(
-                "\(Self.binaryName) not embedded in this Debug configuration; "
-                + "run the release build or wire the Embed Control-Plane Daemon build phase"
-            )
+            return
         }
-        XCTAssertTrue(
+        #expect(
             FileManager.default.isExecutableFile(atPath: url.path),
             "bundled daemon must be marked executable: \(url.path)"
         )
         let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
         let size = (attrs[.size] as? Int64) ?? 0
-        XCTAssertGreaterThan(size, 0, "bundled daemon must be non-empty: \(url.path)")
+        #expect(size > 0, "bundled daemon must be non-empty: \(url.path)")
     }
 
     /// P042 §7.6: when the binary is embedded, it must carry *some*
@@ -78,15 +77,16 @@ final class PackagedBinaryTests: XCTestCase {
     /// release lane (`proposal-042-packaging`) enforces the authority
     /// comparison; this test just pins "signature present at all" so a
     /// stripped binary can't ship accidentally.
-    func test_bundled_daemon_binary_carries_some_signature() throws {
+    @Test func `Bundled daemon binary carries some signature`() throws {
         guard let url = bundledDaemonURL() else {
             if Self.isReleaseLikeBuild {
-                XCTFail(
+                Issue.record(
                     "\(Self.binaryName) MUST be embedded + signed in Release configurations (P042 AC-9a)"
                 )
-                return
+            } else {
+                try Test.cancel("\(Self.binaryName) not embedded in this Debug configuration")
             }
-            throw XCTSkip("\(Self.binaryName) not embedded in this Debug configuration")
+            return
         }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
@@ -96,16 +96,15 @@ final class PackagedBinaryTests: XCTestCase {
         proc.standardError = stderr
         try proc.run()
         proc.waitUntilExit()
-        XCTAssertEqual(
-            proc.terminationStatus,
-            0,
+        #expect(
+            proc.terminationStatus == 0,
             "codesign -dvv must succeed on the embedded daemon"
         )
         // `codesign` emits metadata on stderr; a signed binary contains
         // either `Authority=...` or at minimum `Signature=adhoc`.
         let data = (try? stderr.fileHandleForReading.readToEnd()) ?? Data()
         let output = String(data: data, encoding: .utf8) ?? ""
-        XCTAssertTrue(
+        #expect(
             output.contains("Signature=") || output.contains("Authority="),
             "codesign output must mention a signature: \(output)"
         )

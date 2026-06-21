@@ -1,7 +1,7 @@
 {
   "fixture_id": "queue-rank-null-except-queued-no-signal",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "execution_queue_contract_v1",
   "description": "queue_rank is NULL for all agent execution rows except those in 'queued' state with no active signal, enforcing the sparse rank invariant.",
   "preconditions": {

@@ -1,7 +1,7 @@
 {
   "fixture_id": "many-session-queue-rank-stored",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "execution_queue_contract_v1",
   "description": "When many agent sessions are queued concurrently, all queue_rank values are stored durably with no gaps or duplicates.",
   "preconditions": {

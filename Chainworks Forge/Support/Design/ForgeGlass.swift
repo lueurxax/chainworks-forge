@@ -82,9 +82,25 @@ private struct PlatformLiquidGlassEffect: ViewModifier {
 
     func body(content: Content) -> some View {
         if #available(macOS 26.0, *) {
-            content.glassEffect(.regular, in: RoundedRectangle(cornerRadius: role.cornerRadius, style: .continuous))
+            content.glassEffect(
+                Self.glass(for: role),
+                in: RoundedRectangle(cornerRadius: role.cornerRadius, style: .continuous)
+            )
         } else {
             content
+        }
+    }
+
+    /// Liquid Glass variant per role. Interactive chrome (`.toolbar`, `.prominentAction`)
+    /// adopts the fluid pointer/click response of the refreshed Liquid Glass; structural
+    /// surfaces (panels, sidebar) stay static so only tappable affordances react.
+    @available(macOS 26.0, *)
+    private static func glass(for role: ForgeGlassRole) -> Glass {
+        switch role {
+        case .toolbar, .prominentAction:
+            return .regular.interactive()
+        case .panel, .chrome, .sidebar:
+            return .regular
         }
     }
 }

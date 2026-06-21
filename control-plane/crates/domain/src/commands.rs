@@ -723,8 +723,22 @@ pub struct RunStewardAnalysisCmd {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum P083LifecycleDenialCode {
+    /// Required caller request id is absent.
+    MissingCallerRequestId,
     /// Request-id format does not match lowercase UUIDv4 pattern.
     MalformedRequestId,
+    /// Caller principal class is not permitted for this lifecycle command.
+    PrincipalClassNotAllowed,
+    /// Lifecycle state or target mode is invalid for the requested command.
+    LifecycleStateInvalid,
+    /// Request body failed the published schema contract.
+    SchemaInvalid,
+    /// Request body included properties outside the published schema contract.
+    AdditionalPropertiesRejected,
+    /// Rollback target field is absent.
+    RollbackTargetRequired,
+    /// Rollback target field is invalid.
+    RollbackTargetInvalid,
     /// Same request_id, different command or intent_hash.
     RequestIntentMismatch,
     /// Same request_id and intent_hash with a still-pending lease (retry_after_seconds applies).
@@ -764,7 +778,14 @@ impl P083LifecycleDenialCode {
     /// error extension `code` values. All values are lowercase_snake_case.
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::MissingCallerRequestId => "missing_caller_request_id",
             Self::MalformedRequestId => "malformed_request_id",
+            Self::PrincipalClassNotAllowed => "principal_class_not_allowed",
+            Self::LifecycleStateInvalid => "lifecycle_state_invalid",
+            Self::SchemaInvalid => "schema_invalid",
+            Self::AdditionalPropertiesRejected => "additional_properties_rejected",
+            Self::RollbackTargetRequired => "rollback_target_required",
+            Self::RollbackTargetInvalid => "rollback_target_invalid",
             Self::RequestIntentMismatch => "request_intent_mismatch",
             Self::IdempotencyInFlight => "idempotency_in_flight",
             Self::IdempotencyReplayed => "idempotency_replayed",
@@ -787,7 +808,14 @@ impl P083LifecycleDenialCode {
     /// All denial code strings for use in bounded metric label validation and
     /// GraphQL schema documentation. Mirrors `metric_labels_contract_v1`.
     pub const ALL: &'static [&'static str] = &[
+        "missing_caller_request_id",
         "malformed_request_id",
+        "principal_class_not_allowed",
+        "lifecycle_state_invalid",
+        "schema_invalid",
+        "additional_properties_rejected",
+        "rollback_target_required",
+        "rollback_target_invalid",
         "request_intent_mismatch",
         "idempotency_in_flight",
         "idempotency_replayed",
@@ -1048,7 +1076,14 @@ mod tests {
     #[test]
     fn p083_lifecycle_denial_code_all_round_trip_as_str() {
         let codes = [
+            P083LifecycleDenialCode::MissingCallerRequestId,
             P083LifecycleDenialCode::MalformedRequestId,
+            P083LifecycleDenialCode::PrincipalClassNotAllowed,
+            P083LifecycleDenialCode::LifecycleStateInvalid,
+            P083LifecycleDenialCode::SchemaInvalid,
+            P083LifecycleDenialCode::AdditionalPropertiesRejected,
+            P083LifecycleDenialCode::RollbackTargetRequired,
+            P083LifecycleDenialCode::RollbackTargetInvalid,
             P083LifecycleDenialCode::RequestIntentMismatch,
             P083LifecycleDenialCode::IdempotencyInFlight,
             P083LifecycleDenialCode::IdempotencyReplayed,

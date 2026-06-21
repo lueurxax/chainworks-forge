@@ -1,7 +1,7 @@
 {
   "fixture_id": "voiceover-disabled-command-reason",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "macos_command_routing_contract_v1",
   "description": "VoiceOver announces the reason why a lifecycle command is disabled, not just that it is disabled, enabling screen reader users to understand the blocked state.",
   "preconditions": {

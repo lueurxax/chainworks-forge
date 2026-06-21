@@ -1,7 +1,7 @@
 {
   "fixture_id": "runs-retry-same-intent-new-request-aliased",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "command_idempotency_contract_v1",
   "description": "A retry with a new request_id but matching intent_hash is aliased to the original committed entry rather than creating a duplicate execution.",
   "preconditions": {

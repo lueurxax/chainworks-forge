@@ -26,27 +26,65 @@ struct P083IdentityAmbiguousInboxView: View {
     var onMarkProcessAbsent: (String) -> Void = { _ in }
     var onOpenProviderSessionEvidence: (String) -> Void = { _ in }
 
+    @State private var selectedSessionID: String?
+
     var body: some View {
-        if !sessions.isEmpty {
+        let visibleSessions = deduplicatedSessions
+        if let focusedSession = focusedSession(from: visibleSessions) {
             VStack(alignment: .leading, spacing: 8) {
-                ForEach(sessions) { session in
-                    ManualProcessIdentityCheckBanner(
-                        providerName: session.providerName,
-                        sessionId: session.id,
-                        cancellationEpoch: session.cancellationEpoch,
-                        lastSeenPid: session.lastSeenPid,
-                        processStartIdentityHash: session.processStartIdentityHash,
-                        latestReceiptId: session.latestReceiptId,
-                        reasonDetail: session.reasonDetail,
-                        onRetryIdentityCheck: { onRetryIdentityCheck(session.id) },
-                        onMarkProcessAbsent: { onMarkProcessAbsent(session.id) },
-                        onOpenProviderSessionEvidence: { onOpenProviderSessionEvidence(session.id) }
-                    )
+                if visibleSessions.count > 1 {
+                    Picker("Provider session", selection: selectedSessionBinding(sessions: visibleSessions)) {
+                        ForEach(visibleSessions) { session in
+                            Text("\(session.providerName) · \(session.id)")
+                                .tag(session.id)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .accessibilityLabel("Provider session requiring identity review")
                 }
+
+                ManualProcessIdentityCheckBanner(
+                    providerName: focusedSession.providerName,
+                    sessionId: focusedSession.id,
+                    cancellationEpoch: focusedSession.cancellationEpoch,
+                    lastSeenPid: focusedSession.lastSeenPid,
+                    processStartIdentityHash: focusedSession.processStartIdentityHash,
+                    latestReceiptId: focusedSession.latestReceiptId,
+                    reasonDetail: focusedSession.reasonDetail,
+                    onRetryIdentityCheck: { onRetryIdentityCheck(focusedSession.id) },
+                    onMarkProcessAbsent: { onMarkProcessAbsent(focusedSession.id) },
+                    onOpenProviderSessionEvidence: { onOpenProviderSessionEvidence(focusedSession.id) }
+                )
             }
             .accessibilityElement(children: .contain)
-            .accessibilityLabel("Provider session identity holds: \(sessions.count) session\(sessions.count == 1 ? "" : "s") require attention")
+            .accessibilityLabel("Provider session identity holds: \(visibleSessions.count) session\(visibleSessions.count == 1 ? "" : "s") require attention")
+            .onChange(of: visibleSessions.map(\.id)) { _, sessionIDs in
+                guard let selectedSessionID, !sessionIDs.contains(selectedSessionID) else { return }
+                self.selectedSessionID = sessionIDs.first
+            }
         }
+    }
+
+    private var deduplicatedSessions: [IdentityAmbiguousSession] {
+        var seen = Set<String>()
+        return sessions.filter { session in
+            seen.insert(session.id).inserted
+        }
+    }
+
+    private func focusedSession(from sessions: [IdentityAmbiguousSession]) -> IdentityAmbiguousSession? {
+        if let selectedSessionID,
+           let selected = sessions.first(where: { $0.id == selectedSessionID }) {
+            return selected
+        }
+        return sessions.first
+    }
+
+    private func selectedSessionBinding(sessions: [IdentityAmbiguousSession]) -> Binding<String> {
+        Binding(
+            get: { selectedSessionID ?? sessions.first?.id ?? "" },
+            set: { selectedSessionID = $0 }
+        )
     }
 }
 

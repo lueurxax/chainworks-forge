@@ -2,7 +2,7 @@
 
 ## Overview
 
-This runbook provides guidance for operators on understanding and observing the implemented P079 functionality: Contract-Aware Output Repair and Provider Fallback. Today, P079 records durable evidence for output-contract failures, can run deterministic fixture same-session repair, and fails closed for advisory-only production providers. Accepted transcript/provider-envelope recovery and controlled provider fallback dispatch remain deferred.
+This runbook provides guidance for operators on understanding and observing the implemented P079 functionality: Contract-Aware Output Repair and Provider Fallback. Today, P079 records durable evidence for output-contract failures, can run deterministic fixture same-session repair, accepts bounded transport-attributed provider-envelope recovery when enabled, and fails closed for advisory-only production providers. Controlled provider fallback dispatch remains deferred.
 
 ## Key Concepts
 
@@ -27,7 +27,7 @@ The P079 rollout contract defines the following metric names for adoption and op
 *   `p079_repair_budget_exhausted_total{role}`: Total times the repair budget was exhausted.
 *   `p079_fallback_budget_exhausted_total{role}`: Total times the fallback budget was exhausted.
 
-Operational metric emission and dashboards are deferred. Use run report, MCP, GraphQL readback, and logs for current diagnostics.
+Core repair and recovery metric emission is implemented in the DB metrics inventory. Dashboards and live provider-fallback dispatch readback remain deferred with the fallback lane. Use run report, MCP, GraphQL readback, and logs for current diagnostics.
 
 ### Run Report and MCP
 
@@ -84,5 +84,8 @@ In case of critical issues or during controlled experiments, P079 can be rolled 
 ## Related References
 
 *   [Output Contracts, Failure Evidence, and Narrow Recovery](../../reference/output-contracts-failure-evidence-and-recovery.md): Detailed technical reference for P079 schema and contracts.
+*   [P079 Repair Prompt Template](../../reference/p079-repair-prompt-template.md): Pinned repair prompt version and sanitization rules.
+*   [P079 Recovery Attribution](../../reference/p079-recovery-attribution.md): Transcript/provider-envelope recovery attribution and bounds.
+*   [P079 Adapter Idempotency](../../reference/p079-adapter-idempotency.md): Lease, restart, and adapter idempotency rules.
 *   [Executable Rollout Gate Template](../../reference/executable-rollout-gate-template.md): General guidance on the rollout-contract preflight, gate aliases, and operator readback used by P079.
 *   [P079 Proposal Document](../../proposals/079-contract-aware-output-repair-and-provider-fallback.md): The original proposal document for full context.

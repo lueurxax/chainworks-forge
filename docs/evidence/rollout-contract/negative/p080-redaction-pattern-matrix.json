@@ -1,39 +1,88 @@
 {
   "applicability": "required",
   "commands": {
-    "allowlist": []
+    "allowlist": [
+      "./scripts/test-gate.sh proposal-080",
+      "./scripts/test-gate.sh p080"
+    ]
   },
   "decision_vocabulary": [
     "pass",
-    "fail"
+    "fail",
+    "hold"
   ],
+  "evidence_provenance": {
+    "docs": [
+      "docs/reference/test-gates.md",
+      "docs/runbooks/p080-stale-execution-repair.md"
+    ],
+    "tests": {
+      "db": [
+        "p080_seed_rollout_control_inserts_all_classes",
+        "p080_seed_rollout_control_is_idempotent",
+        "p080_rollout_control_includes_detection_only_class",
+        "p080_repair_acp_startup_stale_requeues_running_invoke_agent",
+        "p080_run_report_section_redacts_stored_readback_rows"
+      ],
+      "graphql-server": [
+        "p080_diagnostics_graphql_returns_page"
+      ],
+      "mcp-server": [
+        "p080_diagnostics_get_rollout_disabled_until_detection_enabled",
+        "p080_reconcile_diagnose_only_happy_path",
+        "p080_repair_if_safe_requeues_acp_startup_stale_when_phase_enabled",
+        "p080_clear_permanent_hold_action_disabled_in_phase"
+      ]
+    }
+  },
+  "expected_outcome": "secret_like_values_redacted",
+  "fixture_class": "redaction_pattern_matrix",
+  "fixture_status": "accepted_for_phase_scoped_gate",
   "gate_aliases": [
     "proposal-080",
     "p080"
   ],
   "hold_conditions": [
-    "placeholder negative fixture"
+    "secret_like_values_redacted"
   ],
   "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
+    "adoption_metric": "p080_reconciliation_events_total",
+    "guardrail_metric": "p080_disabled_action_rejected_total"
   },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
+  "negative_condition": "Secret-like strings are rejected or redacted in readback rows.",
   "operator_report_fields": [
-    "rollout_contract_status"
+    "rollout_contract_status",
+    "rollout_contract_decision",
+    "rollout_contract_projection_integrity",
+    "p080_readback.schema_version",
+    "p080_readback.stale_class",
+    "p080_readback.repair_action"
   ],
-  "placeholder_fixture_kind": "negative:redaction_pattern_matrix",
+  "proposal_id": "080",
+  "proposal_revision_id": "p080-refined-2026-06-02-r28",
   "readback_fields": [
-    "rollout_contract_status"
+    "schema_version",
+    "run_id",
+    "stage_id",
+    "work_item_id",
+    "stale_class",
+    "running_truth",
+    "repair_action",
+    "hold_reason",
+    "projection_integrity",
+    "executor_reregistration_state",
+    "rollout_disablement",
+    "side_effect_status"
   ],
   "readback_lanes": [
-    "run_report"
+    "run_report",
+    "mcp",
+    "graphql",
+    "release_receipt"
   ],
   "rollback_disposition": {
     "data_loss_risk": "none",
-    "mode": "not_applicable"
+    "mode": "disable_rollout_class"
   },
   "schema_version": "rollout_contract_v1"
 }

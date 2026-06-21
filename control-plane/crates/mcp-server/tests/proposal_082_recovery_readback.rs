@@ -301,7 +301,7 @@ async fn p082_runs_get_singular_matches_latest_plural_dynamic_readback() {
 }
 
 #[tokio::test]
-async fn p082_runs_cancel_rejects_missing_idempotency_key_before_mutation() {
+async fn p082_runs_cancel_rejects_missing_caller_request_id_before_mutation() {
     let pool = test_pool().await;
     let run_id = seed_run(&pool).await;
     let handler = command_handler(pool.clone());
@@ -315,11 +315,11 @@ async fn p082_runs_cancel_rejects_missing_idempotency_key_before_mutation() {
         &principal,
     )
     .await
-    .expect_err("runs.cancel must reject missing idempotency_key");
+    .expect_err("runs.cancel must reject missing caller_request_id");
 
     assert!(
-        err.to_string().contains("Missing 'idempotency_key'"),
-        "missing idempotency_key must be rejected before CancelRun mutation, got {err}"
+        err.to_string().contains("Missing 'caller_request_id'"),
+        "missing caller_request_id must be rejected before CancelRun mutation, got {err}"
     );
     let journal_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM command_journal")
         .fetch_one(&pool)

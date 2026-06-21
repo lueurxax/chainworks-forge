@@ -1,7 +1,7 @@
 {
   "fixture_id": "toolbar-menu-keyboard-denial-parity",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "macos_command_routing_contract_v1",
   "description": "Toolbar button, menu item, and keyboard shortcut all reflect the same enabled/disabled state for lifecycle commands; no surface inconsistency exists.",
   "preconditions": {

@@ -1,46 +1,45 @@
 // P042 §6.2 / REQ-006 / UI-001 crash-budget reset coordinator tests.
 
-import XCTest
+import Foundation
+import Testing
 @testable import Chainworks_Forge
 
-final class CrashBudgetResetTests: XCTestCase {
+struct CrashBudgetResetTests {
 
     // MARK: - File primitives
 
-    func test_delete_crash_budget_file_removes_file_when_present() throws {
+    @Test func `Delete crash budget file removes file when present`() throws {
         let tmp = try makeTempAppSupportDir()
         defer { try? FileManager.default.removeItem(at: tmp) }
         let url = CrashBudgetFiles.crashBudgetURL(appSupportDir: tmp)
         try Data("{}".utf8).write(to: url)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        #expect(FileManager.default.fileExists(atPath: url.path))
 
         let outcome = CrashBudgetFiles.deleteCrashBudgetFile(at: url)
 
-        switch outcome {
-        case .removed: break
-        default: XCTFail("expected .removed, got \(outcome)")
+        if case .removed = outcome {} else {
+            Issue.record("expected .removed, got \(outcome)")
         }
-        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        #expect(!FileManager.default.fileExists(atPath: url.path))
     }
 
-    func test_delete_crash_budget_file_reports_already_absent_when_missing() throws {
+    @Test func `Delete crash budget file reports already absent when missing`() throws {
         let tmp = try makeTempAppSupportDir()
         defer { try? FileManager.default.removeItem(at: tmp) }
         let url = CrashBudgetFiles.crashBudgetURL(appSupportDir: tmp)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        #expect(!FileManager.default.fileExists(atPath: url.path))
 
         let outcome = CrashBudgetFiles.deleteCrashBudgetFile(at: url)
 
-        switch outcome {
-        case .alreadyAbsent: break
-        default: XCTFail("expected .alreadyAbsent, got \(outcome)")
+        if case .alreadyAbsent = outcome {} else {
+            Issue.record("expected .alreadyAbsent, got \(outcome)")
         }
     }
 
     // MARK: - Coordinator
 
     @MainActor
-    func test_perform_reset_deletes_file_and_requests_single_restart() async throws {
+    @Test func `Perform reset deletes file and requests single restart`() async throws {
         let tmp = try makeTempAppSupportDir()
         defer { try? FileManager.default.removeItem(at: tmp) }
         let url = CrashBudgetFiles.crashBudgetURL(appSupportDir: tmp)
@@ -55,15 +54,15 @@ final class CrashBudgetResetTests: XCTestCase {
 
         let result = await coordinator.performReset()
 
-        XCTAssertTrue(result.isFullySuccessful)
-        XCTAssertEqual(restarter.restartCount, 1,
-                       "reset must request exactly one daemon restart")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path),
-                       "crash-budget file must be deleted")
+        #expect(result.isFullySuccessful)
+        #expect(restarter.restartCount == 1,
+                "reset must request exactly one daemon restart")
+        #expect(!FileManager.default.fileExists(atPath: url.path),
+                "crash-budget file must be deleted")
     }
 
     @MainActor
-    func test_perform_reset_noop_when_already_absent_still_requests_restart() async throws {
+    @Test func `Perform reset noop when already absent still requests restart`() async throws {
         // §6.2: the operator may click Reset preemptively before the
         // daemon records a crash. In that case there is no file to
         // delete but we still want to kick the daemon so UI stays in
@@ -81,17 +80,17 @@ final class CrashBudgetResetTests: XCTestCase {
 
         let result = await coordinator.performReset()
 
-        XCTAssertTrue(result.isFullySuccessful)
-        XCTAssertEqual(restarter.restartCount, 1)
+        #expect(result.isFullySuccessful)
+        #expect(restarter.restartCount == 1)
         if case .alreadyAbsent = result.fileOutcome {
             // Good.
         } else {
-            XCTFail("expected .alreadyAbsent, got \(result.fileOutcome)")
+            Issue.record("expected .alreadyAbsent, got \(result.fileOutcome)")
         }
     }
 
     @MainActor
-    func test_perform_reset_reports_restart_error_while_still_deleting_file() async throws {
+    @Test func `Perform reset reports restart error while still deleting file`() async throws {
         let tmp = try makeTempAppSupportDir()
         defer { try? FileManager.default.removeItem(at: tmp) }
         let url = CrashBudgetFiles.crashBudgetURL(appSupportDir: tmp)
@@ -107,13 +106,13 @@ final class CrashBudgetResetTests: XCTestCase {
 
         let result = await coordinator.performReset()
 
-        XCTAssertNotNil(result.restartError,
-                        "coordinator must surface restart failures to the UI")
-        XCTAssertFalse(result.isFullySuccessful,
-                       "restart failure blocks `isFullySuccessful`")
+        #expect(result.restartError != nil,
+                "coordinator must surface restart failures to the UI")
+        #expect(!result.isFullySuccessful,
+                "restart failure blocks `isFullySuccessful`")
         // File still removed — deletion runs before the restart request.
-        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
-        XCTAssertTrue(result.summary.contains("restart request failed"))
+        #expect(!FileManager.default.fileExists(atPath: url.path))
+        #expect(result.summary.contains("restart request failed"))
     }
 
     // MARK: - Helpers

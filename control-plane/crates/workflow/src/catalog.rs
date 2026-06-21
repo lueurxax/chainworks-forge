@@ -171,6 +171,8 @@ pub struct ContinuationCapabilityYaml {
     pub live_handle_continuation: Option<LiveHandleContinuationYaml>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_session_resurrection: Option<ProviderSessionResurrectionYaml>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_only_recovery: Option<OutputOnlyRecoveryYaml>,
     #[serde(default)]
     pub require_same_worktree: bool,
     #[serde(default)]
@@ -182,6 +184,17 @@ pub struct LiveHandleContinuationYaml {
     pub enabled: bool,
     #[serde(default)]
     pub require_live_session: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OutputOnlyRecoveryYaml {
+    pub enabled: bool,
+    #[serde(default)]
+    pub allowed_triggers: Vec<String>,
+    #[serde(default)]
+    pub require_live_session: bool,
+    #[serde(default)]
+    pub source_edit_allowance: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -1,126 +1,105 @@
 {
-  "fixture_purpose": "Engine materialized placeholder for a rollout_contract_v1 readback fixture declared by an approved proposal. Implementation must replace or update this fixture with concrete evidence before the proposal gate can be treated as release evidence.",
-  "parity_lanes": {
-    "graphql": {
-      "rolloutContractActionId": null,
-      "rolloutContractCutoverPolicyRevision": null,
-      "rolloutContractDecision": "hold",
-      "rolloutContractDiagnosticRedaction": "none",
-      "rolloutContractDisabledReasonCode": "placeholder_pending_implementation_evidence",
-      "rolloutContractEnabledState": "disabled",
-      "rolloutContractEnforcementMode": "enforce",
-      "rolloutContractEnforcementModeReason": "declared_fixture_placeholder",
-      "rolloutContractFailureReasons": [
-        "placeholder_pending_implementation_evidence"
+  "evidence_provenance": {
+    "gate": "./scripts/test-gate.sh proposal-080",
+    "generated_from": "same-tree P080 DB, MCP, and GraphQL focused tests",
+    "limitations": [
+      "scheduler_ownership_drift_repair_not_promoted",
+      "helper_orphan_reap_not_promoted",
+      "permanent_hold_clear_not_promoted"
+    ],
+    "tests": {
+      "db": [
+        "p080_seed_rollout_control_inserts_all_classes",
+        "p080_seed_rollout_control_is_idempotent",
+        "p080_rollout_control_includes_detection_only_class",
+        "p080_repair_acp_startup_stale_requeues_running_invoke_agent",
+        "p080_run_report_section_redacts_stored_readback_rows"
       ],
-      "rolloutContractHoldConditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
+      "graphql-server": [
+        "p080_diagnostics_graphql_returns_page"
       ],
-      "rolloutContractNextSteps": [
-        "Replace placeholder with concrete GraphQL readback evidence."
-      ],
-      "rolloutContractOperatorMessage": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rolloutContractProjectionIntegrity": "stale",
-      "rolloutContractRollbackDisposition": {
-        "dataLossRisk": "none",
-        "mode": "not_applicable"
-      },
-      "rolloutContractSourceLane": "graphql",
-      "rolloutContractStatus": "fail",
-      "rolloutContractWaiverExpiresAt": null,
-      "rolloutContractWaiverState": "none"
-    },
-    "mcp": {
-      "rollout_contract_action_id": null,
-      "rollout_contract_cutover_policy_revision": null,
-      "rollout_contract_decision": "hold",
-      "rollout_contract_diagnostic_redaction": "none",
-      "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-      "rollout_contract_enabled_state": "disabled",
-      "rollout_contract_enforcement_mode": "enforce",
-      "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-      "rollout_contract_failure_reasons": [
-        "placeholder_pending_implementation_evidence"
-      ],
-      "rollout_contract_hold_conditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rollout_contract_next_steps": [
-        "Replace placeholder with concrete MCP readback evidence."
-      ],
-      "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rollout_contract_projection_integrity": "stale",
-      "rollout_contract_rollback_disposition": {
-        "data_loss_risk": "none",
-        "mode": "not_applicable"
-      },
-      "rollout_contract_source_lane": "mcp",
-      "rollout_contract_status": "fail",
-      "rollout_contract_waiver_expires_at": null,
-      "rollout_contract_waiver_state": "none"
-    },
-    "release_receipt": {
-      "rollout_contract_action_id": null,
-      "rollout_contract_cutover_policy_revision": null,
-      "rollout_contract_decision": "hold",
-      "rollout_contract_diagnostic_redaction": "none",
-      "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-      "rollout_contract_enabled_state": "disabled",
-      "rollout_contract_enforcement_mode": "enforce",
-      "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-      "rollout_contract_failure_reasons": [
-        "placeholder_pending_implementation_evidence"
-      ],
-      "rollout_contract_hold_conditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rollout_contract_next_steps": [
-        "Replace placeholder with concrete release receipt evidence."
-      ],
-      "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rollout_contract_projection_integrity": "stale",
-      "rollout_contract_rollback_disposition": {
-        "data_loss_risk": "none",
-        "mode": "not_applicable"
-      },
-      "rollout_contract_source_lane": "release_receipt",
-      "rollout_contract_status": "fail",
-      "rollout_contract_waiver_expires_at": null,
-      "rollout_contract_waiver_state": "none"
+      "mcp-server": [
+        "p080_diagnostics_get_rollout_disabled_until_detection_enabled",
+        "p080_reconcile_diagnose_only_happy_path",
+        "p080_repair_if_safe_requeues_acp_startup_stale_when_phase_enabled",
+        "p080_clear_permanent_hold_action_disabled_in_phase"
+      ]
     }
   },
-  "placeholder": {
-    "materialized_by": "chainworks_engine",
-    "path": "docs/evidence/rollout-contract/operator-readback/p080-full-surface.fixture.json",
-    "status": "pending_implementation_evidence"
+  "p080_readback": {
+    "evidence_marker_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "executor_reregistration_state": "expected",
+    "hold_age_seconds": null,
+    "hold_reason": "none",
+    "next_retry_or_backoff_time": "2026-06-20T00:00:00Z",
+    "operator_message": "acp startup stale execution was requeued for a fresh provider session",
+    "projection_integrity": "valid",
+    "projection_updated_at": "2026-06-20T00:00:00Z",
+    "repair_action": "acp_session_reset",
+    "repair_idempotency_key": "p080-rik-bbbbbbbbbbbbbbbbbbbbbbbb",
+    "rollout_disablement": "none",
+    "run_id": "00000000-0000-4000-8000-000000000080",
+    "running_truth": "stale_repaired",
+    "schema_version": "p080_readback_v1",
+    "side_effect_status": "not_applicable",
+    "stage_id": "stage-p080-fixture",
+    "stale_class": "acp_startup_stale",
+    "work_item_id": "00000000-0000-4000-8000-000000000081"
   },
-  "proposal_id": "unknown",
+  "parity_lanes": {
+    "graphql": {
+      "p080Diagnostics": "p080_readback_v1",
+      "rolloutContractDecision": "pass",
+      "rolloutContractEnabledState": "phase_scoped",
+      "rolloutContractProjectionIntegrity": "valid",
+      "rolloutContractSourceLane": "graphql",
+      "rolloutContractStatus": "pass"
+    },
+    "mcp": {
+      "p080_diagnostics": "p080_readback_v1",
+      "rollout_contract_decision": "pass",
+      "rollout_contract_enabled_state": "phase_scoped",
+      "rollout_contract_projection_integrity": "valid",
+      "rollout_contract_source_lane": "mcp",
+      "rollout_contract_status": "pass"
+    },
+    "release_receipt": {
+      "p080_release_receipt_section": "p080_release_receipt_section_v1",
+      "rollout_contract_decision": "pass",
+      "rollout_contract_enabled_state": "phase_scoped",
+      "rollout_contract_projection_integrity": "valid",
+      "rollout_contract_source_lane": "release_receipt",
+      "rollout_contract_status": "pass"
+    }
+  },
+  "proposal_id": "080",
   "proposal_revision_id": "p080-refined-2026-06-02-r28",
-  "rollout_contract_action_id": null,
-  "rollout_contract_cutover_policy_revision": null,
-  "rollout_contract_decision": "hold",
-  "rollout_contract_diagnostic_redaction": "none",
-  "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-  "rollout_contract_enabled_state": "disabled",
+  "rollout_contract_action_id": "p080-phase-scoped-readback-2026-06-20",
+  "rollout_contract_cutover_policy_revision": "p080-rollout-phase-scoped-v1",
+  "rollout_contract_decision": "pass",
+  "rollout_contract_diagnostic_redaction": "full",
+  "rollout_contract_disabled_reason_code": null,
+  "rollout_contract_enabled_state": "phase_scoped",
   "rollout_contract_enforcement_mode": "enforce",
-  "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-  "rollout_contract_failure_reasons": [
-    "placeholder_pending_implementation_evidence"
-  ],
+  "rollout_contract_enforcement_mode_reason": "phase_1_detection_and_acp_startup_repair_are_executable; later repair classes remain gated",
+  "rollout_contract_failure_reasons": [],
   "rollout_contract_hold_conditions": [
-    "Replace engine materialized placeholder with proposal-specific rollout evidence."
+    "scheduler_ownership_drift_repair_phase_not_enabled",
+    "helper_orphan_drift_repair_phase_not_enabled",
+    "permanent_hold_clear_phase_not_enabled"
   ],
   "rollout_contract_next_steps": [
-    "Replace placeholder with concrete operator readback evidence."
+    "promote scheduler repair only after P076 retry-safe proof is green",
+    "promote helper reap only after process identity negative fixtures are executable",
+    "promote permanent hold clear only after P098 owner semantics land"
   ],
-  "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-  "rollout_contract_projection_integrity": "stale",
+  "rollout_contract_operator_message": "P080 detection/readback and acp_startup_stale requeue proof are present; unsupported repair classes fail closed.",
+  "rollout_contract_projection_integrity": "valid",
   "rollout_contract_rollback_disposition": {
     "data_loss_risk": "none",
-    "mode": "not_applicable"
+    "mode": "disable_rollout_class"
   },
-  "rollout_contract_source_lane": "run_report",
-  "rollout_contract_status": "fail",
+  "rollout_contract_status": "pass",
   "rollout_contract_waiver_expires_at": null,
   "rollout_contract_waiver_state": "none",
   "schema_version": "operator_readback_v1",

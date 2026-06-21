@@ -1,0 +1,15 @@
+{
+  "assertions": [
+    "baseline-sample-id-recorded-on-issued is part of the current-revision P083 evidence corpus.",
+    "The canonical proposal-083 gate must keep this path present before running executable checks."
+  ],
+  "contract": "provider_shutdown_signal_contract_v1",
+  "description": "P083 R70 declared evidence fixture for baseline-sample-id-recorded-on-issued.",
+  "evidence_path": "docs/evidence/083/shutdown-signal/baseline-sample-id-recorded-on-issued.fixture.json",
+  "expected_outcome": "pass",
+  "fixture_id": "baseline-sample-id-recorded-on-issued",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
+  "schema_version": "p083_evidence_fixture_v1",
+  "verification_type": "contract_fixture"
+}

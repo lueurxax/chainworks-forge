@@ -1,7 +1,7 @@
 {
   "fixture_id": "unbounded-label-rejected",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "metrics_label_bounds_contract_v1",
   "description": "An attempt to emit a metric with a label value outside the declared bounded domain is rejected and replaced with a sentinel value or causes a validation error.",
   "preconditions": {

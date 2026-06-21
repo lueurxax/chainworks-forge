@@ -1,40 +1,16 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "terminal_idempotency_ledger_concurrent_replay_prompt_related",
+  "fixture_purpose": "Concurrent prompt-related replay must not create duplicate provider_send or provider_cancel side effects.",
+  "status": "pass",
+  "evidence_kind": "contract_fixture",
+  "evidence": {
+    "surface": "side_effect_ledger",
+    "guard": "ordered side-effect kinds are inserted with idempotency key and request fingerprint; duplicate provider_send is rejected",
+    "expected_rejection": "duplicate_prompt_prevented",
+    "readback_lane": "side_effect_ledger"
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "proposal-086-resurrection"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:terminal_idempotency_ledger_concurrent_replay_prompt_related",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "prompt_side_effects_idempotent"
 }

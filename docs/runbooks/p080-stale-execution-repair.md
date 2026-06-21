@@ -1,13 +1,13 @@
 # P080 Stale Execution Diagnostics And Repair
 
-P080 Phase 1 is detection/readback only. The daemon may classify running executions and write `diagnosed` / `diagnose_only` P080 readback, but it does not perform ACP reset, scheduler capacity repair, helper reap, manual hold, or permanent-hold clear.
+P080 is currently phase-scoped: detection/readback is enabled behind `detection_only`, and `repair_if_safe` may repair only `acp_startup_stale` tuples after that class is enabled in Phase 2+. Scheduler capacity repair, helper reap, side-effect-adjacent repair, manual hold, and permanent-hold clear remain disabled.
 
 ## First Checks
 
 1. Open `docs/evidence/dashboards/p080-overview.json` and inspect the panel matching the alert metric.
 2. Query `p080.diagnostics.get.v1` with a narrow `filter.run_id` and, when available, `stage_id`, `work_item_id`, and `stale_class`.
 3. Check `p080_readback_v1.projection_integrity`. Do not act on rows with `stale` or `tamper_detected`.
-4. For Phase 1, treat `repair_if_safe`, `hold`, and `p080.clear_permanent_hold.v1` as unavailable even when the tool is listed. Expected errors are `rollout_disabled`, `class_disabled`, or `action_disabled_in_phase`.
+4. Use `repair_if_safe` only for `stale_class=acp_startup_stale` after the rollout row is enabled in Phase 2+. Every mutating repair request must include a fresh `operator_request_dedup_key`; exact replays return the stored response, while changed targets or changed rollout/auth fences return `idempotency_conflict` before mutation.
 5. Do not manually retry release, publish, git, upload, or distribution work unless P076 side-effect reconciliation reports `retry_safe`.
 
 ## Correlation Fields
@@ -32,7 +32,7 @@ Every investigation should capture `run_id`, `stage_id`, `work_item_id`, `stale_
 | `error=rollout_disabled`, `class_disabled`, or `live_disabled` | Inspect rollout-control state. | future `p080.rollout_control.set.v1` | platform on-call |
 | `error=action_disabled_in_phase` | Verify the action is phase-enabled; defer hold/clear actions in Phase 1. | none | platform on-call |
 | `error=invalid_cursor` | Re-query without the cursor. | `p080.diagnostics.get.v1` with `cursor=null` | n/a |
-| `error=idempotency_conflict` | Choose a fresh `operator_request_dedup_key`. | re-issue request with new key | n/a |
+| `error=idempotency_conflict` | The dedup key was reused for a different request or after rollout/auth/live-disable state changed. Re-diagnose the tuple, then choose a fresh `operator_request_dedup_key` only if the repair is still intended. | re-issue request with new key | n/a |
 | `error=permanent_hold_active` | Inspect active hold readback; clear only in Phase 5+. | `p080.clear_permanent_hold.v1` in Phase 5+ | platform on-call |
 | `error=predicate_revalidation_failed` | Re-diagnose; state changed since the predicate hash was captured. | re-issue with refreshed predicate hash or omit it | n/a |
 | `error=side_effect_unsafe` | Defer to P076; do not retry. | none; see P076 runbook | release on-call |

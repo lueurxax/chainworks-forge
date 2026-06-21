@@ -1,7 +1,7 @@
 {
   "fixture_id": "metric-mirrors-byte-equal",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "metrics_label_bounds_contract_v1",
   "description": "Metric values exported by the Rust control-plane daemon are byte-equal to the values observed in the Swift app's mirrored metrics surface for the same event.",
   "preconditions": {

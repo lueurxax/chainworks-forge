@@ -1,7 +1,7 @@
 {
   "fixture_id": "restart-updates-existing-latch",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "late_output_overflow_contract_v1",
   "description": "After a restart, late output that arrives for an existing latch updates the latch row rather than creating a duplicate entry.",
   "preconditions": {

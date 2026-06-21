@@ -55,6 +55,40 @@ use engine::command_handler::{validate_caller_request_id, CommandHandler};
 use crate::protocol::McpTool;
 use crate::request_context::mcp_caller;
 
+const P083_LIFECYCLE_RESPONSE_SCHEMA_VERSION: &str = "p083_lifecycle_response_v1";
+
+fn p083_lifecycle_output_schema() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "status"],
+        "properties": {
+            "schema_version": { "type": "string" },
+            "status": { "type": "string", "enum": ["accepted", "replayed", "aliased", "denied"] },
+            "request_id": { "type": "string" },
+            "denial": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["code", "message"],
+                "properties": {
+                    "code": { "type": "string" },
+                    "message": { "type": "string" },
+                    "next_action": { "type": "string" }
+                }
+            }
+        }
+    })
+}
+
+fn p083_lifecycle_success(request_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": P083_LIFECYCLE_RESPONSE_SCHEMA_VERSION,
+        "status": "accepted",
+        "request_id": request_id
+    })
+}
+
 pub fn tool_specs() -> Vec<McpTool> {
     vec![
         McpTool {
@@ -77,7 +111,7 @@ pub fn tool_specs() -> Vec<McpTool> {
             input_schema: serde_json::json!({
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
-                "required": ["decision", "request_id"],
+                "required": ["approval_id", "resolution", "caller_request_id"],
                 "additionalProperties": false,
                 "properties": {
                     "subject_kind": {
@@ -95,38 +129,24 @@ pub fn tool_specs() -> Vec<McpTool> {
                     },
                     "run_id": { "type": "string", "description": "Deprecated compatibility hint for stage_approval; required for lead_mediation_confirmation" },
                     "stage_id": { "type": "string", "description": "Deprecated compatibility hint for stage_approval" },
-                    "decision": {
+                    "resolution": {
                         "type": "string",
-                        "enum": ["granted", "rejected", "confirm", "manual_fallback"],
-                        "description": "Decision: granted/rejected for stage approvals, confirm/manual_fallback for mediation"
+                        "enum": ["approve", "reject"],
+                        "description": "P083 approval resolution"
                     },
                     "comment": { "type": "string" },
                     "conflict_fingerprint": {
                         "type": "string",
                         "description": "Required for lead_mediation_confirmation"
                     },
-                    "request_id": {
+                    "caller_request_id": {
                         "type": "string",
                         "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                         "description": "CallerRequestId: lowercase UUIDv4 for command_idempotency_contract_v1 (TTL=300s)"
                     }
                 }
             }),
-            output_schema: Some(serde_json::json!({
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["resolved"],
-                "properties": {
-                    "resolved": { "type": "boolean", "description": "true when the approval resolution was durably committed; false on denial" },
-                    "approval_id": { "type": "string" },
-                    "journal_id": { "type": "string" },
-                    "request_id": { "type": "string", "description": "Replayed CallerRequestId for idempotency confirmation" },
-                    "denied": { "type": "boolean", "description": "true when the command was denied before execution" },
-                    "denial_code": { "type": "string", "enum": ["malformed_request_id","request_intent_mismatch","idempotency_in_flight","idempotency_replayed","idempotency_expired_reacquired","idempotency_replay_corrupt","idempotency_terminal_failure","operator_required","p083_operator_required","provider_session_not_found","run_not_found","stage_not_retryable","approval_not_actionable","side_effect_not_reconcilable","enforcement_mode_transition_denied","identity_ambiguous","internal"], "description": "Bounded denial code from P083LifecycleDenialCode" },
-                    "message": { "type": "string", "description": "Human-readable denial or error message" }
-                }
-            })),
+            output_schema: Some(p083_lifecycle_output_schema()),
         },
     ]
 }
@@ -225,19 +245,19 @@ async fn resolve_stage_approval(
     cmd_handler: &CommandHandler,
     principal: &auth::Principal,
 ) -> Result<serde_json::Value> {
-    let decision_str = params["decision"]
+    let decision_str = params["resolution"]
         .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing 'decision'"))?;
+        .ok_or_else(|| anyhow::anyhow!("Missing 'resolution'"))?;
     let comment = params["comment"].as_str().map(|s| s.to_string());
 
     // P083 command_idempotency_contract_v1: request_id (lowercase UUIDv4) is required.
     // Legacy idempotency_key fallback is removed per P083 CallerRequestId mandate.
-    let p083_request_id = if let Some(rid) = params["request_id"].as_str() {
+    let p083_request_id = if let Some(rid) = params["caller_request_id"].as_str() {
         validate_caller_request_id(rid)?;
         rid.to_string()
     } else {
         return Err(anyhow::anyhow!(
-            "approvals.resolve requires 'request_id' (lowercase UUIDv4 per P083 command_idempotency_contract_v1)"
+            "approvals.resolve requires 'caller_request_id' (lowercase UUIDv4 per P083 command_idempotency_contract_v1)"
         ));
     };
     let p081_idempotency_key: Option<String> = None;
@@ -254,9 +274,7 @@ async fn resolve_stage_approval(
             .map_err(|e| anyhow::anyhow!("Invalid approval_id: {e}"))?
             .into();
 
-        let decision: ApprovalResolutionDecision = decision_str
-            .parse()
-            .map_err(|e: String| anyhow::anyhow!("{e}"))?;
+        let decision = parse_p083_approval_resolution(decision_str)?;
 
         // Server-resolve run_id and stage_id from the approval record.
         let approval = approvals::find_by_id(cmd_handler.pool(), approval_id)
@@ -290,12 +308,8 @@ async fn resolve_stage_approval(
             request_id: Some(p083_request_id.clone()),
         });
 
-        let commanded = cmd_handler.handle(cmd, caller).await?;
-        return Ok(serde_json::json!({
-            "resolved": true,
-            "request_id": p083_request_id,
-            "journal_id": commanded.journal_id,
-        }));
+        let _commanded = cmd_handler.handle(cmd, caller).await?;
+        return Ok(p083_lifecycle_success(&p083_request_id));
     }
 
     // Legacy path: resolve by run_id + stage_id.
@@ -308,9 +322,7 @@ async fn resolve_stage_approval(
         .ok_or_else(|| anyhow::anyhow!("Missing 'stage_id' (required when approval_id is absent)"))?
         .to_string();
 
-    let decision: ApprovalResolutionDecision = decision_str
-        .parse()
-        .map_err(|e: String| anyhow::anyhow!("{e}"))?;
+    let decision = parse_p083_approval_resolution(decision_str)?;
 
     let approval = approvals::find_pending_by_run_stage(cmd_handler.pool(), run_id, &stage_id)
         .await?
@@ -332,12 +344,18 @@ async fn resolve_stage_approval(
         request_id: Some(p083_request_id.clone()),
     });
 
-    let commanded = cmd_handler.handle(cmd, caller).await?;
-    Ok(serde_json::json!({
-        "resolved": true,
-        "request_id": p083_request_id,
-        "journal_id": commanded.journal_id,
-    }))
+    let _commanded = cmd_handler.handle(cmd, caller).await?;
+    Ok(p083_lifecycle_success(&p083_request_id))
+}
+
+fn parse_p083_approval_resolution(value: &str) -> Result<ApprovalResolutionDecision> {
+    match value {
+        "approve" => Ok(ApprovalResolutionDecision::Approved),
+        "reject" => Ok(ApprovalResolutionDecision::Rejected),
+        other => Err(anyhow::anyhow!(
+            "invalid approvals.resolve resolution '{other}'; expected approve or reject"
+        )),
+    }
 }
 
 async fn resolve_mediation_confirmation(

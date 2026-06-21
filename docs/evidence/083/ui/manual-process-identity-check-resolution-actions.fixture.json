@@ -1,7 +1,7 @@
 {
   "fixture_id": "manual-process-identity-check-resolution-actions",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "manual_process_identity_check_ui_v1",
   "description": "ManualProcessIdentityCheckBanner renders the four resolution actions required by manual_process_identity_check_ui_v1: Copy Diagnostic, Retry Identity Check, Mark Process Absent, and Open Provider Session Evidence.",
   "preconditions": {

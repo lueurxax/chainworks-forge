@@ -2044,8 +2044,14 @@ agents:
       live_handle_continuation:
         enabled: true
         require_live_session: true
+      output_only_recovery:
+        enabled: true
+        allowed_triggers:
+          - operator_mcp
+        require_live_session: true
+        source_edit_allowance: false
       provider_session_resurrection:
-        enabled: false
+        enabled: true
         allowed_triggers:
           - operator_mcp
         require_recorded_provider_session_id: true

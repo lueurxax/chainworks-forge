@@ -11,9 +11,9 @@ use domain::commands::{
     CancelRunCmd, Command, ForceReconcileSideEffectCmd, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
     MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision, MainSyncRepairStateCmd,
     MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd, MainSyncTriggerReason,
-    MarkProviderSessionProcessAbsentCmd, P083RollbackExecutionCmd, P083SetEnforcementModeCmd,
-    ProposalGateSettlementAction, RetrofitCatalogSnapshotCmd, RetryRunCmd, SettleProposalGateCmd,
-    ShutdownProviderSessionCmd, StartRunCmd,
+    MarkProviderSessionProcessAbsentCmd, P083LifecycleDenialCode, P083RollbackExecutionCmd,
+    P083SetEnforcementModeCmd, ProposalGateSettlementAction, RetrofitCatalogSnapshotCmd,
+    RetryRunCmd, SettleProposalGateCmd, ShutdownProviderSessionCmd, StartRunCmd,
 };
 use domain::ids::{IdeaId, RunId};
 use domain::risk_lineage::RiskAcceptanceLineage;
@@ -21,6 +21,70 @@ use engine::command_handler::{validate_caller_request_id, CommandHandler};
 
 use crate::protocol::McpTool;
 use crate::request_context::mcp_caller;
+
+const P083_LIFECYCLE_RESPONSE_SCHEMA_VERSION: &str = "p083_lifecycle_response_v1";
+
+fn p083_lifecycle_output_schema() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "status"],
+        "properties": {
+            "schema_version": { "type": "string" },
+            "status": {
+                "type": "string",
+                "enum": ["accepted", "replayed", "aliased", "denied"]
+            },
+            "request_id": { "type": "string" },
+            "denial": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["code", "message"],
+                "properties": {
+                    "code": { "type": "string" },
+                    "message": { "type": "string" },
+                    "next_action": { "type": "string" }
+                }
+            }
+        }
+    })
+}
+
+fn p083_lifecycle_success(
+    caller_request_id: &str,
+    idempotency_request_id: &str,
+) -> serde_json::Value {
+    let status = if caller_request_id == idempotency_request_id {
+        "accepted"
+    } else {
+        "aliased"
+    };
+    serde_json::json!({
+        "schema_version": P083_LIFECYCLE_RESPONSE_SCHEMA_VERSION,
+        "status": status,
+        "request_id": idempotency_request_id
+    })
+}
+
+fn p083_lifecycle_denial(
+    code: &str,
+    message: &str,
+    next_action: Option<&str>,
+) -> serde_json::Value {
+    let mut denial = serde_json::json!({
+        "code": code,
+        "message": message
+    });
+    if let Some(next_action) = next_action {
+        denial["next_action"] = serde_json::json!(next_action);
+    }
+    serde_json::json!({
+        "schema_version": P083_LIFECYCLE_RESPONSE_SCHEMA_VERSION,
+        "status": "denied",
+        "denial": denial
+    })
+}
 
 pub fn tool_specs() -> Vec<McpTool> {
     vec![
@@ -79,32 +143,18 @@ pub fn tool_specs() -> Vec<McpTool> {
             input_schema: serde_json::json!({
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
-                "required": ["run_id", "request_id"],
+                "required": ["run_id", "caller_request_id"],
                 "additionalProperties": false,
                 "properties": {
                     "run_id": { "type": "string", "description": "UUID of the run to cancel" },
-                    "request_id": {
+                    "caller_request_id": {
                         "type": "string",
                         "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                         "description": "CallerRequestId: lowercase UUIDv4 for command_idempotency_contract_v1"
                     }
                 }
             }),
-            output_schema: Some(serde_json::json!({
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["cancelled"],
-                "properties": {
-                    "cancelled": { "type": "boolean", "description": "true when cancel was durably committed; false on denial" },
-                    "run_id": { "type": "string" },
-                    "journal_id": { "type": "string" },
-                    "request_id": { "type": "string", "description": "Replayed CallerRequestId for idempotency confirmation" },
-                    "denied": { "type": "boolean", "description": "true when the command was denied before execution" },
-                    "denial_code": { "type": "string", "enum": ["malformed_request_id","request_intent_mismatch","idempotency_in_flight","idempotency_replayed","idempotency_expired_reacquired","idempotency_replay_corrupt","idempotency_terminal_failure","operator_required","p083_operator_required","provider_session_not_found","run_not_found","stage_not_retryable","approval_not_actionable","side_effect_not_reconcilable","enforcement_mode_transition_denied","identity_ambiguous","internal"], "description": "Bounded denial code from P083LifecycleDenialCode" },
-                    "message": { "type": "string", "description": "Human-readable denial or error message" }
-                }
-            })),
+            output_schema: Some(p083_lifecycle_output_schema()),
         },
         McpTool {
             name: "runs.main_sync.request".to_string(),
@@ -335,40 +385,20 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "type": "object",
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "additionalProperties": false,
-                "required": ["provider_session_id", "reason", "request_id"],
+                "required": ["provider_session_id", "caller_request_id"],
                 "properties": {
                     "provider_session_id": {
                         "type": "string",
                         "description": "service_owned: authoritative provider session ID from provider_sessions table"
                     },
-                    "reason": {
-                        "type": "string",
-                        "maxLength": 1024
-                    },
-                    "request_id": {
+                    "caller_request_id": {
                         "type": "string",
                         "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                         "description": "CallerRequestId: lowercase UUIDv4 for command_idempotency_contract_v1"
                     }
                 }
             }),
-            output_schema: Some(serde_json::json!({
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["scheduled"],
-                "properties": {
-                    "scheduled": { "type": "boolean", "description": "true when process signal dispatch is active; false means durable intent recorded only" },
-                    "dispatch_state": { "type": "string", "description": "Signal dispatch state: recorded_no_signal_dispatch when only intent row written; signal_dispatched when OS signal was issued" },
-                    "provider_session_id": { "type": "string" },
-                    "cancellation_epoch": { "type": "integer", "description": "Service-assigned epoch ms for the shutdown intent" },
-                    "journal_id": { "type": "string", "description": "Command journal entry ID for auditability" },
-                    "request_id": { "type": "string", "description": "Replayed CallerRequestId for idempotency confirmation" },
-                    "denied": { "type": "boolean", "description": "true when the command was denied before execution" },
-                    "denial_code": { "type": "string", "enum": ["malformed_request_id","request_intent_mismatch","idempotency_in_flight","idempotency_replayed","idempotency_expired_reacquired","idempotency_replay_corrupt","idempotency_terminal_failure","operator_required","p083_operator_required","provider_session_not_found","run_not_found","stage_not_retryable","approval_not_actionable","side_effect_not_reconcilable","enforcement_mode_transition_denied","identity_ambiguous","internal"], "description": "Bounded denial code from P083LifecycleDenialCode" },
-                    "message": { "type": "string", "description": "Human-readable denial message" }
-                }
-            })),
+            output_schema: Some(p083_lifecycle_output_schema()),
         },
         McpTool {
             name: "p083.rollback_execution".to_string(),
@@ -394,21 +424,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
-            output_schema: Some(serde_json::json!({
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["committed"],
-                "properties": {
-                    "committed": { "type": "boolean", "description": "true when rollback was durably committed; false on denial" },
-                    "target_enforcement_mode": { "type": "string", "enum": ["permissive", "disabled"] },
-                    "journal_id": { "type": "string" },
-                    "caller_request_id": { "type": "string" },
-                    "denied": { "type": "boolean" },
-                    "denial_code": { "type": "string", "enum": ["malformed_request_id","request_intent_mismatch","idempotency_in_flight","idempotency_replayed","idempotency_expired_reacquired","idempotency_replay_corrupt","idempotency_terminal_failure","operator_required","p083_operator_required","provider_session_not_found","run_not_found","stage_not_retryable","approval_not_actionable","side_effect_not_reconcilable","enforcement_mode_transition_denied","identity_ambiguous","internal"] },
-                    "message": { "type": "string", "description": "Human-readable denial message" }
-                }
-            })),
+            output_schema: Some(p083_lifecycle_output_schema()),
         },
         McpTool {
             name: "p083.set_enforcement_mode".to_string(),
@@ -434,21 +450,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
-            output_schema: Some(serde_json::json!({
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["committed"],
-                "properties": {
-                    "committed": { "type": "boolean", "description": "true when mode change was durably committed; false on denial" },
-                    "enforcement_mode": { "type": "string", "enum": ["disabled", "permissive", "enforce"] },
-                    "journal_id": { "type": "string" },
-                    "caller_request_id": { "type": "string" },
-                    "denied": { "type": "boolean" },
-                    "denial_code": { "type": "string", "enum": ["malformed_request_id","request_intent_mismatch","idempotency_in_flight","idempotency_replayed","idempotency_expired_reacquired","idempotency_replay_corrupt","idempotency_terminal_failure","operator_required","p083_operator_required","provider_session_not_found","run_not_found","stage_not_retryable","approval_not_actionable","side_effect_not_reconcilable","enforcement_mode_transition_denied","identity_ambiguous","internal"] },
-                    "message": { "type": "string", "description": "Human-readable denial message" }
-                }
-            })),
+            output_schema: Some(p083_lifecycle_output_schema()),
         },
         McpTool {
             name: "side_effects.force_reconcile".to_string(),
@@ -461,15 +463,15 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "type": "object",
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "additionalProperties": false,
-                "required": ["effect_id", "request_id", "decision_json"],
+                "required": ["side_effect_id", "decision_json", "caller_request_id"],
                 "properties": {
-                    "effect_id": {
+                    "side_effect_id": {
                         "type": "string",
                         "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
                         "maxLength": 36,
                         "description": "UUID of the side effect to force-reconcile"
                     },
-                    "request_id": {
+                    "caller_request_id": {
                         "type": "string",
                         "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                         "description": "CallerRequestId: lowercase UUIDv4 for command_idempotency_contract_v1"
@@ -481,21 +483,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     }
                 }
             }),
-            output_schema: Some(serde_json::json!({
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["reconciled"],
-                "properties": {
-                    "reconciled": { "type": "boolean", "description": "true when force-reconcile was durably committed; false on denial" },
-                    "effect_id": { "type": "string" },
-                    "journal_id": { "type": "string" },
-                    "request_id": { "type": "string" },
-                    "denied": { "type": "boolean" },
-                    "denial_code": { "type": "string", "enum": ["malformed_request_id","request_intent_mismatch","idempotency_in_flight","idempotency_replayed","idempotency_expired_reacquired","idempotency_replay_corrupt","idempotency_terminal_failure","operator_required","p083_operator_required","provider_session_not_found","run_not_found","stage_not_retryable","approval_not_actionable","side_effect_not_reconcilable","enforcement_mode_transition_denied","identity_ambiguous","internal"] },
-                    "message": { "type": "string", "description": "Human-readable denial or error message" }
-                }
-            })),
+            output_schema: Some(p083_lifecycle_output_schema()),
         },
         McpTool {
             name: "runs.retry".to_string(),
@@ -508,34 +496,20 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "type": "object",
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "additionalProperties": false,
-                "required": ["run_id", "request_id"],
+                "required": ["run_id", "caller_request_id"],
                 "properties": {
                     "run_id": {
                         "type": "string",
                         "description": "UUID of the run to retry"
                     },
-                    "request_id": {
+                    "caller_request_id": {
                         "type": "string",
                         "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                         "description": "CallerRequestId: lowercase UUIDv4 for command_idempotency_contract_v1"
                     }
                 }
             }),
-            output_schema: Some(serde_json::json!({
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["queued"],
-                "properties": {
-                    "queued": { "type": "boolean", "description": "true when AdvanceRun work item was durably enqueued; false on denial" },
-                    "run_id": { "type": "string" },
-                    "journal_id": { "type": "string" },
-                    "request_id": { "type": "string" },
-                    "denied": { "type": "boolean" },
-                    "denial_code": { "type": "string", "enum": ["malformed_request_id","request_intent_mismatch","idempotency_in_flight","idempotency_replayed","idempotency_expired_reacquired","idempotency_replay_corrupt","idempotency_terminal_failure","operator_required","p083_operator_required","provider_session_not_found","run_not_found","stage_not_retryable","approval_not_actionable","side_effect_not_reconcilable","enforcement_mode_transition_denied","identity_ambiguous","internal"] },
-                    "message": { "type": "string", "description": "Human-readable denial or error message" }
-                }
-            })),
+            output_schema: Some(p083_lifecycle_output_schema()),
         },
         McpTool {
             name: "provider_session.mark_process_absent".to_string(),
@@ -548,7 +522,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "type": "object",
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "additionalProperties": false,
-                "required": ["provider_session_id", "cancellation_epoch", "request_id"],
+                "required": ["provider_session_id", "cancellation_epoch", "caller_request_id"],
                 "properties": {
                     "provider_session_id": {
                         "type": "string",
@@ -558,29 +532,14 @@ pub fn tool_specs() -> Vec<McpTool> {
                         "type": "integer",
                         "description": "Epoch ms of the held cancellation intent; prevents stale confirmations"
                     },
-                    "request_id": {
+                    "caller_request_id": {
                         "type": "string",
                         "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                         "description": "CallerRequestId: lowercase UUIDv4 for command_idempotency_contract_v1"
                     }
                 }
             }),
-            output_schema: Some(serde_json::json!({
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["marked_absent"],
-                "properties": {
-                    "marked_absent": { "type": "boolean", "description": "true when process_fate set to absent_verified and intent re-opened" },
-                    "provider_session_id": { "type": "string" },
-                    "cancellation_epoch": { "type": "integer" },
-                    "journal_id": { "type": "string", "description": "Command journal entry ID for auditability" },
-                    "request_id": { "type": "string", "description": "Replayed CallerRequestId for idempotency confirmation" },
-                    "denied": { "type": "boolean" },
-                    "denial_code": { "type": "string", "enum": ["malformed_request_id","request_intent_mismatch","idempotency_in_flight","idempotency_replayed","idempotency_expired_reacquired","idempotency_replay_corrupt","idempotency_terminal_failure","operator_required","p083_operator_required","provider_session_not_found","run_not_found","stage_not_retryable","approval_not_actionable","side_effect_not_reconcilable","enforcement_mode_transition_denied","identity_ambiguous","internal"] },
-                    "message": { "type": "string" }
-                }
-            })),
+            output_schema: Some(p083_lifecycle_output_schema()),
         },
     ]
 }
@@ -811,13 +770,11 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
                 .parse()?;
-            // P083 command_idempotency_contract_v1: request_id is the canonical UUIDv4
-            // CallerRequestId. P082/P081 clients may still submit idempotency_key; preserve
-            // the legacy preflight error so missing-key calls fail before any mutation.
-            let request_id = params["request_id"]
+            // P083 command_idempotency_contract_v1: caller_request_id is the public
+            // CallerRequestId field. Internally it is persisted as command_journal.request_id.
+            let request_id = params["caller_request_id"]
                 .as_str()
-                .or_else(|| params["idempotency_key"].as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
+                .ok_or_else(|| anyhow::anyhow!("Missing 'caller_request_id'"))?
                 .to_string();
             validate_caller_request_id(&request_id)?;
             // SEC-P083-MED-003: stamp the validated CallerRequestId into CallerContext so
@@ -827,12 +784,8 @@ pub async fn execute(
                 run_id,
                 request_id: Some(request_id.clone()),
             });
-            let commanded = cmd_handler.handle(cmd, caller).await?;
-            Ok(serde_json::json!({
-                "cancelled": true,
-                "request_id": request_id,
-                "journal_id": commanded.journal_id,
-            }))
+            cmd_handler.handle(cmd, caller).await?;
+            Ok(p083_lifecycle_success(&request_id, &request_id))
         }
 
         "runs.main_sync.request" => {
@@ -1237,25 +1190,24 @@ pub async fn execute(
         "provider_session.shutdown" => {
             // P083: requires operator principal
             if !matches!(principal.class, auth::PrincipalClass::Operator) {
-                return Ok(serde_json::json!({
-                    "scheduled": false,
-                    "denied": true,
-                    "denial_code": "p083_operator_required",
-                    "message": "provider_session.shutdown requires operator principal class"
-                }));
+                return Ok(p083_lifecycle_denial(
+                    "principal_class_not_allowed",
+                    "provider_session.shutdown requires operator principal class",
+                    None,
+                ));
             }
             let provider_session_id = params["provider_session_id"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'provider_session_id'"))?
                 .to_string();
-            let request_id = params["request_id"]
+            let request_id = params["caller_request_id"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'request_id'"))?
+                .ok_or_else(|| anyhow::anyhow!("Missing 'caller_request_id'"))?
                 .to_string();
             validate_caller_request_id(&request_id)?;
             let reason = params["reason"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
+                .unwrap_or("operator_requested_provider_session_shutdown")
                 .to_string();
             validate_p083_reason(&reason, 1024)?;
             // SEC-P083-MED-003: stamp the validated CallerRequestId into CallerContext so
@@ -1274,38 +1226,14 @@ pub async fn execute(
                 .await?;
             match commanded.result {
                 engine::command_handler::CommandResult::ProviderSessionShutdownRecorded {
-                    provider_session_id: ps_id,
-                    journal_id,
                     idempotency_request_id,
-                    cancellation_epoch,
-                    dispatched_count,
-                } => Ok(serde_json::json!({
-                    "scheduled": dispatched_count > 0,
-                    "dispatch_state": "signal_dispatched",
-                    "dispatched_count": dispatched_count,
-                    "provider_session_id": ps_id,
-                    "cancellation_epoch": cancellation_epoch,
-                    "journal_id": journal_id,
-                    "request_id": idempotency_request_id,
-                    "operator_next_step_code": null
-                })),
+                    ..
+                } => Ok(p083_lifecycle_success(&request_id, &idempotency_request_id)),
                 // SEC-P083-HIGH-001: process_id was null at command time; intent is held.
                 engine::command_handler::CommandResult::ProviderSessionShutdownHeld {
-                    provider_session_id: ps_id,
-                    journal_id,
                     idempotency_request_id,
-                    cancellation_epoch,
-                    operator_next_step_code,
-                } => Ok(serde_json::json!({
-                    "scheduled": false,
-                    "dispatch_state": "held_identity_ambiguous",
-                    "dispatched_count": 0,
-                    "provider_session_id": ps_id,
-                    "cancellation_epoch": cancellation_epoch,
-                    "journal_id": journal_id,
-                    "request_id": idempotency_request_id,
-                    "operator_next_step_code": operator_next_step_code
-                })),
+                    ..
+                } => Ok(p083_lifecycle_success(&request_id, &idempotency_request_id)),
                 _ => Err(anyhow::anyhow!(
                     "Unexpected result from ShutdownProviderSession"
                 )),
@@ -1313,26 +1241,30 @@ pub async fn execute(
         }
 
         "p083.rollback_execution" => {
+            if let Some(denial) = validate_p083_rollback_execution_params(&params) {
+                return Ok(denial);
+            }
             if !matches!(principal.class, auth::PrincipalClass::Operator) {
-                return Ok(serde_json::json!({
-                    "committed": false,
-                    "denied": true,
-                    "denial_code": "p083_operator_required",
-                    "message": "p083.rollback_execution requires operator principal class"
-                }));
+                return Ok(p083_lifecycle_denial(
+                    "principal_class_not_allowed",
+                    "p083.rollback_execution requires operator principal class",
+                    None,
+                ));
             }
             let request_id = params["caller_request_id"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'caller_request_id'"))?
+                .expect("validated by validate_p083_rollback_execution_params")
                 .to_string();
-            validate_caller_request_id(&request_id)?;
+            if let Err(err) = validate_caller_request_id(&request_id) {
+                return Ok(p083_mcp_denial(
+                    P083LifecycleDenialCode::MalformedRequestId,
+                    &format!("caller_request_id must be lowercase UUIDv4: {err}"),
+                ));
+            }
             let target_enforcement_mode = params["target_enforcement_mode"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'target_enforcement_mode'"))?
+                .expect("validated by validate_p083_rollback_execution_params")
                 .to_string();
-            if !matches!(target_enforcement_mode.as_str(), "permissive" | "disabled") {
-                anyhow::bail!("target_enforcement_mode must be 'permissive' or 'disabled'");
-            }
             // SEC-P083-MED-003: stamp the validated CallerRequestId into CallerContext.
             let caller = mcp_caller(&principal, "p083.rollback_execution")
                 .with_request_id(request_id.clone());
@@ -1348,15 +1280,9 @@ pub async fn execute(
                 .await?;
             match commanded.result {
                 engine::command_handler::CommandResult::P083RollbackExecutionScheduled {
-                    rollback_mode: rm,
-                    journal_id,
                     idempotency_request_id,
-                } => Ok(serde_json::json!({
-                    "committed": true,
-                    "target_enforcement_mode": rm,
-                    "journal_id": journal_id,
-                    "caller_request_id": idempotency_request_id
-                })),
+                    ..
+                } => Ok(p083_lifecycle_success(&request_id, &idempotency_request_id)),
                 _ => Err(anyhow::anyhow!(
                     "Unexpected result from P083RollbackExecution"
                 )),
@@ -1364,26 +1290,30 @@ pub async fn execute(
         }
 
         "p083.set_enforcement_mode" => {
+            if let Some(denial) = validate_p083_set_enforcement_mode_params(&params) {
+                return Ok(denial);
+            }
             if !matches!(principal.class, auth::PrincipalClass::Operator) {
-                return Ok(serde_json::json!({
-                    "committed": false,
-                    "denied": true,
-                    "denial_code": "p083_operator_required",
-                    "message": "p083.set_enforcement_mode requires operator principal class"
-                }));
+                return Ok(p083_lifecycle_denial(
+                    "principal_class_not_allowed",
+                    "p083.set_enforcement_mode requires operator principal class",
+                    None,
+                ));
             }
             let request_id = params["caller_request_id"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'caller_request_id'"))?
+                .expect("validated by validate_p083_set_enforcement_mode_params")
                 .to_string();
-            validate_caller_request_id(&request_id)?;
+            if let Err(err) = validate_caller_request_id(&request_id) {
+                return Ok(p083_mcp_denial(
+                    P083LifecycleDenialCode::MalformedRequestId,
+                    &format!("caller_request_id must be lowercase UUIDv4: {err}"),
+                ));
+            }
             let target_mode = params["target_mode"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'target_mode'"))?
+                .expect("validated by validate_p083_set_enforcement_mode_params")
                 .to_string();
-            if !matches!(target_mode.as_str(), "disabled" | "permissive" | "enforce") {
-                anyhow::bail!("target_mode must be 'disabled', 'permissive', or 'enforce'");
-            }
             // SEC-P083-MED-003: stamp the validated CallerRequestId into CallerContext.
             let caller = mcp_caller(&principal, "p083.set_enforcement_mode")
                 .with_request_id(request_id.clone());
@@ -1399,15 +1329,9 @@ pub async fn execute(
                 .await?;
             match commanded.result {
                 engine::command_handler::CommandResult::P083EnforcementModeSet {
-                    enforcement_mode: em,
-                    journal_id,
                     idempotency_request_id,
-                } => Ok(serde_json::json!({
-                    "committed": true,
-                    "enforcement_mode": em,
-                    "journal_id": journal_id,
-                    "caller_request_id": idempotency_request_id
-                })),
+                    ..
+                } => Ok(p083_lifecycle_success(&request_id, &idempotency_request_id)),
                 _ => Err(anyhow::anyhow!(
                     "Unexpected result from P083SetEnforcementMode"
                 )),
@@ -1416,16 +1340,15 @@ pub async fn execute(
 
         "runs.retry" => {
             if !matches!(principal.class, auth::PrincipalClass::Operator) {
-                return Ok(serde_json::json!({
-                    "queued": false,
-                    "denied": true,
-                    "denial_code": "operator_required",
-                    "message": "runs.retry requires operator principal class"
-                }));
+                return Ok(p083_lifecycle_denial(
+                    "principal_class_not_allowed",
+                    "runs.retry requires operator principal class",
+                    None,
+                ));
             }
-            let request_id = params["request_id"]
+            let request_id = params["caller_request_id"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'request_id'"))?
+                .ok_or_else(|| anyhow::anyhow!("Missing 'caller_request_id'"))?
                 .to_string();
             validate_caller_request_id(&request_id)?;
             let run_id = parse_run_id(&params)?;
@@ -1443,36 +1366,29 @@ pub async fn execute(
                 .await?;
             match commanded.result {
                 engine::command_handler::CommandResult::RunRetried {
-                    run_id: result_run_id,
-                    journal_id,
                     idempotency_request_id,
-                } => Ok(serde_json::json!({
-                    "queued": true,
-                    "run_id": result_run_id.to_string(),
-                    "journal_id": journal_id,
-                    "request_id": idempotency_request_id
-                })),
+                    ..
+                } => Ok(p083_lifecycle_success(&request_id, &idempotency_request_id)),
                 _ => Err(anyhow::anyhow!("Unexpected result from RetryRun")),
             }
         }
 
         "side_effects.force_reconcile" => {
             if !matches!(principal.class, auth::PrincipalClass::Operator) {
-                return Ok(serde_json::json!({
-                    "reconciled": false,
-                    "denied": true,
-                    "denial_code": "operator_required",
-                    "message": "side_effects.force_reconcile requires operator principal class"
-                }));
+                return Ok(p083_lifecycle_denial(
+                    "principal_class_not_allowed",
+                    "side_effects.force_reconcile requires operator principal class",
+                    None,
+                ));
             }
-            let request_id = params["request_id"]
+            let request_id = params["caller_request_id"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'request_id'"))?
+                .ok_or_else(|| anyhow::anyhow!("Missing 'caller_request_id'"))?
                 .to_string();
             validate_caller_request_id(&request_id)?;
-            let effect_id = params["effect_id"]
+            let effect_id = params["side_effect_id"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'effect_id'"))?
+                .ok_or_else(|| anyhow::anyhow!("Missing 'side_effect_id'"))?
                 .to_string();
             let decision_json = params["decision_json"]
                 .as_str()
@@ -1494,15 +1410,9 @@ pub async fn execute(
                 .await?;
             match commanded.result {
                 engine::command_handler::CommandResult::SideEffectForceReconciled {
-                    effect_id: result_effect_id,
-                    journal_id,
                     idempotency_request_id,
-                } => Ok(serde_json::json!({
-                    "reconciled": true,
-                    "effect_id": result_effect_id,
-                    "journal_id": journal_id,
-                    "request_id": idempotency_request_id
-                })),
+                    ..
+                } => Ok(p083_lifecycle_success(&request_id, &idempotency_request_id)),
                 _ => Err(anyhow::anyhow!(
                     "Unexpected result from ForceReconcileSideEffect"
                 )),
@@ -1512,12 +1422,11 @@ pub async fn execute(
         "provider_session.mark_process_absent" => {
             // P083: requires operator principal
             if !matches!(principal.class, auth::PrincipalClass::Operator) {
-                return Ok(serde_json::json!({
-                    "marked_absent": false,
-                    "denied": true,
-                    "denial_code": "p083_operator_required",
-                    "message": "provider_session.mark_process_absent requires operator principal class"
-                }));
+                return Ok(p083_lifecycle_denial(
+                    "principal_class_not_allowed",
+                    "provider_session.mark_process_absent requires operator principal class",
+                    None,
+                ));
             }
             let provider_session_id = params["provider_session_id"]
                 .as_str()
@@ -1526,9 +1435,9 @@ pub async fn execute(
             let cancellation_epoch = params["cancellation_epoch"]
                 .as_i64()
                 .ok_or_else(|| anyhow::anyhow!("Missing or invalid 'cancellation_epoch'"))?;
-            let request_id = params["request_id"]
+            let request_id = params["caller_request_id"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'request_id'"))?
+                .ok_or_else(|| anyhow::anyhow!("Missing 'caller_request_id'"))?
                 .to_string();
             validate_caller_request_id(&request_id)?;
             // SEC-P083-MED-003: stamp the validated CallerRequestId into CallerContext so
@@ -1549,17 +1458,9 @@ pub async fn execute(
                 .await?;
             match commanded.result {
                 engine::command_handler::CommandResult::ProviderSessionMarkedAbsent {
-                    provider_session_id: ps_id,
-                    cancellation_epoch: epoch,
-                    journal_id,
                     idempotency_request_id,
-                } => Ok(serde_json::json!({
-                    "marked_absent": true,
-                    "provider_session_id": ps_id,
-                    "cancellation_epoch": epoch,
-                    "journal_id": journal_id,
-                    "request_id": idempotency_request_id
-                })),
+                    ..
+                } => Ok(p083_lifecycle_success(&request_id, &idempotency_request_id)),
                 _ => Err(anyhow::anyhow!(
                     "Unexpected result from MarkProviderSessionProcessAbsent"
                 )),
@@ -2212,6 +2113,104 @@ fn validate_p083_reason(reason: &str, max_bytes: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn p083_mcp_denial(code: P083LifecycleDenialCode, message: &str) -> serde_json::Value {
+    p083_lifecycle_denial(code.as_str(), message, None)
+}
+
+fn p083_unknown_property_denial(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    allowed: &[&str],
+) -> Option<serde_json::Value> {
+    let mut unknown: Vec<&str> = obj
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !allowed.contains(key))
+        .collect();
+    unknown.sort_unstable();
+    unknown.first().map(|key| {
+        p083_mcp_denial(
+            P083LifecycleDenialCode::AdditionalPropertiesRejected,
+            &format!("additional property rejected: {key}"),
+        )
+    })
+}
+
+fn validate_p083_rollback_execution_params(
+    params: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let obj = match params.as_object() {
+        Some(obj) => obj,
+        None => {
+            return Some(p083_mcp_denial(
+                P083LifecycleDenialCode::SchemaInvalid,
+                "request arguments must be a JSON object",
+            ));
+        }
+    };
+    if let Some(denial) =
+        p083_unknown_property_denial(obj, &["target_enforcement_mode", "caller_request_id"])
+    {
+        return Some(denial);
+    }
+    match obj.get("caller_request_id").and_then(|v| v.as_str()) {
+        Some(_) => {}
+        None => {
+            return Some(p083_mcp_denial(
+                P083LifecycleDenialCode::MissingCallerRequestId,
+                "caller_request_id is required",
+            ));
+        }
+    }
+    match obj.get("target_enforcement_mode").and_then(|v| v.as_str()) {
+        Some("permissive" | "disabled") => None,
+        Some(_) => Some(p083_mcp_denial(
+            P083LifecycleDenialCode::RollbackTargetInvalid,
+            "target_enforcement_mode must be 'permissive' or 'disabled'",
+        )),
+        None => Some(p083_mcp_denial(
+            P083LifecycleDenialCode::RollbackTargetRequired,
+            "target_enforcement_mode is required",
+        )),
+    }
+}
+
+fn validate_p083_set_enforcement_mode_params(
+    params: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let obj = match params.as_object() {
+        Some(obj) => obj,
+        None => {
+            return Some(p083_mcp_denial(
+                P083LifecycleDenialCode::SchemaInvalid,
+                "request arguments must be a JSON object",
+            ));
+        }
+    };
+    if let Some(denial) = p083_unknown_property_denial(obj, &["target_mode", "caller_request_id"]) {
+        return Some(denial);
+    }
+    match obj.get("caller_request_id").and_then(|v| v.as_str()) {
+        Some(_) => {}
+        None => {
+            return Some(p083_mcp_denial(
+                P083LifecycleDenialCode::MissingCallerRequestId,
+                "caller_request_id is required",
+            ));
+        }
+    }
+    match obj.get("target_mode").and_then(|v| v.as_str()) {
+        Some("disabled" | "permissive" | "enforce") => None,
+        Some(_) => Some(p083_mcp_denial(
+            P083LifecycleDenialCode::LifecycleStateInvalid,
+            "target_mode must be 'disabled', 'permissive', or 'enforce'",
+        )),
+        None => Some(p083_mcp_denial(
+            P083LifecycleDenialCode::LifecycleStateInvalid,
+            "target_mode is required",
+        )),
+    }
+}
+
 /// SEC-001: Validate that a caller-supplied filesystem path does not contain path traversal
 /// sequences, null bytes, or Windows-style separators that could escape the intended root.
 /// This is a defense-in-depth check; canonicalization and server-side authorization are the
@@ -2536,6 +2535,90 @@ mod tests {
 
     fn test_principal() -> auth::Principal {
         auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
+    }
+
+    async fn command_journal_count(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM command_journal")
+            .fetch_one(pool)
+            .await
+            .expect("count command_journal")
+    }
+
+    #[tokio::test]
+    async fn p083_mcp_rollback_rejects_unknown_property_before_command_journal() {
+        let pool = test_pool().await;
+        let handler = make_command_handler(pool.clone());
+        let result = execute(
+            "p083.rollback_execution",
+            serde_json::json!({
+                "target_enforcement_mode": "disabled",
+                "caller_request_id": "11111111-1111-4111-8111-111111111111",
+                "unexpected": true
+            }),
+            &pool,
+            &handler,
+            &test_principal(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["status"], serde_json::json!("denied"));
+        assert_eq!(
+            result["denial"]["code"],
+            serde_json::json!("additional_properties_rejected")
+        );
+        assert_eq!(command_journal_count(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn p083_mcp_rollback_rejects_invalid_target_before_command_journal() {
+        let pool = test_pool().await;
+        let handler = make_command_handler(pool.clone());
+        let result = execute(
+            "p083.rollback_execution",
+            serde_json::json!({
+                "target_enforcement_mode": "enforce",
+                "caller_request_id": "22222222-2222-4222-8222-222222222222"
+            }),
+            &pool,
+            &handler,
+            &test_principal(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["status"], serde_json::json!("denied"));
+        assert_eq!(
+            result["denial"]["code"],
+            serde_json::json!("rollback_target_invalid")
+        );
+        assert_eq!(command_journal_count(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn p083_mcp_set_enforcement_rejects_unknown_property_before_command_journal() {
+        let pool = test_pool().await;
+        let handler = make_command_handler(pool.clone());
+        let result = execute(
+            "p083.set_enforcement_mode",
+            serde_json::json!({
+                "target_mode": "permissive",
+                "caller_request_id": "33333333-3333-4333-8333-333333333333",
+                "extra": "ignored-before-fix"
+            }),
+            &pool,
+            &handler,
+            &test_principal(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["status"], serde_json::json!("denied"));
+        assert_eq!(
+            result["denial"]["code"],
+            serde_json::json!("additional_properties_rejected")
+        );
+        assert_eq!(command_journal_count(&pool).await, 0);
     }
 
     async fn persist_blocked_implementation_summary(pool: &SqlitePool, run_id: RunId) {

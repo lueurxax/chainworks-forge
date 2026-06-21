@@ -38,6 +38,7 @@ fn display_mode(raw: &str) -> String {
     match raw {
         "live_handle_continuation" => "Live Handle Continuation".to_string(),
         "provider_session_resurrection" => "Provider Session Resurrection".to_string(),
+        "output_only_recovery" => "Output Only Recovery".to_string(),
         _ => format!("UNKNOWN({raw})"),
     }
 }
@@ -78,6 +79,7 @@ pub struct GqlContinuationRecord {
 
     pub failure_reason: Option<String>,
     pub reconciliation_status: Option<String>,
+    pub resurrection_phase: Option<String>,
 
     pub request_fingerprint_sha256: String,
     pub canonical_request_artifact_id: Option<ID>,
@@ -125,6 +127,7 @@ impl From<ContinuationRecord> for GqlContinuationRecord {
             is_terminal,
             failure_reason: r.failure_reason,
             reconciliation_status: r.reconciliation_status,
+            resurrection_phase: r.resurrection_phase,
             request_fingerprint_sha256: r.request_fingerprint_sha256,
             canonical_request_artifact_id: r.canonical_request_artifact_id.map(Into::into),
             attach_receipt_artifact_id: r.attach_receipt_artifact_id.map(Into::into),

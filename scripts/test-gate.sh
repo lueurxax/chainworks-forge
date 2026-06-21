@@ -9,6 +9,7 @@ else
 fi
 if [[ -f "$ROOT_DIR/scripts/cargo-cache-env.sh" ]]; then
   CHAINWORKS_CARGO_CACHE_REPO_ROOT="$ROOT_DIR"
+  CHAINWORKS_CARGO_WRAPPER=0
   # shellcheck source=scripts/cargo-cache-env.sh
   source "$ROOT_DIR/scripts/cargo-cache-env.sh"
 fi
@@ -72,6 +73,7 @@ UNSIGNED_BUILD_ARGS=(
   CODE_SIGNING_ALLOWED=NO
   CODE_SIGNING_REQUIRED=NO
   CODE_SIGN_IDENTITY=
+  ENABLE_DEBUG_DYLIB=NO
 )
 
 P077_ROLLOUT_EVIDENCE_PATH="docs/reference/p077-rollout-dependency-evidence.md"
@@ -246,7 +248,7 @@ PROPOSAL_093_TESTS=(
 )
 
 PROPOSAL_086_SWIFT_TESTS=(
-  "Chainworks ForgeTests/Proposal031ThinGraphQLReadBoundaryTests"
+  "Chainworks ForgeTests/Proposal086ContinuationReadbackTests"
 )
 
 PROPOSAL_079_SWIFT_TESTS=(
@@ -330,6 +332,7 @@ PROPOSAL_080_RUST_TESTS=(
   "db p080_redaction_catches_embedded_secret_matrix"
   "db p080_dedup_entry_roundtrip"
   "db p080_insert_reconciliation_event_basic"
+  "db p080_repair_idempotency_key_uses_daemon_hmac_tuple"
   "db p080_live_loop_repair_path_stale_suspected_to_repaired"
   "db p080_seed_rollout_control_partial_rows_fail_closed"
   "db p080_validate_rollout_control_completeness_pass"
@@ -342,6 +345,7 @@ PROPOSAL_080_RUST_TESTS=(
   "mcp-server p080_tools_list_omits_codex_aliases_when_rollout_control_unreadable"
   "mcp-server p080_codex_alias_names_are_identified_for_rollout_fail_closed_filtering"
   "mcp-server p080_clear_permanent_hold_uses_p080_specific_dedup_not_generic_precheck"
+  "mcp-server p080_tool_specs_publish_closed_input_output_error_schemas"
   "mcp-server p080_diagnostics_get_returns_rollout_disabled_in_phase_0"
   "mcp-server p080_diagnostics_get_returns_empty_page_when_detection_only_enabled"
   "mcp-server p080_diagnostics_get_cursor_pages_forward"
@@ -350,13 +354,16 @@ PROPOSAL_080_RUST_TESTS=(
   "mcp-server p080_diagnostics_get_rejects_invalid_filter_instead_of_broadening"
   "mcp-server p080_schema_version_required_returns_error"
   "mcp-server p080_reconcile_diagnose_only_returns_diagnosed"
+  "mcp-server p080_diagnose_only_preserves_public_safe_hash_and_repair_key"
   "mcp-server p080_reconcile_request_rejects_unknown_nested_target_field"
   "mcp-server p080_reconcile_repair_if_safe_returns_rollout_disabled"
   "mcp-server p080_diagnose_only_rejects_dedup_key"
   "mcp-server p080_clear_permanent_hold_returns_action_disabled"
   "mcp-server p080_repair_if_safe_rollout_disabled_returns_rollout_disabled"
   "mcp-server p080_repair_if_safe_rollout_enabled_stale_returns_diagnosed"
+  "mcp-server p080_repair_if_safe_phase2_requeues_acp_startup_stale"
   "mcp-server p080_repair_if_safe_dedup_replay_returns_same_response"
+  "mcp-server p080_repair_if_safe_dedup_conflict_returns_idempotency_conflict"
   "mcp-server p080_dedup_repair_phase1_returns_rollout_disabled"
   "mcp-server p080_diagnostics_get_is_read_only"
   "mcp-server p080_repair_if_safe_phase1_rollout_disabled_before_fence_check"
@@ -1272,6 +1279,7 @@ should_use_adhoc_ui_tests() {
 append_xcodebuild_signing_args() {
   local gate_name="${1:-}"
   local includes_ui="${2:-0}"
+  local hosted_tests="${3:-0}"
 
   if [[ "$includes_ui" == "1" ]] && should_use_adhoc_ui_tests; then
     printf '%s\0' \
@@ -1280,6 +1288,11 @@ append_xcodebuild_signing_args() {
       CODE_SIGN_IDENTITY=- \
       CODE_SIGN_STYLE=Manual \
       DEVELOPMENT_TEAM=
+    return 0
+  fi
+
+  if [[ "$hosted_tests" == "1" && "${CHAINWORKS_USE_UNSIGNED_HOSTED_TESTS:-0}" != "1" ]]; then
+    printf '%s\0' ENABLE_DEBUG_DYLIB=NO
     return 0
   fi
 
@@ -2248,7 +2261,7 @@ run_targeted_tests() {
 
   while IFS= read -r -d '' arg; do
     signing_args+=("$arg")
-  done < <(append_xcodebuild_signing_args "$gate_name" "$includes_ui")
+  done < <(append_xcodebuild_signing_args "$gate_name" "$includes_ui" "1")
 
   if [[ $includes_ui -eq 0 ]]; then
     cmd+=("-resultBundlePath" "$result_bundle")
@@ -2418,7 +2431,12 @@ PY
       log "Result bundle: $derived_result"
     fi
   else
-    "${cmd[@]}"
+    "${cmd[@]}" | tee "$log_path"
+    if grep -q "Executed 0 tests" "$log_path" \
+      && ! grep -Eq "Executed [1-9][0-9]* tests?|Test run with [1-9][0-9]* tests?" "$log_path"; then
+      die "Test gate $gate_name executed 0 tests"
+    fi
+    log "xcodebuild log: $log_path"
     log "Result bundle: $result_bundle"
   fi
 
@@ -7215,6 +7233,80 @@ PY
         echo "FAIL: migration must not admit 'agent' in ck_p080_dedup_principal_class"
         exit 1
       fi
+      python3 - "$ROOT_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+contract_root = root / "docs/evidence/rollout-contract"
+operator_fixture = contract_root / "operator-readback/p080-full-surface.fixture.json"
+negative_fixtures = sorted((contract_root / "negative").glob("p080-*.json"))
+negative_contract_fixtures = []
+rollout_evidence = sorted((root / "docs/evidence/rollout/p080").glob("*.json"))
+placeholder_markers = (
+    "placeholder",
+    "pending_implementation",
+    "must_be_replaced",
+    "declared_fixture_placeholder",
+    "placeholder_fixture_kind",
+)
+
+errors = []
+
+if not operator_fixture.exists():
+    errors.append(f"missing required operator readback fixture: {operator_fixture.relative_to(root)}")
+if not rollout_evidence:
+    errors.append("missing P080 rollout evidence JSON under docs/evidence/rollout/p080")
+
+def load_json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except Exception as exc:
+        errors.append(f"invalid JSON in {path.relative_to(root)}: {exc}")
+        return None
+
+for path in [operator_fixture, *negative_fixtures, *rollout_evidence]:
+    if not path.exists():
+        continue
+    text = path.read_text()
+    data = load_json(path)
+    if any(marker in text for marker in placeholder_markers):
+        errors.append(f"fixture still contains placeholder evidence: {path.relative_to(root)}")
+    if path == operator_fixture and data is not None:
+        lanes = data.get("parity_lanes")
+        if not isinstance(lanes, dict):
+            errors.append(f"operator readback fixture lacks parity_lanes object: {path.relative_to(root)}")
+        else:
+            for lane in ("graphql", "mcp", "release_receipt"):
+                if lane not in lanes:
+                    errors.append(f"operator readback fixture lacks {lane} lane: {path.relative_to(root)}")
+    elif path in negative_fixtures and data is not None:
+        is_contract_fixture = (
+            data.get("schema_version") == "rollout_contract_v1"
+            or "placeholder_fixture_kind" in data
+        )
+        if not is_contract_fixture:
+            continue
+        negative_contract_fixtures.append(path)
+        if data.get("schema_version") != "rollout_contract_v1":
+            errors.append(f"negative fixture has wrong schema_version: {path.relative_to(root)}")
+        if not {"proposal-080", "p080"}.issubset(set(data.get("gate_aliases", []))):
+            errors.append(f"negative fixture does not bind both P080 gate aliases: {path.relative_to(root)}")
+
+if len(negative_contract_fixtures) < 20:
+    errors.append(
+        "missing required P080 negative rollout-contract fixture inventory "
+        f"(found {len(negative_contract_fixtures)}, expected at least 20)"
+    )
+
+if errors:
+    for error in errors:
+        print(f"proposal-080: FAIL — {error}")
+    raise SystemExit(1)
+
+print("proposal-080: rollout fixture and evidence inventory verified")
+PY
       cargo build -p db -p mcp-server -p graphql-server 2>&1
       tmp_log="$(mktemp)"
       for spec in "${PROPOSAL_080_RUST_TESTS[@]}"; do
@@ -8103,14 +8195,50 @@ if (root / "control-plane/crates/db/migrations/079_p079_output_contract_repair.s
 
 required_refs = [
     "docs/reference/output-contracts-failure-evidence-and-recovery.md",
+    "docs/reference/p079-repair-prompt-template.md",
+    "docs/reference/p079-recovery-attribution.md",
+    "docs/reference/p079-adapter-idempotency.md",
     "docs/reference/test-gates.md",
 ]
 for rel in required_refs:
     if not (root / rel).exists():
         fail(f"missing reference doc {rel}")
 
+reference_expectations = {
+    "docs/reference/p079-repair-prompt-template.md": [
+        "p079_repair_v1",
+        "<<<UNTRUSTED_VALIDATOR_ERROR>>>",
+        "[redacted:injection_marker]",
+        "Production providers remain fail-closed",
+    ],
+    "docs/reference/p079-recovery-attribution.md": [
+        "CHAINWORKS_P079_TRANSCRIPT_RECOVERY_ENABLED",
+        "DiscoveredArtifactSourceKind::ProviderEnvelope",
+        "oversized_payload",
+        "attribution_not_verified",
+    ],
+    "docs/reference/p079-adapter-idempotency.md": [
+        "output_contract_repair_leases",
+        "output_contract_repair_fallback_parent_links",
+        "reserved -> prompt_sent",
+        "advisory posture cannot",
+    ],
+}
+for rel, terms in reference_expectations.items():
+    text = (root / rel).read_text()
+    for term in terms:
+        if term not in text:
+            fail(f"{rel} missing {term!r}")
+
 test_gates = (root / "docs/reference/test-gates.md").read_text()
-for term in ["proposal-079|p079", "p079-swift-readback", "Proposal079ContractRepairReadbackTests"]:
+for term in [
+    "proposal-079|p079",
+    "p079-swift-readback",
+    "Proposal079ContractRepairReadbackTests",
+    "p079-repair-prompt-template.md",
+    "p079-recovery-attribution.md",
+    "p079-adapter-idempotency.md",
+]:
     if term not in test_gates:
         fail(f"docs/reference/test-gates.md missing {term!r}")
 
@@ -8135,26 +8263,72 @@ for term in [
     if term not in executor:
         fail(f"engine executor.rs missing {term!r}")
 
+metrics = (root / "control-plane/crates/db/src/metrics.rs").read_text()
+for term in [
+    "P079_REQUIRED_METRICS",
+    "p079_output_repair_attempt_total",
+    "p079_repair_transport_outcome_total",
+    "p079_transcript_recovery_total",
+    "p079_provider_fallback_attempt_total",
+    "p079_eligible_output_failures_recovered_percent",
+    "proposal_079_required_metric_names_are_declared_and_recordable",
+    "record_p079_output_repair_attempt(",
+    "record_p079_repair_terminal(",
+    "record_p079_transcript_recovery(",
+]:
+    if term not in metrics:
+        fail(f"db metrics.rs missing {term!r}")
+
+repair_repo = (root / "control-plane/crates/db/src/repos/output_contract_repair.rs").read_text()
+for term in [
+    "record_p079_output_repair_attempt(",
+    "record_p079_repair_terminal(",
+    "record_p079_repair_lease(",
+    "record_p079_transcript_recovery(",
+    "proposal_079_repair_repo_emits_operational_metrics",
+]:
+    if term not in repair_repo:
+        fail(f"db output_contract_repair.rs missing {term!r}")
+
 for rel in [
     "Chainworks Forge/Engine/Readback/OutputContractRepair/OutputContractRepairEvidence.swift",
     "Chainworks Forge/Engine/Readback/OutputContractRepair/OutputContractRepairPresenter.swift",
     "Chainworks ForgeTests/Proposal079ContractRepairReadbackTests.swift",
+    "Chainworks Forge/Views/RunInspectorView.swift",
 ]:
     if not (root / rel).exists():
         fail(f"missing Swift readback file {rel}")
+
+inspector = (root / "Chainworks Forge/Views/RunInspectorView.swift").read_text()
+for term in [
+    'GroupBox("Status")',
+    'GroupBox("Evidence")',
+    'GroupBox("Authority")',
+    'Button("Copy Path")',
+    'Button("Reveal in Finder")',
+    "activateFileViewerSelecting",
+]:
+    if term not in inspector:
+        fail(f"RunInspectorView.swift missing P079 inspector affordance {term!r}")
 
 print("proposal-079 static checks passed")
 PY
     (
       cd "$ROOT_DIR/control-plane"
-      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p domain output_contract_repair -- --nocapture
-      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p db output_contract_repair -- --nocapture
-      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p db --test proposal_079_output_contract_repair -- --nocapture
-      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p engine --lib p079 -- --nocapture
-      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p engine --test integration invoke_agent_repairs_missing_required_output_in_same_live_session -- --nocapture
-      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p acp p079 -- --nocapture
-      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p graphql-server p079 -- --nocapture
-      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p mcp-server p079 -- --nocapture
+      unset RUSTC_WRAPPER
+      P079_CARGO="${CHAINWORKS_REAL_CARGO:-cargo}"
+      P079_CARGO_TARGET_DIR="${CHAINWORKS_PROPOSAL_079_CARGO_TARGET_DIR:-target/proposal-079-gate}"
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p domain output_contract_repair -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p db proposal_079_required_metric_names_are_declared_and_recordable -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p db output_contract_repair -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p db --test proposal_079_output_contract_repair -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p engine --lib p079 -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p engine --test integration invoke_agent_repairs_missing_required_output_in_same_live_session -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p acp --lib p079 -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p acp --test integration p079 -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p graphql-server --lib p079 -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p mcp-server --lib p079 -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p mcp-server --test proposal_058_runtime_facts p079_sec -- --nocapture
     )
     run_targeted_tests "p079-swift-readback" "${PROPOSAL_079_SWIFT_TESTS[@]}"
     log "Proposal 079 contract-aware output repair gate passed"
@@ -9367,6 +9541,28 @@ PY
     ;;
   proposal-083|p083)
     log "Proposal 083 gate: execution-truth ownership — migrations, repos, metrics, engine, and rollback-disposition validation"
+    python3 - "$ROOT_DIR" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+proposal = root / "docs/proposals/083-execution-truth-ownership-invariant-model.md"
+text = proposal.read_text()
+declared_paths = sorted(
+    set(re.findall(r"docs/evidence/[^\"' )\],}]+", text))
+)
+missing = [path for path in declared_paths if not (root / path).exists()]
+if missing:
+    print(
+        "proposal-083: FAIL — declared evidence corpus is incomplete "
+        f"({len(missing)} missing of {len(declared_paths)} declared paths)"
+    )
+    for path in missing:
+        print(f"proposal-083: missing evidence path: {path}")
+    raise SystemExit(1)
+print(f"proposal-083: declared evidence corpus verified ({len(declared_paths)} paths)")
+PY
     (
       cd "$ROOT_DIR/control-plane"
       # DB layer: migration integration tests and P083 bounded-metric unit tests
@@ -9379,7 +9575,10 @@ PY
       CARGO_TARGET_DIR=target/proposal-083-gate cargo check -p daemon &&
       # GraphQL/MCP layer: rollback disposition validation and schema compile check
       CARGO_TARGET_DIR=target/proposal-083-gate cargo check -p graphql-server &&
-      CARGO_TARGET_DIR=target/proposal-083-gate cargo check -p mcp-server
+      CARGO_TARGET_DIR=target/proposal-083-gate cargo check -p mcp-server &&
+      CARGO_TARGET_DIR=target/proposal-083-gate cargo test -p domain p083_lifecycle_denial_code_all_round_trip_as_str -- --nocapture &&
+      CARGO_TARGET_DIR=target/proposal-083-gate cargo test -p graphql-server approval_mutations -- --nocapture &&
+      CARGO_TARGET_DIR=target/proposal-083-gate cargo test -p mcp-server p083_mcp_ -- --nocapture
     )
     "$ROOT_DIR/scripts/lint-rollout-contract" "$ROOT_DIR/docs/evidence/083/rollout-contract-v1.json"
     python3 - "$ROOT_DIR" <<'PY'
@@ -9475,6 +9674,84 @@ print("proposal-083: durable monotonic baseline correlation verified")
 # Verify R70 rollback target contract is the public GraphQL/MCP shape and the
 # durable idempotency intent excludes diagnostic reason text.
 runs_rs = (root / "control-plane/crates/mcp-server/src/tools/runs.rs").read_text()
+stages_rs = (root / "control-plane/crates/mcp-server/src/tools/stages.rs").read_text()
+approvals_rs = (root / "control-plane/crates/mcp-server/src/tools/approvals.rs").read_text()
+proposal_text = (root / "docs/proposals/083-execution-truth-ownership-invariant-model.md").read_text()
+for schema_path in [
+    "docs/reference/mcp/p083/runs.cancel.input.schema.json",
+    "docs/reference/mcp/p083/runs.cancel.output.schema.json",
+    "docs/reference/mcp/p083/runs.retry.input.schema.json",
+    "docs/reference/mcp/p083/runs.retry.output.schema.json",
+    "docs/reference/mcp/p083/stages.retry.input.schema.json",
+    "docs/reference/mcp/p083/stages.retry.output.schema.json",
+    "docs/reference/mcp/p083/approvals.resolve.input.schema.json",
+    "docs/reference/mcp/p083/approvals.resolve.output.schema.json",
+    "docs/reference/mcp/p083/side_effects.force_reconcile.input.schema.json",
+    "docs/reference/mcp/p083/side_effects.force_reconcile.output.schema.json",
+    "docs/reference/mcp/p083/provider_session.shutdown.input.schema.json",
+    "docs/reference/mcp/p083/provider_session.shutdown.output.schema.json",
+    "docs/reference/mcp/p083/provider_session.mark_process_absent.input.schema.json",
+    "docs/reference/mcp/p083/provider_session.mark_process_absent.output.schema.json",
+    "docs/reference/mcp/p083/p083.rollback_execution.input.schema.json",
+    "docs/reference/mcp/p083/p083.rollback_execution.output.schema.json",
+    "docs/reference/mcp/p083/p083.set_enforcement_mode.input.schema.json",
+    "docs/reference/mcp/p083/p083.set_enforcement_mode.output.schema.json",
+]:
+    if not (root / schema_path).exists():
+        raise SystemExit(f"proposal-083: MCP lifecycle schema missing {schema_path}")
+for term in [
+    '"provider_session.mark_process_absent"',
+    "provider_session.mark_process_absent.input.schema.json",
+    "provider_session.mark_process_absent.output.schema.json",
+]:
+    if term not in proposal_text:
+        raise SystemExit(f"proposal-083: proposal MCP inventory missing {term!r}")
+if 'name: "provider_session.mark_process_absent"' not in runs_rs:
+    raise SystemExit("proposal-083: runtime MCP inventory missing provider_session.mark_process_absent")
+for source_name, source, required_terms, forbidden_terms in [
+    ("runs.rs", runs_rs, [
+        '"required": ["run_id", "caller_request_id"]',
+        '"required": ["provider_session_id", "caller_request_id"]',
+        '"required": ["side_effect_id", "decision_json", "caller_request_id"]',
+        '"required": ["provider_session_id", "cancellation_epoch", "caller_request_id"]',
+        'params["caller_request_id"]',
+        'params["side_effect_id"]',
+    ], [
+        '"required": ["run_id", "request_id"]',
+        '"required": ["provider_session_id", "reason", "request_id"]',
+        '"required": ["effect_id", "request_id", "decision_json"]',
+        '"required": ["provider_session_id", "cancellation_epoch", "request_id"]',
+    ]),
+    ("stages.rs", stages_rs, [
+        '"required": ["stage_execution_id", "caller_request_id"]',
+        'params["stage_execution_id"]',
+        'params["caller_request_id"]',
+    ], [
+        '"required": ["run_id", "stage_id", "request_id"]',
+        'params["request_id"]',
+    ]),
+    ("approvals.rs", approvals_rs, [
+        '"required": ["approval_id", "resolution", "caller_request_id"]',
+        '"enum": ["approve", "reject"]',
+        'params["caller_request_id"]',
+    ], [
+        '"required": ["decision", "request_id"]',
+        'params["request_id"]',
+    ]),
+]:
+    for term in required_terms:
+        if term not in source:
+            raise SystemExit(f"proposal-083: MCP runtime {source_name} missing {term!r}")
+    for term in forbidden_terms:
+        if term in source:
+            raise SystemExit(f"proposal-083: MCP runtime {source_name} still exposes legacy {term!r}")
+for source_name, source in [
+    ("runs.rs", runs_rs),
+    ("stages.rs", stages_rs),
+    ("approvals.rs", approvals_rs),
+]:
+    if "p083_lifecycle_output_schema()" not in source:
+        raise SystemExit(f"proposal-083: MCP runtime {source_name} must use the shared P083 lifecycle output envelope")
 for term in [
     '"required": ["target_enforcement_mode", "caller_request_id"]',
     '"target_enforcement_mode"',
@@ -9492,13 +9769,59 @@ gql_schema = (root / "control-plane/crates/graphql-server/src/schema.rs").read_t
 for term in [
     "target_enforcement_mode: GqlP083RollbackTargetMode",
     "target_mode: GqlP083EnforcementMode",
-    "caller_request_id: String",
+    "caller_request_id: CallerRequestId",
+    "async fn runs_cancel",
+    "run_id: ID",
+    "async fn approvals_resolve",
+    "resolution: ApprovalResolution",
+    "async fn side_effects_force_reconcile",
+    "side_effect_id: ID",
+    "async fn stages_retry",
+    "stage_execution_id: ID",
+    "caller_request_id: CallerRequestId",
 ]:
     if term not in gql_schema:
         raise SystemExit(f"proposal-083: GraphQL lifecycle contract missing {term!r}")
+provider_shutdown_handler = gql_schema.split("async fn provider_session_shutdown", 1)[1].split("async fn p083_rollback_execution", 1)[0]
+runs_retry_handler = gql_schema.split("async fn runs_retry", 1)[1].split("async fn stages_retry", 1)[0]
+stages_retry_handler = gql_schema.split("async fn stages_retry", 1)[1].split("async fn side_effects_force_reconcile", 1)[0]
+side_effects_handler = gql_schema.split("async fn side_effects_force_reconcile", 1)[1].split("async fn p083_mark_provider_session_process_absent", 1)[0]
+mark_absent_handler = gql_schema.split("async fn p083_mark_provider_session_process_absent", 1)[1].split(") -> Result", 1)[0]
+provider_shutdown_args = provider_shutdown_handler.split(") -> Result", 1)[0]
+runs_retry_args = runs_retry_handler.split(") -> Result", 1)[0]
+stages_retry_args = stages_retry_handler.split(") -> Result", 1)[0]
+side_effects_args = side_effects_handler.split(") -> Result", 1)[0]
+provider_shutdown_arg_lines = {line.strip().rstrip(",") for line in provider_shutdown_args.splitlines()}
+runs_retry_arg_lines = {line.strip().rstrip(",") for line in runs_retry_args.splitlines()}
+stages_retry_arg_lines = {line.strip().rstrip(",") for line in stages_retry_args.splitlines()}
+side_effects_arg_lines = {line.strip().rstrip(",") for line in side_effects_args.splitlines()}
+if "caller_request_id: CallerRequestId" not in provider_shutdown_arg_lines:
+    raise SystemExit("proposal-083: providerSessionShutdown must expose callerRequestId")
+if "reason: String" in provider_shutdown_arg_lines or "request_id: String" in provider_shutdown_arg_lines:
+    raise SystemExit("proposal-083: providerSessionShutdown must not expose caller-owned reason/requestId")
+if "caller_request_id: CallerRequestId" not in runs_retry_arg_lines:
+    raise SystemExit("proposal-083: runsRetry must expose callerRequestId")
+if "request_id: String" in runs_retry_arg_lines:
+    raise SystemExit("proposal-083: runsRetry must not expose legacy requestId argument")
+if "stage_execution_id: ID" not in stages_retry_arg_lines or "caller_request_id: CallerRequestId" not in stages_retry_arg_lines:
+    raise SystemExit("proposal-083: stagesRetry must expose stageExecutionId and callerRequestId")
+if "side_effect_id: ID" not in side_effects_arg_lines or "caller_request_id: CallerRequestId" not in side_effects_arg_lines:
+    raise SystemExit("proposal-083: sideEffectsForceReconcile must expose sideEffectId and callerRequestId")
+if "caller_request_id: CallerRequestId" not in {line.strip().rstrip(",") for line in mark_absent_handler.splitlines()}:
+    raise SystemExit("proposal-083: mark-process-absent GraphQL mutation must expose callerRequestId")
 
 gql_types = (root / "control-plane/crates/graphql-server/src/types/p083.rs").read_text()
 for term in [
+    'Scalar(name = "CallerRequestId")',
+    'graphql(name = "DenialReason", rename_items = "snake_case")',
+    'graphql(name = "DenialPayload")',
+    'graphql(name = "ProviderSessionShutdownPayload")',
+    'graphql(name = "RunsCancelPayload")',
+    'graphql(name = "StagesRetryPayload")',
+    'graphql(name = "SideEffectsForceReconcilePayload")',
+    'graphql(name = "P083RollbackExecutionPayload")',
+    'graphql(name = "P083SetEnforcementModePayload")',
+    'graphql(name = "RunsRetryPayload")',
     'graphql(name = "P083RollbackTargetMode", rename_items = "snake_case")',
     'graphql(name = "P083EnforcementMode", rename_items = "snake_case")',
     "pub target_enforcement_mode: String",
@@ -9517,6 +9840,9 @@ if "target_enforcement_mode, reason, principal_id, request_id" not in rollback_h
     raise SystemExit("proposal-083: p083_rollback_audit insert must persist target_enforcement_mode")
 if '"target_mode"' not in set_mode_handler:
     raise SystemExit("proposal-083: set-enforcement intent hash must use target_mode")
+force_reconcile_handler = handler.split("async fn handle_force_reconcile_side_effect", 1)[1].split("async fn handle_shutdown_provider_session", 1)[0]
+if '"decision_json_digest"' not in force_reconcile_handler:
+    raise SystemExit("proposal-083: side_effects.force_reconcile intent hash must include decision_json_digest")
 for handler_name, text in [("rollback", rollback_handler), ("set-enforcement", set_mode_handler)]:
     if '("reason", serde_json::Value::String(c.reason.clone()))' in text:
         raise SystemExit(f"proposal-083: {handler_name} intent hash must exclude diagnostic reason")
@@ -9524,6 +9850,35 @@ migration_091 = (root / "control-plane/crates/db/migrations/091_p083_005_enforce
 if "target_enforcement_mode TEXT NOT NULL" not in migration_091:
     raise SystemExit("proposal-083: p083_rollback_audit must include non-null target_enforcement_mode")
 print("proposal-083: R70 rollback/set-enforcement API and idempotency contract verified")
+
+app_entry = (root / "Chainworks Forge/Chainworks_ForgeApp.swift").read_text()
+for term in [
+    "P083RunCommands",
+    'CommandMenu("Run")',
+    'Button("Cancel Run")',
+    'Button("Retry Run")',
+    'Button("Retry Stage")',
+    'Button("Resolve Approval")',
+    'Button("Shutdown Provider Session")',
+    'Button("Retry Identity Check")',
+    "FocusedValueKey",
+]:
+    if term not in app_entry:
+        raise SystemExit(f"proposal-083: macOS Run command menu missing {term!r}")
+runs_home = (root / "Chainworks Forge/Views/RunsHomeView.swift").read_text()
+for term in [
+    'Label("Run Actions", systemImage: "play.circle")',
+    "focusedSceneValue(\\.p083RunCommandState",
+    "focusedSceneValue(\\.p083RunCommandActions",
+    "p083CopyLifecycleCommandGuidance",
+    "selectedRunDetailTab = .approvals",
+    "Tool: provider_session.mark_process_absent",
+    "cancellation_epoch:",
+    "caller_request_id: <lowercase-uuidv4>",
+]:
+    if term not in runs_home:
+        raise SystemExit(f"proposal-083: Runs toolbar/focused-value parity missing {term!r}")
+print("proposal-083: macOS Run menu and toolbar parity static proof verified")
 PY
     log "Proposal 083 gate passed"
     ;;
@@ -9694,6 +10049,8 @@ for needle in [
     "This is not a retry",
     "Do not commit, push, release, publish, upload",
     "provider_session_attach_receipt_v1",
+    "provider_session_attach_receipt_v2",
+    "attach_provider_session_for_resurrection",
     "worktree_continuation_readback_v1",
     "agent_continuation_evidence_bundle_v1",
     "agent_continuation_report_v1",
@@ -9717,16 +10074,40 @@ for needle in [
     if needle not in executor_text:
         fail(f"P086 canonical prompt missing {needle!r}")
 
+acp_manager_text = (root / "control-plane/crates/acp/src/manager.rs").read_text()
+for needle in [
+    "attach_provider_session_for_resurrection",
+    "provider_session_resurrection_identity_mismatch",
+]:
+    if needle not in acp_manager_text:
+        fail(f"P086 ACP resurrection manager path missing {needle!r}")
+
 # 2c. Admission must be catalog-gated and side-effect-safe, not just role-gated.
 agents_yaml = (root / "examples/agents/agents.yaml").read_text()
 for needle in [
     "continuation_capability:",
     "allowed_triggers:",
     "live_handle_continuation:",
+    "provider_session_resurrection:",
+    "enabled: true",
     "require_no_unresolved_side_effects: true",
 ]:
     if needle not in agents_yaml:
         fail(f"code_writer catalog missing P086 continuation capability needle {needle!r}")
+
+mcp_agents = (root / "control-plane/crates/mcp-server/src/tools/agents.rs").read_text()
+if "provider_session_resurrection_supported_for_provider" in mcp_agents:
+    fail("P086 MCP admission must not use static provider-name resurrection support")
+for needle in [
+    "provider_session_resurrection_capability(",
+    "acp_runtime: Option<&acp::AcpRuntimeManager>",
+    "provider_session_resurrection_adapter_supported(",
+]:
+    if needle not in mcp_agents:
+        fail(f"P086 MCP admission missing runtime adapter capability proof {needle!r}")
+server_text = (root / "control-plane/crates/mcp-server/src/server.rs").read_text()
+if "with_acp_runtime" not in server_text or "self.acp_runtime.as_deref()" not in server_text:
+    fail("P086 MCP server must pass the selected ACP runtime into agents.continue_work admission")
 
 workflow_catalog = (root / "control-plane/crates/workflow/src/catalog.rs").read_text()
 if "pub struct ContinuationCapabilityYaml" not in workflow_catalog:
@@ -9771,6 +10152,19 @@ for needle in [
 ]:
     if needle not in mcp_agents:
         fail(f"P086 MCP admission missing fail-closed guard {needle!r}")
+
+daemon_resurrection_test = (root / "control-plane/crates/daemon/tests/proposal_086_mcp_continuation_live_reuse.rs").read_text()
+for needle in [
+    "p086_mcp_continue_work_resurrects_provider_session_and_records_v2_receipt",
+    "p086_mcp_continue_work_rejects_resurrection_identity_mismatch_before_prompt",
+    "p086_resurrection_rejects_uncorrelated_terminal_response",
+    "p086_resurrection_fail_closes_when_attach_receipt_persistence_fails",
+    "p086_resurrection_records_claude_session_store_recovery_in_raw_receipt",
+    "provider_session_resurrection",
+    "p086_resurrection_raw_receipts",
+]:
+    if needle not in daemon_resurrection_test:
+        fail(f"P086 daemon resurrection behavior test missing {needle!r}")
 
 recovery_text = (root / "control-plane/crates/engine/src/recovery.rs").read_text()
 for needle in [
@@ -9848,12 +10242,37 @@ required_artifacts = [
     "continuation_result_v1.schema.json",
     "lead_continuation_decision_v1.schema.json",
     "provider_session_attach_receipt_v1.schema.json",
+    "provider_session_attach_receipt_v2.schema.json",
     "worktree_continuation_readback_v1.schema.json",
 ]
 for name in required_artifacts:
     schema = load_json(artifact_dir / name)
     if schema.get("additionalProperties") is not False:
         fail(f"artifact schema {name} must have additionalProperties=false at top level")
+
+attach_v2_schema = load_json(artifact_dir / "provider_session_attach_receipt_v2.schema.json")
+attach_v2_required = set(attach_v2_schema.get("required", []))
+for field in [
+    "target_agent_execution_id",
+    "target_stage_execution_id",
+    "request_fingerprint_sha256",
+    "prompt_turn_marker_id",
+    "provider_request_id",
+    "provider_turn_id",
+    "session_store_transcript_path",
+    "session_store_transcript_digest",
+    "session_store_recovery_result",
+    "session_store_read_at",
+    "session_store_ownership_source",
+    "session_store_latest_turn_id",
+    "session_store_latest_tool_activity_at",
+]:
+    if field not in attach_v2_required:
+        fail(f"provider_session_attach_receipt_v2 must require P086 correlation field {field}")
+    if field not in executor_text:
+        fail(f"P086 raw attach receipt builder must persist correlation field {field}")
+if attach_v2_schema.get("properties", {}).get("adapter_capability_version", {}).get("type") != "string":
+    fail("provider_session_attach_receipt_v2 adapter_capability_version must be a string matching adapter capability_version")
 
 response_schema = load_json(artifact_dir / "continuation_response_snapshot_v1.schema.json")
 response_required = set(response_schema["properties"]["payload"].get("required", []))
@@ -9881,14 +10300,17 @@ if "serde_json::json!({" not in executor_text or '"name": name' not in executor_
 print("proposal-086 Phase 0 preflight checks passed (migration, schemas)")
 PY
     log "Proposal 086 Rust unit tests"
+    PROPOSAL_086_CARGO_TARGET_DIR="${CHAINWORKS_PROPOSAL_086_CARGO_TARGET_DIR:-target/proposal-086-gate}"
     (
       cd "$ROOT_DIR/control-plane"
-      CARGO_TARGET_DIR=target/proposal-086-gate cargo test -p domain "continuation"
-      CARGO_TARGET_DIR=target/proposal-086-gate cargo test -p db --test proposal_086_continuation_lifecycle
-      CARGO_TARGET_DIR=target/proposal-086-gate cargo test -p engine --lib p086
-      CARGO_TARGET_DIR=target/proposal-086-gate cargo test -p mcp-server "tools::agents"
-      CARGO_TARGET_DIR=target/proposal-086-gate cargo test -p graphql-server --test proposal_086_continuation_readback
-      CARGO_TARGET_DIR=target/proposal-086-gate cargo test -p daemon --test proposal_086_mcp_continuation_live_reuse
+      CARGO_TARGET_DIR="$PROPOSAL_086_CARGO_TARGET_DIR" cargo test -p domain "continuation"
+      CARGO_TARGET_DIR="$PROPOSAL_086_CARGO_TARGET_DIR" cargo test -p acp claude_resurrection
+      CARGO_TARGET_DIR="$PROPOSAL_086_CARGO_TARGET_DIR" cargo test -p acp claude_session_store
+      CARGO_TARGET_DIR="$PROPOSAL_086_CARGO_TARGET_DIR" cargo test -p db --test proposal_086_continuation_lifecycle
+      CARGO_TARGET_DIR="$PROPOSAL_086_CARGO_TARGET_DIR" cargo test -p engine --lib p086
+      CARGO_TARGET_DIR="$PROPOSAL_086_CARGO_TARGET_DIR" cargo test -p mcp-server "tools::agents"
+      CARGO_TARGET_DIR="$PROPOSAL_086_CARGO_TARGET_DIR" cargo test -p graphql-server --test proposal_086_continuation_readback
+      CARGO_TARGET_DIR="$PROPOSAL_086_CARGO_TARGET_DIR" cargo test -p daemon --test proposal_086_mcp_continuation_live_reuse -- --test-threads=1
     )
     log "Proposal 086 Swift readback tests"
     run_targeted_tests "proposal-086-swift-readback" "${PROPOSAL_086_SWIFT_TESTS[@]}"
@@ -9993,32 +10415,26 @@ def fail(msg):
     raise SystemExit(f"p086-continuation-negative-fixtures: {msg}")
 
 neg_dir = root / "docs/evidence/rollout-contract/p086/negative"
-required_fixtures = [
-    "admission-timeout-sweeper.json",
-    "artifact-schema-lint-failure.json",
-    "cancel-timeout-termination-unverified.json",
-    "duplicate-after-prompt-sent-no-resend.json",
-    "fingerprint-mismatch-same-key.json",
-    "lead-decision-missing-or-changed.json",
-    "malformed-hashes.json",
-    "mcp-schema-lint-failure.json",
-    "missing-log-correlation-key.json",
-    "pre-prompt-crash-after-lease.json",
-    "resurrection-before-attach-receipt.json",
-    "resurrection-before-orphan-reap.json",
-    "resurrection-unsupported-adapter.json",
-    "saturation-without-queue-drain.json",
-    "terminal-missing-result-artifact.json",
-    "worker-panic-recovery.json",
-]
+required_fixtures = sorted(path.name for path in neg_dir.glob("*") if path.suffix == ".json")
+if len(required_fixtures) < 30:
+    fail(f"expected the full P086 negative fixture corpus, found only {len(required_fixtures)} JSON files")
+placeholder_markers = (
+    "placeholder",
+    "pending_implementation",
+    "must_be_replaced",
+    "placeholder_fixture_kind",
+)
 for name in required_fixtures:
     path = neg_dir / name
     if not path.exists():
         fail(f"missing negative fixture: {name}")
+    text = path.read_text()
     try:
-        fixture = json.loads(path.read_text())
+        fixture = json.loads(text)
     except json.JSONDecodeError as exc:
         fail(f"invalid JSON in {name}: {exc}")
+    if any(marker in text for marker in placeholder_markers):
+        fail(f"{name} still contains placeholder evidence")
     status = fixture.get("status")
     if status == "placeholder":
         fail(
@@ -10847,33 +11263,37 @@ PY
     }
     p082_emit_gate_results_from_cargo_output() {
       local output="$1"
-      local scenario_id metric_status
-      while IFS=$'\t' read -r scenario_id metric_status; do
-        if [[ -n "$scenario_id" && -n "$metric_status" ]]; then
-          p082_emit_gate_result_metric "$scenario_id" "$metric_status"
+      local output_file
+      output_file="$(mktemp "${TMPDIR:-/tmp}/p082-gate-output.XXXXXX")"
+      printf '%s\n' "$output" >"$output_file"
+      p082_emit_gate_results_from_cargo_output_file "$output_file"
+      rm -f "$output_file"
+    }
+    p082_emit_gate_results_from_cargo_output_file() {
+      local output_file="$1"
+      local line scenario_id raw_status metric_status key
+      local seen="|"
+      while IFS= read -r line; do
+        if [[ "$line" =~ ^test[[:space:]].*p082_r(0[1-9]|1[0-7])_[^[:space:]]*[[:space:]]\.\.\.[[:space:]](ok|FAILED|ignored)([[:space:]]|$) ]]; then
+          scenario_id="P082-R${BASH_REMATCH[1]}"
+          raw_status="${BASH_REMATCH[2]}"
+          # Static proof fragments retained: "ok": "passed", "FAILED": "failed", "ignored": "interrupted".
+          case "$raw_status" in
+            ok) metric_status="passed" ;;
+            FAILED) metric_status="failed" ;;
+            ignored) metric_status="interrupted" ;;
+            *) continue ;;
+          esac
+          key="${scenario_id}:${metric_status}"
+          case "$seen" in
+            *"|$key|"*) ;;
+            *)
+              seen="${seen}${key}|"
+              p082_emit_gate_result_metric "$scenario_id" "$metric_status"
+              ;;
+          esac
         fi
-      done < <(python3 -c '
-import re
-import sys
-
-seen = set()
-for line in sys.stdin:
-    match = re.search(r"^test .*p082_r(0[1-9]|1[0-7])_[^ ]* \.\.\. (ok|FAILED|ignored)\b", line)
-    if not match:
-        continue
-    scenario_id = f"P082-R{match.group(1)}"
-    raw_status = match.group(2)
-    status = {
-        "ok": "passed",
-        "FAILED": "failed",
-        "ignored": "interrupted",
-    }[raw_status]
-    key = (scenario_id, status)
-    if key in seen:
-        continue
-    seen.add(key)
-    print(f"{scenario_id}\t{status}")
-' <<< "$output")
+      done < "$output_file"
     }
     p082_emit_interrupted_gate_results() {
       local exit_status=$?
@@ -11517,20 +11937,23 @@ PY
       cd "$ROOT_DIR/control-plane"
       p082_cargo_target="$(chainworks_test_gate_cargo_target_dir "${CHAINWORKS_PROPOSAL_082_CARGO_TARGET_DIR:-target/proposal-082}")"
       run_p082_cargo_test() {
-        local output status
+        local output_file status
+        output_file="$(mktemp "${TMPDIR:-/tmp}/p082-cargo-output.XXXXXX")"
         set +e
-        output=$(CARGO_TARGET_DIR="$p082_cargo_target" cargo test "$@" 2>&1)
-        status=$?
+        CARGO_TARGET_DIR="$p082_cargo_target" cargo test "$@" 2>&1 | tee "$output_file"
+        status=${PIPESTATUS[0]}
         set -e
-        printf '%s\n' "$output"
-        p082_emit_gate_results_from_cargo_output "$output"
+        p082_emit_gate_results_from_cargo_output_file "$output_file"
         if [ "$status" -ne 0 ]; then
+          rm -f "$output_file"
           return "$status"
         fi
-        if ! printf '%s\n' "$output" | grep -Eq '^running [1-9][0-9]* tests?$'; then
+        if ! grep -Eq '^running [1-9][0-9]* tests?$' "$output_file"; then
           echo "FAILED: P082 cargo test filter selected zero tests: cargo test $*" >&2
+          rm -f "$output_file"
           return 1
         fi
+        rm -f "$output_file"
       }
       run_p082_cargo_test -p db --test proposal_082_recovery_retry_matrix -- --nocapture
       run_p082_cargo_test -p engine --test proposal_082_recovery_retry_matrix -- --nocapture
@@ -11539,6 +11962,8 @@ PY
       run_p082_cargo_test -p auth live_principal_source_revalidates_revoked_disabled_and_rescoped_credentials -- --nocapture
       run_p082_cargo_test -p mcp-server p082_ -- --nocapture
       run_p082_cargo_test -p mcp-server sec_high_001_mcp_http_observes_live_principal_revocation -- --nocapture
+      run_p082_cargo_test -p daemon --test mcp_stdio sec_high_001_mcp_stdio_revalidates_session_after_principal_ -- --nocapture
+      run_p082_cargo_test -p graphql-server sec_high_001_graphql_http_observes_live_principal_updates -- --nocapture
       run_p082_cargo_test -p daemon sec_high_001_failed_serve_observes_live_principal_revocation -- --nocapture
       run_p082_cargo_test -p mcp-server --test proposal_082_recovery_readback -- --nocapture
     )

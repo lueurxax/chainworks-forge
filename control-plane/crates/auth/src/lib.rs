@@ -343,11 +343,41 @@ impl LivePrincipalSource {
         self.replace(table);
     }
 
+    pub fn mark_unavailable(&self) {
+        self.replace(PrincipalTable { entries: vec![] });
+    }
+
     pub fn resolve_bearer(&self, token: &str) -> Result<Principal, AuthError> {
         self.table
             .read()
             .map_err(|_| AuthError::TableLoadFailed("principal table lock poisoned".into()))
             .and_then(|guard| resolve_bearer(token, &guard))
+    }
+
+    /// Revalidate an existing stdio/session principal against the live table without
+    /// retaining the raw bearer. A missing, disabled, expired, or token-changed entry
+    /// fails closed; a re-scoped entry returns the current Principal.
+    pub fn resolve_principal_by_id_and_token_fingerprint(
+        &self,
+        principal_id: &str,
+        expected_token_fingerprint: &str,
+    ) -> Result<Principal, AuthError> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        self.table
+            .read()
+            .map_err(|_| AuthError::TableLoadFailed("principal table lock poisoned".into()))
+            .and_then(|guard| {
+                guard
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry.id == principal_id
+                            && is_entry_valid_at(entry, now_ms)
+                            && token_fingerprint(&entry.token) == expected_token_fingerprint
+                    })
+                    .map(Principal::from_entry)
+                    .ok_or(AuthError::UnknownToken)
+            })
     }
 }
 
@@ -1568,6 +1598,7 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
             Some(CapabilityToolId::StagesConsumeProviderQuotaHold)
         }
         "workflow_conflicts.resolve" => Some(CapabilityToolId::WorkflowConflictsResolve),
+        "workflow_loop_budget.extend" => Some(CapabilityToolId::WorkflowLoopBudgetExtend),
         "legacy_discovery_override_create" => Some(CapabilityToolId::LegacyDiscoveryOverrideCreate),
         "reports.get" => Some(CapabilityToolId::ReportsGet),
         "artifacts.override_contract" => Some(CapabilityToolId::ArtifactsOverrideContract),
@@ -2257,6 +2288,30 @@ mod tests {
         }];
         let err = validate_v2_principals(&entries).unwrap_err();
         assert!(err.to_string().contains("unknown MCP tool"));
+    }
+
+    #[test]
+    fn v2_accepts_workflow_loop_budget_extend_mcp_tool_name() {
+        let entries = vec![PrincipalEntry {
+            token: "tok".into(),
+            id: "default-operator".into(),
+            class: PrincipalClass::Operator,
+            surface_policies: Some(SurfacePolicies {
+                graphql: Some(GraphqlPolicy {
+                    allow_queries: true,
+                    allow_subscriptions: true,
+                    allowed_mutations: approval_mutations(),
+                }),
+                mcp: Some(McpPolicy {
+                    allowed_tools: vec!["workflow_loop_budget.extend".into()],
+                }),
+            }),
+            ..Default::default()
+        }];
+
+        validate_v2_principals(&entries).unwrap();
+        let principal = Principal::from_entry(&entries[0]);
+        assert!(is_tool_allowed(&principal, "workflow_loop_budget.extend"));
     }
 
     #[test]

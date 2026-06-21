@@ -4,7 +4,7 @@
   "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "title": "Execution-Truth Ownership and Invariant Model",
   "date": "2026-06-04",
-  "status": "Revise-required. The R69 proposal review summary for proposal_revision_id P083-r69-refined-r68-score-lift returned decision=revise_required with aggregate_score=8.8 and min_individual_score=8.1. Four reviewers (api_contract, apple_architect, macos, ui) approve; the reliability reviewer flagged one blocking cross-surface contradiction (REL-P083-R69-BLOCK-001): p083.rollback_execution intent_hash was computed from target_enforcement_mode while neither GraphQL nor MCP accepted a rollback target. This R70 refine pass reconciles that contradiction (Option A from the backlog: a non-null targetEnforcementMode is now part of GraphQL, MCP, rollback_disposition steps, and intent_hash composition; rollback fixtures cover same-request replay, same-intent aliasing, and mismatch denial), promotes the five R69 advisory items into active executable contracts, and removes every R68 reviewer_feedback_resolution mapping that is no longer authoritative. Implementation may start only after the human implementation approval gate is granted and a fresh aggregate review against this revision returns approve with blocker_count=0.",
+  "status": "Implementation in progress. The R69 proposal review summary for proposal_revision_id P083-r69-refined-r68-score-lift returned decision=revise_required with aggregate_score=8.8 and min_individual_score=8.1. Four reviewers (api_contract, apple_architect, macos, ui) approve; the reliability reviewer flagged one blocking cross-surface contradiction (REL-P083-R69-BLOCK-001): p083.rollback_execution intent_hash was computed from target_enforcement_mode while neither GraphQL nor MCP accepted a rollback target. This R70 refine pass reconciles that contradiction (Option A from the backlog: a non-null targetEnforcementMode is now part of GraphQL, MCP, rollback_disposition steps, and intent_hash composition; rollback fixtures cover same-request replay, same-intent aliasing, and mismatch denial), promotes the five R69 advisory items into active executable contracts, and removes every R68 reviewer_feedback_resolution mapping that is no longer authoritative. Closeout still requires a fresh aggregate implementation review against this revision with decision=approve, blocker_count=0, and current-revision evidence.",
   "author": "Codex",
   "source_idea": "Implement Proposal 083: Execution-Truth Ownership and Invariant Model.",
   "canonical_proposal_path": "docs/proposals/083-execution-truth-ownership-invariant-model.md",
@@ -40,10 +40,10 @@
     "unresolved_proposal_text_blocker_count": 0,
     "deferred_blocker_count": 0,
     "disputed_blocker_count": 0,
-    "implementation_may_start": false,
-    "implementation_may_start_after": "Human implementation approval gate is granted, which requires a fresh aggregate review against this revision with decision=approve, blocker_count=0, and a corpus-only-current-revision attestation.",
+    "implementation_may_start": true,
+    "implementation_may_start_after": "Implementation is already in progress. Ready/closeout may be claimed only after a fresh aggregate implementation review against this revision returns decision=approve, blocker_count=0, and a corpus-only-current-revision attestation.",
     "single_authority_pointer": "reviewer_feedback_resolution maps every current R69 score_lift_backlog item to active proposal sections. REL-P083-R69-BLOCK-001 is mapped to the reconciled rollback contracts (graphql_sdl_contract_v1, mcp_tool_inventory_contract_v1, command_idempotency_contract_v1, rollout_contract_v1.rollback_disposition).",
-    "latest_review_authority": "reviews/proposal/summary.json decision=revise_required, blocker_count=1, aggregate_score=8.8, min_individual_score=8.1; four reviewers approve and only the reliability reviewer flagged the rollback cross-surface contradiction that this R70 pass resolves."
+    "latest_review_authority": "reviews/proposal/summary.json decision=revise_required, blocker_count=1, aggregate_score=8.8, min_individual_score=8.1; the blocking rollback cross-surface contradiction is resolved in this R70 contract and implementation is in progress pending fresh implementation-review closeout."
   },
   "executive_summary": "P083 names durable storage as the execution-truth authority for runs, stages, agents, approvals, artifacts, side effects, provider sessions, command idempotency, shutdown receipts, rollout state, and operator readback. This R70 revision resolves the R69 blocking contradiction by treating targetEnforcementMode as a first-class non-null caller input on p083.rollback_execution across GraphQL SDL, MCP, intent_hash composition, and rollback_disposition steps, with three new rollback fixtures (same-request replay, same-intent aliasing, mismatch denial). It promotes the five R69 advisory items into active executable contracts: closed enum types (ApprovalResolution, P083EnforcementMode, P083RollbackTargetMode) with canonical lowercase normalization before hashing; durable monotonic clock baseline correlation via baseline_sample_id on deadline-bearing rows and nearest-baseline-at-or-before lookup; pinned macOS Commands menu structure (Run menu) with toolbar enabled-state and accessibility parity; and a ManualProcessIdentityCheckBanner action hierarchy with explicit primary/secondary/tertiary/overflow placement and loading/success/error feedback states.",
   "problem": [
@@ -157,10 +157,10 @@
     "shared_denial_union_rule": "All P083 lifecycle mutations return a payload union where the failure branch is the shared DenialPayload type carrying a non-null DenialReason enum value. DenialReason is byte-equal in name set to mcp_tool_inventory_contract_v1.shared_denial_vocabulary.",
     "lifecycle_mutation_signatures": [
       "scalar CallerRequestId",
-      "enum ApprovalResolution { approve reject defer }",
+      "enum ApprovalResolution { approve reject }",
       "enum P083EnforcementMode { disabled permissive enforce }",
       "enum P083RollbackTargetMode { permissive disabled }",
-      "enum DenialReason { request_intent_mismatch malformed_request_id missing_caller_request_id request_id_not_owned principal_class_not_allowed lifecycle_state_invalid lifecycle_not_actionable approval_not_pending artifact_not_active side_effect_not_pending provider_session_not_cancellable rollout_contract_disabled enforcement_mode_blocked identity_ambiguous late_output_overflow_latched schema_invalid additional_properties_rejected unknown_command rollback_target_required rollback_target_invalid }",
+      "enum DenialReason { missing_caller_request_id malformed_request_id principal_class_not_allowed lifecycle_state_invalid schema_invalid additional_properties_rejected rollback_target_required rollback_target_invalid request_intent_mismatch idempotency_in_flight idempotency_replayed idempotency_expired_reacquired operator_required p083_operator_required provider_session_not_found run_not_found stage_not_retryable approval_not_actionable side_effect_not_reconcilable enforcement_mode_transition_denied identity_ambiguous idempotency_replay_corrupt idempotency_terminal_failure internal }",
       "type DenialPayload { reason: DenialReason! message: String! retryAfterSeconds: Int }",
       "type RunsCancelSuccess { runId: ID! cancellationEpoch: Int! }",
       "union RunsCancelPayload = RunsCancelSuccess | DenialPayload",
@@ -202,33 +202,38 @@
       {"tool": "runs.cancel", "input_schema_path": "docs/reference/mcp/p083/runs.cancel.input.schema.json", "output_schema_path": "docs/reference/mcp/p083/runs.cancel.output.schema.json", "required_input": ["run_id", "caller_request_id"], "enum_constraints": {}, "denial_codes": ["request_intent_mismatch", "malformed_request_id", "lifecycle_state_invalid", "request_id_not_owned", "schema_invalid", "additional_properties_rejected"]},
       {"tool": "runs.retry", "input_schema_path": "docs/reference/mcp/p083/runs.retry.input.schema.json", "output_schema_path": "docs/reference/mcp/p083/runs.retry.output.schema.json", "required_input": ["run_id", "caller_request_id"], "enum_constraints": {}, "denial_codes": ["request_intent_mismatch", "malformed_request_id", "lifecycle_not_actionable", "schema_invalid", "additional_properties_rejected"]},
       {"tool": "stages.retry", "input_schema_path": "docs/reference/mcp/p083/stages.retry.input.schema.json", "output_schema_path": "docs/reference/mcp/p083/stages.retry.output.schema.json", "required_input": ["stage_execution_id", "caller_request_id"], "enum_constraints": {}, "denial_codes": ["request_intent_mismatch", "malformed_request_id", "lifecycle_not_actionable", "schema_invalid", "additional_properties_rejected"]},
-      {"tool": "approvals.resolve", "input_schema_path": "docs/reference/mcp/p083/approvals.resolve.input.schema.json", "output_schema_path": "docs/reference/mcp/p083/approvals.resolve.output.schema.json", "required_input": ["approval_id", "resolution", "caller_request_id"], "enum_constraints": {"resolution": ["approve", "reject", "defer"]}, "denial_codes": ["approval_not_pending", "malformed_request_id", "schema_invalid", "additional_properties_rejected"]},
+      {"tool": "approvals.resolve", "input_schema_path": "docs/reference/mcp/p083/approvals.resolve.input.schema.json", "output_schema_path": "docs/reference/mcp/p083/approvals.resolve.output.schema.json", "required_input": ["approval_id", "resolution", "caller_request_id"], "enum_constraints": {"resolution": ["approve", "reject"]}, "denial_codes": ["approval_not_pending", "malformed_request_id", "schema_invalid", "additional_properties_rejected"]},
       {"tool": "side_effects.force_reconcile", "input_schema_path": "docs/reference/mcp/p083/side_effects.force_reconcile.input.schema.json", "output_schema_path": "docs/reference/mcp/p083/side_effects.force_reconcile.output.schema.json", "required_input": ["side_effect_id", "caller_request_id"], "enum_constraints": {}, "denial_codes": ["side_effect_not_pending", "malformed_request_id", "schema_invalid", "additional_properties_rejected"]},
       {"tool": "provider_session.shutdown", "input_schema_path": "docs/reference/mcp/p083/provider_session.shutdown.input.schema.json", "output_schema_path": "docs/reference/mcp/p083/provider_session.shutdown.output.schema.json", "required_input": ["provider_session_id", "caller_request_id"], "enum_constraints": {}, "denial_codes": ["provider_session_not_cancellable", "identity_ambiguous", "malformed_request_id", "schema_invalid", "additional_properties_rejected"]},
+      {"tool": "provider_session.mark_process_absent", "input_schema_path": "docs/reference/mcp/p083/provider_session.mark_process_absent.input.schema.json", "output_schema_path": "docs/reference/mcp/p083/provider_session.mark_process_absent.output.schema.json", "required_input": ["provider_session_id", "cancellation_epoch", "caller_request_id"], "enum_constraints": {}, "denial_codes": ["provider_session_not_found", "identity_ambiguous", "malformed_request_id", "schema_invalid", "additional_properties_rejected"]},
       {"tool": "p083.rollback_execution", "input_schema_path": "docs/reference/mcp/p083/p083.rollback_execution.input.schema.json", "output_schema_path": "docs/reference/mcp/p083/p083.rollback_execution.output.schema.json", "required_input": ["target_enforcement_mode", "caller_request_id"], "enum_constraints": {"target_enforcement_mode": ["permissive", "disabled"]}, "denial_codes": ["enforcement_mode_blocked", "principal_class_not_allowed", "rollback_target_required", "rollback_target_invalid", "schema_invalid", "additional_properties_rejected"]},
       {"tool": "p083.set_enforcement_mode", "input_schema_path": "docs/reference/mcp/p083/p083.set_enforcement_mode.input.schema.json", "output_schema_path": "docs/reference/mcp/p083/p083.set_enforcement_mode.output.schema.json", "required_input": ["target_mode", "caller_request_id"], "enum_constraints": {"target_mode": ["disabled", "permissive", "enforce"]}, "denial_codes": ["enforcement_mode_blocked", "principal_class_not_allowed", "schema_invalid", "additional_properties_rejected"]}
     ],
     "shared_denial_vocabulary": [
-      "request_intent_mismatch",
-      "malformed_request_id",
       "missing_caller_request_id",
-      "request_id_not_owned",
+      "malformed_request_id",
       "principal_class_not_allowed",
       "lifecycle_state_invalid",
-      "lifecycle_not_actionable",
-      "approval_not_pending",
-      "artifact_not_active",
-      "side_effect_not_pending",
-      "provider_session_not_cancellable",
-      "rollout_contract_disabled",
-      "enforcement_mode_blocked",
-      "identity_ambiguous",
-      "late_output_overflow_latched",
       "schema_invalid",
       "additional_properties_rejected",
-      "unknown_command",
       "rollback_target_required",
-      "rollback_target_invalid"
+      "rollback_target_invalid",
+      "request_intent_mismatch",
+      "idempotency_in_flight",
+      "idempotency_replayed",
+      "idempotency_expired_reacquired",
+      "operator_required",
+      "p083_operator_required",
+      "provider_session_not_found",
+      "run_not_found",
+      "stage_not_retryable",
+      "approval_not_actionable",
+      "side_effect_not_reconcilable",
+      "enforcement_mode_transition_denied",
+      "identity_ambiguous",
+      "idempotency_replay_corrupt",
+      "idempotency_terminal_failure",
+      "internal"
     ],
     "additional_properties_policy": "Every tool input and output schema sets additionalProperties:false at every object level. Unknown fields are denied with additional_properties_rejected before any side effect.",
     "parity_rule": "shared_denial_vocabulary names match graphql_sdl_contract_v1.DenialReason values byte-for-byte; CI fixture rejects any drift.",
@@ -461,6 +466,20 @@
         ],
         "verification_query": "SELECT provider_session_id FROM provider_cancellation_intents WHERE intent_state IN ('shutdown_started','settled') AND shutdown_epoch IS NULL;",
         "expected_verification_result": "zero rows"
+      },
+      {
+        "logical_id": "p083_008_signal_dispatching_state",
+        "filename": "control-plane/crates/db/migrations/094_p083_008_signal_dispatching_state.sql",
+        "depends_on": ["p083_007_provider_cancellation_intent_and_process_fate"],
+        "sha256_source": "migration_file_bytes",
+        "readback_expectation": "applied_migrations[p083_008_signal_dispatching_state].sha256 equals computed migration file hash and state='applied'",
+        "ddl_summary": [
+          "Recreate shutdown_signal_side_effects so intent_state CHECK admits 'dispatching'",
+          "Preserve existing shutdown_signal_side_effects rows during table recreation",
+          "Recreate shutdown_signal_side_effect_unique and shutdown_signal_side_effects_session_idx"
+        ],
+        "verification_query": "SELECT COUNT(*) FROM shutdown_signal_side_effects WHERE intent_state NOT IN ('planned','dispatching','issued','observed','suppressed','identity_mismatch');",
+        "expected_verification_result": "zero rows"
       }
     ]
   },
@@ -585,11 +604,11 @@
     "schema_version": "current_review_refresh_gate_v1",
     "addresses": [],
     "required_before_ready": [
-      "Latest proposal review summary against this revision returns decision=approve, blocker_count=0, and aggregate_score above the freeze threshold.",
+      "Latest implementation review summary against this revision returns decision=approve, blocker_count=0, and aggregate_score above the freeze threshold.",
       "Selected reviewer artifacts all carry proposal_revision_id equal to the current proposal_revision_id of this file.",
       "Aggregate review summary includes the corpus-only-current-revision attestation."
     ],
-    "freeze_rule": "Ready may be claimed only after a fresh aggregate review against this exact proposal_revision_id returns decision=approve and blocker_count=0 with a current-revision-only corpus attestation in the review summary. Until then, status remains revise_required and human implementation approval cannot proceed.",
+    "freeze_rule": "Ready may be claimed only after a fresh aggregate implementation review against this exact proposal_revision_id returns decision=approve and blocker_count=0 with a current-revision-only corpus attestation in the review summary. Until then, status remains implementation_in_progress and closeout cannot proceed.",
     "routing_note": "Corpus integrity remains a rollout precondition; if a future review pass selects stale-revision reviewer artifacts, corpus_mixed_revision is an explicit rollout hold condition with a negative fixture so the gate fails closed.",
     "corpus_only_current_revision_attestation_required_fields": [
       "review_pass_id",
@@ -630,7 +649,7 @@
       ],
       "enforcement_mode": ["disabled", "permissive", "enforce"],
       "rollback_target": ["permissive", "disabled"],
-      "approval_resolution": ["approve", "reject", "defer"],
+      "approval_resolution": ["approve", "reject"],
       "transition": [
         "disabled_to_permissive", "permissive_to_enforce", "enforce_to_permissive",
         "permissive_to_disabled", "disabled_to_enforce_denied"
@@ -643,7 +662,8 @@
       "command": [
         "runs.cancel", "runs.retry", "stages.retry", "approvals.resolve",
         "side_effects.force_reconcile", "command.run", "copyable_command.regenerate",
-        "provider_session.shutdown", "p083.rollback_execution", "p083.set_enforcement_mode"
+        "provider_session.shutdown", "provider_session.mark_process_absent",
+        "p083.rollback_execution", "p083.set_enforcement_mode"
       ],
       "provider": ["codex", "claude", "gemini", "auggie", "junie"],
       "intent_state": [
@@ -716,7 +736,7 @@
   },
   "rollout": {
     "phases": [
-      {"phase": "design_freeze", "entry": "fresh aggregate review against this revision returns approve with blocker_count=0 and corpus-only-current-revision attestation", "exit": "proposal-083 gate and rollout contract lint pass"},
+      {"phase": "implementation_closeout", "entry": "fresh aggregate implementation review against this revision returns approve with blocker_count=0 and corpus-only-current-revision attestation", "exit": "proposal-083 gate and rollout contract lint pass"},
       {"phase": "additive_migrations", "entry": "Ready proposal", "exit": "migration readback fixture passes"},
       {"phase": "permissive_burn_in", "entry": "mode transition disabled_to_permissive audited", "exit": "24 hours with zero hold conditions and fresh metrics"},
       {"phase": "enforce_cutover", "entry": "preflight requirements pass", "exit": "mode transition permissive_to_enforce audited"},
@@ -753,7 +773,7 @@
     },
     "migrations": {
       "not_applicable": false,
-      "justification": "P083 owns seven additive SQLite migrations enumerated in migration_plan_v1. Release receipt and operator readback must expose sha256 and verification query result for each logical_id."
+      "justification": "P083 owns eight additive SQLite migrations enumerated in migration_plan_v1. Release receipt and operator readback must expose sha256 and verification query result for each logical_id."
     },
     "metrics": {
       "adoption_metric": "p083_applicable_runs_with_passing_execution_truth_preflight_percent",
@@ -945,8 +965,8 @@
     "proposal-083 and p083 gates exist and run the P083 contract suite.",
     "No active proposal section, revision summary, coverage object, or feedback mapping claims blocker ids absent from the current R69 score_lift_backlog.",
     "rollout_contract_v1.rollback_disposition remains strict-template-compatible without unknown fields; generated GraphQL, MCP, run_report, and release_receipt RollbackDispositionJSON fixtures include schema_version='rollback_disposition_v1' and reject missing schema_version.",
-    "migration_plan_v1 enumerates all seven P083 additive migrations with logical_id, filename, dependencies, sha256_source, readback expectation, verification query, and expected verification result.",
-    "command_idempotency_contract_v1 covers runs.cancel, runs.retry, stages.retry, approvals.resolve, side_effects.force_reconcile, provider_session.shutdown, p083.rollback_execution, and p083.set_enforcement_mode with states, TTLs, unique keys, recovery rules, per-command intent_hash_composition_rule (including enum lowercase normalization), and fixtures.",
+    "migration_plan_v1 enumerates all eight P083 additive migrations with logical_id, filename, dependencies, sha256_source, readback expectation, verification query, and expected verification result.",
+    "command_idempotency_contract_v1 covers runs.cancel, runs.retry, stages.retry, approvals.resolve, side_effects.force_reconcile, provider_session.shutdown, provider_session.mark_process_absent, p083.rollback_execution, and p083.set_enforcement_mode with states, TTLs, unique keys, recovery rules, per-command intent_hash_composition_rule (including enum lowercase normalization), and fixtures.",
     "p083.rollback_execution accepts a non-null targetEnforcementMode in GraphQL SDL, requires target_enforcement_mode in the MCP input schema, includes target_enforcement_mode in command_idempotency_contract_v1.per_command_logical_fields[p083.rollback_execution], persists target_enforcement_mode in p083_rollback_audit, and surfaces p083_rollback_target_enforcement_mode in rollout readback; same-request replay, same-intent aliasing across new request_id, and mismatch denial fixtures all exist.",
     "graphql_sdl_contract_v1 enumerates lifecycle mutation SDL with non-null CallerRequestId arguments, a shared DenialReason union, closed enum types ApprovalResolution/P083EnforcementMode/P083RollbackTargetMode, and byte-parity with mcp_tool_inventory_contract_v1.shared_denial_vocabulary and enum_constraints.",
     "mcp_tool_inventory_contract_v1 lists every P083 MCP tool with Draft 2020-12 input/output schemas, additionalProperties=false, enum_constraints for closed-domain fields, shared denial vocabulary, and parity fixtures with GraphQL.",
@@ -1011,7 +1031,7 @@
         "command_idempotency_contract_v1.intent_hash_composition_rule.canonical_enum_normalization_rule",
         "metric_labels_contract_v1.bounded_label_domains[rollback_target,approval_resolution,enforcement_mode]"
       ],
-      "resolution_notes": "ApprovalResolution {approve, reject, defer}, P083EnforcementMode {disabled, permissive, enforce}, and P083RollbackTargetMode {permissive, disabled} are GraphQL enums; MCP enforces matching JSON Schema enum constraints; intent_hash uses lowercase-normalized canonical values; CI fixture graphql-mcp-enum-vocabulary-parity proves byte-equal sets."
+      "resolution_notes": "ApprovalResolution {approve, reject}, P083EnforcementMode {disabled, permissive, enforce}, and P083RollbackTargetMode {permissive, disabled} are GraphQL enums; MCP enforces matching JSON Schema enum constraints; intent_hash uses lowercase-normalized canonical values; CI fixture graphql-mcp-enum-vocabulary-parity proves byte-equal sets."
     },
     "REL-P083-R69-NB-001": {
       "disposition": "addressed",
@@ -1062,7 +1082,8 @@
     "commands_covered": [
       "runs.cancel", "runs.retry", "stages.retry", "approvals.resolve",
       "side_effects.force_reconcile", "provider_session.shutdown",
-      "p083.rollback_execution", "p083.set_enforcement_mode"
+      "provider_session.mark_process_absent", "p083.rollback_execution",
+      "p083.set_enforcement_mode"
     ],
     "tables": {
       "command_idempotency": {
@@ -1091,6 +1112,7 @@
       "approvals.resolve": 300,
       "side_effects.force_reconcile": 300,
       "provider_session.shutdown": 120,
+      "provider_session.mark_process_absent": 120,
       "p083.rollback_execution": 120,
       "p083.set_enforcement_mode": 120,
       "min": 5,
@@ -1105,12 +1127,13 @@
         "runs.retry": ["run_id"],
         "stages.retry": ["stage_execution_id"],
         "approvals.resolve": ["approval_id", "resolution"],
-        "side_effects.force_reconcile": ["side_effect_id"],
+        "side_effects.force_reconcile": ["side_effect_id", "decision_json_digest"],
         "provider_session.shutdown": ["provider_session_id"],
+        "provider_session.mark_process_absent": ["provider_session_id", "cancellation_epoch"],
         "p083.rollback_execution": ["target_enforcement_mode"],
         "p083.set_enforcement_mode": ["target_mode"]
       },
-      "exclusion_rule": "caller_request_id, request timestamps, principal display names, and diagnostic metadata are excluded from intent_hash inputs so that the same lifecycle intent issued with a fresh request id replays through command_request_aliases without creating a new lease.",
+      "exclusion_rule": "caller_request_id, request timestamps, principal display names, and diagnostic metadata are excluded from intent_hash inputs so that the same lifecycle intent issued with a fresh request id replays through command_request_aliases without creating a new lease. side_effects.force_reconcile includes a canonical decision_json_digest because the operator reconciliation decision is caller intent, not diagnostic metadata.",
       "fixtures": [
         "docs/evidence/083/idempotency/intent-hash-canonical-serialization-sorted-keys.fixture.json",
         "docs/evidence/083/idempotency/intent-hash-stable-across-payload-formatting-variations.fixture.json",

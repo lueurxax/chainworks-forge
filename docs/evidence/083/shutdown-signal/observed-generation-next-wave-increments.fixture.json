@@ -1,7 +1,7 @@
 {
   "fixture_id": "observed-generation-next-wave-increments",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "shutdown_signal_generation_contract_v1",
   "description": "When a new wave of signals is issued after a previously observed generation is committed, the generation counter increments by exactly one.",
   "preconditions": {

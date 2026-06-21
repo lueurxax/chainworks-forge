@@ -1,7 +1,7 @@
 {
   "fixture_id": "queue-rank-restart-preserved",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "execution_queue_contract_v1",
   "description": "queue_rank values written before a restart are read back in the identical order after restart, with no re-assignment or reordering.",
   "preconditions": {

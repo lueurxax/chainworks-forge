@@ -1,7 +1,7 @@
 {
   "fixture_id": "windowgroup-projection-value-type-only",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "swift_swiftdata_lifecycle_contract_v1",
   "description": "WindowGroup content receives only value-type projection data; no reference-typed lifecycle ModelContext or ModelObject is passed directly into the view.",
   "preconditions": {

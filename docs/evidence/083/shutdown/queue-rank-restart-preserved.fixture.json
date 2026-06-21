@@ -1,7 +1,7 @@
 {
   "fixture_id": "queue-rank-restart-preserved",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "execution_queue_contract_v1",
   "description": "queue_rank values for queued executions survive a process restart and are restored from durable storage in the correct order.",
   "preconditions": {

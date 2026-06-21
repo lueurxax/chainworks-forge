@@ -1,7 +1,7 @@
 {
   "fixture_id": "manual-process-identity-check-voiceover",
   "proposal_id": "P083",
-  "proposal_revision_id": "P083-r68-refined-r66-score-lift",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
   "contract": "ui_process_identity_contract_v1",
   "description": "The process identity check UI provides correct VoiceOver accessibility labels so screen reader users can understand the ambiguous state and available actions.",
   "preconditions": {

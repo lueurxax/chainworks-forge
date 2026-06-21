@@ -12,6 +12,10 @@ import Foundation
 // or operator-initiated dispatch.
 // ---------------------------------------------------------------------------
 
+nonisolated private func p079CanonicalEnumRaw(_ raw: String) -> String {
+    raw.lowercased()
+}
+
 // MARK: - Top-level status enum (api-contract-r2-001)
 
 nonisolated enum OutputContractRepairStatus: Codable, Sendable, Equatable {
@@ -41,7 +45,7 @@ nonisolated enum OutputContractRepairStatus: Codable, Sendable, Equatable {
 
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
-        switch raw {
+        switch p079CanonicalEnumRaw(raw) {
         case "not_attempted": self = .notAttempted
         case "in_progress": self = .inProgress
         case "recovered": self = .recovered
@@ -86,7 +90,7 @@ nonisolated enum PresentationCategory: Codable, Sendable, Equatable {
 
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
-        switch raw {
+        switch p079CanonicalEnumRaw(raw) {
         case "informational": self = .informational
         case "recovered": self = .recovered
         case "blocked": self = .blocked
@@ -132,7 +136,7 @@ nonisolated enum RecommendedNextAction: Codable, Sendable, Equatable {
 
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
-        switch raw {
+        switch p079CanonicalEnumRaw(raw) {
         case "continue": self = .continue
         case "inspect_repair_evidence": self = .inspectRepairEvidence
         case "configure_fallback_policy": self = .configureFallbackPolicy
@@ -176,7 +180,7 @@ nonisolated enum InitialFailureClass: Codable, Sendable, Equatable {
 
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
-        switch raw {
+        switch p079CanonicalEnumRaw(raw) {
         case "no_output_produced": self = .noOutputProduced
         case "empty_output": self = .emptyOutput
         case "missing_required_outputs": self = .missingRequiredOutputs
@@ -213,7 +217,7 @@ nonisolated enum OutputContractAdapterFamily: Codable, Sendable, Equatable {
 
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
-        switch raw {
+        switch p079CanonicalEnumRaw(raw) {
         case "codex": self = .codex
         case "claude": self = .claude
         case "gemini": self = .gemini
@@ -248,7 +252,7 @@ nonisolated enum OutputContractProviderFamily: Codable, Sendable, Equatable {
 
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
-        switch raw {
+        switch p079CanonicalEnumRaw(raw) {
         case "codex": self = .codex
         case "claude": self = .claude
         case "gemini": self = .gemini
@@ -284,7 +288,7 @@ nonisolated enum LeaseState: Codable, Sendable, Equatable {
 
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
-        switch raw {
+        switch p079CanonicalEnumRaw(raw) {
         case "reserved": self = .reserved
         case "prompt_sent": self = .promptSent
         case "settled": self = .settled
@@ -391,7 +395,7 @@ nonisolated enum SameSessionRepairResult: Codable, Sendable, Equatable {
 
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
-        switch raw {
+        switch p079CanonicalEnumRaw(raw) {
         case "not_needed": self = .notNeeded
         case "accepted": self = .accepted
         case "rejected_invalid": self = .rejectedInvalid
@@ -457,7 +461,7 @@ nonisolated enum TranscriptRecoveryResult: Codable, Sendable, Equatable {
 
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
-        switch raw {
+        switch p079CanonicalEnumRaw(raw) {
         case "not_needed": self = .notNeeded
         case "accepted": self = .accepted
         case "rejected_invalid": self = .rejectedInvalid
@@ -535,7 +539,7 @@ nonisolated enum ProviderFallbackResult: Codable, Sendable, Equatable {
 
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
-        switch raw {
+        switch p079CanonicalEnumRaw(raw) {
         case "not_needed": self = .notNeeded
         case "scheduled": self = .scheduled
         case "accepted": self = .accepted
@@ -615,7 +619,7 @@ nonisolated enum PermissionDecisionValue: Codable, Sendable, Equatable {
 
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
-        switch raw {
+        switch p079CanonicalEnumRaw(raw) {
         case "allowed": self = .allowed
         case "denied": self = .denied
         default: self = .unknownDiagnostic(raw)
