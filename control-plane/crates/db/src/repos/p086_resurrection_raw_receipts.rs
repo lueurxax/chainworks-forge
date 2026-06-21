@@ -12,6 +12,7 @@
 //   Wrong-run Operator     → denied (auth_failure, no existence oracle)
 
 use anyhow::Result;
+use domain::continuation::ResurrectionPhase;
 use sqlx::{Row, SqlitePool};
 
 pub struct RawReceiptRow {
@@ -23,7 +24,7 @@ pub struct RawReceiptRow {
 pub struct ReceiptReadbackContext {
     pub run_id: String,
     pub attach_receipt_artifact_id: Option<String>,
-    pub resurrection_phase: Option<String>,
+    pub resurrection_phase: Option<ResurrectionPhase>,
 }
 
 /// Persist or replace the raw receipt JSON for a resurrection continuation.
@@ -132,10 +133,19 @@ pub async fn continuation_receipt_readback_context(
     .bind(continuation_id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|r| ReceiptReadbackContext {
-        run_id: r.get("run_id"),
-        attach_receipt_artifact_id: r.get("attach_receipt_artifact_id"),
-        resurrection_phase: r.get("resurrection_phase"),
+    Ok(row.map(|r| {
+        let resurrection_phase = r
+            .get::<Option<String>, _>("resurrection_phase")
+            .map(|phase| {
+                phase
+                    .parse::<ResurrectionPhase>()
+                    .expect("database resurrection_phase must match domain enum")
+            });
+        ReceiptReadbackContext {
+            run_id: r.get("run_id"),
+            attach_receipt_artifact_id: r.get("attach_receipt_artifact_id"),
+            resurrection_phase,
+        }
     }))
 }
 

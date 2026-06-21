@@ -10200,6 +10200,12 @@ for needle in [
 if "GqlContinuationMetricsSummary" not in graphql_types:
     fail("GraphQL continuation types missing durable P086 metrics summary")
 for needle in [
+    "pub enum GqlResurrectionPhase",
+    "resurrection_phase: Option<GqlResurrectionPhase>",
+]:
+    if needle not in graphql_types:
+        fail(f"GraphQL continuation types must expose typed resurrection phase needle {needle!r}")
+for needle in [
     "useful_progress_rate",
     "average_time_saved_seconds",
     "followup_validation_success_rate",
@@ -10252,6 +10258,48 @@ for name in required_artifacts:
 
 attach_v2_schema = load_json(artifact_dir / "provider_session_attach_receipt_v2.schema.json")
 attach_v2_required = set(attach_v2_schema.get("required", []))
+phase_values = {
+    "admitted",
+    "launching",
+    "launched",
+    "attaching",
+    "attached_unprompted",
+    "prompting",
+    "settling",
+    "cancelling",
+    "completed",
+    "failed_closed",
+}
+phase_schema_values = set(attach_v2_schema.get("properties", {}).get("resurrection_phase", {}).get("enum", []))
+if phase_schema_values != phase_values:
+    fail(f"provider_session_attach_receipt_v2 resurrection_phase enum drift: {sorted(phase_schema_values)}")
+domain_continuation = (root / "control-plane/crates/domain/src/continuation.rs").read_text()
+for needle in [
+    "pub enum ResurrectionPhase",
+    "ResurrectionPhase::Cancelling",
+    "ResurrectionPhase::FailedClosed",
+    "resurrection_phase: Option<ResurrectionPhase>",
+]:
+    if needle not in domain_continuation:
+        fail(f"domain continuation must expose typed ResurrectionPhase needle {needle!r}")
+db_repo_text = (root / "control-plane/crates/db/src/repos/agent_work_continuations.rs").read_text()
+if "phase: ResurrectionPhase" not in db_repo_text:
+    fail("agent_work_continuations::update_resurrection_phase must accept typed ResurrectionPhase")
+if ".bind(&phase)" not in db_repo_text:
+    fail("agent_work_continuations::update_resurrection_phase must bind the typed phase string")
+if not attach_v2_schema.get("allOf"):
+    fail("provider_session_attach_receipt_v2 must constrain output_only source edit allowance")
+if "output_only_source_edit_violation" not in executor_text:
+    fail("output-only recovery must fail closed when source files change")
+if "output_only_source_edit_allowance_not_supported" not in mcp_agents:
+    fail("MCP admission must reject output-only source edit allowance before admission")
+proposal086 = (root / "docs/proposals/086-agent-work-continuation-and-lead-directed-session-resumption.md").read_text()
+for needle in [
+    "output-only recovery always forbids source edits",
+    "`cancelling`: run or continuation cancellation has been durably requested",
+]:
+    if needle not in proposal086:
+        fail(f"P086 proposal must own R15 contract wording {needle!r}")
 for field in [
     "target_agent_execution_id",
     "target_stage_execution_id",

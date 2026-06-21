@@ -37,7 +37,7 @@ use crate::types::artifact::{GqlArtifact, P085_NO_DEADLINE_JUSTIFICATION};
 use crate::types::continuation::{
     GqlAttachReceiptGuest, GqlAttachReceiptOperator, GqlAttachReceiptReviewer,
     GqlContinuationCandidatesResult, GqlContinuationMetricsSummary, GqlContinuationRecord,
-    GqlContinuationStatus,
+    GqlContinuationStatus, GqlResurrectionPhase,
 };
 use crate::types::idea::GqlIdea;
 use crate::types::p031::{
@@ -3410,6 +3410,12 @@ impl QueryRoot {
                     r.try_get::<Option<String>, _>("resurrection_phase")
                         .ok()
                         .flatten()
+                        .and_then(|phase| {
+                            phase
+                                .parse::<domain::continuation::ResurrectionPhase>()
+                                .ok()
+                        })
+                        .map(GqlResurrectionPhase::from)
                 });
                 Ok(serde_json::to_value(GqlAttachReceiptGuest {
                     continuation_id: cont_id.to_string(),

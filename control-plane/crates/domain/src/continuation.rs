@@ -145,6 +145,72 @@ impl std::str::FromStr for ContinuationStatus {
     }
 }
 
+/// P086: provider-session resurrection substate.
+///
+/// This is intentionally separate from `ContinuationStatus`: status remains the
+/// generic lifecycle, while resurrection phase tracks the attach/replay boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResurrectionPhase {
+    Admitted,
+    Launching,
+    Launched,
+    Attaching,
+    AttachedUnprompted,
+    Prompting,
+    Settling,
+    Cancelling,
+    Completed,
+    FailedClosed,
+}
+
+impl ResurrectionPhase {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            ResurrectionPhase::Completed | ResurrectionPhase::FailedClosed
+        )
+    }
+}
+
+impl std::fmt::Display for ResurrectionPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ResurrectionPhase::Admitted => "admitted",
+            ResurrectionPhase::Launching => "launching",
+            ResurrectionPhase::Launched => "launched",
+            ResurrectionPhase::Attaching => "attaching",
+            ResurrectionPhase::AttachedUnprompted => "attached_unprompted",
+            ResurrectionPhase::Prompting => "prompting",
+            ResurrectionPhase::Settling => "settling",
+            ResurrectionPhase::Cancelling => "cancelling",
+            ResurrectionPhase::Completed => "completed",
+            ResurrectionPhase::FailedClosed => "failed_closed",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl std::str::FromStr for ResurrectionPhase {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "admitted" => Ok(ResurrectionPhase::Admitted),
+            "launching" => Ok(ResurrectionPhase::Launching),
+            "launched" => Ok(ResurrectionPhase::Launched),
+            "attaching" => Ok(ResurrectionPhase::Attaching),
+            "attached_unprompted" => Ok(ResurrectionPhase::AttachedUnprompted),
+            "prompting" => Ok(ResurrectionPhase::Prompting),
+            "settling" => Ok(ResurrectionPhase::Settling),
+            "cancelling" => Ok(ResurrectionPhase::Cancelling),
+            "completed" => Ok(ResurrectionPhase::Completed),
+            "failed_closed" => Ok(ResurrectionPhase::FailedClosed),
+            other => Err(format!("unknown ResurrectionPhase: {other}")),
+        }
+    }
+}
+
 /// P086: Projection record for a single continuation turn (read-only).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ContinuationRecord {
@@ -158,7 +224,7 @@ pub struct ContinuationRecord {
     pub status: String,
     pub failure_reason: Option<String>,
     pub reconciliation_status: Option<String>,
-    pub resurrection_phase: Option<String>,
+    pub resurrection_phase: Option<ResurrectionPhase>,
     pub idempotency_scope: String,
     pub idempotency_key: String,
     pub request_fingerprint_sha256: String,
@@ -250,5 +316,32 @@ mod tests {
             let t: ContinuationTriggerKind = s.parse().expect("parse");
             assert_eq!(t.to_string(), *s);
         }
+    }
+
+    #[test]
+    fn resurrection_phase_roundtrip() {
+        for s in &[
+            "admitted",
+            "launching",
+            "launched",
+            "attaching",
+            "attached_unprompted",
+            "prompting",
+            "settling",
+            "cancelling",
+            "completed",
+            "failed_closed",
+        ] {
+            let phase: ResurrectionPhase = s.parse().expect("parse");
+            assert_eq!(phase.to_string(), *s);
+        }
+    }
+
+    #[test]
+    fn resurrection_phase_terminal() {
+        assert!(ResurrectionPhase::Completed.is_terminal());
+        assert!(ResurrectionPhase::FailedClosed.is_terminal());
+        assert!(!ResurrectionPhase::Cancelling.is_terminal());
+        assert!(!ResurrectionPhase::AttachedUnprompted.is_terminal());
     }
 }

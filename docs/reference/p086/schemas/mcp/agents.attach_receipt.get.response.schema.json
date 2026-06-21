@@ -42,7 +42,22 @@
         "outcome": {"type": "string", "const": "reviewer_projection"},
         "schema_version": {"type": "integer"},
         "failure_class": {"type": ["string", "null"]},
-        "resurrection_phase": {"type": ["string", "null"]},
+        "resurrection_phase": {
+          "type": ["string", "null"],
+          "enum": [
+            "admitted",
+            "launching",
+            "launched",
+            "attaching",
+            "attached_unprompted",
+            "prompting",
+            "settling",
+            "cancelling",
+            "completed",
+            "failed_closed",
+            null
+          ]
+        },
         "attach_started_at": {"type": ["string", "null"]},
         "attach_completed_at": {"type": ["string", "null"]},
         "output_only": {"type": ["boolean", "null"]},
@@ -59,7 +74,22 @@
       "properties": {
         "outcome": {"type": "string", "const": "redacted"},
         "attach_receipt_artifact_present": {"type": "boolean"},
-        "resurrection_phase": {"type": ["string", "null"]}
+        "resurrection_phase": {
+          "type": ["string", "null"],
+          "enum": [
+            "admitted",
+            "launching",
+            "launched",
+            "attaching",
+            "attached_unprompted",
+            "prompting",
+            "settling",
+            "cancelling",
+            "completed",
+            "failed_closed",
+            null
+          ]
+        }
       }
     },
     "not_found_response": {

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
-use domain::continuation::{ContinuationCandidate, ContinuationRecord};
+use domain::continuation::{ContinuationCandidate, ContinuationRecord, ResurrectionPhase};
 
 /// P086: Eligibility info for an agent execution that may receive a continuation.
 pub struct ContinuationEligibilityInfo {
@@ -119,6 +119,13 @@ const SELECT_COLS: &str = r#"
 "#;
 
 fn row_to_record(r: &sqlx::sqlite::SqliteRow) -> ContinuationRecord {
+    let resurrection_phase = r
+        .get::<Option<String>, _>("resurrection_phase")
+        .map(|phase| {
+            phase
+                .parse::<ResurrectionPhase>()
+                .expect("database resurrection_phase must match domain enum")
+        });
     ContinuationRecord {
         id: r.get("id"),
         run_id: r.get("run_id"),
@@ -130,7 +137,7 @@ fn row_to_record(r: &sqlx::sqlite::SqliteRow) -> ContinuationRecord {
         status: r.get("status"),
         failure_reason: r.get("failure_reason"),
         reconciliation_status: r.get("reconciliation_status"),
-        resurrection_phase: r.get("resurrection_phase"),
+        resurrection_phase,
         idempotency_scope: r.get("idempotency_scope"),
         idempotency_key: r.get("idempotency_key"),
         request_fingerprint_sha256: r.get("request_fingerprint_sha256"),
@@ -1291,15 +1298,16 @@ pub async fn insert_side_effect_ledger_row(
 pub async fn update_resurrection_phase(
     pool: &SqlitePool,
     continuation_id: &str,
-    phase: &str,
+    phase: ResurrectionPhase,
     timeout_class: Option<&str>,
 ) -> Result<u64> {
     let now = chrono::Utc::now().to_rfc3339();
-    let deadline = if matches!(phase, "completed" | "failed_closed") {
+    let deadline = if phase.is_terminal() {
         None
     } else {
         Some((chrono::Utc::now() + chrono::Duration::seconds(300)).to_rfc3339())
     };
+    let phase = phase.to_string();
     let rows = sqlx::query(
         "UPDATE agent_work_continuations
          SET resurrection_phase = ?,
@@ -1309,7 +1317,7 @@ pub async fn update_resurrection_phase(
              updated_at = ?
          WHERE id = ? AND mode = 'provider_session_resurrection'",
     )
-    .bind(phase)
+    .bind(&phase)
     .bind(deadline)
     .bind(&now)
     .bind(timeout_class)

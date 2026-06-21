@@ -5,6 +5,7 @@ use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{agent_work_continuations, ideas, runs, sessions, stages};
 use domain::agent::{AgentExecution, AgentStatus};
+use domain::continuation::ResurrectionPhase;
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, IdeaId, RunId, StageExecutionId};
 use domain::run::{Run, RunStatus};
@@ -278,9 +279,14 @@ async fn seed_continuation_readback(
     )
     .await
     .unwrap();
-    agent_work_continuations::update_resurrection_phase(pool, &continuation_id, "completed", None)
-        .await
-        .unwrap();
+    agent_work_continuations::update_resurrection_phase(
+        pool,
+        &continuation_id,
+        ResurrectionPhase::Completed,
+        None,
+    )
+    .await
+    .unwrap();
     agent_work_continuations::record_p086_continuation_metric_event(
         pool,
         Some(&run_id.to_string()),

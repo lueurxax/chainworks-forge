@@ -1,6 +1,6 @@
 use async_graphql::*;
 use chrono;
-use domain::continuation::ContinuationRecord;
+use domain::continuation::{ContinuationRecord, ResurrectionPhase};
 
 use crate::types::p031::GqlFreshnessState;
 
@@ -55,6 +55,50 @@ fn is_terminal_status(status: &str) -> bool {
     matches!(status, "succeeded" | "no_progress" | "failed" | "cancelled")
 }
 
+/// P086 GraphQL enum mirror for the daemon resurrection substate.
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[graphql(name = "ResurrectionPhase")]
+pub enum GqlResurrectionPhase {
+    #[graphql(name = "admitted")]
+    Admitted,
+    #[graphql(name = "launching")]
+    Launching,
+    #[graphql(name = "launched")]
+    Launched,
+    #[graphql(name = "attaching")]
+    Attaching,
+    #[graphql(name = "attached_unprompted")]
+    AttachedUnprompted,
+    #[graphql(name = "prompting")]
+    Prompting,
+    #[graphql(name = "settling")]
+    Settling,
+    #[graphql(name = "cancelling")]
+    Cancelling,
+    #[graphql(name = "completed")]
+    Completed,
+    #[graphql(name = "failed_closed")]
+    FailedClosed,
+}
+
+impl From<ResurrectionPhase> for GqlResurrectionPhase {
+    fn from(value: ResurrectionPhase) -> Self {
+        match value {
+            ResurrectionPhase::Admitted => GqlResurrectionPhase::Admitted,
+            ResurrectionPhase::Launching => GqlResurrectionPhase::Launching,
+            ResurrectionPhase::Launched => GqlResurrectionPhase::Launched,
+            ResurrectionPhase::Attaching => GqlResurrectionPhase::Attaching,
+            ResurrectionPhase::AttachedUnprompted => GqlResurrectionPhase::AttachedUnprompted,
+            ResurrectionPhase::Prompting => GqlResurrectionPhase::Prompting,
+            ResurrectionPhase::Settling => GqlResurrectionPhase::Settling,
+            ResurrectionPhase::Cancelling => GqlResurrectionPhase::Cancelling,
+            ResurrectionPhase::Completed => GqlResurrectionPhase::Completed,
+            ResurrectionPhase::FailedClosed => GqlResurrectionPhase::FailedClosed,
+        }
+    }
+}
+
 /// P086: Read-only GraphQL projection of a continuation turn.
 /// Exposes raw (daemon-canonical) values alongside display labels;
 /// unrecognised raw values produce UNKNOWN(<raw>) display strings
@@ -79,7 +123,7 @@ pub struct GqlContinuationRecord {
 
     pub failure_reason: Option<String>,
     pub reconciliation_status: Option<String>,
-    pub resurrection_phase: Option<String>,
+    pub resurrection_phase: Option<GqlResurrectionPhase>,
 
     pub request_fingerprint_sha256: String,
     pub canonical_request_artifact_id: Option<ID>,
@@ -127,7 +171,7 @@ impl From<ContinuationRecord> for GqlContinuationRecord {
             is_terminal,
             failure_reason: r.failure_reason,
             reconciliation_status: r.reconciliation_status,
-            resurrection_phase: r.resurrection_phase,
+            resurrection_phase: r.resurrection_phase.map(Into::into),
             request_fingerprint_sha256: r.request_fingerprint_sha256,
             canonical_request_artifact_id: r.canonical_request_artifact_id.map(Into::into),
             attach_receipt_artifact_id: r.attach_receipt_artifact_id.map(Into::into),
@@ -331,7 +375,7 @@ pub struct GqlAttachReceiptReviewer {
 #[graphql(name = "ProviderSessionAttachReceiptGuest")]
 pub struct GqlAttachReceiptGuest {
     pub continuation_id: String,
-    pub resurrection_phase: Option<String>,
+    pub resurrection_phase: Option<GqlResurrectionPhase>,
 }
 
 /// Compute freshness and lag from an RFC-3339 updated_at timestamp.

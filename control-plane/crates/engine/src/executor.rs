@@ -48,6 +48,7 @@ use domain::code_writer_completion::{
     CodeWriterCompletionOutputDecisionRecord, CodeWriterCompletionReceiptRecord,
     CodeWriterCompletionTextCaptureRecord, CodeWriterOutputSettlementRow,
 };
+use domain::continuation::ResurrectionPhase;
 use domain::discovery::{
     AgentExecutionDiscoveryDiagnostics, DiscoveryDiagnosticsV1, DiscoveryFilesystem,
     DiscoveryPathKind, ExpectedOutputSpec, ExpectedPathBaselineStatus, LegacyBroadDiscoveryPolicy,
@@ -6098,7 +6099,7 @@ impl BackgroundExecutor {
         db::repos::agent_work_continuations::update_resurrection_phase(
             &self.pool,
             &continuation.id,
-            "failed_closed",
+            ResurrectionPhase::FailedClosed,
             None,
         )
         .await?;
@@ -7614,7 +7615,7 @@ impl BackgroundExecutor {
                 update_resurrection_phase(
                     &self.pool,
                     continuation_id,
-                    "failed_closed",
+                    ResurrectionPhase::FailedClosed,
                     Some("attach_timeout"),
                 )
                 .await?;
@@ -7633,7 +7634,13 @@ impl BackgroundExecutor {
                 return Ok(());
             };
 
-            update_resurrection_phase(&self.pool, continuation_id, "launching", None).await?;
+            update_resurrection_phase(
+                &self.pool,
+                continuation_id,
+                ResurrectionPhase::Launching,
+                None,
+            )
+            .await?;
             let canonical_worktree_root =
                 worktree_root.as_deref().unwrap_or(workspace_root.as_str());
             let attach_started_at = chrono::Utc::now().to_rfc3339();
@@ -7699,7 +7706,7 @@ impl BackgroundExecutor {
                     update_resurrection_phase(
                         &self.pool,
                         continuation_id,
-                        "failed_closed",
+                        ResurrectionPhase::FailedClosed,
                         Some("attach_timeout"),
                     )
                     .await?;
@@ -7733,8 +7740,13 @@ impl BackgroundExecutor {
                     return Ok(());
                 }
             };
-            update_resurrection_phase(&self.pool, continuation_id, "attached_unprompted", None)
-                .await?;
+            update_resurrection_phase(
+                &self.pool,
+                continuation_id,
+                ResurrectionPhase::AttachedUnprompted,
+                None,
+            )
+            .await?;
 
             if let (Some(child_pid), Some(process_group_id)) = (
                 attach_result.managed_child_pid,
@@ -7867,6 +7879,10 @@ impl BackgroundExecutor {
             raw_receipt.insert(
                 "changed_source_files_count".into(),
                 serde_json::Value::from(0),
+            );
+            raw_receipt.insert(
+                "changed_source_files".into(),
+                serde_json::Value::Array(Vec::new()),
             );
             raw_receipt.insert("failure_class".into(), serde_json::Value::Null);
             raw_receipt.insert("resurrection_deadline_at".into(), serde_json::Value::Null);
@@ -8010,7 +8026,7 @@ impl BackgroundExecutor {
                 update_resurrection_phase(
                     &self.pool,
                     continuation_id,
-                    "failed_closed",
+                    ResurrectionPhase::FailedClosed,
                     Some("unprompted_timeout"),
                 )
                 .await?;
@@ -8076,7 +8092,7 @@ impl BackgroundExecutor {
                 update_resurrection_phase(
                     &self.pool,
                     continuation_id,
-                    "failed_closed",
+                    ResurrectionPhase::FailedClosed,
                     Some("prompt_timeout"),
                 )
                 .await?;
@@ -8101,7 +8117,13 @@ impl BackgroundExecutor {
             )
             .await?;
             let prompt_sent_at = chrono::Utc::now().to_rfc3339();
-            update_resurrection_phase(&self.pool, continuation_id, "prompting", None).await?;
+            update_resurrection_phase(
+                &self.pool,
+                continuation_id,
+                ResurrectionPhase::Prompting,
+                None,
+            )
+            .await?;
             update_continuation_status(&self.pool, continuation_id, "prompt_sent", None).await?;
             current_receipt_json["prompt_sent_at"] =
                 serde_json::Value::String(prompt_sent_at.clone());
@@ -8175,7 +8197,13 @@ impl BackgroundExecutor {
                 .await;
             let _ = self.acp.close_session(&session_generation_id).await;
             let settling_at = chrono::Utc::now().to_rfc3339();
-            update_resurrection_phase(&self.pool, continuation_id, "settling", None).await?;
+            update_resurrection_phase(
+                &self.pool,
+                continuation_id,
+                ResurrectionPhase::Settling,
+                None,
+            )
+            .await?;
             current_receipt_json["resurrection_phase"] =
                 serde_json::Value::String("settling".to_string());
             current_receipt_json["resurrection_last_heartbeat_at"] =
@@ -8265,7 +8293,7 @@ impl BackgroundExecutor {
                         update_resurrection_phase(
                             &self.pool,
                             continuation_id,
-                            "failed_closed",
+                            ResurrectionPhase::FailedClosed,
                             None,
                         )
                         .await?;
@@ -8313,8 +8341,13 @@ impl BackgroundExecutor {
                     )
                     .await?;
                     let completed_at = chrono::Utc::now().to_rfc3339();
-                    update_resurrection_phase(&self.pool, continuation_id, "completed", None)
-                        .await?;
+                    update_resurrection_phase(
+                        &self.pool,
+                        continuation_id,
+                        ResurrectionPhase::Completed,
+                        None,
+                    )
+                    .await?;
                     current_receipt_json["resurrection_phase"] =
                         serde_json::Value::String("completed".to_string());
                     current_receipt_json["resurrection_last_heartbeat_at"] =
@@ -8349,7 +8382,7 @@ impl BackgroundExecutor {
                     update_resurrection_phase(
                         &self.pool,
                         continuation_id,
-                        "failed_closed",
+                        ResurrectionPhase::FailedClosed,
                         Some("settle_timeout"),
                     )
                     .await?;

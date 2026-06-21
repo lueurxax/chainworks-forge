@@ -54,7 +54,22 @@
         "status": {"type": "string"},
         "failure_reason": {"type": ["string", "null"]},
         "reconciliation_status": {"type": ["string", "null"]},
-        "resurrection_phase": {"type": ["string", "null"]},
+        "resurrection_phase": {
+          "type": ["string", "null"],
+          "enum": [
+            "admitted",
+            "launching",
+            "launched",
+            "attaching",
+            "attached_unprompted",
+            "prompting",
+            "settling",
+            "cancelling",
+            "completed",
+            "failed_closed",
+            null
+          ]
+        },
         "idempotency_scope": {"type": "string"},
         "idempotency_key": {"type": "string"},
         "request_fingerprint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},

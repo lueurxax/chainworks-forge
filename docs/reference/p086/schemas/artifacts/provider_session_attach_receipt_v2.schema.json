@@ -39,6 +39,7 @@
     "output_only",
     "source_edit_allowance",
     "changed_source_files_count",
+    "changed_source_files",
     "failure_class",
     "session_store_transcript_path",
     "session_store_transcript_digest",
@@ -109,7 +110,7 @@
     "changed_source_files": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "Explicit list of source files changed during the continuation, recorded when source_edit_allowance=true. Present only on post-execution receipt updates; absent (not null) when source edits were not allowed."
+      "description": "Explicit list of source files changed during the continuation. For output_only=true this list must stay empty and source_edit_allowance must be false."
     },
     "failure_class": {
       "type": ["string", "null"],
@@ -172,5 +173,20 @@
       ]
     },
     "timeout_settled_at": { "type": ["string", "null"], "format": "date-time" }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "output_only": { "const": true } },
+        "required": ["output_only"]
+      },
+      "then": {
+        "properties": {
+          "source_edit_allowance": { "const": false },
+          "changed_source_files_count": { "const": 0 },
+          "changed_source_files": { "maxItems": 0 }
+        }
+      }
+    }
+  ]
 }

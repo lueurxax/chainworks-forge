@@ -68,7 +68,7 @@ of these modes:
 | `normal_fresh_execution` | Start a new execution attempt with no provider memory dependency. | New provider session only. |
 | `normal_live_reuse` | Send another prompt through a live ACP handle that Chainworks still owns and whose previous prompt boundary settled cleanly. | Existing live ACP handle. |
 | `provider_session_resurrection` | Start a new Chainworks-managed ACP subprocess and attach/resume a recorded provider session id after the old ACP handle is gone. | New ACP process attached to old provider session id. |
-| `output_only_recovery` | Recover missing or malformed required outputs from useful work already performed; do not redo implementation work unless explicitly allowed. | Live reuse or provider-session resurrection, with explicit recovery receipt. |
+| `output_only_recovery` | Recover missing or malformed required outputs from useful work already performed; do not redo implementation work and do not allow source edits. | Live reuse or provider-session resurrection, with explicit recovery receipt. |
 
 A normal retry must never silently reuse an ambiguous provider session after
 `prompt_closed_during_stream`, `transport_closed`, `provider_timeout`, failed
@@ -84,8 +84,8 @@ was selected, and why other modes were rejected. In particular:
   ineligible for `normal_live_reuse`;
 - the same provider session id may still be eligible for
   `provider_session_resurrection` if adapter and catalog gates pass;
-- output-only recovery must state whether source edits are forbidden or
-  explicitly allowed;
+- output-only recovery always forbids source edits and fails closed if source
+  edits are requested or observed;
 - any fallback from resurrection/recovery to a fresh retry requires a separate
   operator-visible decision and must not happen automatically.
 
@@ -271,8 +271,10 @@ Provider-session resurrection must support the P079/P088 output-repair shape:
 - the operator wants a short continuation that returns only corrected required
   outputs, using the provider session that already did the work.
 
-The repair prompt must explicitly forbid additional code edits unless the
-operator instruction allows them.
+The repair prompt must explicitly forbid additional code edits. P086 does not
+introduce an operator override that allows source edits in output-only recovery;
+requests or frozen-catalog capabilities that attempt to enable such an override
+must fail closed before admission.
 
 Output-only recovery is a distinct continuation purpose, not a generic retry.
 It must ask only for the missing or invalid required outputs, include the
@@ -284,9 +286,9 @@ pieces.
 Output-only repair also needs machine-checkable proof, not only prompt wording.
 For output-only resurrection requests, Chainworks must capture a pre/post
 worktree source snapshot or equivalent diff summary and record
-`changed_source_files == 0`. If source edits are intentionally allowed by the
-operator, the request and receipt must say so explicitly and list the changed
-source files.
+`changed_source_files == 0`, `source_edit_allowance = false`, and an empty
+changed-source list. Any changed source file during output-only settlement is a
+terminal fail-closed outcome, not an accepted recovery path.
 
 ### 3.6 Durable State And Replay Contract
 
@@ -324,7 +326,10 @@ Allowed resurrection phases:
    durable.
 7. `settling`: provider response is being collected and artifacts are being
    settled.
-8. `completed` or `failed_closed`.
+8. `cancelling`: run or continuation cancellation has been durably requested
+   while the resurrection worker may still need to close/reap the managed
+   provider child.
+9. `completed` or `failed_closed`.
 
 Compatibility mapping to the existing status lifecycle:
 
@@ -337,6 +342,7 @@ Compatibility mapping to the existing status lifecycle:
 | `attached_unprompted` | `preflight_passed` |
 | `prompting` | `prompt_sent` |
 | `settling` | `observing`, `worktree_observed`, `needs_continuation_reconciliation`, `finalizing` |
+| `cancelling` | `cancelling`, `cancelled` |
 | `completed` | `succeeded`, `no_progress` |
 | `failed_closed` | `failed`, `cancelled` |
 
@@ -504,8 +510,9 @@ Required tests and evidence:
    resurrected provider session without changing source files when the operator
    asked for output-only repair.
 16. Output-only repair test: source snapshot evidence records
-   `changed_source_files == 0`; a deliberately allowed source-edit request must
-   record the explicit operator allowance and changed file list.
+   `changed_source_files == 0`, `source_edit_allowance=false`, and an empty
+   changed-source list; a catalog/request attempting source-edit allowance fails
+   closed before admission with deterministic evidence.
 17. Crash/replay tests: crashes in `launching`, `launched`, `attaching`,
     `attached_unprompted`, and `prompting` follow the replay rules without
     duplicate prompt send and without normal retry fallback.
