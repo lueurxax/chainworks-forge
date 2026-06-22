@@ -23,8 +23,7 @@ CREATE TABLE IF NOT EXISTS agent_work_continuations (
   mode                            TEXT    NOT NULL
                                     CHECK (mode IN (
                                       'live_handle_continuation',
-                                      'provider_session_resurrection',
-                                      'output_only_recovery'
+                                      'provider_session_resurrection'
                                     )),
   -- trigger_kind: operator_mcp | lead_auto
   trigger_kind                    TEXT    NOT NULL

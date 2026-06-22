@@ -6,7 +6,7 @@ const Inspector = ({ runId }) => (
     <div className="fg-panel" style={{padding:14,display:"flex",flexDirection:"column",gap:10}}>
       {[
         ["Run ID", runId],
-        ["Workflow", "proposal-loop-live@v3"],
+        ["Workflow", "full-mvp-live@v3"],
         ["Catalog", "agents.yaml · sha256:7c4d…2a"],
         ["Provider", "Claude Code"],
         ["Model", "claude-sonnet-4-5"],

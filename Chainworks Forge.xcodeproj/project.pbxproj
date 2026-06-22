@@ -14,7 +14,6 @@
 		CE8915722F700957006EC77C /* proposal-to-release.yaml in Resources */ = {isa = PBXBuildFile; fileRef = CE89156B2F700957006EC77C /* proposal-to-release.yaml */; };
 		CE8915732F700957006EC77C /* agents.yaml in Resources */ = {isa = PBXBuildFile; fileRef = CE8915682F700957006EC77C /* agents.yaml */; };
 		CE8915742F700957006EC77C /* workflow.yaml in Resources */ = {isa = PBXBuildFile; fileRef = CE89156C2F700957006EC77C /* workflow.yaml */; };
-		CE8915752F700957006EC77C /* proposal-loop-live.yaml in Resources */ = {isa = PBXBuildFile; fileRef = CE8915762F700957006EC77C /* proposal-loop-live.yaml */; };
 		CE8915772F700957006EC77C /* full-mvp-live.yaml in Resources */ = {isa = PBXBuildFile; fileRef = CE8915782F700957006EC77C /* full-mvp-live.yaml */; };
 		CEAPPINT2F95D001006EC77C /* AppIntents.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = CEAPPINT2F95D000006EC77C /* AppIntents.framework */; };
 /* End PBXBuildFile section */
@@ -58,7 +57,6 @@
 		CE89156B2F700957006EC77C /* proposal-to-release.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = "proposal-to-release.yaml"; sourceTree = "<group>"; };
 		CE89156C2F700957006EC77C /* workflow.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = workflow.yaml; sourceTree = "<group>"; };
 		CE89156E2F700957006EC77C /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
-		CE8915762F700957006EC77C /* proposal-loop-live.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = "proposal-loop-live.yaml"; sourceTree = "<group>"; };
 		CE8915782F700957006EC77C /* full-mvp-live.yaml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = "full-mvp-live.yaml"; sourceTree = "<group>"; };
 		CEAPPINT2F95D000006EC77C /* AppIntents.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AppIntents.framework; path = System/Library/Frameworks/AppIntents.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
@@ -164,7 +162,6 @@
 			children = (
 				CE8915782F700957006EC77C /* full-mvp-live.yaml */,
 				CE89156B2F700957006EC77C /* proposal-to-release.yaml */,
-				CE8915762F700957006EC77C /* proposal-loop-live.yaml */,
 				CE89156C2F700957006EC77C /* workflow.yaml */,
 			);
 			path = workflows;
@@ -318,7 +315,6 @@
 				CE8915702F700957006EC77C /* proposal-po-reviewer.yaml in Resources */,
 				CE8915712F700957006EC77C /* README.md in Resources */,
 				CE8915722F700957006EC77C /* proposal-to-release.yaml in Resources */,
-				CE8915752F700957006EC77C /* proposal-loop-live.yaml in Resources */,
 				CE8915732F700957006EC77C /* agents.yaml in Resources */,
 				CE8915742F700957006EC77C /* workflow.yaml in Resources */,
 				CE8915772F700957006EC77C /* full-mvp-live.yaml in Resources */,

@@ -35,15 +35,6 @@ struct ProjectRootPolicyTests {
         }
     }
 
-    @Test("Proposal loop workflow requires project access")
-    func proposalLoopWorkflowRequiresProjectAccess() throws {
-        let workflowURL = testRepositoryRootURL()
-            .appendingPathComponent("examples/workflows/proposal-loop-live.yaml", isDirectory: false)
-        let workflow = try YAMLParser.loadWorkflow(from: workflowURL)
-
-        #expect(workflow.workflow.execution.requiresProjectAccess)
-    }
-
     @Test("Full MVP workflow requires project access")
     func fullMVPWorkflowRequiresProjectAccess() throws {
         let workflowURL = testRepositoryRootURL()

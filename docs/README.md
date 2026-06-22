@@ -34,7 +34,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 - [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — RunPlan compiler, orchestrator, executors, artifact management, resume, declarative workflow authority, quality-gate blocker boundary routing, durable side-effect ledger, and conflict resolution / lead mediation
 - [reference/artifact-discovery-and-settlement-optimization.md](reference/artifact-discovery-and-settlement-optimization.md) — Bounded discovery, settlement pipeline, and pre-prompt metadata
 - [reference/runtime-contract.md](reference/runtime-contract.md) — Frozen run snapshots, state machines, artifact model
-- [reference/execution-truth-and-recovery.md](reference/execution-truth-and-recovery.md) — Terminal outcomes, atomic transition settlement, cursor-driven resume, recovery precedence, host interruption, workflow conflict recovery, durable side-effect reconciliation, and startup recovery progress
+- [reference/execution-truth-and-recovery.md](reference/execution-truth-and-recovery.md) — Terminal outcomes, durable execution-truth ownership, command idempotency, shutdown recovery, manual identity holds, atomic transition settlement, cursor-driven resume, recovery precedence, durable side-effect reconciliation, and startup recovery progress
 - [reference/rust-control-plane.md](reference/rust-control-plane.md) — Rust + SQLite daemon: architecture, crate layout, persistence, side-effect ledger, targeted retry authority, retry payload recovery, boundaries, capacity-aware scheduling, DbWriter gateway, write serialization, evidence spooling, provider toolchain homes, and generated-state housekeeping
 - [reference/escalation-policies.md](reference/escalation-policies.md) — Configurable escalation policies, durable tier advancement, readback shape, macOS read surface, rollout gate, and release-proof boundary
 
@@ -122,7 +122,6 @@ Runnable agent catalogs and workflow presets live under [`../examples`](../examp
 - [../examples/README.md](../examples/README.md)
 - [../examples/agents/agents.yaml](../examples/agents/agents.yaml)
 - [../examples/workflows/workflow.yaml](../examples/workflows/workflow.yaml)
-- [../examples/workflows/proposal-loop-live.yaml](../examples/workflows/proposal-loop-live.yaml)
 - [../examples/workflows/full-mvp-live.yaml](../examples/workflows/full-mvp-live.yaml)
 
 ## Research and Product

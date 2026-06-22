@@ -224,7 +224,6 @@ fn bundled_simultaneous_transition_findings() -> Vec<SimultaneousTransitionFindi
     let workflow_paths = [
         workflow_dir.join("workflow.yaml"),
         workflow_dir.join("full-mvp-live.yaml"),
-        workflow_dir.join("proposal-loop-live.yaml"),
         workflow_dir.join("proposal-to-release.yaml"),
     ];
 

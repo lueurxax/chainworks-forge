@@ -40,6 +40,7 @@
     "source_edit_allowance",
     "changed_source_files_count",
     "changed_source_files",
+    "output_only_source_proof",
     "failure_class",
     "session_store_transcript_path",
     "session_store_transcript_digest",
@@ -71,7 +72,12 @@
     "actual_provider_session_id": { "type": ["string", "null"] },
     "identity_proof_source": {
       "type": ["string", "null"],
-      "enum": ["provider_attach_response", "provider_session_readback", null]
+      "enum": [
+        "provider_attach_response",
+        "provider_session_readback",
+        "session_new_result.sessionId",
+        null
+      ]
     },
     "identity_proof_observed_at": { "type": ["string", "null"], "format": "date-time" },
     "identity_proof_artifact_id": { "type": ["string", "null"] },
@@ -111,6 +117,29 @@
       "type": "array",
       "items": { "type": "string" },
       "description": "Explicit list of source files changed during the continuation. For output_only=true this list must stay empty and source_edit_allowance must be false."
+    },
+    "output_only_source_proof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "proof_source",
+        "baseline_source_entry_count",
+        "baseline_source_sha256",
+        "baseline_changed_files_count",
+        "baseline_sha256"
+      ],
+      "properties": {
+        "proof_source": {
+          "type": "string",
+          "enum": ["source_snapshot_pre_post", "git_status_short_final"]
+        },
+        "baseline_source_entry_count": { "type": "integer", "minimum": 0 },
+        "final_source_entry_count": { "type": "integer", "minimum": 0 },
+        "baseline_source_sha256": { "type": ["string", "null"] },
+        "final_source_sha256": { "type": ["string", "null"] },
+        "baseline_changed_files_count": { "type": "integer", "minimum": 0 },
+        "baseline_sha256": { "type": ["string", "null"] }
+      }
     },
     "failure_class": {
       "type": ["string", "null"],

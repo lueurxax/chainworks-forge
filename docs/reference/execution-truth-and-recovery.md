@@ -6,7 +6,7 @@ P058 layers a chain-level escalation contract on top of agent-level execution tr
 
 ## Purpose
 
-The runtime must be able to say, once and only once, what actually happened in an agent attempt after output, timeout, cancellation, limit exhaustion, relaunch, and recovery. P083, the Execution-Truth Ownership and Invariant Model, further refines this by pinning durable shutdown state, command-idempotency storage, bounded metric labels, and rollout-contract readback to persisted control-plane records, along with defining specific UI interactions for manual identity verification and comprehensive migration plans. It introduces explicit contracts for CallerRequestIDs, RollbackDispositionJSON, Shutdown Contracts, Provider Cancellation Intents, and Late Output Overflow.
+The runtime must be able to say, once and only once, what actually happened in an agent attempt after output, timeout, cancellation, limit exhaustion, relaunch, and recovery. The execution-truth model pins durable shutdown state, command-idempotency storage, bounded metric labels, rollout-contract readback, manual identity verification, and additive migration proof to persisted control-plane records.
 
 This document is the stable contract for:
 
@@ -51,7 +51,7 @@ Every settled `AgentExecution` uses exactly one canonical terminal outcome:
 - `limit_exhausted_before_output`
 - `limit_exhausted_after_output`
 
-These values live in [`Chainworks Forge/Models/ExecutionTruth.swift`](<../../Chainworks Forge/Models/ExecutionTruth.swift>) and are persisted on `AgentExecution.canonicalOutcome`.
+These values are the reference-owned terminal-outcome vocabulary and are persisted on `AgentExecution.canonicalOutcome` where legacy Swift records expose that field.
 
 ### Neutral finish markers are not success on their own
 
@@ -88,9 +88,93 @@ Readers must use this precedence:
 2.  supporting evidence such as `outcomeEnvelopeJSON`, `providerReceiptJSON`, and validation payloads,
 3.  coarse legacy fields like `AgentStatus` only when canonical columns are absent.
 
-**P083 Data Authority Rule**: SQLite rows are authoritative. GraphQL, MCP, filesystem artifacts, report JSON, and SwiftData projections are readback or evidence surfaces only.
+**Data Authority Rule**: SQLite rows are authoritative. GraphQL, MCP, filesystem artifacts, report JSON, and SwiftData projections are readback or evidence surfaces only.
 
 Raw receipts or transcripts must never silently override canonical persisted outcome truth.
+
+## Durable Execution-Truth Ownership
+
+The Rust control plane owns lifecycle truth for runs, stages, agents, approvals,
+artifacts, side effects, provider sessions, command idempotency, shutdown
+receipts, rollout state, and operator readback. Northbound payloads and the
+macOS app render or request that truth; they do not become alternative sources
+of authority.
+
+Durable ownership rules:
+
+- Lifecycle commands require a lowercase UUIDv4 `caller_request_id` /
+  `callerRequestId` and execute through command-idempotency rows.
+- Caller intent is hashed from the command's semantic fields only. Diagnostic
+  text, timestamps, display names, and caller request ids are excluded from the
+  intent hash.
+- `side_effects.force_reconcile` includes the canonical
+  `decision_json_digest` in the intent hash because the operator decision is
+  part of command intent.
+- `provider_session.mark_process_absent` binds the authoritative provider
+  session id and cancellation epoch before clearing an identity-ambiguous hold.
+- Rollback requires an explicit target enforcement mode (`permissive` or
+  `disabled`) and persists audit/idempotency rows before readback changes.
+- JSON contracts that expose `schema_version` follow the append-only policy in
+  [p083/schema-version-evolution-policy.md](p083/schema-version-evolution-policy.md).
+
+### Command idempotency
+
+`command_idempotency` and `command_request_aliases` are the durable authority
+for replay, in-flight detection, same-intent aliasing, and request-intent
+mismatch denial. The current lifecycle command set is:
+
+- `runs.cancel`
+- `runs.retry`
+- `stages.retry`
+- `approvals.resolve`
+- `side_effects.force_reconcile`
+- `provider_session.shutdown`
+- `provider_session.mark_process_absent`
+- `p083.rollback_execution`
+- `p083.set_enforcement_mode`
+
+Each command has a per-command TTL policy and failed-terminal retry policy in
+the domain command contract. Failed terminal retry policy is command-specific:
+one-way transitions such as approval resolution are not automatically retried,
+while safe retry/requeue or identity-recovery commands use bounded retry or
+cooldown behavior.
+
+### Shutdown and manual identity recovery
+
+Provider shutdown persists cancellation intent and planned signal side-effect
+rows before signal dispatch. Recovery scans unresolved signal side effects and
+identity-ambiguous provider sessions at daemon startup. If process identity
+cannot be proven, the intent moves to a held state with
+`process_fate='identity_ambiguous'`.
+
+The macOS app renders `ManualProcessIdentityCheckBanner` from backend readback.
+The banner can trigger a read-only identity probe and copy diagnostics. Clearing
+the hold requires the operator command `provider_session.mark_process_absent`,
+which confirms the process is absent, writes durable idempotency/journal rows,
+sets `process_fate='absent_verified'`, and re-opens settlement.
+
+### Late output and durable time
+
+Late provider output after cancellation is latched into
+`cancel_late_output_overflow` by normalized scope, run id, provider session id,
+cancellation epoch, and overflow kind. Concurrent writers accumulate counters on
+one latch row and leave active projection mutation blocked.
+
+Shutdown and cancellation deadline rows store `baseline_sample_id` when a
+durable monotonic clock sample is available. Readers use the stored baseline, or
+the nearest at-or-before fallback for legacy rows, rather than reconstructing
+deadlines from current wall-clock state.
+
+### Rollout readback
+
+`Run.p083RolloutContractReadback` and MCP `runs.get` expose rollout-contract
+status, enforcement mode, hold conditions, rollback disposition, and related
+diagnostics. Rollback disposition values are resolver-validated against
+`rollback_disposition_v1` before serialization.
+
+The historical gate aliases `proposal-083` and `p083` are retained as stable
+proof commands. They validate stable reference/evidence files rather than a
+proposal document.
 
 ### Watchdog-specific truth refines, but does not replace, canonical outcome
 
@@ -230,7 +314,7 @@ It may narrow the operator action after a watchdog failure or exhausted retry, b
 
 ### Durable Side-Effect Ledger and Reconciliation
 
-For irreversible or externally visible operations (e.g., `git_push`, `connect_upload`), success is not just about the agent finishing. The system must ensure that the side effect is durable and reconcilable if a crash occurs mid-execution. P083 introduces the `command_idempotency_contract_v1`, `shutdown_signal_side_effect_contract_v1`, and `provider_cancellation_intent_contract_v1` to rigorously define these behaviors.
+For irreversible or externally visible operations (e.g., `git_push`, `connect_upload`), success is not just about the agent finishing. The system must ensure that the side effect is durable and reconcilable if a crash occurs mid-execution. The `command_idempotency_contract_v1`, `shutdown_signal_side_effect_contract_v1`, and `provider_cancellation_intent_contract_v1` define these behaviors.
 
 **Durability Rules:**
 - **Durable Intent**: The control plane persists a `SideEffect` record with status `prepared` before the external operation begins.
@@ -464,8 +548,9 @@ High-signal proof owners include:
 -   `ResumeManagerTests` for interrupted-run classification and approval restore behavior,
 -   `RecoveryCoordinatorTests` for narrow recovery action ownership,
 -   failed-stage evidence and report/recovery fallback suites,
--   `control-plane/crates/db/tests/proposal_083_migrations.rs` for P083's additive SQLite migrations,
+-   `control-plane/crates/db/tests/proposal_083_migrations.rs` for additive SQLite execution-truth migrations,
 -   `docs/evidence/083/` fixtures for command idempotency, shutdown, cancellation, late output, UI, metrics, and macOS behavior,
+-   `./scripts/test-gate.sh proposal-083` / `./scripts/test-gate.sh p083` for the retained execution-truth ownership proof gate,
 -   `./scripts/test-gate.sh proposal-058` for Rust ACP runtime facts, claim/start ownership,
     source-generation artifact ownership, GraphQL/MCP readback parity, and provider-quota
     retry ledger behavior.

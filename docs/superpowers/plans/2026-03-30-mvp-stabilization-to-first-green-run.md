@@ -48,7 +48,6 @@ Success means exactly this:
 - Modify: `/Users/user/Documents/Chainworks Forge/Chainworks Forge/DSL/YAMLValidator.swift`
 - Modify: `/Users/user/Documents/Chainworks Forge/examples/workflows/full-mvp-live.yaml`
 - Modify: `/Users/user/Documents/Chainworks Forge/examples/workflows/workflow.yaml`
-- Modify: `/Users/user/Documents/Chainworks Forge/examples/workflows/proposal-loop-live.yaml`
 
 **Read-model / proof lane**
 - Modify: `/Users/user/Documents/Chainworks Forge/Chainworks Forge/Engine/RunReportBuilder.swift`

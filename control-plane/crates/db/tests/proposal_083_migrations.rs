@@ -27,6 +27,34 @@ async fn artifact_lineage_table_exists_after_migration() {
 }
 
 #[tokio::test]
+async fn p083_h003_artifact_lineage_migration_is_create_table_posture() {
+    let migration_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations/087_p083_001_artifact_lineage_report_kind.sql");
+    let migration = std::fs::read_to_string(migration_path).unwrap();
+    assert!(
+        migration.contains("CREATE TABLE IF NOT EXISTS artifact_lineage"),
+        "P083-HARDEN-003 supported-store posture creates artifact_lineage for P083"
+    );
+    assert!(
+        !migration.contains("ALTER TABLE artifact_lineage ADD COLUMN report_kind"),
+        "P083-HARDEN-003 must not claim an ALTER/backfill posture in code"
+    );
+}
+
+#[tokio::test]
+async fn p083_h003_supported_store_has_no_preexisting_artifact_lineage_rows() {
+    let pool = test_pool().await;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM artifact_lineage")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "P083-HARDEN-003 supported stores start with no artifact_lineage rows before P083 enforcement"
+    );
+}
+
+#[tokio::test]
 async fn artifact_lineage_non_report_row_accepts_null_report_kind() {
     let pool = test_pool().await;
     // Seed the required run
@@ -401,6 +429,64 @@ async fn cancel_late_output_overflow_normalized_columns_are_generated() {
     assert_eq!(
         norm_sess, "sess-upper",
         "normalized_provider_session_id should be lowercased and trimmed"
+    );
+}
+
+#[tokio::test]
+async fn cancel_late_output_overflow_concurrent_writers_accumulate_one_latch_key() {
+    let pool = test_pool().await;
+    let writers = 8;
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..writers {
+        let pool = pool.clone();
+        tasks.spawn(async move {
+            db::repos::cancel_late_output_overflow::record_overflow_latch(
+                &pool,
+                "session",
+                Some("Run-H008 "),
+                Some(" Sess-H008"),
+                7,
+                "message_count",
+                1,
+                128,
+            )
+            .await
+        });
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        result
+            .expect("writer task panicked")
+            .expect("writer failed");
+    }
+
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS row_count,
+                SUM(dropped_message_count) AS dropped_messages,
+                SUM(dropped_byte_count) AS dropped_bytes,
+                MIN(projection_mutation_blocked) AS min_projection_mutation_blocked
+           FROM cancel_late_output_overflow
+          WHERE scope='session'
+            AND normalized_run_id='run-h008'
+            AND normalized_provider_session_id='sess-h008'
+            AND cancellation_epoch=7
+            AND overflow_kind='message_count'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(row.try_get::<i64, _>("row_count").unwrap(), 1);
+    assert_eq!(row.try_get::<i64, _>("dropped_messages").unwrap(), writers);
+    assert_eq!(
+        row.try_get::<i64, _>("dropped_bytes").unwrap(),
+        writers * 128
+    );
+    assert_eq!(
+        row.try_get::<i64, _>("min_projection_mutation_blocked")
+            .unwrap(),
+        1,
+        "H008 concurrent late-output writers must leave active projections blocked"
     );
 }
 

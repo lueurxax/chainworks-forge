@@ -271,6 +271,7 @@ pub struct GqlContinuationMetricsSummary {
     pub provider_session_budget_cost_cents_total: i64,
     pub provider_session_resurrection_attach_success_total: i64,
     pub provider_session_resurrection_attach_failure_total: i64,
+    pub provider_session_resurrection_prompt_sent_total: i64,
     pub orphan_reap_attempted_total: i64,
     pub orphan_reap_verified_total: i64,
     pub resurrection_unsupported_total: i64,
@@ -339,6 +340,8 @@ impl From<db::repos::agent_work_continuations::P086ContinuationMetricsSummary>
                 .provider_session_resurrection_attach_success_total,
             provider_session_resurrection_attach_failure_total: summary
                 .provider_session_resurrection_attach_failure_total,
+            provider_session_resurrection_prompt_sent_total: summary
+                .provider_session_resurrection_prompt_sent_total,
             orphan_reap_attempted_total: summary.orphan_reap_attempted_total,
             orphan_reap_verified_total: summary.orphan_reap_verified_total,
             resurrection_unsupported_total: summary.resurrection_unsupported_total,

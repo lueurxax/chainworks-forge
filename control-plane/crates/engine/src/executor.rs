@@ -64,6 +64,8 @@ use domain::retry_authority::AdvanceRunPayloadV1;
 use domain::run::DeliveryConfiguration;
 use workflow::catalog::{AgentCatalogFile, AgentEntry};
 
+const MAX_P086_OUTPUT_ONLY_SOURCE_SNAPSHOT_BYTES: u64 = 2 * 1024 * 1024;
+
 use crate::contracts::{
     artifact_format_for_companion_output, artifact_format_for_machine_output,
     build_captured_outputs_from_discovery_decisions, build_expected_output_specs,
@@ -1918,6 +1920,48 @@ fn p086_continuation_response_hash(
         "failure_reason": failure_reason,
     });
     format!("{:x}", Sha256::digest(payload.to_string().as_bytes()))
+}
+
+struct P086ResurrectionLaunchObserver {
+    pool: SqlitePool,
+    continuation_id: String,
+    worker_pid: i64,
+    daemon_generation_id: String,
+}
+
+#[async_trait::async_trait]
+impl acp::adapters::AcpLaunchObserver for P086ResurrectionLaunchObserver {
+    async fn provider_process_launched(
+        &self,
+        process: acp::adapters::AcpLaunchedProcess,
+    ) -> anyhow::Result<()> {
+        let process_uid = unsafe { libc::getuid() } as i64;
+        db::repos::agent_work_continuations::set_supervised_worker_provider_process(
+            &self.pool,
+            &self.continuation_id,
+            self.worker_pid,
+            &self.daemon_generation_id,
+            process.child_pid as i64,
+            process.process_group_id as i64,
+            process_uid,
+        )
+        .await?;
+        db::repos::agent_work_continuations::update_resurrection_phase(
+            &self.pool,
+            &self.continuation_id,
+            ResurrectionPhase::Launched,
+            None,
+        )
+        .await?;
+        db::repos::agent_work_continuations::update_resurrection_phase(
+            &self.pool,
+            &self.continuation_id,
+            ResurrectionPhase::Attaching,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -5493,10 +5537,9 @@ impl BackgroundExecutor {
     const P080_LOOP_MAX_PER_TICK: usize = 10;
     const P080_LOOP_TICK_DEADLINE_SECS: u64 = 20;
 
-    /// Periodically classifies running executions and, when the rollout-control
-    /// flag for `acp_startup_stale` is enabled, runs the Phase 0/1/2
-    /// diagnose_only pass. No actual ACP session resets or scheduler capacity
-    /// reclamation happen until Phase 3+ is promoted via rollout_control.
+    /// Periodically classifies running executions and, when repair classes are
+    /// promoted by rollout-control phase, requeues safe stale InvokeAgent rows.
+    /// Classes that are not yet promoted still receive diagnose-only readback.
     ///
     /// Admission gate: the `acp_startup_stale` rollout_control row must be
     /// present and enabled (fail-closed: missing or disabled → skip repair).
@@ -5523,9 +5566,9 @@ impl BackgroundExecutor {
                 tokio::time::timeout(tick_deadline, self.p080_reconciliation_tick(max_per_tick))
                     .await;
             match tick_result {
-                Ok(diagnosed) => {
-                    if diagnosed > 0 {
-                        info!(diagnosed, "P080 live loop tick: diagnosed stale executions (Phase 0/1/2 — diagnose_only, no actual ACP reset)");
+                Ok(changed) => {
+                    if changed > 0 {
+                        info!(changed, "P080 live loop tick reconciled stale executions");
                     }
                 }
                 Err(_) => {
@@ -5538,11 +5581,10 @@ impl BackgroundExecutor {
         }
     }
 
-    /// Single reconciliation tick: classify running executions and, when
-    /// rollout is enabled, emit a `diagnosed` event for each `stale_suspected`
-    /// row (Phase 0/1/2 — diagnose_only; no actual ACP reset or scheduler
-    /// capacity reclamation until Phase 3+ is promoted via rollout_control).
-    /// Returns the number of executions diagnosed this tick.
+    /// Single reconciliation tick: classify running executions, auto-repair
+    /// phase-promoted safe classes, and emit `diagnosed` events for remaining
+    /// stale rows whose repair class is not yet promoted. Returns the number of
+    /// rows repaired or diagnosed this tick.
     ///
     /// MISSING-002 fix: detection_only independently enables the classifier and
     /// heartbeat upserts; acp_startup_stale gates only the reconciliation-event
@@ -5607,7 +5649,10 @@ impl BackgroundExecutor {
                 info!(
                     classified = counts.total,
                     acp_startup_stale = counts.acp_startup_stale,
+                    acp_prompt_stale = counts.acp_prompt_stale,
                     scheduler_ownership_drift = counts.scheduler_ownership_drift,
+                    helper_orphan_drift = counts.helper_orphan_drift,
+                    release_side_effect_drift = counts.release_side_effect_drift,
                     warmup_pending = counts.warmup_pending,
                     "P080 classified running executions"
                 );
@@ -5626,6 +5671,24 @@ impl BackgroundExecutor {
                         "class=scheduler_ownership_drift,provider=unknown,work_kind=unknown",
                     );
                 }
+                for _ in 0..counts.acp_prompt_stale {
+                    db::metrics::increment_counter_with_label(
+                        "stale_execution_detected_total",
+                        "class=acp_prompt_stale,provider=unknown,work_kind=unknown",
+                    );
+                }
+                for _ in 0..counts.helper_orphan_drift {
+                    db::metrics::increment_counter_with_label(
+                        "stale_execution_detected_total",
+                        "class=helper_orphan_drift,provider=unknown,work_kind=unknown",
+                    );
+                }
+                for _ in 0..counts.release_side_effect_drift {
+                    db::metrics::increment_counter_with_label(
+                        "stale_execution_detected_total",
+                        "class=release_side_effect_drift,provider=unknown,work_kind=unknown",
+                    );
+                }
             }
             Ok(_) => {}
             Err(err) => {
@@ -5635,6 +5698,38 @@ impl BackgroundExecutor {
                     "classifier_db_error",
                 );
                 return 0;
+            }
+        }
+
+        let mut reconciled = 0usize;
+        match db::repos::p080::auto_repair_promoted_stale_rows(
+            &self.pool,
+            max_per_tick,
+            "system:p080_reconciler",
+        )
+        .await
+        {
+            Ok(counts) => {
+                if counts.repaired > 0 || counts.race_aborted > 0 || counts.failed > 0 {
+                    info!(
+                        repaired = counts.repaired,
+                        race_aborted = counts.race_aborted,
+                        failed = counts.failed,
+                        skipped_not_promoted = counts.skipped_not_promoted,
+                        "P080 live loop: auto repair pass completed for promoted classes"
+                    );
+                }
+                reconciled += counts.repaired + counts.race_aborted;
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "P080 live loop: auto repair pass failed; falling back to diagnose-only readback"
+                );
+                db::metrics::increment_counter_with_label(
+                    "stale_execution_repair_failed_total",
+                    "class=unknown,reason=dependency_read_failure",
+                );
             }
         }
 
@@ -5671,7 +5766,6 @@ impl BackgroundExecutor {
             }
         };
 
-        let mut diagnosed = 0usize;
         for row in &candidates {
             // Only diagnose rows still in stale_suspected state.
             let rb: serde_json::Value =
@@ -5684,16 +5778,27 @@ impl BackgroundExecutor {
             let now = chrono::Utc::now();
             let now_str = now.to_rfc3339();
 
-            let predicate_hash = format!(
-                "{:x}",
-                Sha256::digest(
-                    format!(
-                        "{}:{}:{}:acp_startup_stale",
-                        row.run_id, row.stage_id, row.work_item_id
-                    )
-                    .as_bytes()
-                )
-            );
+            let predicate_hash = match db::repos::p080::compute_repair_predicate_hash(
+                &self.pool,
+                &row.run_id,
+                &row.stage_id,
+                &row.work_item_id,
+                "acp_startup_stale",
+            )
+            .await
+            {
+                Ok(hash) => hash,
+                Err(err) => {
+                    warn!(
+                        run_id = %row.run_id,
+                        stage_id = %row.stage_id,
+                        work_item_id = %row.work_item_id,
+                        error = %err,
+                        "P080 live loop: failed to compute diagnose predicate hash; skipping row"
+                    );
+                    continue;
+                }
+            };
 
             // rollout_disablement reflects whether repair is enabled for this class.
             // In detection-only mode (acp_startup_stale disabled), it is "class_disabled".
@@ -5704,8 +5809,8 @@ impl BackgroundExecutor {
                 "class_disabled"
             };
 
-            // Phase 0/1/2 readback: running_truth stays stale_suspected,
-            // repair_action is diagnose_only. No actual ACP reset performed.
+            // Diagnose fallback for rows that were not auto-repaired above:
+            // running_truth stays stale_suspected and repair_action is diagnose_only.
             // repair_idempotency_key is NULL for diagnose_only per proposal §4.3 (L164-168).
             // Phase 3+: use daemon-keyed HMAC-SHA-256 truncated to p080-rik-<24 hex>.
             let diagnosed_readback = serde_json::json!({
@@ -5780,7 +5885,7 @@ impl BackgroundExecutor {
                 acp_startup_stale_phase = %acp_startup_stale_phase,
                 "P080 live loop: diagnosed acp_startup_stale execution (Phase 0/1/2 diagnose_only)"
             );
-            diagnosed += 1;
+            reconciled += 1;
         }
 
         // Retire heartbeat rows for executions that have reached terminal states,
@@ -5795,7 +5900,7 @@ impl BackgroundExecutor {
             }
         }
 
-        diagnosed
+        reconciled
     }
 
     /// P086 Phase 2: Execute a single continuation row to completion.
@@ -6136,6 +6241,7 @@ impl BackgroundExecutor {
                 Some("attach_receipt_persist_failed"),
                 None,
                 worktree_root,
+                None,
             )
             .await
         {
@@ -6265,6 +6371,7 @@ impl BackgroundExecutor {
         failure_reason: Option<&str>,
         provider_result: Option<&acp::ExecutionResult>,
         worktree_root: Option<&str>,
+        output_only_source_baseline: Option<&serde_json::Value>,
     ) -> anyhow::Result<()> {
         let transcript_text_raw = provider_result
             .and_then(|result| result.transcript_text.as_deref())
@@ -6281,8 +6388,56 @@ impl BackgroundExecutor {
             .as_array()
             .cloned()
             .unwrap_or_default();
-        let output_only_changed_source_files =
-            Self::p086_output_only_changed_source_files(&changed_files);
+        let final_source_snapshot = if continuation.mode == "output_only_recovery" {
+            Some(Self::p086_output_only_source_snapshot(worktree_root))
+        } else {
+            None
+        };
+        let output_only_changed_source_files = if continuation.mode == "output_only_recovery" {
+            if let Some(final_snapshot) = final_source_snapshot.as_ref() {
+                Self::p086_output_only_changed_source_files_from_snapshots(
+                    output_only_source_baseline,
+                    final_snapshot,
+                    &changed_files,
+                )
+            } else {
+                Self::p086_output_only_changed_source_files(&changed_files)
+            }
+        } else {
+            Self::p086_output_only_changed_source_files(&changed_files)
+        };
+        let baseline_source_entry_count = output_only_source_baseline
+            .and_then(|baseline| baseline.get("entry_count"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let final_source_entry_count = final_source_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("entry_count"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let baseline_source_sha256 = output_only_source_baseline
+            .and_then(|baseline| baseline.get("snapshot_sha256"))
+            .and_then(serde_json::Value::as_str);
+        let final_source_sha256 = final_source_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("snapshot_sha256"))
+            .and_then(serde_json::Value::as_str);
+        let output_only_source_proof = serde_json::json!({
+            "proof_source": if output_only_source_baseline.is_some() {
+                "source_snapshot_pre_post"
+            } else {
+                "git_status_short_final"
+            },
+            "baseline_source_entry_count": baseline_source_entry_count,
+            "final_source_entry_count": final_source_entry_count,
+            "baseline_source_sha256": baseline_source_sha256,
+            "final_source_sha256": final_source_sha256,
+            "baseline_changed_files_count": 0,
+            "final_changed_files_count": changed_files.len(),
+            "baseline_sha256": output_only_source_baseline
+                .map(|baseline| sha256_digest(baseline.to_string().as_bytes())),
+            "final_sha256": sha256_digest(worktree_readback.to_string().as_bytes())
+        });
         let output_only_source_edit_violation = continuation.mode == "output_only_recovery"
             && !output_only_changed_source_files.is_empty();
         let effective_terminal_status = if output_only_source_edit_violation {
@@ -6358,6 +6513,7 @@ impl BackgroundExecutor {
                 "changed_source_files": output_only_changed_source_files,
                 "changed_source_files_count": output_only_changed_source_files.len(),
                 "output_only_source_edit_violation": output_only_source_edit_violation,
+                "output_only_source_proof": output_only_source_proof,
                 "tests_or_gates": tests_or_gates,
                 "transcript_bytes": transcript_text.as_bytes().len(),
                 "transcript_sha256": if transcript_text.is_empty() { None } else { Some(sha256_digest(transcript_text.as_bytes())) },
@@ -6436,6 +6592,7 @@ impl BackgroundExecutor {
                         "changed_source_files": output_only_changed_source_files,
                         "changed_source_files_count": output_only_changed_source_files.len(),
                         "output_only_source_edit_violation": output_only_source_edit_violation,
+                        "output_only_source_proof": output_only_source_proof,
                         "tests_or_gates": Self::p086_extract_test_gate_lines(transcript_text),
                         "response_fingerprint_sha256": response_fingerprint,
                         "provider_transcript_artifact_ids": [response_artifact_id]
@@ -6453,6 +6610,7 @@ impl BackgroundExecutor {
                         "changed_source_files": output_only_changed_source_files,
                         "changed_source_files_count": output_only_changed_source_files.len(),
                         "output_only_source_edit_violation": output_only_source_edit_violation,
+                        "output_only_source_proof": output_only_source_proof,
                         "response_fingerprint_sha256": response_fingerprint,
                         "provider_transcript_artifact_ids": [response_artifact_id]
                     }),
@@ -6899,6 +7057,7 @@ impl BackgroundExecutor {
             Some("cancelled_after_provider_send"),
             provider_result,
             worktree_root,
+            None,
         )
         .await?;
         Ok(true)
@@ -6965,6 +7124,205 @@ impl BackgroundExecutor {
             .map(Self::p086_normalize_changed_path)
             .filter(|path| Self::p086_is_source_path(path))
             .collect()
+    }
+
+    fn p086_output_only_changed_source_files_since(
+        baseline_changed_files: &[serde_json::Value],
+        final_changed_files: &[serde_json::Value],
+    ) -> Vec<String> {
+        let baseline: HashSet<String> = baseline_changed_files
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(Self::p086_normalize_changed_path)
+            .collect();
+        Self::p086_output_only_changed_source_files(final_changed_files)
+            .into_iter()
+            .filter(|path| !baseline.contains(path))
+            .collect()
+    }
+
+    fn p086_output_only_source_snapshot(worktree_root: Option<&str>) -> serde_json::Value {
+        let Some(root) = worktree_root else {
+            return serde_json::json!({
+                "schema_version": "p086_output_only_source_snapshot_v1",
+                "snapshot_available": false,
+                "unavailable_reason": "missing_worktree_root",
+                "entry_count": 0,
+                "entries": []
+            });
+        };
+        let root_path = Path::new(root);
+        let mut paths = Vec::new();
+        let git_output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .arg("ls-files")
+            .output();
+        if let Ok(output) = git_output.as_ref() {
+            if output.status.success() {
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    let path = Self::p086_normalize_changed_path(line);
+                    if Self::p086_is_source_path(&path) {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+        let worktree_readback = Self::p086_worktree_readback(Some(root));
+        if let Some(changed_files) = worktree_readback
+            .get("changed_files")
+            .and_then(serde_json::Value::as_array)
+        {
+            for path in Self::p086_output_only_changed_source_files(changed_files) {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        paths.dedup();
+
+        let entries: Vec<_> = paths
+            .iter()
+            .map(|path| Self::p086_output_only_source_snapshot_entry(root_path, path))
+            .collect();
+        let entries_value = serde_json::Value::Array(entries.clone());
+        let snapshot_sha256 = sha256_digest(entries_value.to_string().as_bytes());
+        serde_json::json!({
+            "schema_version": "p086_output_only_source_snapshot_v1",
+            "proof_source": "source_snapshot",
+            "worktree_root": root,
+            "snapshot_available": git_output
+                .as_ref()
+                .map(|output| output.status.success())
+                .unwrap_or(false),
+            "git_ls_files_available": git_output
+                .as_ref()
+                .map(|output| output.status.success())
+                .unwrap_or(false),
+            "entry_count": entries.len(),
+            "max_file_bytes": MAX_P086_OUTPUT_ONLY_SOURCE_SNAPSHOT_BYTES,
+            "entries": entries,
+            "snapshot_sha256": snapshot_sha256
+        })
+    }
+
+    fn p086_output_only_source_snapshot_entry(root: &Path, path: &str) -> serde_json::Value {
+        let full_path = root.join(path);
+        match std::fs::symlink_metadata(&full_path) {
+            Ok(metadata) => {
+                let modified_unix_ms = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_millis() as u64);
+                if metadata.file_type().is_symlink() {
+                    return serde_json::json!({
+                        "path": path,
+                        "kind": "symlink",
+                        "size_bytes": metadata.len(),
+                        "modified_unix_ms": modified_unix_ms,
+                        "digest_available": false,
+                        "content_sha256": serde_json::Value::Null
+                    });
+                }
+                if !metadata.is_file() {
+                    return serde_json::json!({
+                        "path": path,
+                        "kind": "non_file",
+                        "size_bytes": metadata.len(),
+                        "modified_unix_ms": modified_unix_ms,
+                        "digest_available": false,
+                        "content_sha256": serde_json::Value::Null
+                    });
+                }
+                let content_sha256 = if metadata.len() <= MAX_P086_OUTPUT_ONLY_SOURCE_SNAPSHOT_BYTES
+                {
+                    std::fs::read(&full_path)
+                        .ok()
+                        .map(|bytes| sha256_digest(&bytes))
+                } else {
+                    None
+                };
+                serde_json::json!({
+                    "path": path,
+                    "kind": "file",
+                    "size_bytes": metadata.len(),
+                    "modified_unix_ms": modified_unix_ms,
+                    "digest_available": content_sha256.is_some(),
+                    "content_sha256": content_sha256
+                })
+            }
+            Err(error) => serde_json::json!({
+                "path": path,
+                "kind": "missing_or_unreadable",
+                "size_bytes": serde_json::Value::Null,
+                "modified_unix_ms": serde_json::Value::Null,
+                "digest_available": false,
+                "content_sha256": serde_json::Value::Null,
+                "read_error": error.to_string()
+            }),
+        }
+    }
+
+    fn p086_output_only_source_snapshot_signatures(
+        snapshot: &serde_json::Value,
+    ) -> BTreeMap<String, String> {
+        let mut signatures = BTreeMap::new();
+        if let Some(entries) = snapshot
+            .get("entries")
+            .and_then(serde_json::Value::as_array)
+        {
+            for entry in entries {
+                let Some(path) = entry.get("path").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let signature = serde_json::json!({
+                    "kind": entry.get("kind").cloned().unwrap_or(serde_json::Value::Null),
+                    "size_bytes": entry.get("size_bytes").cloned().unwrap_or(serde_json::Value::Null),
+                    "modified_unix_ms": entry.get("modified_unix_ms").cloned().unwrap_or(serde_json::Value::Null),
+                    "digest_available": entry.get("digest_available").cloned().unwrap_or(serde_json::Value::Null),
+                    "content_sha256": entry.get("content_sha256").cloned().unwrap_or(serde_json::Value::Null),
+                })
+                .to_string();
+                signatures.insert(path.to_string(), signature);
+            }
+        }
+        signatures
+    }
+
+    fn p086_output_only_changed_source_files_from_snapshots(
+        baseline_snapshot: Option<&serde_json::Value>,
+        final_snapshot: &serde_json::Value,
+        final_changed_files: &[serde_json::Value],
+    ) -> Vec<String> {
+        let Some(baseline_snapshot) = baseline_snapshot else {
+            return Self::p086_output_only_changed_source_files(final_changed_files);
+        };
+        if baseline_snapshot
+            .get("snapshot_available")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            return Self::p086_output_only_changed_source_files(final_changed_files);
+        }
+        let baseline = Self::p086_output_only_source_snapshot_signatures(baseline_snapshot);
+        let final_entries = Self::p086_output_only_source_snapshot_signatures(final_snapshot);
+        let mut changed = Vec::new();
+        for (path, signature) in final_entries {
+            if !Self::p086_is_source_path(&path) {
+                continue;
+            }
+            if baseline.get(&path) != Some(&signature) {
+                changed.push(path);
+            }
+        }
+        for path in Self::p086_output_only_changed_source_files(final_changed_files) {
+            if !baseline.contains_key(&path) {
+                changed.push(path);
+            }
+        }
+        changed.sort();
+        changed.dedup();
+        changed
     }
 
     fn p086_normalize_changed_path(path: &str) -> String {
@@ -7232,6 +7590,7 @@ impl BackgroundExecutor {
             ctx.worktree_root
                 .as_deref()
                 .or(ctx.workspace_root.as_deref()),
+            None,
         )
         .await
     }
@@ -7329,6 +7688,7 @@ impl BackgroundExecutor {
             terminal_reason,
             None,
             worktree_root,
+            None,
         )
         .await
     }
@@ -7479,6 +7839,7 @@ impl BackgroundExecutor {
                     Some("cancelled_before_provider_send"),
                     None,
                     worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                    None,
                 )
                 .await?;
             }
@@ -7525,6 +7886,7 @@ impl BackgroundExecutor {
                     Some("no_session_generation_id"),
                     None,
                     worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                    None,
                 )
                 .await?;
                 return Ok(());
@@ -7629,6 +7991,7 @@ impl BackgroundExecutor {
                     Some("provider_session_id_required"),
                     None,
                     worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                    None,
                 )
                 .await?;
                 return Ok(());
@@ -7643,49 +8006,65 @@ impl BackgroundExecutor {
             .await?;
             let canonical_worktree_root =
                 worktree_root.as_deref().unwrap_or(workspace_root.as_str());
+            let output_only_source_baseline = if output_only_recovery {
+                Some(Self::p086_output_only_source_snapshot(Some(
+                    canonical_worktree_root,
+                )))
+            } else {
+                None
+            };
             let attach_started_at = chrono::Utc::now().to_rfc3339();
+            let launch_observer = Arc::new(P086ResurrectionLaunchObserver {
+                pool: self.pool.clone(),
+                continuation_id: continuation_id.to_string(),
+                worker_pid,
+                daemon_generation_id: daemon_generation_id.clone(),
+            });
             let attach_result = self
                 .acp
-                .attach_provider_session_for_resurrection(acp::ExecutionRequest {
-                    agent_execution_id: None,
-                    run_id,
-                    stage_execution_id: Some(cont.stage_execution_id.clone()),
-                    stage_id: format!(
-                        "resurrection_attach_{}",
-                        &continuation_id[..8.min(continuation_id.len())]
-                    ),
-                    attempt_number: 1,
-                    agent_id: "code_writer".to_string(),
-                    provider: provider.clone(),
-                    model: model.clone(),
-                    effort: None,
-                    workspace_root: workspace_root.clone(),
-                    prompt: String::new(),
-                    worktree_root: worktree_root.clone(),
-                    worktree_write_enabled: worktree_root.is_some(),
-                    worktree_strategy: None,
-                    expected_output_paths: Vec::new(),
-                    expected_outputs: Vec::new(),
-                    keep_session_alive: true,
-                    reuse_existing_session: false,
-                    session_generation_id: Some(session_generation_id.clone()),
-                    provider_session_id: Some(provider_session_id.clone()),
-                    provider_runtime_home: None,
-                    mcp_servers: Vec::new(),
-                    chainworks_meta_root: ctx.chainworks_meta_root.clone(),
-                    legacy_broad_discovery_policy:
-                        domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
-                    xcode_shim_injection_signal: false,
-                    requires_xcode_host_execution: false,
-                    owner_kind: "stage_execution".to_string(),
-                    owner_id: Some(cont.stage_execution_id.clone()),
-                    origin_stage_id: None,
-                    origin_stage_execution_id: None,
-                    mediation_record_id: None,
-                    toolchain_home: None,
-                    toolchain_go_scope_enabled: false,
-                    p079_repair_canonical_paths: None,
-                })
+                .attach_provider_session_for_resurrection_with_launch_observer(
+                    acp::ExecutionRequest {
+                        agent_execution_id: None,
+                        run_id,
+                        stage_execution_id: Some(cont.stage_execution_id.clone()),
+                        stage_id: format!(
+                            "resurrection_attach_{}",
+                            &continuation_id[..8.min(continuation_id.len())]
+                        ),
+                        attempt_number: 1,
+                        agent_id: "code_writer".to_string(),
+                        provider: provider.clone(),
+                        model: model.clone(),
+                        effort: None,
+                        workspace_root: workspace_root.clone(),
+                        prompt: String::new(),
+                        worktree_root: worktree_root.clone(),
+                        worktree_write_enabled: worktree_root.is_some(),
+                        worktree_strategy: None,
+                        expected_output_paths: Vec::new(),
+                        expected_outputs: Vec::new(),
+                        keep_session_alive: true,
+                        reuse_existing_session: false,
+                        session_generation_id: Some(session_generation_id.clone()),
+                        provider_session_id: Some(provider_session_id.clone()),
+                        provider_runtime_home: None,
+                        mcp_servers: Vec::new(),
+                        chainworks_meta_root: ctx.chainworks_meta_root.clone(),
+                        legacy_broad_discovery_policy:
+                            domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+                        xcode_shim_injection_signal: false,
+                        requires_xcode_host_execution: false,
+                        owner_kind: "stage_execution".to_string(),
+                        owner_id: Some(cont.stage_execution_id.clone()),
+                        origin_stage_id: None,
+                        origin_stage_execution_id: None,
+                        mediation_record_id: None,
+                        toolchain_home: None,
+                        toolchain_go_scope_enabled: false,
+                        p079_repair_canonical_paths: None,
+                    },
+                    Some(launch_observer),
+                )
                 .await;
 
             let attach_result = match attach_result {
@@ -7735,6 +8114,7 @@ impl BackgroundExecutor {
                         Some(failure_class),
                         None,
                         worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                        None,
                     )
                     .await?;
                     return Ok(());
@@ -7745,6 +8125,20 @@ impl BackgroundExecutor {
                 continuation_id,
                 ResurrectionPhase::AttachedUnprompted,
                 None,
+            )
+            .await?;
+            db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+                &self.pool,
+                Some(&cont.run_id),
+                Some(&cont.stage_execution_id),
+                Some(&cont.agent_execution_id),
+                Some(&cont.id),
+                "provider_session_resurrection_attach_success_total",
+                serde_json::json!({
+                    "mode": cont.mode,
+                    "outcome": "attached"
+                }),
+                1,
             )
             .await?;
 
@@ -7807,7 +8201,7 @@ impl BackgroundExecutor {
             );
             raw_receipt.insert(
                 "identity_proof_source".into(),
-                serde_json::Value::String("provider_attach_response".into()),
+                serde_json::Value::String(attach_result.identity_proof_source.clone()),
             );
             raw_receipt.insert(
                 "identity_proof_observed_at".into(),
@@ -7883,6 +8277,29 @@ impl BackgroundExecutor {
             raw_receipt.insert(
                 "changed_source_files".into(),
                 serde_json::Value::Array(Vec::new()),
+            );
+            raw_receipt.insert(
+                "output_only_source_proof".into(),
+                serde_json::json!({
+                    "proof_source": if output_only_source_baseline.is_some() {
+                        "source_snapshot_pre_post"
+                    } else {
+                        "git_status_short_final"
+                    },
+                    "baseline_source_entry_count": output_only_source_baseline
+                        .as_ref()
+                        .and_then(|baseline| baseline.get("entry_count"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    "baseline_source_sha256": output_only_source_baseline
+                        .as_ref()
+                        .and_then(|baseline| baseline.get("snapshot_sha256"))
+                        .and_then(serde_json::Value::as_str),
+                    "baseline_changed_files_count": 0,
+                    "baseline_sha256": output_only_source_baseline
+                        .as_ref()
+                        .map(|baseline| sha256_digest(baseline.to_string().as_bytes()))
+                }),
             );
             raw_receipt.insert("failure_class".into(), serde_json::Value::Null);
             raw_receipt.insert("resurrection_deadline_at".into(), serde_json::Value::Null);
@@ -8040,6 +8457,7 @@ impl BackgroundExecutor {
                     Some("approval_required"),
                     None,
                     worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                    None,
                 )
                 .await?;
                 return Ok(());
@@ -8136,6 +8554,20 @@ impl BackgroundExecutor {
                 Some(&attach_receipt_artifact_id),
                 &current_receipt_json,
                 &prompt_sent_at,
+            )
+            .await?;
+            db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+                &self.pool,
+                Some(&cont.run_id),
+                Some(&cont.stage_execution_id),
+                Some(&cont.agent_execution_id),
+                Some(&cont.id),
+                "provider_session_resurrection_prompt_sent_total",
+                serde_json::json!({
+                    "mode": cont.mode,
+                    "outcome": "prompt_sent"
+                }),
+                1,
             )
             .await?;
             db::repos::agent_work_continuations::refresh_supervised_worker_heartbeat(
@@ -8269,6 +8701,7 @@ impl BackgroundExecutor {
                                 &cont.request_fingerprint_sha256,
                                 &cont.stage_execution_id,
                                 &cont.agent_execution_id,
+                                &provider_session_id,
                             ],
                         )
                     {
@@ -8288,6 +8721,7 @@ impl BackgroundExecutor {
                             Some("terminal_response_uncorrelated"),
                             None,
                             worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                            output_only_source_baseline.as_ref(),
                         )
                         .await?;
                         update_resurrection_phase(
@@ -8338,6 +8772,7 @@ impl BackgroundExecutor {
                         failure_reason,
                         Some(&result),
                         worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                        output_only_source_baseline.as_ref(),
                     )
                     .await?;
                     let completed_at = chrono::Utc::now().to_rfc3339();
@@ -8377,6 +8812,7 @@ impl BackgroundExecutor {
                         Some("provider_error"),
                         None,
                         worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                        output_only_source_baseline.as_ref(),
                     )
                     .await?;
                     update_resurrection_phase(
@@ -8427,6 +8863,7 @@ impl BackgroundExecutor {
                 Some("live_handle_not_found"),
                 None,
                 worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                None,
             )
             .await?;
             return Ok(());
@@ -8537,6 +8974,7 @@ impl BackgroundExecutor {
                 Some("approval_required"),
                 None,
                 worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                None,
             )
             .await?;
             return Ok(());
@@ -8753,6 +9191,7 @@ impl BackgroundExecutor {
                     failure_reason,
                     Some(&result),
                     worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                    None,
                 )
                 .await?;
                 info!(
@@ -8799,6 +9238,7 @@ impl BackgroundExecutor {
                     Some("provider_error"),
                     None,
                     worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                    None,
                 )
                 .await?;
             }
@@ -21601,7 +22041,7 @@ plain progress line without gate evidence";
             serde_json::json!("Chainworks Forge/Views/RunsHomeView.swift"),
             serde_json::json!("scripts/test-gate.sh"),
             serde_json::json!("docs/evidence/rollout-contract/p086/result.fixture.json"),
-            serde_json::json!("docs/proposals/086-agent-work-continuation-and-lead-directed-session-resumption.md"),
+            serde_json::json!("docs/evidence/rollout-contract/p086/negative/result.fixture.json"),
             serde_json::json!("old.rs -> examples/agents/agents.yaml"),
             serde_json::json!("README.md"),
         ];
@@ -21616,6 +22056,281 @@ plain progress line without gate evidence";
                 "scripts/test-gate.sh",
                 "examples/agents/agents.yaml",
             ]
+        );
+    }
+
+    #[test]
+    fn p086_output_only_recovery_compares_against_pre_prompt_baseline() {
+        let baseline = vec![
+            serde_json::json!("control-plane/crates/engine/src/executor.rs"),
+            serde_json::json!("docs/evidence/rollout-contract/p086/result.fixture.json"),
+        ];
+        let final_changed = vec![
+            serde_json::json!("control-plane/crates/engine/src/executor.rs"),
+            serde_json::json!("scripts/test-gate.sh"),
+            serde_json::json!("docs/evidence/rollout-contract/p086/result.fixture.json"),
+        ];
+
+        let source_edits = BackgroundExecutor::p086_output_only_changed_source_files_since(
+            &baseline,
+            &final_changed,
+        );
+
+        assert_eq!(source_edits, vec!["scripts/test-gate.sh"]);
+    }
+
+    #[test]
+    fn p086_output_only_recovery_detects_dirty_source_content_change() {
+        let baseline = serde_json::json!({
+            "snapshot_available": true,
+            "entry_count": 1,
+            "entries": [{
+                "path": "control-plane/crates/engine/src/executor.rs",
+                "kind": "file",
+                "size_bytes": 10,
+                "modified_unix_ms": 1000,
+                "digest_available": true,
+                "content_sha256": "before"
+            }]
+        });
+        let final_snapshot = serde_json::json!({
+            "snapshot_available": true,
+            "entry_count": 1,
+            "entries": [{
+                "path": "control-plane/crates/engine/src/executor.rs",
+                "kind": "file",
+                "size_bytes": 10,
+                "modified_unix_ms": 2000,
+                "digest_available": true,
+                "content_sha256": "after"
+            }]
+        });
+        let final_changed = vec![serde_json::json!(
+            "control-plane/crates/engine/src/executor.rs"
+        )];
+
+        let source_edits = BackgroundExecutor::p086_output_only_changed_source_files_from_snapshots(
+            Some(&baseline),
+            &final_snapshot,
+            &final_changed,
+        );
+
+        assert_eq!(
+            source_edits,
+            vec!["control-plane/crates/engine/src/executor.rs"]
+        );
+    }
+
+    #[test]
+    fn p086_output_only_recovery_detects_edit_then_revert_metadata_change() {
+        let baseline = serde_json::json!({
+            "snapshot_available": true,
+            "entry_count": 1,
+            "entries": [{
+                "path": "scripts/test-gate.sh",
+                "kind": "file",
+                "size_bytes": 10,
+                "modified_unix_ms": 1000,
+                "digest_available": true,
+                "content_sha256": "same"
+            }]
+        });
+        let final_snapshot = serde_json::json!({
+            "snapshot_available": true,
+            "entry_count": 1,
+            "entries": [{
+                "path": "scripts/test-gate.sh",
+                "kind": "file",
+                "size_bytes": 10,
+                "modified_unix_ms": 3000,
+                "digest_available": true,
+                "content_sha256": "same"
+            }]
+        });
+
+        let source_edits = BackgroundExecutor::p086_output_only_changed_source_files_from_snapshots(
+            Some(&baseline),
+            &final_snapshot,
+            &[],
+        );
+
+        assert_eq!(source_edits, vec!["scripts/test-gate.sh"]);
+    }
+
+    #[tokio::test]
+    async fn p086_resurrection_launch_observer_persists_process_before_attaching() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
+        db::writer::register_shared_writer(&pool, writer)
+            .await
+            .unwrap();
+        let now = "2026-06-20T00:00:00Z";
+        sqlx::query("INSERT INTO ideas (id,title,body,status,created_at) VALUES ('idea-1','idea','body','active',?)")
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id,idea_id,status,workflow_id,workflow_title,workspace_root,artifact_root,started_at,chainworks_meta_root)
+             VALUES ('run-1','idea-1','running','wf','Workflow','/tmp/ws','/tmp/art',?,'/tmp/cw-run')",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO stage_executions (id,run_id,stage_id,label,status,started_at)
+             VALUES ('stage-exec-1','run-1','state_1','Stage','completed',?)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_executions (id,stage_execution_id,agent_id,provider,status,started_at,completed_at,owner_kind,owner_id)
+             VALUES ('agent-exec-1','stage-exec-1','code_writer','claude','completed',?,?,'stage_execution','stage-exec-1')",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let admission = db::repos::agent_work_continuations::ContinuationAdmission {
+            continuation_id: "cont-launch".to_string(),
+            command_journal_id: "cmd-cont-launch".to_string(),
+            run_id: "run-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            agent_execution_id: "agent-exec-1".to_string(),
+            mode: "provider_session_resurrection".to_string(),
+            trigger_kind: "operator_mcp".to_string(),
+            idempotency_scope: "agent-exec-1".to_string(),
+            idempotency_key: "key-cont-launch".to_string(),
+            request_fingerprint_sha256: "a".repeat(64),
+            lead_decision_artifact_id: None,
+            lead_decision_artifact_sha256: None,
+            continuation_instruction_sha256: None,
+            budget_json: None,
+            caller_principal_id: "operator".to_string(),
+            caller_surface: "mcp".to_string(),
+            caller_principal_class: "operator".to_string(),
+            caller_tool: "agents.continue_work".to_string(),
+            created_at: now.to_string(),
+        };
+        assert!(matches!(
+            db::repos::agent_work_continuations::admit_continuation_atomic(&pool, &admission, "{}")
+                .await
+                .unwrap(),
+            db::repos::agent_work_continuations::AtomicAdmissionOutcome::Accepted
+        ));
+        db::repos::agent_work_continuations::claim_for_continuation_worker(
+            &pool,
+            "cont-launch",
+            4242,
+            "daemon-gen-1",
+            "session-gen-1",
+        )
+        .await
+        .unwrap();
+
+        let observer = P086ResurrectionLaunchObserver {
+            pool: pool.clone(),
+            continuation_id: "cont-launch".to_string(),
+            worker_pid: 4242,
+            daemon_generation_id: "daemon-gen-1".to_string(),
+        };
+        acp::adapters::AcpLaunchObserver::provider_process_launched(
+            &observer,
+            acp::adapters::AcpLaunchedProcess {
+                child_pid: 1111,
+                process_group_id: 2222,
+            },
+        )
+        .await
+        .unwrap();
+
+        let row = sqlx::query(
+            "SELECT provider_child_pid, provider_process_group_id
+             FROM supervised_workers_continuation
+             WHERE continuation_id = 'cont-launch'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<i64, _>("provider_child_pid"), 1111);
+        assert_eq!(row.get::<i64, _>("provider_process_group_id"), 2222);
+        let phase = db::repos::agent_work_continuations::find_by_id(&pool, "cont-launch")
+            .await
+            .unwrap()
+            .unwrap()
+            .resurrection_phase;
+        assert_eq!(phase, Some(ResurrectionPhase::Attaching));
+    }
+
+    #[test]
+    fn p086_resurrection_terminal_correlation_requires_provider_session_id() {
+        let result = acp::ExecutionResult {
+            agent_execution_id: domain::ids::AgentExecutionId::new(),
+            status: domain::agent::AgentStatus::Completed,
+            artifact_paths: Vec::new(),
+            discovered_artifacts: Vec::new(),
+            pre_prompt_expected_outputs: Vec::new(),
+            transcript_text: Some(
+                "p086-prompt-turn:cont-1:provider_session_attach\n\
+                 request-fingerprint-1\n\
+                 stage-exec-1\n\
+                 agent-exec-1\n\
+                 provider-session-1"
+                    .to_string(),
+            ),
+            completion_text_capture: Default::default(),
+            cost_cents: None,
+            usage: None,
+            provider_session_id: Some("provider-session-1".to_string()),
+            reused_existing_session: true,
+            session_generation_id: Some("session-generation-1".to_string()),
+            mcp_observation: None,
+            actual_mcp_extensions: Vec::new(),
+            actual_mcp_runtime_ids: Vec::new(),
+            mcp_session_startup_latency_ms: None,
+            xcode_shim_warning_events: Vec::new(),
+            close_diagnostic: None,
+            provider_session_store_capture: None,
+            provider_session_store_recovery: None,
+            acp_pre_initialize_local_latency_ms: None,
+            acp_initialize_latency_ms: None,
+            acp_session_new_latency_ms: None,
+            acp_prompt_duration_ms: None,
+            acp_pre_prompt_metadata_latency_ms: None,
+            acp_pre_prompt_metadata_timeout: false,
+            acp_pre_prompt_metadata_digest_bytes: 0,
+            legacy_broad_discovery_snapshot: None,
+            runtime_receipt: None,
+            runtime_tool_path_preflight_json: None,
+        };
+
+        assert!(
+            BackgroundExecutor::p086_result_contains_all_correlation_terms(
+                &result,
+                &[
+                    "p086-prompt-turn:cont-1:provider_session_attach",
+                    "request-fingerprint-1",
+                    "stage-exec-1",
+                    "agent-exec-1",
+                    "provider-session-1",
+                ],
+            )
+        );
+        assert!(
+            !BackgroundExecutor::p086_result_contains_all_correlation_terms(
+                &result,
+                &[
+                    "p086-prompt-turn:cont-1:provider_session_attach",
+                    "request-fingerprint-1",
+                    "stage-exec-1",
+                    "agent-exec-1",
+                    "provider-session-2",
+                ],
+            )
         );
     }
 

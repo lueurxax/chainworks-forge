@@ -334,6 +334,7 @@ PROPOSAL_080_RUST_TESTS=(
   "db p080_insert_reconciliation_event_basic"
   "db p080_repair_idempotency_key_uses_daemon_hmac_tuple"
   "db p080_live_loop_repair_path_stale_suspected_to_repaired"
+  "db p080_auto_repair_promoted_stale_rows_repairs_acp_and_scheduler"
   "db p080_seed_rollout_control_partial_rows_fail_closed"
   "db p080_validate_rollout_control_completeness_pass"
   "db p080_validate_rollout_control_completeness_missing_class_fails"
@@ -363,6 +364,10 @@ PROPOSAL_080_RUST_TESTS=(
   "mcp-server p080_repair_if_safe_rollout_enabled_stale_returns_diagnosed"
   "mcp-server p080_repair_if_safe_phase2_requeues_acp_startup_stale"
   "mcp-server p080_repair_if_safe_dedup_replay_returns_same_response"
+  "mcp-server p080_diagnose_only_populates_repair_predicate_hash_for_stale_row"
+  "mcp-server p080_repair_if_safe_scheduler_ownership_drift_requeues_in_phase3"
+  "mcp-server p080_repair_if_safe_scheduler_ownership_drift_phase2_rejects_before_mutation"
+  "mcp-server p080_repair_if_safe_predicate_hash_changes_when_work_item_witness_changes"
   "mcp-server p080_repair_if_safe_dedup_conflict_returns_idempotency_conflict"
   "mcp-server p080_dedup_repair_phase1_returns_rollout_disabled"
   "mcp-server p080_diagnostics_get_is_read_only"
@@ -1313,7 +1318,33 @@ die() {
 }
 
 latest_crash_log() {
-  ls -1t "$HOME/Library/Logs/DiagnosticReports"/Chainworks\ Forge-*.ips 2>/dev/null | head -1 || true
+  python3 - "${HOME:-}/Library/Logs/DiagnosticReports" <<'PY' || true
+import os
+import sys
+
+directory = sys.argv[1]
+try:
+    entries = os.scandir(directory)
+except OSError:
+    raise SystemExit(0)
+
+latest_path = None
+latest_mtime = -1.0
+with entries:
+    for entry in entries:
+        name = entry.name
+        if not (name.startswith("Chainworks Forge-") and name.endswith(".ips")):
+            continue
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        if mtime > latest_mtime:
+            latest_mtime = mtime
+            latest_path = entry.path
+if latest_path:
+    print(latest_path)
+PY
 }
 
 normalize_host() {
@@ -2597,7 +2628,7 @@ Available gates:
   proposal-080|p080  Proposal 080 continuous stale execution reconciliation — DB + MCP + GraphQL unit tests
   proposal-081|p081  Proposal 081 Phase 1 boundary-first API and auth contract matrix gate
   proposal-082|p082  Proposal 082 recovery and retry state-machine matrix proof gate
-  proposal-083|p083  Proposal 083 focused code-fix regression gate (main-sync request id)
+  proposal-083|p083  Execution-truth ownership proof gate (retained historical alias)
   proposal-085|p085  Proposal 085 thin-client read-model parity and affordance contract gate
   proposal-086|p086|p086-continuation-preflight
                   Proposal 086 Phase 0 preflight: migration shape, MCP/artifact schemas, and Rust unit tests
@@ -7244,6 +7275,14 @@ operator_fixture = contract_root / "operator-readback/p080-full-surface.fixture.
 negative_fixtures = sorted((contract_root / "negative").glob("p080-*.json"))
 negative_contract_fixtures = []
 rollout_evidence = sorted((root / "docs/evidence/rollout/p080").glob("*.json"))
+required_phase_reports = [
+    root / "docs/evidence/rollout/p080/phase-1-soak-report.json",
+    root / "docs/evidence/rollout/p080/phase-2-soak-report.json",
+    root / "docs/evidence/rollout/p080/phase-3-soak-report.json",
+    root / "docs/evidence/rollout/p080/phase-4-soak-report.json",
+    root / "docs/evidence/rollout/p080/phase-5-soak-report.json",
+]
+required_phase_report_set = set(required_phase_reports)
 placeholder_markers = (
     "placeholder",
     "pending_implementation",
@@ -7258,6 +7297,9 @@ if not operator_fixture.exists():
     errors.append(f"missing required operator readback fixture: {operator_fixture.relative_to(root)}")
 if not rollout_evidence:
     errors.append("missing P080 rollout evidence JSON under docs/evidence/rollout/p080")
+for phase_report in required_phase_reports:
+    if not phase_report.exists():
+        errors.append(f"missing required P080 phase report: {phase_report.relative_to(root)}")
 
 def load_json(path: Path):
     try:
@@ -7293,6 +7335,28 @@ for path in [operator_fixture, *negative_fixtures, *rollout_evidence]:
             errors.append(f"negative fixture has wrong schema_version: {path.relative_to(root)}")
         if not {"proposal-080", "p080"}.issubset(set(data.get("gate_aliases", []))):
             errors.append(f"negative fixture does not bind both P080 gate aliases: {path.relative_to(root)}")
+    elif path in required_phase_report_set and data is not None:
+        if data.get("schema_version") != "p080_phase_soak_report_v1":
+            errors.append(f"P080 phase report has wrong schema_version: {path.relative_to(root)}")
+        if data.get("proposal_id") != "080":
+            errors.append(f"P080 phase report has wrong proposal_id: {path.relative_to(root)}")
+        if not {"proposal-080", "p080"}.issubset(set(data.get("gate_aliases", []))):
+            errors.append(f"P080 phase report does not bind both gate aliases: {path.relative_to(root)}")
+        if data.get("status") not in {"passed", "not_promoted_current_scope"}:
+            errors.append(f"P080 phase report has unsupported status: {path.relative_to(root)}")
+        if data.get("promotion_decision") not in {
+            "promoted_current_scope",
+            "not_promoted_current_scope",
+        }:
+            errors.append(f"P080 phase report has unsupported promotion_decision: {path.relative_to(root)}")
+        if path.name in {"phase-4-soak-report.json", "phase-5-soak-report.json"}:
+            if data.get("promotion_decision") != "not_promoted_current_scope":
+                errors.append(f"P080 follow-up phase must not be promoted in current scope: {path.relative_to(root)}")
+            if data.get("fail_closed") is not True:
+                errors.append(f"P080 follow-up phase must record fail_closed=true: {path.relative_to(root)}")
+        if path.name in {"phase-1-soak-report.json", "phase-2-soak-report.json", "phase-3-soak-report.json"}:
+            if data.get("promotion_decision") != "promoted_current_scope":
+                errors.append(f"P080 implemented phase must be promoted_current_scope: {path.relative_to(root)}")
 
 if len(negative_contract_fixtures) < 20:
     errors.append(
@@ -8241,6 +8305,23 @@ for term in [
 ]:
     if term not in test_gates:
         fail(f"docs/reference/test-gates.md missing {term!r}")
+
+retired_proposal = root / "docs/proposals/079-contract-aware-output-repair-and-provider-fallback.md"
+if retired_proposal.exists():
+    fail("retired P079 proposal file must not be the gate's operational source of truth")
+
+stable_reference = (root / "docs/reference/output-contracts-failure-evidence-and-recovery.md").read_text()
+for term in [
+    "implemented for the current safe repair/recovery scope",
+    "production same-session repair remains fail-closed for advisory-only providers",
+    "controlled provider fallback dispatch from frozen YAML policy",
+    "projection artifact rebuild/recovery sweep",
+    "independent plan-evidence purge",
+    "retained under the existing run-meta lifecycle",
+    "Retained Gate Aliases",
+]:
+    if term not in stable_reference:
+        fail(f"P079 stable reference scope alignment missing {term!r}")
 
 domain = (root / "control-plane/crates/domain/src/output_contract_repair.rs").read_text()
 for term in [
@@ -9540,28 +9621,59 @@ PY
     log "Proposal 092 retained gate passed"
     ;;
   proposal-083|p083)
-    log "Proposal 083 gate: execution-truth ownership — migrations, repos, metrics, engine, and rollback-disposition validation"
+    log "Execution-truth retained gate: proposal-083|p083 alias validates migrations, repos, metrics, engine, and rollback-disposition"
     python3 - "$ROOT_DIR" <<'PY'
 import re
 import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-proposal = root / "docs/proposals/083-execution-truth-ownership-invariant-model.md"
-text = proposal.read_text()
-declared_paths = sorted(
-    set(re.findall(r"docs/evidence/[^\"' )\],}]+", text))
-)
+stable_sources = [
+    root / "docs/reference/execution-truth-and-recovery.md",
+    root / "docs/reference/rust-control-plane.md",
+    root / "docs/reference/mcp-northbound-control-plane-server.md",
+    root / "docs/reference/query-projections-and-client-consumption-contract.md",
+    root / "docs/reference/p083/schema-version-evolution-policy.md",
+    root / "docs/evidence/083/README.md",
+    root / "docs/evidence/083/rollout-contract-v1.json",
+]
+source_text = "\n".join(path.read_text() for path in stable_sources if path.exists())
+declared_paths = {
+    path.rstrip("`.,")
+    for path in re.findall(r"docs/evidence/[^\"' )\],}]+", source_text)
+}
+declared_paths = {
+    path
+    for path in declared_paths
+    if path.startswith("docs/evidence/083") or "p083" in Path(path).name
+}
+evidence_root = root / "docs/evidence/083"
+if evidence_root.exists():
+    declared_paths.update(
+        p.relative_to(root).as_posix()
+        for p in evidence_root.rglob("*")
+        if p.is_file()
+    )
+rollout_root = root / "docs/evidence/rollout-contract"
+if rollout_root.exists():
+    declared_paths.update(
+        p.relative_to(root).as_posix()
+        for p in rollout_root.rglob("*")
+        if p.is_file() and "p083" in p.name
+    )
+declared_paths = sorted(declared_paths)
+if not declared_paths:
+    raise SystemExit("proposal-083: stable evidence corpus is empty")
 missing = [path for path in declared_paths if not (root / path).exists()]
 if missing:
     print(
-        "proposal-083: FAIL — declared evidence corpus is incomplete "
+        "proposal-083: FAIL — stable evidence corpus is incomplete "
         f"({len(missing)} missing of {len(declared_paths)} declared paths)"
     )
     for path in missing:
         print(f"proposal-083: missing evidence path: {path}")
     raise SystemExit(1)
-print(f"proposal-083: declared evidence corpus verified ({len(declared_paths)} paths)")
+print(f"proposal-083: stable evidence corpus verified ({len(declared_paths)} paths)")
 PY
     (
       cd "$ROOT_DIR/control-plane"
@@ -9576,7 +9688,7 @@ PY
       # GraphQL/MCP layer: rollback disposition validation and schema compile check
       CARGO_TARGET_DIR=target/proposal-083-gate cargo check -p graphql-server &&
       CARGO_TARGET_DIR=target/proposal-083-gate cargo check -p mcp-server &&
-      CARGO_TARGET_DIR=target/proposal-083-gate cargo test -p domain p083_lifecycle_denial_code_all_round_trip_as_str -- --nocapture &&
+      CARGO_TARGET_DIR=target/proposal-083-gate cargo test -p domain p083_ -- --nocapture &&
       CARGO_TARGET_DIR=target/proposal-083-gate cargo test -p graphql-server approval_mutations -- --nocapture &&
       CARGO_TARGET_DIR=target/proposal-083-gate cargo test -p mcp-server p083_mcp_ -- --nocapture
     )
@@ -9676,7 +9788,17 @@ print("proposal-083: durable monotonic baseline correlation verified")
 runs_rs = (root / "control-plane/crates/mcp-server/src/tools/runs.rs").read_text()
 stages_rs = (root / "control-plane/crates/mcp-server/src/tools/stages.rs").read_text()
 approvals_rs = (root / "control-plane/crates/mcp-server/src/tools/approvals.rs").read_text()
-proposal_text = (root / "docs/proposals/083-execution-truth-ownership-invariant-model.md").read_text()
+stable_contract_text = "\n".join(
+    path.read_text()
+    for path in [
+        root / "docs/reference/execution-truth-and-recovery.md",
+        root / "docs/reference/mcp-northbound-control-plane-server.md",
+        root / "docs/reference/rust-control-plane.md",
+        root / "docs/reference/query-projections-and-client-consumption-contract.md",
+        root / "docs/evidence/083/README.md",
+    ]
+    if path.exists()
+)
 for schema_path in [
     "docs/reference/mcp/p083/runs.cancel.input.schema.json",
     "docs/reference/mcp/p083/runs.cancel.output.schema.json",
@@ -9700,12 +9822,10 @@ for schema_path in [
     if not (root / schema_path).exists():
         raise SystemExit(f"proposal-083: MCP lifecycle schema missing {schema_path}")
 for term in [
-    '"provider_session.mark_process_absent"',
-    "provider_session.mark_process_absent.input.schema.json",
-    "provider_session.mark_process_absent.output.schema.json",
+    "provider_session.mark_process_absent",
 ]:
-    if term not in proposal_text:
-        raise SystemExit(f"proposal-083: proposal MCP inventory missing {term!r}")
+    if term not in stable_contract_text:
+        raise SystemExit(f"proposal-083: stable MCP/reference inventory missing {term!r}")
 if 'name: "provider_session.mark_process_absent"' not in runs_rs:
     raise SystemExit("proposal-083: runtime MCP inventory missing provider_session.mark_process_absent")
 for source_name, source, required_terms, forbidden_terms in [
@@ -9776,6 +9896,7 @@ for term in [
     "resolution: ApprovalResolution",
     "async fn side_effects_force_reconcile",
     "side_effect_id: ID",
+    "decision_json: String",
     "async fn stages_retry",
     "stage_execution_id: ID",
     "caller_request_id: CallerRequestId",
@@ -9807,6 +9928,8 @@ if "stage_execution_id: ID" not in stages_retry_arg_lines or "caller_request_id:
     raise SystemExit("proposal-083: stagesRetry must expose stageExecutionId and callerRequestId")
 if "side_effect_id: ID" not in side_effects_arg_lines or "caller_request_id: CallerRequestId" not in side_effects_arg_lines:
     raise SystemExit("proposal-083: sideEffectsForceReconcile must expose sideEffectId and callerRequestId")
+if "decision_json: String" not in side_effects_arg_lines:
+    raise SystemExit("proposal-083: sideEffectsForceReconcile must expose decisionJson")
 if "caller_request_id: CallerRequestId" not in {line.strip().rstrip(",") for line in mark_absent_handler.splitlines()}:
     raise SystemExit("proposal-083: mark-process-absent GraphQL mutation must expose callerRequestId")
 
@@ -9843,6 +9966,10 @@ if '"target_mode"' not in set_mode_handler:
 force_reconcile_handler = handler.split("async fn handle_force_reconcile_side_effect", 1)[1].split("async fn handle_shutdown_provider_session", 1)[0]
 if '"decision_json_digest"' not in force_reconcile_handler:
     raise SystemExit("proposal-083: side_effects.force_reconcile intent hash must include decision_json_digest")
+if '"side_effect_id"' not in force_reconcile_handler:
+    raise SystemExit("proposal-083: side_effects.force_reconcile intent hash must use public side_effect_id field")
+if '("effect_id", serde_json::Value::String(c.effect_id.clone()))' in force_reconcile_handler:
+    raise SystemExit("proposal-083: side_effects.force_reconcile intent hash must not use internal effect_id field")
 for handler_name, text in [("rollback", rollback_handler), ("set-enforcement", set_mode_handler)]:
     if '("reason", serde_json::Value::String(c.reason.clone()))' in text:
         raise SystemExit(f"proposal-083: {handler_name} intent hash must exclude diagnostic reason")
@@ -9850,6 +9977,129 @@ migration_091 = (root / "control-plane/crates/db/migrations/091_p083_005_enforce
 if "target_enforcement_mode TEXT NOT NULL" not in migration_091:
     raise SystemExit("proposal-083: p083_rollback_audit must include non-null target_enforcement_mode")
 print("proposal-083: R70 rollback/set-enforcement API and idempotency contract verified")
+
+schema_policy = root / "docs/reference/p083/schema-version-evolution-policy.md"
+schema_fixture = root / "docs/evidence/083/api/schema-version-evolution-policy.fixture.json"
+if not schema_policy.exists():
+    raise SystemExit("proposal-083: missing H004 schema-version evolution reference policy")
+if not schema_fixture.exists():
+    raise SystemExit("proposal-083: missing H004 schema-version evolution fixture")
+schema_policy_text = schema_policy.read_text()
+for term in [
+    "append-only version semantics",
+    "Same-version changes may add optional fields only",
+    "A schema version must be bumped",
+    "Readers must keep prior supported versions readable",
+    "Unknown `schema_version` values are diagnostics",
+]:
+    if term not in schema_policy_text:
+        raise SystemExit(f"proposal-083: H004 schema-version policy missing {term!r}")
+import json
+import re
+fixture = json.loads(schema_fixture.read_text())
+case_ids = {case.get("case_id") for case in fixture.get("cases", [])}
+for case_id in [
+    "same_version_optional_additive_field",
+    "same_version_required_field_change",
+    "prior_version_readability",
+    "unknown_schema_version",
+]:
+    if case_id not in case_ids:
+        raise SystemExit(f"proposal-083: H004 fixture missing case {case_id!r}")
+
+db_migration_tests = (root / "control-plane/crates/db/tests/proposal_083_migrations.rs").read_text()
+for term in [
+    "p083_h003_artifact_lineage_migration_is_create_table_posture",
+    "p083_h003_supported_store_has_no_preexisting_artifact_lineage_rows",
+    "cancel_late_output_overflow_concurrent_writers_accumulate_one_latch_key",
+    "projection_mutation_blocked",
+]:
+    if term not in db_migration_tests:
+        raise SystemExit(f"proposal-083: DB P083 migration tests missing hardening proof {term!r}")
+
+commands_rs = (root / "control-plane/crates/domain/src/commands.rs").read_text()
+for term in [
+    'command: "provider_session.mark_process_absent"',
+    "p083_ttl_policy_covers_all_nine_commands",
+    "p083_failed_terminal_retry_policy_covers_all_nine_commands",
+    "p083_provider_session_mark_process_absent_has_cooldown_policy",
+]:
+    if term not in commands_rs:
+        raise SystemExit(f"proposal-083: domain command policy missing {term!r}")
+
+swiftdata_signoff_path = root / "docs/evidence/083/swift/pre-p083-copied-store-transition-signoff.fixture.json"
+if not swiftdata_signoff_path.exists():
+    raise SystemExit("proposal-083: missing copied pre-P083 SwiftData transition signoff fixture")
+swiftdata_signoff = json.loads(swiftdata_signoff_path.read_text())
+required_store_classes = {
+    "empty_first_launch_store",
+    "active_run_with_stage_and_agent_rows_store",
+    "historical_artifacts_and_reports_store",
+    "approval_pending_store",
+    "provider_session_history_store",
+}
+store_entries = swiftdata_signoff.get("representative_store_matrix", [])
+store_classes = {entry.get("store_class") for entry in store_entries}
+if store_classes != required_store_classes:
+    missing = sorted(required_store_classes - store_classes)
+    extra = sorted(store_classes - required_store_classes)
+    raise SystemExit(
+        "proposal-083: copied pre-P083 SwiftData transition signoff store matrix mismatch "
+        f"missing={missing} extra={extra}"
+    )
+if swiftdata_signoff.get("global_assertions", {}).get("lifecycle_bearing_roots_receive_mutable_lifecycle_modelcontext") is not False:
+    raise SystemExit("proposal-083: SwiftData transition signoff must prove no mutable lifecycle ModelContext reaches lifecycle-bearing roots")
+for entry in store_entries:
+    store_class = entry.get("store_class")
+    for field in ["input_store_hash", "migrated_store_hash"]:
+        value = entry.get(field, "")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+            raise SystemExit(f"proposal-083: {store_class} has invalid {field}")
+    if entry.get("launch_result") != "pass" or entry.get("migration_result") != "pass":
+        raise SystemExit(f"proposal-083: {store_class} must record passing launch and migration results")
+    if entry.get("lifecycle_modelcontext_leakage") is not False:
+        raise SystemExit(f"proposal-083: {store_class} must record lifecycle_modelcontext_leakage=false")
+    if entry.get("store_origin") not in {"copied_pre_p083_store", "generated_representative_copy"}:
+        raise SystemExit(f"proposal-083: {store_class} must identify copied/generated representative store origin")
+print("proposal-083: copied pre-P083 SwiftData transition signoff verified")
+
+h009_path = root / "docs/evidence/083/reliability/h009-external-side-effect-composition.fixture.json"
+if not h009_path.exists():
+    raise SystemExit("proposal-083: missing P083-HARDEN-009 external side-effect composition fixture")
+h009 = json.loads(h009_path.read_text())
+required_commands = {
+    "runs.cancel",
+    "runs.retry",
+    "stages.retry",
+    "approvals.resolve",
+    "side_effects.force_reconcile",
+    "provider_session.shutdown",
+    "provider_session.mark_process_absent",
+    "p083.rollback_execution",
+    "p083.set_enforcement_mode",
+}
+h009_commands = {entry.get("command") for entry in h009.get("commands", [])}
+if h009_commands != required_commands:
+    missing = sorted(required_commands - h009_commands)
+    extra = sorted(h009_commands - required_commands)
+    raise SystemExit(f"proposal-083: H009 command coverage mismatch missing={missing} extra={extra}")
+for command in required_commands:
+    if f'command: "{command}"' not in commands_rs:
+        raise SystemExit(f"proposal-083: H009 covers command not present in domain policy: {command}")
+for entry in h009.get("commands", []):
+    command = entry.get("command")
+    for field in ["external_effect_kind", "planned_rows", "receipt_rows", "replay_recovery_expectation", "idempotency_boundary"]:
+        value = entry.get(field)
+        if not value:
+            raise SystemExit(f"proposal-083: H009 {command} missing {field}")
+    if not isinstance(entry.get("planned_rows"), list) or not all(entry["planned_rows"]):
+        raise SystemExit(f"proposal-083: H009 {command} planned_rows must be non-empty strings")
+    if not isinstance(entry.get("receipt_rows"), list) or not all(entry["receipt_rows"]):
+        raise SystemExit(f"proposal-083: H009 {command} receipt_rows must be non-empty strings")
+    crash_fixture = entry.get("crash_between_commit_and_external_action_fixture", {})
+    if not crash_fixture.get("fixture_id") or not crash_fixture.get("crash_window"):
+        raise SystemExit(f"proposal-083: H009 {command} missing crash-between fixture id/window")
+print("proposal-083: P083-HARDEN-009 external side-effect composition proof verified")
 
 app_entry = (root / "Chainworks Forge/Chainworks_ForgeApp.swift").read_text()
 for term in [
@@ -9880,7 +10130,7 @@ for term in [
         raise SystemExit(f"proposal-083: Runs toolbar/focused-value parity missing {term!r}")
 print("proposal-083: macOS Run menu and toolbar parity static proof verified")
 PY
-    log "Proposal 083 gate passed"
+    log "Execution-truth retained gate passed"
     ;;
   proposal-086|p086|p086-continuation-preflight)
     log "Proposal 086 Phase 0 preflight: migration shape, MCP/artifact schemas, and Rust unit tests"
@@ -10051,6 +10301,18 @@ for needle in [
     "provider_session_attach_receipt_v1",
     "provider_session_attach_receipt_v2",
     "attach_provider_session_for_resurrection",
+    "attach_provider_session_for_resurrection_with_launch_observer",
+    "P086ResurrectionLaunchObserver",
+    "provider_process_launched",
+    "attach_result.identity_proof_source",
+    "provider_session_resurrection_attach_success_total",
+    "provider_session_resurrection_prompt_sent_total",
+    "p086_output_only_source_snapshot",
+    "p086_output_only_changed_source_files_from_snapshots",
+    "output_only_source_baseline.as_ref()",
+    "&provider_session_id",
+    "ResurrectionPhase::Launched",
+    "ResurrectionPhase::Attaching",
     "worktree_continuation_readback_v1",
     "agent_continuation_evidence_bundle_v1",
     "agent_continuation_report_v1",
@@ -10130,6 +10392,7 @@ for needle in [
     "followup_validation_success_rate",
     "provider_session_budget_input_tokens_total",
     "provider_session_resurrection_attach_failure_total",
+    "provider_session_resurrection_prompt_sent_total",
     "rejected_lead_auto_agent_limit",
     "rejected_lead_auto_stage_limit",
 ]:
@@ -10211,6 +10474,7 @@ for needle in [
     "followup_validation_success_rate",
     "provider_session_budget_input_tokens_total",
     "provider_session_resurrection_attach_failure_total",
+    "provider_session_resurrection_prompt_sent_total",
 ]:
     if needle not in graphql_types:
         fail(f"GraphQL continuation metrics summary missing P086 KPI field {needle!r}")
@@ -10227,6 +10491,7 @@ for needle in [
     "followupValidationSuccessRate",
     "providerSessionBudgetInputTokensTotal",
     "providerSessionResurrectionAttachFailureTotal",
+    "providerSessionResurrectionPromptSentTotal",
 ]:
     if needle not in swift_read_boundary:
         fail(f"Swift P031 read boundary missing passive P086 readback needle {needle!r}")
@@ -10289,17 +10554,30 @@ if ".bind(&phase)" not in db_repo_text:
     fail("agent_work_continuations::update_resurrection_phase must bind the typed phase string")
 if not attach_v2_schema.get("allOf"):
     fail("provider_session_attach_receipt_v2 must constrain output_only source edit allowance")
+proof_sources = set(attach_v2_schema.get("properties", {}).get("identity_proof_source", {}).get("enum", []))
+if "session_new_result.sessionId" not in proof_sources:
+    fail("provider_session_attach_receipt_v2 must allow adapter-declared Claude identity proof source")
+if "output_only_source_proof" not in attach_v2_required:
+    fail("provider_session_attach_receipt_v2 must require output-only pre/post source proof")
 if "output_only_source_edit_violation" not in executor_text:
     fail("output-only recovery must fail closed when source files change")
+for needle in [
+    "p086_output_only_source_snapshot",
+    "p086_output_only_changed_source_files_from_snapshots",
+    "source_snapshot_pre_post",
+    "output_only_source_baseline",
+]:
+    if needle not in executor_text:
+        fail(f"output-only recovery must compare pre/post source snapshots: {needle!r}")
 if "output_only_source_edit_allowance_not_supported" not in mcp_agents:
     fail("MCP admission must reject output-only source edit allowance before admission")
-proposal086 = (root / "docs/proposals/086-agent-work-continuation-and-lead-directed-session-resumption.md").read_text()
+continuation_reference = (root / "docs/reference/agent-work-continuation.md").read_text()
 for needle in [
-    "output-only recovery always forbids source edits",
-    "`cancelling`: run or continuation cancellation has been durably requested",
+    "Output-only recovery always forbids source edits",
+    "`cancelling` phase, used only after durable cancellation has been requested",
 ]:
-    if needle not in proposal086:
-        fail(f"P086 proposal must own R15 contract wording {needle!r}")
+    if needle not in continuation_reference:
+        fail(f"agent work continuation reference must own R15 contract wording {needle!r}")
 for field in [
     "target_agent_execution_id",
     "target_stage_execution_id",
@@ -10361,7 +10639,18 @@ PY
       CARGO_TARGET_DIR="$PROPOSAL_086_CARGO_TARGET_DIR" cargo test -p daemon --test proposal_086_mcp_continuation_live_reuse -- --test-threads=1
     )
     log "Proposal 086 Swift readback tests"
+    PROPOSAL_086_PREBUILT_DAEMON="$(chainworks_test_gate_cargo_target_dir "$PROPOSAL_086_CARGO_TARGET_DIR")/debug/control-plane"
+    if [[ ! -x "$PROPOSAL_086_PREBUILT_DAEMON" ]]; then
+      die "proposal-086: expected prebuilt control-plane daemon at $PROPOSAL_086_PREBUILT_DAEMON"
+    fi
+    PREVIOUS_CHAINWORKS_PREBUILT_CONTROL_PLANE_DAEMON="${CHAINWORKS_PREBUILT_CONTROL_PLANE_DAEMON:-}"
+    export CHAINWORKS_PREBUILT_CONTROL_PLANE_DAEMON="$PROPOSAL_086_PREBUILT_DAEMON"
     run_targeted_tests "proposal-086-swift-readback" "${PROPOSAL_086_SWIFT_TESTS[@]}"
+    if [[ -n "$PREVIOUS_CHAINWORKS_PREBUILT_CONTROL_PLANE_DAEMON" ]]; then
+      export CHAINWORKS_PREBUILT_CONTROL_PLANE_DAEMON="$PREVIOUS_CHAINWORKS_PREBUILT_CONTROL_PLANE_DAEMON"
+    else
+      unset CHAINWORKS_PREBUILT_CONTROL_PLANE_DAEMON
+    fi
     log "Proposal 086 Phase 0 preflight gate passed"
     ;;
   p086-continuation-readback)

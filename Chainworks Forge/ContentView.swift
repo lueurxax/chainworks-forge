@@ -1123,7 +1123,10 @@ private struct P036ShellSidebar: View {
 
     private var collapseButton: some View {
         Button(action: onToggleCollapsed) {
-            Image(systemName: isCollapsed ? "sidebar.left" : "sidebar.leading")
+            // Distinct from the runs-list NavigationSplitView's native sidebar toggle
+            // (sidebar.left): a sidebar-with-items glyph reads as "navigation menu", so the
+            // two left-side collapse controls no longer look like identical burgers.
+            Image(systemName: "sidebar.squares.leading")
                 .font(.system(size: 13, weight: .semibold))
                 .frame(width: 28, height: 28)
         }

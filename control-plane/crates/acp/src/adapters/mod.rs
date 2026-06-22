@@ -841,6 +841,17 @@ pub struct OpenedAcpAdapterSession {
     pub runtime_tool_path_preflight_json: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcpLaunchedProcess {
+    pub child_pid: u32,
+    pub process_group_id: u32,
+}
+
+#[async_trait]
+pub trait AcpLaunchObserver: Send + Sync {
+    async fn provider_process_launched(&self, process: AcpLaunchedProcess) -> Result<()>;
+}
+
 /// Common interface for all ACP provider adapters.
 #[async_trait]
 pub trait AcpAdapter: Send + Sync {
@@ -994,8 +1005,21 @@ pub trait AcpAdapter: Send + Sync {
     async fn open_session_with_specs(
         &self,
         req: &ExecutionRequest,
+        launch_spec: AcpLaunchSpec,
+        session_new_spec: AcpSessionNewSpec,
+    ) -> Result<OpenedAcpAdapterSession> {
+        self.open_session_with_specs_and_launch_observer(req, launch_spec, session_new_spec, None)
+            .await
+    }
+
+    /// Open a session from precomputed launch and session specs while reporting
+    /// the managed child process immediately after spawn, before `session/new`.
+    async fn open_session_with_specs_and_launch_observer(
+        &self,
+        req: &ExecutionRequest,
         mut launch_spec: AcpLaunchSpec,
         session_new_spec: AcpSessionNewSpec,
+        launch_observer: Option<Arc<dyn AcpLaunchObserver>>,
     ) -> Result<OpenedAcpAdapterSession> {
         let effective_req;
         let req = if req.provider_runtime_home.is_none() {
@@ -1062,6 +1086,30 @@ pub trait AcpAdapter: Send + Sync {
                 return Err(err).with_context(|| spawn_context);
             }
         };
+        if let Some(observer) = launch_observer {
+            let Some(child_pid) = child.id() else {
+                for spec in launch_spec.cleanup_paths.drain(..) {
+                    cleanup_path(&spec.path);
+                }
+                let mut child = child;
+                let _ = child.kill().await;
+                bail!("provider_process_launch_unobservable: spawned child had no pid");
+            };
+            if let Err(err) = observer
+                .provider_process_launched(AcpLaunchedProcess {
+                    child_pid,
+                    process_group_id: child_pid,
+                })
+                .await
+            {
+                for spec in launch_spec.cleanup_paths.drain(..) {
+                    cleanup_path(&spec.path);
+                }
+                let mut child = child;
+                let _ = child.kill().await;
+                return Err(err).context("persist provider process launch binding");
+            }
+        }
         let xcode_shim_grant = match launch_spec.register_xcode_shim_grant_for_child(&child) {
             Ok(grant) => grant,
             Err(err) => {

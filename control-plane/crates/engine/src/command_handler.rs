@@ -9139,7 +9139,8 @@ impl CommandHandler {
     }
 
     /// P083: Force-reconcile a side effect to reconciled status with operator decision.
-    /// command_idempotency_contract_v1 with TTL=300s; intent keyed on (command, effect_id).
+    /// command_idempotency_contract_v1 with TTL=300s; intent keyed on
+    /// (command, side_effect_id, decision_json_digest).
     async fn handle_force_reconcile_side_effect(
         &self,
         c: ForceReconcileSideEffectCmd,
@@ -9176,7 +9177,10 @@ impl CommandHandler {
                 "decision_json_digest",
                 serde_json::Value::String(decision_json_intent_digest),
             ),
-            ("effect_id", serde_json::Value::String(c.effect_id.clone())),
+            (
+                "side_effect_id",
+                serde_json::Value::String(c.effect_id.clone()),
+            ),
         ]);
 
         if let Some(existing) =
@@ -11151,7 +11155,7 @@ reviewer_override:
                     serde_json::Value::String(decision_json_intent_digest),
                 ),
                 (
-                    "effect_id",
+                    "side_effect_id",
                     serde_json::Value::String(effect_id.to_string()),
                 ),
             ])
@@ -11194,7 +11198,7 @@ reviewer_override:
                     serde_json::Value::String(decision_json_intent_digest),
                 ),
                 (
-                    "effect_id",
+                    "side_effect_id",
                     serde_json::Value::String(effect_id.to_string()),
                 ),
             ])
@@ -11211,6 +11215,53 @@ reviewer_override:
             hash_compact, hash_spaced,
             "semantically equal decision_json with different whitespace must produce the same \
              intent hash after canonical re-serialization"
+        );
+    }
+
+    #[test]
+    fn p083_force_reconcile_intent_hash_uses_public_side_effect_id_field_name() {
+        let side_effect_id = "eff-00000000-0000-4000-a000-000000000003";
+        let decision_json = r#"{"schema_version":"side_effect_decision_v1","decision":"approved"}"#;
+        let decision_value: serde_json::Value =
+            serde_json::from_str(decision_json).expect("valid JSON");
+        let decision_canonical = serde_json::to_string(&decision_value).unwrap_or_default();
+        let decision_json_intent_digest = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(decision_canonical.as_bytes()))
+        };
+
+        let public_contract_hash = canonical_intent_hash(&[
+            (
+                "command",
+                serde_json::Value::String("side_effects.force_reconcile".into()),
+            ),
+            (
+                "decision_json_digest",
+                serde_json::Value::String(decision_json_intent_digest.clone()),
+            ),
+            (
+                "side_effect_id",
+                serde_json::Value::String(side_effect_id.to_string()),
+            ),
+        ]);
+        let legacy_internal_hash = canonical_intent_hash(&[
+            (
+                "command",
+                serde_json::Value::String("side_effects.force_reconcile".into()),
+            ),
+            (
+                "decision_json_digest",
+                serde_json::Value::String(decision_json_intent_digest),
+            ),
+            (
+                "effect_id",
+                serde_json::Value::String(side_effect_id.to_string()),
+            ),
+        ]);
+
+        assert_ne!(
+            public_contract_hash, legacy_internal_hash,
+            "P083 canonical intent bytes must use the public side_effect_id field name"
         );
     }
 }

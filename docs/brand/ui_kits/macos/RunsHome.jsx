@@ -2,7 +2,7 @@
 
 const RUNS = [
   { id: "RUN-0248", title: "Bound stage-settlement reads to projection truth",
-    status: "approval", workflow: "proposal-loop-live", provider: "Claude Code",
+    status: "approval", workflow: "full-mvp-live", provider: "Claude Code",
     stage: "4 · review", started: "2m ago", progress: 0.55,
     artifacts: 12, approvals: 1 },
   { id: "RUN-0247", title: "Wire daemon supervisor to packaged-mode crash budget",
@@ -18,7 +18,7 @@ const RUNS = [
     stage: "7 · sealed", started: "1h ago", progress: 1,
     artifacts: 24, approvals: 2 },
   { id: "RUN-0244", title: "Frozen provider/model provenance truth in run snapshot",
-    status: "completed", workflow: "proposal-loop-live", provider: "Claude Code",
+    status: "completed", workflow: "full-mvp-live", provider: "Claude Code",
     stage: "7 · sealed", started: "3h ago", progress: 1,
     artifacts: 17, approvals: 1 },
   { id: "RUN-0243", title: "ACP fallback diagnostics export bundle",

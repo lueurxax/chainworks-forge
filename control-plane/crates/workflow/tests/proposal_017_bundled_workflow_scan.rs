@@ -12,7 +12,6 @@ fn proposal_017_bundled_workflows_have_no_static_simultaneous_transition_matches
     let workflow_paths = [
         workflow_dir.join("workflow.yaml"),
         workflow_dir.join("full-mvp-live.yaml"),
-        workflow_dir.join("proposal-loop-live.yaml"),
         workflow_dir.join("proposal-to-release.yaml"),
     ];
 

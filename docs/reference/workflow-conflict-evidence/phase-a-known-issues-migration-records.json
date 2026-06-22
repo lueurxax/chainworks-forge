@@ -42,7 +42,6 @@
     "scanned_workflow_paths": [
       "examples/workflows/workflow.yaml",
       "examples/workflows/full-mvp-live.yaml",
-      "examples/workflows/proposal-loop-live.yaml",
       "examples/workflows/proposal-to-release.yaml"
     ],
     "simultaneous_transition_findings_count": 0,

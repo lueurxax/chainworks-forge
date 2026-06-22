@@ -95,7 +95,7 @@ The repository is past the scaffold stage. The implemented system now includes:
 - declarative workflow authority, typed workflow conflicts, and advisory rejection history
 - operator-facing run, approval, report, recovery, and comparison surfaces
 - provider configuration, remediation, ACP-backed execution slices, and legacy Goose compatibility paths
-- durable storage as the execution-truth authority for runs, stages, agents, approvals, artifacts, side effects, provider sessions, command idempotency, shutdown receipts, rollout state, and operator readback (P083: Execution-Truth Ownership and Invariant Model)
+- durable storage as the execution-truth authority for runs, stages, agents, approvals, artifacts, side effects, provider sessions, command idempotency, shutdown receipts, rollout state, and operator readback
 - local Rust daemon lifecycle, supervision, packaged-mode health/readiness, diagnostics, and release-host packaging proof lanes
 - repo-backed delivery, release gating, benchmark/sign-off, and export flows
 - provider toolchain cache mapping ensuring isolated writable roots for Xcode and Go
@@ -112,7 +112,7 @@ The repository is past the scaffold stage. The implemented system now includes:
 - stable proposal-loop feedback-fidelity documentation and proof under [`docs/reference`](docs/reference) and [`docs/evidence`](docs/evidence)
 - Local Persistence Write Budget and Evidence Spooling — DbWriter lanes/coalescing/shutdown primitives, evidence_spool_refs and storage_write_pressure_snapshots schemas, failed-stage evidence spooling, transcript spooling, storageHealth/MCP diagnostics with live heartbeat/drain/lock/WAL readback, diagnostics-bundle storage snapshots, and fail-closed write-bypass/raw-evidence gate coverage are implemented. Temporary rollout bypasses are retired; the remaining allowlist is limited to migrations, tests, startup repair, and evidence-spool orphan repair.
 - Agent work continuation and lead-directed same-session resumption — `agents.continue_work`, `agents.continuation_status`, and `agents.continuation_candidates` MCP commands for eligible stage-owned `code_writer` agent executions, with persisted continuation/side-effect ledger/supervised-worker/provider-process tables, durable metric events, materialized Draft 2020-12 JSON Schemas, and guarded admission for `live_handle_continuation`. `lead_auto` may be requested by Agent principals only with a validated lead decision artifact; `operator_mcp` remains Operator-only. Per-adapter `provider_session_resurrection` remains explicit and fail-closed for adapters that do not declare attach/resume support. The worker drives the `accepted → … → succeeded | no_progress | failed | cancelled` state machine with durable runtime/worktree/provider-send ledger rows, a live-handle attach receipt, heartbeat-backed supervised-worker ownership, cancellation cascade handling, duplicate-send reconciliation that requires provider-send evidence, worktree readback, evidence bundle, response snapshot, result/no-progress, operator report artifacts, passive GraphQL history/metrics readback, and a read-only macOS Overview card. `P086` names remain only as retained gate/schema/evidence aliases.
-- Contract-aware output repair and provider fallback (P079) - partially implemented. The SQLite migration, domain types, DB repos, GraphQL/MCP readback, Swift evidence DTOs, MCP receipt sanitization, crash-consistent materialization, Junie plan-evidence capture/redaction, and deterministic fixture same-session repair path are wired. Production same-session repair is fail-closed for advisory-only providers until enforceable sandbox/permission restrictions exist. Transcript/provider-envelope recovery, controlled provider fallback, macOS inspector UI, P079 metrics, and the full acceptance gate remain deferred.
+- Contract-aware output repair and provider fallback is implemented for the current safe repair/recovery scope. SQLite persistence, domain/readback types, repair-event and lease repos, GraphQL/MCP/run-report readback, Swift DTO/presenter support, read-only macOS inspector surfacing, MCP receipt sanitization, crash-consistent materialization, Junie plan-evidence capture/redaction, bounded transcript/provider-envelope recovery, and deterministic fixture same-session repair are wired. Production same-session repair remains fail-closed for advisory-only providers until enforceable restrictions exist; controlled provider fallback dispatch, projection artifact rebuild/sweep, and independent plan-evidence purge are future work.
 
 Active proposal work is currently concentrated in:
 
@@ -278,14 +278,13 @@ Implemented-system references:
 - [`docs/reference/test-gates.md`](docs/reference/test-gates.md)
 - [`docs/reference/agent-work-continuation.md`](docs/reference/agent-work-continuation.md)
 - [`docs/reference/boundary-first-api-auth-contract.md`](docs/reference/boundary-first-api-auth-contract.md)
-- [`docs/proposals/083-execution-truth-ownership-invariant-model.md`](docs/proposals/083-execution-truth-ownership-invariant-model.md)
+- [`docs/reference/execution-truth-and-recovery.md`](docs/reference/execution-truth-and-recovery.md)
 
 Examples:
 
 - [`examples/README.md`](examples/README.md)
 - [`examples/agents/agents.yaml`](examples/agents/agents.yaml)
 - [`examples/workflows/workflow.yaml`](examples/workflows/workflow.yaml)
-- [`examples/workflows/proposal-loop-live.yaml`](examples/workflows/proposal-loop-live.yaml)
 - [`examples/workflows/full-mvp-live.yaml`](examples/workflows/full-mvp-live.yaml)
 - [`examples/workflows/proposal-to-release.yaml`](examples/workflows/proposal-to-release.yaml)
 

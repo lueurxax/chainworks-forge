@@ -86,39 +86,6 @@ struct RunsHomeView: View {
             p083SessionsModel.updateSelectedRun(newRunID)
         }
         .toolbar {
-            // Section switcher — centered in the window toolbar. High effective priority
-            // (principal) so it never collapses into the overflow as the window narrows.
-            if model.runDetail != nil {
-                ToolbarItem(placement: .principal) {
-                    Picker("Run section", selection: $selectedRunDetailTab) {
-                        ForEach(P031RunDetailTab.allCases) { tab in
-                            Text(tab.title).tag(tab)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(maxWidth: 520)
-                    .accessibilityIdentifier("run-detail-section-picker")
-                }
-            }
-
-            // Full-chrome redesign (macOS 27): "New run" routes to the Ideas tab, the
-            // real run-compilation entry point. Default (.automatic) priority so it
-            // overflows after freshness but before the critical operator actions.
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    NotificationCenter.default.post(
-                        name: .chainworksSelectTab,
-                        object: nil,
-                        userInfo: ["tab": "Ideas"]
-                    )
-                } label: {
-                    Label("New run", systemImage: "plus")
-                }
-                .help("Capture an idea and compile a new run")
-                .accessibilityIdentifier("runs-new-run-button")
-            }
-
             // P0XX (macOS 27 toolbar): freshness is a low-priority status item — when the
             // window narrows it is the first to collapse into the system overflow menu,
             // leaving the primary action in place. `contentMarginsRemoved()` lets the
@@ -491,8 +458,18 @@ struct RunsHomeView: View {
             runDetailAlert
 
             if let runDetail = model.runDetail {
-                // Section switcher migrated to the window toolbar (.principal) as part of the
-                // macOS 27 chrome redesign; the detail pane now renders content directly.
+                Picker("Run section", selection: $selectedRunDetailTab) {
+                    ForEach(P031RunDetailTab.allCases) { tab in
+                        Text(tab.title).tag(tab)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 720)
+                .padding(.horizontal, 20)
+                .padding(.top, 20)
+                .accessibilityIdentifier("run-detail-section-picker")
+
                 runDetailTabContent(runDetail)
             } else {
                 ScrollView {

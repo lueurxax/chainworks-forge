@@ -1,0 +1,40 @@
+{
+  "schema_version": "p083_evidence_fixture_v1",
+  "fixture_id": "p083-schema-version-evolution-policy",
+  "proposal": "P083",
+  "contract": "P083-HARDEN-004",
+  "reference": "docs/reference/p083/schema-version-evolution-policy.md",
+  "cases": [
+    {
+      "case_id": "same_version_optional_additive_field",
+      "input": {
+        "schema_version": "rollback_disposition_v1",
+        "mode": "disabled",
+        "data_loss_risk": "none",
+        "steps": [],
+        "optional_operator_note": "ignored by older readers"
+      },
+      "expected": "readable_without_mutation"
+    },
+    {
+      "case_id": "same_version_required_field_change",
+      "change": "add required field to rollback_disposition_v1",
+      "expected": "requires_new_schema_version"
+    },
+    {
+      "case_id": "prior_version_readability",
+      "input": {
+        "schema_version": "p083_evidence_fixture_v1",
+        "legacy_optional_field_absent": true
+      },
+      "expected": "readback_maps_absent_fields_without_mutating_payload"
+    },
+    {
+      "case_id": "unknown_schema_version",
+      "input": {
+        "schema_version": "p083_unknown_future_schema"
+      },
+      "expected": "typed_schema_diagnostic_before_mutation"
+    }
+  ]
+}

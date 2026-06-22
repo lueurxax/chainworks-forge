@@ -5,7 +5,7 @@
 | Date | 2026-05-16 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | P037 ACP execution supervision, [auto-retry observation ledger](../reference/auto-retry-observation-ledger.md), P083 execution-truth ownership invariants, P088 code-writer completion receipts |
+| Depends on | P037 ACP execution supervision, [auto-retry observation ledger](../reference/auto-retry-observation-ledger.md), [execution-truth ownership invariants](../reference/execution-truth-and-recovery.md#durable-execution-truth-ownership), P088 code-writer completion receipts |
 | Related | `docs/reference/rust-control-plane.md`, `docs/reference/test-gates.md`, `scripts/test-gate.sh`, Rust ACP provider runtime homes |
 | Scope | Bound uncontrolled temporary file growth by making Chainworks temporary artifacts owned, discoverable, and lifecycle-managed. |
 | Non-goal | No daemon-wide hard quota/watermark policy, no provider token-budget policy, no deletion of active worktrees, no weakening of failure evidence preservation. |

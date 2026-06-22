@@ -1,0 +1,38 @@
+{
+  "schema_version": "p080_phase_soak_report_v1",
+  "proposal_id": "080",
+  "proposal_revision_id": "p080-refined-2026-06-02-r28",
+  "phase": "phase_4_helper_reaping_followup",
+  "recorded_at": "2026-06-22T00:00:00Z",
+  "status": "not_promoted_current_scope",
+  "promotion_decision": "not_promoted_current_scope",
+  "gate_aliases": [
+    "proposal-080",
+    "p080"
+  ],
+  "repair_classes": [
+    "helper_orphan_drift"
+  ],
+  "fail_closed": true,
+  "evidence_sources": [
+    "control-plane/crates/db/src/repos/p080.rs",
+    "docs/evidence/rollout/p080/phase-scoped-same-tree-proof.json"
+  ],
+  "soak_window": {
+    "kind": "not_promoted",
+    "production_daemon_trace": false
+  },
+  "assertions": {
+    "helper_process_signal_is_not_enabled": true,
+    "diagnostics_preserve_helper_lease_evidence": true,
+    "repair_requires_future_pid_safe_contract": true
+  },
+  "required_before_promotion": [
+    "durable helper lease ownership proof",
+    "process start-time or equivalent PID reuse witness",
+    "parent-chain or runtime-owned process identity proof",
+    "graceful termination policy",
+    "negative proof for PID reuse and unrelated-process safety"
+  ],
+  "followup_owner": "future process-control safety proposal"
+}

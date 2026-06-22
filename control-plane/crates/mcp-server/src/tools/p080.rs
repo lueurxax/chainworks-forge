@@ -618,7 +618,7 @@ async fn handle_diagnostics_get(
         return Ok(err);
     }
 
-    // Gate on detection_only rollout row (proposal §3.1 L617-624, DEFECT-007).
+    // Gate on the stable detection_only rollout-control row.
     // diagnostics.get must not expose stale projections when detection_only is disabled.
     let detection_enabled = match db::repos::p080::get_rollout_control(pool, "detection_only").await
     {
@@ -993,7 +993,7 @@ async fn handle_reconcile_request(
     }
 
     if requested_action == "diagnose_only" {
-        // DEFECT-5 (proposal §3.1, prepush 2026-06-09): diagnose_only is a
+        // diagnose_only is a
         // detection-class read of a readback row and must respect the
         // detection_only rollout gate, mirroring diagnostics.get. Default-off
         // rows seed with enabled=0, so unauthorized callers cannot infer
@@ -1098,11 +1098,33 @@ async fn handle_reconcile_request(
         )
         .await
         {
-            Ok(Some(row)) => serde_json::from_str(&row.readback_json)
-                .map(redact_readback)
-                .unwrap_or_else(|_| {
+            Ok(Some(row)) => {
+                let mut readback = serde_json::from_str(&row.readback_json).unwrap_or_else(|_| {
                     fallback_readback(&run_id, &stage_id, &work_item_id, &stale_class)
-                }),
+                });
+                if readback
+                    .get("running_truth")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("stale_suspected")
+                    && readback
+                        .get("evidence_marker_hash")
+                        .map_or(true, serde_json::Value::is_null)
+                {
+                    if let Ok(predicate_hash) = db::repos::p080::compute_repair_predicate_hash(
+                        pool,
+                        &run_id,
+                        &stage_id,
+                        &work_item_id,
+                        &stale_class,
+                    )
+                    .await
+                    {
+                        readback["evidence_marker_hash"] =
+                            serde_json::Value::String(predicate_hash);
+                    }
+                }
+                redact_readback(readback)
+            }
             _ => fallback_readback(&run_id, &stage_id, &work_item_id, &stale_class),
         };
 
@@ -1131,7 +1153,7 @@ async fn handle_reconcile_request(
     }
 
     if requested_action == "repair_if_safe" {
-        // Authorization check before phase check per proposal §3.1.
+        // Authorization check before phase check per the stable ReadOnlyOperator matrix.
         // repair_if_safe requires p080:repair capability (Operator class).
         // Since ReadOnlyOperator is now denied P080 tools at the auth layer
         // (SEC-P080-HIGH-002), this branch is only reachable by Operator principals.
@@ -1185,10 +1207,11 @@ async fn handle_reconcile_request(
         };
         let stale_class = match target["stale_class"].as_str() {
             Some("acp_startup_stale") => "acp_startup_stale",
+            Some("scheduler_ownership_drift") => "scheduler_ownership_drift",
             Some(_) => {
                 return Ok(p080_error_detail(
                     "rollout_disabled",
-                    "repair_if_safe currently supports only acp_startup_stale; other classes remain fail-closed",
+                    "repair_if_safe supports acp_startup_stale and scheduler_ownership_drift; other classes remain fail-closed",
                     serde_json::json!({
                         "rollout_disablement": "class_disabled",
                         "requested_action": "repair_if_safe"
@@ -1241,7 +1264,7 @@ async fn handle_reconcile_request(
         if !rollout.enabled {
             return Ok(p080_error_detail(
                 "class_disabled",
-                "repair_if_safe is disabled for acp_startup_stale",
+                &format!("repair_if_safe is disabled for {stale_class}"),
                 serde_json::json!({
                     "rollout_disablement": "class_disabled",
                     "requested_action": "repair_if_safe"
@@ -1249,10 +1272,19 @@ async fn handle_reconcile_request(
                 None,
             ));
         }
-        if !matches!(
-            rollout.phase.as_str(),
-            "phase_2" | "phase_3" | "phase_4" | "phase_5"
-        ) {
+        let phase_reached = match stale_class {
+            "acp_startup_stale" => {
+                matches!(
+                    rollout.phase.as_str(),
+                    "phase_2" | "phase_3" | "phase_4" | "phase_5"
+                )
+            }
+            "scheduler_ownership_drift" => {
+                matches!(rollout.phase.as_str(), "phase_3" | "phase_4" | "phase_5")
+            }
+            _ => false,
+        };
+        if !phase_reached {
             return Ok(p080_error_detail(
                 "rollout_disabled",
                 "repair_if_safe is not yet enabled (rollout phase not reached for this class)",
@@ -1313,8 +1345,9 @@ async fn handle_reconcile_request(
                 && entry.repair_class_enabled_hash == repair_class_enabled_hash
                 && entry.live_disable_generation == live_disable_generation;
             if same_fence {
-                return serde_json::from_str(&entry.response_json)
-                    .map_err(|err| anyhow::anyhow!("p080 dedup response_json invalid: {err}"));
+                let response: serde_json::Value = serde_json::from_str(&entry.response_json)
+                    .map_err(|err| anyhow::anyhow!("p080 dedup response_json invalid: {err}"))?;
+                return Ok(redact_reconcile_response_readback(response));
             }
             return Ok(p080_error_detail(
                 "idempotency_conflict",
@@ -1344,17 +1377,35 @@ async fn handle_reconcile_request(
             expires_at: expires_at.clone(),
         };
 
-        let response = match db::repos::p080::repair_acp_startup_stale_requeue_invoke_agent_checked(
-            pool,
-            &run_id,
-            &stage_id,
-            &work_item_id,
-            &principal.id,
-            params["expected_predicate_hash"].as_str(),
-            Some(&dedup_commit),
-        )
-        .await?
-        {
+        let repair_result = match stale_class {
+            "acp_startup_stale" => {
+                db::repos::p080::repair_acp_startup_stale_requeue_invoke_agent_checked(
+                    pool,
+                    &run_id,
+                    &stage_id,
+                    &work_item_id,
+                    &principal.id,
+                    params["expected_predicate_hash"].as_str(),
+                    Some(&dedup_commit),
+                )
+                .await?
+            }
+            "scheduler_ownership_drift" => {
+                db::repos::p080::repair_scheduler_ownership_drift_requeue_invoke_agent_checked(
+                    pool,
+                    &run_id,
+                    &stage_id,
+                    &work_item_id,
+                    &principal.id,
+                    params["expected_predicate_hash"].as_str(),
+                    Some(&dedup_commit),
+                )
+                .await?
+            }
+            _ => unreachable!("unsupported P080 repair stale_class passed validation"),
+        };
+
+        let response = match repair_result {
             db::repos::p080::P080RepairRequeueResult::Repaired(outcome) => {
                 serde_json::json!({
                     "schema_version": "p080_reconcile_response_v1",
@@ -1399,9 +1450,11 @@ async fn handle_reconcile_request(
                 )
                 .await?
                 {
-                    return serde_json::from_str(&entry.response_json).map_err(|err| {
-                        anyhow::anyhow!("p080 concurrent dedup response_json invalid: {err}")
-                    });
+                    let response: serde_json::Value = serde_json::from_str(&entry.response_json)
+                        .map_err(|err| {
+                            anyhow::anyhow!("p080 concurrent dedup response_json invalid: {err}")
+                        })?;
+                    return Ok(redact_reconcile_response_readback(response));
                 }
                 return Ok(p080_error_detail(
                     "idempotency_conflict",
@@ -2343,6 +2396,14 @@ fn extract_filter(
         hold_reason: validate_str_field!("hold_reason"),
         include_recent_repaired: f["include_recent_repaired"].as_bool().unwrap_or(false),
     })
+}
+
+fn redact_reconcile_response_readback(mut response: serde_json::Value) -> serde_json::Value {
+    if let Some(readback) = response.get_mut("readback") {
+        let raw = std::mem::take(readback);
+        *readback = redact_readback(raw);
+    }
+    response
 }
 
 fn fallback_readback(
@@ -3773,11 +3834,22 @@ mod tests {
         stage_id: &str,
         work_item_id: &str,
     ) {
+        insert_stale_readback_for_class(pool, run_id, stage_id, work_item_id, "acp_startup_stale")
+            .await;
+    }
+
+    async fn insert_stale_readback_for_class(
+        pool: &sqlx::SqlitePool,
+        run_id: &str,
+        stage_id: &str,
+        work_item_id: &str,
+        stale_class: &str,
+    ) {
         let now_str = chrono::Utc::now().to_rfc3339();
         let readback_json = serde_json::to_string(&serde_json::json!({
             "schema_version": "p080_readback_v1",
             "run_id": run_id, "stage_id": stage_id, "work_item_id": work_item_id,
-            "stale_class": "acp_startup_stale", "running_truth": "stale_suspected",
+            "stale_class": stale_class, "running_truth": "stale_suspected",
             "repair_action": "diagnose_only", "hold_reason": "rollout_disabled",
             "hold_age_seconds": null, "next_retry_or_backoff_time": null,
             "projection_updated_at": now_str, "projection_integrity": "valid",
@@ -3790,11 +3862,12 @@ mod tests {
             "INSERT INTO p080_readback_heartbeats_v1
              (run_id, stage_id, work_item_id, stale_class, projection_generation,
               projection_updated_at, projection_integrity, readback_json, updated_at)
-             VALUES (?1, ?2, ?3, 'acp_startup_stale', 1, ?4, 'valid', ?5, ?6)",
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, 'valid', ?6, ?7)",
         )
         .bind(run_id)
         .bind(stage_id)
         .bind(work_item_id)
+        .bind(stale_class)
         .bind(&now_str)
         .bind(&readback_json)
         .bind(&now_str)
@@ -3808,6 +3881,23 @@ mod tests {
         run_id: &str,
         stage_id: &str,
         work_item_id: &str,
+    ) {
+        insert_running_invoke_agent_for_repair_class(
+            pool,
+            run_id,
+            stage_id,
+            work_item_id,
+            "acp_startup_stale",
+        )
+        .await;
+    }
+
+    async fn insert_running_invoke_agent_for_repair_class(
+        pool: &sqlx::SqlitePool,
+        run_id: &str,
+        stage_id: &str,
+        work_item_id: &str,
+        stale_class: &str,
     ) {
         let now = chrono::Utc::now().to_rfc3339();
         let idea_id = format!("idea-{work_item_id}");
@@ -3877,7 +3967,7 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        insert_stale_readback(pool, run_id, stage_id, work_item_id).await;
+        insert_stale_readback_for_class(pool, run_id, stage_id, work_item_id, stale_class).await;
     }
 
     #[tokio::test]
@@ -4330,6 +4420,277 @@ mod tests {
             repaired_events, 1,
             "dedup replay must not write a second repair event"
         );
+    }
+
+    #[tokio::test]
+    async fn p080_diagnose_only_populates_repair_predicate_hash_for_stale_row() {
+        let pool = db::pool::create_pool("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        db::repos::p080::seed_rollout_control_if_absent(&pool)
+            .await
+            .unwrap();
+        enable_rollout_class(&pool, "detection_only").await;
+        insert_running_invoke_agent_for_repair_class(
+            &pool,
+            "00000000-0000-0000-0000-000000080201",
+            "stage-predicate-read-01",
+            "00000000-0000-0000-0000-000000080202",
+            "scheduler_ownership_drift",
+        )
+        .await;
+
+        let principal = auth::Principal::new("test-operator", auth::PrincipalClass::Operator);
+        let result = execute(
+            "p080.reconcile.request.v1",
+            serde_json::json!({
+                "schema_version": "p080_reconcile_request_v1",
+                "target": {
+                    "run_id": "00000000-0000-0000-0000-000000080201",
+                    "stage_id": "stage-predicate-read-01",
+                    "work_item_id": "00000000-0000-0000-0000-000000080202",
+                    "stale_class": "scheduler_ownership_drift"
+                },
+                "requested_action": "diagnose_only"
+            }),
+            &pool,
+            &principal,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["decision"], "diagnosed");
+        let marker = result["readback"]["evidence_marker_hash"]
+            .as_str()
+            .expect("diagnose_only should return repair predicate hash");
+        assert_eq!(marker.len(), 64);
+        assert!(marker.bytes().all(|b| b.is_ascii_hexdigit()));
+        let expected = db::repos::p080::compute_repair_predicate_hash(
+            &pool,
+            "00000000-0000-0000-0000-000000080201",
+            "stage-predicate-read-01",
+            "00000000-0000-0000-0000-000000080202",
+            "scheduler_ownership_drift",
+        )
+        .await
+        .unwrap();
+        assert_eq!(marker, expected);
+    }
+
+    #[tokio::test]
+    async fn p080_repair_if_safe_scheduler_ownership_drift_requeues_in_phase3() {
+        let pool = db::pool::create_pool("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        db::repos::p080::seed_rollout_control_if_absent(&pool)
+            .await
+            .unwrap();
+        enable_rollout_class_with_phase(&pool, "scheduler_ownership_drift", "phase_3", 3).await;
+        enable_rollout_class(&pool, "detection_only").await;
+        insert_running_invoke_agent_for_repair_class(
+            &pool,
+            "run-sched-01",
+            "stage-sched-01",
+            "wi-sched-01",
+            "scheduler_ownership_drift",
+        )
+        .await;
+
+        let principal = auth::Principal::new("test-operator", auth::PrincipalClass::Operator);
+        let predicate_hash = db::repos::p080::compute_repair_predicate_hash(
+            &pool,
+            "run-sched-01",
+            "stage-sched-01",
+            "wi-sched-01",
+            "scheduler_ownership_drift",
+        )
+        .await
+        .unwrap();
+        let result = execute(
+            "p080.reconcile.request.v1",
+            serde_json::json!({
+                "schema_version": "p080_reconcile_request_v1",
+                "target": {
+                    "run_id": "run-sched-01",
+                    "stage_id": "stage-sched-01",
+                    "work_item_id": "wi-sched-01",
+                    "stale_class": "scheduler_ownership_drift"
+                },
+                "requested_action": "repair_if_safe",
+                "operator_request_dedup_key": "dedup-sched-01",
+                "expected_predicate_hash": predicate_hash
+            }),
+            &pool,
+            &principal,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["schema_version"], "p080_reconcile_response_v1");
+        assert_eq!(result["decision"], "repaired");
+        assert_eq!(
+            result["readback"]["stale_class"],
+            "scheduler_ownership_drift"
+        );
+        assert_eq!(
+            result["readback"]["repair_action"],
+            "scheduler_lease_reclaim"
+        );
+        assert_eq!(result["readback"]["running_truth"], "stale_repaired");
+
+        let payload_json: String =
+            sqlx::query_scalar("SELECT payload_json FROM work_items WHERE id = 'wi-sched-01'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
+        assert_eq!(
+            payload["p080_reconciliation"]["stale_class"],
+            "scheduler_ownership_drift"
+        );
+        assert_eq!(
+            payload["p080_reconciliation"]["reason"],
+            "p080_scheduler_ownership_drift_repair"
+        );
+
+        let event: (String, String, String) = sqlx::query_as(
+            "SELECT stale_class, repair_action, decision
+             FROM p080_reconciliation_events_v1
+             WHERE run_id = 'run-sched-01' AND work_item_id = 'wi-sched-01'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(event.0, "scheduler_ownership_drift");
+        assert_eq!(event.1, "scheduler_lease_reclaim");
+        assert_eq!(event.2, "repaired");
+    }
+
+    #[tokio::test]
+    async fn p080_repair_if_safe_scheduler_ownership_drift_phase2_rejects_before_mutation() {
+        let pool = db::pool::create_pool("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        db::repos::p080::seed_rollout_control_if_absent(&pool)
+            .await
+            .unwrap();
+        enable_rollout_class_with_phase(&pool, "scheduler_ownership_drift", "phase_2", 2).await;
+        enable_rollout_class(&pool, "detection_only").await;
+        insert_running_invoke_agent_for_repair_class(
+            &pool,
+            "run-sched-02",
+            "stage-sched-02",
+            "wi-sched-02",
+            "scheduler_ownership_drift",
+        )
+        .await;
+
+        let principal = auth::Principal::new("test-operator", auth::PrincipalClass::Operator);
+        let result = execute(
+            "p080.reconcile.request.v1",
+            serde_json::json!({
+                "schema_version": "p080_reconcile_request_v1",
+                "target": {
+                    "run_id": "run-sched-02",
+                    "stage_id": "stage-sched-02",
+                    "work_item_id": "wi-sched-02",
+                    "stale_class": "scheduler_ownership_drift"
+                },
+                "requested_action": "repair_if_safe",
+                "operator_request_dedup_key": "dedup-sched-02"
+            }),
+            &pool,
+            &principal,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["schema_version"], "p080_error_response_v1");
+        assert_eq!(result["code"], "rollout_disabled");
+        assert_eq!(result["detail"]["rollout_disablement"], "phase_not_reached");
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM work_items WHERE id = 'wi-sched-02'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "running");
+        let dedup_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM p080_operator_request_dedup_v1
+             WHERE operator_request_dedup_key = 'dedup-sched-02'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(dedup_count, 0);
+    }
+
+    #[tokio::test]
+    async fn p080_repair_if_safe_predicate_hash_changes_when_work_item_witness_changes() {
+        let pool = db::pool::create_pool("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        db::repos::p080::seed_rollout_control_if_absent(&pool)
+            .await
+            .unwrap();
+        enable_rollout_class_with_phase(&pool, "scheduler_ownership_drift", "phase_3", 3).await;
+        enable_rollout_class(&pool, "detection_only").await;
+        insert_running_invoke_agent_for_repair_class(
+            &pool,
+            "run-predicate-witness-01",
+            "stage-predicate-witness-01",
+            "wi-predicate-witness-01",
+            "scheduler_ownership_drift",
+        )
+        .await;
+        let stale_hash = db::repos::p080::compute_repair_predicate_hash(
+            &pool,
+            "run-predicate-witness-01",
+            "stage-predicate-witness-01",
+            "wi-predicate-witness-01",
+            "scheduler_ownership_drift",
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE work_items SET status = 'pending' WHERE id = 'wi-predicate-witness-01'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let principal = auth::Principal::new("test-operator", auth::PrincipalClass::Operator);
+        let result = execute(
+            "p080.reconcile.request.v1",
+            serde_json::json!({
+                "schema_version": "p080_reconcile_request_v1",
+                "target": {
+                    "run_id": "run-predicate-witness-01",
+                    "stage_id": "stage-predicate-witness-01",
+                    "work_item_id": "wi-predicate-witness-01",
+                    "stale_class": "scheduler_ownership_drift"
+                },
+                "requested_action": "repair_if_safe",
+                "operator_request_dedup_key": "dedup-predicate-witness-01",
+                "expected_predicate_hash": stale_hash
+            }),
+            &pool,
+            &principal,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["schema_version"], "p080_error_response_v1");
+        assert_eq!(result["code"], "predicate_revalidation_failed");
+        assert_ne!(result["detail"]["actual_predicate_hash"], stale_hash);
+        let dedup_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM p080_operator_request_dedup_v1
+             WHERE operator_request_dedup_key = 'dedup-predicate-witness-01'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(dedup_count, 0);
     }
 
     #[tokio::test]

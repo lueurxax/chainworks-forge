@@ -6,9 +6,9 @@ This document is a historical snapshot of the 2026-05-06 planning state. Current
 
 Known-obsolete parts:
 
-- Section 5's suggested numbers are stale: **P086** and **P087** were since used by agent work continuation and local storage tiering. Limit work is now reserved as **P101** (agent limit observatory / runtime budget dashboard) and **P102** (limit-aware session pool / runtime fallback policy).
+- Historical note: Section 5's suggested numbers are stale: **P086** and **P087** were since used by agent work continuation and local storage tiering. Limit work is now reserved as **P101** (agent limit observatory / runtime budget dashboard) and **P102** (limit-aware session pool / runtime fallback policy).
 - P081 has since reached Implemented/Ready (audit R8) and its proposal file was retired; links below point to the reference doc.
-- Several steps described as upcoming (write-budget contract, durable side-effect ledger, P046, P076, P086, P088, P058 escalation chains) have since been implemented; see the reference tree.
+- Historical note: Several steps described as upcoming (write-budget contract, durable side-effect ledger, P046, P076, P086, P088, P058 escalation chains) have since been implemented; see the reference tree.
 
 ## Navigation
 
@@ -99,11 +99,11 @@ The implemented [durable side-effect ledger](../reference/rust-control-plane.md#
 
 This pair is now the most important safety foundation after the UI/action boundary.
 
-#### P079 and P080 recovery-quality proposals
+#### P079 and P080 recovery-quality contracts
 
-[P079](../proposals/079-contract-aware-output-repair-and-provider-fallback.md) covers contract-aware output repair and provider fallback.
+[P079 output repair/fallback](../reference/output-contracts-failure-evidence-and-recovery.md#p079-output-contract-repair-and-fallback-details) covers contract-aware output repair and provider fallback.
 
-[P080](../proposals/080-continuous-stale-execution-reconciliation.md) covers continuous stale execution reconciliation. Its initial detection/readback scaffold is implemented; active repair remains rollout-gated.
+[P080 stale execution reconciliation](../reference/rust-control-plane.md) covers phase-scoped detection/readback plus promoted repair for `acp_startup_stale` and `scheduler_ownership_drift`. Helper reap, side-effect-adjacent repair, manual hold, and permanent-hold clear remain fail-closed; operator handling lives in the [P080 stale-execution runbook](../runbooks/p080-stale-execution-repair.md).
 
 Both are useful, but both must remain downstream of the implemented write-budget contract and durable side-effect safety rails.
 
@@ -155,7 +155,7 @@ Related docs:
 
 - [Durable side-effect ledger](../reference/rust-control-plane.md#durable-side-effect-ledger)
 - [Auto-retry observation ledger](../reference/auto-retry-observation-ledger.md)
-- [P080 continuous stale execution reconciliation](../proposals/080-continuous-stale-execution-reconciliation.md)
+- [P080 stale execution reconciliation](../reference/rust-control-plane.md)
 - [Execution truth and recovery](../reference/execution-truth-and-recovery.md)
 
 ### 2.4 P073 and ROADMAP need stronger current alignment
@@ -382,7 +382,7 @@ Deliverables:
 
 #### Step 12 - P083 ownership invariant model
 
-Do [P083](../proposals/083-execution-truth-ownership-invariant-model.md) after the durable side-effect ledger or alongside late side-effect hardening.
+This ownership model is implemented in [execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md#durable-execution-truth-ownership), after the durable side-effect ledger and alongside late side-effect hardening.
 
 Purpose:
 
@@ -427,8 +427,8 @@ use new proposal numbers.
 
 Suggested:
 
-- **P086 - Agent Limit Observatory and Runtime Budget Dashboard**
-- **P087 - Limit-Aware Session Pool and Runtime Fallback Policy**
+- **P101 - Agent Limit Observatory and Runtime Budget Dashboard**
+- **P102 - Limit-Aware Session Pool and Runtime Fallback Policy**
 
 Do not reuse P079/P080 for limit work.
 

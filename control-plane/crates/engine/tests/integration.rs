@@ -18929,7 +18929,6 @@ fn p017_phase_b_checked_in_lead_resolver_resolves_bundled_workflows() {
     for workflow_path in [
         "examples/workflows/full-mvp-live.yaml",
         "examples/workflows/workflow.yaml",
-        "examples/workflows/proposal-loop-live.yaml",
     ] {
         match resolver.resolve(workflow_path, "examples/agents/agents.yaml") {
             LeadResolution::Resolved { lead_agent_id, .. } => {

@@ -1,0 +1,119 @@
+{
+  "fixture_id": "h009-external-side-effect-composition",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
+  "schema_version": "p083_harden_009_external_side_effect_composition_v1",
+  "contract": "P083-HARDEN-009",
+  "description": "Inventory of idempotent lifecycle commands and their durable planned rows, receipt rows, crash-between-commit-and-external-action fixtures, and replay expectations.",
+  "coverage_rule": "Every P083 lifecycle command in P083_COMMAND_TTL_POLICIES is listed. Commands with immediate local effects still use command_idempotency planned/outcome rows as the external-action composition boundary.",
+  "commands": [
+    {
+      "command": "runs.cancel",
+      "external_effect_kind": "run_cancellation_and_provider_cancel_fanout",
+      "planned_rows": ["command_idempotency", "command_journal", "provider_cancellation_intents"],
+      "receipt_rows": ["command_idempotency.outcome_json", "provider_cancellation_intents.receipt_state"],
+      "crash_between_commit_and_external_action_fixture": {
+        "fixture_id": "h009-runs-cancel-crash-after-planned-before-provider-cancel",
+        "crash_window": "after command_idempotency acquired and provider_cancellation_intents requested, before provider cancellation dispatch"
+      },
+      "replay_recovery_expectation": "Restart reloads requested cancellation intents and issues at most one provider cancellation per provider_session_id and cancellation_epoch.",
+      "idempotency_boundary": "principal_id + caller_request_id + intent_hash"
+    },
+    {
+      "command": "runs.retry",
+      "external_effect_kind": "scheduler_work_enqueue",
+      "planned_rows": ["command_idempotency", "command_journal", "work_items"],
+      "receipt_rows": ["command_idempotency.outcome_json", "work_items.claim_state"],
+      "crash_between_commit_and_external_action_fixture": {
+        "fixture_id": "h009-runs-retry-crash-after-work-item-planned-before-claim",
+        "crash_window": "after retry work item is committed, before scheduler claims or dispatches provider work"
+      },
+      "replay_recovery_expectation": "Replay returns the committed retry outcome; scheduler sees one durable work item and does not enqueue a duplicate.",
+      "idempotency_boundary": "principal_id + caller_request_id + intent_hash"
+    },
+    {
+      "command": "stages.retry",
+      "external_effect_kind": "stage_work_enqueue",
+      "planned_rows": ["command_idempotency", "command_journal", "work_items"],
+      "receipt_rows": ["command_idempotency.outcome_json", "work_items.claim_state"],
+      "crash_between_commit_and_external_action_fixture": {
+        "fixture_id": "h009-stages-retry-crash-after-work-item-planned-before-claim",
+        "crash_window": "after stage retry work item is committed, before scheduler claims or dispatches provider work"
+      },
+      "replay_recovery_expectation": "Replay aliases to the committed stage retry result and preserves a single retry work item for the stage_execution_id.",
+      "idempotency_boundary": "principal_id + caller_request_id + intent_hash"
+    },
+    {
+      "command": "approvals.resolve",
+      "external_effect_kind": "approval_transition_and_workflow_unblock",
+      "planned_rows": ["command_idempotency", "command_journal", "approvals"],
+      "receipt_rows": ["command_idempotency.outcome_json", "approvals.resolved_at"],
+      "crash_between_commit_and_external_action_fixture": {
+        "fixture_id": "h009-approvals-resolve-crash-after-resolution-before-transition",
+        "crash_window": "after approval resolution is committed, before workflow transition evaluation resumes"
+      },
+      "replay_recovery_expectation": "Restart observes the resolved approval and performs transition evaluation once; duplicate resolve calls replay or fail terminal per policy.",
+      "idempotency_boundary": "principal_id + caller_request_id + intent_hash"
+    },
+    {
+      "command": "side_effects.force_reconcile",
+      "external_effect_kind": "side_effect_ledger_disposition",
+      "planned_rows": ["command_idempotency", "command_journal", "side_effects"],
+      "receipt_rows": ["command_idempotency.outcome_json", "side_effects.disposition_receipt"],
+      "crash_between_commit_and_external_action_fixture": {
+        "fixture_id": "h009-side-effects-force-reconcile-crash-after-disposition-before-readback",
+        "crash_window": "after side-effect disposition is committed, before readback/projection observes the terminal state"
+      },
+      "replay_recovery_expectation": "Replay returns the committed disposition; payload mismatch is denied and no second disposition is applied.",
+      "idempotency_boundary": "principal_id + caller_request_id + command + side_effect_id + decision_json_digest"
+    },
+    {
+      "command": "provider_session.shutdown",
+      "external_effect_kind": "provider_process_signal",
+      "planned_rows": ["command_idempotency", "provider_cancellation_intents", "shutdown_signal_side_effects"],
+      "receipt_rows": ["command_idempotency.outcome_json", "shutdown_signal_receipts", "provider_cancellation_intents.receipt_state"],
+      "crash_between_commit_and_external_action_fixture": {
+        "fixture_id": "h009-provider-session-shutdown-crash-after-planned-before-signal",
+        "crash_window": "after shutdown_signal_side_effects rows are planned, before SIGTERM/SIGKILL dispatch"
+      },
+      "replay_recovery_expectation": "Startup dispatches scoped planned rows once, records signal receipts, and suppresses duplicate dispatch for the same observed_generation.",
+      "idempotency_boundary": "principal_id + caller_request_id + intent_hash"
+    },
+    {
+      "command": "provider_session.mark_process_absent",
+      "external_effect_kind": "manual_identity_resolution",
+      "planned_rows": ["command_idempotency", "provider_sessions"],
+      "receipt_rows": ["command_idempotency.outcome_json", "provider_sessions.process_absent_verified_at"],
+      "crash_between_commit_and_external_action_fixture": {
+        "fixture_id": "h009-provider-session-mark-process-absent-crash-after-verified-before-readback",
+        "crash_window": "after operator-verified absence is committed, before UI/readback observes identity hold resolution"
+      },
+      "replay_recovery_expectation": "Replay returns the committed manual identity result; repeated calls do not mutate a resolved provider session twice.",
+      "idempotency_boundary": "principal_id + caller_request_id + intent_hash"
+    },
+    {
+      "command": "p083.rollback_execution",
+      "external_effect_kind": "rollout_enforcement_mode_change",
+      "planned_rows": ["command_idempotency", "p083_rollback_audit"],
+      "receipt_rows": ["command_idempotency.outcome_json", "rollout_contract_enforcement_mode_audit"],
+      "crash_between_commit_and_external_action_fixture": {
+        "fixture_id": "h009-p083-rollback-execution-crash-after-audit-before-readback",
+        "crash_window": "after rollback audit/enforcement mode change commits, before readback exposes rollback disposition"
+      },
+      "replay_recovery_expectation": "Replay returns the committed rollback target; enforcement mode remains at the target and no second audit transition is emitted for the same request.",
+      "idempotency_boundary": "principal_id + caller_request_id + target_enforcement_mode"
+    },
+    {
+      "command": "p083.set_enforcement_mode",
+      "external_effect_kind": "rollout_enforcement_mode_change",
+      "planned_rows": ["command_idempotency", "rollout_contract_enforcement_mode_audit"],
+      "receipt_rows": ["command_idempotency.outcome_json", "rollout_contract_enforcement_mode_audit"],
+      "crash_between_commit_and_external_action_fixture": {
+        "fixture_id": "h009-p083-set-enforcement-mode-crash-after-audit-before-readback",
+        "crash_window": "after enforcement mode audit commits, before rollout readback exposes the new mode"
+      },
+      "replay_recovery_expectation": "Replay returns the committed enforcement target; stale or mismatched requests are denied by intent hash.",
+      "idempotency_boundary": "principal_id + caller_request_id + target_mode"
+    }
+  ]
+}

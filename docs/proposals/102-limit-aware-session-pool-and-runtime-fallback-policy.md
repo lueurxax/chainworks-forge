@@ -5,7 +5,7 @@
 | Date | 2026-06-09 |
 | Status | Draft / Parked until P073 freeze lifts; depends on P101 observability landing first |
 | Author | Roadmap triage 2026-06-09 |
-| Depends on | P101 agent limit observatory, P079 contract-aware output repair and provider fallback, implemented session lineage/reuse-scope machinery, durable side-effect ledger (P078) |
+| Depends on | P101 agent limit observatory, implemented [P079 output repair/fallback contract](../reference/output-contracts-failure-evidence-and-recovery.md#p079-output-contract-repair-and-fallback-details), implemented session lineage/reuse-scope machinery, durable side-effect ledger (P078) |
 | Related | `docs/reference/session-lineage-reuse-and-operator-reset.md`, `docs/reference/acp-runtime-transport.md`, `docs/reference/provider-binding-truth.md`, `docs/reference/executable-rollout-gate-template.md` |
 | Scope | Use P101 limit signals to drive session pooling/reuse decisions and bounded provider/model fallback when a binding hits limits, inside the existing session lineage and P079 fallback rails, with durable typed decisions and full readback. |
 | Non-goal | Never applies to release/publish/git/upload side-effect lanes. No silent provider substitution. No changes to output contracts or approval semantics. Not an autoscaler. |

@@ -340,6 +340,18 @@ async fn p086_durable_metric_events_are_recorded_and_summarized() {
         Some("stage-exec-1"),
         Some("agent-exec-1"),
         Some("cont-metrics"),
+        "provider_session_resurrection_prompt_sent_total",
+        serde_json::json!({"mode": "provider_session_resurrection", "outcome": "prompt_sent"}),
+        1,
+    )
+    .await
+    .unwrap();
+    agent_work_continuations::record_p086_continuation_metric_event(
+        &pool,
+        Some("run-1"),
+        Some("stage-exec-1"),
+        Some("agent-exec-1"),
+        Some("cont-metrics"),
         "continuation_fresh_session_avoided_total",
         serde_json::json!({"outcome": "reused_existing_session"}),
         1,
@@ -465,9 +477,37 @@ async fn p086_durable_metric_events_are_recorded_and_summarized() {
     )
     .await
     .unwrap();
+    agent_work_continuations::record_p086_continuation_metric_event(
+        &pool,
+        Some("run-1"),
+        Some("stage-exec-1"),
+        Some("agent-exec-1"),
+        Some("cont-metrics"),
+        "provider_session_resurrection_attach_success_total",
+        serde_json::json!({"mode": "provider_session_resurrection", "outcome": "attached"}),
+        1,
+    )
+    .await
+    .unwrap();
+    agent_work_continuations::record_p086_continuation_metric_event(
+        &pool,
+        Some("run-1"),
+        Some("stage-exec-1"),
+        Some("agent-exec-1"),
+        Some("cont-metrics"),
+        "provider_session_resurrection_attach_failure_total",
+        serde_json::json!({
+            "mode": "provider_session_resurrection",
+            "failure_class": "actual_session_mismatch",
+            "outcome": "failed_closed"
+        }),
+        1,
+    )
+    .await
+    .unwrap();
 
     let events =
-        agent_work_continuations::list_p086_continuation_metric_events_for_run(&pool, "run-1", 20)
+        agent_work_continuations::list_p086_continuation_metric_events_for_run(&pool, "run-1", 50)
             .await
             .unwrap();
     assert!(
@@ -481,6 +521,17 @@ async fn p086_durable_metric_events_are_recorded_and_summarized() {
             .iter()
             .any(|event| event.metric_name == "continuation_settlement_total"),
         "settlement metric must be durable"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event.metric_name == "provider_session_resurrection_attach_failure_total"
+                && event
+                    .labels_json
+                    .get("failure_class")
+                    .and_then(|value| value.as_str())
+                    == Some("actual_session_mismatch")
+        }),
+        "attach failure metrics must retain typed failure_class labels"
     );
 
     let summary =
@@ -515,12 +566,13 @@ async fn p086_durable_metric_events_are_recorded_and_summarized() {
     assert_eq!(summary.provider_session_budget_cost_cents_total, 7);
     assert_eq!(
         summary.provider_session_resurrection_attach_success_total,
-        0
+        1
     );
     assert_eq!(
         summary.provider_session_resurrection_attach_failure_total,
-        1
+        2
     );
+    assert_eq!(summary.provider_session_resurrection_prompt_sent_total, 1);
     assert_eq!(summary.resurrection_unsupported_total, 1);
 }
 

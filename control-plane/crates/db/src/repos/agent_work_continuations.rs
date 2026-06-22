@@ -97,6 +97,7 @@ pub struct P086ContinuationMetricsSummary {
     pub provider_session_budget_cost_cents_total: i64,
     pub provider_session_resurrection_attach_success_total: i64,
     pub provider_session_resurrection_attach_failure_total: i64,
+    pub provider_session_resurrection_prompt_sent_total: i64,
 }
 
 const SELECT_COLS: &str = r#"
@@ -184,6 +185,7 @@ fn bounded_p086_metric_labels(labels: serde_json::Value) -> serde_json::Value {
         "outcome",
         "terminal_status",
         "failure_reason",
+        "failure_class",
         "evidence_source",
         "resurrection_status",
         "orphan_reap_policy",
@@ -410,6 +412,15 @@ pub async fn p086_continuation_metrics_summary_for_run(
                     }
                     _ => {}
                 }
+            }
+            "provider_session_resurrection_attach_success_total" => {
+                summary.provider_session_resurrection_attach_success_total += value;
+            }
+            "provider_session_resurrection_attach_failure_total" => {
+                summary.provider_session_resurrection_attach_failure_total += value;
+            }
+            "provider_session_resurrection_prompt_sent_total" => {
+                summary.provider_session_resurrection_prompt_sent_total += value;
             }
             _ => {}
         }

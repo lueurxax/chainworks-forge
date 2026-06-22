@@ -1,15 +1,15 @@
 {
   "disabled_classes": [
-    "scheduler_ownership_drift",
     "helper_orphan_drift",
     "release_side_effect_drift",
     "permanent_hold_clear"
   ],
-  "evidence_id": "p080-phase-scoped-same-tree-proof-2026-06-20",
+  "evidence_id": "p080-phase-scoped-same-tree-proof-2026-06-22",
   "gate": "./scripts/test-gate.sh proposal-080",
   "implemented_classes": [
     "detection_only",
-    "acp_startup_stale"
+    "acp_startup_stale",
+    "scheduler_ownership_drift"
   ],
   "proof": {
     "db_tests": [
@@ -17,33 +17,54 @@
       "p080_seed_rollout_control_is_idempotent",
       "p080_rollout_control_includes_detection_only_class",
       "p080_repair_acp_startup_stale_requeues_running_invoke_agent",
+      "p080_auto_repair_promoted_stale_rows_repairs_acp_and_scheduler",
       "p080_run_report_section_redacts_stored_readback_rows"
     ],
     "graphql_tests": [
       "p080_diagnostics_graphql_returns_page"
     ],
     "mcp_tests": [
-      "p080_diagnostics_get_rollout_disabled_until_detection_enabled",
-      "p080_reconcile_diagnose_only_happy_path",
-      "p080_repair_if_safe_requeues_acp_startup_stale_when_phase_enabled",
+      "p080_diagnostics_get_returns_rollout_disabled_in_phase_0",
+      "p080_reconcile_diagnose_only_returns_diagnosed",
+      "p080_diagnose_only_populates_repair_predicate_hash_for_stale_row",
+      "p080_repair_if_safe_phase2_requeues_acp_startup_stale",
       "p080_repair_if_safe_dedup_replay_returns_same_response",
+      "p080_repair_if_safe_scheduler_ownership_drift_requeues_in_phase3",
+      "p080_repair_if_safe_scheduler_ownership_drift_phase2_rejects_before_mutation",
+      "p080_repair_if_safe_predicate_hash_changes_when_work_item_witness_changes",
       "p080_repair_if_safe_dedup_conflict_returns_idempotency_conflict",
       "p080_clear_permanent_hold_action_disabled_in_phase"
     ],
     "negative_fixture_directory": "docs/evidence/rollout-contract/negative",
-    "operator_readback_fixture": "docs/evidence/rollout-contract/operator-readback/p080-full-surface.fixture.json"
+    "operator_readback_fixture": "docs/evidence/rollout-contract/operator-readback/p080-full-surface.fixture.json",
+    "phase_reports": [
+      "docs/evidence/rollout/p080/phase-1-soak-report.json",
+      "docs/evidence/rollout/p080/phase-2-soak-report.json",
+      "docs/evidence/rollout/p080/phase-3-soak-report.json",
+      "docs/evidence/rollout/p080/phase-4-soak-report.json",
+      "docs/evidence/rollout/p080/phase-5-soak-report.json"
+    ]
   },
   "proposal_id": "080",
   "proposal_revision_id": "p080-refined-2026-06-02-r28",
-  "recorded_at": "2026-06-20T00:00:00Z",
-  "rollout_phase": "phase_scoped_detection_and_acp_startup_repair",
+  "recorded_at": "2026-06-22T00:00:00Z",
+  "rollout_phase": "phase_scoped_detection_acp_startup_scheduler_and_live_auto_repair",
+  "scope_boundary": "phase_scoped_implemented_slice",
   "safety_assertions": {
     "acp_startup_repair_requeues_invoke_agent": true,
     "clear_permanent_hold_not_enabled": true,
     "diagnose_only_has_no_dedup_write": true,
     "repair_if_safe_dedup_replay_fenced_before_mutation": true,
+    "repair_if_safe_predicate_hash_binds_ownership_witnesses": true,
     "helper_process_signal_not_enabled": true,
+    "helper_reaping_not_in_current_closeout_scope": true,
     "read_only_operator_repair_rejected": true,
+    "scheduler_ownership_drift_repair_requeues_invoke_agent": true,
+    "scheduler_ownership_drift_repair_phase2_rejected_before_mutation": true,
+    "live_loop_auto_repair_promoted_classes": true,
+    "live_loop_repair_events_use_live_loop_source": true,
+    "p076_active_side_effect_retry_not_in_current_closeout_scope": true,
+    "permanent_hold_clear_not_in_current_closeout_scope": true,
     "side_effect_adjacent_repair_not_enabled_without_p076_retry_safe_truth": true
   },
   "schema_version": "p080_rollout_evidence_v1",

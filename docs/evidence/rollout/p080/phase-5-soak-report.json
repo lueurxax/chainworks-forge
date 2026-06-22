@@ -1,0 +1,40 @@
+{
+  "schema_version": "p080_phase_soak_report_v1",
+  "proposal_id": "080",
+  "proposal_revision_id": "p080-refined-2026-06-02-r28",
+  "phase": "phase_5_permanent_hold_and_auto_retry_followup",
+  "recorded_at": "2026-06-22T00:00:00Z",
+  "status": "not_promoted_current_scope",
+  "promotion_decision": "not_promoted_current_scope",
+  "gate_aliases": [
+    "proposal-080",
+    "p080"
+  ],
+  "repair_classes": [
+    "permanent_hold_clear",
+    "external_side_effect_auto_retry"
+  ],
+  "fail_closed": true,
+  "evidence_sources": [
+    "control-plane/crates/mcp-server/src/tools/p080.rs",
+    "docs/reference/auto-retry-observation-ledger.md",
+    "docs/evidence/rollout/p080/phase-scoped-same-tree-proof.json"
+  ],
+  "soak_window": {
+    "kind": "not_promoted",
+    "production_daemon_trace": false
+  },
+  "assertions": {
+    "clear_permanent_hold_returns_action_disabled_in_phase": true,
+    "external_side_effect_auto_retry_is_not_enabled": true,
+    "p076_mainline_is_observe_only": true,
+    "manual_hold_clear_semantics_are_owned_by_p098": true
+  },
+  "required_before_promotion": [
+    "authoritative side-effect retry-safe contract",
+    "operator-intent and hold-owner validation",
+    "cooldown and permanent-hold clear replay semantics",
+    "runtime metrics for active retry promotion"
+  ],
+  "followup_owner": "P098 manual hold and future active auto-retry proposal"
+}

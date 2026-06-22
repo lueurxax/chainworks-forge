@@ -2,7 +2,7 @@
   "schemaVersion": 39,
   "uid": "p080-overview",
   "title": "P080 Continuous Stale Execution Reconciliation Overview",
-  "description": "Grafana model for the rollout-critical metrics pinned by Proposal 080. Labels intentionally exclude run_id, stage_id, work_item_id, paths, operator text, prompt text, principal_id, and provider error text.",
+  "description": "Grafana model for the rollout-critical P080 stale-execution metrics. Labels intentionally exclude run_id, stage_id, work_item_id, paths, operator text, prompt text, principal_id, and provider error text.",
   "tags": [
     "chainworks",
     "p080",

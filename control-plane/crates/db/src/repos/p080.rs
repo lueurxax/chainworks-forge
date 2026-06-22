@@ -162,7 +162,10 @@ const CLASSIFY_SCAN_LIMIT: i64 = 500;
 pub struct ClassifierCounts {
     pub warmup_pending: usize,
     pub acp_startup_stale: usize,
+    pub acp_prompt_stale: usize,
     pub scheduler_ownership_drift: usize,
+    pub helper_orphan_drift: usize,
+    pub release_side_effect_drift: usize,
     pub useful: usize,
     pub total: usize,
 }
@@ -174,6 +177,9 @@ pub struct ClassifierCounts {
 /// - elapsed < 60 s AND session still active    → `warmup_pending`
 /// - session_generation.status = 'ended'        → `acp_startup_stale` (ownership lost)
 /// - elapsed ≥ 300 s                            → `acp_startup_stale`
+/// - P037 prompt supervision marks prompt stale → `acp_prompt_stale`
+/// - unresolved side-effect ledger row exists   → `release_side_effect_drift`
+/// - active helper lease is expired             → `helper_orphan_drift`
 /// - work_item absent or not 'running'          → `scheduler_ownership_drift`
 /// - else                                       → `useful`
 pub async fn classify_and_upsert_running_executions(pool: &SqlitePool) -> Result<ClassifierCounts> {
@@ -186,7 +192,18 @@ pub async fn classify_and_upsert_running_executions(pool: &SqlitePool) -> Result
     // is classified as acp_startup_stale regardless of elapsed time.
     // A null session_generation (no session lineage entry) means the execution was
     // not started through the normal ACP session path — flag as scheduler_ownership_drift.
-    let rows: Vec<(String, String, String, String, String, Option<String>)> = sqlx::query_as(
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+    )> = sqlx::query_as(
         r#"
         SELECT
             COALESCE(
@@ -203,21 +220,65 @@ pub async fn classify_and_upsert_running_executions(pool: &SqlitePool) -> Result
             se.stage_id,
             ae.started_at,
             ae.id AS exec_id,
-            sg.status AS session_gen_status
+            sg.status AS session_gen_status,
+            arf.supervision_classification AS supervision_classification,
+            CASE WHEN EXISTS (
+                SELECT 1
+                FROM side_effects side
+                WHERE side.run_id = se.run_id
+                  AND side.stage_execution_id = se.id
+                  AND (side.agent_execution_id IS NULL OR side.agent_execution_id = ae.id)
+                  AND side.status IN (
+                    'prepared','executing','externally_observed',
+                    'needs_reconciliation','conflict','unrecoverable'
+                  )
+            ) THEN 1 ELSE 0 END AS has_unresolved_side_effect,
+            CASE WHEN EXISTS (
+                SELECT 1
+                FROM p080_helper_leases_v1 helper
+                WHERE helper.run_id = se.run_id
+                  AND helper.stage_id = se.stage_id
+                  AND helper.agent_execution_id = ae.id
+                  AND helper.terminated_at IS NULL
+                  AND helper.expires_at IS NOT NULL
+                  AND helper.expires_at <= ?2
+            ) THEN 1 ELSE 0 END AS has_expired_helper_lease,
+            CASE WHEN EXISTS (
+                SELECT 1
+                FROM p080_executor_registration_watchdog_v1 watchdog
+                WHERE watchdog.run_id = se.run_id
+                  AND watchdog.stage_id = se.stage_id
+                  AND watchdog.agent_execution_id = ae.id
+                  AND watchdog.reregistration_state IN ('missing','stale')
+            ) THEN 1 ELSE 0 END AS has_missing_executor_registration
         FROM   agent_executions ae
         JOIN   stage_executions se ON ae.stage_execution_id = se.id
         LEFT JOIN session_generations sg ON ae.session_generation_id = sg.id
+        LEFT JOIN agent_execution_runtime_facts arf ON arf.agent_execution_id = ae.id
         WHERE  ae.status = 'running'
         LIMIT  ?1
         "#,
     )
     .bind(CLASSIFY_SCAN_LIMIT)
+    .bind(&now_str)
     .fetch_all(pool)
     .await
     .context("p080 classify: query running executions")?;
 
     let mut counts = ClassifierCounts::default();
-    for (work_item_id, run_id, stage_id, started_at_str, exec_id, session_gen_status) in rows {
+    for (
+        work_item_id,
+        run_id,
+        stage_id,
+        started_at_str,
+        exec_id,
+        session_gen_status,
+        supervision_classification,
+        has_unresolved_side_effect,
+        has_expired_helper_lease,
+        has_missing_executor_registration,
+    ) in rows
+    {
         let _ = exec_id; // kept for future join; work_item_id is now the projection key
         let started_at = match chrono::DateTime::parse_from_rfc3339(&started_at_str) {
             Ok(t) => t.with_timezone(&Utc),
@@ -236,22 +297,97 @@ pub async fn classify_and_upsert_running_executions(pool: &SqlitePool) -> Result
         // ACP session path — classify as scheduler_ownership_drift if beyond warmup.
         let no_session = session_gen_status.is_none();
 
-        let (stale_class, running_truth, hold_reason) = if session_ended {
+        let prompt_stale = supervision_classification
+            .as_deref()
+            .map(|classification| {
+                let normalized = classification.to_ascii_lowercase();
+                normalized.contains("acp_prompt_stale")
+                    || normalized.contains("prompt_stale")
+                    || normalized.contains("p037")
+            })
+            .unwrap_or(false);
+
+        let (
+            stale_class,
+            running_truth,
+            repair_action,
+            hold_reason,
+            side_effect_status,
+            operator_message,
+        ) = if prompt_stale && elapsed >= WARMUP_SECS {
+            (
+                "acp_prompt_stale",
+                "needs_operator",
+                "delegated_to_p037",
+                "rollout_disabled",
+                "not_applicable",
+                "prompt supervision owns this execution; P080 delegates stale prompt handling to P037",
+            )
+        } else if has_unresolved_side_effect != 0 && elapsed >= WARMUP_SECS {
+            (
+                "release_side_effect_drift",
+                "needs_effect_reconciliation",
+                "delegated_to_p076",
+                "side_effect_drift_unsafe",
+                "unsafe",
+                "unresolved side-effect ledger entry blocks P080 repair; delegate to P076",
+            )
+        } else if has_expired_helper_lease != 0 && elapsed >= WARMUP_SECS {
+            (
+                "helper_orphan_drift",
+                "needs_operator",
+                "diagnose_only",
+                "ambiguous_owner",
+                "not_applicable",
+                "expired Chainworks helper lease detected; helper reap remains disabled until process ownership is verified",
+            )
+        } else if session_ended {
             // Session closed but execution still marked running — strongest ownership signal.
-            ("acp_startup_stale", "stale_suspected", "rollout_disabled")
-        } else if no_session && elapsed >= WARMUP_SECS {
+            (
+                "acp_startup_stale",
+                "stale_suspected",
+                "diagnose_only",
+                "rollout_disabled",
+                "not_applicable",
+                "",
+            )
+        } else if (no_session || has_missing_executor_registration != 0) && elapsed >= WARMUP_SECS {
             // No ACP session linkage after warmup — scheduler may not have launched the agent.
             (
                 "scheduler_ownership_drift",
                 "stale_suspected",
+                "diagnose_only",
                 "rollout_disabled",
+                "not_applicable",
+                "",
             )
         } else if elapsed < WARMUP_SECS {
-            ("warmup_pending", "warmup_pending", "warmup_pending")
+            (
+                "warmup_pending",
+                "warmup_pending",
+                "diagnose_only",
+                "warmup_pending",
+                "not_applicable",
+                "",
+            )
         } else if elapsed >= STALE_SECS {
-            ("acp_startup_stale", "stale_suspected", "rollout_disabled")
+            (
+                "acp_startup_stale",
+                "stale_suspected",
+                "diagnose_only",
+                "rollout_disabled",
+                "not_applicable",
+                "",
+            )
         } else {
-            ("useful", "useful", "none")
+            (
+                "useful",
+                "useful",
+                "diagnose_only",
+                "none",
+                "not_applicable",
+                "",
+            )
         };
 
         let readback_json = serde_json::json!({
@@ -261,7 +397,7 @@ pub async fn classify_and_upsert_running_executions(pool: &SqlitePool) -> Result
             "work_item_id": work_item_id,
             "stale_class": stale_class,
             "running_truth": running_truth,
-            "repair_action": "diagnose_only",
+            "repair_action": repair_action,
             "hold_reason": hold_reason,
             "hold_age_seconds": null,
             "next_retry_or_backoff_time": null,
@@ -269,8 +405,8 @@ pub async fn classify_and_upsert_running_executions(pool: &SqlitePool) -> Result
             "projection_integrity": "valid",
             "executor_reregistration_state": "expected",
             "rollout_disablement": "phase_not_reached",
-            "side_effect_status": "not_applicable",
-            "operator_message": "",
+            "side_effect_status": side_effect_status,
+            "operator_message": operator_message,
             "evidence_marker_hash": null,
             "repair_idempotency_key": null
         });
@@ -316,7 +452,10 @@ pub async fn classify_and_upsert_running_executions(pool: &SqlitePool) -> Result
         match stale_class {
             "warmup_pending" => counts.warmup_pending += 1,
             "acp_startup_stale" => counts.acp_startup_stale += 1,
+            "acp_prompt_stale" => counts.acp_prompt_stale += 1,
             "scheduler_ownership_drift" => counts.scheduler_ownership_drift += 1,
+            "helper_orphan_drift" => counts.helper_orphan_drift += 1,
+            "release_side_effect_drift" => counts.release_side_effect_drift += 1,
             _ => counts.useful += 1,
         }
         counts.total += 1;
@@ -1871,6 +2010,397 @@ pub enum P080RepairRequeueResult {
     DedupAlreadyReserved,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct P080AutoRepairCounts {
+    pub repaired: usize,
+    pub race_aborted: usize,
+    pub failed: usize,
+    pub skipped_not_promoted: usize,
+}
+
+impl P080AutoRepairCounts {
+    pub fn attempted(&self) -> usize {
+        self.repaired + self.race_aborted + self.failed
+    }
+
+    fn add(&mut self, other: P080AutoRepairCounts) {
+        self.repaired += other.repaired;
+        self.race_aborted += other.race_aborted;
+        self.failed += other.failed;
+        self.skipped_not_promoted += other.skipped_not_promoted;
+    }
+}
+
+fn p080_repair_phase_reached(stale_class: &str, phase: &str) -> bool {
+    match stale_class {
+        "acp_startup_stale" => matches!(phase, "phase_2" | "phase_3" | "phase_4" | "phase_5"),
+        "scheduler_ownership_drift" => matches!(phase, "phase_3" | "phase_4" | "phase_5"),
+        _ => false,
+    }
+}
+
+async fn p080_repair_class_promoted(pool: &SqlitePool, stale_class: &str) -> Result<bool> {
+    let promoted = match get_rollout_control(pool, stale_class).await? {
+        Some(row) => row.enabled && p080_repair_phase_reached(stale_class, &row.phase),
+        None => false,
+    };
+    Ok(promoted)
+}
+
+pub async fn auto_repair_promoted_stale_rows(
+    pool: &SqlitePool,
+    max_per_tick: usize,
+    initiating_principal_id: &str,
+) -> Result<P080AutoRepairCounts> {
+    let mut counts = P080AutoRepairCounts::default();
+    for stale_class in ["acp_startup_stale", "scheduler_ownership_drift"] {
+        let remaining = max_per_tick.saturating_sub(counts.attempted());
+        if remaining == 0 {
+            break;
+        }
+        if !p080_repair_class_promoted(pool, stale_class).await? {
+            counts.skipped_not_promoted += 1;
+            continue;
+        }
+        let class_counts = auto_repair_promoted_stale_rows_for_class(
+            pool,
+            stale_class,
+            remaining,
+            initiating_principal_id,
+        )
+        .await?;
+        counts.add(class_counts);
+    }
+    Ok(counts)
+}
+
+async fn auto_repair_promoted_stale_rows_for_class(
+    pool: &SqlitePool,
+    stale_class: &str,
+    max_per_tick: usize,
+    initiating_principal_id: &str,
+) -> Result<P080AutoRepairCounts> {
+    let mut counts = P080AutoRepairCounts::default();
+    let candidates = list_readback_page(
+        pool,
+        ReadbackFilter {
+            stale_class: Some(stale_class.to_string()),
+            ..Default::default()
+        },
+        max_per_tick,
+    )
+    .await?;
+
+    for row in candidates {
+        let readback: serde_json::Value =
+            serde_json::from_str(&row.readback_json).unwrap_or_default();
+        if readback
+            .get("running_truth")
+            .and_then(serde_json::Value::as_str)
+            != Some("stale_suspected")
+        {
+            continue;
+        }
+
+        let result = match stale_class {
+            "acp_startup_stale" => {
+                repair_stale_invoke_agent_checked(
+                    pool,
+                    &row.run_id,
+                    &row.stage_id,
+                    &row.work_item_id,
+                    stale_class,
+                    "acp_session_reset",
+                    "p080_acp_startup_stale_repair",
+                    "acp startup stale execution was requeued for a fresh provider session",
+                    "live_loop",
+                    initiating_principal_id,
+                    None,
+                    None,
+                )
+                .await
+            }
+            "scheduler_ownership_drift" => {
+                repair_stale_invoke_agent_checked(
+                    pool,
+                    &row.run_id,
+                    &row.stage_id,
+                    &row.work_item_id,
+                    stale_class,
+                    "scheduler_lease_reclaim",
+                    "p080_scheduler_ownership_drift_repair",
+                    "scheduler ownership drift was requeued for a fresh scheduler claim",
+                    "live_loop",
+                    initiating_principal_id,
+                    None,
+                    None,
+                )
+                .await
+            }
+            _ => continue,
+        };
+
+        match result {
+            Ok(P080RepairRequeueResult::Repaired(_)) => counts.repaired += 1,
+            Ok(P080RepairRequeueResult::RaceAborted) => counts.race_aborted += 1,
+            Ok(P080RepairRequeueResult::PredicateRevalidationFailed { .. })
+            | Ok(P080RepairRequeueResult::DedupAlreadyReserved) => counts.failed += 1,
+            Err(err) => {
+                counts.failed += 1;
+                warn!(
+                    error = %err,
+                    run_id = %row.run_id,
+                    stage_id = %row.stage_id,
+                    work_item_id = %row.work_item_id,
+                    stale_class,
+                    "P080 live-loop auto repair failed for promoted stale row"
+                );
+            }
+        }
+    }
+
+    Ok(counts)
+}
+
+pub async fn compute_repair_predicate_hash(
+    pool: &SqlitePool,
+    run_id: &str,
+    stage_id: &str,
+    work_item_id: &str,
+    stale_class: &str,
+) -> Result<String> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("p080 compute repair predicate: begin tx")?;
+    let hash =
+        compute_repair_predicate_hash_tx(&mut tx, run_id, stage_id, work_item_id, stale_class)
+            .await?;
+    tx.commit()
+        .await
+        .context("p080 compute repair predicate: commit tx")?;
+    Ok(hash)
+}
+
+async fn compute_repair_predicate_hash_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    stage_id: &str,
+    work_item_id: &str,
+    stale_class: &str,
+) -> Result<String> {
+    let readback: Option<(
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        r#"SELECT projection_generation,
+                  projection_integrity,
+                  json_extract(readback_json, '$.running_truth'),
+                  json_extract(readback_json, '$.repair_action'),
+                  json_extract(readback_json, '$.side_effect_status'),
+                  json_extract(readback_json, '$.executor_reregistration_state'),
+                  json_extract(readback_json, '$.rollout_disablement')
+           FROM p080_readback_heartbeats_v1
+           WHERE run_id = ?1
+             AND stage_id = ?2
+             AND work_item_id = ?3
+             AND stale_class = ?4"#,
+    )
+    .bind(run_id)
+    .bind(stage_id)
+    .bind(work_item_id)
+    .bind(stale_class)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("p080 compute repair predicate: read readback witness")?;
+
+    let work_item: Option<(
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        r#"SELECT status,
+                      kind,
+                      json_extract(payload_json, '$.p058_claimed.agent_execution_id'),
+                      json_extract(payload_json, '$.p080_reconciliation.reason')
+               FROM work_items
+               WHERE id = ?1
+                 AND run_id = ?2
+                 AND stage_id = ?3"#,
+    )
+    .bind(work_item_id)
+    .bind(run_id)
+    .bind(stage_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("p080 compute repair predicate: read work item witness")?;
+    let claimed_agent_execution_id = work_item
+        .as_ref()
+        .and_then(|(_, _, claimed, _)| claimed.as_deref())
+        .unwrap_or("");
+
+    let agent: Option<(Option<String>, Option<String>, Option<String>)> =
+        if claimed_agent_execution_id.is_empty() {
+            None
+        } else {
+            sqlx::query_as(
+                r#"SELECT status, session_generation_id, stage_execution_id
+                   FROM agent_executions
+                   WHERE id = ?1"#,
+            )
+            .bind(claimed_agent_execution_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .context("p080 compute repair predicate: read agent witness")?
+        };
+    let session_generation_id = agent
+        .as_ref()
+        .and_then(|(_, session_generation_id, _)| session_generation_id.as_deref())
+        .unwrap_or("");
+    let session_status: Option<String> = if session_generation_id.is_empty() {
+        None
+    } else {
+        sqlx::query_scalar("SELECT status FROM session_generations WHERE id = ?1")
+            .bind(session_generation_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .context("p080 compute repair predicate: read session witness")?
+    };
+
+    let unresolved_side_effect_count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM side_effects side
+           JOIN stage_executions se ON side.stage_execution_id = se.id
+           WHERE side.run_id = ?1
+             AND se.stage_id = ?2
+             AND (side.agent_execution_id IS NULL OR side.agent_execution_id = ?3)
+             AND side.status IN (
+                 'prepared','executing','externally_observed',
+                 'needs_reconciliation','conflict','unrecoverable'
+             )"#,
+    )
+    .bind(run_id)
+    .bind(stage_id)
+    .bind(claimed_agent_execution_id)
+    .fetch_one(&mut **tx)
+    .await
+    .context("p080 compute repair predicate: read side-effect witness")?;
+
+    let now_str = Utc::now().to_rfc3339();
+    let helper_counts: (i64, i64) = sqlx::query_as(
+        r#"SELECT COUNT(*),
+                  COALESCE(SUM(CASE WHEN expires_at IS NOT NULL AND expires_at <= ?4 THEN 1 ELSE 0 END), 0)
+           FROM p080_helper_leases_v1
+           WHERE run_id = ?1
+             AND stage_id = ?2
+             AND work_item_id = ?3
+             AND terminated_at IS NULL"#,
+    )
+    .bind(run_id)
+    .bind(stage_id)
+    .bind(work_item_id)
+    .bind(&now_str)
+    .fetch_one(&mut **tx)
+    .await
+    .context("p080 compute repair predicate: read helper witness")?;
+
+    let watchdog_states: Option<String> = sqlx::query_scalar(
+        r#"SELECT group_concat(part, '|')
+           FROM (
+             SELECT agent_execution_id || ':' || reregistration_state || ':' || COALESCE(session_generation_id, '') AS part
+             FROM p080_executor_registration_watchdog_v1
+             WHERE run_id = ?1
+               AND stage_id = ?2
+               AND work_item_id = ?3
+             ORDER BY agent_execution_id, reregistration_state, COALESCE(session_generation_id, '')
+           )"#,
+    )
+    .bind(run_id)
+    .bind(stage_id)
+    .bind(work_item_id)
+    .fetch_one(&mut **tx)
+    .await
+    .context("p080 compute repair predicate: read watchdog witness")?;
+
+    let mut fields: Vec<(&str, String)> = Vec::new();
+    fields.push(("version", "p080_repair_predicate_v2".to_string()));
+    fields.push(("run_id", run_id.to_string()));
+    fields.push(("stage_id", stage_id.to_string()));
+    fields.push(("work_item_id", work_item_id.to_string()));
+    fields.push(("stale_class", stale_class.to_string()));
+    if let Some((
+        generation,
+        integrity,
+        running_truth,
+        repair_action,
+        side_effect_status,
+        executor_state,
+        rollout_disablement,
+    )) = readback
+    {
+        fields.push(("readback_generation", generation.to_string()));
+        fields.push(("readback_integrity", integrity));
+        fields.push(("running_truth", running_truth.unwrap_or_default()));
+        fields.push(("repair_action", repair_action.unwrap_or_default()));
+        fields.push(("side_effect_status", side_effect_status.unwrap_or_default()));
+        fields.push(("executor_state", executor_state.unwrap_or_default()));
+        fields.push((
+            "rollout_disablement",
+            rollout_disablement.unwrap_or_default(),
+        ));
+    } else {
+        fields.push(("readback_generation", "missing".to_string()));
+    }
+    if let Some((status, kind, claimed, reconciliation_reason)) = work_item {
+        fields.push(("work_item_status", status.unwrap_or_default()));
+        fields.push(("work_item_kind", kind.unwrap_or_default()));
+        fields.push(("claimed_agent_execution_id", claimed.unwrap_or_default()));
+        fields.push((
+            "prior_reconciliation_reason",
+            reconciliation_reason.unwrap_or_default(),
+        ));
+    } else {
+        fields.push(("work_item_status", "missing".to_string()));
+    }
+    if let Some((agent_status, session_generation_id, stage_execution_id)) = agent {
+        fields.push(("agent_execution_status", agent_status.unwrap_or_default()));
+        fields.push((
+            "agent_session_generation_id",
+            session_generation_id.unwrap_or_default(),
+        ));
+        fields.push((
+            "agent_stage_execution_id",
+            stage_execution_id.unwrap_or_default(),
+        ));
+    } else {
+        fields.push(("agent_execution_status", "missing".to_string()));
+    }
+    fields.push((
+        "session_generation_status",
+        session_status.unwrap_or_default(),
+    ));
+    fields.push((
+        "unresolved_side_effect_count",
+        unresolved_side_effect_count.to_string(),
+    ));
+    fields.push(("active_helper_lease_count", helper_counts.0.to_string()));
+    fields.push(("expired_helper_lease_count", helper_counts.1.to_string()));
+    fields.push(("watchdog_states", watchdog_states.unwrap_or_default()));
+
+    let canonical = fields
+        .into_iter()
+        .map(|(key, value)| format!("{}:{key}={}:{}", key.len(), value.len(), value))
+        .collect::<Vec<_>>()
+        .join("|");
+    Ok(lower_hex_sha256(&canonical))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn repair_acp_startup_stale_requeue_invoke_agent(
     pool: &SqlitePool,
@@ -1905,12 +2435,76 @@ pub async fn repair_acp_startup_stale_requeue_invoke_agent_checked(
     expected_predicate_hash: Option<&str>,
     dedup_commit: Option<&P080OperatorDedupCommit>,
 ) -> Result<P080RepairRequeueResult> {
+    repair_stale_invoke_agent_checked(
+        pool,
+        run_id,
+        stage_id,
+        work_item_id,
+        "acp_startup_stale",
+        "acp_session_reset",
+        "p080_acp_startup_stale_repair",
+        "acp startup stale execution was requeued for a fresh provider session",
+        "operator_request",
+        initiating_principal_id,
+        expected_predicate_hash,
+        dedup_commit,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn repair_scheduler_ownership_drift_requeue_invoke_agent_checked(
+    pool: &SqlitePool,
+    run_id: &str,
+    stage_id: &str,
+    work_item_id: &str,
+    initiating_principal_id: &str,
+    expected_predicate_hash: Option<&str>,
+    dedup_commit: Option<&P080OperatorDedupCommit>,
+) -> Result<P080RepairRequeueResult> {
+    repair_stale_invoke_agent_checked(
+        pool,
+        run_id,
+        stage_id,
+        work_item_id,
+        "scheduler_ownership_drift",
+        "scheduler_lease_reclaim",
+        "p080_scheduler_ownership_drift_repair",
+        "scheduler ownership drift was requeued for a fresh scheduler claim",
+        "operator_request",
+        initiating_principal_id,
+        expected_predicate_hash,
+        dedup_commit,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn repair_stale_invoke_agent_checked(
+    pool: &SqlitePool,
+    run_id: &str,
+    stage_id: &str,
+    work_item_id: &str,
+    stale_class: &str,
+    repair_action: &str,
+    requeue_reason: &str,
+    repaired_operator_message: &str,
+    event_source: &str,
+    initiating_principal_id: &str,
+    expected_predicate_hash: Option<&str>,
+    dedup_commit: Option<&P080OperatorDedupCommit>,
+) -> Result<P080RepairRequeueResult> {
     let now = Utc::now();
     let now_str = now.to_rfc3339();
-    let predicate_hash = lower_hex_sha256(&format!(
-        "{run_id}:{stage_id}:{work_item_id}:acp_startup_stale"
-    ));
 
+    let mut tx = pool
+        .begin()
+        .await
+        .with_context(|| format!("p080 repair_{stale_class}: begin tx"))?;
+
+    let predicate_hash =
+        compute_repair_predicate_hash_tx(&mut tx, run_id, stage_id, work_item_id, stale_class)
+            .await?;
     if let Some(expected) = expected_predicate_hash {
         if expected != predicate_hash {
             return Ok(P080RepairRequeueResult::PredicateRevalidationFailed {
@@ -1920,17 +2514,12 @@ pub async fn repair_acp_startup_stale_requeue_invoke_agent_checked(
         }
     }
 
-    let mut tx = pool
-        .begin()
-        .await
-        .context("p080 repair_acp_startup_stale: begin tx")?;
-
     if let Some(dedup) = dedup_commit {
         let reserved = reserve_dedup_entry_tx(&mut tx, dedup).await?;
         if reserved == 0 {
             tx.commit()
                 .await
-                .context("p080 repair_acp_startup_stale: commit dedup race no-op")?;
+                .with_context(|| format!("p080 repair_{stale_class}: commit dedup race no-op"))?;
             return Ok(P080RepairRequeueResult::DedupAlreadyReserved);
         }
     }
@@ -1941,21 +2530,22 @@ pub async fn repair_acp_startup_stale_requeue_invoke_agent_checked(
            WHERE run_id = ?1
              AND stage_id = ?2
              AND work_item_id = ?3
-             AND stale_class = 'acp_startup_stale'"#,
+             AND stale_class = ?4"#,
     )
     .bind(run_id)
     .bind(stage_id)
     .bind(work_item_id)
+    .bind(stale_class)
     .fetch_optional(&mut *tx)
     .await
-    .context("p080 repair_acp_startup_stale: load target readback")?;
+    .with_context(|| format!("p080 repair_{stale_class}: load target readback"))?;
     if existing.as_deref() != Some("stale_suspected") {
         if let Some(dedup) = dedup_commit {
             let response_json = p080_race_aborted_response_json(
                 run_id,
                 stage_id,
                 work_item_id,
-                "acp_startup_stale",
+                stale_class,
                 &now_str,
                 &predicate_hash,
             )?;
@@ -1963,7 +2553,7 @@ pub async fn repair_acp_startup_stale_requeue_invoke_agent_checked(
         }
         tx.commit()
             .await
-            .context("p080 repair_acp_startup_stale: commit no-op")?;
+            .with_context(|| format!("p080 repair_{stale_class}: commit no-op"))?;
         return Ok(P080RepairRequeueResult::RaceAborted);
     }
 
@@ -1973,7 +2563,8 @@ pub async fn repair_acp_startup_stale_requeue_invoke_agent_checked(
         run_id,
         stage_id,
         now,
-        "p080_acp_startup_stale_repair",
+        requeue_reason,
+        stale_class,
     )
     .await?;
     if !requeued {
@@ -1982,7 +2573,7 @@ pub async fn repair_acp_startup_stale_requeue_invoke_agent_checked(
                 run_id,
                 stage_id,
                 work_item_id,
-                "acp_startup_stale",
+                stale_class,
                 &now_str,
                 &predicate_hash,
             )?;
@@ -1990,7 +2581,7 @@ pub async fn repair_acp_startup_stale_requeue_invoke_agent_checked(
         }
         tx.commit()
             .await
-            .context("p080 repair_acp_startup_stale: commit race no-op")?;
+            .with_context(|| format!("p080 repair_{stale_class}: commit race no-op"))?;
         return Ok(P080RepairRequeueResult::RaceAborted);
     }
 
@@ -2000,20 +2591,21 @@ pub async fn repair_acp_startup_stale_requeue_invoke_agent_checked(
            WHERE run_id = ?1
              AND stage_id = ?2
              AND work_item_id = ?3
-             AND stale_class = 'acp_startup_stale'"#,
+             AND stale_class = ?4"#,
     )
     .bind(run_id)
     .bind(stage_id)
     .bind(work_item_id)
+    .bind(stale_class)
     .fetch_optional(&mut *tx)
     .await
-    .context("p080 repair_acp_startup_stale: read recurrence epoch")?
+    .with_context(|| format!("p080 repair_{stale_class}: read recurrence epoch"))?
     .unwrap_or(0);
     let next_epoch = current_epoch + 1;
     sqlx::query(
         r#"INSERT INTO p080_recurrence_epoch_v1
              (run_id, stage_id, work_item_id, stale_class, epoch, last_advance_reason, updated_at)
-           VALUES (?1, ?2, ?3, 'acp_startup_stale', ?4, 'repaired', ?5)
+           VALUES (?1, ?2, ?3, ?4, ?5, 'repaired', ?6)
            ON CONFLICT(run_id, stage_id, work_item_id, stale_class) DO UPDATE SET
              epoch = excluded.epoch,
              last_advance_reason = 'repaired',
@@ -2022,21 +2614,22 @@ pub async fn repair_acp_startup_stale_requeue_invoke_agent_checked(
     .bind(run_id)
     .bind(stage_id)
     .bind(work_item_id)
+    .bind(stale_class)
     .bind(next_epoch)
     .bind(&now_str)
     .execute(&mut *tx)
     .await
-    .context("p080 repair_acp_startup_stale: update recurrence epoch")?;
+    .with_context(|| format!("p080 repair_{stale_class}: update recurrence epoch"))?;
 
     let repair_idempotency_key = derive_p080_repair_idempotency_key(
         next_epoch,
         run_id,
         stage_id,
         work_item_id,
-        "acp_startup_stale",
-        "acp_session_reset",
+        stale_class,
+        repair_action,
     )
-    .context("p080 repair_acp_startup_stale: derive repair idempotency key")?;
+    .with_context(|| format!("p080 repair_{stale_class}: derive repair idempotency key"))?;
     let event_id = format!(
         "p080-repair-{}",
         repair_idempotency_key.trim_start_matches("p080-rik-")
@@ -2047,47 +2640,50 @@ pub async fn repair_acp_startup_stale_requeue_invoke_agent_checked(
         "run_id": run_id,
         "stage_id": stage_id,
         "work_item_id": work_item_id,
-        "stale_class": "acp_startup_stale",
+        "stale_class": stale_class,
         "running_truth": "stale_repaired",
-        "repair_action": "acp_session_reset",
+        "repair_action": repair_action,
         "hold_reason": "none",
         "hold_age_seconds": null,
-        "next_retry_or_backoff_time": now_str,
+        "next_retry_or_backoff_time": null,
         "projection_updated_at": now_str,
         "projection_integrity": "valid",
         "executor_reregistration_state": "expected",
         "rollout_disablement": "none",
         "side_effect_status": "not_applicable",
-        "operator_message": "acp startup stale execution was requeued for a fresh provider session",
+        "operator_message": repaired_operator_message,
         "evidence_marker_hash": predicate_hash,
         "repair_idempotency_key": repair_idempotency_key.clone()
     });
     let readback_json = serde_json::to_string(&readback)?;
     validate_readback_json_for_write(&readback_json)
-        .context("p080 repair_acp_startup_stale: readback validation failed")?;
+        .with_context(|| format!("p080 repair_{stale_class}: readback validation failed"))?;
 
     sqlx::query(
         r#"
         INSERT OR IGNORE INTO p080_reconciliation_events_v1
-          (id, run_id, stage_id, work_item_id, stale_class, repair_action, hold_reason,
-           predicate_hash, recurrence_epoch, decision, event_source, created_at,
-           details_json, initiating_principal_id, repair_idempotency_key)
-        VALUES (?1, ?2, ?3, ?4, 'acp_startup_stale', 'acp_session_reset', 'none',
-                ?5, ?6, 'repaired', 'operator_request', ?7, '{}', ?8, ?9)
-        "#,
+	          (id, run_id, stage_id, work_item_id, stale_class, repair_action, hold_reason,
+	           predicate_hash, recurrence_epoch, decision, event_source, created_at,
+	           details_json, initiating_principal_id, repair_idempotency_key)
+	        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'none',
+	                ?7, ?8, 'repaired', ?9, ?10, '{}', ?11, ?12)
+	        "#,
     )
     .bind(&event_id)
     .bind(run_id)
     .bind(stage_id)
     .bind(work_item_id)
+    .bind(stale_class)
+    .bind(repair_action)
     .bind(&predicate_hash)
     .bind(next_epoch)
+    .bind(event_source)
     .bind(&now_str)
     .bind(initiating_principal_id)
     .bind(&repair_idempotency_key)
     .execute(&mut *tx)
     .await
-    .context("p080 repair_acp_startup_stale: insert repair event")?;
+    .with_context(|| format!("p080 repair_{stale_class}: insert repair event"))?;
 
     sqlx::query(
         r#"
@@ -2095,7 +2691,7 @@ pub async fn repair_acp_startup_stale_requeue_invoke_agent_checked(
           (run_id, stage_id, work_item_id, stale_class,
            projection_generation, projection_updated_at, projection_integrity,
            readback_json, updated_at)
-        VALUES (?1, ?2, ?3, 'acp_startup_stale', 1, ?4, 'valid', ?5, ?6)
+        VALUES (?1, ?2, ?3, ?4, 1, ?5, 'valid', ?6, ?7)
         ON CONFLICT(run_id, stage_id, work_item_id, stale_class) DO UPDATE SET
           projection_generation = projection_generation + 1,
           projection_updated_at = excluded.projection_updated_at,
@@ -2107,20 +2703,22 @@ pub async fn repair_acp_startup_stale_requeue_invoke_agent_checked(
     .bind(run_id)
     .bind(stage_id)
     .bind(work_item_id)
+    .bind(stale_class)
     .bind(&now_str)
     .bind(&readback_json)
     .bind(&now_str)
     .execute(&mut *tx)
     .await
-    .context("p080 repair_acp_startup_stale: upsert repaired readback")?;
+    .with_context(|| format!("p080 repair_{stale_class}: upsert repaired readback"))?;
 
     if let Some(dedup) = dedup_commit {
+        let public_readback = redact_readback_json(readback.clone());
         let response_json = serde_json::json!({
             "schema_version": "p080_reconcile_response_v1",
             "decision": "repaired",
             "event_id": event_id,
-            "operator_message": "repair_if_safe accepted for acp_startup_stale; request fingerprint was consumed",
-            "readback": readback.clone()
+            "operator_message": format!("repair_if_safe accepted for {stale_class}; request fingerprint was consumed"),
+            "readback": public_readback
         })
         .to_string();
         update_reserved_dedup_response_tx(&mut tx, dedup, &response_json).await?;
@@ -2128,7 +2726,12 @@ pub async fn repair_acp_startup_stale_requeue_invoke_agent_checked(
 
     tx.commit()
         .await
-        .context("p080 repair_acp_startup_stale: commit tx")?;
+        .with_context(|| format!("p080 repair_{stale_class}: commit tx"))?;
+
+    crate::metrics::increment_counter_with_label(
+        "stale_execution_repaired_total",
+        &format!("class={stale_class},repair_action={repair_action}"),
+    );
 
     Ok(P080RepairRequeueResult::Repaired(P080RepairOutcome {
         event_id,
@@ -2855,6 +3458,221 @@ mod tests {
         assert_eq!(counts.total, 0);
     }
 
+    async fn insert_running_classifier_fixture(
+        pool: &SqlitePool,
+        suffix: &str,
+        started_at: &str,
+    ) -> (String, String, String, String, String) {
+        let idea_id = format!("idea-p080-classifier-{suffix}");
+        let run_id = format!("run-p080-classifier-{suffix}");
+        let stage_execution_id = format!("stage-exec-p080-classifier-{suffix}");
+        let stage_id = format!("stage-p080-classifier-{suffix}");
+        let agent_execution_id = format!("agent-exec-p080-classifier-{suffix}");
+        let work_item_id = format!("work-p080-classifier-{suffix}");
+
+        sqlx::query(
+            "INSERT INTO ideas (id, title, body, status, created_at)
+             VALUES (?1, ?2, 'body', 'draft', ?3)",
+        )
+        .bind(&idea_id)
+        .bind(format!("P080 classifier {suffix}"))
+        .bind(started_at)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs
+             (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at)
+             VALUES (?1, ?2, 'running', 'wf', 'Workflow', '/tmp/ws', '/tmp/artifacts', ?3)",
+        )
+        .bind(&run_id)
+        .bind(&idea_id)
+        .bind(started_at)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO stage_executions
+             (id, run_id, stage_id, label, status, started_at)
+             VALUES (?1, ?2, ?3, 'Stage', 'running', ?4)",
+        )
+        .bind(&stage_execution_id)
+        .bind(&run_id)
+        .bind(&stage_id)
+        .bind(started_at)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_executions
+             (id, stage_execution_id, agent_id, provider, model, status, started_at)
+             VALUES (?1, ?2, 'agent', 'codex', 'model', 'running', ?3)",
+        )
+        .bind(&agent_execution_id)
+        .bind(&stage_execution_id)
+        .bind(started_at)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO work_items
+             (id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, started_at)
+             VALUES (?1, 'invoke_agent', '{}', 'running', ?2, ?3, ?4, ?4, ?4)",
+        )
+        .bind(&work_item_id)
+        .bind(&run_id)
+        .bind(&stage_id)
+        .bind(started_at)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        (
+            run_id,
+            stage_id,
+            stage_execution_id,
+            agent_execution_id,
+            work_item_id,
+        )
+    }
+
+    #[tokio::test]
+    async fn p080_classifier_projects_prompt_stale_as_p037_delegation() {
+        let pool = setup_db().await;
+        let started_at = (Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+        let (run_id, stage_id, _, agent_execution_id, work_item_id) =
+            insert_running_classifier_fixture(&pool, "prompt", &started_at).await;
+
+        sqlx::query(
+            "INSERT INTO agent_execution_runtime_facts
+             (agent_execution_id, supervision_classification, created_at, updated_at)
+             VALUES (?1, 'acp_prompt_stale', ?2, ?2)",
+        )
+        .bind(&agent_execution_id)
+        .bind(&started_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let counts = classify_and_upsert_running_executions(&pool).await.unwrap();
+        assert_eq!(counts.acp_prompt_stale, 1);
+        let row = get_readback(&pool, &run_id, &stage_id, &work_item_id, "acp_prompt_stale")
+            .await
+            .unwrap()
+            .expect("prompt stale readback");
+        let readback: serde_json::Value = serde_json::from_str(&row.readback_json).unwrap();
+        assert_eq!(readback["running_truth"], "needs_operator");
+        assert_eq!(readback["repair_action"], "delegated_to_p037");
+        assert_eq!(readback["side_effect_status"], "not_applicable");
+    }
+
+    #[tokio::test]
+    async fn p080_classifier_projects_unresolved_side_effect_as_p076_delegation() {
+        let pool = setup_db().await;
+        let started_at = (Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+        let (run_id, stage_id, stage_execution_id, agent_execution_id, work_item_id) =
+            insert_running_classifier_fixture(&pool, "se", &started_at).await;
+
+        sqlx::query(
+            "INSERT INTO side_effects
+             (id, run_id, stage_execution_id, agent_execution_id, effect_kind, target_key,
+              idempotency_key, request_fingerprint, status, created_at, updated_at)
+             VALUES ('side-effect-p080-classifier', ?1, ?2, NULL, 'git_push', 'target-p080-side-effect',
+                     'idem-p080-side-effect', 'fingerprint-p080-side-effect', 'needs_reconciliation', ?3, ?3)",
+        )
+        .bind(&run_id)
+        .bind(&stage_execution_id)
+        .bind(&started_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let visible_to_classifier: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM side_effects side
+             JOIN stage_executions se ON side.stage_execution_id = se.id
+             JOIN agent_executions ae ON ae.stage_execution_id = se.id
+             WHERE se.id = ?1
+               AND ae.id = ?2
+               AND side.status IN (
+                    'prepared','executing','externally_observed',
+                    'needs_reconciliation','conflict','unrecoverable'
+               )
+               AND (side.agent_execution_id IS NULL OR side.agent_execution_id = ae.id)",
+        )
+        .bind(&stage_execution_id)
+        .bind(&agent_execution_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            visible_to_classifier, 1,
+            "unresolved side-effect fixture must be visible to the classifier ownership join"
+        );
+
+        let counts = classify_and_upsert_running_executions(&pool).await.unwrap();
+        assert_eq!(counts.release_side_effect_drift, 1);
+        let row = get_readback(
+            &pool,
+            &run_id,
+            &stage_id,
+            &work_item_id,
+            "release_side_effect_drift",
+        )
+        .await
+        .unwrap()
+        .expect("side-effect drift readback");
+        let readback: serde_json::Value = serde_json::from_str(&row.readback_json).unwrap();
+        assert_eq!(readback["running_truth"], "needs_effect_reconciliation");
+        assert_eq!(readback["repair_action"], "delegated_to_p076");
+        assert_eq!(readback["hold_reason"], "side_effect_drift_unsafe");
+        assert_eq!(readback["side_effect_status"], "unsafe");
+    }
+
+    #[tokio::test]
+    async fn p080_classifier_projects_expired_helper_lease_as_operator_held() {
+        let pool = setup_db().await;
+        let started_at = (Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+        let expired_at = (Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+        let (run_id, stage_id, _, agent_execution_id, work_item_id) =
+            insert_running_classifier_fixture(&pool, "helper", &started_at).await;
+
+        sqlx::query(
+            "INSERT INTO p080_helper_leases_v1
+             (id, run_id, stage_id, work_item_id, helper_kind, process_group_id,
+              owner_process_id, process_start_boottime_nanos, acquired_at, created_at, updated_at,
+              agent_execution_id, expires_at)
+             VALUES ('helper-lease-p080-classifier', ?1, ?2, ?3, 'provider_helper', 4242,
+                     4242, 100, ?4, ?4, ?4, ?5, ?6)",
+        )
+        .bind(&run_id)
+        .bind(&stage_id)
+        .bind(&work_item_id)
+        .bind(&started_at)
+        .bind(&agent_execution_id)
+        .bind(&expired_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let counts = classify_and_upsert_running_executions(&pool).await.unwrap();
+        assert_eq!(counts.helper_orphan_drift, 1);
+        let row = get_readback(
+            &pool,
+            &run_id,
+            &stage_id,
+            &work_item_id,
+            "helper_orphan_drift",
+        )
+        .await
+        .unwrap()
+        .expect("helper drift readback");
+        let readback: serde_json::Value = serde_json::from_str(&row.readback_json).unwrap();
+        assert_eq!(readback["running_truth"], "needs_operator");
+        assert_eq!(readback["repair_action"], "diagnose_only");
+        assert_eq!(readback["hold_reason"], "ambiguous_owner");
+    }
+
     #[tokio::test]
     async fn p080_list_readback_page_empty_returns_empty() {
         let pool = setup_db().await;
@@ -3155,6 +3973,11 @@ mod tests {
 
         assert_eq!(outcome.readback["running_truth"], "stale_repaired");
         assert_eq!(outcome.readback["repair_action"], "acp_session_reset");
+        assert_eq!(
+            outcome.readback["next_retry_or_backoff_time"],
+            serde_json::Value::Null,
+            "repaired rows without cooldown or hold must not publish a retry/backoff time"
+        );
 
         let work_row: (String, String) = sqlx::query_as(
             "SELECT status, payload_json FROM work_items WHERE id = 'work-p080-repair'",
@@ -3185,6 +4008,199 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(repaired_events, 1);
+    }
+
+    async fn insert_running_repair_fixture(
+        pool: &SqlitePool,
+        suffix: &str,
+        stale_class: &str,
+    ) -> (String, String, String) {
+        let now = Utc::now().to_rfc3339();
+        let idea_id = format!("idea-p080-auto-{suffix}");
+        let run_id = format!("run-p080-auto-{suffix}");
+        let stage_execution_id = format!("stage-exec-p080-auto-{suffix}");
+        let stage_id = format!("stage-p080-auto-{suffix}");
+        let agent_execution_id = format!("agent-exec-p080-auto-{suffix}");
+        let work_item_id = format!("work-p080-auto-{suffix}");
+
+        sqlx::query(
+            "INSERT INTO ideas (id, title, body, status, created_at)
+             VALUES (?1, ?2, 'body', 'draft', ?3)",
+        )
+        .bind(&idea_id)
+        .bind(format!("P080 auto {suffix}"))
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs
+             (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at)
+             VALUES (?1, ?2, 'running', 'wf', 'Workflow', '/tmp/ws', '/tmp/artifacts', ?3)",
+        )
+        .bind(&run_id)
+        .bind(&idea_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO stage_executions
+             (id, run_id, stage_id, label, status, started_at)
+             VALUES (?1, ?2, ?3, 'Stage', 'running', ?4)",
+        )
+        .bind(&stage_execution_id)
+        .bind(&run_id)
+        .bind(&stage_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_executions
+             (id, stage_execution_id, agent_id, provider, model, status, started_at)
+             VALUES (?1, ?2, 'agent', 'codex', 'model', 'running', ?3)",
+        )
+        .bind(&agent_execution_id)
+        .bind(&stage_execution_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+        let payload = serde_json::json!({
+            "stage_execution_id": stage_execution_id,
+            "p058_claimed": {
+                "agent_execution_id": agent_execution_id
+            }
+        });
+        sqlx::query(
+            "INSERT INTO work_items
+             (id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, started_at)
+             VALUES (?1, 'invoke_agent', ?2, 'running', ?3, ?4, ?5, ?5, ?5)",
+        )
+        .bind(&work_item_id)
+        .bind(payload.to_string())
+        .bind(&run_id)
+        .bind(&stage_id)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+        let stale_json = serde_json::json!({
+            "schema_version": "p080_readback_v1",
+            "run_id": run_id,
+            "stage_id": stage_id,
+            "work_item_id": work_item_id,
+            "stale_class": stale_class,
+            "running_truth": "stale_suspected",
+            "repair_action": "diagnose_only",
+            "hold_reason": "rollout_disabled"
+        });
+        sqlx::query(
+            "INSERT INTO p080_readback_heartbeats_v1
+             (run_id, stage_id, work_item_id, stale_class, projection_generation,
+              projection_updated_at, projection_integrity, readback_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, 'valid', ?6, ?5)",
+        )
+        .bind(&run_id)
+        .bind(&stage_id)
+        .bind(&work_item_id)
+        .bind(stale_class)
+        .bind(&now)
+        .bind(stale_json.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+
+        (run_id, stage_id, work_item_id)
+    }
+
+    #[tokio::test]
+    async fn p080_auto_repair_promoted_stale_rows_repairs_acp_and_scheduler() {
+        let pool = setup_db().await;
+        seed_rollout_control_if_absent(&pool).await.unwrap();
+        set_rollout_control(
+            &pool,
+            "detection_only",
+            true,
+            "operator_change",
+            "test enable detection",
+        )
+        .await
+        .unwrap();
+        set_rollout_control(
+            &pool,
+            "acp_startup_stale",
+            true,
+            "operator_change",
+            "test enable acp",
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE p080_rollout_control_v1 SET phase = 'phase_2' WHERE class = 'acp_startup_stale'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        set_rollout_control(
+            &pool,
+            "scheduler_ownership_drift",
+            true,
+            "operator_change",
+            "test enable scheduler",
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE p080_rollout_control_v1 SET phase = 'phase_3' WHERE class = 'scheduler_ownership_drift'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let acp = insert_running_repair_fixture(&pool, "acp", "acp_startup_stale").await;
+        let scheduler =
+            insert_running_repair_fixture(&pool, "scheduler", "scheduler_ownership_drift").await;
+
+        let counts = auto_repair_promoted_stale_rows(&pool, 10, "system:p080_reconciler")
+            .await
+            .unwrap();
+
+        assert_eq!(counts.repaired, 2);
+        assert_eq!(counts.race_aborted, 0);
+        assert_eq!(counts.failed, 0);
+
+        let live_loop_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM p080_reconciliation_events_v1
+             WHERE event_source = 'live_loop' AND decision = 'repaired'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(live_loop_events, 2);
+
+        let acp_readback = get_readback(&pool, &acp.0, &acp.1, &acp.2, "acp_startup_stale")
+            .await
+            .unwrap()
+            .expect("acp readback");
+        let acp_json: serde_json::Value =
+            serde_json::from_str(&acp_readback.readback_json).unwrap();
+        assert_eq!(acp_json["running_truth"], "stale_repaired");
+        assert_eq!(acp_json["repair_action"], "acp_session_reset");
+
+        let scheduler_readback = get_readback(
+            &pool,
+            &scheduler.0,
+            &scheduler.1,
+            &scheduler.2,
+            "scheduler_ownership_drift",
+        )
+        .await
+        .unwrap()
+        .expect("scheduler readback");
+        let scheduler_json: serde_json::Value =
+            serde_json::from_str(&scheduler_readback.readback_json).unwrap();
+        assert_eq!(scheduler_json["running_truth"], "stale_repaired");
+        assert_eq!(scheduler_json["repair_action"], "scheduler_lease_reclaim");
     }
 
     #[tokio::test]

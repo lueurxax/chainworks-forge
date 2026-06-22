@@ -888,6 +888,11 @@ pub const P083_COMMAND_TTL_POLICIES: &[P083CommandTtlPolicy] = &[
         recommended_min_ttl_seconds: 90,
     },
     P083CommandTtlPolicy {
+        command: "provider_session.mark_process_absent",
+        ttl_seconds: 120,
+        recommended_min_ttl_seconds: 90,
+    },
+    P083CommandTtlPolicy {
         command: "p083.rollback_execution",
         ttl_seconds: 120,
         recommended_min_ttl_seconds: 60,
@@ -975,6 +980,11 @@ pub const P083_FAILED_TERMINAL_RETRY_POLICIES: &[P083FailedTerminalRetryPolicy] 
         command: "provider_session.shutdown",
         retry_allowed: FailedTerminalRetryAllowed::AfterCooldownSeconds(30),
         rationale: "Shutdown failure may reflect a transient identity state; 30s cooldown reduces PID reuse risk.",
+    },
+    P083FailedTerminalRetryPolicy {
+        command: "provider_session.mark_process_absent",
+        retry_allowed: FailedTerminalRetryAllowed::AfterCooldownSeconds(30),
+        rationale: "Manual process-absent recovery clears an identity hold; cooldown reduces stale identity and PID reuse risk after a failed terminal attempt.",
     },
     P083FailedTerminalRetryPolicy {
         command: "p083.rollback_execution",
@@ -1112,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn p083_ttl_policy_covers_all_eight_commands() {
+    fn p083_ttl_policy_covers_all_nine_commands() {
         let required = [
             "runs.cancel",
             "runs.retry",
@@ -1120,6 +1130,7 @@ mod tests {
             "approvals.resolve",
             "side_effects.force_reconcile",
             "provider_session.shutdown",
+            "provider_session.mark_process_absent",
             "p083.rollback_execution",
             "p083.set_enforcement_mode",
         ];
@@ -1149,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn p083_failed_terminal_retry_policy_covers_all_eight_commands() {
+    fn p083_failed_terminal_retry_policy_covers_all_nine_commands() {
         let required = [
             "runs.cancel",
             "runs.retry",
@@ -1157,6 +1168,7 @@ mod tests {
             "approvals.resolve",
             "side_effects.force_reconcile",
             "provider_session.shutdown",
+            "provider_session.mark_process_absent",
             "p083.rollback_execution",
             "p083.set_enforcement_mode",
         ];
@@ -1181,6 +1193,18 @@ mod tests {
         assert!(matches!(
             policy.retry_allowed,
             FailedTerminalRetryAllowed::AfterCooldownSeconds(_)
+        ));
+    }
+
+    #[test]
+    fn p083_provider_session_mark_process_absent_has_cooldown_policy() {
+        let ttl = p083_ttl_policy_for("provider_session.mark_process_absent").unwrap();
+        assert_eq!(ttl.ttl_seconds, 120);
+        let retry =
+            p083_failed_terminal_retry_policy_for("provider_session.mark_process_absent").unwrap();
+        assert!(matches!(
+            retry.retry_allowed,
+            FailedTerminalRetryAllowed::AfterCooldownSeconds(30)
         ));
     }
 }

@@ -1471,7 +1471,7 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
             matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
         }
         // P080: diagnostics.get and reconcile.request (diagnose_only) are allowed for
-        // ReadOnlyOperator per approved proposal §3.1 auth matrix (lines 145-153).
+        // ReadOnlyOperator per the stable P080 auth matrix.
         // repair_if_safe is gated at the handler level for Operator class only.
         // clear_permanent_hold is Phase 5+ and Operator-only.
         CapabilityToolId::P080DiagnosticsGet => {
@@ -3131,7 +3131,7 @@ mod tests {
     fn sec_p080_read_only_operator_tool_capabilities() {
         let ro = Principal::new("p080-ro", PrincipalClass::ReadOnlyOperator);
         // P080: ReadOnlyOperator has exactly diagnostics.get and reconcile.request
-        // (diagnose_only gated at handler level) per proposal §3.1 auth matrix.
+        // (diagnose_only gated at handler level) per the stable P080 auth matrix.
         assert!(
             is_tool_allowed(&ro, "p080.diagnostics.get.v1"),
             "ReadOnlyOperator must have p080.diagnostics.get.v1"

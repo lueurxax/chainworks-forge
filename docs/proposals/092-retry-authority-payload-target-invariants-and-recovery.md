@@ -5,8 +5,8 @@
 | Date | 2026-05-19 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | P045 run recovery and granular retry MCP tools, [auto-retry observation ledger](../reference/auto-retry-observation-ledger.md), P080 continuous stale execution reconciliation, P082 recovery/retry state-machine test matrix, P083 execution-truth ownership invariants, P088 code-writer completion receipts |
-| Related | P037 ACP supervision, P079 contract-aware output repair/provider fallback, `control-plane/crates/db/src/repos/work_items.rs`, `control-plane/crates/engine/src/orchestrator.rs`, `control-plane/crates/engine/src/recovery.rs` |
+| Depends on | P045 run recovery and granular retry MCP tools, [auto-retry observation ledger](../reference/auto-retry-observation-ledger.md), P080 continuous stale execution reconciliation, P082 recovery/retry state-machine test matrix, [execution-truth ownership invariants](../reference/execution-truth-and-recovery.md#durable-execution-truth-ownership), P088 code-writer completion receipts |
+| Related | P037 ACP supervision, implemented [P079 output repair/provider fallback contract](../reference/output-contracts-failure-evidence-and-recovery.md#p079-output-contract-repair-and-fallback-details), `control-plane/crates/db/src/repos/work_items.rs`, `control-plane/crates/engine/src/orchestrator.rs`, `control-plane/crates/engine/src/recovery.rs` |
 | Scope | Make retry work-item payloads unambiguous, prevent stale source-target mismatches after auto-contract retries, and recover valid completed retry attempts that are stranded as running work. |
 | Non-goal | No weakening of output contracts, no blind retry policy, no manual SQL repair path, no provider-specific workaround, and no broad rewrite of work queue or retry authority. |
 

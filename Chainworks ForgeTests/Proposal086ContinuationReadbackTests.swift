@@ -73,6 +73,7 @@ struct Proposal086ContinuationReadbackTests {
             providerSessionBudgetCostCentsTotal: 1,
             providerSessionResurrectionAttachSuccessTotal: 1,
             providerSessionResurrectionAttachFailureTotal: 0,
+            providerSessionResurrectionPromptSentTotal: 1,
             orphanReapAttemptedTotal: 0,
             orphanReapVerifiedTotal: 0,
             resurrectionUnsupportedTotal: 0

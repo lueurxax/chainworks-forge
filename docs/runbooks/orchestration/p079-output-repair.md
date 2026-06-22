@@ -60,7 +60,7 @@ When reviewing `OutputContractRepairEvidence`, pay attention to the following fi
 
 *   **`status: blocked` / `recommended_next_action: manual_investigation`**:
     *   **Cause**: A repair or fallback attempt was blocked, potentially due to a violation of P079 hold conditions or an unrecoverable error.
-    *   **Action**: Review the `initial_failure_class`, `initial_failure_subtype`, and any associated logs. Check the `Hold Conditions` section in the P079 proposal document for potential causes. Escalate if necessary.
+    *   **Action**: Review the `initial_failure_class`, `initial_failure_subtype`, and any associated logs. Check the [P079 hold conditions](../../reference/output-contracts-failure-evidence-and-recovery.md#p079-hold-conditions-detail) for potential causes. Escalate if necessary.
 *   **`status: failed` / `recommended_next_action: inspect_repair_evidence`**:
     *   **Cause**: A repair or fallback attempt failed, possibly due to a logical error or persistent issue.
     *   **Action**: Examine the full `OutputContractRepairEvidence` payload for details. Look for specific error messages in logs if available. Consider re-running the agent with additional debugging if the issue is reproducible.
@@ -88,4 +88,3 @@ In case of critical issues or during controlled experiments, P079 can be rolled 
 *   [P079 Recovery Attribution](../../reference/p079-recovery-attribution.md): Transcript/provider-envelope recovery attribution and bounds.
 *   [P079 Adapter Idempotency](../../reference/p079-adapter-idempotency.md): Lease, restart, and adapter idempotency rules.
 *   [Executable Rollout Gate Template](../../reference/executable-rollout-gate-template.md): General guidance on the rollout-contract preflight, gate aliases, and operator readback used by P079.
-*   [P079 Proposal Document](../../proposals/079-contract-aware-output-repair-and-provider-fallback.md): The original proposal document for full context.

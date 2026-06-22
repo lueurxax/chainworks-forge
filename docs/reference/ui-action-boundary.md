@@ -98,7 +98,7 @@ Agents and automations must use MCP/control-plane tools for operational actions.
 They must not use GraphQL mutations or direct SQLite writes as a control path.
 
 For governed SwiftUI, GraphQL is for UI reads, UI subscriptions, and the two
-approval mutations only. The P083 operator GraphQL lifecycle mutations
+approval mutations only. The execution-truth operator GraphQL lifecycle mutations
 (`providerSessionShutdown`, `p083MarkProviderSessionProcessAbsent`,
 `p083RollbackExecution`, `p083SetEnforcementMode`, `runsRetry`) are
 non-UI command surface for explicitly authorized operator callers and

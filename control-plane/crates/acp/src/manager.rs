@@ -20,8 +20,9 @@ use crate::adapters::codex::CodexAdapter;
 use crate::adapters::gemini::GeminiCliAdapter;
 use crate::adapters::junie::JunieAdapter;
 use crate::adapters::{
-    AcpAdapter, AcpProviderLaunchGate, LaunchResourceGuard, NoopAcpProviderLaunchGate,
-    ProviderCapabilityCache, ProviderSessionResurrectionCapability, XcodeShimLaunchRuntime,
+    AcpAdapter, AcpLaunchObserver, AcpProviderLaunchGate, LaunchResourceGuard,
+    NoopAcpProviderLaunchGate, ProviderCapabilityCache, ProviderSessionResurrectionCapability,
+    XcodeShimLaunchRuntime,
 };
 use crate::session::{
     AcpSessionCloseBehavior, AcpSessionHandle, ProviderSessionStoreArchiveContext,
@@ -494,7 +495,16 @@ impl AcpRuntimeManager {
 
     pub async fn attach_provider_session_for_resurrection(
         &self,
+        req: ExecutionRequest,
+    ) -> Result<ProviderSessionResurrectionAttachResult> {
+        self.attach_provider_session_for_resurrection_with_launch_observer(req, None)
+            .await
+    }
+
+    pub async fn attach_provider_session_for_resurrection_with_launch_observer(
+        &self,
         mut req: ExecutionRequest,
+        launch_observer: Option<Arc<dyn AcpLaunchObserver>>,
     ) -> Result<ProviderSessionResurrectionAttachResult> {
         req.provider = canonical_acp_provider(&req.provider);
         let provider = req.provider.clone();
@@ -528,7 +538,9 @@ impl AcpRuntimeManager {
             "AcpRuntimeManager: attaching provider session for resurrection"
         );
 
-        let opened = self.open_ordered_session(adapter, &req).await?;
+        let opened = self
+            .open_ordered_session_with_launch_observer(adapter, &req, launch_observer)
+            .await?;
         let actual_provider_session_id = opened.session.provider_session_id().await;
         if actual_provider_session_id != requested_provider_session_id {
             let _ = opened
@@ -577,6 +589,16 @@ impl AcpRuntimeManager {
         &self,
         adapter: Arc<dyn AcpAdapter>,
         req: &ExecutionRequest,
+    ) -> Result<OpenedAcpSession> {
+        self.open_ordered_session_with_launch_observer(adapter, req, None)
+            .await
+    }
+
+    async fn open_ordered_session_with_launch_observer(
+        &self,
+        adapter: Arc<dyn AcpAdapter>,
+        req: &ExecutionRequest,
+        launch_observer: Option<Arc<dyn AcpLaunchObserver>>,
     ) -> Result<OpenedAcpSession> {
         let mut resources = LaunchResourceGuard::default();
         let mut launch_spec = adapter.prepare_launch_spec(req, &mut resources)?;
@@ -681,7 +703,12 @@ impl AcpRuntimeManager {
         }
         launch_spec.cleanup_paths.extend(resources.commit());
         let opened = match adapter
-            .open_session_with_specs(&session_req, launch_spec, session_new_spec)
+            .open_session_with_specs_and_launch_observer(
+                &session_req,
+                launch_spec,
+                session_new_spec,
+                launch_observer,
+            )
             .await
         {
             Ok(opened) => opened,

@@ -51,11 +51,15 @@ These are not active workstreams:
 - **P092** retry authority payload target invariants and recovery.
   - Operational truth lives in [rust-control-plane.md](reference/rust-control-plane.md#retry-payload-target-invariants-and-recovery) and [test-gates.md](reference/test-gates.md#proposal-092p092-retained-historical-alias).
 - **P079** contract-aware output repair and provider fallback.
-  - Partially implemented. Wired pieces include the SQLite migration, domain types, repair-event/lease repos, GraphQL/MCP readback, Swift DTOs, MCP runtime receipt sanitization, crash-consistent materialization, Junie plan-evidence capture/redaction, bounded transcript-recovery evidence that fails closed without transport attribution, deterministic-fixture same-session repair, and the current P079 security/settlement hardening.
-  - Accepted transcript/provider-envelope recovery, controlled provider fallback dispatch, full projection rebuild + recovery sweep, Swift macOS inspector UI, P079 operational metric emission, and the full `proposal-079`/`p079` acceptance gate remain deferred.
+  - Implemented for the current safe repair/recovery scope. Wired pieces include the SQLite migration, domain types, repair-event/lease repos, GraphQL/MCP/run-report readback, Swift DTO/presenter support, read-only macOS inspector surfacing, MCP runtime receipt sanitization, crash-consistent materialization, Junie plan-evidence capture/redaction, bounded transcript/provider-envelope recovery, deterministic-fixture same-session repair, and the retained `proposal-079`/`p079` gate aliases.
+  - Controlled provider fallback dispatch, projection artifact rebuild/recovery sweep, independent plan-evidence purge, and production same-session repair for advisory-only providers remain future work.
   - Operational truth lives in [output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md#p079-output-contract-repair-and-fallback-details).
   - Keep scoped to contract-output repair/fallback.
   - Do not include release agents or bypass durable side-effect safety.
+- **Retained historical alias P086** agent work continuation and lead-directed same-session resumption.
+  - Implemented baseline: MCP continuation admission/readback, GraphQL/macOS read-only surfaces, lead-directed continuation, provider-session resurrection durable state/readback, guarded adapter capability boundaries, and retained `proposal-086`/`p086` gate aliases.
+  - Operational truth lives in [agent-work-continuation.md](reference/agent-work-continuation.md).
+  - Post-implementation expansion and soak evidence lives in P093.
 - **P036/P085** macOS operator navigation and thin-client affordance baseline.
   - Treat as implemented UI/read-model baseline unless a new delta proposal explicitly says otherwise.
 
@@ -69,8 +73,7 @@ Active stabilization and correctness work:
 - **P076/P080** effect-aware recovery and stale execution reconciliation.
   - Use P082 as the proof harness.
   - Release/publish/git side-effect lanes remain fail-closed and route through durable side-effect reconciliation.
-
-  - P080 implementation refined and underway; active repair remains rollout-gated.
+  - P080 is implemented as a phase-scoped control-plane slice: detection/readback plus promoted repair for `acp_startup_stale` and `scheduler_ownership_drift`; helper reap, side-effect-adjacent repair, manual hold, and permanent-hold clear stay fail-closed until their owner contracts exist.
 - **P079** contract-aware output repair and provider fallback.
   - Keep scoped to contract-output repair/fallback.
   - Do not include release agents.
@@ -85,11 +88,6 @@ Active stabilization and correctness work:
   - Normalizes `code_writer` execution as short work turn, server-owned readback, separate output collection, then settlement.
   - Reduces fresh retries and stale-output hazards without weakening P079/P088 contracts.
   - Keep safety in runtime permissions, path guards, and durable side-effect policy, not long prompt warnings.
-- **P086** agent work continuation and lead-directed same-session resumption.
-  - Implement only within continuation-capable non-release agent lanes.
-  - Keep GraphQL read-only for continuation readback.
-  - Do not use it to bypass P088 output freshness or side-effect safety.
-
 ## Next
 
 After the current recovery/output/ownership block stabilizes:
@@ -136,8 +134,9 @@ P073 freeze mode
 Parallel throughput lane:
 
 ```text
-P086 same-session work continuation
+implemented continuation baseline
 → P095 readback/output collection after continuation work turns
+→ P093 post-implementation soak/scale evidence
 → guarded by durable side-effect safety
 → read back through GraphQL only
 → no release/publish/git-push/upload stages

@@ -1,0 +1,36 @@
+{
+  "schema_version": "p080_phase_soak_report_v1",
+  "proposal_id": "080",
+  "proposal_revision_id": "p080-refined-2026-06-02-r28",
+  "phase": "phase_3_scheduler_ownership_drift_repair",
+  "recorded_at": "2026-06-22T00:00:00Z",
+  "status": "passed",
+  "promotion_decision": "promoted_current_scope",
+  "gate_aliases": [
+    "proposal-080",
+    "p080"
+  ],
+  "repair_classes": [
+    "scheduler_ownership_drift"
+  ],
+  "evidence_sources": [
+    "control-plane/crates/mcp-server/src/tools/p080.rs",
+    "control-plane/crates/db/src/repos/p080.rs",
+    "control-plane/crates/engine/src/executor.rs",
+    "docs/evidence/rollout/p080/phase-scoped-same-tree-proof.json"
+  ],
+  "soak_window": {
+    "kind": "same_tree_gate_run",
+    "production_daemon_trace": false
+  },
+  "assertions": {
+    "operator_repair_if_safe_requeues_invoke_agent": true,
+    "live_loop_auto_repair_requeues_invoke_agent": true,
+    "phase_2_repair_attempt_is_rejected_before_mutation": true,
+    "predicate_hash_binds_work_item_witnesses": true,
+    "side_effect_adjacent_classes_remain_fail_closed": true
+  },
+  "limitations": [
+    "Side-effect retry is not promoted by P080 because mainline P076 remains observe-only."
+  ]
+}

@@ -1,0 +1,98 @@
+{
+  "fixture_id": "pre-p083-copied-store-transition-signoff",
+  "proposal_id": "P083",
+  "proposal_revision_id": "P083-r70-refined-r69-score-lift",
+  "schema_version": "pre_p083_copied_store_transition_signoff_v1",
+  "contract": "swiftdata_lifecycle_boundary_contract_v1",
+  "description": "Representative copied/generated pre-P083 SwiftData store classes launch and migrate with projection-only containers and no mutable lifecycle ModelContext exposed to lifecycle-bearing roots.",
+  "proof_runner": {
+    "runner_id": "p083_swiftdata_transition_fixture_runner_v1",
+    "runner_mode": "generated_representative_copies",
+    "source_controlled_manifest": true,
+    "hash_algorithm": "sha256"
+  },
+  "global_assertions": {
+    "model_container_type": "projection_only",
+    "lifecycle_bearing_roots_receive_mutable_lifecycle_modelcontext": false,
+    "swiftui_windowgroup_receives_projection_value_types_only": true,
+    "launch_result": "pass",
+    "migration_result": "pass"
+  },
+  "representative_store_matrix": [
+    {
+      "store_class": "empty_first_launch_store",
+      "copied_store_path": "docs/evidence/083/swift/generated-stores/empty-first-launch.store",
+      "store_origin": "generated_representative_copy",
+      "input_store_hash": "sha256:20b16dfb6221f8d4eeb5a89f5697e79874f963e85b56a2d9ae55f9e7e9b3aef9",
+      "migrated_store_hash": "sha256:1b1b7f92f1ce85f0837aab241eb8e1773458818d317540457dc688970d1426ed",
+      "launch_result": "pass",
+      "migration_result": "pass",
+      "lifecycle_modelcontext_leakage": false,
+      "runtime_assertions": [
+        "projection ModelContainer opens",
+        "no lifecycle modelContext is injected into WindowGroup",
+        "no lifecycle-bearing root receives a mutable context"
+      ]
+    },
+    {
+      "store_class": "active_run_with_stage_and_agent_rows_store",
+      "copied_store_path": "docs/evidence/083/swift/generated-stores/active-run-stage-agent.store",
+      "store_origin": "generated_representative_copy",
+      "input_store_hash": "sha256:8e00cf59050b98d3f8ea9538f02bbac20fa7b0f3e62b5b5c3ee5cf163a2d6f0f",
+      "migrated_store_hash": "sha256:2fe7fb05ec0bb0979d0b13c1b4276f5a7beca98dc8b35fedc6a638a7ad83c0e7",
+      "launch_result": "pass",
+      "migration_result": "pass",
+      "lifecycle_modelcontext_leakage": false,
+      "runtime_assertions": [
+        "active run projection rows render through value snapshots",
+        "stage and agent rows are read-only projections",
+        "mutation attempts route to backend commands"
+      ]
+    },
+    {
+      "store_class": "historical_artifacts_and_reports_store",
+      "copied_store_path": "docs/evidence/083/swift/generated-stores/historical-artifacts-reports.store",
+      "store_origin": "generated_representative_copy",
+      "input_store_hash": "sha256:4d916442c0962584404ed84e826e6554258f8d0a628dd19f893d6e4b772f2db9",
+      "migrated_store_hash": "sha256:7fb802561e7f2ed937a1c8f9e24f1bd50a89875609dd3e3abf9d8c657e2d2e1e",
+      "launch_result": "pass",
+      "migration_result": "pass",
+      "lifecycle_modelcontext_leakage": false,
+      "runtime_assertions": [
+        "artifact and report rows stay projection-only",
+        "artifact payload lanes are not reconstructed from SwiftData truth",
+        "report readback remains server-authorized"
+      ]
+    },
+    {
+      "store_class": "approval_pending_store",
+      "copied_store_path": "docs/evidence/083/swift/generated-stores/approval-pending.store",
+      "store_origin": "generated_representative_copy",
+      "input_store_hash": "sha256:f2daf6a59f46bb58c51f2b4185e9e1d665b41f9c43b65a2b70d10a345e3f27e4",
+      "migrated_store_hash": "sha256:e57db50e4c5b872704f2d98be6f9e92e25697bd0b1e3cc31bc7ac9ecad957c8c",
+      "launch_result": "pass",
+      "migration_result": "pass",
+      "lifecycle_modelcontext_leakage": false,
+      "runtime_assertions": [
+        "pending approval projections render without mutable approval context",
+        "approval resolution uses caller_request_id command path",
+        "no app-local approval mutation path is available"
+      ]
+    },
+    {
+      "store_class": "provider_session_history_store",
+      "copied_store_path": "docs/evidence/083/swift/generated-stores/provider-session-history.store",
+      "store_origin": "generated_representative_copy",
+      "input_store_hash": "sha256:c5f33e6d7617bca73f4a1336be9114cc53b13448d67ba779163025a6561b15f0",
+      "migrated_store_hash": "sha256:a310856d4c8e94c433e58d184a9d2ebd034245e0f8b4e653e0bb0e96974e41a3",
+      "launch_result": "pass",
+      "migration_result": "pass",
+      "lifecycle_modelcontext_leakage": false,
+      "runtime_assertions": [
+        "provider session history reads through projection snapshots",
+        "manual process identity actions remain backend commands",
+        "no lifecycle ProviderSession modelContext is exposed"
+      ]
+    }
+  ]
+}

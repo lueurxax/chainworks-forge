@@ -13,7 +13,6 @@ Canonical baseline examples:
 Live and delivery-oriented presets:
 
 - `agents/agents_with_gemini.yaml`
-- `workflows/proposal-loop-live.yaml`
 - `workflows/full-mvp-live.yaml`
 
 Compact reference examples:

@@ -1,0 +1,36 @@
+{
+  "schema_version": "p080_phase_soak_report_v1",
+  "proposal_id": "080",
+  "proposal_revision_id": "p080-refined-2026-06-02-r28",
+  "phase": "phase_2_acp_startup_stale_repair",
+  "recorded_at": "2026-06-22T00:00:00Z",
+  "status": "passed",
+  "promotion_decision": "promoted_current_scope",
+  "gate_aliases": [
+    "proposal-080",
+    "p080"
+  ],
+  "repair_classes": [
+    "acp_startup_stale"
+  ],
+  "evidence_sources": [
+    "control-plane/crates/mcp-server/src/tools/p080.rs",
+    "control-plane/crates/db/src/repos/p080.rs",
+    "control-plane/crates/engine/src/executor.rs",
+    "docs/evidence/rollout/p080/phase-scoped-same-tree-proof.json"
+  ],
+  "soak_window": {
+    "kind": "same_tree_gate_run",
+    "production_daemon_trace": false
+  },
+  "assertions": {
+    "operator_repair_if_safe_requeues_invoke_agent": true,
+    "live_loop_auto_repair_requeues_invoke_agent": true,
+    "repair_event_source_is_live_loop_for_auto_repair": true,
+    "dedup_replay_is_fenced_before_mutation": true,
+    "read_only_operator_repair_is_rejected": true
+  },
+  "limitations": [
+    "This report proves the promoted same-tree behavior and does not claim production soak duration."
+  ]
+}

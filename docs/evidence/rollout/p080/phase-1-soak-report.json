@@ -1,0 +1,36 @@
+{
+  "schema_version": "p080_phase_soak_report_v1",
+  "proposal_id": "080",
+  "proposal_revision_id": "p080-refined-2026-06-02-r28",
+  "phase": "phase_1_detection_readback",
+  "recorded_at": "2026-06-22T00:00:00Z",
+  "status": "passed",
+  "promotion_decision": "promoted_current_scope",
+  "gate_aliases": [
+    "proposal-080",
+    "p080"
+  ],
+  "repair_classes": [
+    "detection_only"
+  ],
+  "evidence_sources": [
+    "docs/evidence/rollout/p080/phase-scoped-same-tree-proof.json",
+    "docs/evidence/rollout-contract/operator-readback/p080-full-surface.fixture.json",
+    "control-plane/crates/db/src/repos/p080.rs",
+    "control-plane/crates/mcp-server/src/tools/p080.rs",
+    "control-plane/crates/graphql-server/src/p080.rs"
+  ],
+  "soak_window": {
+    "kind": "same_tree_gate_run",
+    "production_daemon_trace": false
+  },
+  "assertions": {
+    "diagnostics_are_read_only": true,
+    "diagnose_only_writes_repair_predicate_hash": true,
+    "operator_readback_has_graphql_mcp_and_release_receipt_lanes": true,
+    "non_operator_readback_is_redacted": true
+  },
+  "limitations": [
+    "This report is same-tree gate evidence, not a 72 hour production daemon soak."
+  ]
+}

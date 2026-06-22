@@ -138,7 +138,7 @@ const CatalogView = () => (
 
 const WorkflowView = () => (
   <div className="fg-card">
-    <SectionHeader icon="workflow" title="proposal-loop-live@v3" subtitle="Frozen workflow snapshot · 7 stages · 2 approval gates"/>
+    <SectionHeader icon="workflow" title="full-mvp-live@v3" subtitle="Frozen workflow snapshot · 20 stages · approval gates"/>
     <pre style={{
       background:"#0E1623",color:"#E5EAF2",borderRadius:10,padding:"14px 16px",
       font:"12px/18px var(--font-mono)",overflow:"auto",margin:0,

@@ -696,33 +696,6 @@ fn p060_full_mvp_dynamic_workflow_does_not_require_fixed_quartet_refinement_inpu
 }
 
 #[test]
-fn p060_proposal_loop_live_remains_legacy_fixed_reviewer_fanout() {
-    let wf_path = format!("{}/workflows/proposal-loop-live.yaml", fixtures_dir());
-    let wf = workflow::definition::load(&wf_path).expect("should parse proposal loop workflow");
-    let state = wf
-        .states
-        .get("state_3_proposal_reviewed")
-        .expect("proposal-loop-live has proposal review state");
-    let run = state.run.as_ref().expect("review state has run block");
-    assert!(run.system_task.is_none());
-    assert!(run.dynamic_parallel.is_none());
-    let parallel = run
-        .parallel
-        .as_ref()
-        .expect("legacy fixed parallel reviewers");
-    let reviewer_ids: Vec<_> = parallel.iter().map(|task| task.agent.as_str()).collect();
-    assert_eq!(
-        reviewer_ids,
-        vec![
-            "proposal_reviewer_product_owner",
-            "proposal_reviewer_ux",
-            "proposal_reviewer_ui",
-            "proposal_reviewer_architect",
-        ]
-    );
-}
-
-#[test]
 fn proposal_017_phase_c_executable_catalog_rejects_missing_system_lead() {
     let workflow = r#"
 initial_state: start

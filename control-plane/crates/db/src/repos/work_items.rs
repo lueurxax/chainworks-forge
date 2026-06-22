@@ -735,6 +735,7 @@ pub async fn p080_requeue_running_invoke_agent_by_id_tx(
     stage_id: &str,
     scheduled_at: DateTime<Utc>,
     reason: &str,
+    stale_class: &str,
 ) -> Result<bool> {
     let Some(row) = sqlx::query(
         r#"SELECT payload_json
@@ -770,7 +771,7 @@ pub async fn p080_requeue_running_invoke_agent_by_id_tx(
                 "requeued_at": scheduled_at.to_rfc3339(),
                 "reason": reason,
                 "source_work_item_id": work_item_id,
-                "stale_class": "acp_startup_stale"
+                "stale_class": stale_class
             }),
         );
     }

@@ -371,6 +371,11 @@ async fn seed_continuation_readback(
             serde_json::json!({"resurrection_status": "unsupported"}),
             1,
         ),
+        (
+            "provider_session_resurrection_prompt_sent_total",
+            serde_json::json!({"mode": "provider_session_resurrection", "outcome": "prompt_sent"}),
+            1,
+        ),
     ] {
         agent_work_continuations::record_p086_continuation_metric_event(
             pool,
@@ -492,6 +497,7 @@ async fn p086_graphql_continuation_readback_exposes_terminal_fields_without_muta
                     providerSessionBudgetCostCentsTotal
                     providerSessionResurrectionAttachSuccessTotal
                     providerSessionResurrectionAttachFailureTotal
+                    providerSessionResurrectionPromptSentTotal
                     resurrectionUnsupportedTotal
                   }}
                   continuations(runId: "{run_id}") {{
@@ -599,6 +605,7 @@ async fn p086_graphql_continuation_readback_exposes_terminal_fields_without_muta
     assert_eq!(metrics["providerSessionBudgetCostCentsTotal"], 7);
     assert_eq!(metrics["providerSessionResurrectionAttachSuccessTotal"], 0);
     assert_eq!(metrics["providerSessionResurrectionAttachFailureTotal"], 1);
+    assert_eq!(metrics["providerSessionResurrectionPromptSentTotal"], 1);
     assert_eq!(metrics["resurrectionUnsupportedTotal"], 1);
     assert_eq!(data["continuations"][0]["id"], continuation_id);
     assert_eq!(data["continuations"][0]["statusRaw"], "succeeded");

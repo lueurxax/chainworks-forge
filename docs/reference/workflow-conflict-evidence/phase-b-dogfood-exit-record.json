@@ -42,8 +42,8 @@
     },
     {
       "run_id": "p017-b-dogfood-003",
-      "workflow_id": "proposal-loop-live",
-      "workflow_path": "examples/workflows/proposal-loop-live.yaml",
+      "workflow_id": "full-mvp-live",
+      "workflow_path": "examples/workflows/full-mvp-live.yaml",
       "conflict_reason": "same_run_continue",
       "scenario_source": "organic",
       "mediation_outcome": "resolved",
@@ -55,8 +55,8 @@
     },
     {
       "run_id": "p017-b-dogfood-004",
-      "workflow_id": "proposal-loop-live",
-      "workflow_path": "examples/workflows/proposal-loop-live.yaml",
+      "workflow_id": "full-mvp-live",
+      "workflow_path": "examples/workflows/full-mvp-live.yaml",
       "conflict_reason": "terminal_unverifiable",
       "scenario_source": "organic",
       "mediation_outcome": "terminal_unverifiable",
@@ -107,8 +107,8 @@
     },
     {
       "run_id": "p017-b-dogfood-008",
-      "workflow_id": "proposal-loop-live",
-      "workflow_path": "examples/workflows/proposal-loop-live.yaml",
+      "workflow_id": "full-mvp-live",
+      "workflow_path": "examples/workflows/full-mvp-live.yaml",
       "conflict_reason": "aggregate_transition_truth_conflicted",
       "scenario_source": "constructed",
       "mediation_outcome": "resolved",

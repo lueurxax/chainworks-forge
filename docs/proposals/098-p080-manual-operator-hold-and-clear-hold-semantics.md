@@ -5,8 +5,8 @@
 | Date | 2026-06-02 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | [080-continuous-stale-execution-reconciliation.md](080-continuous-stale-execution-reconciliation.md), [boundary-first API/auth contract](../reference/boundary-first-api-auth-contract.md), [execution truth and recovery](../reference/execution-truth-and-recovery.md) |
-| Related | P037 ACP supervision, P083 execution-truth ownership invariants, durable side-effect reconciliation, `docs/reference/rust-control-plane.md` |
+| Depends on | [P080 stale-execution readback and repair contract](../reference/rust-control-plane.md), [P080 operator runbook](../runbooks/p080-stale-execution-repair.md), [boundary-first API/auth contract](../reference/boundary-first-api-auth-contract.md), [execution truth and recovery](../reference/execution-truth-and-recovery.md) |
+| Related | P037 ACP supervision, [execution-truth ownership invariants](../reference/execution-truth-and-recovery.md#durable-execution-truth-ownership), durable side-effect reconciliation, `docs/reference/rust-control-plane.md` |
 | Scope | Define the governed manual hold, clear-hold, authorization, replay, readback, and audit contract for P080 stale execution reconciliation. |
 | Non-goal | No automatic human approval, no SwiftUI mutation surface, no side-effect retry, and no replacement for P080's automatic stale classification or repair phases. |
 
@@ -233,4 +233,3 @@ Add `proposal-098` / `p098` gate coverage:
 - Clearing a hold does not bypass P080 safety or side-effect reconciliation.
 - Every successful hold and clear-hold has command journal, audit, metric, and readback evidence.
 - Steward can distinguish manual intervention time from ordinary run progress.
-

@@ -8,7 +8,7 @@ It describes the current fixture-backed live runtime contract, the app surfaces 
 
 - State: implemented as ACP-only live execution baseline
 - Scope owner: current app runtime and UI shell
-- Backing workflow: `examples/workflows/proposal-loop-live.yaml`
+- Backing workflow: `examples/workflows/full-mvp-live.yaml`
 - Live transport: runtime-profile-selected `RuntimeTransportProtocol` adapter or deterministic ACP fixture transport
 
 Current repo-backed ACP families in this slice are:
@@ -162,7 +162,7 @@ The live slice is intentionally narrow and runs only the proposal loop workflow:
 
 Primary workflow file:
 
-- `examples/workflows/proposal-loop-live.yaml`
+- `examples/workflows/full-mvp-live.yaml`
 
 Expected primary outputs:
 

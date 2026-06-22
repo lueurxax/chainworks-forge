@@ -171,6 +171,7 @@ while True:
     request_fingerprint = ""
     target_stage_execution_id = ""
     target_agent_execution_id = ""
+    provider_session_id = ""
     for line in prompt.splitlines():
         if line.startswith("- Prompt turn marker id: "):
             prompt_marker = line.split(": ", 1)[1]
@@ -180,9 +181,11 @@ while True:
             target_stage_execution_id = line.split(": ", 1)[1]
         if line.startswith("- Agent execution id: "):
             target_agent_execution_id = line.split(": ", 1)[1]
+        if line.startswith("- Provider session id: "):
+            provider_session_id = line.split(": ", 1)[1]
     with open(os.path.join(cwd, "p086-resurrection-turn.txt"), "w") as f:
         f.write("resurrection continuation wrote this file\n")
-    send({{"jsonrpc": "2.0", "method": "session/update", "params": {{"update": {{"sessionUpdate": "agent_message_chunk", "content": "resurrection turn marker " + prompt_marker + " request " + request_fingerprint + " stage " + target_stage_execution_id + " agent " + target_agent_execution_id + " ran ./scripts/test-gate.sh proposal-086 passed"}}}}}})
+    send({{"jsonrpc": "2.0", "method": "session/update", "params": {{"update": {{"sessionUpdate": "agent_message_chunk", "content": "resurrection turn marker " + prompt_marker + " request " + request_fingerprint + " stage " + target_stage_execution_id + " agent " + target_agent_execution_id + " provider_session " + provider_session_id + " ran ./scripts/test-gate.sh proposal-086 passed"}}}}}})
     send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"stopReason": "end_turn", "sessionId": actual_session_id}}}})
 "#,
         marker_path = marker.to_string_lossy(),
@@ -1309,7 +1312,7 @@ async fn p086_resurrection_records_claude_session_store_recovery_in_raw_receipt(
         .expect("continuation row should exist");
     let prompt_marker = format!("p086-prompt-turn:{continuation_id}:provider_session_attach");
     let recovered_text = format!(
-        "{prompt_marker} {} {} {} CHAINWORKS_OUTPUT {{\"continuation\":\"recovered\"}} ./scripts/test-gate.sh proposal-086 passed",
+        "{prompt_marker} {} {} {} fixture-session-reuse CHAINWORKS_OUTPUT {{\"continuation\":\"recovered\"}} ./scripts/test-gate.sh proposal-086 passed",
         continuation.request_fingerprint_sha256,
         continuation.stage_execution_id,
         continuation.agent_execution_id

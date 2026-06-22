@@ -3023,6 +3023,7 @@ struct P086ContinuationMetricsSummaryReadModel: Decodable, Equatable, Sendable {
   let providerSessionBudgetCostCentsTotal: Int
   let providerSessionResurrectionAttachSuccessTotal: Int
   let providerSessionResurrectionAttachFailureTotal: Int
+  let providerSessionResurrectionPromptSentTotal: Int
   let orphanReapAttemptedTotal: Int
   let orphanReapVerifiedTotal: Int
   let resurrectionUnsupportedTotal: Int
@@ -3063,6 +3064,7 @@ struct P086ContinuationMetricsSummaryReadModel: Decodable, Equatable, Sendable {
     case providerSessionBudgetCostCentsTotal
     case providerSessionResurrectionAttachSuccessTotal
     case providerSessionResurrectionAttachFailureTotal
+    case providerSessionResurrectionPromptSentTotal
     case orphanReapAttemptedTotal
     case orphanReapVerifiedTotal
     case resurrectionUnsupportedTotal
@@ -3489,6 +3491,7 @@ enum P031GraphQLDocuments {
         providerSessionBudgetCostCentsTotal
         providerSessionResurrectionAttachSuccessTotal
         providerSessionResurrectionAttachFailureTotal
+        providerSessionResurrectionPromptSentTotal
         orphanReapAttemptedTotal
         orphanReapVerifiedTotal
         resurrectionUnsupportedTotal
