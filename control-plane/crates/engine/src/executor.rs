@@ -3853,12 +3853,27 @@ fn runtime_facts_for_execution_result(
     });
     let provider_quota_classification = observed_failure_classification
         .as_ref()
-        .filter(|classification| classification.failure_kind == AgentFailureKind::ProviderQuota);
+        .filter(|classification| classification.failure_kind == AgentFailureKind::ProviderQuota)
+        .cloned()
+        .or_else(|| {
+            runtime_receipt
+                .and_then(|receipt| receipt.failure_phase.as_deref())
+                .is_some_and(|phase| phase == "provider_quota")
+                .then(|| {
+                    classify_observation(
+                        crate::failure_classifier::RuntimeFailureObservation::ProviderQuota {
+                            retry_after: None,
+                        },
+                    )
+                })
+        });
     match validation_summary.and_then(|summary| summary.failure_class.as_ref()) {
         Some(domain::validation::ValidationFailureClass::NoOutputProduced)
             if provider_quota_classification.is_some() =>
         {
-            let classification = provider_quota_classification.expect("checked above");
+            let classification = provider_quota_classification
+                .as_ref()
+                .expect("checked above");
             facts.failure_kind = Some(classification.failure_kind.clone());
             facts.operator_action_hint = Some(classification.operator_action_hint.clone());
             facts.retry_after = retry_after_or_default_for_provider_quota(classification, now);
@@ -24165,6 +24180,59 @@ plain progress line without gate evidence";
             Some(OperatorActionHint::WaitUntilRetryAfter)
         );
         assert_eq!(facts.retry_after, Some(retry_after));
+        assert_eq!(
+            facts.output_settlement,
+            AgentOutputSettlement::MissingRequiredOutputs
+        );
+    }
+
+    #[test]
+    fn provider_quota_runtime_receipt_overrides_no_output_validation_failure() {
+        let validation = TaskValidationSummary {
+            output_results: vec![],
+            contract_metadata: vec![],
+            raw_output_exists: false,
+            failure_class: Some(domain::validation::ValidationFailureClass::NoOutputProduced),
+            failure_summary: Some("required output was not produced".into()),
+        };
+        let mut receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 2,
+                session_update_count: 1,
+                permission_request_count: 0,
+                permission_grant_sent_count: 0,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 0,
+                agent_thought_chunk_count: 0,
+                tool_call_count: 0,
+                tool_call_update_count: 0,
+                plan_update_count: 0,
+                meaningful_progress_count: 0,
+                unknown_notification_count: 1,
+            },
+            Some("provider_quota"),
+        );
+        receipt.provider = "gemini".into();
+        receipt.provider_error_message_redacted =
+            Some("You have exhausted your daily quota on this model.".into());
+
+        let facts = runtime_facts_for_execution_result(
+            domain::ids::AgentExecutionId::new(),
+            AgentStatus::Failed,
+            Some(&validation),
+            None,
+            chrono::Utc::now(),
+            None,
+            Some(&receipt),
+            None,
+        );
+
+        assert_eq!(facts.failure_kind, Some(AgentFailureKind::ProviderQuota));
+        assert_eq!(
+            facts.operator_action_hint,
+            Some(OperatorActionHint::WaitUntilRetryAfter)
+        );
+        assert!(facts.retry_after.is_some());
         assert_eq!(
             facts.output_settlement,
             AgentOutputSettlement::MissingRequiredOutputs

@@ -204,7 +204,6 @@ struct Chainworks_ForgeApp: App {
         }
         #if DEBUG
         Task.detached {
-            try? await SMAppService.agent(plistName: plistName).unregister()
             do {
                 try await DebugPackagedDaemonProcess.shared.ensureStarted(
                     bundleURL: Bundle.main.bundleURL
@@ -212,6 +211,7 @@ struct Chainworks_ForgeApp: App {
             } catch {
                 ForgeLogger.app.error("Failed to start debug packaged daemon process: \(error.localizedDescription)")
             }
+            try? await SMAppService.agent(plistName: plistName).unregister()
         }
         #else
         do {
@@ -239,8 +239,10 @@ struct Chainworks_ForgeApp: App {
     static func restartPackagedDaemonAgent() async throws {
         let plistName = "com.chainworks.forge.daemon.plist"
         #if DEBUG
-        try? await SMAppService.agent(plistName: plistName).unregister()
         try await DebugPackagedDaemonProcess.shared.restart(bundleURL: Bundle.main.bundleURL)
+        Task.detached {
+            try? await SMAppService.agent(plistName: plistName).unregister()
+        }
         #else
         let label = "com.chainworks.forge.daemon"
         let service = SMAppService.agent(plistName: plistName)
@@ -366,6 +368,7 @@ private actor DebugPackagedDaemonProcess {
             }
         }
         try process.run()
+        ForgeLogger.app.info("Started debug packaged daemon process pid=\(process.processIdentifier)")
         return process
     }
 

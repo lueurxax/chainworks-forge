@@ -1267,13 +1267,13 @@ escalation_policies:
       - contract_output_failure
       - stale_no_output
     tiers:
-      - tier_id: codex_orchestrator
-        kind: backend_profile
-        backend_profile_id: codex_orchestrator_high
-        max_attempts: 1
       - tier_id: claude_opus_orchestrator
         kind: backend_profile
         backend_profile_id: claude_orchestrator_high
+        max_attempts: 1
+      - tier_id: gemini_reasoning_fallback
+        kind: backend_profile
+        backend_profile_id: gemini_reasoning_pro_high
         max_attempts: 1
       - tier_id: human_pause
         kind: pause
@@ -1552,7 +1552,7 @@ agents:
     title: Lead / Orchestrator
     mode: orchestration
     system_role: lead
-    backend_profile: gemini_reasoning_pro_high
+    backend_profile: codex_orchestrator_high
     permission_profile: ORCH
     lead_resolution_contract: LeadResolutionContract
     skill_ref: orchestrator_core
