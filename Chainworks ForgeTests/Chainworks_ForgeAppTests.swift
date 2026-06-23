@@ -90,6 +90,78 @@ struct Chainworks_ForgeAppTests {
         #expect(Chainworks_ForgeApp.packagedDaemonAgentPlistURL(in: bundleURL) == plistURL)
     }
 
+    @Test("Packaged app bootstrap prefers bundled write-path guide over source checkout")
+    @MainActor
+    func packagedBootstrapPrefersBundledWritePathGuide() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ChainworksForgeAppTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let bundledURL = root
+            .appendingPathComponent("Bundle", isDirectory: true)
+            .appendingPathComponent("p031-operator-write-path-guide.json", isDirectory: false)
+        try FileManager.default.createDirectory(
+            at: bundledURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("bundled".utf8).write(to: bundledURL)
+
+        let repoGuideURL = root
+            .appendingPathComponent("Repo", isDirectory: true)
+            .appendingPathComponent("docs/reference/p031-operator-write-path-guide.json", isDirectory: false)
+        try FileManager.default.createDirectory(
+            at: repoGuideURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("source".utf8).write(to: repoGuideURL)
+
+        let sourceFilePath = root
+            .appendingPathComponent("Repo", isDirectory: true)
+            .appendingPathComponent("Chainworks Forge/Views/RunsHomeView.swift", isDirectory: false)
+            .path
+
+        let resource = P031OperatorWritePathGuideBootstrap.load(
+            currentDirectoryPath: root.path,
+            bundledURL: bundledURL,
+            sourceFilePath: sourceFilePath
+        )
+
+        #expect(resource.url == bundledURL)
+        #expect(resource.data == Data("bundled".utf8))
+    }
+
+    @Test("Packaged app bootstrap does not read source guide without explicit fallback")
+    @MainActor
+    func packagedBootstrapDoesNotFallbackToSourceGuideByDefault() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ChainworksForgeAppTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let repoGuideURL = root
+            .appendingPathComponent("Repo", isDirectory: true)
+            .appendingPathComponent("docs/reference/p031-operator-write-path-guide.json", isDirectory: false)
+        try FileManager.default.createDirectory(
+            at: repoGuideURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("source".utf8).write(to: repoGuideURL)
+
+        let sourceFilePath = root
+            .appendingPathComponent("Repo", isDirectory: true)
+            .appendingPathComponent("Chainworks Forge/Views/RunsHomeView.swift", isDirectory: false)
+            .path
+
+        let resource = P031OperatorWritePathGuideBootstrap.load(
+            currentDirectoryPath: root.path,
+            bundledURL: nil,
+            sourceFilePath: sourceFilePath,
+            environment: [:]
+        )
+
+        #expect(resource.url == nil)
+        #expect(resource.data == nil)
+    }
+
     @Test("LaunchAgent kickstart targets the submitted GUI service without forcing restart")
     func launchAgentKickstartArgumentsDoNotForceRestart() {
         #if os(macOS)

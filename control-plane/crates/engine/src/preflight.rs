@@ -1,11 +1,15 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use domain::run::DeliveryConfiguration;
+
+const DELIVERY_PREFLIGHT_GIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeliveryPreflightResult {
@@ -73,52 +77,102 @@ fn check_repo_root_exists(repo_root: &str) -> PreflightCheck {
 }
 
 fn check_git_repository(repo_root: &str) -> PreflightCheck {
-    let output = Command::new("git")
-        .args(["-C", repo_root, "rev-parse", "--is-inside-work-tree"])
-        .output();
-    let passed = output
-        .as_ref()
-        .map(|output| output.status.success())
-        .unwrap_or(false);
+    let status = run_git_with_timeout(
+        &["-C", repo_root, "rev-parse", "--is-inside-work-tree"],
+        DELIVERY_PREFLIGHT_GIT_TIMEOUT,
+    );
+    let passed = status == PreflightCommandStatus::Success;
     PreflightCheck {
         id: "git_repository_valid".into(),
         label: "Repository root is a git repository".into(),
         passed,
-        detail: (!passed).then(|| "git rev-parse failed".to_string()),
+        detail: (!passed).then(|| status.detail("git rev-parse failed")),
     }
 }
 
 fn check_base_branch_exists(repo_root: &str, base_branch: &str) -> PreflightCheck {
-    let current_branch_matches = Command::new("git")
-        .args(["-C", repo_root, "symbolic-ref", "--short", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|output| {
-            output
-                .status
-                .success()
-                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        })
-        .map(|branch| branch == base_branch)
-        .unwrap_or(false);
-    let branch_ref_exists = Command::new("git")
-        .args([
+    let branch_ref_status = run_git_with_timeout(
+        &[
             "-C",
             repo_root,
             "rev-parse",
             "--verify",
             "--quiet",
             base_branch,
-        ])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false);
-    let passed = !base_branch.trim().is_empty() && (current_branch_matches || branch_ref_exists);
+        ],
+        DELIVERY_PREFLIGHT_GIT_TIMEOUT,
+    );
+    let branch_ref_exists = branch_ref_status == PreflightCommandStatus::Success;
+    let passed = !base_branch.trim().is_empty() && branch_ref_exists;
     PreflightCheck {
         id: "base_branch_exists".into(),
         label: "Base branch exists".into(),
         passed,
         detail: (!passed).then(|| format!("base branch {base_branch:?} was not found")),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreflightCommandStatus {
+    Success,
+    Failed,
+    TimedOut,
+    SpawnFailed,
+}
+
+impl PreflightCommandStatus {
+    fn detail(self, fallback: &str) -> String {
+        match self {
+            Self::Success => fallback.to_string(),
+            Self::Failed => fallback.to_string(),
+            Self::TimedOut => format!("{fallback}: command timed out"),
+            Self::SpawnFailed => format!("{fallback}: command could not be started"),
+        }
+    }
+}
+
+fn run_git_with_timeout(args: &[&str], timeout: Duration) -> PreflightCommandStatus {
+    run_command_with_timeout("git", args, timeout)
+}
+
+fn run_command_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> PreflightCommandStatus {
+    let mut child = match Command::new(program)
+        .current_dir("/")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return PreflightCommandStatus::SpawnFailed,
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    PreflightCommandStatus::Success
+                } else {
+                    PreflightCommandStatus::Failed
+                };
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return PreflightCommandStatus::TimedOut;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return PreflightCommandStatus::Failed;
+            }
+        }
     }
 }
 
@@ -144,5 +198,17 @@ fn non_empty_check(id: &str, label: &str, value: &str) -> PreflightCheck {
         label: label.into(),
         passed,
         detail: (!passed).then(|| format!("{id} is empty")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preflight_command_timeout_kills_hung_child() {
+        let status = run_command_with_timeout("sh", &["-c", "sleep 60"], Duration::from_millis(50));
+
+        assert_eq!(status, PreflightCommandStatus::TimedOut);
     }
 }

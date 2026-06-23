@@ -2264,8 +2264,16 @@ enum P031OperatorWritePathGuideBootstrap {
             forResource: guideResourceName,
             withExtension: guideResourceExtension
         ),
-        sourceFilePath: String = #filePath
+        sourceFilePath: String = #filePath,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> P031OperatorWritePathGuideBootstrapResource {
+        if let bundledURL, let data = try? Data(contentsOf: bundledURL) {
+            return P031OperatorWritePathGuideBootstrapResource(data: data, url: bundledURL)
+        }
+        guard shouldUseSourceFallback(environment: environment) else {
+            return P031OperatorWritePathGuideBootstrapResource(data: nil, url: nil)
+        }
+
         let url = AppConfiguration.preferredExampleURL(
             repoRelativePath: guideRepoRelativePath,
             bundledURL: bundledURL,
@@ -2274,6 +2282,10 @@ enum P031OperatorWritePathGuideBootstrap {
         )
         let data = url.flatMap { try? Data(contentsOf: $0) }
         return P031OperatorWritePathGuideBootstrapResource(data: data, url: url)
+    }
+
+    static func shouldUseSourceFallback(environment: [String: String]) -> Bool {
+        environment["CHAINWORKS_ALLOW_SOURCE_GUIDE_FALLBACK"] == "1"
     }
 }
 

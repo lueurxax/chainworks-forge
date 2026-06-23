@@ -2242,6 +2242,22 @@ fn canonicalize_run_start_paths(
     workflow_yaml_path: &str,
     agent_catalog_yaml_path: &str,
 ) -> anyhow::Result<(String, String, String, String)> {
+    canonicalize_run_start_paths_with_resource_root(
+        workspace_root,
+        artifact_root,
+        workflow_yaml_path,
+        agent_catalog_yaml_path,
+        packaged_resource_root_from_current_exe(),
+    )
+}
+
+fn canonicalize_run_start_paths_with_resource_root(
+    workspace_root: &str,
+    artifact_root: &str,
+    workflow_yaml_path: &str,
+    agent_catalog_yaml_path: &str,
+    packaged_resource_root: Option<PathBuf>,
+) -> anyhow::Result<(String, String, String, String)> {
     validate_run_start_path("workspace_root", workspace_root)?;
     validate_run_start_path("artifact_root", artifact_root)?;
     validate_run_start_path("workflow_yaml_path", workflow_yaml_path)?;
@@ -2263,18 +2279,21 @@ fn canonicalize_run_start_paths(
         "artifact_root",
         artifact_root,
         &canonical_workspace,
+        None,
         true,
     )?;
     let workflow = canonicalize_run_start_child_path(
         "workflow_yaml_path",
         workflow_yaml_path,
         &canonical_workspace,
+        packaged_resource_root.as_deref(),
         false,
     )?;
     let catalog = canonicalize_run_start_child_path(
         "agent_catalog_yaml_path",
         agent_catalog_yaml_path,
         &canonical_workspace,
+        packaged_resource_root.as_deref(),
         false,
     )?;
     Ok((
@@ -2285,10 +2304,23 @@ fn canonicalize_run_start_paths(
     ))
 }
 
+fn packaged_resource_root_from_current_exe() -> Option<PathBuf> {
+    let mode = std::env::var("MODE").ok()?;
+    if mode != "packaged-app" && mode != "packaged-helper" {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let resources = exe.parent()?.parent()?.join("Resources");
+    resources.exists().then(|| {
+        std::fs::canonicalize(&resources).unwrap_or_else(|_| normalize_path_components(&resources))
+    })
+}
+
 fn canonicalize_run_start_child_path(
     field: &str,
     raw: &str,
     canonical_workspace: &Path,
+    packaged_resource_root: Option<&Path>,
     allow_missing_leaf: bool,
 ) -> anyhow::Result<PathBuf> {
     let path = Path::new(raw);
@@ -2312,10 +2344,26 @@ fn canonicalize_run_start_child_path(
         anyhow::bail!("runs.start: field '{field}' does not exist");
     };
 
-    if !canonical.starts_with(canonical_workspace) {
+    let is_packaged_resource =
+        packaged_resource_root.is_some_and(|resource_root| canonical.starts_with(resource_root));
+    if !canonical.starts_with(canonical_workspace) && !is_packaged_resource {
         anyhow::bail!("runs.start: field '{field}' escapes canonical workspace_root");
     }
     Ok(canonical)
+}
+
+fn normalize_path_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 /// SEC HIGH-001: Remove operator-only run snapshot fields for non-Operator MCP principals.
@@ -2833,6 +2881,65 @@ mod tests {
         let error = execute("runs.start", params, &pool, &handler, &test_principal())
             .await
             .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("escapes canonical workspace_root"));
+    }
+
+    #[test]
+    fn run_start_paths_allow_packaged_resource_workflow_and_catalog() {
+        let workspace = tempfile::tempdir().unwrap();
+        let resources = tempfile::tempdir().unwrap();
+        let artifact_root = workspace.path().join(".chainworks");
+        std::fs::create_dir_all(&artifact_root).unwrap();
+        let workflow = resources.path().join("full-mvp-live.yaml");
+        let catalog = resources.path().join("agents.yaml");
+        std::fs::write(&workflow, "states: {}\n").unwrap();
+        std::fs::write(&catalog, "agents: []\n").unwrap();
+        let canonical_resources = resources.path().canonicalize().unwrap();
+
+        let (_, _, resolved_workflow, resolved_catalog) =
+            canonicalize_run_start_paths_with_resource_root(
+                &workspace.path().to_string_lossy(),
+                &artifact_root.to_string_lossy(),
+                &workflow.to_string_lossy(),
+                &catalog.to_string_lossy(),
+                Some(canonical_resources),
+            )
+            .unwrap();
+
+        assert_eq!(
+            PathBuf::from(resolved_workflow),
+            workflow.canonicalize().unwrap()
+        );
+        assert_eq!(
+            PathBuf::from(resolved_catalog),
+            catalog.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn run_start_paths_still_reject_non_resource_workflow_escape() {
+        let workspace = tempfile::tempdir().unwrap();
+        let resources = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let artifact_root = workspace.path().join(".chainworks");
+        std::fs::create_dir_all(&artifact_root).unwrap();
+        let workflow = outside.path().join("workflow.yaml");
+        let catalog = resources.path().join("agents.yaml");
+        std::fs::write(&workflow, "states: {}\n").unwrap();
+        std::fs::write(&catalog, "agents: []\n").unwrap();
+        let canonical_resources = resources.path().canonicalize().unwrap();
+
+        let error = canonicalize_run_start_paths_with_resource_root(
+            &workspace.path().to_string_lossy(),
+            &artifact_root.to_string_lossy(),
+            &workflow.to_string_lossy(),
+            &catalog.to_string_lossy(),
+            Some(canonical_resources),
+        )
+        .unwrap_err();
+
         assert!(error
             .to_string()
             .contains("escapes canonical workspace_root"));
