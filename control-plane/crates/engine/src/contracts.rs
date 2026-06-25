@@ -448,6 +448,7 @@ pub fn build_validation_failure_record(
         receipt_exists,
         transcript_exists,
         recovery_recommendation,
+        diagnostic_artifact_paths: Vec::new(),
     })
 }
 

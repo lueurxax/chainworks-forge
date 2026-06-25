@@ -1,0 +1,20 @@
+{
+  "schema_version": "p089_temp_inventory_negative_fixture_v1",
+  "expected_status": "fail",
+  "negative_condition": "A Swift or MCP client rejects, crashes on, or silently drops a temp inventory row with an additive unknown enum value.",
+  "mutated_contract": {
+    "row": {
+      "schema_version": "temp_artifact_inventory_v1",
+      "artifact_id": "temp_artifact:sha256:unknown-enum-fixture",
+      "correlation_key": "sha256:unknown-enum-fixture",
+      "root_kind": "future_root_kind",
+      "artifact_kind": "future_artifact_kind",
+      "manifest_state": "future_manifest_state",
+      "lifecycle_classification": "future_lifecycle_classification",
+      "active_process_evidence": "future_process_evidence",
+      "path_display": "${CHAINWORKS_CACHE_TMP}/unknown-enum-fixture",
+      "path_hash": "sha256:unknown-enum-fixture"
+    }
+  },
+  "assertion": "The gate must fail if clients do not preserve unknown enum raw values as operator-review states."
+}

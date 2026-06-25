@@ -1697,7 +1697,7 @@ agents:
     backend_profile: gemini_review_pro
     permission_profile: RO_REVIEW
     skill_ref: proposal_review_router_skill
-    skill_role: ui_designer
+    skill_role: architect
     inputs:
       - idea_brief
       - proposal_current
@@ -1826,7 +1826,7 @@ agents:
     skill_ref: proposal_review_router_skill
     skill_role: ui_designer
     inputs: [idea_brief, proposal_current, proposal_feedback_coverage, reviewer_scope_plan, score_lift_backlog]
-    outputs: [proposal_review_ui]
+    outputs: [proposal_review_macos]
     output_contract: proposal_review_v1
     requires_human_approval: false
     routing:

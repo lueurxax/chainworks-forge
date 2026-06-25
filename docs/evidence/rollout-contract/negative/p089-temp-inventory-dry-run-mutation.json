@@ -1,0 +1,12 @@
+{
+  "schema_version": "p089_temp_inventory_negative_fixture_v1",
+  "expected_status": "fail",
+  "negative_condition": "Dry-run changes fixture path existence, file count, size, mtime, or manifest contents.",
+  "mutation_guard_before": {
+    "fixture_digest": "sha256:before"
+  },
+  "mutation_guard_after": {
+    "fixture_digest": "sha256:after"
+  },
+  "assertion": "The mutation guard must fail if before and after fixture digests differ."
+}

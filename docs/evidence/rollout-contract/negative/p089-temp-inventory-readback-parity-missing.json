@@ -1,0 +1,12 @@
+{
+  "schema_version": "p089_temp_inventory_negative_fixture_v1",
+  "expected_status": "fail",
+  "negative_condition": "One operator readback lane omits inventory or dry-run summary fields.",
+  "missing_lane": "release_receipt",
+  "missing_fields": [
+    "temp_artifact_inventory_status",
+    "temp_artifact_dry_run_status",
+    "temp_artifact_dry_run_mutation_guard"
+  ],
+  "assertion": "The focused gate must require GraphQL, MCP, run report, and release receipt parity."
+}

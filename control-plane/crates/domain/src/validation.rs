@@ -68,4 +68,6 @@ pub struct ValidationFailureRecord {
     pub receipt_exists: bool,
     pub transcript_exists: bool,
     pub recovery_recommendation: RecoveryRecommendation,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostic_artifact_paths: Vec<String>,
 }

@@ -1642,7 +1642,10 @@ fn extract_agent_message_chunk(parsed: &Value) -> Option<String> {
         return None;
     }
     let update = parsed.pointer("/params/update")?;
-    if update.get("sessionUpdate").and_then(Value::as_str) != Some("agent_message_chunk") {
+    let Some(session_update) = update.get("sessionUpdate").and_then(Value::as_str) else {
+        return None;
+    };
+    if !matches!(session_update, "agent_message_chunk" | "text_chunk") {
         return None;
     }
     update
@@ -7058,7 +7061,7 @@ mod tests {
     }
 
     #[test]
-    fn proposal_089_completion_capture_uses_agent_message_chunks_only() {
+    fn proposal_089_completion_capture_uses_assistant_text_chunks_not_tool_or_thought_chunks() {
         let thought = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "session/update",
@@ -7096,12 +7099,30 @@ mod tests {
                 }
             }
         });
+        let claude_text_chunk = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "claude-session",
+                "update": {
+                    "sessionUpdate": "text_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": "{\"CHAINWORKS_OUTPUT\":{\"proposal_review_ui\":{\"decision\":\"approve\"}}}"
+                    }
+                }
+            }
+        });
 
         assert_eq!(extract_agent_message_chunk(&thought), None);
         assert_eq!(extract_agent_message_chunk(&tool), None);
         assert_eq!(
             extract_agent_message_chunk(&message).as_deref(),
             Some("{\"CHAINWORKS_OUTPUT\":{\"tests_result\":{\"status\":\"not_run\",\"commands\":[]}}}")
+        );
+        assert_eq!(
+            extract_agent_message_chunk(&claude_text_chunk).as_deref(),
+            Some("{\"CHAINWORKS_OUTPUT\":{\"proposal_review_ui\":{\"decision\":\"approve\"}}}")
         );
     }
 

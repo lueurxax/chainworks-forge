@@ -1,0 +1,13 @@
+{
+  "schema_version": "p089_temp_inventory_negative_fixture_v1",
+  "expected_status": "fail",
+  "negative_condition": "A packaged or production temp inventory scan accepts CHAINWORKS_TEMP_INVENTORY_ROOTS_JSON without CHAINWORKS_ENABLE_TEST_TEMP_INVENTORY_ROOTS=1.",
+  "mutated_contract": {
+    "test_root_override": {
+      "environment_key": "CHAINWORKS_TEMP_INVENTORY_ROOTS_JSON",
+      "diagnostic_mode_enabled": false,
+      "root_value": "[{\"root_token\":\"fixture\",\"path\":\"/tmp/chainworks-fixture\"}]"
+    }
+  },
+  "assertion": "The gate must fail closed unless the test-only root override is paired with explicit diagnostic/test mode and canonical root validation."
+}

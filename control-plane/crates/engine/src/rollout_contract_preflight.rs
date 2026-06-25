@@ -1957,6 +1957,7 @@ fn extract_rollout_contract_source(
         return Ok(None);
     };
     let has_inline = object.contains_key("rollout_contract_v1")
+        || object.contains_key("inline_rollout_contract_v1")
         || object.contains_key("p084_self_contract")
         || object
             .get("schema_version")
@@ -1985,10 +1986,33 @@ fn extract_rollout_contract_source(
         }));
     }
 
+    if let (Some(canonical), Some(legacy)) = (
+        object.get("rollout_contract_v1"),
+        object.get("inline_rollout_contract_v1"),
+    ) {
+        if canonical != legacy {
+            return Ok(Some(extraction_failure_contract(
+                vec![
+                    "duplicate_source: rollout_contract_v1 and legacy inline_rollout_contract_v1 keys are both present with different values"
+                        .to_string(),
+                ],
+                "duplicate_source",
+            )));
+        }
+    }
+
     if let Some(inline) = object.get("rollout_contract_v1") {
         return Ok(Some(RolloutContractSource {
             contract: inline.clone(),
             source: format!("{}#rollout_contract_v1", proposal_path.display()),
+            extraction_failures: Vec::new(),
+        }));
+    }
+
+    if let Some(inline) = object.get("inline_rollout_contract_v1") {
+        return Ok(Some(RolloutContractSource {
+            contract: inline.clone(),
+            source: format!("{}#inline_rollout_contract_v1", proposal_path.display()),
             extraction_failures: Vec::new(),
         }));
     }
@@ -2803,6 +2827,7 @@ fn rollout_negative_fixture_placeholder(
 ) -> serde_json::Value {
     let gate_aliases = proposal
         .get("rollout_contract_v1")
+        .or_else(|| proposal.get("inline_rollout_contract_v1"))
         .and_then(|contract| contract.get("gate_aliases"))
         .cloned()
         .unwrap_or_else(|| serde_json::json!(["proposal-placeholder"]));
@@ -3172,6 +3197,7 @@ fn proposal_metadata_from_value(
         proposal_id_from_value(value).unwrap_or_else(|| DEFAULT_PROPOSAL_ID.to_string());
     let contract_object_hash = value
         .get("rollout_contract_v1")
+        .or_else(|| value.get("inline_rollout_contract_v1"))
         .map(hash_json_value)
         .or_else(|| value.get("p084_self_contract").map(hash_json_value))
         .unwrap_or_else(|| DEFAULT_CONTRACT_OBJECT_HASH.to_string());
@@ -4301,6 +4327,81 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic == "declared_operational_metric:rollout_contract_permissive_dogfood_total{proposal_id,status,would_block}"));
+    }
+
+    #[tokio::test]
+    async fn legacy_inline_rollout_contract_alias_creates_pass_record() {
+        let dir = TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let pool = test_pool(&url).await;
+        let mut run = test_run();
+        run.workspace_root = dir.path().to_string_lossy().to_string();
+
+        let proposal_path = dir.path().join("approved-proposal.json");
+        let proposal = serde_json::json!({
+            "source_proposal": "docs/proposals/089-temp-artifact-inventory.md",
+            "proposal_revision_id": "p089-r2",
+            "inline_rollout_contract_v1": valid_rollout_contract()
+        });
+        std::fs::write(&proposal_path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+        let artifact = test_artifact(&run, proposal_path.to_string_lossy().to_string());
+
+        let check = upsert_linted_contract_check(
+            &pool,
+            &run,
+            &artifact,
+            &test_effective_policy(RolloutContractEnforcementMode::Enforce),
+            0,
+        )
+        .await
+        .unwrap()
+        .expect("legacy inline_rollout_contract_v1 should produce a terminal check");
+
+        assert_eq!(check.status, RolloutContractStatus::Pass);
+        assert_eq!(check.decision, RolloutContractDecision::Release);
+        assert!(check
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("#inline_rollout_contract_v1")));
+    }
+
+    #[tokio::test]
+    async fn duplicate_rollout_contract_aliases_fail_closed_when_values_differ() {
+        let dir = TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let pool = test_pool(&url).await;
+        let mut run = test_run();
+        run.workspace_root = dir.path().to_string_lossy().to_string();
+
+        let mut legacy_contract = valid_rollout_contract();
+        legacy_contract["gate_aliases"] = serde_json::json!(["proposal-legacy"]);
+        let proposal_path = dir.path().join("approved-proposal.json");
+        let proposal = serde_json::json!({
+            "source_proposal": "docs/proposals/089-temp-artifact-inventory.md",
+            "proposal_revision_id": "p089-r2",
+            "rollout_contract_v1": valid_rollout_contract(),
+            "inline_rollout_contract_v1": legacy_contract
+        });
+        std::fs::write(&proposal_path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+        let artifact = test_artifact(&run, proposal_path.to_string_lossy().to_string());
+
+        let check = upsert_linted_contract_check(
+            &pool,
+            &run,
+            &artifact,
+            &test_effective_policy(RolloutContractEnforcementMode::Enforce),
+            0,
+        )
+        .await
+        .unwrap()
+        .expect("duplicate rollout contract sources should produce a terminal check");
+
+        assert_eq!(check.status, RolloutContractStatus::Fail);
+        assert_eq!(check.decision, RolloutContractDecision::Hold);
+        assert!(check
+            .failure_reasons
+            .iter()
+            .any(|reason| reason.starts_with("duplicate_source:")));
     }
 
     #[tokio::test]

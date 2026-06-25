@@ -48,6 +48,15 @@ The key should be the declared canonical target path. Output-name keys remain ac
 
 Each value is the full machine payload for that output contract. It must include every declared required field and use the contract-specific shape from `AgentCatalog.contracts`. The executor owns materializing those payloads to canonical files after validation; write-enabled agents should not shell-write run artifact outputs directly into the run meta-root.
 
+A malformed final JSON object is never silently repaired or accepted. When the
+final response contains a `CHAINWORKS_OUTPUT` marker but JSON parsing fails, the
+executor classifies the failure as `invalid_required_outputs` with subtype
+`malformed_json_contract_output`, records the parser error and declared output
+identity, and routes the same-session repair lane to request only the failed
+declared output. Canonical target-path keys in that malformed payload are still
+treated as the correct binding intent; the defect is the invalid JSON syntax, not
+the use of path keys.
+
 ### Envelope outputs are canonical named discoveries
 
 ACP responses may contain named structured output blocks:
@@ -193,6 +202,12 @@ The executor follows this order:
 4. settle the work item and stage.
 
 Raw outputs always survive long enough for inspection, even when validation fails afterward.
+
+For malformed final `CHAINWORKS_OUTPUT` failures, the validation record also
+links diagnostic completion-text artifacts when the capture is available. These
+artifacts are evidence for operator triage and repair prompts; they do not
+replace the strict declared-output validator and do not allow partial parsing of
+invalid JSON as success.
 
 ## Owner Chain
 

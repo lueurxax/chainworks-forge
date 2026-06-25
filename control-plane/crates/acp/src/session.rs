@@ -210,10 +210,10 @@ impl AcpSession {
         let (
             status,
             artifact_paths,
-            discovered_artifacts,
+            mut discovered_artifacts,
             pre_prompt_expected_outputs,
-            transcript_text,
-            completion_text_capture,
+            mut transcript_text,
+            mut completion_text_capture,
             usage,
             xcode_shim_warning_events,
             acp_pre_initialize_local_latency_ms,
@@ -225,6 +225,19 @@ impl AcpSession {
             acp_pre_prompt_metadata_digest_bytes,
             legacy_broad_discovery_snapshot,
         ) = prompt_result;
+        let mut provider_session_store_recovery = None;
+        if completion_text_capture.capture_status == crate::AcpCompletionCaptureStatus::Absent
+            && discovered_artifacts.is_empty()
+        {
+            if let Some(recovery) =
+                self.recover_claude_task_complete_after_missing_completion_capture(req)
+            {
+                transcript_text = Some(recovery.text);
+                discovered_artifacts = recovery.discovered_artifacts;
+                completion_text_capture = recovery.completion_text_capture;
+                provider_session_store_recovery = recovery.metadata;
+            }
+        }
         let mcp_observation = self.transport.mcp_observation();
         let actual_mcp_extensions = mcp_observation
             .as_ref()
@@ -254,7 +267,7 @@ impl AcpSession {
             xcode_shim_warning_events,
             close_diagnostic: None,
             provider_session_store_capture: None,
-            provider_session_store_recovery: None,
+            provider_session_store_recovery,
             acp_pre_initialize_local_latency_ms: Some(acp_pre_initialize_local_latency_ms),
             acp_initialize_latency_ms: Some(acp_initialize_latency_ms),
             acp_session_new_latency_ms: Some(acp_session_new_latency_ms),
@@ -494,6 +507,28 @@ impl AcpSession {
             runtime_receipt,
             runtime_tool_path_preflight_json: None,
         })
+    }
+
+    fn recover_claude_task_complete_after_missing_completion_capture(
+        &self,
+        req: &ExecutionRequest,
+    ) -> Option<ProviderSessionStoreTaskCompleteRecovery> {
+        if req.provider.trim().to_ascii_lowercase() != "claude" {
+            return None;
+        }
+        let provider_session_id = req
+            .provider_session_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.transport.session_id().to_string());
+        let recovery_target = claude_session_store_recovery_target_from_request(req);
+        recover_claude_task_complete_from_projects_root(
+            &claude_projects_root(),
+            &provider_session_id,
+            &req.expected_outputs,
+            recovery_target.as_ref(),
+        )
     }
 }
 
@@ -1157,6 +1192,8 @@ pub fn finalize_provider_session_store_capture(
         return Ok(None);
     }
 
+    refresh_external_provider_session_store_capture(capture, context)?;
+
     let archive_root = app_support_runtime_root()
         .join("session-store-archives")
         .join(&capture.provider)
@@ -1205,6 +1242,73 @@ pub fn finalize_provider_session_store_capture(
         )
     })?;
     Ok(Some(archive_root))
+}
+
+fn refresh_external_provider_session_store_capture(
+    capture: &ProviderSessionStoreCapture,
+    context: &ProviderSessionStoreArchiveContext,
+) -> Result<()> {
+    match canonical_provider_for_capture(&capture.provider).as_deref() {
+        Some("claude") => refresh_claude_session_store_capture(capture, context),
+        Some("junie") => refresh_junie_session_store_capture(capture, context),
+        _ => Ok(()),
+    }
+}
+
+fn refresh_claude_session_store_capture(
+    capture: &ProviderSessionStoreCapture,
+    context: &ProviderSessionStoreArchiveContext,
+) -> Result<()> {
+    let Some(provider_session_id) = non_empty(context.provider_session_id.as_deref()) else {
+        return Ok(());
+    };
+    let projects_root = claude_projects_root();
+    if !projects_root.exists() {
+        return Ok(());
+    }
+    let file_name = format!("{provider_session_id}.jsonl");
+    let Some(source) = find_file_named(&projects_root, &file_name)? else {
+        return Ok(());
+    };
+    let relative = source.strip_prefix(&projects_root).unwrap_or(&source);
+    let dest = Path::new(&capture.staging_root)
+        .join("projects")
+        .join(relative);
+    copy_file(&source, &dest)
+        .with_context(|| format!("refresh Claude provider transcript {}", source.display()))?;
+    Ok(())
+}
+
+fn refresh_junie_session_store_capture(
+    capture: &ProviderSessionStoreCapture,
+    context: &ProviderSessionStoreArchiveContext,
+) -> Result<()> {
+    let Some(provider_session_id) = non_empty(context.provider_session_id.as_deref()) else {
+        return Ok(());
+    };
+    let sessions_root = junie_sessions_root();
+    if !sessions_root.exists() {
+        return Ok(());
+    }
+    let source = sessions_root.join(provider_session_id);
+    let source = if source.exists() {
+        Some(source)
+    } else {
+        find_dir_named(&sessions_root, provider_session_id)?
+    };
+    let Some(source) = source else {
+        return Ok(());
+    };
+    let relative = source.strip_prefix(&sessions_root).unwrap_or(&source);
+    let dest = Path::new(&capture.staging_root)
+        .join("sessions")
+        .join(relative);
+    if dest.exists() {
+        fs::remove_dir_all(&dest).ok();
+    }
+    copy_dir_recursive(&source, &dest)
+        .with_context(|| format!("refresh Junie provider session {}", source.display()))?;
+    Ok(())
 }
 
 fn copy_file(source: &Path, dest: &Path) -> Result<()> {
@@ -1814,6 +1918,62 @@ mod tests {
             .join("-workspace")
             .join("provider-session-1.jsonl")
             .exists());
+        std::env::remove_var("CHAINWORKS_CLAUDE_SESSION_STORE_ROOT");
+        std::env::remove_var("CHAINWORKS_SESSION_STORE_ROOT");
+    }
+
+    #[test]
+    fn finalize_provider_session_store_refreshes_claude_staging_before_archive() {
+        let _guard = SESSION_STORE_ENV_LOCK.lock().unwrap();
+        let temp = tempdir().unwrap();
+        std::env::set_var(
+            "CHAINWORKS_SESSION_STORE_ROOT",
+            temp.path()
+                .join("pending-root")
+                .to_string_lossy()
+                .to_string(),
+        );
+        std::env::set_var(
+            "CHAINWORKS_CLAUDE_SESSION_STORE_ROOT",
+            temp.path()
+                .join("claude-projects")
+                .to_string_lossy()
+                .to_string(),
+        );
+        std::env::set_var(
+            "CHAINWORKS_APP_SUPPORT_ROOT",
+            temp.path()
+                .join("app-support")
+                .to_string_lossy()
+                .to_string(),
+        );
+        let transcript = temp
+            .path()
+            .join("claude-projects")
+            .join("-workspace")
+            .join("provider-session-1.jsonl");
+        write_file(&transcript, "{\"type\":\"assistant\",\"text\":\"early\"}\n");
+        let context = archive_context("claude", Some("provider-session-1"));
+        let capture = stage_external_provider_session_store(&context)
+            .unwrap()
+            .expect("capture expected");
+
+        write_file(
+            &transcript,
+            "{\"type\":\"assistant\",\"text\":\"early\"}\n{\"type\":\"assistant\",\"text\":\"final\"}\n",
+        );
+
+        let archive_root = finalize_provider_session_store_capture(&capture, true, &context)
+            .unwrap()
+            .expect("archive root expected");
+        let archived_transcript = archive_root
+            .join("projects")
+            .join("-workspace")
+            .join("provider-session-1.jsonl");
+        let archived = std::fs::read_to_string(archived_transcript).unwrap();
+        assert!(archived.contains("\"final\""));
+
+        std::env::remove_var("CHAINWORKS_APP_SUPPORT_ROOT");
         std::env::remove_var("CHAINWORKS_CLAUDE_SESSION_STORE_ROOT");
         std::env::remove_var("CHAINWORKS_SESSION_STORE_ROOT");
     }

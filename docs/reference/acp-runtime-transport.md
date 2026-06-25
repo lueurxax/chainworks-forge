@@ -211,6 +211,23 @@ the run worktree for write-enabled implementation work, otherwise
 and MCP-backed tool resolution aligned with the same tree the orchestrator
 expects the agent to operate on.
 
+### Provider session-store capture
+
+When the engine preserves provider-native session-store evidence for failed
+settlement, the ACP session layer stages provider files and finalizes them into
+the app-support session-store archive. For external native stores such as Claude
+and Junie, finalization refreshes the staged copy from the live native store by
+`provider_session_id` immediately before archiving. This prevents a long final
+assistant response from being archived a few JSONL lines behind the terminal
+response that the engine actually settled.
+
+Session-store archives are forensic evidence, not the primary output channel.
+The primary channel remains the terminal ACP completion text and extracted
+`CHAINWORKS_OUTPUT`; when session-store recovery supplies a final response, the
+engine still applies the same declared-output extraction, validation, and repair
+rules described in
+[structured-output-envelope-and-contract-validation.md](structured-output-envelope-and-contract-validation.md).
+
 Permission auto-grant prefers provider-declared read-only allowlist options
 before falling back to one-shot approval. This preserves autonomous operation
 without repeatedly exercising fragile terminal approval round-trips for safe

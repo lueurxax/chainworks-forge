@@ -694,18 +694,15 @@ impl Orchestrator {
                             })
                             .collect();
                         let total = stage_invokes.len();
-                        let completed_work_items = stage_invokes
-                            .iter()
-                            .filter(|w| w.status == db::work_item::WorkItemStatus::Completed)
-                            .count();
-                        let failed_work_items = stage_invokes
-                            .iter()
-                            .filter(|w| w.status == db::work_item::WorkItemStatus::Failed)
-                            .count();
-                        let settled_work_items = completed_work_items + failed_work_items;
                         let stage_agent_executions =
                             db::repos::agent_executions::find_by_stage(&self.pool, stage.id)
                                 .await?;
+                        let settled_work_items = stage_invokes
+                            .iter()
+                            .filter(|item| {
+                                authoritative_invoke_settled(item, &stage_agent_executions)
+                            })
+                            .count();
                         let stage_runtime_facts =
                             agent_execution_runtime_facts::list_by_run(&self.pool, run_id).await?;
                         let facts_by_execution: std::collections::HashMap<_, _> =
@@ -3025,7 +3022,9 @@ impl Orchestrator {
                 .filter(|item| {
                     matches!(
                         item.status,
-                        WorkItemStatus::Completed | WorkItemStatus::Failed
+                        WorkItemStatus::Completed
+                            | WorkItemStatus::Failed
+                            | WorkItemStatus::Running
                     )
                 })
                 .find(|item| {
@@ -8168,6 +8167,22 @@ fn authoritative_failed_stage_invokes(
         .count()
 }
 
+fn authoritative_invoke_settled(
+    item: &db::work_item::WorkItem,
+    stage_agent_executions: &[domain::agent::AgentExecution],
+) -> bool {
+    match item.status {
+        db::work_item::WorkItemStatus::Completed
+        | db::work_item::WorkItemStatus::Failed
+        | db::work_item::WorkItemStatus::Cancelled => true,
+        db::work_item::WorkItemStatus::Running => {
+            work_item_agent_execution(item, stage_agent_executions)
+                .is_some_and(|execution| execution.status != AgentStatus::Running)
+        }
+        db::work_item::WorkItemStatus::Pending => false,
+    }
+}
+
 fn authoritative_invoke_failed(
     item: &db::work_item::WorkItem,
     stage_agent_executions: &[domain::agent::AgentExecution],
@@ -8179,12 +8194,30 @@ fn authoritative_invoke_failed(
     if item.status == db::work_item::WorkItemStatus::Failed {
         return true;
     }
-    if item.status != db::work_item::WorkItemStatus::Completed {
+    if !matches!(
+        item.status,
+        db::work_item::WorkItemStatus::Completed | db::work_item::WorkItemStatus::Running
+    ) {
         return false;
     }
 
-    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&item.payload_json) else {
+    let Some(execution) = work_item_agent_execution(item, stage_agent_executions) else {
         return false;
+    };
+    if item.status == db::work_item::WorkItemStatus::Running
+        && execution.status == AgentStatus::Running
+    {
+        return false;
+    }
+    agent_execution_votes_failed(execution, facts_by_execution)
+}
+
+fn work_item_agent_execution<'a>(
+    item: &db::work_item::WorkItem,
+    stage_agent_executions: &'a [domain::agent::AgentExecution],
+) -> Option<&'a domain::agent::AgentExecution> {
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&item.payload_json) else {
+        return None;
     };
 
     if let Some(claimed_id) = payload
@@ -8194,21 +8227,14 @@ fn authoritative_invoke_failed(
     {
         return stage_agent_executions
             .iter()
-            .find(|execution| execution.id == claimed_id)
-            .map(|execution| agent_execution_votes_failed(execution, facts_by_execution))
-            .unwrap_or(false);
+            .find(|execution| execution.id == claimed_id);
     }
 
     let payload_agent_id = payload.get("agent_id").and_then(serde_json::Value::as_str);
-    let Some(latest_execution) = stage_agent_executions
+    stage_agent_executions
         .iter()
         .filter(|execution| Some(execution.agent_id.as_str()) == payload_agent_id)
         .max_by_key(|execution| execution.completed_at.unwrap_or(execution.started_at))
-    else {
-        return false;
-    };
-
-    agent_execution_votes_failed(latest_execution, facts_by_execution)
 }
 
 fn agent_execution_votes_failed(
@@ -8322,20 +8348,8 @@ fn build_declared_outputs(
         .iter()
         .map(|output_name| {
             let schema = task.output_schemas.get(output_name).cloned();
-            let machine_artifact_name = schema
-                .as_ref()
-                .and_then(|schema| schema.normalized_artifact_name.as_deref())
-                .unwrap_or(output_name.as_str());
-            let path_artifact_name = if plan.artifact_paths.contains_key(output_name) {
-                output_name.as_str()
-            } else {
-                machine_artifact_name
-            };
             let target_path =
-                p060_dynamic_review_target_path(output_name, schema.as_ref(), plan, run, task)
-                    .unwrap_or_else(|| {
-                        resolved_artifact_path_for_task(path_artifact_name, plan, run, task)
-                    });
+                declared_output_target_path_for_task(output_name, schema.as_ref(), plan, run, task);
             let companion_output_name = schema
                 .as_ref()
                 .filter(|schema| {
@@ -8386,6 +8400,25 @@ fn build_declared_outputs(
             }
         })
         .collect()
+}
+
+fn declared_output_target_path_for_task(
+    output_name: &str,
+    schema: Option<&workflow::plan::OutputSchema>,
+    plan: &workflow::plan::RunPlan,
+    run: &domain::run::Run,
+    task: &workflow::plan::CompiledTask,
+) -> String {
+    let machine_artifact_name = schema
+        .and_then(|schema| schema.normalized_artifact_name.as_deref())
+        .unwrap_or(output_name);
+    let path_artifact_name = if plan.artifact_paths.contains_key(output_name) {
+        output_name
+    } else {
+        machine_artifact_name
+    };
+    p060_dynamic_review_target_path(output_name, schema, plan, run, task)
+        .unwrap_or_else(|| resolved_artifact_path_for_task(path_artifact_name, plan, run, task))
 }
 
 fn dynamic_materialization_epoch(stage: &StageExecution) -> i64 {
@@ -8636,7 +8669,13 @@ fn build_task_prompt(
              actual large output file itself when using direct-file mode.",
         ));
         for output_name in &task.outputs {
-            let normalized = resolved_artifact_path_for_task(output_name, plan, run, task);
+            let normalized = declared_output_target_path_for_task(
+                output_name,
+                task.output_schemas.get(output_name),
+                plan,
+                run,
+                task,
+            );
             parts.push(format!("- `{output_name}` → `{normalized}`"));
             if let Some(schema) = task.output_schemas.get(output_name) {
                 if crate::contracts::validation_mode(schema) == "structured_with_human_companion" {
@@ -12100,6 +12139,112 @@ mod tests {
             declared.target_path,
             format!("/workspace/.chainworks/runs/{run_id}/reviews/proposal/product-owner.json"),
             "dynamic P060 product-owner reviews must validate the artifact path written by the existing reviewer catalog"
+        );
+    }
+
+    #[test]
+    fn p060_dynamic_prompt_uses_same_target_path_as_declared_output() {
+        let run_id = RunId::new();
+        let run = test_run(run_id);
+        let plan = test_plan();
+        let mut task = reviewer_task();
+        let output_name = p060_dynamic_review_output_name("proposal_reviewer_macos");
+        task.outputs = vec![output_name.clone()];
+        task.output_schemas.clear();
+        task.output_schemas.insert(
+            output_name.clone(),
+            p060_dynamic_review_output_schema("proposal_review_v1"),
+        );
+
+        let declared_outputs = build_declared_outputs(&task, &plan, &run);
+        let prompt = build_task_prompt(&task, &plan, &run, None, None, None);
+
+        assert_eq!(declared_outputs.len(), 1);
+        let declared = &declared_outputs[0];
+        assert!(
+            prompt.contains(&format!("- `{}` → `{}`", output_name, declared.target_path)),
+            "agent prompt must show the same canonical path that settlement validates"
+        );
+    }
+
+    #[test]
+    fn running_invoke_with_terminal_failed_agent_votes_failed_for_authoritative_fan_in() {
+        let run_id = RunId::new();
+        let stage_execution_id = StageExecutionId::new();
+        let agent_execution_id = AgentExecutionId::new();
+        let now = Utc::now();
+        let item = db::work_item::WorkItem {
+            id: "invoke-running-terminal-agent".into(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "stage_execution_id": stage_execution_id.to_string(),
+                "agent_id": "proposal_reviewer_macos",
+                "p058_claimed": {
+                    "agent_execution_id": agent_execution_id.to_string()
+                }
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Running,
+            run_id: Some(run_id),
+            stage_id: Some("state_4_proposal_reviewed".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 1,
+            last_error: None,
+        };
+        let execution = AgentExecution {
+            id: agent_execution_id,
+            stage_execution_id: Some(stage_execution_id),
+            agent_id: "proposal_reviewer_macos".into(),
+            provider: "claude_acp".into(),
+            model: Some("opus".into()),
+            status: AgentStatus::Failed,
+            started_at: now - Duration::minutes(3),
+            completed_at: Some(now),
+            owner_execution_lineage_id: Some(stage_execution_id.to_string()),
+            session_lineage_id: Some("lineage-1".into()),
+            session_generation_id: Some("generation-1".into()),
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: Some("owner-key".into()),
+            session_reuse_scope: Some("none".into()),
+            session_family_id: None,
+            session_reuse_disposition: None,
+            session_reset_reason: None,
+            backend_profile_id: None,
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
+            mcp_session_startup_latency_ms: None,
+            owner_kind: None,
+            owner_id: None,
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
+        };
+        let facts_by_execution = HashMap::new();
+
+        assert_eq!(
+            authoritative_failed_stage_invokes(&[&item], &[execution], &facts_by_execution),
+            1,
+            "fan-in must not wait forever when work item is running but its claimed agent is terminal failed"
         );
     }
 

@@ -1,0 +1,10 @@
+{
+  "schema_version": "p089_temp_inventory_negative_fixture_v1",
+  "expected_status": "fail",
+  "negative_condition": "Exported operator readback exposes raw absolute home or system temp paths instead of path_display plus path_hash.",
+  "unsafe_sample": {
+    "path_display": "/Users/example/Library/Caches/Chainworks Forge/tmp/provider-runtime/session-1",
+    "path_hash": null
+  },
+  "assertion": "The gate must fail when exported readback leaks raw absolute paths or omits a stable path hash."
+}

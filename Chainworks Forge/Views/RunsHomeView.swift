@@ -558,7 +558,12 @@ struct RunsHomeView: View {
                         }
 
                         if let stageMap = workbench.stageMap {
-                            P036StageMapCard(map: stageMap)
+                            P036OverviewCommandCenterCard(
+                                map: stageMap,
+                                activeAgents: workbench.activeTimelineAgents,
+                                artifacts: workbench.artifactsAndReports,
+                                recoveryEvidence: workbench.recoveryEvidence
+                            )
                         }
 
                         if let continuationReadback = runDetail.continuationReadback {
@@ -5870,6 +5875,667 @@ private struct P036RunDetailSummaryCard: View {
         NSPasteboard.general.setString(runID, forType: .string)
         copyFeedback = "Copied full run ID"
         #endif
+    }
+}
+
+private struct P036OverviewCommandCenterCard: View {
+    let map: RunsWorkbenchPresentationModel.StageMap
+    let activeAgents: [RunsWorkbenchPresentationModel.ActiveTimelineAgent]
+    let artifacts: [RunsWorkbenchPresentationModel.ArtifactReportRow]
+    let recoveryEvidence: [RunsWorkbenchPresentationModel.RecoveryEvidenceRow]
+
+    private var currentStage: RunsWorkbenchPresentationModel.StageCard? {
+        map.stages.first(where: \.isCurrent)
+            ?? map.stages.first(where: { $0.status == "active" })
+            ?? map.stages.first(where: { $0.status == "blocked" })
+    }
+
+    private var currentStageIndex: Int? {
+        guard let currentStage else { return nil }
+        return map.stages.firstIndex(where: { $0.id == currentStage.id })
+    }
+
+    private var previousStage: RunsWorkbenchPresentationModel.StageCard? {
+        if let currentStageIndex {
+            return map.stages[..<currentStageIndex].last(where: { $0.status == "terminal" })
+        }
+        return map.stages.last(where: { $0.status == "terminal" })
+    }
+
+    private var nextTransitions: [RunsWorkbenchPresentationModel.StageTransition] {
+        Array((currentStage?.transitions ?? []).prefix(4))
+    }
+
+    private var latestCompletedStageArtifacts: [RunsWorkbenchPresentationModel.ArtifactReportRow] {
+        guard let previousStage else { return [] }
+        let rows = artifacts.filter { $0.presentation.stageID == previousStage.id }
+        guard !rows.isEmpty else { return [] }
+        let latestIteration = rows.map { $0.presentation.iteration ?? -1 }.max() ?? -1
+        let iterationRows = rows.filter { ($0.presentation.iteration ?? -1) == latestIteration }
+        let latestAttempt = iterationRows.map { $0.presentation.attemptNumber ?? -1 }.max() ?? -1
+        return Array(iterationRows
+            .filter { ($0.presentation.attemptNumber ?? -1) == latestAttempt }
+            .prefix(5))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            ForgeSectionHeader(
+                title: "Run focus",
+                subtitle: "Current stage, immediate context, and latest evidence",
+                symbol: "scope"
+            )
+
+            if map.stages.isEmpty {
+                ForgeEmptyState(
+                    title: "No stage readback",
+                    systemImage: "scope",
+                    description: "The control plane has not returned stage topology for this run yet."
+                )
+            } else {
+                P036OverviewStageSnapshotCard(
+                    title: "Current stage",
+                    stage: currentStage,
+                    fallback: "No active stage is marked in readback.",
+                    emphasis: .primary
+                )
+
+                P036ActiveAgentsReadbackCard(
+                    title: "Agents in work",
+                    subtitle: currentStage.map { "Current stage · \($0.title)" } ?? "Latest active-agent readback",
+                    agents: activeAgents,
+                    stageID: currentStage?.id,
+                    emptyText: "No active agent executions for the current stage."
+                )
+
+                HStack(alignment: .top, spacing: 12) {
+                    P036OverviewStageSnapshotCard(
+                        title: "Previous outcome",
+                        stage: previousStage,
+                        fallback: "No completed stage before the current one.",
+                        emphasis: .secondary
+                    )
+
+                    P036OverviewNextStagesCard(transitions: nextTransitions)
+                }
+
+                HStack(alignment: .top, spacing: 12) {
+                    P036OverviewArtifactsCard(
+                        stage: previousStage,
+                        rows: latestCompletedStageArtifacts
+                    )
+
+                    P036OverviewRecoveryDigest(rows: recoveryEvidence)
+                }
+            }
+        }
+        .forgePanel()
+        .accessibilityIdentifier("p036-overview-command-center")
+    }
+}
+
+private struct P036OverviewStageSnapshotCard: View {
+    enum Emphasis {
+        case primary
+        case secondary
+    }
+
+    let title: String
+    let stage: RunsWorkbenchPresentationModel.StageCard?
+    let fallback: String
+    let emphasis: Emphasis
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if let stage {
+                if emphasis == .primary {
+                    HStack(alignment: .top, spacing: 16) {
+                        VStack(alignment: .leading, spacing: 12) {
+                            stageHeader(stage)
+                            occurrenceStack(for: stage, limit: 3)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+
+                        liveFacts(for: stage)
+                    }
+                } else {
+                    stageHeader(stage)
+                    chipRow(for: stage)
+                    Divider()
+                    occurrenceStack(for: stage, limit: 2)
+                }
+            } else {
+                Text(fallback)
+                    .font(ForgeTypography.body)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 86, alignment: .topLeading)
+            }
+        }
+        .padding(emphasis == .primary ? 14 : 12)
+        .frame(maxWidth: .infinity, minHeight: emphasis == .primary ? 184 : 156, alignment: .topLeading)
+        .background(
+            RoundedRectangle(cornerRadius: emphasis == .primary ? 12 : 10, style: .continuous)
+                .fill(emphasis == .primary ? ForgeStatusColor.running.opacity(0.07) : ForgeColor.Surface.elevated)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: emphasis == .primary ? 12 : 10, style: .continuous)
+                .strokeBorder(
+                    emphasis == .primary ? ForgeStatusColor.running.opacity(0.72) : ForgeColor.Surface.border,
+                    lineWidth: emphasis == .primary ? 2 : 1
+                )
+        }
+    }
+
+    private func stageHeader(_ stage: RunsWorkbenchPresentationModel.StageCard) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text(String(format: "%02d", stage.ordinal))
+                .font(ForgeTypography.body.monospacedDigit().weight(.semibold))
+                .foregroundStyle(emphasis == .primary ? ForgeStatusColor.running : ForgeColor.Text.tertiary)
+                .frame(width: 30, alignment: .leading)
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text(title.uppercased())
+                    .font(ForgeTypography.micro.weight(.semibold))
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+                Text(stage.title)
+                    .font(emphasis == .primary ? ForgeTypography.sectionHeader : ForgeTypography.body.weight(.semibold))
+                    .foregroundStyle(ForgeColor.Text.primary)
+                    .lineLimit(emphasis == .primary ? 2 : 3)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(stage.ownerAgentTitle)
+                    .font(ForgeTypography.micro)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 8)
+
+            StatusCapsule(
+                text: statusLabel(for: stage.status),
+                color: statusColor(for: stage.status),
+                icon: statusIconName(for: stage.status),
+                size: .small
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func chipRow(for stage: RunsWorkbenchPresentationModel.StageCard) -> some View {
+        let chips = metadataChips(for: stage)
+        if !chips.isEmpty {
+            HStack(spacing: 6) {
+                ForEach(chips, id: \.self) { chip in
+                    Text(chip)
+                        .font(ForgeTypography.micro)
+                        .foregroundStyle(ForgeColor.Text.secondary)
+                        .lineLimit(1)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(ForgeColor.Surface.muted, in: Capsule())
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func occurrenceStack(for stage: RunsWorkbenchPresentationModel.StageCard, limit: Int) -> some View {
+        if stage.occurrences.isEmpty {
+            Text(stage.status == "terminal" ? "No agent rows in latest readback." : "No active agent rows in latest readback.")
+                .font(ForgeTypography.supporting)
+                .foregroundStyle(ForgeColor.Text.tertiary)
+        } else {
+            VStack(alignment: .leading, spacing: 7) {
+                ForEach(stage.occurrences.prefix(limit)) { occurrence in
+                    P036StageOccurrenceRow(occurrence: occurrence)
+                }
+                if stage.hiddenOccurrenceCount > 0 {
+                    Text("+ \(stage.hiddenOccurrenceCount) more")
+                        .font(ForgeTypography.micro)
+                        .foregroundStyle(ForgeColor.Text.tertiary)
+                }
+            }
+        }
+    }
+
+    private func liveFacts(for stage: RunsWorkbenchPresentationModel.StageCard) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("LIVE FACTS")
+                .font(ForgeTypography.micro.weight(.semibold))
+                .foregroundStyle(ForgeColor.Text.tertiary)
+            factRow("Owner", stage.ownerAgentTitle)
+            factRow("Iteration", displayValue(stage.iterationText))
+            factRow("Attempt", displayValue(stage.attemptText))
+            factRow("Artifacts", "\(stage.artifactCount)")
+            factRow("Events", "\(stage.communicationCount)")
+        }
+        .padding(12)
+        .frame(width: 190, alignment: .topLeading)
+        .background(ForgeColor.Surface.elevated.opacity(0.72), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(ForgeColor.Surface.border, lineWidth: 1)
+        }
+    }
+
+    private func factRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(label)
+                .font(ForgeTypography.micro)
+                .foregroundStyle(ForgeColor.Text.tertiary)
+            Spacer(minLength: 8)
+            Text(value)
+                .font(ForgeTypography.micro.monospacedDigit().weight(.semibold))
+                .foregroundStyle(ForgeColor.Text.primary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+
+    private func displayValue(_ value: String?) -> String {
+        guard let value, !value.isEmpty else { return "—" }
+        return value
+    }
+
+    private func metadataChips(for stage: RunsWorkbenchPresentationModel.StageCard) -> [String] {
+        [
+            stage.iterationText,
+            stage.attemptText,
+            stage.approvalRequired ? "Approval" : nil,
+            stage.artifactCount > 0 ? "\(stage.artifactCount) artifacts" : nil,
+            stage.communicationCount > 0 ? "\(stage.communicationCount) events" : nil
+        ].compactMap { $0 }.filter { !$0.isEmpty }
+    }
+
+    private func statusColor(for status: String) -> Color {
+        switch status {
+        case "terminal": return ForgeStatusColor.success
+        case "active": return ForgeStatusColor.running
+        case "blocked": return ForgeStatusColor.error
+        case "pending": return ForgeStatusColor.neutral
+        default: return ForgeStatusColor.neutral
+        }
+    }
+
+    private func statusLabel(for status: String) -> String {
+        switch status {
+        case "terminal": return "Completed"
+        case "active": return "Running"
+        case "blocked": return "Blocked"
+        case "pending": return "Pending"
+        default: return "Unavailable"
+        }
+    }
+
+    private func statusIconName(for status: String) -> String {
+        switch status {
+        case "terminal": return "checkmark.circle.fill"
+        case "active": return "play.circle.fill"
+        case "blocked": return "exclamationmark.octagon.fill"
+        case "pending": return "clock.fill"
+        default: return "questionmark.circle.fill"
+        }
+    }
+}
+
+private struct P036OverviewNextStagesCard: View {
+    let transitions: [RunsWorkbenchPresentationModel.StageTransition]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("NEXT ROUTES")
+                    .font(ForgeTypography.micro.weight(.semibold))
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+                Spacer(minLength: 8)
+                if !transitions.isEmpty {
+                    Text("\(transitions.count) route\(transitions.count == 1 ? "" : "s")")
+                        .font(ForgeTypography.micro.monospacedDigit())
+                        .foregroundStyle(ForgeColor.Text.tertiary)
+                }
+            }
+
+            if transitions.isEmpty {
+                Text("No next route in topology readback.")
+                    .font(ForgeTypography.body)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 86, alignment: .topLeading)
+            } else {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(transitions) { transition in
+                        let route = routePresentation(for: transition)
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: route.iconName)
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(route.color)
+                                .frame(width: 18, height: 22)
+
+                            VStack(alignment: .leading, spacing: 5) {
+                                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                    Text(route.label)
+                                        .font(ForgeTypography.micro.weight(.semibold))
+                                        .foregroundStyle(route.color)
+                                        .lineLimit(1)
+                                        .padding(.horizontal, 7)
+                                        .padding(.vertical, 2)
+                                        .background(route.color.opacity(0.14), in: Capsule())
+                                    Spacer(minLength: 6)
+                                }
+
+                                Text(transition.toLabel)
+                                    .font(ForgeTypography.body.weight(.semibold))
+                                    .foregroundStyle(ForgeColor.Text.primary)
+                                    .lineLimit(2)
+                                Text(route.summary)
+                                    .font(ForgeTypography.micro)
+                                    .foregroundStyle(ForgeColor.Text.secondary)
+                                    .lineLimit(2)
+                            }
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(ForgeColor.Surface.muted, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, minHeight: 156, alignment: .topLeading)
+        .background(ForgeColor.Surface.elevated, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(ForgeColor.Surface.border, lineWidth: 1)
+        }
+    }
+
+    private struct RoutePresentation {
+        let label: String
+        let summary: String
+        let iconName: String
+        let color: Color
+    }
+
+    private func routePresentation(for transition: RunsWorkbenchPresentationModel.StageTransition) -> RoutePresentation {
+        let target = transition.toLabel.lowercased()
+        let detail = (transition.detail ?? "").lowercased()
+
+        if target.contains("continued") || target.contains("refined") || detail.contains("needs_code_fixes") || detail.contains("invalid") {
+            return RoutePresentation(
+                label: "Fix path",
+                summary: "Used when review finds code-owned fixes, invalid output, or remaining implementation work.",
+                iconName: "arrow.uturn.left.circle.fill",
+                color: ForgeStatusColor.warning
+            )
+        }
+
+        if target.contains("manual release") || target.contains("workflow complete") || detail.contains("complete") || detail.contains("handoff_required") {
+            return RoutePresentation(
+                label: "Ready path",
+                summary: "Used when implementation is complete or the remaining work is a downstream handoff.",
+                iconName: "arrow.right.circle.fill",
+                color: ForgeStatusColor.success
+            )
+        }
+
+        if target.contains("approval") || detail.contains("approval") {
+            return RoutePresentation(
+                label: "Approval path",
+                summary: "Routes to an explicit operator decision before execution continues.",
+                iconName: "checkmark.seal.fill",
+                color: ForgeStatusColor.approval
+            )
+        }
+
+        return RoutePresentation(
+            label: "Conditional path",
+            summary: readableCondition(from: transition.detail),
+            iconName: "arrow.right.circle.fill",
+            color: ForgeStatusColor.running
+        )
+    }
+
+    private func readableCondition(from detail: String?) -> String {
+        guard let detail, !detail.isEmpty else {
+            return "Available when the current stage transition condition passes."
+        }
+        let normalized = detail
+            .replacingOccurrences(of: "implementation_self_assessment_v2.status", with: "self-assessment status")
+            .replacingOccurrences(of: "==", with: "is")
+            .replacingOccurrences(of: "||", with: "or")
+            .replacingOccurrences(of: "&&", with: "and")
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "'", with: "")
+        return "When \(normalized)"
+    }
+}
+
+private struct P036OverviewArtifactsCard: View {
+    let stage: RunsWorkbenchPresentationModel.StageCard?
+    let rows: [RunsWorkbenchPresentationModel.ArtifactReportRow]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Latest completed-stage artifacts")
+                .font(ForgeTypography.body.weight(.semibold))
+                .foregroundStyle(ForgeColor.Text.primary)
+            Text(stage.map { "From \($0.title)" } ?? "No completed stage selected")
+                .font(ForgeTypography.micro)
+                .foregroundStyle(ForgeColor.Text.secondary)
+                .lineLimit(1)
+
+            if rows.isEmpty {
+                Text("No latest-iteration artifacts returned for the previous completed stage.")
+                    .font(ForgeTypography.micro)
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+                    .frame(maxWidth: .infinity, minHeight: 54, alignment: .topLeading)
+            } else {
+                VStack(spacing: 6) {
+                    ForEach(rows) { row in
+                        HStack(spacing: 8) {
+                            Image(systemName: "doc.text")
+                                .foregroundStyle(ForgeColor.Text.secondary)
+                            Text(row.title)
+                                .font(ForgeTypography.micro.weight(.semibold))
+                                .foregroundStyle(ForgeColor.Text.primary)
+                                .lineLimit(1)
+                            Spacer(minLength: 8)
+                            Text(row.payloadAvailability.rawValue.replacingOccurrences(of: "_", with: " "))
+                                .font(ForgeTypography.micro)
+                                .foregroundStyle(ForgeColor.Text.secondary)
+                                .lineLimit(1)
+                        }
+                        .padding(.vertical, 6)
+                        .padding(.horizontal, 8)
+                        .background(ForgeColor.Surface.muted, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .background(ForgeColor.Surface.elevated, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(ForgeColor.Surface.border, lineWidth: 1)
+        }
+    }
+}
+
+private struct P036OverviewRecoveryDigest: View {
+    let rows: [RunsWorkbenchPresentationModel.RecoveryEvidenceRow]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Recovery evidence")
+                .font(ForgeTypography.body.weight(.semibold))
+                .foregroundStyle(ForgeColor.Text.primary)
+            Text(rows.isEmpty ? "No recovery facts" : "\(rows.count) diagnostic row\(rows.count == 1 ? "" : "s")")
+                .font(ForgeTypography.micro)
+                .foregroundStyle(ForgeColor.Text.secondary)
+
+            if rows.isEmpty {
+                Text("Nothing to review.")
+                    .font(ForgeTypography.micro)
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+                    .frame(maxWidth: .infinity, minHeight: 54, alignment: .topLeading)
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(rows.prefix(3)) { row in
+                        Label(row.title, systemImage: "bandage.fill")
+                            .font(ForgeTypography.micro)
+                            .foregroundStyle(ForgeColor.Text.secondary)
+                            .lineLimit(2)
+                    }
+                    if rows.count > 3 {
+                        Text("+ \(rows.count - 3) more")
+                            .font(ForgeTypography.micro)
+                            .foregroundStyle(ForgeColor.Text.tertiary)
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .frame(width: 260, alignment: .topLeading)
+        .background(ForgeColor.Surface.elevated, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(ForgeColor.Surface.border, lineWidth: 1)
+        }
+    }
+}
+
+private struct P036ActiveAgentsReadbackCard: View {
+    let title: String
+    let subtitle: String
+    let agents: [RunsWorkbenchPresentationModel.ActiveTimelineAgent]
+    let stageID: String?
+    let emptyText: String
+
+    private var visibleAgents: [RunsWorkbenchPresentationModel.ActiveTimelineAgent] {
+        let scoped = stageID.map { id in
+            agents.filter { $0.stageID == id }
+        } ?? agents
+        return scoped.sorted {
+            if let lhs = $0.selectionOrder, let rhs = $1.selectionOrder, lhs != rhs {
+                return lhs < rhs
+            }
+            if $0.latestAt != $1.latestAt {
+                return $0.latestAt > $1.latestAt
+            }
+            return $0.title.localizedStandardCompare($1.title) == .orderedAscending
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(title.uppercased())
+                    .font(ForgeTypography.micro.weight(.semibold))
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+                Text(subtitle)
+                    .font(ForgeTypography.micro)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                    .lineLimit(1)
+                Spacer()
+                if !visibleAgents.isEmpty {
+                    Text("\(visibleAgents.count) active")
+                        .font(ForgeTypography.micro.monospacedDigit().weight(.semibold))
+                        .foregroundStyle(ForgeStatusColor.running)
+                }
+            }
+
+            if visibleAgents.isEmpty {
+                Text(emptyText)
+                    .font(ForgeTypography.supporting)
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+                    .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+            } else {
+                VStack(alignment: .leading, spacing: 7) {
+                    ForEach(visibleAgents) { agent in
+                        P036ActiveAgentReadbackRow(agent: agent)
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .background(ForgeColor.Surface.elevated.opacity(0.72), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(ForgeColor.Surface.border, lineWidth: 1)
+        }
+    }
+}
+
+private struct P036ActiveAgentReadbackRow: View {
+    let agent: RunsWorkbenchPresentationModel.ActiveTimelineAgent
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "bolt.circle.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(ForgeStatusColor.running)
+                .frame(width: 14)
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(agent.title)
+                        .font(ForgeTypography.micro.weight(.semibold))
+                        .foregroundStyle(ForgeColor.Text.primary)
+                        .lineLimit(1)
+                    Text(statusLabel)
+                        .font(ForgeTypography.micro)
+                        .foregroundStyle(ForgeStatusColor.running)
+                        .lineLimit(1)
+                }
+
+                Text(detailText)
+                    .font(ForgeTypography.micro)
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            Spacer(minLength: 8)
+
+            if agent.eventCount > 0 {
+                Text("\(agent.eventCount) events")
+                    .font(ForgeTypography.micro.monospacedDigit())
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(agent.title), \(statusLabel), \(detailText), \(agent.eventCount) events")
+    }
+
+    private var statusLabel: String {
+        let status = agent.status.trimmingCharacters(in: .whitespacesAndNewlines)
+        return status.isEmpty ? "running" : status
+    }
+
+    private var providerModelLabel: String? {
+        let parts = [
+            agent.providerID,
+            agent.modelID,
+        ].compactMap { value -> String? in
+            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        guard !parts.isEmpty else { return nil }
+        return parts.joined(separator: " · ")
+    }
+
+    private var detailText: String {
+        [
+            providerModelLabel,
+            agent.stageLabel,
+            agent.taskLabel,
+            agent.sessionID.map { "session \($0)" },
+        ].compactMap { value -> String? in
+            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        .joined(separator: " · ")
     }
 }
 

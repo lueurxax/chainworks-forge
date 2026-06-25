@@ -64,9 +64,12 @@ outputs through the normal discovery-decision materialization functions. That
 gate is provider-specific proof, not a broader replacement for this contract or
 for the P088 completion-repair boundary.
 
-### Missing outputs get one same-session repair turn
+### Missing or malformed outputs get one same-session repair turn
 
-When an agent turn finishes without required outputs, the runtime must try one narrow repair turn in the same live ACP session before it invalidates that session or blocks the run for `missing_required_outputs`.
+When an agent turn finishes without required outputs, or with a malformed final
+`CHAINWORKS_OUTPUT` object for a declared output, the runtime must try one narrow
+repair turn in the same live ACP session before it invalidates that session or
+blocks the run for `missing_required_outputs` / `invalid_required_outputs`.
 
 The repair turn is not a task retry. It must:
 
@@ -78,6 +81,13 @@ The repair turn is not a task retry. It must:
 - and validate the repaired payloads through the same declared-output import path.
 
 If the repair turn produces contract-valid required outputs, the executor merges the repair result into the original execution result and the stage may continue without a new provider session. If the repair turn fails, cannot be settled, or still does not produce valid outputs, the runtime records the failed output settlement and then invalidates/closes the active session generation so the next operator retry starts from a fresh session.
+
+Malformed final-envelope repair is strict. The engine records
+`malformed_json_contract_output` with the parser error, output name, and canonical
+target path, then asks for a fresh valid JSON object. It must not auto-edit the
+provider's malformed JSON, even when a small syntax fix would make it parse.
+Repair output is accepted only after the normal declared-output binding,
+contract validation, and materialization path succeeds.
 
 Repair settlement must bind only exact declared output identities. When prompts use canonical target paths as
 `CHAINWORKS_OUTPUT` keys, those keys must match byte-for-byte after JSON decoding: no leading/trailing whitespace,
@@ -633,6 +643,13 @@ For this slice, the current northbound readers are:
 - and stage projections for the lightweight `has_validation_failure` bit.
 
 The typed source of truth for failure detail is the durable `ValidationFailureRecord`, not loose artifact metadata.
+
+For malformed final `CHAINWORKS_OUTPUT` failures, `ValidationFailureRecord`
+includes `diagnostic_artifact_paths` when redacted completion text was captured.
+This makes the final provider handoff inspectable even if a native provider
+session archive is incomplete or later unavailable. The linked completion text is
+diagnostic evidence only; aggregate stages still consume only normalized,
+contract-valid outputs.
 
 That means:
 

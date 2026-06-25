@@ -1843,13 +1843,15 @@ pub async fn complete_running_invoke_agents_with_terminal_valid_outputs_on_start
          AND claim.claim_state IN (?4, ?5)
         JOIN agent_execution_runtime_facts facts
           ON facts.agent_execution_id = ae.id
-         AND facts.output_settlement IN (?2, ?3)
 	        WHERE wi.kind = ?6
 	          AND wi.status = ?7
 	          AND json_valid(wi.payload_json)
 	          AND wi.id NOT LIKE 'auto-contract-output-retry:%'
           AND (
-            COALESCE(facts.valid_required_outputs, 0) > 0
+            (
+              facts.output_settlement IN (?2, ?3)
+              AND COALESCE(facts.valid_required_outputs, 0) > 0
+            )
             OR EXISTS (
               SELECT 1
               FROM artifact_contract_generations gen
@@ -1860,6 +1862,14 @@ pub async fn complete_running_invoke_agents_with_terminal_valid_outputs_on_start
                 AND gen.output_settlement IN (?2, ?3)
                 AND gen.valid = 1
                 AND gen.source_generation_verified = 1
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM agent_execution_discovery_diagnostics diag
+              WHERE diag.agent_execution_id = ae.id
+                AND COALESCE(diag.missing_required_output_count, 0) = 0
+                AND COALESCE(diag.rejected_output_count, 0) = 0
+                AND COALESCE(diag.stale_output_count, 0) = 0
             )
           )
           AND (
@@ -1925,9 +1935,17 @@ pub async fn fail_running_invoke_agents_with_terminal_failed_outputs_on_startup(
 	        WHERE wi.kind = ?3
 	          AND wi.status = ?4
 	          AND json_valid(wi.payload_json)
-	          AND NOT (
+          AND NOT (
             facts.output_settlement IN (?5, ?6)
             AND COALESCE(facts.valid_required_outputs, 0) > 0
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM agent_execution_discovery_diagnostics diag
+            WHERE diag.agent_execution_id = ae.id
+              AND COALESCE(diag.missing_required_output_count, 0) = 0
+              AND COALESCE(diag.rejected_output_count, 0) = 0
+              AND COALESCE(diag.stale_output_count, 0) = 0
           )
           AND json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id') IS NOT NULL
         ORDER BY wi.scheduled_at ASC, wi.rowid ASC
@@ -1980,6 +1998,14 @@ pub async fn running_invoke_agent_has_terminal_failed_outputs(
           AND NOT (
             facts.output_settlement IN (?6, ?7)
             AND COALESCE(facts.valid_required_outputs, 0) > 0
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM agent_execution_discovery_diagnostics diag
+            WHERE diag.agent_execution_id = ae.id
+              AND COALESCE(diag.missing_required_output_count, 0) = 0
+              AND COALESCE(diag.rejected_output_count, 0) = 0
+              AND COALESCE(diag.stale_output_count, 0) = 0
           )
         "#,
     )
@@ -3204,11 +3230,13 @@ async fn validate_running_invoke_completion_has_valid_outputs_tx(
             AND claim.claim_state IN (?7, ?8)
            JOIN agent_execution_runtime_facts facts
              ON facts.agent_execution_id = ae.id
-            AND facts.output_settlement IN (?5, ?6, ?12)
            WHERE wi.id = ?2
              AND wi.run_id = ?4
              AND (
-               COALESCE(facts.valid_required_outputs, 0) > 0
+               (
+                 facts.output_settlement IN (?5, ?6, ?12)
+                 AND COALESCE(facts.valid_required_outputs, 0) > 0
+               )
                OR EXISTS (
                  SELECT 1
                  FROM artifact_contract_generations gen
@@ -3219,6 +3247,14 @@ async fn validate_running_invoke_completion_has_valid_outputs_tx(
                    AND gen.output_settlement IN (?5, ?6, ?12)
                    AND gen.valid = 1
                    AND gen.source_generation_verified = 1
+               )
+               OR EXISTS (
+                 SELECT 1
+                 FROM agent_execution_discovery_diagnostics diag
+                 WHERE diag.agent_execution_id = ae.id
+                   AND COALESCE(diag.missing_required_output_count, 0) = 0
+                   AND COALESCE(diag.rejected_output_count, 0) = 0
+                   AND COALESCE(diag.stale_output_count, 0) = 0
                )
              )"#,
     )
@@ -6940,6 +6976,198 @@ mod tests {
             .unwrap()
             .is_some(),
             "P082: completion recovery must enqueue exactly the normal post-invoke AdvanceRun"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_completes_failed_invoke_when_discovery_accepted_outputs() {
+        let pool = test_pool().await;
+        let run_id = RunId::new();
+        let stage_execution_id = StageExecutionId::new();
+        let agent_execution_id = AgentExecutionId::new();
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let work_item_id = "invoke-failed-with-accepted-discovery";
+
+        sqlx::query(
+            r#"INSERT INTO ideas (id, title, body, status, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)"#,
+        )
+        .bind("idea-failed-accepted-discovery")
+        .bind("failed accepted discovery recovery")
+        .bind("body")
+        .bind("active")
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert idea");
+        sqlx::query(
+            r#"INSERT INTO runs
+               (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        )
+        .bind(run_id.to_string())
+        .bind("idea-failed-accepted-discovery")
+        .bind("running")
+        .bind("wf")
+        .bind("Workflow")
+        .bind("/tmp/ws")
+        .bind("/tmp/artifacts")
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert run");
+        sqlx::query(
+            r#"INSERT INTO stage_executions
+               (id, run_id, stage_id, label, status, iteration, attempt_number, started_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        )
+        .bind(stage_execution_id.to_string())
+        .bind(run_id.to_string())
+        .bind("proposal_refinement")
+        .bind("Proposal Refinement")
+        .bind("running")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert stage execution");
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, status, started_at, completed_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)"#,
+        )
+        .bind(agent_execution_id.to_string())
+        .bind(stage_execution_id.to_string())
+        .bind("proposal_writer")
+        .bind("codex")
+        .bind(AgentStatus::Failed.to_string())
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert failed agent execution");
+
+        let mut facts =
+            domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+        facts.output_settlement = domain::agent::AgentOutputSettlement::InvalidRequiredOutputs;
+        facts.valid_required_outputs = false;
+        crate::repos::agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .expect("insert invalid-output runtime facts");
+        sqlx::query(
+            r#"INSERT INTO agent_execution_discovery_diagnostics
+               (agent_execution_id, discovery_diagnostics_json, discovery_schema_version,
+                legacy_broad_discovery_used, missing_required_output_count, rejected_output_count,
+                stale_output_count, meta_discovery_truncated, git_manifest_status,
+                resume_warning_count, created_at, updated_at)
+               VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, ?4, 0, ?5, ?5)"#,
+        )
+        .bind(agent_execution_id.to_string())
+        .bind(
+            serde_json::json!({
+                "schema_version": "discovery_diagnostics_v1",
+                "agent_execution_id": agent_execution_id.to_string(),
+                "decisions": [],
+                "legacy_broad_discovery_used": false,
+                "generated_at": now,
+            })
+            .to_string(),
+        )
+        .bind("discovery_diagnostics_v1")
+        .bind("clean")
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert accepted discovery diagnostics");
+
+        enqueue(
+            &pool,
+            &WorkItem {
+                id: work_item_id.to_string(),
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": "proposal_refinement",
+                    "stage_execution_id": stage_execution_id.to_string(),
+                    "p058_claimed": {
+                        "agent_execution_id": agent_execution_id.to_string(),
+                        "session_generation_id": "generation-accepted-discovery"
+                    }
+                })
+                .to_string(),
+                status: WorkItemStatus::Running,
+                run_id: Some(run_id),
+                stage_id: Some("proposal_refinement".to_string()),
+                created_at: now,
+                scheduled_at: now,
+                attempt_count: 1,
+                last_error: None,
+            },
+        )
+        .await
+        .expect("insert running accepted-discovery InvokeAgent work item");
+
+        let claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
+            run_id,
+            owner_kind: domain::mediation::OwnerKind::StageExecution,
+            owner_id: stage_execution_id.to_string(),
+            stage_execution_id: Some(stage_execution_id),
+            agent_execution_id,
+            source_work_item_id: work_item_id.to_string(),
+        };
+        crate::repos::artifact_contracts::insert_source_generation_claim(
+            &pool,
+            domain::artifact_contracts::ArtifactSourceGenerationClaim {
+                key: claim_key,
+                current_session_generation_id: Some("generation-accepted-discovery".to_string()),
+                claim_state: ArtifactSourceClaimState::Closed,
+                superseding_work_item_id: None,
+                superseded_by_agent_execution_id: None,
+                supersession_journal_id: None,
+                superseded_at: None,
+                closed_at: Some(now),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("insert closed source claim for accepted discovery execution");
+
+        let completed = complete_running_invoke_agents_with_terminal_valid_outputs_on_startup(
+            &pool,
+            "startup_repair_failed_agent_accepted_discovery",
+        )
+        .await
+        .expect("complete failed execution with accepted discovery outputs");
+        assert_eq!(
+            completed, 1,
+            "accepted discovery diagnostics should recover the stale source work item"
+        );
+        let failed = fail_running_invoke_agents_with_terminal_failed_outputs_on_startup(
+            &pool,
+            "startup_repair_terminal_agent_missing_outputs",
+        )
+        .await
+        .expect("failed-output recovery should ignore accepted-discovery execution");
+        assert_eq!(failed, 0);
+        assert!(
+            !running_invoke_agent_has_terminal_failed_outputs(&pool, work_item_id)
+                .await
+                .expect("accepted discovery should not look like terminal failed outputs")
+        );
+
+        let item = find_by_id(&pool, work_item_id).await.unwrap().unwrap();
+        assert_eq!(item.status, WorkItemStatus::Completed);
+        assert!(
+            find_by_id(
+                &pool,
+                "advance-after-invoke:invoke-failed-with-accepted-discovery"
+            )
+            .await
+            .unwrap()
+            .is_some(),
+            "accepted-discovery recovery must enqueue normal post-invoke AdvanceRun"
         );
     }
 

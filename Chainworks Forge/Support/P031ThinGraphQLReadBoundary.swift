@@ -620,7 +620,7 @@ struct P072ApprovalMutationClient<Transport: P031GraphQLReadTransport>: Sendable
       document: P031GraphQLDocuments.approveApproval,
       variables: [
         "approvalId": .string(approvalID),
-        "idempotencyKey": .string(idempotencyKey),
+        "requestId": .string(idempotencyKey),
       ]
     ).approveApproval
   }
@@ -633,7 +633,7 @@ struct P072ApprovalMutationClient<Transport: P031GraphQLReadTransport>: Sendable
       variables: [
         "approvalId": .string(approvalID),
         "reason": .string(reason),
-        "idempotencyKey": .string(idempotencyKey),
+        "requestId": .string(idempotencyKey),
       ]
     ).rejectApproval
   }
@@ -3632,8 +3632,8 @@ enum P031GraphQLDocuments {
     """
 
   static let approveApproval = """
-    mutation P072ApproveApproval($approvalId: ID!, $idempotencyKey: String!) {
-      approveApproval(approvalId: $approvalId, idempotencyKey: $idempotencyKey) {
+    mutation P072ApproveApproval($approvalId: ID!, $requestId: String!) {
+      approveApproval(approvalId: $approvalId, requestId: $requestId) {
         approval {
           id
           runId
@@ -3654,8 +3654,8 @@ enum P031GraphQLDocuments {
     """
 
   static let rejectApproval = """
-    mutation P072RejectApproval($approvalId: ID!, $reason: String!, $idempotencyKey: String!) {
-      rejectApproval(approvalId: $approvalId, reason: $reason, idempotencyKey: $idempotencyKey) {
+    mutation P072RejectApproval($approvalId: ID!, $reason: String!, $requestId: String!) {
+      rejectApproval(approvalId: $approvalId, reason: $reason, requestId: $requestId) {
         approval {
           id
           runId

@@ -2100,8 +2100,32 @@ fn build_declared_output_discovery_settlement_with_filesystem(
         let direct_file_ref = envelope.and_then(|artifact| {
             read_direct_file_ref_output(spec, artifact, pre_prompt_expected_outputs, filesystem)
         });
+        let invalid_direct_file_ref = envelope.is_some_and(|artifact| {
+            looks_like_direct_file_ref_manifest(&artifact.content) && direct_file_ref.is_none()
+        });
         let candidate = if let Some(candidate) = direct_file_ref {
             Some(candidate)
+        } else if let Some(artifact) = envelope.filter(|_| invalid_direct_file_ref) {
+            let mut decision = rejected_output_decision(
+                spec,
+                OutputDiscoveryReason::ContractInvalid,
+                Some(OutputDiscoveryProvenance::ProviderEnvelope),
+                None,
+                None,
+                Some(artifact.content.len() as u64),
+                Some(spec.max_bytes),
+                None,
+                filesystem,
+            );
+            decision
+                .diagnostics
+                .insert("output_mode".to_string(), "direct_file_ref".to_string());
+            decision.diagnostics.insert(
+                "direct_file_ref_rejection".to_string(),
+                "manifest_did_not_resolve_to_fresh_canonical_file".to_string(),
+            );
+            decisions.push(decision);
+            continue;
         } else if let Some(artifact) = envelope {
             Some((
                 OutputDiscoveryReason::ProviderEnvelope,
@@ -2262,42 +2286,16 @@ fn discovery_settlement_idempotency_key(
 }
 
 fn settle_agent_outputs_from_discovery_decisions(
-    declared_outputs: &[DeclaredOutput],
+    _declared_outputs: &[DeclaredOutput],
     expected_outputs: &[ExpectedOutputSpec],
     discovered_artifacts: &[acp::DiscoveredArtifact],
     pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
 ) -> Result<DeclaredOutputDiscoverySettlement> {
-    let settlement = build_declared_output_discovery_settlement(
+    Ok(build_declared_output_discovery_settlement(
         expected_outputs,
         discovered_artifacts,
         pre_prompt_expected_outputs,
-    );
-    for declared in declared_outputs {
-        if let Some(artifact) = find_accepted_provider_artifact_for_output(
-            discovered_artifacts,
-            &settlement.decisions,
-            &declared.output_name,
-            &declared.target_path,
-        ) {
-            write_discovered_output(&declared.target_path, &artifact.content)?;
-        }
-
-        if let (Some(companion_name), Some(companion_path)) = (
-            declared.companion_output_name.as_deref(),
-            declared.companion_path.as_deref(),
-        ) {
-            if let Some(artifact) = find_accepted_provider_artifact_for_output(
-                discovered_artifacts,
-                &settlement.decisions,
-                companion_name,
-                companion_path,
-            ) {
-                write_discovered_output(companion_path, &artifact.content)?;
-            }
-        }
-    }
-
-    Ok(settlement)
+    ))
 }
 
 fn materialize_validated_discovery_decisions(
@@ -2318,6 +2316,7 @@ fn materialize_validated_discovery_decisions(
     for declared in declared_outputs {
         materialize_validated_output_candidate(
             &declared.output_name,
+            &declared.output_name,
             &declared.target_path,
             settlement,
             &valid_output_names,
@@ -2329,6 +2328,7 @@ fn materialize_validated_discovery_decisions(
         ) {
             materialize_validated_output_candidate(
                 companion_name,
+                &declared.output_name,
                 companion_path,
                 settlement,
                 &valid_output_names,
@@ -2340,6 +2340,7 @@ fn materialize_validated_discovery_decisions(
 
 fn materialize_validated_output_candidate(
     output_name: &str,
+    validation_gate_output_name: &str,
     target_path: &str,
     settlement: &DeclaredOutputDiscoverySettlement,
     valid_output_names: &HashSet<&str>,
@@ -2347,7 +2348,7 @@ fn materialize_validated_output_candidate(
     if path_looks_like_directory_target(target_path) {
         return Ok(());
     }
-    if !valid_output_names.contains(output_name) {
+    if !valid_output_names.contains(validation_gate_output_name) {
         return Ok(());
     }
     let Some(decision) = settlement
@@ -2976,17 +2977,14 @@ fn read_direct_file_ref_output(
     }
 
     let digest = sha256_digest(&bytes);
-    if manifest
-        .digest
-        .as_deref()
-        .is_some_and(|expected| normalize_sha256_digest(expected) != digest)
-    {
+    if manifest.digest.as_deref().is_some_and(|expected| {
+        !direct_file_ref_placeholder_digest(expected) && normalize_sha256_digest(expected) != digest
+    }) {
         return None;
     }
-    if manifest
-        .size_bytes
-        .is_some_and(|expected| expected != bytes.len() as u64)
-    {
+    if manifest.size_bytes.is_some_and(|expected| {
+        !direct_file_ref_placeholder_size(expected, bytes.len()) && expected != bytes.len() as u64
+    }) {
         return None;
     }
 
@@ -3019,6 +3017,32 @@ struct DirectFileRefManifest {
     path: String,
     digest: Option<String>,
     size_bytes: Option<u64>,
+}
+
+fn looks_like_direct_file_ref_manifest(content: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(content) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let mode = object
+        .get("mode")
+        .or_else(|| object.get("output_mode"))
+        .or_else(|| object.get("content_mode"))
+        .and_then(serde_json::Value::as_str);
+    if matches!(
+        mode,
+        Some("direct_file" | "direct_file_ref" | "file_ref" | "canonical_file")
+    ) {
+        return true;
+    }
+    (object.contains_key("path") || object.contains_key("canonical_path"))
+        && (object.contains_key("digest")
+            || object.contains_key("sha256")
+            || object.contains_key("size_bytes")
+            || object.contains_key("bytes")
+            || object.contains_key("output_name"))
 }
 
 fn direct_file_ref_manifest(content: &[u8], output_name: &str) -> Option<DirectFileRefManifest> {
@@ -3070,6 +3094,19 @@ fn direct_file_ref_manifest(content: &[u8], output_name: &str) -> Option<DirectF
         digest,
         size_bytes,
     })
+}
+
+fn direct_file_ref_placeholder_digest(value: &str) -> bool {
+    let trimmed = value.trim().trim_start_matches("sha256:").trim();
+    trimmed.is_empty()
+        || matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "pending" | "tbd" | "unknown" | "placeholder"
+        )
+}
+
+fn direct_file_ref_placeholder_size(expected: u64, actual: usize) -> bool {
+    expected == 0 && actual > 0
 }
 
 fn normalize_sha256_digest(value: &str) -> String {
@@ -3200,24 +3237,6 @@ fn read_changed_directory_output(
         current.baseline_status,
         current,
     ))
-}
-
-fn find_accepted_provider_artifact_for_output<'a>(
-    discovered_artifacts: &'a [acp::DiscoveredArtifact],
-    decisions: &[OutputDiscoveryDecision],
-    output_name: &str,
-    target_path: &str,
-) -> Option<&'a acp::DiscoveredArtifact> {
-    let decision = decisions.iter().find(|decision| {
-        decision.output_name == output_name
-            && decision.status == OutputDiscoveryStatus::Accepted
-            && decision.provenance == Some(OutputDiscoveryProvenance::ProviderEnvelope)
-    })?;
-    let payload_ref = decision.accepted_payload_ref.as_deref()?;
-    (payload_ref == provider_envelope_payload_ref(output_name)).then(|| {
-        find_discovered_artifact_for_output(discovered_artifacts, output_name, target_path)
-            .filter(|artifact| artifact.source_path.is_none())
-    })?
 }
 
 fn missing_output_decision(spec: &ExpectedOutputSpec) -> OutputDiscoveryDecision {
@@ -4535,6 +4554,132 @@ fn output_contract_repair_skip_classification(
         .filter(|classification| classification.failure_kind == AgentFailureKind::ProviderQuota)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MalformedChainworksOutputDiagnostic {
+    output_name: String,
+    target_path: String,
+    subtype: &'static str,
+    parser_error: String,
+    raw_payload_size: usize,
+}
+
+fn malformed_chainworks_output_diagnostic(
+    captured_text: &str,
+    declared_outputs: &[DeclaredOutput],
+) -> Option<MalformedChainworksOutputDiagnostic> {
+    if !captured_text.contains("CHAINWORKS_OUTPUT") {
+        return None;
+    }
+    let marker = captured_text.find("\"CHAINWORKS_OUTPUT\"")?;
+    let parser_error = chainworks_output_parse_error(captured_text, marker)?;
+    let declared = declared_outputs.iter().find(|output| {
+        captured_text.contains(&output.target_path) || captured_text.contains(&output.output_name)
+    })?;
+    Some(MalformedChainworksOutputDiagnostic {
+        output_name: declared.output_name.clone(),
+        target_path: declared.target_path.clone(),
+        subtype: "malformed_json_contract_output",
+        parser_error,
+        raw_payload_size: captured_text.len(),
+    })
+}
+
+fn chainworks_output_parse_error(captured_text: &str, marker: usize) -> Option<String> {
+    let mut starts: Vec<usize> = captured_text[..marker]
+        .match_indices('{')
+        .map(|(idx, _)| idx)
+        .collect();
+    starts.push(marker);
+    starts.into_iter().rev().find_map(|start| {
+        let candidate = captured_text[start..].trim();
+        if candidate.is_empty() {
+            return None;
+        }
+        match serde_json::from_str::<serde_json::Value>(candidate) {
+            Ok(value) if value.get("CHAINWORKS_OUTPUT").is_some() => None,
+            Ok(_) => None,
+            Err(error) => Some(error.to_string()),
+        }
+    })
+}
+
+fn classify_malformed_chainworks_output_when_capture_exists(
+    validation: &mut TaskValidationSummary,
+    completion_capture: &acp::AcpCompletionTextCaptureMetadata,
+    transcript_text: Option<&str>,
+    discovered_artifacts: &[acp::DiscoveredArtifact],
+    declared_outputs: &[DeclaredOutput],
+) {
+    if !discovered_artifacts.is_empty()
+        || validation.failure_class
+            != Some(domain::validation::ValidationFailureClass::NoOutputProduced)
+    {
+        return;
+    }
+    let captured_text = completion_capture
+        .captured_text
+        .as_deref()
+        .or(transcript_text)
+        .unwrap_or_default();
+    if !captured_text.contains("\"CHAINWORKS_OUTPUT\"")
+        && !captured_text.contains("CHAINWORKS_OUTPUT")
+    {
+        return;
+    }
+
+    let diagnostic = malformed_chainworks_output_diagnostic(captured_text, declared_outputs);
+    let message = diagnostic.as_ref().map_or_else(
+        || {
+            "malformed CHAINWORKS_OUTPUT envelope was present in provider final text, but no declared output could be extracted; retry/repair should request a valid JSON output envelope only".to_string()
+        },
+        |diagnostic| {
+            format!(
+                "{}: malformed CHAINWORKS_OUTPUT JSON for declared output `{}` at canonical target `{}`; parser_error={}; retry/repair should return one valid JSON object using canonical target path keys",
+                diagnostic.subtype,
+                diagnostic.output_name,
+                diagnostic.target_path,
+                diagnostic.parser_error
+            )
+        },
+    );
+    validation.failure_class =
+        Some(domain::validation::ValidationFailureClass::InvalidRequiredOutputs);
+    validation.failure_summary = Some(message.to_string());
+    validation.raw_output_exists = true;
+    let payload_size = diagnostic
+        .as_ref()
+        .map(|diagnostic| diagnostic.raw_payload_size)
+        .unwrap_or_else(|| captured_text.len());
+    for result in &mut validation.output_results {
+        if result.status != domain::validation::ValidationStatus::Passed {
+            let applies_to_result = diagnostic
+                .as_ref()
+                .is_none_or(|diagnostic| diagnostic.output_name == result.output_name);
+            if applies_to_result {
+                result.validation_error = Some(message.to_string());
+            }
+            if result.raw_payload_size == 0 {
+                result.raw_payload_size = payload_size;
+            }
+        }
+    }
+}
+
+fn validation_failure_is_malformed_chainworks_output(
+    record: &domain::validation::ValidationFailureRecord,
+) -> bool {
+    record.failure_class == domain::validation::ValidationFailureClass::InvalidRequiredOutputs
+        && (record
+            .failure_summary
+            .contains("malformed_json_contract_output")
+            || record.output_results.iter().any(|result| {
+                result
+                    .validation_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("malformed_json_contract_output"))
+            }))
+}
+
 fn redact_runtime_message(message: &str) -> String {
     let mut scrubbed = message.to_string();
     for (name, value) in std::env::vars() {
@@ -4622,32 +4767,6 @@ fn redact_sensitive_assignment(token: &str) -> Option<String> {
         return None;
     }
     Some(format!("{}[redacted]", &token[..=separator]))
-}
-
-fn find_discovered_artifact_for_output<'a>(
-    discovered_artifacts: &'a [acp::DiscoveredArtifact],
-    output_name: &str,
-    target_path: &str,
-) -> Option<&'a acp::DiscoveredArtifact> {
-    discovered_artifacts
-        .iter()
-        .find(|artifact| artifact.name == output_name || artifact.name == target_path)
-}
-
-fn discovered_artifact_matches_declared_output(
-    discovered: &acp::DiscoveredArtifact,
-    declared: &DeclaredOutput,
-) -> bool {
-    discovered.name == declared.output_name
-        || discovered.name == declared.target_path
-        || declared
-            .companion_output_name
-            .as_deref()
-            .is_some_and(|name| discovered.name == name)
-        || declared
-            .companion_path
-            .as_deref()
-            .is_some_and(|path| discovered.name == path)
 }
 
 fn declared_machine_artifact_name<'a>(declared: &'a DeclaredOutput) -> &'a str {
@@ -9484,6 +9603,15 @@ impl BackgroundExecutor {
                                     return Ok(true);
                                 }
                             }
+                            if let Err(fail_error) =
+                                self.work_queue.fail(&item_id, &e.to_string()).await
+                            {
+                                error!(
+                                    item_id = %item_id,
+                                    error = %fail_error,
+                                    "Failed to mark work item failed after completion rejection"
+                                );
+                            }
                             return Err(e);
                         }
                         Ok(true)
@@ -9850,6 +9978,13 @@ impl BackgroundExecutor {
                                             }
                                         } else {
                                             error!(item_id = %item_id, error = %e, "Failed to mark work item complete");
+                                            if let Err(e2) = executor
+                                                .work_queue
+                                                .fail(&item_id, &e.to_string())
+                                                .await
+                                            {
+                                                error!(item_id = %item_id, error = %e2, "Failed to mark work item failed after completion rejection");
+                                            }
                                         }
                                     }
                                 }
@@ -9915,6 +10050,11 @@ impl BackgroundExecutor {
                                         }
                                     } else {
                                         error!(item_id = %item_id, error = %e, "Failed to mark work item complete");
+                                        if let Err(e2) =
+                                            self.work_queue.fail(&item_id, &e.to_string()).await
+                                        {
+                                            error!(item_id = %item_id, error = %e2, "Failed to mark work item failed after completion rejection");
+                                        }
                                     }
                                 }
                             }
@@ -14065,7 +14205,7 @@ impl BackgroundExecutor {
                         )
                     })
                     .unwrap_or_default();
-                let validation_summary_override = if captured_declared_outputs.is_empty() {
+                let mut validation_summary_override = if captured_declared_outputs.is_empty() {
                     None
                 } else {
                     Some(
@@ -14078,6 +14218,15 @@ impl BackgroundExecutor {
                         .await?,
                     )
                 };
+                if let Some(summary) = validation_summary_override.as_mut() {
+                    classify_malformed_chainworks_output_when_capture_exists(
+                        summary,
+                        &result.completion_text_capture,
+                        result.transcript_text.as_deref(),
+                        &result.discovered_artifacts,
+                        &declared_outputs,
+                    );
+                }
                 let (
                     acp_cap_validation_sample_size,
                     acp_cap_validation_p90_output_bytes,
@@ -14336,7 +14485,7 @@ impl BackgroundExecutor {
 
                 if let Some(summary) = validation_summary {
                     if summary.failure_class.is_some() {
-                        let validation_failure_record = build_validation_failure_record(
+                        let mut validation_failure_record = build_validation_failure_record(
                             domain::ids::ArtifactId::new(),
                             run_id,
                             stage_id.clone(),
@@ -14353,6 +14502,30 @@ impl BackgroundExecutor {
                             ))
                             .exists(),
                         )?;
+                        if validation_failure_is_malformed_chainworks_output(
+                            &validation_failure_record,
+                        ) {
+                            if let Ok(Some(paths)) = persist_p088_completion_text_artifacts(
+                                &run.artifact_root,
+                                agent_exec_id,
+                                "validation_failure",
+                                0,
+                                &result.completion_text_capture,
+                            )
+                            .await
+                            {
+                                if let Some(redacted_path) = paths.redacted_path {
+                                    validation_failure_record
+                                        .diagnostic_artifact_paths
+                                        .push(redacted_path);
+                                }
+                                if let Some(storage_error) = paths.storage_error {
+                                    validation_failure_record
+                                        .diagnostic_artifact_paths
+                                        .push(format!("storage_error:{storage_error}"));
+                                }
+                            }
+                        }
                         let validation_failure_json =
                             serde_json::to_string_pretty(&validation_failure_record)?;
                         stages::update_validation_failure_json(
@@ -22783,6 +22956,118 @@ plain progress line without gate evidence";
     }
 
     #[test]
+    fn malformed_chainworks_output_diagnostic_identifies_canonical_path_output() {
+        let declared_outputs = vec![DeclaredOutput {
+            output_name: "proposal_review_summary".to_string(),
+            target_path: "/workspace/.chainworks/runs/run-1/reviews/proposal/ui.json".to_string(),
+            schema: Some(workflow::plan::OutputSchema {
+                contract_id: "proposal_review_v1".to_string(),
+                format: "json".to_string(),
+                human_format: None,
+                machine_format: Some("json".to_string()),
+                validation_mode: Some("strict_structured".to_string()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec!["decision".to_string(), "score".to_string()],
+            }),
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        }];
+        let malformed = r#"{"CHAINWORKS_OUTPUT":{"/workspace/.chainworks/runs/run-1/reviews/proposal/ui.json":{"decision":"request_changes","score":7.0,"assumptions":["a"}}}"#;
+
+        let diagnostic =
+            malformed_chainworks_output_diagnostic(malformed, &declared_outputs).unwrap();
+
+        assert_eq!(diagnostic.output_name, "proposal_review_summary");
+        assert_eq!(
+            diagnostic.target_path,
+            "/workspace/.chainworks/runs/run-1/reviews/proposal/ui.json"
+        );
+        assert_eq!(diagnostic.subtype, "malformed_json_contract_output");
+        assert!(!diagnostic.parser_error.is_empty());
+        assert!(diagnostic.parser_error.contains("line"));
+        assert_eq!(diagnostic.raw_payload_size, malformed.len());
+    }
+
+    #[test]
+    fn malformed_chainworks_output_rewrites_validation_for_repairable_failed_output() {
+        let declared_outputs = vec![DeclaredOutput {
+            output_name: "proposal_review_summary".to_string(),
+            target_path: "/workspace/.chainworks/runs/run-1/reviews/proposal/ui.json".to_string(),
+            schema: Some(workflow::plan::OutputSchema {
+                contract_id: "proposal_review_v1".to_string(),
+                format: "json".to_string(),
+                human_format: None,
+                machine_format: Some("json".to_string()),
+                validation_mode: Some("strict_structured".to_string()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec!["decision".to_string(), "score".to_string()],
+            }),
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        }];
+        let malformed = r#"{"CHAINWORKS_OUTPUT":{"/workspace/.chainworks/runs/run-1/reviews/proposal/ui.json":{"decision":"request_changes","score":7.0,"assumptions":["a"}}}"#;
+        let mut validation = TaskValidationSummary {
+            output_results: vec![domain::validation::OutputValidationResult {
+                output_name: "proposal_review_summary".to_string(),
+                contract_id: Some("proposal_review_v1".to_string()),
+                status: domain::validation::ValidationStatus::Failed,
+                missing_fields: Vec::new(),
+                validation_error: Some("required output was not produced".to_string()),
+                raw_payload_size: 0,
+            }],
+            contract_metadata: vec![],
+            raw_output_exists: false,
+            failure_class: Some(domain::validation::ValidationFailureClass::NoOutputProduced),
+            failure_summary: Some(
+                "proposal_review_summary: required output was not produced".to_string(),
+            ),
+        };
+        let capture = acp::AcpCompletionTextCaptureMetadata {
+            capture_status: acp::AcpCompletionCaptureStatus::Captured,
+            capture_source: Some(acp::AcpCompletionCaptureSource::TerminalFinalResponse),
+            captured_text: Some(malformed.to_string()),
+            raw_byte_limit: 1024,
+            captured_byte_count: malformed.len() as u64,
+            completion_text_truncated: false,
+            extraction_input_truncated: false,
+            extraction_input_sha256: None,
+            absence_reason: None,
+        };
+
+        classify_malformed_chainworks_output_when_capture_exists(
+            &mut validation,
+            &capture,
+            None,
+            &[],
+            &declared_outputs,
+        );
+
+        assert_eq!(
+            validation.failure_class,
+            Some(domain::validation::ValidationFailureClass::InvalidRequiredOutputs)
+        );
+        assert!(validation.raw_output_exists);
+        assert!(validation_summary_requires_output_contract_repair(
+            &validation
+        ));
+        let error = validation.output_results[0]
+            .validation_error
+            .as_deref()
+            .unwrap();
+        assert!(error.contains("malformed_json_contract_output"));
+        assert!(error.contains("proposal_review_summary"));
+        assert!(error.contains("/workspace/.chainworks/runs/run-1/reviews/proposal/ui.json"));
+        assert_eq!(
+            validation.output_results[0].raw_payload_size,
+            malformed.len()
+        );
+    }
+
+    #[test]
     fn output_contract_repair_prompt_uses_contract_complete_skeletons() {
         let declared_outputs = vec![
             DeclaredOutput {
@@ -24240,6 +24525,77 @@ plain progress line without gate evidence";
     }
 
     #[test]
+    fn chainworks_output_present_but_unextracted_is_malformed_output_not_no_output() {
+        let mut validation = TaskValidationSummary {
+            output_results: vec![domain::validation::OutputValidationResult {
+                output_name: "proposal_review_ui".into(),
+                contract_id: Some("proposal_review_v1".into()),
+                status: domain::validation::ValidationStatus::Failed,
+                missing_fields: vec![],
+                validation_error: Some("required output was not produced".into()),
+                raw_payload_size: 0,
+            }],
+            contract_metadata: vec![],
+            raw_output_exists: false,
+            failure_class: Some(domain::validation::ValidationFailureClass::NoOutputProduced),
+            failure_summary: Some("proposal_review_ui: required output was not produced".into()),
+        };
+        let capture = acp::AcpCompletionTextCaptureMetadata {
+            capture_status: acp::AcpCompletionCaptureStatus::Captured,
+            capture_source: Some(acp::AcpCompletionCaptureSource::StreamedUpdateTail),
+            captured_text: Some(
+                r#"{"CHAINWORKS_OUTPUT":{"/tmp/ui.json":{"decision":"approve"}}"#.into(),
+            ),
+            raw_byte_limit: 1024,
+            captured_byte_count: 64,
+            completion_text_truncated: false,
+            extraction_input_truncated: false,
+            extraction_input_sha256: None,
+            absence_reason: None,
+        };
+
+        classify_malformed_chainworks_output_when_capture_exists(
+            &mut validation,
+            &capture,
+            None,
+            &[],
+            &[DeclaredOutput {
+                output_name: "proposal_review_ui".into(),
+                target_path: "/tmp/ui.json".into(),
+                schema: Some(workflow::plan::OutputSchema {
+                    contract_id: "proposal_review_v1".into(),
+                    format: "json".into(),
+                    human_format: None,
+                    machine_format: Some("json".into()),
+                    validation_mode: Some("strict_structured".into()),
+                    normalized_artifact_name: None,
+                    raw_artifact_name: None,
+                    required_fields: vec!["decision".into()],
+                }),
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            }],
+        );
+
+        assert_eq!(
+            validation.failure_class,
+            Some(domain::validation::ValidationFailureClass::InvalidRequiredOutputs)
+        );
+        assert!(validation
+            .failure_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("CHAINWORKS_OUTPUT"));
+        assert!(validation.output_results[0]
+            .validation_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("malformed"));
+        assert!(validation.raw_output_exists);
+    }
+
+    #[test]
     fn provider_quota_prompt_error_skips_output_contract_repair() {
         let mut receipt = sample_runtime_receipt(
             acp::AcpRuntimeReceiptCounters {
@@ -25421,8 +25777,21 @@ plain progress line without gate evidence";
             None,
             false,
         );
-        settle_agent_outputs_from_discovery_decisions(&[declared], &specs, &discovered, &[])
-            .expect("accepted envelope-derived outputs should be materialized to canonical paths");
+        let settlement = settle_agent_outputs_from_discovery_decisions(
+            &[declared.clone()],
+            &specs,
+            &discovered,
+            &[],
+        )
+        .expect("accepted envelope-derived outputs should be materialized to canonical paths");
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &[declared.clone()],
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+        let validation = validate_task_outputs(&captured);
+        materialize_validated_discovery_decisions(&[declared], &settlement, &validation)
+            .expect("validated envelope-derived outputs should materialize to canonical paths");
 
         assert_eq!(
             std::fs::read_to_string(machine_path).unwrap(),
@@ -25774,10 +26143,21 @@ plain progress line without gate evidence";
             None,
             false,
         );
-        settle_agent_outputs_from_discovery_decisions(&[declared], &specs, &discovered, &[])
-            .expect(
-                "accepted path-keyed JSON envelope outputs should materialize to canonical paths",
-            );
+        let settlement = settle_agent_outputs_from_discovery_decisions(
+            &[declared.clone()],
+            &specs,
+            &discovered,
+            &[],
+        )
+        .expect("accepted path-keyed JSON envelope outputs should materialize to canonical paths");
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &[declared.clone()],
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+        let validation = validate_task_outputs(&captured);
+        materialize_validated_discovery_decisions(&[declared], &settlement, &validation)
+            .expect("validated path-keyed JSON envelope outputs should materialize");
 
         assert_eq!(
             std::fs::read_to_string(machine_path).unwrap(),
@@ -25869,6 +26249,179 @@ plain progress line without gate evidence";
             Some(&output_bytes[..])
         );
         assert!(validation.failure_class.is_none());
+    }
+
+    #[test]
+    fn direct_file_ref_manifest_with_placeholder_digest_uses_fresh_canonical_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("reviews/proposal/macos.json");
+        std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+        let output_bytes =
+            br#"{"agent_id":"macos","role":"reviewer","score":9.3,"decision":"approve","verdict":"ready","summary":"ok","issues":[],"blocking_issues":[],"non_blocking_issues":[],"suggestions":[],"assumptions":[]}"#;
+        std::fs::write(&output_path, output_bytes).unwrap();
+        let declared = DeclaredOutput {
+            output_name: "proposal_review_macos".to_string(),
+            target_path: output_path.to_string_lossy().into_owned(),
+            schema: Some(workflow::plan::OutputSchema {
+                contract_id: "proposal_review_v1".to_string(),
+                format: "json".to_string(),
+                human_format: None,
+                machine_format: Some("json".to_string()),
+                validation_mode: Some("strict_structured".to_string()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec![
+                    "agent_id".to_string(),
+                    "role".to_string(),
+                    "score".to_string(),
+                    "decision".to_string(),
+                    "verdict".to_string(),
+                    "summary".to_string(),
+                    "issues".to_string(),
+                    "blocking_issues".to_string(),
+                    "non_blocking_issues".to_string(),
+                    "suggestions".to_string(),
+                    "assumptions".to_string(),
+                ],
+            }),
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            Some(tmp.path().to_str().unwrap()),
+            false,
+        );
+        let metadata_context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "prompt-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let pre_prompt_metadata = vec![PrePromptExpectedOutputMetadata::absent(
+            &specs[0],
+            &metadata_context,
+        )];
+        let manifest = serde_json::json!({
+            "mode": "direct_file",
+            "output_name": "proposal_review_macos",
+            "path": output_path.to_string_lossy(),
+            "digest": "sha256:pending",
+            "size_bytes": 0
+        });
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: "proposal_review_macos".to_string(),
+            content: serde_json::to_vec(&manifest).unwrap(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+        }];
+
+        let settlement =
+            build_declared_output_discovery_settlement(&specs, &discovered, &pre_prompt_metadata);
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &[declared],
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+        let validation = validate_task_outputs(&captured);
+
+        assert_eq!(
+            settlement.decisions[0].status,
+            OutputDiscoveryStatus::Accepted
+        );
+        assert_eq!(
+            settlement.decisions[0].reason,
+            OutputDiscoveryReason::ExactPathNew
+        );
+        assert_eq!(
+            captured[0].machine_bytes.as_deref(),
+            Some(&output_bytes[..]),
+            "direct-file manifest is only a pointer; settlement must validate the canonical file bytes"
+        );
+        assert!(validation.failure_class.is_none());
+    }
+
+    #[test]
+    fn invalid_direct_file_manifest_does_not_fallback_or_overwrite_canonical_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("reviews/proposal/macos.json");
+        std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+        let existing_bytes = br#"{"agent_id":"old","role":"reviewer"}"#;
+        std::fs::write(&output_path, existing_bytes).unwrap();
+        let declared = DeclaredOutput {
+            output_name: "proposal_review_macos".to_string(),
+            target_path: output_path.to_string_lossy().into_owned(),
+            schema: Some(workflow::plan::OutputSchema {
+                contract_id: "proposal_review_v1".to_string(),
+                format: "json".to_string(),
+                human_format: None,
+                machine_format: Some("json".to_string()),
+                validation_mode: Some("strict_structured".to_string()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec!["agent_id".to_string(), "role".to_string()],
+            }),
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            Some(tmp.path().to_str().unwrap()),
+            false,
+        );
+        let metadata_context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "prompt-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let pre_prompt_metadata = vec![
+            StdDiscoveryFilesystem::capture_pre_prompt_expected_output_metadata(
+                &specs[0],
+                &metadata_context,
+            ),
+        ];
+        let manifest = serde_json::json!({
+            "mode": "direct_file",
+            "output_name": "proposal_review_macos",
+            "path": tmp.path().join("wrong/macos.json").to_string_lossy(),
+            "digest": "sha256:pending",
+            "size_bytes": 0
+        });
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: "proposal_review_macos".to_string(),
+            content: serde_json::to_vec(&manifest).unwrap(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+        }];
+
+        let settlement = settle_agent_outputs_from_discovery_decisions(
+            &[declared.clone()],
+            &specs,
+            &discovered,
+            &pre_prompt_metadata,
+        )
+        .expect("invalid manifest should settle as rejected, not error");
+
+        assert_eq!(
+            settlement.decisions[0].status,
+            OutputDiscoveryStatus::Rejected
+        );
+        assert_eq!(
+            std::fs::read(&output_path).unwrap(),
+            existing_bytes,
+            "invalid direct-file manifest must not be materialized over the canonical file"
+        );
     }
 
     #[test]

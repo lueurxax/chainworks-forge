@@ -1,0 +1,12 @@
+{
+  "schema_version": "p089_temp_inventory_negative_fixture_v1",
+  "expected_status": "fail",
+  "negative_condition": "The focused inventory smoke gate attempts to reuse proposal-089 or p089 while those aliases remain retained historical Junie canary gates.",
+  "mutated_contract": {
+    "gate_aliases": ["proposal-089", "p089"],
+    "commands": {
+      "allowlist": ["./scripts/test-gate.sh proposal-089", "./scripts/test-gate.sh p089"]
+    }
+  },
+  "assertion": "The gate must fail closed until a non-conflicting inventory-specific alias is registered."
+}
