@@ -231,6 +231,11 @@ pub enum AcpPromptProgressKind {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AcpPromptProgressUpdate {
     pub run_id: RunId,
+    /// Durable execution that owns this prompt. Retained on the early prompt
+    /// progress event so the engine can persist the provider session before a
+    /// terminal response exists.
+    #[serde(default)]
+    pub agent_execution_id: Option<AgentExecutionId>,
     pub stage_execution_id: Option<String>,
     pub stage_id: String,
     pub agent_id: String,

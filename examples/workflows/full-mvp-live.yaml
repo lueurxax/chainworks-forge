@@ -142,7 +142,7 @@ states:
       - to: state_5_proposal_refined
         when: proposal_decomposition_plan.requires_split == true
       - to: state_6_implementation_approval
-        when: proposal_decomposition_plan.implementation_start_decision == 'ready_with_declared_boundaries'
+        when: proposal_decomposition_plan.requires_split == false and proposal_decomposition_plan.implementation_start_decision == 'ready_with_declared_boundaries'
 
   state_5_proposal_refined:
     label: Proposal refined
@@ -427,9 +427,9 @@ states:
       - to: state_9_followup_proposal_seeded
         when: blocker_boundary_status.followup_proposal_required == true
       - to: state_9_external_evidence_blocked
-        when: blocker_boundary_status.has_release_blocking_external_blockers == true and blocker_boundary_status.followup_proposal_required == false
+        when: blocker_boundary_status.has_release_blocking_external_blockers == true and blocker_boundary_status.has_no_release_blocking_external_blockers == false and blocker_boundary_status.followup_proposal_required == false
       - to: state_11_manual_release
-        when: blocker_boundary_status.has_no_release_blocking_external_blockers == true and blocker_boundary_status.followup_proposal_required == false
+        when: blocker_boundary_status.has_release_blocking_external_blockers == false and blocker_boundary_status.has_no_release_blocking_external_blockers == true and blocker_boundary_status.followup_proposal_required == false
 
   state_9_followup_proposal_seeded:
     label: Follow-up proposal seed generated

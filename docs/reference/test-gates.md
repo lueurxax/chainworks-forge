@@ -21,8 +21,9 @@ Use the repository gate runner:
 ./scripts/test-gate.sh list
 ```
 
-The runner does three things before every gate:
+The runner performs these checks before every gate:
 
+- services the throttled build-cache lifecycle before new build artifacts are created
 - refuses to start if build/test tooling is already running
 - for `ui-smoke`, `proposal-006`, and `full`, also refuses to start if `Chainworks Forge.app` is already running on the host
 - prints the latest known `Chainworks Forge-*.ips` crash log path
@@ -37,6 +38,36 @@ ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-ga
 ```
 
 Do not omit the `test@` user when writing prompts, docs, or runbooks for remote UI work.
+
+## Build Cache Lifecycle
+
+`scripts/cargo-managed`, the generated Cargo wrapper, and `scripts/test-gate.sh`
+invoke `scripts/maybe-clean-build-caches.sh`. Maintenance is lock-safe,
+fail-open, and throttled to once every 15 minutes by default. The underlying
+`scripts/clean-build-caches.sh` preserves active Cargo/Xcode paths and enforces
+these default pressure budgets:
+
+- shared Cargo target: 32 GiB
+- repository-local Cargo target: 8 GiB
+- each worktree-local Cargo target: 8 GiB
+
+Managed builds default `CARGO_INCREMENTAL=0` because `sccache` is the canonical
+cross-run compiler cache. Set `CHAINWORKS_CARGO_INCREMENTAL=1` only for a
+bounded diagnostic session. Set `CHAINWORKS_AUTO_CACHE_CLEANUP=0` to disable
+automatic maintenance temporarily, or change the throttle with
+`CHAINWORKS_AUTO_CACHE_CLEANUP_INTERVAL_SECONDS`.
+
+Manual inspection and cleanup remain available:
+
+```bash
+./scripts/clean-build-caches.sh --dry-run
+./scripts/maybe-clean-build-caches.sh
+```
+
+Automatic maintenance skips Cargo target deletion when process visibility is
+unavailable or another artifact-writing Cargo command is active. Successful
+gate residuals are reclaimed by the next maintenance pass rather than growing
+without bound.
 
 ## Gate Layers
 
@@ -1014,7 +1045,8 @@ Scope:
 
 - `domain::lifecycle` status types, degraded/failure disjointness, and failure invariant tests
 - lifecycle reporter transitions and `DaemonStatusChanged` broadcasts
-- `/health` and `/ready` status-code matrix
+- `/health` and `/ready` status-code matrix, including the startup-probe
+  contract where `starting` is live on `/health` but not ready on `/ready`
 - GraphQL `daemonStatus` and `daemonStatusChanged` query/subscription auth and shape
 - packaged-mode PID lock, crash-budget helpers, loopback enforcement, `daemon.port`, cwd, and build-SHA behavior
 - SQLite migration preflight, backup, no-downgrade safety, and migration-error mapping
@@ -2062,10 +2094,10 @@ Contract-aware output repair and fallback-substrate gate. P079 closeout scope is
 Scope (what this gate proves today):
 
 - the `p079_output_contract_repair_v1` SQLite migration creates `output_contract_repair_events`, `output_contract_repair_leases`, and `output_contract_repair_fallback_parent_links` with the required columns, uniqueness, and dispatch-commit invariants
-- domain types, enums, presentation projection, and SCHEMA/flag constants exposed by `crates/domain/src/output_contract_repair.rs`
+- domain types, enums, presentation projection, and schema constants exposed by `crates/domain/src/output_contract_repair.rs`
 - DB repository slices for repair events and leases
 - engine fail-closed advisory posture, provider-support checks, plan-evidence redaction, SEC-002 transcript-recovery bounds, and accepted transport-attributed provider-envelope recovery
-- deterministic fixture same-session repair dispatch through `invoke_agent_repairs_missing_required_output_in_same_live_session` with `CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED` and `CHAINWORKS_P079_ACCEPT_ADVISORY_REPAIR_POSTURE`
+- deterministic fixture same-session repair dispatch through `invoke_agent_repairs_missing_required_output_in_same_live_session`; output repair is always-on settlement behavior and does not require a daemon environment flag
 - Swift DTO build + the `Proposal079ContractRepairReadbackTests` fixture-decode and run-detail presenter slice, including GraphQL enum casing and inspector readback selection (also runnable standalone via `./scripts/test-gate.sh p079-swift-readback`)
 
 Command:

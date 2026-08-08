@@ -116,7 +116,7 @@ pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, exec: &AgentExecution) 
 
 pub async fn find_by_id(pool: &SqlitePool, id: AgentExecutionId) -> Result<Option<AgentExecution>> {
     let query = format!("SELECT {SELECT_COLS} FROM agent_executions WHERE id = ?");
-    let row = sqlx::query(&query)
+    let row = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(id.to_string())
         .fetch_optional(pool)
         .await?;
@@ -346,7 +346,7 @@ pub async fn find_by_stage(
     let query = format!(
         "SELECT {SELECT_COLS} FROM agent_executions WHERE stage_execution_id = ? ORDER BY started_at ASC"
     );
-    let rows = sqlx::query(&query)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(stage_execution_id.to_string())
         .fetch_all(pool)
         .await?;
@@ -361,7 +361,7 @@ pub async fn find_by_stage_tx(
     let query = format!(
         "SELECT {SELECT_COLS} FROM agent_executions WHERE stage_execution_id = ? ORDER BY started_at ASC"
     );
-    let rows = sqlx::query(&query)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(stage_execution_id.to_string())
         .fetch_all(&mut **tx)
         .await?;
@@ -386,7 +386,7 @@ pub async fn list_by_run(pool: &SqlitePool, run_id: RunId) -> Result<Vec<AgentEx
          WHERE se.run_id = ? OR lcm.run_id = ?
          ORDER BY ae.started_at ASC"
     );
-    let rows = sqlx::query(&query)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(run_id.to_string())
         .bind(run_id.to_string())
         .fetch_all(pool)
@@ -408,7 +408,7 @@ pub async fn list_running_by_run(pool: &SqlitePool, run_id: RunId) -> Result<Vec
          WHERE se.run_id = ? AND ae.status = ?
          ORDER BY ae.started_at ASC"
     );
-    let rows = sqlx::query(&query)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(run_id.to_string())
         .bind(AgentStatus::Running.to_string())
         .fetch_all(pool)
@@ -437,7 +437,7 @@ pub async fn list_by_run_tx(
          WHERE se.run_id = ? OR lcm.run_id = ?
          ORDER BY ae.started_at ASC"
     );
-    let rows = sqlx::query(&query)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(run_id.to_string())
         .bind(run_id.to_string())
         .fetch_all(&mut **tx)
@@ -465,7 +465,7 @@ pub async fn list_by_mediation_id(
            AND lead_mediation_record_id = ?
          ORDER BY started_at ASC"
     );
-    let rows = sqlx::query(&query)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(mediation_id)
         .fetch_all(pool)
         .await

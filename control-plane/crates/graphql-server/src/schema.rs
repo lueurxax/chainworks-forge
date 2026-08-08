@@ -3558,6 +3558,67 @@ impl QueryRoot {
             total_count,
         })
     }
+
+    /// P089: Read-only managed temporary artifact inventory.
+    ///
+    /// Returns a disabled disposition when `CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE`
+    /// is absent or `disabled`. In `hidden_readback` and `operator_visible` modes,
+    /// returns classified inventory rows with redacted path display and HMAC-SHA256
+    /// path hashes. The scanner and HMAC key generation are not yet implemented;
+    /// this resolver currently returns the disabled-mode response for all modes
+    /// pending P089-IMPL-004 (hidden-readback backend API).
+    ///
+    /// `input.limit` is 0–500 (no clamping); `input.timeout_ms` is 1–5000.
+    /// Exactly one of `runId` or `workspaceContext` must be provided for scanning
+    /// (currently accepted but unused while the scanner is not yet implemented).
+    async fn temp_artifact_inventory(
+        &self,
+        ctx: &Context<'_>,
+        input: crate::types::temp_artifact_inventory::GqlTempArtifactInventoryInput,
+    ) -> Result<crate::types::temp_artifact_inventory::GqlTempArtifactInventory> {
+        require_operator_read(ctx).await?;
+
+        // Validate limit and timeout_ms at the GraphQL boundary.
+        if input.limit < 0 || input.limit > 500 {
+            return Err(
+                Error::new("limit must be 0 through 500").extend_with(|_, ext| {
+                    ext.set("code", "INVALID_LIMIT");
+                }),
+            );
+        }
+        if input.timeout_ms < 1 || input.timeout_ms > 5000 {
+            return Err(
+                Error::new("timeout_ms must be 1 through 5000").extend_with(|_, ext| {
+                    ext.set("code", "INVALID_TIMEOUT");
+                }),
+            );
+        }
+
+        // Read daemon-process mode from env (read once per request; config injection
+        // is a future hardening step after P089-IMPL-003 is complete).
+        let mode = std::env::var("CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE")
+            .ok()
+            .and_then(|v| {
+                domain::temp_artifact_inventory::TempArtifactInventoryMode::from_env_str(&v)
+            })
+            .unwrap_or(domain::temp_artifact_inventory::TempArtifactInventoryMode::Disabled);
+
+        if mode.is_disabled() {
+            return Ok(
+                crate::types::temp_artifact_inventory::GqlTempArtifactInventory::disabled(Some(
+                    "mode_disabled",
+                )),
+            );
+        }
+
+        // Hidden-readback and operator_visible: scanner not yet implemented (P089-IMPL-004).
+        // Return disabled response with a distinct reason code until the scanner is wired.
+        Ok(
+            crate::types::temp_artifact_inventory::GqlTempArtifactInventory::disabled(Some(
+                "scanner_not_implemented",
+            )),
+        )
+    }
 }
 
 /// P086: Reviewer-redacted projection of a raw receipt JSON.
@@ -4856,7 +4917,7 @@ async fn proposal_064_command_readback(
          WHERE run_id = ? AND command_type IN ({placeholders}) \
          ORDER BY created_at DESC LIMIT 8"
     );
-    let mut query = sqlx::query(&sql).bind(run_id.to_string());
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(run_id.to_string());
     for command_type in command_types {
         query = query.bind(*command_type);
     }
@@ -8079,7 +8140,7 @@ async fn p093_persist_live_timeline_raw_detail(
     }
     query.push_str(" ORDER BY ae.started_at DESC LIMIT 1");
 
-    let mut sql = sqlx::query(&query)
+    let mut sql = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(run_id.to_string())
         .bind(stage_id)
         .bind(agent_id)
@@ -9737,6 +9798,7 @@ mod tests {
                 action: "retry_failed_agent".to_string(),
                 explanation: "Retry the agent with the same inputs.".to_string(),
             },
+            diagnostic_artifact_paths: Vec::new(),
         }
     }
 
@@ -10740,7 +10802,7 @@ mod tests {
                 completed_at: None,
                 owner_agent: Some("proposal_writer".into()),
                 provider: Some("codex".into()),
-                model: Some("gpt-5.5".into()),
+                model: Some("gpt-5.6".into()),
                 stage_type: None,
                 validation_failure_json: None,
                 evidence_packet_json: None,
@@ -10757,7 +10819,7 @@ mod tests {
                 stage_execution_id: Some(stage_execution_id),
                 agent_id: "proposal_writer".into(),
                 provider: "codex".into(),
-                model: Some("gpt-5.5".into()),
+                model: Some("gpt-5.6".into()),
                 started_at: Utc::now(),
                 completed_at: None,
                 status: domain::agent::AgentStatus::Running,
@@ -10816,7 +10878,7 @@ mod tests {
                 checksum_sha256: None,
                 size_bytes: Some(42),
                 provider: "codex".into(),
-                model: Some("gpt-5.5".into()),
+                model: Some("gpt-5.6".into()),
                 created_at: Utc::now(),
                 is_pinned: false,
                 report_kind: None,

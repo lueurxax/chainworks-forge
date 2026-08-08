@@ -552,7 +552,8 @@ pub async fn update_generation_runtime_session(
         "sessions.update_generation_runtime_session",
         sqlx::query(
             r#"UPDATE session_generations
-           SET provider_session_id = ?1, turn_count = ?2
+           SET provider_session_id = ?1,
+               turn_count = MAX(turn_count, ?2)
            WHERE id = ?3"#,
         )
         .bind(provider_session_id)

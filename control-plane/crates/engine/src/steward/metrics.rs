@@ -313,7 +313,7 @@ async fn load_resumed_run_count(pool: &SqlitePool, run_ids: &[String]) -> Result
     Ok(rows.len())
 }
 
-fn push_bind_list<'args>(builder: &mut QueryBuilder<'args, Sqlite>, values: &'args [String]) {
+fn push_bind_list<'args>(builder: &mut QueryBuilder<Sqlite>, values: &'args [String]) {
     let mut separated = builder.separated(", ");
     for value in values {
         separated.push_bind(value);

@@ -102,7 +102,7 @@ async fn claim_next_where(pool: &SqlitePool, kind_predicate: &str) -> Result<Opt
            LIMIT 1"#
     );
     let row = loop {
-        let row = sqlx::query(&query)
+        let row = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
             .bind(&pending_status)
             .bind(&now)
             .fetch_optional(&mut **tx)
@@ -6633,7 +6633,7 @@ mod tests {
                 completed_at: None,
                 owner_agent: Some("proposal_implementation_auditor".to_string()),
                 provider: Some("codex".to_string()),
-                model: Some("gpt-5.5".to_string()),
+                model: Some("gpt-5.6".to_string()),
                 stage_type: None,
                 validation_failure_json: None,
                 evidence_packet_json: None,
@@ -6650,7 +6650,7 @@ mod tests {
                 stage_execution_id: Some(stage_execution_id),
                 agent_id: "proposal_implementation_auditor".to_string(),
                 provider: "codex".to_string(),
-                model: Some("gpt-5.5".to_string()),
+                model: Some("gpt-5.6".to_string()),
                 started_at: now - Duration::minutes(30),
                 completed_at: Some(now - Duration::minutes(1)),
                 status: AgentStatus::Completed,
@@ -7588,7 +7588,7 @@ mod tests {
                 completed_at: None,
                 owner_agent: Some("prepush_code_reviewer".to_string()),
                 provider: Some("codex".to_string()),
-                model: Some("gpt-5.5".to_string()),
+                model: Some("gpt-5.6".to_string()),
                 stage_type: None,
                 validation_failure_json: None,
                 evidence_packet_json: None,
@@ -7605,7 +7605,7 @@ mod tests {
                 stage_execution_id: Some(stage_execution_id),
                 agent_id: "prepush_code_reviewer".to_string(),
                 provider: "codex".to_string(),
-                model: Some("gpt-5.5".to_string()),
+                model: Some("gpt-5.6".to_string()),
                 started_at: now - Duration::minutes(30),
                 completed_at: Some(now - Duration::minutes(1)),
                 status: AgentStatus::Completed,
@@ -7686,15 +7686,32 @@ mod tests {
                     "run_id": run_id.to_string(),
                     "stage_id": "implementation_review",
                     "stage_execution_id": stage_execution_id.to_string(),
+                    "target_stage_execution_id": stage_execution_id.to_string(),
                     "retry_authority_id": retry_authority_id,
                     "targeted_retry": {
                         "retry_authority_id": retry_authority_id,
-                        "target_stage_execution_id": stage_execution_id.to_string()
+                        "target_stage_execution_id": stage_execution_id.to_string(),
+                        "reason": "operator_targeted_retry",
+                        "source_stage_execution_id": StageExecutionId::new().to_string(),
+                        "source_agent_execution_id": AgentExecutionId::new().to_string(),
+                        "source_work_item_id": "p060-dynamic:source-stage:plan:4",
+                        "provider_fallback": {
+                            "from_backend_profile_id": "claude_design_medium",
+                            "from_provider": "claude_acp",
+                            "reason": "current_catalog_binding_changed",
+                            "to_backend_profile_id": "gemini_review_pro",
+                            "to_provider": "gemini_acp"
+                        }
                     },
                     "p058_claimed": {
                         "agent_execution_id": agent_execution_id.to_string(),
                         "session_generation_id": uuid::Uuid::new_v4().to_string(),
                         "artifact_claim_key": {
+                            "agent_execution_id": agent_execution_id.to_string(),
+                            "owner_id": stage_execution_id.to_string(),
+                            "owner_kind": "stage_execution",
+                            "run_id": run_id.to_string(),
+                            "source_work_item_id": "targeted-invoke-close-hung-after-output",
                             "stage_execution_id": stage_execution_id.to_string()
                         }
                     }

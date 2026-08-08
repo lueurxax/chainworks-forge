@@ -1,50 +1,35 @@
 {
-  "configurations" : [
+  "configurations": [
     {
-      "id" : "A1B2C3D4-E5F6-7890-ABCD-EF1234567890",
-      "name" : "Configuration 1",
-      "options" : {
-
-      }
+      "id": "A1B2C3D4-E5F6-7890-ABCD-EF1234567890",
+      "name": "Configuration 1",
+      "options": {}
     }
   ],
-  "defaultOptions" : {
-    "targetForVariableExpansion" : {
-      "containerPath" : "container:Chainworks Forge.xcodeproj",
-      "identifier" : "CE8913472F6FC30A006EC77C",
-      "name" : "Chainworks ForgeTests"
+  "defaultOptions": {
+    "targetForVariableExpansion": {
+      "containerPath": "container:Chainworks Forge.xcodeproj",
+      "identifier": "CE8913472F6FC30A006EC77C",
+      "name": "Chainworks ForgeTests"
     }
   },
-  "testTargets" : [
+  "testTargets": [
     {
-      "selectedTests" : [
+      "selectedTests": [
+        "Proposal081ApprovalActionAttemptStoreTests",
         "ArtifactPathClipboardTests",
         "ForgeGlassTests",
         "ProcessSupportTests",
         "Proposal046Tests",
-        "Proposal024RunSurfaceTests",
-        "Proposal031ThinGraphQLReadBoundaryTests",
-        "Proposal081ApprovalActionAttemptStoreTests",
-        "Proposal081GraphQLRedactionTests",
-        "Proposal078OperatorReadbackTests",
-        "Proposal085Tests",
-        "Proposal088OperatorReadbackTests",
-        "ProviderBindingTruthTests",
-        "ProviderPlatformTests",
-        "ResumeManagerTests",
-        "RunArtifactHierarchyBuilderTests",
-        "RunStartModePresentationTests",
-        "RunTimelineInspectorViewTests",
-        "RunTests",
-        "SourceContextBuilderTests",
-        "WorkflowMapProjectionTests"
+        "Proposal079ContractRepairReadbackTests",
+        "Proposal086ContinuationReadbackTests"
       ],
-      "target" : {
-        "containerPath" : "container:Chainworks Forge.xcodeproj",
-        "identifier" : "CE8913472F6FC30A006EC77C",
-        "name" : "Chainworks ForgeTests"
+      "target": {
+        "containerPath": "container:Chainworks Forge.xcodeproj",
+        "identifier": "CE8913472F6FC30A006EC77C",
+        "name": "Chainworks ForgeTests"
       }
     }
   ],
-  "version" : 1
+  "version": 1
 }

@@ -27,9 +27,11 @@ async fn graphql_playground() -> impl IntoResponse {
 }
 
 /// Liveness probe (Proposal 042 §5.2). Returns 200 iff the process is
-/// live-and-serving — `Ready` or `Degraded`. `Degraded` explicitly stays
-/// 200 so a supervisor's liveness-keyed restart does not loop-restart a
-/// recoverable daemon.
+/// alive enough to answer status probes: `Starting`, `Ready`, or
+/// `Degraded`. `Starting` is intentionally live but not ready so UI and
+/// supervisors can distinguish startup recovery from a missing process.
+/// `Degraded` explicitly stays 200 so a supervisor's liveness-keyed
+/// restart does not loop-restart a recoverable daemon.
 ///
 /// Response body shape:
 /// - `state=ready`: `{state, schema_version, pid}`
@@ -40,7 +42,9 @@ pub(crate) async fn health_handler(
 ) -> impl IntoResponse {
     let status = reporter.snapshot();
     let code = match status.state {
-        DaemonLifecycleState::Ready | DaemonLifecycleState::Degraded => StatusCode::OK,
+        DaemonLifecycleState::Starting
+        | DaemonLifecycleState::Ready
+        | DaemonLifecycleState::Degraded => StatusCode::OK,
         _ => StatusCode::SERVICE_UNAVAILABLE,
     };
     (code, Json(status))
@@ -59,6 +63,16 @@ pub(crate) async fn ready_handler(
         StatusCode::SERVICE_UNAVAILABLE
     };
     (code, Json(status))
+}
+
+/// Status-only router used by daemon startup before GraphQL/MCP are
+/// ready. It exposes the same unauthenticated probe contract as the full
+/// router, but no mutations or subscriptions.
+pub fn build_probe_router(reporter: LifecycleReporter) -> Router {
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/ready", get(ready_handler))
+        .layer(Extension(reporter))
 }
 
 pub(crate) const GRAPHQL_WS_UNAUTHORIZED_CLOSE_CODE: u16 = 4401;
@@ -1288,14 +1302,6 @@ mod tests {
         (code, json)
     }
 
-    fn build_probe_router(reporter: LifecycleReporter) -> Router {
-        // We only need the two probe routes + the reporter extension.
-        Router::new()
-            .route("/health", get(health_handler))
-            .route("/ready", get(ready_handler))
-            .layer(Extension(reporter))
-    }
-
     #[tokio::test]
     async fn test_health_endpoint_returns_200_when_ready() {
         let reporter = test_reporter_in_state(DaemonLifecycleState::Ready);
@@ -1315,9 +1321,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_health_endpoint_returns_503_only_when_starting_failed_or_shutdown() {
+    async fn test_health_endpoint_returns_200_when_starting() {
+        let reporter = test_reporter_in_state(DaemonLifecycleState::Starting);
+        reporter.set_startup_phase("startup_recovery");
+        let (code, body) = probe(build_probe_router(reporter), "/health").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["state"], "starting");
+        assert_eq!(body["startup_phase"], "startup_recovery");
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint_returns_503_only_when_failed_or_shutdown() {
         for (state, expected_str) in [
-            (DaemonLifecycleState::Starting, "starting"),
             (DaemonLifecycleState::Failed, "failed"),
             (DaemonLifecycleState::Shutdown, "shutdown"),
             (DaemonLifecycleState::Restarting, "restarting"),

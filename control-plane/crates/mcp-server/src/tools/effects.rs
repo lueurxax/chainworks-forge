@@ -29,6 +29,7 @@ fn redact_last_error(raw: Option<&str>) -> Option<String> {
 struct ReconciliationReadback {
     readback_source: String,
     report_details: serde_json::Value,
+    report_path: Option<String>,
 }
 
 struct ReadbackProbeSpec {
@@ -170,9 +171,46 @@ async fn build_reconciliation_readback(
         "generated_at": Utc::now().to_rfc3339(),
     });
 
+    let canonical_artifact_root = std::fs::canonicalize(&run.artifact_root)
+        .with_context(|| format!("cannot canonicalize artifact_root: {}", run.artifact_root))?;
+    let report_dir = match effect
+        .evidence_root
+        .as_deref()
+        .filter(|root| !root.trim().is_empty())
+    {
+        Some(root) => {
+            let canonical_evidence_root = std::fs::canonicalize(root)
+                .with_context(|| format!("cannot canonicalize evidence_root: {root}"))?;
+            if !canonical_evidence_root.starts_with(&canonical_artifact_root) {
+                anyhow::bail!("evidence_root escapes artifact_root containment");
+            }
+            canonical_evidence_root.join("reconciliation")
+        }
+        None => canonical_artifact_root
+            .join("side-effects")
+            .join(effect.id.to_string())
+            .join("reconciliation"),
+    };
+    std::fs::create_dir_all(&report_dir)
+        .with_context(|| format!("create reconciliation report dir {}", report_dir.display()))?;
+    let report_path = report_dir.join("reconciliation-report.json");
+    let report_payload = serde_json::json!({
+        "schema_version": RECONCILIATION_REPORT_SCHEMA_VERSION,
+        "effect_id": effect.id.to_string(),
+        "effect_kind": effect.effect_kind.to_string(),
+        "readback_source": readback_source,
+        "report_details": report_details,
+    });
+    std::fs::write(
+        &report_path,
+        serde_json::to_vec_pretty(&report_payload).context("serialize reconciliation report")?,
+    )
+    .with_context(|| format!("write reconciliation report {}", report_path.display()))?;
+
     Ok(ReconciliationReadback {
         readback_source: readback_source.to_string(),
         report_details,
+        report_path: Some(report_path.to_string_lossy().into_owned()),
     })
 }
 
@@ -569,6 +607,8 @@ pub async fn handle_effects_reconcile(
         "readback_source": readback.readback_source,
         "readback_unavailable": false,
         "report_details": readback.report_details,
+        "report_path": readback.report_path.clone(),
+        "reconciliation_report_path": readback.report_path,
         "recommended_action": recommended_action,
         "retry_forbidden": true,
         "updated_at": effect.updated_at.to_rfc3339()

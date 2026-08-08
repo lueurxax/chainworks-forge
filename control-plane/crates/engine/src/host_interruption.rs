@@ -103,7 +103,7 @@ pub trait HostInterruptionRuntimeCleanup: Send + Sync {
 #[async_trait]
 impl HostInterruptionRuntimeCleanup for AcpRuntimeManager {
     async fn close_session_generation(&self, generation_id: &str) -> Result<()> {
-        match self.close_session(generation_id).await {
+        match self.request_close_session(generation_id).await {
             Ok(_) => Ok(()),
             Err(error)
                 if error

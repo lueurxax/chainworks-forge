@@ -1960,6 +1960,10 @@ fn extract_rollout_contract_source(
         || object.contains_key("inline_rollout_contract_v1")
         || object.contains_key("p084_self_contract")
         || object
+            .get("rollout")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|rollout| rollout.contains_key("rollout_contract_v1"))
+        || object
             .get("schema_version")
             .and_then(|value| value.as_str())
             == Some(ROLLOUT_CONTRACT_SCHEMA_VERSION);
@@ -2013,6 +2017,18 @@ fn extract_rollout_contract_source(
         return Ok(Some(RolloutContractSource {
             contract: inline.clone(),
             source: format!("{}#inline_rollout_contract_v1", proposal_path.display()),
+            extraction_failures: Vec::new(),
+        }));
+    }
+
+    if let Some(inline) = object
+        .get("rollout")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|rollout| rollout.get("rollout_contract_v1"))
+    {
+        return Ok(Some(RolloutContractSource {
+            contract: inline.clone(),
+            source: format!("{}#rollout.rollout_contract_v1", proposal_path.display()),
             extraction_failures: Vec::new(),
         }));
     }
@@ -4363,6 +4379,44 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("#inline_rollout_contract_v1")));
+    }
+
+    #[tokio::test]
+    async fn nested_rollout_contract_v1_under_rollout_creates_pass_record() {
+        let dir = TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let pool = test_pool(&url).await;
+        let mut run = test_run();
+        run.workspace_root = dir.path().to_string_lossy().to_string();
+
+        let proposal_path = dir.path().join("approved-proposal.json");
+        let proposal = serde_json::json!({
+            "source_proposal": "docs/proposals/089-temp-artifact-inventory.md",
+            "proposal_revision_id": "p089-r13",
+            "rollout": {
+                "rollout_contract_v1": valid_rollout_contract()
+            }
+        });
+        std::fs::write(&proposal_path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+        let artifact = test_artifact(&run, proposal_path.to_string_lossy().to_string());
+
+        let check = upsert_linted_contract_check(
+            &pool,
+            &run,
+            &artifact,
+            &test_effective_policy(RolloutContractEnforcementMode::Enforce),
+            0,
+        )
+        .await
+        .unwrap()
+        .expect("nested rollout.rollout_contract_v1 should produce a terminal check");
+
+        assert_eq!(check.status, RolloutContractStatus::Pass);
+        assert_eq!(check.decision, RolloutContractDecision::Release);
+        assert!(check
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("#rollout.rollout_contract_v1")));
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@ import Foundation
 // Swift readback DTO module (APPLE-001, APPLE-R3-001)
 //
 // Decodes output_contract_repair.v1 evidence records from GraphQL or MCP responses.
-// Pre-P079 runs and feature-disabled runs decode as nil without throwing.
+// Pre-P079 runs and executions without repair evidence decode as nil without throwing.
 // Unknown enum values map to .unknownDiagnostic(rawString) — the original provider
 // raw string is preserved in the associated value for inspector forensics (DEFECT-006).
 // The conservative fallback never authorizes output settlement, transition truth,
@@ -763,7 +763,7 @@ extension OutputContractRepairStatus {
 // MARK: - Container decoding helper (optional parent field)
 
 /// Decodes an optional OutputContractRepairEvidence from a keyed container.
-/// Returns nil for pre-P079 runs and feature-disabled runs without throwing.
+/// Returns nil for pre-P079 runs and executions without repair evidence.
 extension KeyedDecodingContainer {
     func decodeOutputContractRepairEvidenceIfPresent(
         forKey key: Key

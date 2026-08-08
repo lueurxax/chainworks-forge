@@ -19,7 +19,7 @@ This reference covers:
 - the structured-output envelope and contract-validation substrate used by the Rust control plane,
 - catalog-backed output-contract authority,
 - strict proposal-review and aggregate summary contract enforcement,
-- Junie `code_writer` completion-boundary subtypes, engine-owned failure envelopes, and staged repair settlement,
+- `code_writer` completion-boundary subtypes, engine-owned failure envelopes, and provider-neutral direct-file repair settlement,
 - workflow-owned quality-gate blocker boundary contracts and readback,
 - canonical validation-failure and failed-stage evidence,
 - same-run retry lineage and artifact namespace rules,
@@ -53,7 +53,7 @@ The detailed owner chain for that substrate lives in [structured-output-envelope
 
 Agent-authored required outputs should enter the system through the final `CHAINWORKS_OUTPUT` object returned by the provider session. Prompt generation must provide contract-complete skeletons for each declared output; repair prompts must use the same contract-complete skeletons for failed outputs.
 
-The executor then binds those payloads to the compiled output declarations, validates them against `AgentCatalog.contracts`, and materializes canonical artifact files. Exact-path filesystem outputs and legacy block envelopes remain accepted as compatibility evidence, but they do not create a second contract authority and do not bypass validation.
+The executor then binds those payloads to the compiled output declarations, validates them against `AgentCatalog.contracts`, and materializes canonical artifact files. For large declared outputs, the payload may be a `direct_file` / `direct_file_ref` manifest that points to the declared canonical path instead of embedding the full file content. That manifest is only a transport hint: the executor must read the canonical file, verify path ownership, freshness, digest/size when supplied as real values, and then validate the file contents against the same declared contract before publication. Synthetic digest/size placeholders such as non-hex `sha256:*` markers or approximate sizes are recorded as diagnostics and do not override a fresh, owned, schema-valid canonical file. Exact-path filesystem outputs and legacy block envelopes remain accepted as compatibility evidence, but they do not create a second contract authority and do not bypass validation.
 
 The retained `proposal-089|p089` gate is the focused Junie proof for this
 materialization path. It validates that the production `code_writer` Junie ACP
@@ -63,6 +63,14 @@ without completion repair, while the executor generates
 outputs through the normal discovery-decision materialization functions. That
 gate is provider-specific proof, not a broader replacement for this contract or
 for the P088 completion-repair boundary.
+
+Control-plane generated outputs are not provider-authored outputs. If a provider
+returns a `CHAINWORKS_OUTPUT` envelope for a control-plane-owned output such as
+`changed_files_manifest`, the executor must use the generated canonical file as
+the source of truth and ignore conflicting provider manifests for that logical
+output. Provider manifests can describe agent-authored files, but they must not
+shadow control-plane evidence or cause a generated output to be reported as
+missing.
 
 ### Missing or malformed outputs get one same-session repair turn
 
@@ -87,7 +95,10 @@ Malformed final-envelope repair is strict. The engine records
 target path, then asks for a fresh valid JSON object. It must not auto-edit the
 provider's malformed JSON, even when a small syntax fix would make it parse.
 Repair output is accepted only after the normal declared-output binding,
-contract validation, and materialization path succeeds.
+contract validation, and materialization path succeeds. A repair payload that
+returns a `direct_file` manifest is not itself the declared artifact content; it
+is accepted only if the referenced canonical file is current-attempt evidence and
+the file contents validate against the declared output contract.
 
 Repair settlement must bind only exact declared output identities. When prompts use canonical target paths as
 `CHAINWORKS_OUTPUT` keys, those keys must match byte-for-byte after JSON decoding: no leading/trailing whitespace,
@@ -163,13 +174,22 @@ directories through a symlink-safe component walk.
 new `AgentStatus` values. Public preflight JSON records attempt count,
 remediation, provider launch state, and redacted operation/path/failure classes.
 
-### Staged per-output repair settlement
+### Provider-neutral direct-file and per-output repair settlement
 
-When Junie repair returns multiple outputs, the engine validates and settles each
-declared output independently. Valid siblings may commit even when another
-sibling is malformed, stale, or absent. Invalid siblings remain rejected with
-typed reasons and must not overwrite canonical files or active artifact
-pointers.
+When completion or repair settlement returns multiple declared outputs, the
+engine validates and settles each output independently. This behavior is
+provider-neutral for ACP providers such as Claude, Codex, Gemini, Auggie, and
+Junie. Valid siblings may commit even when another sibling is malformed, stale,
+or absent. Invalid siblings remain rejected with typed reasons and must not
+overwrite canonical files or active artifact pointers.
+
+`direct_file` / `direct_file_ref` candidates follow the same staged row model.
+The candidate digest is the digest of the referenced canonical file contents, not
+the tiny manifest. A manifest keyed by output name or canonical path may be used
+only to locate the expected file; settlement success still requires the file to
+match the compiled output declaration, remain inside the authorized run
+meta-root or artifact root, be fresh relative to the current attempt, and pass
+contract validation.
 
 The durable settlement table is `code_writer_output_settlement_rows`. Each row
 belongs to exactly one `code_writer_completion_receipts.id` through
@@ -184,9 +204,9 @@ discarded; committed rows are recovered from their canonical digest; failed rows
 preserve the prior digest and failure reason.
 
 P090 Junie hardening is always enabled in runtime code. Strict final-payload
-handling, Junie tool-path preflight enforcement, and staged per-output repair
-settlement do not depend on process environment variables during normal daemon
-startup.
+handling and Junie tool-path preflight enforcement remain Junie-specific.
+Provider-neutral staged/direct-file settlement does not depend on process
+environment variables during normal daemon startup.
 
 ### One contract authority
 
@@ -944,17 +964,17 @@ The following conditions are strictly enforced to prevent unintended behavior an
 
 ### P079 Rollback Disposition
 
-In the event of a rollback or disablement of P079, the following disposition and steps are applied to ensure data integrity and system stability.
+In the event of a rollback or disablement of P079-adjacent optional capabilities, the following disposition and steps are applied to ensure data integrity and system stability. Core output repair remains enabled as settlement behavior.
 
-- **Mode**: `feature_flag_disable_keep_evidence_readback`
+- **Mode**: `optional_feature_disable_keep_evidence_readback`
 - **Data Loss Risk**: `none`
 - **Rollback Steps**:
-    1.  Disable `CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED`, `CHAINWORKS_P079_TRANSCRIPT_RECOVERY_ENABLED`, and `CHAINWORKS_P079_PROVIDER_FALLBACK_ENABLED`.
+    1.  Disable optional transcript-recovery and provider-fallback rollout flags, if they are enabled.
     2.  Keep `output_contract_repair.v1` SQLite rows and rebuilt evidence artifacts readable through run report, MCP, and GraphQL.
-    3.  Stop scheduling new repair and fallback leases while leaving existing source-generation and artifact-settlement history untouched.
-    4.  Allow the recovery sweep to continue reclaiming stale leases so feature-disabled runs do not leave hanging rows.
-    5.  Return eligible output failures to pre-P079 blocked-stage behavior.
-    6.  Re-enable only after the retained `proposal-079`/`p079` gate aliases pass.
+    3.  Stop scheduling new optional fallback leases while leaving existing source-generation, repair, and artifact-settlement history untouched.
+    4.  Allow the recovery sweep to continue reclaiming stale leases so optional-capability-disabled runs do not leave hanging rows.
+    5.  Keep eligible output failures on the always-on repair path; unrecoverable failures still block with retained evidence.
+    6.  Re-enable optional capabilities only after the retained `proposal-079`/`p079` gate aliases pass.
 
 ### P079 GraphQL and MCP Readback
 
@@ -962,7 +982,7 @@ The `OutputContractRepairEvidence` is exposed via GraphQL and MCP for readback a
 
 -   **GraphQL**:
     -   The `outputContractRepair` field is available on `AgentExecution` types.
-    -   It is nullable for pre-P079 runs, feature-disabled runs, and executions without an output-contract failure.
+    -   It is nullable for pre-P079 runs and executions without an output-contract failure.
     -   Nested objects (e.g., `sameSessionRepair`, `transcriptRecovery`, `providerFallback`, `providerPlanEvidence`, `budget`, `lease`) are non-null when the parent `OutputContractRepairEvidence` is non-null, as they are always materialized with default values.
     -   Optional scalar fields use `null` rather than empty sentinel strings.
     -   SwiftUI row identity is `(repair_attempt_id, agent_execution_id)`; `evidence_version` is a content-version/refresh-invalidation field.

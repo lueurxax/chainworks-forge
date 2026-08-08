@@ -153,9 +153,10 @@ pub async fn list_by_execution_id(
     pool: &SqlitePool,
     agent_execution_id: AgentExecutionId,
 ) -> Result<Vec<AgentExecutionRuntimePromptReceiptRecord>> {
-    let rows = sqlx::query(&prompt_select_sql(
+    // The SELECT list and suffix are compile-time constants.
+    let rows = sqlx::query(sqlx::AssertSqlSafe(prompt_select_sql(
         "WHERE agent_execution_id = ?1 ORDER BY turn_index ASC, prompt_kind ASC",
-    ))
+    )))
     .bind(agent_execution_id.to_string())
     .fetch_all(pool)
     .await?;

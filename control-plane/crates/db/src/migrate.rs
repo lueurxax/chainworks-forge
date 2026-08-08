@@ -584,7 +584,8 @@ async fn table_column_is_nullable(
     table: &str,
     column: &str,
 ) -> Result<bool, MigrationError> {
-    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+    let rows = sqlx::query(r#"SELECT name, "notnull" FROM pragma_table_info(?1)"#)
+        .bind(table)
         .fetch_all(pool)
         .await
         .map_err(|e| MigrationError::IoError(format!("inspect {table} column nullability: {e}")))?;
@@ -606,7 +607,8 @@ async fn table_contains_columns(
     table: &str,
     expected_columns: &[&str],
 ) -> Result<bool, MigrationError> {
-    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+    let rows = sqlx::query(r#"SELECT name FROM pragma_table_info(?1)"#)
+        .bind(table)
         .fetch_all(pool)
         .await
         .map_err(|e| MigrationError::IoError(format!("inspect {table} columns: {e}")))?;

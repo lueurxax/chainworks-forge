@@ -186,8 +186,11 @@ mod tests {
             "xcode_run_scope_queue_timeout",
             "queue timeout failure kind must be distinct from setup failure"
         );
-        assert!(timeout_err.wait_ms >= 0, "wait_ms must be recorded");
         assert!(timeout_err.deadline_ms > 0, "deadline_ms must be recorded");
+        assert!(
+            timeout_err.wait_ms >= timeout_err.deadline_ms,
+            "wait_ms must record a wait through the configured deadline"
+        );
 
         // Verify failure kind is distinct from setup failure.
         assert_ne!(

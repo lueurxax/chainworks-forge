@@ -910,6 +910,29 @@ impl AcpRuntimeManager {
         close_result
     }
 
+    /// Remove a live session and signal its prompt to stop without waiting for
+    /// the prompt-held session lock. Host-interruption recovery must use this
+    /// path so it can durably schedule the replacement after wake.
+    pub async fn request_close_session(&self, session_generation_id: &str) -> Result<()> {
+        let session = self
+            .live_sessions
+            .lock()
+            .await
+            .remove(session_generation_id);
+        let lease_cleanup = self
+            .live_xcode_leases
+            .lock()
+            .await
+            .remove(session_generation_id);
+        let Some(session) = session else {
+            self.release_xcode_leases(lease_cleanup).await;
+            bail!("No live ACP session registered for generation id '{session_generation_id}'");
+        };
+        session.request_close();
+        self.release_xcode_leases(lease_cleanup).await;
+        Ok(())
+    }
+
     /// Close and remove all live ACP sessions.
     pub async fn close_all_sessions(&self) -> usize {
         let sessions = {

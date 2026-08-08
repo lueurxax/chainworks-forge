@@ -5,6 +5,7 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use domain::agent::AgentFailureKind;
 use domain::ids::{AgentExecutionId, RunId, StageExecutionId};
 use domain::mediation::OwnerKind;
+use domain::run::RunStatus;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentRetryBudgetLedgerRow {
@@ -263,6 +264,7 @@ pub async fn list_reset_elapsed_auto_retry_candidates(
                   ledger.agent_execution_id AS agent_execution_id,
                   ledger.retry_after AS retry_after
            FROM agent_retry_budget_ledger ledger
+           INNER JOIN runs r ON r.id = ledger.run_id
            INNER JOIN agent_executions ae ON ae.id = ledger.agent_execution_id
            INNER JOIN agent_execution_runtime_facts facts
              ON facts.agent_execution_id = ledger.agent_execution_id
@@ -273,12 +275,15 @@ pub async fn list_reset_elapsed_auto_retry_candidates(
              AND ledger.retry_after IS NOT NULL
              AND ledger.retry_after <= ?2
              AND ledger.stage_execution_id IS NOT NULL
+             AND r.status = ?3
+             AND r.cancellation_settled_at IS NULL
              AND ae.status = 'failed'
              AND facts.failure_kind = ?1
            ORDER BY ledger.retry_after ASC, ledger.created_at ASC"#,
     )
     .bind(AgentFailureKind::ProviderQuota.to_string())
     .bind(now.to_rfc3339())
+    .bind(RunStatus::Blocked.to_string())
     .fetch_all(pool)
     .await?;
     rows.iter().map(parse_auto_retry_candidate_row).collect()

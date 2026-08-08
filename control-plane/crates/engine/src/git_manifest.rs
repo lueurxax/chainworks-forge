@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -258,28 +259,61 @@ impl GitManifestRunner {
     }
 
     async fn run_git_bytes(&self, args: &[&str]) -> Result<Vec<u8>, GitCommandError> {
-        let child = Command::new("git")
+        let mut child = Command::new("git")
             .args(args)
             .current_dir(&self.worktree_root)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_PAGER", "cat")
+            .env("GIT_TERMINAL_PROMPT", "0")
             .kill_on_drop(true)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|error| GitCommandError::CommandFailed(error.to_string()))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| GitCommandError::CommandFailed("git stdout pipe missing".to_string()))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| GitCommandError::CommandFailed("git stderr pipe missing".to_string()))?;
+        let stdout_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+        });
 
-        let output = match timeout(self.timeout, child.wait_with_output()).await {
+        let status = match timeout(self.timeout, child.wait()).await {
             Ok(output) => {
                 output.map_err(|error| GitCommandError::CommandFailed(error.to_string()))?
             }
-            Err(_) => return Err(GitCommandError::Timeout),
+            Err(_) => {
+                let _ = child.start_kill();
+                let _ = timeout(Duration::from_secs(1), child.wait()).await;
+                stdout_task.abort();
+                stderr_task.abort();
+                return Err(GitCommandError::Timeout);
+            }
         };
+        let stdout = stdout_task
+            .await
+            .map_err(|error| GitCommandError::CommandFailed(error.to_string()))?
+            .map_err(|error| GitCommandError::CommandFailed(error.to_string()))?;
+        let stderr = stderr_task
+            .await
+            .map_err(|error| GitCommandError::CommandFailed(error.to_string()))?
+            .map_err(|error| GitCommandError::CommandFailed(error.to_string()))?;
 
-        if output.status.success() {
-            return Ok(output.stdout);
+        if status.success() {
+            return Ok(stdout);
         }
 
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
         let message = if stderr.is_empty() { stdout } else { stderr };
         if message.contains("not a git repository") {
             Err(GitCommandError::NotGitRepository(message))
@@ -287,7 +321,7 @@ impl GitManifestRunner {
             Err(GitCommandError::CommandFailed(format!(
                 "git {} failed (exit {}): {}",
                 args.join(" "),
-                output.status,
+                status,
                 message
             )))
         }
@@ -520,6 +554,65 @@ mod tests {
 
         assert_eq!(manifest.status, GitManifestStatus::NotGitRepository);
         assert!(!manifest.diagnostics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn trusted_git_manifest_runner_reads_linked_worktree_common_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let primary = root.path().join("primary");
+        let linked = root.path().join("linked");
+        std::fs::create_dir_all(&primary).unwrap();
+        run_git_for_test(&primary, &["init"]).await;
+        run_git_for_test(
+            &primary,
+            &["config", "user.email", "chainworks@example.invalid"],
+        )
+        .await;
+        run_git_for_test(&primary, &["config", "user.name", "Chainworks Test"]).await;
+        std::fs::write(primary.join("tracked.txt"), "before\n").unwrap();
+        run_git_for_test(&primary, &["add", "tracked.txt"]).await;
+        run_git_for_test(&primary, &["commit", "-m", "fixture"]).await;
+        run_git_for_test(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                linked.to_string_lossy().as_ref(),
+                "-b",
+                "linked-fixture",
+            ],
+        )
+        .await;
+        std::fs::write(linked.join("tracked.txt"), "after\n").unwrap();
+
+        let manifest = GitManifestRunner::new(linked.clone()).run().await.unwrap();
+
+        assert_eq!(manifest.status, GitManifestStatus::Available);
+        assert_eq!(manifest.files, vec!["tracked.txt".to_string()]);
+        assert!(manifest
+            .unstaged_changes
+            .contains(&"tracked.txt".to_string()));
+        assert!(linked.join(".git").is_file());
+    }
+
+    #[tokio::test]
+    async fn proposal_053_git_manifest_timeout_returns_promptly() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git_for_test(repo.path(), &["init"]).await;
+        run_git_for_test(repo.path(), &["config", "alias.slow-status", "!sleep 30"]).await;
+        let runner = GitManifestRunner {
+            worktree_root: repo.path().to_path_buf(),
+            timeout: Duration::from_millis(20),
+        };
+
+        let started = std::time::Instant::now();
+        let result = runner.run_git_bytes(&["slow-status"]).await;
+
+        assert!(matches!(result, Err(GitCommandError::Timeout)));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout path should not wait for the slow git alias to finish"
+        );
     }
 
     async fn run_git_for_test(dir: &Path, args: &[&str]) {

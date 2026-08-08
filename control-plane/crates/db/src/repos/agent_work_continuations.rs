@@ -464,7 +464,7 @@ pub async fn list_for_agent_execution(
         "SELECT {SELECT_COLS} FROM agent_work_continuations \
          WHERE agent_execution_id = ? ORDER BY created_at DESC LIMIT 200"
     );
-    let rows = sqlx::query(&query)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(agent_execution_id)
         .fetch_all(pool)
         .await
@@ -479,7 +479,7 @@ pub async fn list_for_run(pool: &SqlitePool, run_id: &str) -> Result<Vec<Continu
         "SELECT {SELECT_COLS} FROM agent_work_continuations \
          WHERE run_id = ? ORDER BY created_at DESC LIMIT 200"
     );
-    let rows = sqlx::query(&query)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(run_id)
         .fetch_all(pool)
         .await
@@ -499,7 +499,7 @@ pub async fn find_active_for_agent_execution(
            AND status NOT IN ('succeeded', 'no_progress', 'failed', 'cancelled') \
          ORDER BY created_at DESC LIMIT 1"
     );
-    let row = sqlx::query(&query)
+    let row = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(agent_execution_id)
         .fetch_optional(pool)
         .await
@@ -677,7 +677,7 @@ pub async fn find_by_idempotency(
          WHERE idempotency_scope = ? AND idempotency_key = ? \
          ORDER BY created_at DESC LIMIT 1"
     );
-    let row = sqlx::query(&query)
+    let row = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(idempotency_scope)
         .bind(idempotency_key)
         .fetch_optional(pool)
@@ -782,13 +782,13 @@ pub async fn list_terminal_missing_artifacts(
     limit: i64,
 ) -> Result<Vec<ContinuationRecord>> {
     let limit = limit.clamp(1, 500);
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {SELECT_COLS} FROM agent_work_continuations
          WHERE status IN ('succeeded', 'no_progress', 'failed', 'cancelled')
            AND (response_artifact_id IS NULL OR result_or_no_progress_artifact_id IS NULL)
          ORDER BY updated_at ASC
          LIMIT ?"
-    ))
+    )))
     .bind(limit)
     .fetch_all(pool)
     .await
@@ -851,7 +851,7 @@ pub async fn admit_continuation_atomic(
          WHERE idempotency_scope = ? AND idempotency_key = ? \
          ORDER BY created_at DESC LIMIT 1"
     );
-    let existing_row = sqlx::query(&idempotency_query)
+    let existing_row = sqlx::query(sqlx::AssertSqlSafe(idempotency_query.as_str()))
         .bind(&admission.idempotency_scope)
         .bind(&admission.idempotency_key)
         .fetch_optional(&mut **tx)
@@ -921,7 +921,7 @@ pub async fn admit_continuation_atomic(
            AND status NOT IN ('succeeded', 'no_progress', 'failed', 'cancelled') \
          ORDER BY created_at DESC LIMIT 1"
     );
-    let active_row = sqlx::query(&active_query)
+    let active_row = sqlx::query(sqlx::AssertSqlSafe(active_query.as_str()))
         .bind(&admission.agent_execution_id)
         .fetch_optional(&mut **tx)
         .await
@@ -1200,7 +1200,7 @@ pub async fn claim_for_continuation_worker(
             .await?;
 
     let query = format!("SELECT {SELECT_COLS} FROM agent_work_continuations WHERE id = ?");
-    let Some(row) = sqlx::query(&query)
+    let Some(row) = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(continuation_id)
         .fetch_optional(&mut **tx)
         .await
@@ -1544,7 +1544,7 @@ pub async fn set_evidence_artifact_ids(
 /// P086 Phase 2: Find a continuation row by its primary key.
 pub async fn find_by_id(pool: &SqlitePool, id: &str) -> Result<Option<ContinuationRecord>> {
     let query = format!("SELECT {SELECT_COLS} FROM agent_work_continuations WHERE id = ?");
-    let row = sqlx::query(&query)
+    let row = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(id)
         .fetch_optional(pool)
         .await
@@ -1741,12 +1741,12 @@ pub async fn list_needing_continuation_reconciliation(
     pool: &SqlitePool,
     limit: i64,
 ) -> Result<Vec<ContinuationRecord>> {
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {SELECT_COLS} FROM agent_work_continuations
          WHERE status = 'needs_continuation_reconciliation'
          ORDER BY updated_at ASC
          LIMIT ?"
-    ))
+    )))
     .bind(limit.clamp(1, 500))
     .fetch_all(pool)
     .await

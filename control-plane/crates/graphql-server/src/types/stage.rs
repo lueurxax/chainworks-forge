@@ -1549,7 +1549,7 @@ impl GqlAgentExecution {
     }
 
     /// P079: Output contract repair evidence for this agent execution.
-    /// Returns null when no P079 repair event exists (pre-P079 runs, feature-disabled, not triggered).
+    /// Returns null when no P079 repair event exists (pre-P079 runs or not triggered).
     /// Returns typed OutputContractRepairEvidence (MISSING-008 fix — replaces prior JSON blob).
     /// SEC-MED-002: canonical_path and owner_principal_id are gated by operator-debug access,
     /// matching the redaction policy applied by MCP reports.

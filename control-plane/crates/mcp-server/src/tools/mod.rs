@@ -11,11 +11,12 @@ pub mod runtime;
 pub mod stages;
 pub mod steward;
 pub mod storage;
+pub mod temp_artifact_inventory;
 
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
 
-pub fn all_capability_tool_ids() -> [CapabilityToolId; 54] {
+pub fn all_capability_tool_ids() -> [CapabilityToolId; 55] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -71,6 +72,8 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 54] {
         CapabilityToolId::RetryRun,
         CapabilityToolId::SideEffectsForceReconcile,
         CapabilityToolId::ProviderSessionMarkProcessAbsent,
+        // P089: read-only temp artifact inventory preview.
+        CapabilityToolId::TempArtifactInventoryPreview,
     ]
 }
 
@@ -157,6 +160,8 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "p083.set_enforcement_mode" => Some(CapabilityToolId::P083SetEnforcementMode),
         "runs.retry" => Some(CapabilityToolId::RetryRun),
         "side_effects.force_reconcile" => Some(CapabilityToolId::SideEffectsForceReconcile),
+        // P089: read-only temp artifact inventory preview.
+        "temp_artifacts.inventory.preview" => Some(CapabilityToolId::TempArtifactInventoryPreview),
         _ => None,
     }
 }
@@ -216,6 +221,7 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "p083_set_enforcement_mode" => "p083.set_enforcement_mode",
         "runs_retry" => "runs.retry",
         "side_effects_force_reconcile" => "side_effects.force_reconcile",
+        "temp_artifacts_inventory_preview" => "temp_artifacts.inventory.preview",
         _ => tool_name,
     }
 }
@@ -371,6 +377,10 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
         CapabilityToolId::SideEffectsForceReconcile => {
             tool_spec_by_name(runs::tool_specs(), "side_effects.force_reconcile")
         }
+        CapabilityToolId::TempArtifactInventoryPreview => tool_spec_by_name(
+            temp_artifact_inventory::tool_specs(),
+            "temp_artifacts.inventory.preview",
+        ),
     }
 }
 
@@ -389,6 +399,7 @@ pub fn all_tool_specs() -> Vec<McpTool> {
     specs.extend(automation::tool_specs());
     specs.extend(agents::tool_specs());
     specs.extend(p080::tool_specs());
+    specs.extend(temp_artifact_inventory::tool_specs());
     specs
 }
 

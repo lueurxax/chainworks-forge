@@ -37,6 +37,7 @@ fn p083_lifecycle_output_schema() -> serde_json::Value {
                 "enum": ["accepted", "replayed", "aliased", "denied"]
             },
             "request_id": { "type": "string" },
+            "journal_id": { "type": "string" },
             "denial": {
                 "type": "object",
                 "additionalProperties": false,
@@ -740,6 +741,18 @@ pub async fn execute(
                             )
                             .await?,
                         );
+                        if is_operator {
+                            obj.insert(
+                                "p094_boundary_readback".to_string(),
+                                crate::tools::reports::p094_boundary_readback_json(pool, run_id)
+                                    .await?,
+                            );
+                            obj.insert(
+                                "p094_rollout_decision".to_string(),
+                                crate::tools::reports::p094_rollout_decision_json(pool, run_id)
+                                    .await?,
+                            );
+                        }
                     }
                     // P058 Phase 1: attach escalation_readback parity on runs.get.
                     // Full chain detail only for Operator; summary-only for Agent/Observer.
@@ -784,8 +797,15 @@ pub async fn execute(
                 run_id,
                 request_id: Some(request_id.clone()),
             });
-            cmd_handler.handle(cmd, caller).await?;
-            Ok(p083_lifecycle_success(&request_id, &request_id))
+            let commanded = cmd_handler.handle(cmd, caller).await?;
+            let mut response = p083_lifecycle_success(&request_id, &request_id);
+            if let Some(obj) = response.as_object_mut() {
+                obj.insert(
+                    "journal_id".to_string(),
+                    serde_json::Value::String(commanded.journal_id),
+                );
+            }
+            Ok(response)
         }
 
         "runs.main_sync.request" => {
@@ -2799,9 +2819,23 @@ mod tests {
             .current_dir(repo.path())
             .output()
             .expect("git init should run");
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Chainworks Test",
+                "-c",
+                "user.email=chainworks-test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ])
+            .current_dir(repo.path())
+            .output()
+            .expect("git empty commit should run");
         let worktrees = tempfile::tempdir().unwrap();
         let delivery_json = format!(
-            r#"{{"repo_identifier":"repo-1","repo_root":"{}","base_branch":"main","worktree_base_path":"{}","target_branch":"cw/release","release_target_id":"app-store"}}"#,
+            r#"{{"repo_identifier":"repo-1","repo_root":"{}","base_branch":"main","worktree_base_path":"{}","target_branch":"cw/release","release_target_id":"app-store","release_mode":"sandbox"}}"#,
             repo.path().display(),
             worktrees.path().display()
         );
@@ -2831,7 +2865,9 @@ mod tests {
         let result = execute("runs.start", params, &pool, &handler, &test_principal())
             .await
             .unwrap();
-        let run_id = result["id"].as_str().expect("run id");
+        let run_id = result["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("runs.start response must contain id: {result}"));
         let run = runs::find_by_id(&pool, run_id.parse().unwrap())
             .await
             .unwrap()
@@ -3309,6 +3345,7 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             run_id: run.id,
             stage_id: "state_10_implementation".to_string(),
+            stage_execution_id: None,
             agent_id: "code_writer".to_string(),
             policy_id: "code_writer_default_escalation".to_string(),
             policy_hash: "sha256:abc123".to_string(),
@@ -3368,6 +3405,7 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             run_id: run.id,
             stage_id: "state_10_implementation".to_string(),
+            stage_execution_id: None,
             agent_id: "code_writer".to_string(),
             policy_id: "code_writer_default_escalation".to_string(),
             policy_hash: "sha256:abc123".to_string(),
@@ -3433,6 +3471,7 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             run_id: run.id,
             stage_id: "state_10_implementation".to_string(),
+            stage_execution_id: None,
             agent_id: "code_writer".to_string(),
             policy_id: "policy_escalation_v1".to_string(),
             policy_hash: "sha256:deadbeef".to_string(),
@@ -3572,6 +3611,7 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             run_id: run.id,
             stage_id: "state_10".to_string(),
+            stage_execution_id: None,
             agent_id: "code_writer".to_string(),
             policy_id: "p1".to_string(),
             policy_hash: "sha256:abc".to_string(),
@@ -3651,6 +3691,7 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             run_id: run.id,
             stage_id: "state_10".to_string(),
+            stage_execution_id: None,
             agent_id: "code_writer".to_string(),
             policy_id: "p1".to_string(),
             policy_hash: "sha256:abc".to_string(),

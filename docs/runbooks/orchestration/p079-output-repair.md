@@ -73,13 +73,13 @@ When reviewing `OutputContractRepairEvidence`, pay attention to the following fi
 
 ## Rollback / Disablement
 
-In case of critical issues or during controlled experiments, P079 can be rolled back or disabled.
+In case of critical issues or during controlled experiments, P079-adjacent optional capabilities can be rolled back or disabled. Core output repair is always-on settlement behavior.
 
 *   **Procedure**:
-    1.  Disable the feature flags: `CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED`, `CHAINWORKS_P079_TRANSCRIPT_RECOVERY_ENABLED`, and `CHAINWORKS_P079_PROVIDER_FALLBACK_ENABLED`.
+    1.  Disable optional transcript-recovery and provider-fallback rollout flags, if they are enabled.
     2.  No database schema rollback is required; existing evidence remains readable.
-    3.  Monitor system behavior to ensure a smooth return to pre-P079 output handling.
-*   **Impact**: Disabling P079 will revert output failure handling to the pre-P079 behavior, where most output contract failures will result in immediate stage blockages.
+    3.  Monitor system behavior to ensure repair evidence and settlement remain healthy.
+*   **Impact**: Optional fallback/recovery surfaces can be disabled, but eligible output contract failures continue through the core repair path before blocking.
 
 ## Related References
 

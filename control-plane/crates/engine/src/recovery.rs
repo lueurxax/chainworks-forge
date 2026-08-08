@@ -299,13 +299,25 @@ fn p088_startup_receipt_recovery_max_files() -> usize {
     std::env::var("CHAINWORKS_P088_STARTUP_RECEIPT_RECOVERY_MAX_FILES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(256)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn startup_projection_rebuild_is_detached_from_recovery_caller() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let handle = spawn_startup_read_projection_rebuild(pool, domain::ids::RunId::new());
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("background projection task must not hold startup")
+            .unwrap();
+    }
 
     #[test]
     fn proposal_058_recovery_action_uses_failure_kind_and_output_settlement() {
@@ -987,10 +999,10 @@ impl RecoveryService {
                     );
                 }
             }
-            match artifact_contracts::repair_contract_status_normalization_and_rebuild(
-                &self.pool, run.id,
-            )
-            .await
+            // The contract rows and DB projection are canonical. The matching
+            // JSON export is rebuilt later as a derived read model, so a stuck
+            // artifact root cannot make the daemon unavailable at startup.
+            match artifact_contracts::repair_contract_status_normalization(&self.pool, run.id).await
             {
                 Ok(repaired_contracts) => {
                     if repaired_contracts > 0 {
@@ -1045,13 +1057,8 @@ impl RecoveryService {
                     warn!(run_id = %run.id, error = %e, "Failed to repair run during startup");
                 }
             }
-            if let Err(e) = rebuild_startup_read_projections(&self.pool, run.id).await {
-                warn!(
-                    run_id = %run.id,
-                    error = %e,
-                    "Failed to rebuild startup read projections"
-                );
-            }
+            let _startup_projection_rebuild =
+                spawn_startup_read_projection_rebuild(self.pool.clone(), run.id);
             if repaired_run {
                 runs_repaired += 1;
             }
@@ -3489,9 +3496,19 @@ fn recovery_snapshot_represents_wait(raw: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-async fn rebuild_startup_read_projections(
-    pool: &SqlitePool,
+/// Refresh derived read/export projections without extending the daemon's
+/// readiness critical path. Canonical recovery is complete before this runs.
+fn spawn_startup_read_projection_rebuild(
+    pool: SqlitePool,
     run_id: domain::ids::RunId,
-) -> Result<()> {
-    projections::rebuild_all_for_run(pool, run_id).await
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(error) = projections::rebuild_all_for_run(&pool, run_id).await {
+            warn!(
+                run_id = %run_id,
+                %error,
+                "Failed to rebuild startup read projections"
+            );
+        }
+    })
 }

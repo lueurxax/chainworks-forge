@@ -690,6 +690,7 @@ pub async fn insert_ledger_tx(
     // MEDIUM-002: ID fields exposed through readback get identifier + credential-pattern check.
     check_identifier_field("id", &ledger.id)?;
     check_identifier_field("stage_id", &ledger.stage_id)?;
+    check_opt_identifier_field("stage_execution_id", &ledger.stage_execution_id)?;
     check_identifier_field("agent_id", &ledger.agent_id)?;
     check_identifier_field("policy_id", &ledger.policy_id)?;
     // policy_hash may contain hex digits and prefix; length cap only (not identifier format check).
@@ -700,15 +701,16 @@ pub async fn insert_ledger_tx(
     check_ledger_mutable_field_lengths(ledger)?;
     sqlx::query(
         r#"INSERT INTO escalation_ledger
-           (id, run_id, stage_id, agent_id, policy_id, policy_hash,
+           (id, run_id, stage_id, stage_execution_id, agent_id, policy_id, policy_hash,
             status_raw, current_tier_id, current_tier_kind_raw,
             chain_attempt_index, trigger_raw, pause_reason_raw,
             operator_action_hint, runbook_anchor, created_at, updated_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"#,
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"#,
     )
     .bind(&ledger.id)
     .bind(ledger.run_id.to_string())
     .bind(&ledger.stage_id)
+    .bind(&ledger.stage_execution_id)
     .bind(&ledger.agent_id)
     .bind(&ledger.policy_id)
     .bind(&ledger.policy_hash)
@@ -771,7 +773,7 @@ pub async fn find_ledgers_by_run(
     // P058-SEC-02: SQL-level row cap (cap+1) prevents unbounded fetch_all.
     // Application-layer cap is 50; fetching 51 lets callers detect truncation (len > 50).
     let rows = sqlx::query(
-        r#"SELECT id, run_id, stage_id, agent_id, policy_id, policy_hash,
+        r#"SELECT id, run_id, stage_id, stage_execution_id, agent_id, policy_id, policy_hash,
                   status_raw, current_tier_id, current_tier_kind_raw,
                   chain_attempt_index, trigger_raw, pause_reason_raw,
                   operator_action_hint, runbook_anchor, created_at, updated_at
@@ -793,6 +795,7 @@ pub async fn find_ledgers_by_run(
                 id: row.try_get("id")?,
                 run_id: run_id_str.parse().map_err(|e| anyhow!("bad run_id: {e}"))?,
                 stage_id: row.try_get("stage_id")?,
+                stage_execution_id: row.try_get("stage_execution_id")?,
                 agent_id: row.try_get("agent_id")?,
                 policy_id: row.try_get("policy_id")?,
                 policy_hash: row.try_get("policy_hash")?,
@@ -961,7 +964,7 @@ pub async fn find_ledger_by_id(
     ledger_id: &str,
 ) -> Result<Option<EscalationLedger>> {
     let row = sqlx::query(
-        r#"SELECT id, run_id, stage_id, agent_id, policy_id, policy_hash,
+        r#"SELECT id, run_id, stage_id, stage_execution_id, agent_id, policy_id, policy_hash,
                   status_raw, current_tier_id, current_tier_kind_raw,
                   chain_attempt_index, trigger_raw, pause_reason_raw,
                   operator_action_hint, runbook_anchor, created_at, updated_at
@@ -980,6 +983,7 @@ pub async fn find_ledger_by_id(
             id: row.try_get("id")?,
             run_id: run_id_str.parse().map_err(|e| anyhow!("bad run_id: {e}"))?,
             stage_id: row.try_get("stage_id")?,
+            stage_execution_id: row.try_get("stage_execution_id")?,
             agent_id: row.try_get("agent_id")?,
             policy_id: row.try_get("policy_id")?,
             policy_hash: row.try_get("policy_hash")?,
@@ -1002,27 +1006,30 @@ pub async fn find_ledger_by_id(
     .transpose()
 }
 
-/// Look up an escalation ledger by its chain key: (run_id, stage_id, agent_id, policy_id).
+/// Look up an escalation ledger by its chain key:
+/// (run_id, stage_id, stage_execution_id, agent_id, policy_id).
 /// Returns None when no matching chain exists yet.
 pub async fn find_ledger_by_chain_key(
     pool: &SqlitePool,
     run_id: RunId,
     stage_id: &str,
+    stage_execution_id: &str,
     agent_id: &str,
     policy_id: &str,
 ) -> Result<Option<EscalationLedger>> {
     let row = sqlx::query(
-        r#"SELECT id, run_id, stage_id, agent_id, policy_id, policy_hash,
+        r#"SELECT id, run_id, stage_id, stage_execution_id, agent_id, policy_id, policy_hash,
                   status_raw, current_tier_id, current_tier_kind_raw,
                   chain_attempt_index, trigger_raw, pause_reason_raw,
                   operator_action_hint, runbook_anchor, created_at, updated_at
            FROM escalation_ledger
-           WHERE run_id = ? AND stage_id = ? AND agent_id = ? AND policy_id = ?
+           WHERE run_id = ? AND stage_id = ? AND stage_execution_id = ? AND agent_id = ? AND policy_id = ?
            ORDER BY created_at ASC, id ASC
            LIMIT 1"#,
     )
     .bind(run_id.to_string())
     .bind(stage_id)
+    .bind(stage_execution_id)
     .bind(agent_id)
     .bind(policy_id)
     .fetch_optional(pool)
@@ -1036,6 +1043,7 @@ pub async fn find_ledger_by_chain_key(
             id: row.try_get("id")?,
             run_id: run_id_str.parse().map_err(|e| anyhow!("bad run_id: {e}"))?,
             stage_id: row.try_get("stage_id")?,
+            stage_execution_id: row.try_get("stage_execution_id")?,
             agent_id: row.try_get("agent_id")?,
             policy_id: row.try_get("policy_id")?,
             policy_hash: row.try_get("policy_hash")?,
@@ -1069,6 +1077,7 @@ pub async fn insert_or_ignore_ledger(
 ) -> Result<String> {
     check_identifier_field("id", &ledger.id)?;
     check_identifier_field("stage_id", &ledger.stage_id)?;
+    check_opt_identifier_field("stage_execution_id", &ledger.stage_execution_id)?;
     check_identifier_field("agent_id", &ledger.agent_id)?;
     check_identifier_field("policy_id", &ledger.policy_id)?;
     check_field_len("policy_hash", &ledger.policy_hash, FIELD_ID_MAX)?;
@@ -1081,15 +1090,16 @@ pub async fn insert_or_ignore_ledger(
 
     let insert_result = sqlx::query(
         r#"INSERT OR IGNORE INTO escalation_ledger
-           (id, run_id, stage_id, agent_id, policy_id, policy_hash,
+           (id, run_id, stage_id, stage_execution_id, agent_id, policy_id, policy_hash,
             status_raw, current_tier_id, current_tier_kind_raw,
             chain_attempt_index, trigger_raw, pause_reason_raw,
             operator_action_hint, runbook_anchor, created_at, updated_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"#,
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"#,
     )
     .bind(&ledger.id)
     .bind(ledger.run_id.to_string())
     .bind(&ledger.stage_id)
+    .bind(&ledger.stage_execution_id)
     .bind(&ledger.agent_id)
     .bind(&ledger.policy_id)
     .bind(&ledger.policy_hash)
@@ -1119,11 +1129,12 @@ pub async fn insert_or_ignore_ledger(
     // attaching new executions to a chain whose frozen hash no longer matches.
     let existing: (String, String) = sqlx::query_as(
         r#"SELECT id, policy_hash FROM escalation_ledger
-           WHERE run_id = ? AND stage_id = ? AND agent_id = ? AND policy_id = ?
+           WHERE run_id = ? AND stage_id = ? AND stage_execution_id = ? AND agent_id = ? AND policy_id = ?
            LIMIT 1"#,
     )
     .bind(ledger.run_id.to_string())
     .bind(&ledger.stage_id)
+    .bind(&ledger.stage_execution_id)
     .bind(&ledger.agent_id)
     .bind(&ledger.policy_id)
     .fetch_one(&mut *tx)
@@ -1165,6 +1176,7 @@ pub async fn insert_or_ignore_ledger_tx(
 ) -> Result<String> {
     check_identifier_field("id", &ledger.id)?;
     check_identifier_field("stage_id", &ledger.stage_id)?;
+    check_opt_identifier_field("stage_execution_id", &ledger.stage_execution_id)?;
     check_identifier_field("agent_id", &ledger.agent_id)?;
     check_identifier_field("policy_id", &ledger.policy_id)?;
     check_field_len("policy_hash", &ledger.policy_hash, FIELD_ID_MAX)?;
@@ -1175,15 +1187,16 @@ pub async fn insert_or_ignore_ledger_tx(
 
     let insert_result = sqlx::query(
         r#"INSERT OR IGNORE INTO escalation_ledger
-           (id, run_id, stage_id, agent_id, policy_id, policy_hash,
+           (id, run_id, stage_id, stage_execution_id, agent_id, policy_id, policy_hash,
             status_raw, current_tier_id, current_tier_kind_raw,
             chain_attempt_index, trigger_raw, pause_reason_raw,
             operator_action_hint, runbook_anchor, created_at, updated_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"#,
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"#,
     )
     .bind(&ledger.id)
     .bind(ledger.run_id.to_string())
     .bind(&ledger.stage_id)
+    .bind(&ledger.stage_execution_id)
     .bind(&ledger.agent_id)
     .bind(&ledger.policy_id)
     .bind(&ledger.policy_hash)
@@ -1208,11 +1221,12 @@ pub async fn insert_or_ignore_ledger_tx(
 
     let (existing_id, existing_policy_hash): (String, String) = sqlx::query_as(
         r#"SELECT id, policy_hash FROM escalation_ledger
-           WHERE run_id = ? AND stage_id = ? AND agent_id = ? AND policy_id = ?
+           WHERE run_id = ? AND stage_id = ? AND stage_execution_id = ? AND agent_id = ? AND policy_id = ?
            LIMIT 1"#,
     )
     .bind(ledger.run_id.to_string())
     .bind(&ledger.stage_id)
+    .bind(&ledger.stage_execution_id)
     .bind(&ledger.agent_id)
     .bind(&ledger.policy_id)
     .fetch_one(&mut **tx)

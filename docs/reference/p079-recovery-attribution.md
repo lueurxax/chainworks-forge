@@ -46,11 +46,12 @@ Recovery is fail-closed and bounded:
 If the transcript exceeds the byte cap, recovery returns `unavailable` with
 subtype `oversized_payload`. No partial payload is accepted.
 
-## Feature Flag
+## Activation
 
-Recovery requires `CHAINWORKS_P079_TRANSCRIPT_RECOVERY_ENABLED`. If an
-extractable provider envelope exists but the flag is disabled, recovery returns
-`unavailable` and records `feature_flag_disabled` as subtype.
+Transcript recovery is always enabled for transport-attributed provider
+envelopes. There is no runtime enablement flag for the core recovery path. The
+only remaining runtime knob is the bounded byte cap
+`CHAINWORKS_P079_TRANSCRIPT_RECOVERY_MAX_BYTES`.
 
 ## Result Mapping
 
@@ -59,7 +60,6 @@ extractable provider envelope exists but the flag is disabled, recovery returns
 - Oversized transcript: `unavailable`, subtype `oversized_payload`
 - Raw/unattributed output body: `unavailable`, subtype
   `unattributable_envelope` or `attribution_not_verified`
-- Feature flag disabled: `unavailable`, subtype `feature_flag_disabled`
 - Transport-attributed provider envelope: `accepted`
 
 Accepted recovery still runs through declared-output validation and canonical

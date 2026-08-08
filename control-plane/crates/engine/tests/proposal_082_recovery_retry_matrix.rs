@@ -263,6 +263,7 @@ fn p082_cancellation_reason_codes_defined() {
     let cancellation_codes = [
         recovery_matrix::REASON_CANCEL_ACTIVE_STAGE_REQUESTED,
         recovery_matrix::REASON_CANCEL_PENDING_APPROVAL_PRESERVED,
+        recovery_matrix::REASON_CANCEL_PENDING_APPROVAL_EXPIRED,
         recovery_matrix::REASON_CANCEL_SIDE_EFFECT_RECONCILIATION_REQUIRED,
         recovery_matrix::REASON_CANCEL_STARTUP_REPAIR_CONVERGED,
     ];
@@ -878,7 +879,9 @@ fn p082_r16_startup_requeue_exhausted_uses_held_status_not_repaired() {
             now,
         ),
         summary,
-        Some("Startup requeue exhausted: generation 1 was already consumed. Use existing recovery inspection or cancellation paths to clear the hold."),
+        Some(
+            "Startup requeue exhausted: generation 1 was already consumed. Use existing recovery inspection or cancellation paths to clear the hold.",
+        ),
     );
     // R16 must be held, not repaired — held prevents duplicate work scheduling.
     assert_eq!(
@@ -898,8 +901,10 @@ fn p082_r16_startup_requeue_exhausted_uses_held_status_not_repaired() {
         "P082-R16: replayed must be true when idempotency key was already observed"
     );
     // operator_message must be non-null for held states.
-    assert!(!rb["recovery_operator_message"].is_null(),
-        "P082-R16: recovery_operator_message must be non-null for startup_requeue_exhausted held state");
+    assert!(
+        !rb["recovery_operator_message"].is_null(),
+        "P082-R16: recovery_operator_message must be non-null for startup_requeue_exhausted held state"
+    );
     // source_json_key must point to the approved storage owner.
     assert_eq!(
         rb["source_json_key"].as_str().unwrap(),
@@ -1044,14 +1049,17 @@ fn p082_r15_crash_loop_same_key_must_not_create_duplicate() {
     );
     let r15_rb = recovery_matrix::set_readback_startup_repair(
         recovery_matrix::build_readback_v1(
-            "P082-R15", "repaired", "retry",
+            "P082-R15",
+            "repaired",
+            "retry",
             recovery_matrix::REASON_REPAIR_CRASH_RESUME_IDEMPOTENT,
             "Crash-resume replay reused an existing repair idempotency key without duplicate mutation.",
             "startup_repairs, retry_payload_recovery_events, side_effects, runs, command_journal",
             "startup_repairs, work_items, command_journal",
             repair_id,
             Some("startup_repairs.notes.p082_recovery_matrix_readback"),
-            "valid", now,
+            "valid",
+            now,
         ),
         r15_summary,
         None,
@@ -1154,7 +1162,9 @@ fn p082_r05_stale_acp_startup_xcode_requires_non_null_operator_message() {
             "2026-05-21T00:00:00Z",
         ),
         xcode_summary,
-        Some("Xcode startup grace exceeded. Inspect Xcode broker and session startup. Grace: 12 minutes."),
+        Some(
+            "Xcode startup grace exceeded. Inspect Xcode broker and session startup. Grace: 12 minutes.",
+        ),
     );
     assert_eq!(rb["scenario_id"].as_str().unwrap(), "P082-R05");
     assert!(
@@ -1189,16 +1199,16 @@ fn p082_r10_duplicate_mediation_owner_uses_inspect_duplicate_decision() {
     assert!(recovery_matrix::validate_readback_v1_shape(&rb));
 }
 
-// ── P082-R12: Cancel with pending approval preserves approval state ────────
+// ── P082-R12: Cancel with pending approval expires approval actionability ───
 
 #[test]
-fn p082_r12_cancel_with_pending_approval_must_not_auto_resolve() {
+fn p082_r12_cancel_with_pending_approval_expires_actionability() {
     let rb = recovery_matrix::build_readback_v1(
         "P082-R12",
         "cancelled",
         "cancel",
-        recovery_matrix::REASON_CANCEL_PENDING_APPROVAL_PRESERVED,
-        "Cancellation settled without auto-resolving the pending approval decision.",
+        recovery_matrix::REASON_CANCEL_PENDING_APPROVAL_EXPIRED,
+        "Cancellation expired pending approval entries so they cannot remain actionable.",
         "runs, approvals, approval_inbox",
         "runs, approvals",
         "run-r12",
@@ -1215,7 +1225,7 @@ fn p082_r12_cancel_with_pending_approval_must_not_auto_resolve() {
     assert_eq!(rb["recovery_decision"].as_str().unwrap(), "cancel");
     assert_eq!(
         rb["recovery_reason_code"].as_str().unwrap(),
-        recovery_matrix::REASON_CANCEL_PENDING_APPROVAL_PRESERVED
+        recovery_matrix::REASON_CANCEL_PENDING_APPROVAL_EXPIRED
     );
     assert!(recovery_matrix::validate_readback_v1_shape(&rb));
 }

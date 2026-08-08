@@ -1494,7 +1494,7 @@ const P083_MIGRATIONS: &[P083MigrationDescriptor] = &[
 fn p083_migration_sha256(version: i64) -> String {
     use crate::migrate::MIGRATOR;
     if let Some(m) = MIGRATOR.iter().find(|m| m.version == version) {
-        let sql_bytes = m.sql.as_bytes();
+        let sql_bytes = m.sql.as_str().as_bytes();
         let mut hasher = Sha256::new();
         hasher.update(sql_bytes);
         format!("{:x}", hasher.finalize())

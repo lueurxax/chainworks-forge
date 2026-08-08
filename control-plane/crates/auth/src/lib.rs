@@ -732,9 +732,8 @@ impl Default for PrincipalEntry {
 /// Returns 43-char base64url (without padding) encoding of 32 random bytes = 256 bits entropy.
 /// Satisfies P081 token format: 32..4096 visible ASCII, no CTL characters.
 fn generate_bootstrap_token() -> String {
-    use rand::RngCore;
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::fill(&mut bytes);
     base64_url_no_pad(&bytes)
 }
 
@@ -1292,7 +1291,7 @@ fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolI
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 54] {
+fn all_tool_capabilities() -> [CapabilityToolId; 55] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -1351,6 +1350,8 @@ fn all_tool_capabilities() -> [CapabilityToolId; 54] {
         CapabilityToolId::P083SetEnforcementMode,
         CapabilityToolId::RetryRun,
         CapabilityToolId::SideEffectsForceReconcile,
+        // P089: read-only temp artifact inventory preview (Operator-only).
+        CapabilityToolId::TempArtifactInventoryPreview,
     ]
 }
 
@@ -1496,6 +1497,9 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         CapabilityToolId::P083SetEnforcementMode => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::RetryRun => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::SideEffectsForceReconcile => matches!(class, PrincipalClass::Operator),
+        // P089: temp artifact inventory preview is read-only Operator-only (SEC-P089-001).
+        // Redacted paths and HMAC hashes are scoped to the operator session only.
+        CapabilityToolId::TempArtifactInventoryPreview => matches!(class, PrincipalClass::Operator),
     }
 }
 
@@ -1643,6 +1647,8 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
         "p083.set_enforcement_mode" => Some(CapabilityToolId::P083SetEnforcementMode),
         "runs.retry" => Some(CapabilityToolId::RetryRun),
         "side_effects.force_reconcile" => Some(CapabilityToolId::SideEffectsForceReconcile),
+        // P089: read-only temp artifact inventory preview.
+        "temp_artifacts.inventory.preview" => Some(CapabilityToolId::TempArtifactInventoryPreview),
         _ => None,
     }
 }

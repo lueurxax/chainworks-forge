@@ -1192,7 +1192,7 @@ nonisolated final class P081ApprovalActionAttemptStore: @unchecked Sendable {
     init(
         defaults: UserDefaults = .standard,
         storageKey: String = "chainworks.p081.approval-action-attempts.v1",
-        makeID: @escaping @Sendable () -> String = { makeUUIDv7() }
+        makeID: @escaping @Sendable () -> String = { makeCallerRequestID() }
     ) {
         self.defaults = defaults
         self.storageKey = storageKey
@@ -1205,7 +1205,7 @@ nonisolated final class P081ApprovalActionAttemptStore: @unchecked Sendable {
         defer { lock.unlock() }
 
         var attempts = loadLocked()
-        if let existing = attempts[attemptKey] {
+        if let existing = attempts[attemptKey], Self.isValidCallerRequestID(existing) {
             return existing
         }
 
@@ -1262,6 +1262,24 @@ nonisolated final class P081ApprovalActionAttemptStore: @unchecked Sendable {
 
     private static func escaped(_ value: String) -> String {
         value.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? value
+    }
+
+    private static func isValidCallerRequestID(_ value: String) -> Bool {
+        let chars = Array(value)
+        guard chars.count == 36 else { return false }
+        for index in [8, 13, 18, 23] where chars[index] != "-" {
+            return false
+        }
+        guard chars[14] == "4" else { return false }
+        guard ["8", "9", "a", "b"].contains(chars[19]) else { return false }
+        return value.unicodeScalars.allSatisfy { scalar in
+            switch scalar.value {
+            case 45, 48...57, 97...102:
+                return true
+            default:
+                return false
+            }
+        }
     }
 }
 
@@ -5415,31 +5433,8 @@ private struct P031FreshnessBadge: View {
     }
 }
 
-
-
-// P081 Defect1: Generate a UUIDv7 string for approval action idempotency keys.
-// UUIDv7 embeds the current Unix timestamp in ms in the high 48 bits, version nibble 0x7
-// in bits 48-51, and random bytes elsewhere (RFC 9562). The server validates
-// idempotency keys as UUIDv7 (version nibble check) so UUIDv4 from UUID() must not be used.
-private nonisolated func makeUUIDv7() -> String {
-    let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
-    var bytes = [UInt8](repeating: 0, count: 16)
-    bytes[0] = UInt8((nowMs >> 40) & 0xFF)
-    bytes[1] = UInt8((nowMs >> 32) & 0xFF)
-    bytes[2] = UInt8((nowMs >> 24) & 0xFF)
-    bytes[3] = UInt8((nowMs >> 16) & 0xFF)
-    bytes[4] = UInt8((nowMs >> 8) & 0xFF)
-    bytes[5] = UInt8(nowMs & 0xFF)
-    for i in 6..<16 { bytes[i] = UInt8.random(in: 0...255) }
-    bytes[6] = (bytes[6] & 0x0F) | 0x70  // version = 7
-    bytes[8] = (bytes[8] & 0x3F) | 0x80  // variant = 10xx
-    return String(
-        format: "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5], bytes[6], bytes[7],
-        bytes[8], bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
-    )
+private nonisolated func makeCallerRequestID() -> String {
+    UUID().uuidString.lowercased()
 }
 
 #Preview("Stages") {

@@ -211,7 +211,7 @@ pub async fn get_blocking_conflicts_for_runs(
         status_start + 1,
         status_start + 2,
     );
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
     for id in run_ids {
         q = q.bind(id);
     }

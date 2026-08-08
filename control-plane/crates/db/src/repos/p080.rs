@@ -6,7 +6,6 @@
 //!   - Readback heartbeat page reader for the diagnostics MCP tool
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::path::PathBuf;
@@ -2816,7 +2815,7 @@ fn p080_repair_hmac_key_material() -> Result<Vec<u8>> {
         })?;
     }
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::fill(&mut bytes);
     let encoded: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
     write_p080_repair_hmac_key_file(&path, &encoded)?;
     Ok(encoded.into_bytes())

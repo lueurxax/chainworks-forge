@@ -66,11 +66,13 @@ pub async fn list_by_run(
     pool: &SqlitePool,
     run_id: RunId,
 ) -> Result<Vec<RetryPayloadRecoveryEvent>> {
-    let rows = sqlx::query(select_sql("WHERE run_id = ?1 ORDER BY updated_at ASC").as_str())
-        .bind(run_id.to_string())
-        .fetch_all(pool)
-        .await
-        .context("list retry payload recovery events by run")?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(select_sql(
+        "WHERE run_id = ?1 ORDER BY updated_at ASC",
+    )))
+    .bind(run_id.to_string())
+    .fetch_all(pool)
+    .await
+    .context("list retry payload recovery events by run")?;
     rows.iter().map(parse_row).collect()
 }
 

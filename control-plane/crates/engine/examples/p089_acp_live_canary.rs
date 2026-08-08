@@ -142,6 +142,26 @@ fn load_catalog_binding(repo_root: &Path) -> Result<CatalogBinding> {
         );
         contract_ids.insert(output.clone(), contract_id);
     }
+    let manifest_contract_id = "changed_files_manifest".to_string();
+    let manifest_contract = output_schemas
+        .get(serde_yaml::Value::String(manifest_contract_id.clone()))
+        .context("missing output schema contract changed_files_manifest")?;
+    contract_schemas.insert(
+        manifest_contract_id.clone(),
+        OutputSchema {
+            contract_id: manifest_contract_id,
+            format: yaml_string(manifest_contract, "format")?,
+            human_format: yaml_optional_string(manifest_contract, "human_format"),
+            machine_format: yaml_optional_string(manifest_contract, "machine_format"),
+            validation_mode: yaml_optional_string(manifest_contract, "validation_mode"),
+            normalized_artifact_name: yaml_optional_string(
+                manifest_contract,
+                "normalized_artifact_name",
+            ),
+            raw_artifact_name: yaml_optional_string(manifest_contract, "raw_artifact_name"),
+            required_fields: yaml_string_vec(manifest_contract, "required_fields"),
+        },
+    );
     Ok(CatalogBinding {
         catalog_sha256: sha256_file(&catalog_path)?,
         catalog_path,
@@ -178,13 +198,13 @@ async fn main() -> Result<()> {
     let artifact_root = run_dir.join("artifacts");
     fs::create_dir_all(&artifact_root)?;
 
-    let outputs: BTreeMap<String, PathBuf> = binding
-        .outputs
+    let mut declared_output_names = binding.outputs.clone();
+    declared_output_names.push("changed_files_manifest".to_string());
+    let outputs: BTreeMap<String, PathBuf> = declared_output_names
         .iter()
         .map(|name| (name.clone(), artifact_root.join(format!("{name}.json"))))
         .collect();
-    let declared_outputs = binding
-        .outputs
+    let declared_outputs = declared_output_names
         .iter()
         .map(|name| DeclaredOutput {
             output_name: name.clone(),
@@ -260,6 +280,7 @@ tests_result={}
         reuse_existing_session: false,
         session_generation_id: Some(session_generation_id.clone()),
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: Some(run_dir.join("meta").to_string_lossy().into_owned()),
         legacy_broad_discovery_policy: LegacyBroadDiscoveryPolicy::Disabled,

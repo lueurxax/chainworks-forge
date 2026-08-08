@@ -65,7 +65,7 @@ impl AcpAdapter for AuggieAdapter {
             "Spawning Auggie ACP subprocess"
         );
 
-        Ok(AcpLaunchSpec::new(&self.binary_path))
+        Ok(auggie_launch_spec(&self.binary_path))
     }
 
     fn prepare_session_new_spec(&self, _req: &ExecutionRequest) -> Result<AcpSessionNewSpec> {
@@ -74,5 +74,22 @@ impl AcpAdapter for AuggieAdapter {
 
     fn supports_http_mcp_capability_probe(&self) -> bool {
         false
+    }
+}
+
+fn auggie_launch_spec(binary_path: &str) -> AcpLaunchSpec {
+    AcpLaunchSpec::new(binary_path).with_arg("--acp")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_spec_enters_auggie_acp_mode() {
+        let launch_spec = auggie_launch_spec("/bin/auggie-fixture");
+
+        assert_eq!(launch_spec.binary_path, "/bin/auggie-fixture");
+        assert_eq!(launch_spec.args, ["--acp"]);
     }
 }

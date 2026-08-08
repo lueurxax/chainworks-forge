@@ -9,6 +9,7 @@ import Foundation
 import Testing
 @testable import Chainworks_Forge
 
+@Suite(.serialized)
 @MainActor
 struct DaemonLifecycleClientTests {
 
@@ -330,7 +331,7 @@ struct DaemonLifecycleClientTests {
     @Test func `DaemonLifecycleState is live matches rust contract`() {
         #expect(DaemonLifecycleState.ready.isLive)
         #expect(DaemonLifecycleState.degraded.isLive)
-        #expect(!DaemonLifecycleState.starting.isLive)
+        #expect(DaemonLifecycleState.starting.isLive)
         #expect(!DaemonLifecycleState.failed.isLive)
     }
 
@@ -400,6 +401,86 @@ struct DaemonLifecycleClientTests {
         #expect(vm.lastError != nil, "the transport error remains visible for diagnostics")
     }
 
+    @Test func `startup bootstrap retries transient graphql 404 and reaches ready`() async {
+        DaemonStartupSequenceURLProtocol.configure(
+            responses: [
+                (status: 404, body: Data()),
+                (
+                    status: 200,
+                    body: Data(
+                        """
+                        {
+                          "data": {
+                            "daemonStatus": {
+                              "json": "{\\"state\\":\\"ready\\",\\"schema_version\\":95,\\"binary_schema_version\\":95,\\"build_sha\\":\\"test\\",\\"last_state_change_at\\":\\"2026-07-25T10:00:00Z\\",\\"restart_count_since_boot\\":0,\\"pid\\":42}"
+                            }
+                          }
+                        }
+                        """.utf8
+                    )
+                ),
+            ]
+        )
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [DaemonStartupSequenceURLProtocol.self]
+        let client = DaemonLifecycleClient(
+            endpoint: DaemonClientEndpoint(
+                baseURL: URL(string: "http://127.0.0.1:4000")!,
+                bearerToken: "test"
+            ),
+            urlSession: URLSession(configuration: config)
+        )
+        let vm = DaemonStatusViewModel(client: client)
+
+        await vm.startSnapshotPlusSubscribe(startupRetryDelays: [.zero])
+
+        #expect(vm.status?.state == .ready)
+        #expect(vm.lastError == nil)
+        #expect(DaemonStartupSequenceURLProtocol.requestCount == 2)
+    }
+
+    @Test func `startup bootstrap does not retry unauthorized graphql response`() async {
+        DaemonStartupSequenceURLProtocol.configure(
+            responses: [
+                (status: 401, body: Data("unauthorized".utf8)),
+                (
+                    status: 200,
+                    body: Data(
+                        """
+                        {
+                          "data": {
+                            "daemonStatus": {
+                              "json": "{\\"state\\":\\"ready\\",\\"schema_version\\":95,\\"binary_schema_version\\":95,\\"build_sha\\":\\"test\\",\\"last_state_change_at\\":\\"2026-07-25T10:00:00Z\\",\\"restart_count_since_boot\\":0,\\"pid\\":42}"
+                            }
+                          }
+                        }
+                        """.utf8
+                    )
+                ),
+            ]
+        )
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [DaemonStartupSequenceURLProtocol.self]
+        let client = DaemonLifecycleClient(
+            endpoint: DaemonClientEndpoint(
+                baseURL: URL(string: "http://127.0.0.1:4000")!,
+                bearerToken: "test"
+            ),
+            urlSession: URLSession(configuration: config)
+        )
+        let vm = DaemonStatusViewModel(client: client)
+
+        await vm.startSnapshotPlusSubscribe(startupRetryDelays: [.zero])
+
+        #expect(vm.status == nil)
+        #expect(vm.isUnavailable)
+        #expect(DaemonStartupSequenceURLProtocol.requestCount == 1)
+        guard case .httpFailure(status: 401, _)? = vm.lastError else {
+            Issue.record("expected HTTP 401, got \(String(describing: vm.lastError))")
+            return
+        }
+    }
+
     // MARK: - WS URL derivation
 
     @Test func `endpoint graphqlWSURL rewrites scheme to ws`() {
@@ -409,4 +490,50 @@ struct DaemonLifecycleClientTests {
         )
         #expect(endpoint.graphqlWSURL.absoluteString == "ws://127.0.0.1:4000/graphql/ws")
     }
+}
+
+private final class DaemonStartupSequenceURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var queuedResponses: [(status: Int, body: Data)] = []
+    private nonisolated(unsafe) static var observedRequestCount = 0
+
+    static var requestCount: Int {
+        lock.withLock { observedRequestCount }
+    }
+
+    static func configure(responses: [(status: Int, body: Data)]) {
+        lock.withLock {
+            queuedResponses = responses
+            observedRequestCount = 0
+        }
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        request.url?.path == "/graphql"
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        let response = Self.lock.withLock { () -> (status: Int, body: Data) in
+            Self.observedRequestCount += 1
+            guard !Self.queuedResponses.isEmpty else {
+                return (status: 500, body: Data())
+            }
+            return Self.queuedResponses.removeFirst()
+        }
+        let http = HTTPURLResponse(
+            url: request.url!,
+            statusCode: response.status,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: response.body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }

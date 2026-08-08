@@ -4,7 +4,9 @@ use serde::de::DeserializeOwned;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use tokio::sync::Semaphore;
 
 use domain::agent::{AgentOutputSettlement, ArtifactSourceClaimState};
 use domain::artifact_contracts::{
@@ -26,6 +28,8 @@ use crate::pool::log_write_transaction;
 use crate::writer::begin_registered_immediate_transaction;
 
 const ARTIFACT_CONTRACT_READBACK_MAX_BYTES: u64 = 1024 * 1024;
+const P094_ARTIFACT_READ_TIMEOUT: Duration = Duration::from_millis(250);
+static P094_ARTIFACT_READ_PERMITS: Semaphore = Semaphore::const_new(4);
 
 #[derive(Clone, Debug)]
 struct ArtifactReadRoots {
@@ -256,6 +260,15 @@ pub async fn repair_contract_status_normalization_and_rebuild(
     pool: &SqlitePool,
     run_id: RunId,
 ) -> Result<u64> {
+    let repaired = repair_contract_status_normalization(pool, run_id).await?;
+    export_projection_files(pool, run_id).await?;
+    Ok(repaired)
+}
+
+/// Repairs the canonical contract rows and their database projection without
+/// touching the derived filesystem exports. Startup recovery uses this form so
+/// an unavailable artifact root cannot keep the daemon from becoming ready.
+pub async fn repair_contract_status_normalization(pool: &SqlitePool, run_id: RunId) -> Result<u64> {
     let mut tx = crate::writer::begin_repository_transaction(
         pool,
         "artifact_contracts.repair_contract_status_normalization",
@@ -264,7 +277,6 @@ pub async fn repair_contract_status_normalization_and_rebuild(
     let repaired = repair_contract_status_normalization_tx(&mut tx, run_id).await?;
     rebuild_run_state_projection_tx(&mut tx, run_id).await?;
     tx.commit().await?;
-    export_projection_files(pool, run_id).await?;
     Ok(repaired)
 }
 
@@ -1055,8 +1067,8 @@ async fn p094_active_contract_readback_json(
         return Ok(serde_json::Value::Null);
     };
     let roots = artifact_read_roots_for_run(pool, run_id).await?;
-    let payload = read_confined_artifact_bytes(&roots, &row.raw_path)
-        .ok()
+    let payload = read_p094_artifact_payload_bounded(roots, row.raw_path.clone())
+        .await
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .unwrap_or(serde_json::Value::Null);
     let mut object = match payload {
@@ -1093,6 +1105,24 @@ async fn p094_active_contract_readback_json(
         }),
     );
     Ok(serde_json::Value::Object(object))
+}
+
+async fn read_p094_artifact_payload_bounded(
+    roots: ArtifactReadRoots,
+    raw_path: String,
+) -> Option<Vec<u8>> {
+    // The summary GraphQL path calls P094 enrichment even when the client did
+    // not request the payload field. Artifact roots may live on slow or stale
+    // filesystems, so never let one open(2) hold the request worker forever.
+    let permit = P094_ARTIFACT_READ_PERMITS.try_acquire().ok()?;
+    let read = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        read_confined_artifact_bytes(&roots, &raw_path).ok()
+    });
+    match tokio::time::timeout(P094_ARTIFACT_READ_TIMEOUT, read).await {
+        Ok(Ok(payload)) => payload,
+        Ok(Err(_)) | Err(_) => None,
+    }
 }
 
 pub async fn canonical_contract_field(

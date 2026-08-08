@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
@@ -107,9 +107,9 @@ pub async fn repair_slot_with_mcp_context(
                 let base_delay = delays[attempt];
                 // P087: 20 percent jitter using rand
                 let sleep_ms = {
-                    let mut rng = rand::thread_rng();
+                    let mut rng = rand::rng();
                     let jitter_range = (base_delay as f64 * 0.4) as i64; // total 40% range (-20% to +20%)
-                    let jitter: i64 = rng.gen_range(0..jitter_range.max(1)) - (jitter_range / 2);
+                    let jitter: i64 = rng.random_range(0..jitter_range.max(1)) - (jitter_range / 2);
                     (base_delay as i64 + jitter).max(1) as u64
                 };
 

@@ -162,7 +162,10 @@ def refresh_acp_evidence() -> None:
         },
     )
 
-    expected_contracts = catalog_binding["contract_ids"]
+    expected_contracts = {
+        item["output_name"]: item.get("contract_id")
+        for item in harness["expected_outputs"]
+    }
     compiled_outputs = []
     for item in harness["expected_outputs"]:
         name = item["output_name"]

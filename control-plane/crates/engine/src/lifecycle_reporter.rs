@@ -64,12 +64,39 @@ impl LifecycleReporter {
                 guard.degraded.clear();
                 guard.failure = None;
             }
+            if state != DaemonLifecycleState::Starting {
+                guard.startup_phase = None;
+                guard.startup_phase_started_at = None;
+            }
             if let Err(msg) = guard.check_failure_invariant() {
                 warn!(invariant = msg, "lifecycle reporter emitted invalid status");
             }
             guard.clone()
         };
         info!(state = %state, "daemon lifecycle state changed");
+        let _ = self
+            .events
+            .send(DomainEvent::DaemonStatusChanged { status: snapshot });
+    }
+
+    /// Publish a finer startup phase while the daemon is in `Starting`.
+    /// This is intentionally status-only readback; it does not imply
+    /// readiness for GraphQL/MCP mutations.
+    pub fn set_startup_phase(&self, phase: impl Into<String>) {
+        let phase = phase.into();
+        let snapshot = {
+            let mut guard = self.inner.lock().expect("lifecycle reporter lock");
+            if guard.state != DaemonLifecycleState::Starting {
+                return;
+            }
+            if guard.startup_phase.as_deref() == Some(phase.as_str()) {
+                return;
+            }
+            guard.startup_phase = Some(phase.clone());
+            guard.startup_phase_started_at = Some(Utc::now());
+            guard.clone()
+        };
+        info!(phase = %phase, "daemon startup phase changed");
         let _ = self
             .events
             .send(DomainEvent::DaemonStatusChanged { status: snapshot });
@@ -168,6 +195,8 @@ impl LifecycleReporter {
                 backup_path,
             });
             guard.degraded.clear();
+            guard.startup_phase = None;
+            guard.startup_phase_started_at = None;
             guard.clone()
         };
         warn!(
@@ -207,6 +236,30 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn startup_phase_only_publishes_while_starting_and_clears_on_ready() {
+        let (reporter, mut rx) = make();
+        reporter.set_startup_phase("ignored");
+        assert!(rx.try_recv().is_err());
+
+        reporter.set_state(DaemonLifecycleState::Starting);
+        let _ = rx.recv().await.unwrap();
+        reporter.set_startup_phase("startup_recovery");
+        let event = rx.recv().await.unwrap();
+        match event {
+            DomainEvent::DaemonStatusChanged { status } => {
+                assert_eq!(status.startup_phase.as_deref(), Some("startup_recovery"));
+                assert!(status.startup_phase_started_at.is_some());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        reporter.set_state(DaemonLifecycleState::Ready);
+        let snap = reporter.snapshot();
+        assert!(snap.startup_phase.is_none());
+        assert!(snap.startup_phase_started_at.is_none());
     }
 
     #[tokio::test]

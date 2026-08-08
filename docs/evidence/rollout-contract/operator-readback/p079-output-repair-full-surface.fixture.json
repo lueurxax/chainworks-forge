@@ -87,7 +87,7 @@
         "expires_at": "2026-05-30T10:03:00Z",
         "lease_seconds": 180
       },
-      "policy_feature_flags": ["CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED"],
+      "policy_feature_flags": [],
       "repair_prompt_template_version": "p079_repair_v1",
       "final_output_settlement": null,
       "evidence_artifact_path": null,
@@ -155,7 +155,7 @@
         "expires_at": "2026-05-30T10:03:00Z",
         "lease_seconds": 180
       },
-      "policy_feature_flags": ["CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED"],
+      "policy_feature_flags": [],
       "repair_prompt_template_version": "p079_repair_v1",
       "final_output_settlement": "valid_outputs_from_repair",
       "evidence_artifact_path": "output_contract_repair/agent-fixture-003/evidence.json",
@@ -232,7 +232,7 @@
         "expires_at": "2026-05-30T10:03:00Z",
         "lease_seconds": 180
       },
-      "policy_feature_flags": ["CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED"],
+      "policy_feature_flags": [],
       "repair_prompt_template_version": "p079_repair_v1",
       "final_output_settlement": "blocked_missing_required_outputs",
       "evidence_artifact_path": "output_contract_repair/agent-fixture-004/evidence.json",
@@ -287,7 +287,7 @@
         "expires_at": "2026-05-30T10:03:00Z",
         "lease_seconds": 180
       },
-      "policy_feature_flags": ["CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED"],
+      "policy_feature_flags": [],
       "repair_prompt_template_version": null,
       "final_output_settlement": "blocked_provider_mode_mismatch",
       "evidence_artifact_path": null,
@@ -342,7 +342,7 @@
         "expires_at": "2026-05-30T10:03:00Z",
         "lease_seconds": 180
       },
-      "policy_feature_flags": ["CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED"],
+      "policy_feature_flags": [],
       "repair_prompt_template_version": null,
       "final_output_settlement": "cancelled",
       "evidence_artifact_path": null,
@@ -415,7 +415,7 @@
         "expires_at": "2026-05-30T10:03:00Z",
         "lease_seconds": 180
       },
-      "policy_feature_flags": ["CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED"],
+      "policy_feature_flags": [],
       "repair_prompt_template_version": "p079_repair_v1",
       "final_output_settlement": "failed_transport",
       "evidence_artifact_path": null,

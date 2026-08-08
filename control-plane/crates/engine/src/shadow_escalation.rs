@@ -12,7 +12,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use db::repos::escalation as escalation_repo;
-use domain::agent::AgentFailureKind;
+use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind};
 use domain::escalation::EscalationEvent;
 use domain::ids::AgentExecutionId;
 use sqlx::SqlitePool;
@@ -50,6 +50,26 @@ pub fn classify_trigger_from_failure_kind(
     }
 }
 
+/// Classify an escalation trigger from complete runtime facts.
+///
+/// `failure_kind` alone is not precise enough for ACP startup/transport failures: those may be
+/// reported as `provider_internal_error` while the transport-specific code carries the durable
+/// boundary (`ACP_INITIALIZE_HANDSHAKE_FAILED`, JSON-RPC stream failure, etc.). Escalation must
+/// use the transport signal when present so the chain can move to a different provider instead of
+/// retrying the same broken startup path.
+pub fn classify_trigger_from_runtime_facts(
+    facts: &AgentExecutionRuntimeFacts,
+) -> Option<&'static str> {
+    if facts
+        .transport_error_code
+        .as_deref()
+        .is_some_and(|code| !code.trim().is_empty())
+    {
+        return Some("transport_failure");
+    }
+    classify_trigger_from_failure_kind(facts.failure_kind.as_ref())
+}
+
 /// Find the next tier in the policy's tier list after `current_tier_id`.
 /// Returns `None` when `current_tier_id` is not found or is the last tier.
 fn find_next_tier<'a>(
@@ -70,8 +90,43 @@ pub async fn try_write_shadow_escalation(
     failure_kind: Option<&AgentFailureKind>,
     completed_at: DateTime<Utc>,
 ) {
-    if let Err(e) =
-        write_shadow_escalation_inner(pool, agent_execution_id, failure_kind, completed_at).await
+    let trigger_raw = classify_trigger_from_failure_kind(failure_kind);
+    if let Err(e) = write_shadow_escalation_inner(
+        pool,
+        agent_execution_id,
+        failure_kind,
+        trigger_raw,
+        completed_at,
+    )
+    .await
+    {
+        warn!(
+            agent_execution_id = %agent_execution_id,
+            error = %e,
+            "P058 escalation scheduler write failed (non-blocking to primary execution)"
+        );
+    }
+}
+
+/// P058: Write escalation selection using complete runtime facts.
+///
+/// Prefer this from engine settlement paths. It preserves the legacy failure-kind mapping while
+/// allowing transport-specific runtime fields to select `transport_failure`.
+pub async fn try_write_shadow_escalation_from_runtime_facts(
+    pool: &SqlitePool,
+    agent_execution_id: AgentExecutionId,
+    facts: &AgentExecutionRuntimeFacts,
+    completed_at: DateTime<Utc>,
+) {
+    let trigger_raw = classify_trigger_from_runtime_facts(facts);
+    if let Err(e) = write_shadow_escalation_inner(
+        pool,
+        agent_execution_id,
+        facts.failure_kind.as_ref(),
+        trigger_raw,
+        completed_at,
+    )
+    .await
     {
         warn!(
             agent_execution_id = %agent_execution_id,
@@ -85,6 +140,7 @@ async fn write_shadow_escalation_inner(
     pool: &SqlitePool,
     agent_execution_id: AgentExecutionId,
     failure_kind: Option<&AgentFailureKind>,
+    trigger_raw: Option<&'static str>,
     completed_at: DateTime<Utc>,
 ) -> Result<()> {
     let agent_exec_id_str = agent_execution_id.to_string();
@@ -121,7 +177,7 @@ async fn write_shadow_escalation_inner(
     };
 
     // 5. Classify trigger from failure kind — skip non-escalatable outcomes.
-    let Some(trigger_raw) = classify_trigger_from_failure_kind(failure_kind) else {
+    let Some(trigger_raw) = trigger_raw else {
         return Ok(());
     };
 
@@ -614,6 +670,7 @@ mod tests {
                 id: "ledger-runtime-advance".into(),
                 run_id,
                 stage_id: "impl_state".into(),
+                stage_execution_id: None,
                 agent_id: "impl_agent".into(),
                 policy_id: "impl_escalation".into(),
                 policy_hash: "sha256:testpolicy".into(),
@@ -663,6 +720,7 @@ mod tests {
             &pool,
             agent_execution_id,
             Some(&AgentFailureKind::MissingRequiredOutputs),
+            Some("contract_output_failure"),
             now,
         )
         .await
@@ -738,6 +796,20 @@ mod tests {
                 .pointer("/redacted_evidence_ref")
                 .and_then(|value| value.as_str()),
             Some(format!("ref/escalation/{agent_execution_id}").as_str())
+        );
+    }
+
+    #[test]
+    fn runtime_facts_transport_code_overrides_provider_internal_error_trigger() {
+        let now = Utc::now();
+        let agent_execution_id = AgentExecutionId::new();
+        let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+        facts.failure_kind = Some(AgentFailureKind::ProviderInternalError);
+        facts.transport_error_code = Some("ACP_INITIALIZE_HANDSHAKE_FAILED".to_string());
+
+        assert_eq!(
+            classify_trigger_from_runtime_facts(&facts),
+            Some("transport_failure")
         );
     }
 }

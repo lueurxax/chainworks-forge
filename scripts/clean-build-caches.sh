@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Build-cache hygiene for Chainworks Forge.
 #
-# Reclaims disk used by stale build outputs WITHOUT hurting the hot
-# path for active work. Skips directories that cargo/xcodebuild
-# actively rely on (current DerivedData, `target/debug/deps`) so the
-# next build still re-uses the hot incremental cache.
+# Reclaims disk used by stale build outputs while preserving active builds.
+# The shared policy defaults Cargo incremental compilation off and keeps
+# dependency/sccache reuse, so deleting stale incremental trees does not remove
+# the canonical reusable compiler cache.
 #
 # Usage:
 #   ./scripts/clean-build-caches.sh [--dry-run] [--aggressive] [--protect-worktree NAME]
@@ -21,6 +21,9 @@
 #     roots exceed the configured pressure budget. This keeps the common cache
 #     useful while preventing long-lived agent targets from growing without
 #     bound.
+#   * Shared reusable `agents/debug` and `debug` target profiles when the shared
+#     root is still above budget after lighter cleanup. This costs a rebuild but
+#     keeps ENOSPC from recurring when deps/build outputs dwarf incremental data.
 #   * `$TMPDIR/chainworks-test-gates` DerivedData, xcresult, and target
 #     residuals not referenced by currently running xcodebuild commands.
 #   * All but the most recently modified
@@ -74,7 +77,9 @@ fi
 SHARED_CARGO_TARGET_DIR="${CHAINWORKS_SHARED_CARGO_TARGET_DIR:-$(chainworks_default_cargo_target_dir)}"
 SHARED_GATE_TARGET_ROOT="${CHAINWORKS_GATE_CARGO_TARGET_ROOT:-$SHARED_CARGO_TARGET_DIR/gates}"
 SHARED_TARGET_MAX_GB="${CHAINWORKS_SHARED_CARGO_TARGET_MAX_GB:-32}"
+LOCAL_TARGET_MAX_GB="${CHAINWORKS_LOCAL_CARGO_TARGET_MAX_GB:-8}"
 WORKTREE_TARGET_MAX_GB="${CHAINWORKS_WORKTREE_CARGO_TARGET_MAX_GB:-8}"
+CARGO_CLEANUP_DEFERRED=0
 
 if [[ -n "${CHAINWORKS_CLEAN_PROTECTED_WORKTREES:-}" ]]; then
     IFS=' :' read -r -a _env_protected_worktrees <<< "${CHAINWORKS_CLEAN_PROTECTED_WORKTREES}"
@@ -111,23 +116,41 @@ gb_to_kib() {
     awk -v gb="$gb" 'BEGIN { printf "%.0f\n", gb * 1024 * 1024 }'
 }
 
+load_process_list() {
+    if [[ -n "${CHAINWORKS_CACHE_PROCESS_LIST_FILE:-}" ]]; then
+        cat "$CHAINWORKS_CACHE_PROCESS_LIST_FILE"
+        return $?
+    fi
+    ps -axo pid=,command= 2>/dev/null
+}
+
 is_cargo_running() {
-    ps -axo pid=,command= |
-        awk -v self="$$" '
-            $1 == self { next }
-            /(^|[[:space:]])cargo (test|build)([[:space:]]|$)/ { found = 1; exit }
-            /(^|[[:space:]])rustc([[:space:]]|$)/ { found = 1; exit }
+    local processes
+    local ignored_pid="${CHAINWORKS_CACHE_IGNORE_PID:-}"
+    if ! processes="$(load_process_list)"; then
+        # Process visibility is a safety boundary. Unknown means active.
+        return 0
+    fi
+    printf '%s\n' "$processes" |
+        awk -v self="$$" -v ignored="$ignored_pid" '
+            $1 == self || (ignored != "" && $1 == ignored) { next }
+            /(^|[\/[:space:]])cargo[[:space:]]+(test|build|check|clippy|run|bench|doc|rustc)([[:space:]]|$)/ { found = 1; exit }
+            /(^|[\/[:space:]])rustc([[:space:]]|$)/ { found = 1; exit }
             END { exit(found ? 0 : 1) }
         '
 }
 
 load_active_tmp_paths() {
+    local processes
     ACTIVE_TMP_PATHS=()
+    if ! processes="$(load_process_list)"; then
+        return 1
+    fi
     while IFS= read -r path; do
         [[ -n "$path" ]] || continue
         ACTIVE_TMP_PATHS+=("$path")
     done < <(
-        ps -axo command |
+        printf '%s\n' "$processes" |
             awk -v base="$TMP_BASE/" '
                 /xcodebuild/ {
                     for (i = 1; i <= NF; i++) {
@@ -210,6 +233,16 @@ prune_child_dirs_until_budget() {
     [[ -d "$budget_root" && -d "$child_root" ]] || return 0
 
     local child
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        while IFS= read -r child; do
+            [[ -n "$child" && -d "$child" ]] || continue
+            say "$label is above pressure budget; removing oldest reusable Cargo target $child"
+            delete "$child"
+        done < <(find "$child_root" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null |
+            xargs -0 ls -dtr 2>/dev/null)
+        return 0
+    fi
+
     while target_root_over_budget "$budget_root" "$max_gb"; do
         child="$(find "$child_root" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null |
             xargs -0 ls -dtr 2>/dev/null |
@@ -217,6 +250,24 @@ prune_child_dirs_until_budget() {
         [[ -n "$child" && -d "$child" ]] || break
         say "$label is above pressure budget; removing oldest reusable Cargo target $child"
         delete "$child"
+    done
+}
+
+prune_specific_dirs_until_budget() {
+    local budget_root="$1"
+    local max_gb="$2"
+    local label="$3"
+    shift 3
+    [[ -d "$budget_root" ]] || return 0
+
+    local candidate
+    for candidate in "$@"; do
+        if ! target_root_over_budget "$budget_root" "$max_gb"; then
+            return 0
+        fi
+        [[ -d "$candidate" ]] || continue
+        say "$label is above pressure budget; removing reusable Cargo target $candidate"
+        delete "$candidate"
     done
 }
 
@@ -257,11 +308,27 @@ clean_worktree_adhoc_target_dirs() {
 # ── 1. Orphan per-proposal target dirs ───────────────────────────────
 TARGET_ROOT="$ROOT_DIR/control-plane/target"
 if is_cargo_running; then
+    CARGO_CLEANUP_DEFERRED=1
     say "cargo build/test is running; skipping Cargo target cleanup"
 else
     clean_orphan_target_dirs "$TARGET_ROOT"
+    clean_target_pressure "$TARGET_ROOT" "$LOCAL_TARGET_MAX_GB" "local"
+    prune_specific_dirs_until_budget \
+        "$TARGET_ROOT" \
+        "$LOCAL_TARGET_MAX_GB" \
+        "local Cargo target" \
+        "$TARGET_ROOT/debug" \
+        "$TARGET_ROOT/release"
+
     clean_target_pressure "$SHARED_CARGO_TARGET_DIR" "$SHARED_TARGET_MAX_GB" "shared"
     prune_child_dirs_until_budget "$SHARED_CARGO_TARGET_DIR" "$SHARED_GATE_TARGET_ROOT" "$SHARED_TARGET_MAX_GB" "shared Cargo target"
+    prune_specific_dirs_until_budget \
+        "$SHARED_CARGO_TARGET_DIR" \
+        "$SHARED_TARGET_MAX_GB" \
+        "shared Cargo target" \
+        "$SHARED_CARGO_TARGET_DIR/agents/debug" \
+        "$SHARED_CARGO_TARGET_DIR/agents" \
+        "$SHARED_CARGO_TARGET_DIR/debug"
 
     if [[ -d "$WORKTREE_ROOT" ]]; then
         for worktree in "$WORKTREE_ROOT"/*; do
@@ -280,19 +347,22 @@ fi
 
 # ── 2. Swift gate residuals ──────────────────────────────────────────
 if [[ -d "$TMP_BASE" ]]; then
-    load_active_tmp_paths
-    for pat in "*-DerivedData" "*.xcresult" "proposal-0*-target" "p*-regression-target" "p*-readloop-targeted-DerivedData"; do
-        # shellcheck disable=SC2086
-        for stale in "$TMP_BASE"/${pat}; do
-            [[ -e "$stale" ]] || continue
-            if is_active_tmp_path "$stale"; then
-                say "keeping active xcodebuild path $stale"
-                continue
-            fi
-            say "removing stale Swift gate residual $stale"
-            delete "$stale"
+    if load_active_tmp_paths; then
+        for pat in "*-DerivedData" "*.xcresult" "proposal-0*-target" "p*-regression-target" "p*-readloop-targeted-DerivedData"; do
+            # shellcheck disable=SC2086
+            for stale in "$TMP_BASE"/${pat}; do
+                [[ -e "$stale" ]] || continue
+                if is_active_tmp_path "$stale"; then
+                    say "keeping active xcodebuild path $stale"
+                    continue
+                fi
+                say "removing stale Swift gate residual $stale"
+                delete "$stale"
+            done
         done
-    done
+    else
+        say "process visibility is unavailable; skipping Swift gate residual cleanup"
+    fi
 fi
 
 # ── 3. Xcode DerivedData (keep newest) ───────────────────────────────
@@ -311,6 +381,7 @@ fi
 # ── 4. --aggressive: incremental + release ───────────────────────────
 if [[ "$AGGRESSIVE" -eq 1 ]]; then
     if is_cargo_running; then
+        CARGO_CLEANUP_DEFERRED=1
         say "cargo build/test is running; skipping aggressive target cleanup"
     else
         if [[ -d "$TARGET_ROOT/debug/incremental" ]]; then
@@ -345,4 +416,9 @@ fi
 if [[ -d "$DD_ROOT" ]]; then
     echo "Xcode DerivedData Chainworks_Forge final size:"
     du -sh "$DD_ROOT"/Chainworks_Forge-* 2>/dev/null | tail -n 1 || true
+fi
+
+if [[ "$CARGO_CLEANUP_DEFERRED" -eq 1 &&
+    "${CHAINWORKS_CACHE_REQUIRE_CARGO_MAINTENANCE:-0}" =~ ^(1|true|TRUE|yes|YES)$ ]]; then
+    exit 75
 fi

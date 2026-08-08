@@ -1,4 +1,4 @@
-# Proposal 101: Unified Three-Column Navigation Shell and Sidebar-Toggle Consolidation
+# Proposal 104: Unified Three-Column Navigation Shell and Sidebar-Toggle Consolidation
 
 | Field | Value |
 |---|---|

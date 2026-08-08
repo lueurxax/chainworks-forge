@@ -2710,7 +2710,7 @@ async fn p082_readback_accessor_tolerates_malformed_mutable_json_columns() {
             binding_fingerprint, rehydrated_from_checkpoint_artifact_id, working_directory,
             workspace_mode, runtime_provider, runtime_model, status, created_at, last_activity_at)
 	           VALUES (?1, ?2, 1, 'p082-json-valid-owner-work', NULL, 'binding-json-valid', NULL, '/',
-	                   'read_write', 'codex', 'gpt-5.5', 'active', ?3, NULL)"#,
+	                   'read_write', 'codex', 'gpt-5.6', 'active', ?3, NULL)"#,
     )
     .bind(&generation_id)
     .bind(&lineage_id)
@@ -2826,7 +2826,7 @@ async fn p082_readback_accessor_ignores_oversized_work_item_payload_json_claims(
             binding_fingerprint, rehydrated_from_checkpoint_artifact_id, working_directory,
             workspace_mode, runtime_provider, runtime_model, status, created_at, last_activity_at)
            VALUES (?1, ?2, 1, 'p082-json-size-owner', NULL, 'binding-json-size',
-                   NULL, '/', 'read_write', 'codex', 'gpt-5.5', 'active', ?3, NULL)"#,
+                   NULL, '/', 'read_write', 'codex', 'gpt-5.6', 'active', ?3, NULL)"#,
     )
     .bind(&generation_id)
     .bind(&lineage_id)
@@ -2921,7 +2921,7 @@ async fn p082_stale_startup_requeue_ignores_malformed_work_item_payload_json() {
             binding_fingerprint, rehydrated_from_checkpoint_artifact_id, working_directory,
             workspace_mode, runtime_provider, runtime_model, status, created_at, last_activity_at)
            VALUES (?1, ?2, 1, 'json-valid-requeue-owner', NULL, 'binding-json-valid-requeue',
-                   NULL, '/', 'read_write', 'codex', 'gpt-5.5', 'active', ?3, NULL)"#,
+                   NULL, '/', 'read_write', 'codex', 'gpt-5.6', 'active', ?3, NULL)"#,
     )
     .bind(&generation_id)
     .bind(&lineage_id)
@@ -4022,15 +4022,15 @@ fn p082_r08_identifier_guidance_no_mutation_invariant() {
 // ── P082-R12/R13/R14: Cancellation interleaving shape tests ───────────────────
 
 #[test]
-fn p082_r12_cancellation_approval_preserved_readback_shape() {
+fn p082_r12_cancellation_approval_expired_readback_shape() {
     let now = Utc::now();
     let run_id = "run-cancel-r12-test";
     let readback = recovery_matrix::build_readback_v1(
         "P082-R12",
         "cancelled",
         "cancel",
-        recovery_matrix::REASON_CANCEL_PENDING_APPROVAL_PRESERVED,
-        "Run cancellation settled without modifying pending approval decision.",
+        recovery_matrix::REASON_CANCEL_PENDING_APPROVAL_EXPIRED,
+        "Run cancellation expired pending approval entries so they cannot remain actionable.",
         "runs, approvals, approval_inbox",
         "runs, approvals",
         run_id,
@@ -4043,9 +4043,9 @@ fn p082_r12_cancellation_approval_preserved_readback_shape() {
     assert_eq!(readback["recovery_decision"].as_str().unwrap(), "cancel");
     assert_eq!(
         readback["recovery_reason_code"].as_str().unwrap(),
-        recovery_matrix::REASON_CANCEL_PENDING_APPROVAL_PRESERVED
+        recovery_matrix::REASON_CANCEL_PENDING_APPROVAL_EXPIRED
     );
-    // Approval decided_at must remain null — shape must not reference approval decisions.
+    // Cancelled-run approvals must not remain actionable.
     assert!(
         readback["recovery_next_action"]
             .as_str()

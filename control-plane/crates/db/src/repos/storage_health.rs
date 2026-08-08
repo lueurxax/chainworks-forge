@@ -1392,7 +1392,7 @@ pub async fn evidence_spool_summary_for_run(
         query.push_str(" WHERE run_id = ?1");
     }
     query.push_str(" GROUP BY status");
-    let mut q = sqlx::query(&query);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(query.as_str()));
     if let Some(run_id) = run_id {
         q = q.bind(run_id);
     }

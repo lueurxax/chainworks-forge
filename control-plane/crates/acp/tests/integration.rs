@@ -318,72 +318,6 @@ sys.exit(0)
         script.to_string_lossy().into_owned()
     }
 
-    /// Write a fixture ACP server that emits duplicate session/update chunks
-    /// containing a residual absolute Xcode command path.
-    pub fn create_residual_xcode_warning_script(tmpdir: &std::path::Path) -> String {
-        let script = tmpdir.join("acp_residual_xcode_warning.py");
-        let code = r#"#!/usr/bin/env python3
-import sys, json
-
-def send(obj):
-    sys.stdout.write(json.dumps(obj) + '\n')
-    sys.stdout.flush()
-
-def recv():
-    line = sys.stdin.readline()
-    if not line:
-        return None
-    stripped = line.strip()
-    if not stripped:
-        return None
-    try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
-        return None
-
-msg = recv()
-if msg is None:
-    sys.exit(1)
-send({"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": 1}})
-
-msg = recv()
-if msg is None:
-    sys.exit(1)
-session_id = "fixture-session-residual-xcode-warning"
-send({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": session_id}})
-
-msg = recv()
-if msg is None:
-    sys.exit(1)
-
-warning = {
-    "jsonrpc": "2.0",
-    "method": "session/update",
-    "params": {
-        "update": {
-            "sessionUpdate": "tool_call",
-            "content": "running /usr/bin/xcrun simctl list devices from provider shell"
-        }
-    }
-}
-send(warning)
-send(warning)
-send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn", "sessionId": session_id}})
-
-try:
-    recv()
-except Exception:
-    pass
-
-sys.exit(0)
-"#;
-        std::fs::write(&script, code).unwrap();
-        let mut p = std::fs::metadata(&script).unwrap().permissions();
-        p.set_mode(0o755);
-        std::fs::set_permissions(&script, p).unwrap();
-        script.to_string_lossy().into_owned()
-    }
-
     /// Write a fixture ACP server script that completes the handshake but
     /// returns a JSON-RPC error for `session/prompt`, triggering `AgentStatus::Failed`.
     pub fn create_fail_script(tmpdir: &std::path::Path) -> String {
@@ -1249,7 +1183,7 @@ session_line = {
         }
     }
 }
-session_path = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "06" / "15" / "credits.jsonl"
+session_path = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "06" / "15" / f"{session_id}.jsonl"
 session_path.parent.mkdir(parents=True, exist_ok=True)
 session_path.write_text(json.dumps(session_line) + "\n")
 
@@ -6424,7 +6358,7 @@ async fn codex_task_complete_session_store_recovers_missing_acp_terminal_respons
         agent_execution_id: None,
         agent_id: "proposal_implementation_auditor".into(),
         provider: "codex".into(),
-        model: Some("gpt-5.5".into()),
+        model: Some("gpt-5.6".into()),
         effort: None,
         workspace_root: tmp.path().to_string_lossy().into_owned(),
         prompt: "audit".into(),
@@ -6509,7 +6443,7 @@ async fn codex_prompt_error_uses_session_store_credits_signal_as_provider_quota(
         agent_execution_id: None,
         agent_id: "proposal_implementation_auditor".into(),
         provider: "codex".into(),
-        model: Some("gpt-5.5".into()),
+        model: Some("gpt-5.6".into()),
         effort: None,
         workspace_root: tmp.path().to_string_lossy().into_owned(),
         prompt: "audit".into(),

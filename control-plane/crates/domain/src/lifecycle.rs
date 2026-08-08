@@ -44,10 +44,11 @@ impl DaemonLifecycleState {
     }
 
     /// True iff this state is "alive" from a supervisor's liveness
-    /// probe point of view — per §5.2 status-code matrix, `Degraded`
-    /// is alive (must not trigger restart).
+    /// probe point of view. `Starting` is alive when the process has
+    /// bound the probe listener and is still doing startup recovery;
+    /// `Degraded` is alive and must not trigger restart.
     pub fn is_live(self) -> bool {
-        matches!(self, Self::Ready | Self::Degraded)
+        matches!(self, Self::Starting | Self::Ready | Self::Degraded)
     }
 
     /// True iff the process has hit a terminal state for its current
@@ -221,6 +222,14 @@ pub struct DaemonStatus {
     /// is the one that caused the transition out of `Ready`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degraded: Vec<DegradedReason>,
+    /// Startup subphase for long pre-ready work. Omitted outside
+    /// `Starting`. This lets `/health` distinguish "daemon absent" from
+    /// "daemon is alive and repairing startup state".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_phase: Option<String>,
+    /// Timestamp for the current startup subphase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_phase_started_at: Option<DateTime<Utc>>,
     /// `Some` iff `state == Failed`. Exactly one failure per terminal
     /// transition — the daemon does not accumulate failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -246,6 +255,8 @@ impl DaemonStatus {
             started_at: None,
             last_state_change_at: Utc::now(),
             degraded: Vec::new(),
+            startup_phase: None,
+            startup_phase_started_at: None,
             failure: None,
             xcode_broker_health: None,
             restart_count_since_boot: 0,
@@ -282,7 +293,7 @@ mod tests {
     fn daemon_lifecycle_state_predicates() {
         assert!(DaemonLifecycleState::Ready.is_live());
         assert!(DaemonLifecycleState::Degraded.is_live());
-        assert!(!DaemonLifecycleState::Starting.is_live());
+        assert!(DaemonLifecycleState::Starting.is_live());
         assert!(!DaemonLifecycleState::Failed.is_live());
 
         assert!(DaemonLifecycleState::Ready.is_serving());

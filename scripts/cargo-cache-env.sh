@@ -12,6 +12,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 fi
 
 chainworks_cargo_cache_repo_root="${CHAINWORKS_CARGO_CACHE_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export CHAINWORKS_CARGO_CACHE_REPO_ROOT="$chainworks_cargo_cache_repo_root"
 
 chainworks_default_cargo_target_dir() {
     if [[ -n "${HOME:-}" ]]; then
@@ -207,6 +208,11 @@ if [[ -z "$real_cargo" || ! -x "$real_cargo" ]]; then
   exit 127
 fi
 
+cleanup_script="${CHAINWORKS_CARGO_CACHE_REPO_ROOT:-}/scripts/maybe-clean-build-caches.sh"
+if [[ -x "$cleanup_script" ]]; then
+  CHAINWORKS_CACHE_IGNORE_PID=$$ "$cleanup_script"
+fi
+
 if [[ ! "${CHAINWORKS_ALLOW_LOCAL_CARGO_TARGET_DIR:-0}" =~ ^(1|true|TRUE|yes|YES)$ ]]; then
   requested="${CARGO_TARGET_DIR:-}"
   suffix=""
@@ -280,6 +286,7 @@ fi
 
 export CHAINWORKS_SHARED_CARGO_TARGET_DIR="${CHAINWORKS_SHARED_CARGO_TARGET_DIR:-$(chainworks_default_cargo_target_dir)}"
 export CHAINWORKS_GATE_CARGO_TARGET_ROOT="${CHAINWORKS_GATE_CARGO_TARGET_ROOT:-${CHAINWORKS_SHARED_CARGO_TARGET_DIR}/gates}"
+export CARGO_INCREMENTAL="${CHAINWORKS_CARGO_INCREMENTAL:-${CARGO_INCREMENTAL:-0}}"
 mkdir -p "${CARGO_TARGET_DIR}"
 
 _chainworks_sccache_mode="${CHAINWORKS_CARGO_SCCACHE:-auto}"

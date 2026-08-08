@@ -611,7 +611,7 @@ async fn p082_runs_get_singular_is_latest_row_from_same_plural_snapshot() {
             binding_fingerprint, rehydrated_from_checkpoint_artifact_id, working_directory,
             workspace_mode, runtime_provider, runtime_model, status, created_at, last_activity_at)
            VALUES (?1, ?2, 1, ?3, NULL, 'binding-r05-mcp', NULL, '/', 'read_write',
-                   'codex', 'gpt-5.5', 'active', ?4, NULL)"#,
+                   'codex', 'gpt-5.6', 'active', ?4, NULL)"#,
     )
     .bind(&generation_id)
     .bind(&lineage_id)

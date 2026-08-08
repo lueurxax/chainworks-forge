@@ -33,6 +33,17 @@ pub struct SessionPolicyDecision {
     pub disposition: SessionReuseDisposition,
     pub should_reuse_live_session: bool,
     pub session_reset_reason: Option<String>,
+    pub invalidated_generation_ids: Vec<String>,
+}
+
+fn with_generation_to_close(
+    mut decision: SessionPolicyDecision,
+    generation_id: &str,
+) -> SessionPolicyDecision {
+    decision
+        .invalidated_generation_ids
+        .push(generation_id.to_string());
+    decision
 }
 
 pub async fn ensure_policy(
@@ -97,15 +108,18 @@ pub async fn ensure_policy(
                     CLAUDE_LONG_CONTEXT_CREDITS_REQUIRED_REASON,
                 )
                 .await?;
-                return create_generation(
-                    pool,
-                    lineage,
-                    input,
-                    SessionReuseDisposition::FreshAfterInvalidation,
-                    Some(CLAUDE_LONG_CONTEXT_CREDITS_REQUIRED_REASON.to_string()),
-                    None,
-                )
-                .await;
+                return Ok(with_generation_to_close(
+                    create_generation(
+                        pool,
+                        lineage,
+                        input,
+                        SessionReuseDisposition::FreshAfterInvalidation,
+                        Some(CLAUDE_LONG_CONTEXT_CREDITS_REQUIRED_REASON.to_string()),
+                        None,
+                    )
+                    .await?,
+                    &active_generation.id,
+                ));
             }
 
             if active_generation_has_missing_required_outputs_failure(pool, &active_generation.id)
@@ -118,15 +132,18 @@ pub async fn ensure_policy(
                     PREVIOUS_MISSING_REQUIRED_OUTPUTS_REASON,
                 )
                 .await?;
-                return create_generation(
-                    pool,
-                    lineage,
-                    input,
-                    SessionReuseDisposition::FreshAfterInvalidation,
-                    None,
-                    None,
-                )
-                .await;
+                return Ok(with_generation_to_close(
+                    create_generation(
+                        pool,
+                        lineage,
+                        input,
+                        SessionReuseDisposition::FreshAfterInvalidation,
+                        None,
+                        None,
+                    )
+                    .await?,
+                    &active_generation.id,
+                ));
             }
 
             if active_generation_has_tool_output_budget_failure(pool, &active_generation.id).await?
@@ -138,15 +155,18 @@ pub async fn ensure_policy(
                     TOOL_OUTPUT_BUDGET_EXCEEDED_REASON,
                 )
                 .await?;
-                return create_generation(
-                    pool,
-                    lineage,
-                    input,
-                    SessionReuseDisposition::FreshAfterInvalidation,
-                    Some(TOOL_OUTPUT_BUDGET_EXCEEDED_REASON.to_string()),
-                    None,
-                )
-                .await;
+                return Ok(with_generation_to_close(
+                    create_generation(
+                        pool,
+                        lineage,
+                        input,
+                        SessionReuseDisposition::FreshAfterInvalidation,
+                        Some(TOOL_OUTPUT_BUDGET_EXCEEDED_REASON.to_string()),
+                        None,
+                    )
+                    .await?,
+                    &active_generation.id,
+                ));
             }
 
             let scope = lineage.session_reuse_scope.as_str();
@@ -158,15 +178,18 @@ pub async fn ensure_policy(
                     "scope_none_requires_fresh_session",
                 )
                 .await?;
-                return create_generation(
-                    pool,
-                    lineage,
-                    input,
-                    SessionReuseDisposition::FreshSessionRequired,
-                    Some("policy_forbid".to_string()),
-                    None,
-                )
-                .await;
+                return Ok(with_generation_to_close(
+                    create_generation(
+                        pool,
+                        lineage,
+                        input,
+                        SessionReuseDisposition::FreshSessionRequired,
+                        Some("policy_forbid".to_string()),
+                        None,
+                    )
+                    .await?,
+                    &active_generation.id,
+                ));
             }
 
             if active_generation.binding_fingerprint != input.binding_fingerprint {
@@ -177,15 +200,18 @@ pub async fn ensure_policy(
                     "binding_fingerprint_changed",
                 )
                 .await?;
-                return create_generation(
-                    pool,
-                    lineage,
-                    input,
-                    SessionReuseDisposition::FreshSessionRequired,
-                    Some("provider_mismatch".to_string()),
-                    None,
-                )
-                .await;
+                return Ok(with_generation_to_close(
+                    create_generation(
+                        pool,
+                        lineage,
+                        input,
+                        SessionReuseDisposition::FreshSessionRequired,
+                        Some("provider_mismatch".to_string()),
+                        None,
+                    )
+                    .await?,
+                    &active_generation.id,
+                ));
             }
 
             if scope == "same_invocation_owner"
@@ -198,15 +224,18 @@ pub async fn ensure_policy(
                     "invocation_owner_changed",
                 )
                 .await?;
-                return create_generation(
-                    pool,
-                    lineage,
-                    input,
-                    SessionReuseDisposition::FreshSessionRequired,
-                    Some("policy_forbid".to_string()),
-                    None,
-                )
-                .await;
+                return Ok(with_generation_to_close(
+                    create_generation(
+                        pool,
+                        lineage,
+                        input,
+                        SessionReuseDisposition::FreshSessionRequired,
+                        Some("policy_forbid".to_string()),
+                        None,
+                    )
+                    .await?,
+                    &active_generation.id,
+                ));
             }
 
             match budget::evaluate(
@@ -232,6 +261,7 @@ pub async fn ensure_policy(
                         disposition: SessionReuseDisposition::Reused,
                         should_reuse_live_session: true,
                         session_reset_reason: None,
+                        invalidated_generation_ids: Vec::new(),
                     });
                 }
                 BudgetDecision::Compact { reason } => {
@@ -264,15 +294,18 @@ pub async fn ensure_policy(
                         },
                     )
                     .await?;
-                    return create_generation(
-                        pool,
-                        lineage,
-                        input,
-                        SessionReuseDisposition::ReusedAfterResume,
-                        None,
-                        Some(checkpoint_artifact_id),
-                    )
-                    .await;
+                    return Ok(with_generation_to_close(
+                        create_generation(
+                            pool,
+                            lineage,
+                            input,
+                            SessionReuseDisposition::ReusedAfterResume,
+                            None,
+                            Some(checkpoint_artifact_id),
+                        )
+                        .await?,
+                        &active_generation.id,
+                    ));
                 }
                 BudgetDecision::Invalidate { reason } => {
                     sessions::end_generation(
@@ -295,15 +328,18 @@ pub async fn ensure_policy(
                         },
                     )
                     .await?;
-                    return create_generation(
-                        pool,
-                        lineage,
-                        input,
-                        SessionReuseDisposition::FreshAfterBudget,
-                        None,
-                        None,
-                    )
-                    .await;
+                    return Ok(with_generation_to_close(
+                        create_generation(
+                            pool,
+                            lineage,
+                            input,
+                            SessionReuseDisposition::FreshAfterBudget,
+                            None,
+                            None,
+                        )
+                        .await?,
+                        &active_generation.id,
+                    ));
                 }
             }
         }
@@ -390,15 +426,18 @@ pub async fn ensure_policy_tx(
                     CLAUDE_LONG_CONTEXT_CREDITS_REQUIRED_REASON,
                 )
                 .await?;
-                return create_generation_tx(
-                    tx,
-                    lineage,
-                    input,
-                    SessionReuseDisposition::FreshAfterInvalidation,
-                    Some(CLAUDE_LONG_CONTEXT_CREDITS_REQUIRED_REASON.to_string()),
-                    None,
-                )
-                .await;
+                return Ok(with_generation_to_close(
+                    create_generation_tx(
+                        tx,
+                        lineage,
+                        input,
+                        SessionReuseDisposition::FreshAfterInvalidation,
+                        Some(CLAUDE_LONG_CONTEXT_CREDITS_REQUIRED_REASON.to_string()),
+                        None,
+                    )
+                    .await?,
+                    &active_generation.id,
+                ));
             }
 
             if active_generation_has_missing_required_outputs_failure_tx(tx, &active_generation.id)
@@ -411,15 +450,18 @@ pub async fn ensure_policy_tx(
                     PREVIOUS_MISSING_REQUIRED_OUTPUTS_REASON,
                 )
                 .await?;
-                return create_generation_tx(
-                    tx,
-                    lineage,
-                    input,
-                    SessionReuseDisposition::FreshAfterInvalidation,
-                    None,
-                    None,
-                )
-                .await;
+                return Ok(with_generation_to_close(
+                    create_generation_tx(
+                        tx,
+                        lineage,
+                        input,
+                        SessionReuseDisposition::FreshAfterInvalidation,
+                        None,
+                        None,
+                    )
+                    .await?,
+                    &active_generation.id,
+                ));
             }
 
             if active_generation_has_tool_output_budget_failure_tx(tx, &active_generation.id)
@@ -432,15 +474,18 @@ pub async fn ensure_policy_tx(
                     TOOL_OUTPUT_BUDGET_EXCEEDED_REASON,
                 )
                 .await?;
-                return create_generation_tx(
-                    tx,
-                    lineage,
-                    input,
-                    SessionReuseDisposition::FreshAfterInvalidation,
-                    Some(TOOL_OUTPUT_BUDGET_EXCEEDED_REASON.to_string()),
-                    None,
-                )
-                .await;
+                return Ok(with_generation_to_close(
+                    create_generation_tx(
+                        tx,
+                        lineage,
+                        input,
+                        SessionReuseDisposition::FreshAfterInvalidation,
+                        Some(TOOL_OUTPUT_BUDGET_EXCEEDED_REASON.to_string()),
+                        None,
+                    )
+                    .await?,
+                    &active_generation.id,
+                ));
             }
 
             let scope = lineage.session_reuse_scope.as_str();
@@ -452,15 +497,18 @@ pub async fn ensure_policy_tx(
                     "scope_none_requires_fresh_session",
                 )
                 .await?;
-                return create_generation_tx(
-                    tx,
-                    lineage,
-                    input,
-                    SessionReuseDisposition::FreshSessionRequired,
-                    Some("policy_forbid".to_string()),
-                    None,
-                )
-                .await;
+                return Ok(with_generation_to_close(
+                    create_generation_tx(
+                        tx,
+                        lineage,
+                        input,
+                        SessionReuseDisposition::FreshSessionRequired,
+                        Some("policy_forbid".to_string()),
+                        None,
+                    )
+                    .await?,
+                    &active_generation.id,
+                ));
             }
 
             if active_generation.binding_fingerprint != input.binding_fingerprint {
@@ -471,15 +519,18 @@ pub async fn ensure_policy_tx(
                     "binding_fingerprint_changed",
                 )
                 .await?;
-                return create_generation_tx(
-                    tx,
-                    lineage,
-                    input,
-                    SessionReuseDisposition::FreshSessionRequired,
-                    Some("provider_mismatch".to_string()),
-                    None,
-                )
-                .await;
+                return Ok(with_generation_to_close(
+                    create_generation_tx(
+                        tx,
+                        lineage,
+                        input,
+                        SessionReuseDisposition::FreshSessionRequired,
+                        Some("provider_mismatch".to_string()),
+                        None,
+                    )
+                    .await?,
+                    &active_generation.id,
+                ));
             }
 
             if scope == "same_invocation_owner"
@@ -492,15 +543,18 @@ pub async fn ensure_policy_tx(
                     "invocation_owner_changed",
                 )
                 .await?;
-                return create_generation_tx(
-                    tx,
-                    lineage,
-                    input,
-                    SessionReuseDisposition::FreshSessionRequired,
-                    Some("policy_forbid".to_string()),
-                    None,
-                )
-                .await;
+                return Ok(with_generation_to_close(
+                    create_generation_tx(
+                        tx,
+                        lineage,
+                        input,
+                        SessionReuseDisposition::FreshSessionRequired,
+                        Some("policy_forbid".to_string()),
+                        None,
+                    )
+                    .await?,
+                    &active_generation.id,
+                ));
             }
 
             match budget::evaluate(
@@ -526,6 +580,7 @@ pub async fn ensure_policy_tx(
                         disposition: SessionReuseDisposition::Reused,
                         should_reuse_live_session: true,
                         session_reset_reason: None,
+                        invalidated_generation_ids: Vec::new(),
                     });
                 }
                 BudgetDecision::Compact { reason } => {
@@ -558,15 +613,18 @@ pub async fn ensure_policy_tx(
                         },
                     )
                     .await?;
-                    return create_generation_tx(
-                        tx,
-                        lineage,
-                        input,
-                        SessionReuseDisposition::ReusedAfterResume,
-                        None,
-                        Some(checkpoint_artifact_id),
-                    )
-                    .await;
+                    return Ok(with_generation_to_close(
+                        create_generation_tx(
+                            tx,
+                            lineage,
+                            input,
+                            SessionReuseDisposition::ReusedAfterResume,
+                            None,
+                            Some(checkpoint_artifact_id),
+                        )
+                        .await?,
+                        &active_generation.id,
+                    ));
                 }
                 BudgetDecision::Invalidate { reason } => {
                     sessions::end_generation_tx(
@@ -589,15 +647,18 @@ pub async fn ensure_policy_tx(
                         },
                     )
                     .await?;
-                    return create_generation_tx(
-                        tx,
-                        lineage,
-                        input,
-                        SessionReuseDisposition::FreshAfterBudget,
-                        None,
-                        None,
-                    )
-                    .await;
+                    return Ok(with_generation_to_close(
+                        create_generation_tx(
+                            tx,
+                            lineage,
+                            input,
+                            SessionReuseDisposition::FreshAfterBudget,
+                            None,
+                            None,
+                        )
+                        .await?,
+                        &active_generation.id,
+                    ));
                 }
             }
         }
@@ -1251,6 +1312,7 @@ async fn create_generation(
         disposition,
         should_reuse_live_session: false,
         session_reset_reason,
+        invalidated_generation_ids: Vec::new(),
     })
 }
 
@@ -1309,6 +1371,7 @@ async fn create_generation_tx(
         disposition,
         should_reuse_live_session: false,
         session_reset_reason,
+        invalidated_generation_ids: Vec::new(),
     })
 }
 
@@ -1599,6 +1662,82 @@ mod tests {
             SessionReuseDisposition::FreshSessionRequired
         );
         assert_eq!(decision.generation.generation, 2);
+        assert_eq!(
+            decision.invalidated_generation_ids,
+            vec!["generation-owner".to_string()],
+            "policy invalidation must tell the executor which live ACP session to close"
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_fingerprint_change_reports_invalidated_generation_to_close() {
+        let pool = test_pool().await;
+        seed_run(&pool).await;
+        let now = chrono::Utc::now();
+        let lineage = SessionLineage {
+            id: "lineage-binding".into(),
+            run_id: "00000000-0000-0000-0000-000000000001".into(),
+            agent_id: "proposal_writer".into(),
+            lineage_id: "proposal-loop".into(),
+            session_reuse_scope: "same_agent_family_within_run".into(),
+            session_family_id: Some("proposal-loop".into()),
+            active_generation_id: Some("generation-binding".into()),
+            created_at: now,
+            closed_at: None,
+        };
+        sessions::insert_lineage(&pool, &lineage).await.unwrap();
+        sessions::insert_generation(
+            &pool,
+            &SessionGeneration {
+                id: "generation-binding".into(),
+                lineage_id: lineage.id.clone(),
+                generation: 1,
+                invocation_owner_key: "owner".into(),
+                provider_session_id: Some("provider-session".into()),
+                binding_fingerprint: "old-fingerprint".into(),
+                rehydrated_from_checkpoint_artifact_id: None,
+                working_directory: "/tmp/ws".into(),
+                workspace_mode: "read_only".into(),
+                runtime_provider: "claude".into(),
+                runtime_model: "sonnet".into(),
+                status: SessionGenerationStatus::Active,
+                turn_count: 1,
+                estimated_input_tokens: 0,
+                latest_cached_input_tokens: None,
+                latest_output_tokens: None,
+                latest_model_context_window: None,
+                cumulative_prompt_tokens: 0,
+                cumulative_cost_cents: 0,
+                created_at: now,
+                last_activity_at: None,
+                ended_at: None,
+                end_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let decision = ensure_policy(&pool, base_input()).await.unwrap();
+        assert_eq!(
+            decision.disposition,
+            SessionReuseDisposition::FreshSessionRequired
+        );
+        assert_eq!(decision.generation.generation, 2);
+        assert_eq!(
+            decision.invalidated_generation_ids,
+            vec!["generation-binding".to_string()],
+            "binding fingerprint invalidation must synchronously close the old live ACP session"
+        );
+
+        let invalidated = sessions::find_generation_by_id(&pool, "generation-binding")
+            .await
+            .unwrap()
+            .expect("old generation should remain as durable evidence");
+        assert_eq!(invalidated.status, SessionGenerationStatus::Invalidated);
+        assert_eq!(
+            invalidated.end_reason.as_deref(),
+            Some("binding_fingerprint_changed")
+        );
     }
 
     #[tokio::test]

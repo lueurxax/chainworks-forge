@@ -142,10 +142,10 @@ pub async fn find_receipts_by_session(
     pool: &SqlitePool,
     provider_session_id: &str,
 ) -> Result<Vec<ShutdownInterruptedReceipt>> {
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{RECEIPT_SELECT} WHERE provider_session_id = ?1
          ORDER BY shutdown_epoch, receipt_generation"
-    ))
+    )))
     .bind(provider_session_id)
     .fetch_all(pool)
     .await
@@ -160,10 +160,10 @@ pub async fn find_receipt_by_key(
     shutdown_epoch: i64,
     receipt_generation: i64,
 ) -> Result<Option<ShutdownInterruptedReceipt>> {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{RECEIPT_SELECT} WHERE provider_session_id = ?1
          AND shutdown_epoch = ?2 AND receipt_generation = ?3"
-    ))
+    )))
     .bind(provider_session_id)
     .bind(shutdown_epoch)
     .bind(receipt_generation)
@@ -368,12 +368,12 @@ pub async fn find_active_signal(
     signal_kind: &str,
     generation: i64,
 ) -> Result<Option<ShutdownSignalSideEffect>> {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{SIGNAL_SELECT}
          WHERE provider_session_id = ?1 AND shutdown_epoch = ?2
            AND signal_kind = ?3 AND generation = ?4
            AND intent_state IN ('planned','dispatching','issued')"
-    ))
+    )))
     .bind(provider_session_id)
     .bind(shutdown_epoch)
     .bind(signal_kind)
@@ -389,10 +389,10 @@ pub async fn find_signals_by_session(
     pool: &SqlitePool,
     provider_session_id: &str,
 ) -> Result<Vec<ShutdownSignalSideEffect>> {
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{SIGNAL_SELECT} WHERE provider_session_id = ?1
          ORDER BY shutdown_epoch, signal_kind, generation"
-    ))
+    )))
     .bind(provider_session_id)
     .fetch_all(pool)
     .await

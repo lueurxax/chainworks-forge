@@ -126,7 +126,12 @@ struct Chainworks_ForgeApp: App {
     }
 
     static func isUIAutomationHost(for environment: [String: String]) -> Bool {
-        environment.keys.contains { $0.hasPrefix("CHAINWORKS_UI_TEST") }
+        for key in environment.keys {
+            if key.hasPrefix("CHAINWORKS_UI_TEST") {
+                return true
+            }
+        }
+        return false
     }
 
     private static func clearSavedWindowState() {
@@ -195,14 +200,37 @@ struct Chainworks_ForgeApp: App {
         return fileManager.fileExists(atPath: url.path) ? url : nil
     }
 
+    nonisolated static func bundledDaemonBuildSHA(
+        in bundleURL: URL,
+        fileManager: FileManager = .default
+    ) -> String? {
+        let url = bundleURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Resources", isDirectory: true)
+            .appendingPathComponent("bundled-daemon-build-sha.txt", isDirectory: false)
+        guard fileManager.fileExists(atPath: url.path),
+              let raw = try? String(contentsOf: url, encoding: .utf8)
+        else {
+            return nil
+        }
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
     private static func registerPackagedDaemonAgentIfAvailable() {
         #if os(macOS)
         let plistName = "com.chainworks.forge.daemon.plist"
+        cleanupStaleDaemonLaunchAgents()
         guard packagedDaemonAgentPlistURL(in: Bundle.main.bundleURL) != nil else {
             ForgeLogger.app.error("Packaged daemon LaunchAgent plist is missing from Contents/Library/LaunchAgents")
             return
         }
         #if DEBUG
+        let label = "com.chainworks.forge.daemon"
+        if launchdServiceIsRegistered(label: label) {
+            kickstartPackagedDaemonAgentIfStopped(label: label)
+            return
+        }
         Task.detached {
             do {
                 try await DebugPackagedDaemonProcess.shared.ensureStarted(
@@ -238,13 +266,18 @@ struct Chainworks_ForgeApp: App {
 
     static func restartPackagedDaemonAgent() async throws {
         let plistName = "com.chainworks.forge.daemon.plist"
+        cleanupStaleDaemonLaunchAgents()
+        let label = "com.chainworks.forge.daemon"
         #if DEBUG
+        if launchdServiceIsRegistered(label: label) {
+            try await runLaunchctlKickstart(label: label, force: true)
+            return
+        }
         try await DebugPackagedDaemonProcess.shared.restart(bundleURL: Bundle.main.bundleURL)
         Task.detached {
             try? await SMAppService.agent(plistName: plistName).unregister()
         }
         #else
-        let label = "com.chainworks.forge.daemon"
         let service = SMAppService.agent(plistName: plistName)
         try? await service.unregister()
         try service.register()
@@ -285,6 +318,70 @@ struct Chainworks_ForgeApp: App {
             throw LaunchctlKickstartError(status: process.terminationStatus)
         }
     }
+
+    nonisolated static func staleDaemonLaunchAgentLabels() -> [String] {
+        [
+            "com.chainworks.forge.daemon.local-restart",
+        ]
+    }
+
+    private static func cleanupStaleDaemonLaunchAgents() {
+        for label in staleDaemonLaunchAgentLabels() {
+            do {
+                try runLaunchctlBootoutSync(label: label)
+            } catch {
+                ForgeLogger.app.debug("Stale daemon LaunchAgent bootout skipped for \(label): \(error.localizedDescription)")
+            }
+            removeStaleDaemonLaunchAgentPlist(label: label)
+        }
+    }
+
+    nonisolated static func launchctlBootoutArguments(
+        label: String,
+        uid: uid_t = getuid()
+    ) -> [String] {
+        ["bootout", "gui/\(uid)/\(label)"]
+    }
+
+    private nonisolated static func runLaunchctlBootoutSync(label: String) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = launchctlBootoutArguments(label: label)
+        try process.run()
+        process.waitUntilExit()
+        if process.terminationStatus != 0 {
+            throw LaunchctlKickstartError(status: process.terminationStatus)
+        }
+    }
+
+    private static func removeStaleDaemonLaunchAgentPlist(label: String) {
+        let url = FileManager.default
+            .homeDirectoryForCurrentUser
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("LaunchAgents", isDirectory: true)
+            .appendingPathComponent("\(label).plist", isDirectory: false)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        do {
+            try FileManager.default.removeItem(at: url)
+        } catch {
+            ForgeLogger.app.debug("Stale daemon LaunchAgent plist removal skipped for \(label): \(error.localizedDescription)")
+        }
+    }
+
+    private nonisolated static func launchdServiceIsRegistered(label: String) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = ["print", "gui/\(getuid())/\(label)"]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
     #endif
 }
 
@@ -293,6 +390,17 @@ private struct UnitTestHostRootView: View {
         Color.clear
             .frame(width: 1, height: 1)
             .accessibilityIdentifier("unit-test-host-root")
+    }
+}
+
+private extension Dictionary where Key == String, Value == String {
+    nonisolated func mergingBundledDaemonBuildSHA(from bundleURL: URL) -> [String: String] {
+        var result = self
+        if result["GIT_SHA"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false,
+           let buildSHA = Chainworks_ForgeApp.bundledDaemonBuildSHA(in: bundleURL) {
+            result["GIT_SHA"] = buildSHA
+        }
+        return result
     }
 }
 
@@ -398,10 +506,10 @@ private actor DebugPackagedDaemonProcess {
                 if let value = entry.value as? String {
                     result[entry.key] = value
                 }
-            }
+            }.mergingBundledDaemonBuildSHA(from: bundleURL)
         }
 
-        return [:]
+        return [:].mergingBundledDaemonBuildSHA(from: bundleURL)
     }
 
     private func existingPackagedDaemonIsRunning() -> Bool {

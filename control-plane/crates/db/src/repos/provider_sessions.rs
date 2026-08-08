@@ -165,19 +165,21 @@ pub async fn find_by_id(
     pool: &SqlitePool,
     provider_session_id: &str,
 ) -> Result<Option<ProviderSession>> {
-    let row = sqlx::query(&format!("{SESSION_SELECT} WHERE provider_session_id = ?1"))
-        .bind(provider_session_id)
-        .fetch_optional(pool)
-        .await
-        .context("provider_sessions: find_by_id")?;
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "{SESSION_SELECT} WHERE provider_session_id = ?1"
+    )))
+    .bind(provider_session_id)
+    .fetch_optional(pool)
+    .await
+    .context("provider_sessions: find_by_id")?;
     Ok(row.map(map_session))
 }
 
 /// Find all provider sessions for a run.
 pub async fn find_by_run_id(pool: &SqlitePool, run_id: &str) -> Result<Vec<ProviderSession>> {
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{SESSION_SELECT} WHERE run_id = ?1 ORDER BY created_at"
-    ))
+    )))
     .bind(run_id)
     .fetch_all(pool)
     .await
@@ -188,9 +190,9 @@ pub async fn find_by_run_id(pool: &SqlitePool, run_id: &str) -> Result<Vec<Provi
 /// Find all provider sessions with process_fate='identity_ambiguous'.
 /// Used by recovery to surface manual_process_identity_check holds.
 pub async fn find_identity_ambiguous(pool: &SqlitePool) -> Result<Vec<ProviderSession>> {
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{SESSION_SELECT} WHERE process_fate = 'identity_ambiguous'"
-    ))
+    )))
     .fetch_all(pool)
     .await
     .context("provider_sessions: find_identity_ambiguous")?;
@@ -295,12 +297,12 @@ pub async fn find_active_cancellation_intent(
     pool: &SqlitePool,
     provider_session_id: &str,
 ) -> Result<Option<ProviderCancellationIntent>> {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{INTENT_SELECT}
          WHERE provider_session_id = ?1
            AND intent_state IN ('requested','shutdown_started')
          ORDER BY cancellation_epoch DESC LIMIT 1"
-    ))
+    )))
     .bind(provider_session_id)
     .fetch_optional(pool)
     .await
@@ -313,10 +315,10 @@ pub async fn find_cancellation_intents(
     pool: &SqlitePool,
     provider_session_id: &str,
 ) -> Result<Vec<ProviderCancellationIntent>> {
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{INTENT_SELECT} WHERE provider_session_id = ?1
          ORDER BY cancellation_epoch"
-    ))
+    )))
     .bind(provider_session_id)
     .fetch_all(pool)
     .await
@@ -551,9 +553,9 @@ pub async fn mark_process_absent_verified_tx(
 pub async fn find_requested_intents_null_shutdown_epoch(
     pool: &SqlitePool,
 ) -> Result<Vec<ProviderCancellationIntent>> {
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{INTENT_SELECT} WHERE intent_state = 'requested' AND shutdown_epoch IS NULL"
-    ))
+    )))
     .fetch_all(pool)
     .await
     .context("provider_cancellation_intents: find_requested_null_shutdown_epoch")?;

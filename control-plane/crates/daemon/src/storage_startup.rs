@@ -3,6 +3,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use sqlx::SqlitePool;
+use tracing::{info, warn};
 
 /// Bounded P075 startup evidence-orphan reconciliation summary.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -69,6 +70,41 @@ pub async fn run_startup_evidence_orphan_sweep(
     Ok(summary)
 }
 
+/// Start the best-effort P075 reconciliation after the daemon is ready.
+///
+/// Filesystem enumeration is deliberately isolated from the readiness path:
+/// an unavailable artifact root must not make the operator shell disappear.
+pub fn spawn_startup_evidence_orphan_sweep(pool: SqlitePool) -> tokio::task::JoinHandle<()> {
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        // sweep_evidence_orphans performs bounded synchronous directory I/O.
+        // Keep that work off Tokio's request workers so GraphQL remains
+        // responsive while an artifact root is slow or unavailable.
+        match runtime.block_on(run_startup_evidence_orphan_sweep(&pool)) {
+            Ok(summary) => {
+                info!(
+                    roots_inspected = summary.roots_inspected,
+                    roots_missing = summary.roots_missing,
+                    scanned_files = summary.scanned_files,
+                    already_indexed = summary.already_indexed,
+                    recovered_orphans = summary.recovered_orphans,
+                    skipped_files = summary.skipped_files,
+                    bytes_read = summary.bytes_read,
+                    truncated = summary.truncated,
+                    errors = summary.errors,
+                    "P075 background evidence orphan sweep complete"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    err = %err,
+                    "P075 background evidence orphan sweep could not enumerate active runs"
+                );
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -81,7 +117,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn startup_sweep_recovers_active_run_orphan_without_failing_startup() {
+    async fn background_startup_sweep_recovers_active_run_orphan_without_blocking_startup() {
         let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
         db::writer::register_shared_writer(
             &pool,
@@ -158,10 +194,8 @@ mod tests {
         .await
         .unwrap();
 
-        let summary = run_startup_evidence_orphan_sweep(&pool).await.unwrap();
-        assert_eq!(summary.roots_inspected, 1);
-        assert_eq!(summary.recovered_orphans, 1);
-        assert_eq!(summary.errors, 0);
+        let handle = spawn_startup_evidence_orphan_sweep(pool.clone());
+        handle.await.unwrap();
 
         let row = db::repos::evidence_spool_refs::find_by_run_and_path(
             &pool,

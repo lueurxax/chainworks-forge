@@ -209,4 +209,21 @@ BUNDLED_SHA_RESOURCE_DIR="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PAT
 mkdir -p "${BUNDLED_SHA_RESOURCE_DIR}"
 printf '%s\n' "${GIT_SHA}" > "${BUNDLED_SHA_RESOURCE_DIR}/bundled-daemon-build-sha.txt"
 
+# `SMAppService.agent` starts from the embedded LaunchAgent plist, not
+# from the current shell. Stamp the same SHA into that plist so a
+# daemon launched from the app reports the bundled build identity even
+# when the Rust binary was supplied through the local prebuilt path.
+BUNDLED_LAUNCH_AGENT_PLIST="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH:-Contents}/Library/LaunchAgents/com.chainworks.forge.daemon.plist"
+if [ -f "${BUNDLED_LAUNCH_AGENT_PLIST}" ]; then
+    /usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables' "${BUNDLED_LAUNCH_AGENT_PLIST}" >/dev/null 2>&1 \
+        || /usr/libexec/PlistBuddy -c 'Add :EnvironmentVariables dict' "${BUNDLED_LAUNCH_AGENT_PLIST}"
+    if /usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:GIT_SHA' "${BUNDLED_LAUNCH_AGENT_PLIST}" >/dev/null 2>&1; then
+        /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:GIT_SHA ${GIT_SHA}" "${BUNDLED_LAUNCH_AGENT_PLIST}"
+    else
+        /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:GIT_SHA string ${GIT_SHA}" "${BUNDLED_LAUNCH_AGENT_PLIST}"
+    fi
+else
+    echo "warning: embedded LaunchAgent plist not found at ${BUNDLED_LAUNCH_AGENT_PLIST}; GIT_SHA will not be stamped into launchd environment" >&2
+fi
+
 echo "embed-control-plane-daemon: ok → ${DEST_BIN}"

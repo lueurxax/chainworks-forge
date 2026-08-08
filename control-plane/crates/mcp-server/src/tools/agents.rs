@@ -767,18 +767,19 @@ fn reviewer_redact_receipt(raw: &serde_json::Value) -> serde_json::Value {
 }
 
 fn reviewer_attach_receipt_projection(raw: &serde_json::Value) -> serde_json::Value {
+    let redacted = reviewer_redact_receipt(raw);
     serde_json::json!({
         "outcome": "reviewer_projection",
-        "schema_version": raw.get("schema_version").and_then(serde_json::Value::as_i64).unwrap_or(2),
-        "failure_class": raw.get("failure_class").cloned().unwrap_or(serde_json::Value::Null),
-        "resurrection_phase": raw.get("resurrection_phase").cloned().unwrap_or(serde_json::Value::Null),
-        "attach_started_at": raw.get("attach_started_at").cloned().unwrap_or(serde_json::Value::Null),
-        "attach_completed_at": raw.get("attach_completed_at").cloned().unwrap_or(serde_json::Value::Null),
-        "output_only": raw.get("output_only").cloned().unwrap_or(serde_json::Value::Null),
-        "source_edit_allowance": raw.get("source_edit_allowance").cloned().unwrap_or(serde_json::Value::Null),
-        "changed_source_files_count": raw.get("changed_source_files_count").cloned().unwrap_or(serde_json::Value::Null),
-        "orphan_reap_verified": raw.get("orphan_reap_verified").and_then(serde_json::Value::as_bool).unwrap_or(false),
-        "identity_proof_source": raw.get("identity_proof_source").cloned().unwrap_or(serde_json::Value::Null)
+        "schema_version": redacted.get("schema_version").and_then(serde_json::Value::as_i64).unwrap_or(2),
+        "failure_class": redacted.get("failure_class").cloned().unwrap_or(serde_json::Value::Null),
+        "resurrection_phase": redacted.get("resurrection_phase").cloned().unwrap_or(serde_json::Value::Null),
+        "attach_started_at": redacted.get("attach_started_at").cloned().unwrap_or(serde_json::Value::Null),
+        "attach_completed_at": redacted.get("attach_completed_at").cloned().unwrap_or(serde_json::Value::Null),
+        "output_only": redacted.get("output_only").cloned().unwrap_or(serde_json::Value::Null),
+        "source_edit_allowance": redacted.get("source_edit_allowance").cloned().unwrap_or(serde_json::Value::Null),
+        "changed_source_files_count": redacted.get("changed_source_files_count").cloned().unwrap_or(serde_json::Value::Null),
+        "orphan_reap_verified": redacted.get("orphan_reap_verified").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        "identity_proof_source": redacted.get("identity_proof_source").cloned().unwrap_or(serde_json::Value::Null)
     })
 }
 

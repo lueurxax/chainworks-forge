@@ -75,11 +75,11 @@ enum ProviderAdapterSupport {
         let familyModels: [String]
         switch provider.family {
         case .codexACP:
-            familyModels = ["gpt-5", "codex-acp"]
+            familyModels = ["gpt-5.6"]
         case .claudeACP:
             familyModels = ["sonnet", "opus"]
         case .geminiACP:
-            familyModels = ["gemini-3.1-pro-preview", "gemini-2.5-flash"]
+            familyModels = ["gemini-3.1-pro-preview", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
         case .auggie:
             familyModels = ["auggie-default"]
         case .junie:

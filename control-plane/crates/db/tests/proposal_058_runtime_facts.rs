@@ -346,6 +346,7 @@ async fn proposal_058_counts_recent_escalation_launches_for_storm_detection() {
             id: "ledger-p058-recent-launches".into(),
             run_id,
             stage_id: "state_1".into(),
+            stage_execution_id: None,
             agent_id: "code_writer".into(),
             policy_id: "policy-p058".into(),
             policy_hash: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -416,6 +417,7 @@ async fn proposal_058_late_frame_event_and_runtime_facts_share_transaction() {
             id: "ledger-p058-late-frame".into(),
             run_id,
             stage_id: "state_1".into(),
+            stage_execution_id: None,
             agent_id: "code_writer".into(),
             policy_id: "policy-p058".into(),
             policy_hash: "sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"

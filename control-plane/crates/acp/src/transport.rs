@@ -353,9 +353,13 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Max time without meaningful agent progress while the transport remains alive.
 /// Keepalive/status-only ACP messages reset transport idleness, but not progress.
 const PROGRESS_TIMEOUT: Duration = Duration::from_secs(300);
-const CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT: Duration = Duration::from_secs(900);
+/// A provider with an observable unresolved local operation gets a bounded
+/// extension beyond the ordinary progress deadline. This covers Claude tool
+/// work and Codex's own `wait_agent` delegation boundary.
+const POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT: Duration = Duration::from_secs(900);
 const PROMPT_PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(15);
-const CLAUDE_LOCAL_ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const LOCAL_ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const PROVIDER_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CLAUDE_LOCAL_ACTIVITY_MAX_READ_BYTES: u64 = 1024 * 1024;
 const PROVIDER_SESSION_STORE_LINE_CAP_BYTES: usize = 16 * 1024 * 1024;
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
@@ -408,7 +412,7 @@ enum AcpSilenceDeadlineDecision {
     Timeout,
 }
 
-fn claude_silent_after_activity_timeout_decision(
+fn local_activity_timeout_decision(
     has_observed_local_activity: bool,
     elapsed: Duration,
     warning_recorded: bool,
@@ -420,12 +424,20 @@ fn claude_silent_after_activity_timeout_decision(
             AcpSilenceDeadlineDecision::Continue
         };
     }
-    if elapsed >= CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT {
+    if elapsed >= POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT {
         AcpSilenceDeadlineDecision::Timeout
     } else if elapsed >= PROGRESS_TIMEOUT && !warning_recorded {
         AcpSilenceDeadlineDecision::WarnGrace
     } else {
         AcpSilenceDeadlineDecision::Continue
+    }
+}
+
+fn local_activity_progress_timeout_limit(has_open_local_activity: bool) -> Duration {
+    if has_open_local_activity {
+        POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT
+    } else {
+        PROGRESS_TIMEOUT
     }
 }
 
@@ -689,8 +701,14 @@ impl ClaudeLocalActivityMonitor {
             self.open_tool_use_count(),
             self.open_background_task_count(),
             self.summary.last_event_type.as_deref().unwrap_or("none"),
-            self.summary.last_assistant_message_id.as_deref().unwrap_or("none"),
-            self.summary.last_assistant_stop_reason.as_deref().unwrap_or("none"),
+            self.summary
+                .last_assistant_message_id
+                .as_deref()
+                .unwrap_or("none"),
+            self.summary
+                .last_assistant_stop_reason
+                .as_deref()
+                .unwrap_or("none"),
             self.summary.last_assistant_incomplete
         )
     }
@@ -943,6 +961,8 @@ struct CodexLocalActivitySummary {
     running_processes_started: u64,
     running_process_outputs: u64,
     running_processes_finished: u64,
+    background_agent_waits_started: u64,
+    background_agent_waits_finished: u64,
     turn_aborted: bool,
     turn_completed: bool,
     stdin_closed_control_failures: u64,
@@ -970,6 +990,7 @@ struct CodexLocalActivityMonitor {
     summary: CodexLocalActivitySummary,
     active_call_process_ids: HashMap<String, String>,
     open_process_ids: HashSet<String>,
+    open_background_agent_wait_call_ids: HashSet<String>,
 }
 
 impl CodexLocalActivityMonitor {
@@ -978,6 +999,9 @@ impl CodexLocalActivityMonitor {
             return None;
         }
         let mut candidate_roots = Vec::new();
+        if let Some(runtime_home) = req.provider_runtime_home.as_deref() {
+            push_codex_session_store_root_candidate(&mut candidate_roots, Path::new(runtime_home));
+        }
         push_codex_runtime_root_candidate(&mut candidate_roots, Path::new(&req.workspace_root));
         if let Some(worktree_root) = req.worktree_root.as_deref() {
             push_codex_runtime_root_candidate(&mut candidate_roots, Path::new(worktree_root));
@@ -993,6 +1017,7 @@ impl CodexLocalActivityMonitor {
             summary: CodexLocalActivitySummary::default(),
             active_call_process_ids: HashMap::new(),
             open_process_ids: HashSet::new(),
+            open_background_agent_wait_call_ids: HashSet::new(),
         })
     }
 
@@ -1009,6 +1034,7 @@ impl CodexLocalActivityMonitor {
             summary: CodexLocalActivitySummary::default(),
             active_call_process_ids: HashMap::new(),
             open_process_ids: HashSet::new(),
+            open_background_agent_wait_call_ids: HashSet::new(),
         }
     }
 
@@ -1142,6 +1168,7 @@ impl CodexLocalActivityMonitor {
                     self.summary.last_event_type = Some("turn_aborted".to_string());
                     self.active_call_process_ids.clear();
                     self.open_process_ids.clear();
+                    self.open_background_agent_wait_call_ids.clear();
                     return true;
                 }
                 Some("task_complete") => {
@@ -1154,6 +1181,7 @@ impl CodexLocalActivityMonitor {
                     }
                     self.active_call_process_ids.clear();
                     self.open_process_ids.clear();
+                    self.open_background_agent_wait_call_ids.clear();
                     return true;
                 }
                 _ => {}
@@ -1180,7 +1208,7 @@ impl CodexLocalActivityMonitor {
         let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
             return false;
         };
-        if !matches!(name, "exec_command" | "write_stdin") {
+        if !matches!(name, "exec_command" | "write_stdin" | "wait_agent") {
             return false;
         }
         self.summary.event_count += 1;
@@ -1192,6 +1220,13 @@ impl CodexLocalActivityMonitor {
                     .insert(call_id.to_string(), process_id.clone());
                 self.open_process_ids.insert(process_id);
             }
+        }
+        if name == "wait_agent"
+            && self
+                .open_background_agent_wait_call_ids
+                .insert(call_id.to_string())
+        {
+            self.summary.background_agent_waits_started += 1;
         }
         true
     }
@@ -1211,6 +1246,11 @@ impl CodexLocalActivityMonitor {
             self.summary.turn_aborted = true;
             self.active_call_process_ids.clear();
             self.open_process_ids.clear();
+            self.open_background_agent_wait_call_ids.clear();
+            return true;
+        }
+        if self.open_background_agent_wait_call_ids.remove(call_id) {
+            self.summary.background_agent_waits_finished += 1;
             return true;
         }
         if let Some(process_id) = codex_running_process_id_from_output(output) {
@@ -1268,7 +1308,7 @@ impl CodexLocalActivityMonitor {
     }
 
     fn has_open_local_activity(&self) -> bool {
-        !self.open_process_ids.is_empty()
+        !self.open_process_ids.is_empty() || !self.open_background_agent_wait_call_ids.is_empty()
     }
 
     fn open_process_count(&self) -> usize {
@@ -1281,14 +1321,17 @@ impl CodexLocalActivityMonitor {
 
     fn summary_for_error(&self) -> String {
         format!(
-            "local_event_count={}, function_calls={}, function_outputs={}, running_processes_started={}, running_process_outputs={}, running_processes_finished={}, open_processes={}, turn_aborted={}, turn_completed={}, stdin_closed_control_failures={}, unbounded_tool_outputs={}, max_original_token_count={}, max_total_output_lines={}, turn_aborted_after_open_process={}, last_pathology={}, last_event_type={}",
+            "local_event_count={}, function_calls={}, function_outputs={}, running_processes_started={}, running_process_outputs={}, running_processes_finished={}, background_agent_waits_started={}, background_agent_waits_finished={}, open_processes={}, open_background_agent_waits={}, turn_aborted={}, turn_completed={}, stdin_closed_control_failures={}, unbounded_tool_outputs={}, max_original_token_count={}, max_total_output_lines={}, turn_aborted_after_open_process={}, last_pathology={}, last_event_type={}",
             self.summary.event_count,
             self.summary.function_calls,
             self.summary.function_outputs,
             self.summary.running_processes_started,
             self.summary.running_process_outputs,
             self.summary.running_processes_finished,
+            self.summary.background_agent_waits_started,
+            self.summary.background_agent_waits_finished,
             self.open_process_count(),
+            self.open_background_agent_wait_call_ids.len(),
             self.summary.turn_aborted,
             self.summary.turn_completed,
             self.summary.stdin_closed_control_failures,
@@ -1317,6 +1360,16 @@ fn push_codex_runtime_root_candidate(candidates: &mut Vec<PathBuf>, base: &Path)
         return;
     }
     let candidate = base.join(".forge-codex-acp");
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn push_codex_session_store_root_candidate(candidates: &mut Vec<PathBuf>, candidate: &Path) {
+    if candidate.as_os_str().is_empty() {
+        return;
+    }
+    let candidate = candidate.to_path_buf();
     if !candidates.iter().any(|existing| existing == &candidate) {
         candidates.push(candidate);
     }
@@ -1549,6 +1602,7 @@ pub(crate) fn signal_process_group(pid: u32, signal: libc::c_int) {
     }
 }
 
+#[cfg(test)]
 fn stderr_line_is_diagnostic_warning(line: &str) -> bool {
     line.contains("EPIPE") || line.contains("write EPIPE")
 }
@@ -1862,6 +1916,7 @@ fn is_provider_quota_or_capacity_failure(provider: &str, message: &str) -> bool 
     lower.contains("quota")
         || lower.contains("rate limit")
         || lower.contains("hit your limit")
+        || lower.contains("session limit")
         || lower.contains("exhausted your capacity")
         || lower.contains("capacity on this model")
         || (provider == "gemini" && lower.contains("capacity"))
@@ -1951,6 +2006,7 @@ fn push_streamed_transcript_chunk(buffer: &mut String, chunk: &str, truncated: &
 struct CompletionTextCapture {
     terminal_final_response_seen: bool,
     terminal_final_response: Option<CapturedCompletionText>,
+    provider_session_store_final_response: Option<CapturedCompletionText>,
     streamed_update_tail: Option<CapturedCompletionText>,
 }
 
@@ -1971,6 +2027,7 @@ impl Default for CompletionTextCapture {
         Self {
             terminal_final_response_seen: false,
             terminal_final_response: None,
+            provider_session_store_final_response: None,
             streamed_update_tail: None,
         }
     }
@@ -1991,6 +2048,12 @@ impl CompletionTextCapture {
         self.terminal_final_response = bounded_completion_text(sanitized);
     }
 
+    fn set_provider_session_store_final_response(&mut self, text: &str) {
+        let sanitized = strip_ansi(text);
+        self.provider_session_store_final_response = bounded_completion_text(sanitized);
+    }
+
+    #[cfg(test)]
     fn select_extraction_input(&self) -> SelectedCompletionTextCapture {
         self.select_extraction_input_with_capped_stream(None, false)
     }
@@ -2004,6 +2067,15 @@ impl CompletionTextCapture {
             return selected_completion_text(
                 capture,
                 AcpCompletionCaptureSource::TerminalFinalResponse,
+            );
+        }
+
+        if let Some(capture) =
+            non_empty_capture(self.provider_session_store_final_response.as_ref())
+        {
+            return selected_completion_text(
+                capture,
+                AcpCompletionCaptureSource::ProviderSessionStoreFinalResponse,
             );
         }
 
@@ -2673,22 +2745,26 @@ pub(crate) async fn send_ndjson(stdin: &mut tokio::process::ChildStdin, msg: &Va
 
 pub(crate) async fn await_response(
     reader: &mut BufReader<tokio::process::ChildStdout>,
+    child: &mut Child,
     expected_id: &str,
     time_limit: Duration,
+    phase: &str,
 ) -> Result<Value> {
     let start = Instant::now();
     let mut line = String::new();
 
     loop {
+        ensure_provider_process_alive(child, phase)?;
         let elapsed = start.elapsed();
         if elapsed >= time_limit {
             bail!("ACP handshake timed out waiting for response id={expected_id}");
         }
         let remaining = time_limit - elapsed;
+        let read_wait = remaining.min(PROVIDER_PROCESS_POLL_INTERVAL);
 
         line.clear();
         let n = match timeout(
-            remaining,
+            read_wait,
             read_capped_ndjson_line(
                 reader,
                 &mut line,
@@ -2701,6 +2777,10 @@ pub(crate) async fn await_response(
             Ok(Ok(n)) => n,
             Ok(Err(err)) => return Err(err).context("ACP handshake read_line error"),
             Err(_) => {
+                ensure_provider_process_alive(child, phase)?;
+                if read_wait < remaining {
+                    continue;
+                }
                 return diagnose_late_handshake_response(reader, expected_id, start, time_limit)
                     .await;
             }
@@ -2757,6 +2837,18 @@ pub(crate) async fn await_response(
             .get("result")
             .cloned()
             .unwrap_or_else(|| Value::Object(Default::default())));
+    }
+}
+
+fn ensure_provider_process_alive(child: &mut Child, phase: &str) -> Result<()> {
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            bail!("ACP provider subprocess exited during {phase}: {status}");
+        }
+        Ok(None) => Ok(()),
+        Err(error) => Err(error).context(format!(
+            "ACP provider subprocess liveness check during {phase}"
+        )),
     }
 }
 
@@ -2876,9 +2968,15 @@ pub(crate) async fn probe_initialize_with_timeout(
     .await
     .context("ACP: send capability probe initialize")?;
 
-    let result = await_response(&mut reader, &request_id, handshake_timeout)
-        .await
-        .context("ACP: capability probe initialize handshake")?;
+    let result = await_response(
+        &mut reader,
+        &mut child,
+        &request_id,
+        handshake_timeout,
+        "capability probe initialize handshake",
+    )
+    .await
+    .context("ACP: capability probe initialize handshake")?;
 
     let _ = AsyncWriteExt::shutdown(&mut stdin).await;
     drop(stdin);
@@ -3945,10 +4043,12 @@ fn provider_activity_type_marker(type_markers: &[String]) -> Option<&'static str
 fn collect_nested_type_markers(value: &Value, markers: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
-            if let Some(marker) = map.get("type").and_then(Value::as_str) {
-                let marker = marker.to_string();
-                if !markers.iter().any(|existing| existing == &marker) {
-                    markers.push(marker);
+            for key in ["sessionUpdate", "session_update", "type"] {
+                if let Some(marker) = map.get(key).and_then(Value::as_str) {
+                    let marker = marker.to_string();
+                    if !markers.iter().any(|existing| existing == &marker) {
+                        markers.push(marker);
+                    }
                 }
             }
             for nested in map.values() {
@@ -3993,6 +4093,7 @@ async fn record_prompt_progress_detail_for_session(
 ) {
     let update = AcpPromptProgressUpdate {
         run_id: req.run_id,
+        agent_execution_id: req.agent_execution_id,
         stage_execution_id: req.stage_execution_id.clone(),
         stage_id: req.stage_id.clone(),
         agent_id: req.agent_id.clone(),
@@ -4194,24 +4295,46 @@ fn provider_stream_silence_classification(
     }
 }
 
-fn note_claude_silence_grace_receipt_event(
+fn note_provider_silence_grace_receipt_event(
     runtime_receipt: &mut RuntimeReceiptTracker,
-    monitor: Option<&ClaudeLocalActivityMonitor>,
+    claude_monitor: Option<&ClaudeLocalActivityMonitor>,
+    codex_monitor: Option<&CodexLocalActivityMonitor>,
     phase: &str,
     elapsed: Duration,
 ) -> Option<String> {
-    let summary = note_claude_local_activity_receipt_event(runtime_receipt, monitor)?;
+    let summary = provider_local_activity_summary(runtime_receipt, claude_monitor, codex_monitor);
     runtime_receipt.push_event(
         "provider_local_activity_silence_grace_started",
         Some(format!(
             "phase={}, elapsed_s={}, grace_timeout_s={}, {}",
             phase,
             elapsed.as_secs(),
-            CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs(),
+            POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs(),
             summary
         )),
     );
     Some(summary)
+}
+
+fn recover_claude_session_store_final_response(
+    completion_capture: &mut CompletionTextCapture,
+    runtime_receipt: &mut RuntimeReceiptTracker,
+    monitor: Option<&ClaudeLocalActivityMonitor>,
+) -> bool {
+    let Some(final_response) =
+        monitor.and_then(ClaudeLocalActivityMonitor::latest_final_response_text)
+    else {
+        return false;
+    };
+    completion_capture.set_provider_session_store_final_response(&final_response);
+    runtime_receipt.push_event(
+        "provider_session_store_final_response_recovered",
+        Some(format!(
+            "captured_byte_count={}",
+            final_response.len().min(COMPLETION_CAPTURE_RAW_BYTE_LIMIT)
+        )),
+    );
+    true
 }
 
 impl AcpTransportSession {
@@ -4222,6 +4345,37 @@ impl AcpTransportSession {
         kind: AcpPromptProgressKind,
     ) {
         record_prompt_progress_for_session(req, progress_sink, &self.session_id, kind).await;
+    }
+
+    fn provider_failure_receipt(
+        &mut self,
+        runtime_receipt: &mut RuntimeReceiptTracker,
+        req: &ExecutionRequest,
+        provider_failure: &ProviderFailureEvent,
+        terminal_response_status: Option<&str>,
+        jsonrpc_error_code: Option<i64>,
+        provider_error_message: Option<&str>,
+    ) -> AcpRuntimeReceipt {
+        runtime_receipt.push_event("provider_failure", Some(provider_failure.detail.clone()));
+        if let Some(status) = terminal_response_status {
+            runtime_receipt.note_terminal_response(status);
+        }
+        let mut receipt = runtime_receipt.build(
+            &self.provider,
+            self.model.as_ref(),
+            &self.session_id,
+            req.session_generation_id.as_ref(),
+            self.xcode_shim_injected,
+            self.requires_xcode_host_execution,
+            "failed",
+            Some(provider_failure.failure_phase.to_string()),
+        );
+        receipt.jsonrpc_error_code = jsonrpc_error_code;
+        receipt.provider_error_message_redacted = Some(truncate_runtime_receipt_detail(
+            provider_error_message.unwrap_or(&provider_failure.message),
+        ));
+        self.last_runtime_receipt = Some(receipt.clone());
+        receipt
     }
 
     pub async fn start(
@@ -4351,9 +4505,15 @@ impl AcpTransportSession {
         .await
         .context("ACP: send initialize")?;
 
-        await_response(&mut reader, &init_id, HANDSHAKE_TIMEOUT)
-            .await
-            .context("ACP: initialize handshake")?;
+        await_response(
+            &mut reader,
+            &mut child,
+            &init_id,
+            HANDSHAKE_TIMEOUT,
+            "initialize handshake",
+        )
+        .await
+        .context("ACP: initialize handshake")?;
         startup_receipt.note_initialize_received(&init_id);
         let acp_initialize_latency_ms = initialize_started.elapsed().as_millis() as u64;
         info!(
@@ -4383,9 +4543,15 @@ impl AcpTransportSession {
             .context("ACP: send session/new")?;
         }
 
-        let sn_result = await_response(&mut reader, &sn_id, HANDSHAKE_TIMEOUT)
-            .await
-            .context("ACP: session/new handshake")?;
+        let sn_result = await_response(
+            &mut reader,
+            &mut child,
+            &sn_id,
+            HANDSHAKE_TIMEOUT,
+            "session/new handshake",
+        )
+        .await
+        .context("ACP: session/new handshake")?;
         let acp_session_new_latency_ms = session_new_started.elapsed().as_millis() as u64;
         info!(
             run_id = %req.run_id,
@@ -4421,9 +4587,15 @@ impl AcpTransportSession {
             )
             .await
             .context("ACP: send session/set_mode")?;
-            await_response(&mut reader, &set_mode_id, HANDSHAKE_TIMEOUT)
-                .await
-                .context("ACP: session/set_mode handshake")?;
+            await_response(
+                &mut reader,
+                &mut child,
+                &set_mode_id,
+                HANDSHAKE_TIMEOUT,
+                "session/set_mode handshake",
+            )
+            .await
+            .context("ACP: session/set_mode handshake")?;
         }
 
         for (config_id, value) in &config.config_options {
@@ -4453,7 +4625,15 @@ impl AcpTransportSession {
                 continue;
             }
 
-            match await_response(&mut reader, &sco_id, HANDSHAKE_TIMEOUT).await {
+            match await_response(
+                &mut reader,
+                &mut child,
+                &sco_id,
+                HANDSHAKE_TIMEOUT,
+                "session/set_config_option handshake",
+            )
+            .await
+            {
                 Ok(_) => {
                     // SEC-ACP-001: omit value — config option values can carry model keys or tokens.
                     debug!(
@@ -4492,11 +4672,17 @@ impl AcpTransportSession {
             .await
             .with_context(|| format!("ACP: send required session/set_config_option {config_id}"))?;
 
-            await_response(&mut reader, &sco_id, HANDSHAKE_TIMEOUT)
-                .await
-                .with_context(|| {
-                    format!("ACP: required session/set_config_option rejected for {config_id}")
-                })?;
+            await_response(
+                &mut reader,
+                &mut child,
+                &sco_id,
+                HANDSHAKE_TIMEOUT,
+                "required session/set_config_option handshake",
+            )
+            .await
+            .with_context(|| {
+                format!("ACP: required session/set_config_option rejected for {config_id}")
+            })?;
             // SEC-ACP-001: omit value — config option values can carry model keys or tokens.
             debug!(
                 session_id = %session_id,
@@ -4911,6 +5097,7 @@ impl AcpTransportSession {
         let mut seen_xcode_warning_keys = HashSet::new();
         let mut failure_phase: Option<String> = None;
         let mut claude_local_activity_silence_warning_recorded = false;
+        let mut claude_local_activity_progress_warning_recorded = false;
 
         'streaming: loop {
             poll_claude_local_activity_watchdog(
@@ -4938,19 +5125,23 @@ impl AcpTransportSession {
                 max_instant_option(last_acp_activity, last_provider_local_activity);
             let idle = effective_last_activity.elapsed();
             if idle >= IDLE_TIMEOUT {
-                let has_observed_claude_activity = claude_local_activity
+                let has_observed_local_activity = claude_local_activity
                     .as_ref()
-                    .is_some_and(|monitor| monitor.has_observed_activity());
-                match claude_silent_after_activity_timeout_decision(
-                    has_observed_claude_activity,
+                    .is_some_and(|monitor| monitor.has_observed_activity())
+                    || codex_local_activity
+                        .as_ref()
+                        .is_some_and(|monitor| monitor.has_observed_activity());
+                match local_activity_timeout_decision(
+                    has_observed_local_activity,
                     idle,
                     claude_local_activity_silence_warning_recorded,
                 ) {
                     AcpSilenceDeadlineDecision::WarnGrace => {
                         claude_local_activity_silence_warning_recorded = true;
-                        let local_summary = note_claude_silence_grace_receipt_event(
+                        let local_summary = note_provider_silence_grace_receipt_event(
                             &mut runtime_receipt,
                             claude_local_activity.as_ref(),
+                            codex_local_activity.as_ref(),
                             "idle_timeout",
                             idle,
                         )
@@ -4958,13 +5149,42 @@ impl AcpTransportSession {
                         warn!(
                             session_id = %self.session_id,
                             elapsed_s = idle.as_secs(),
-                            grace_timeout_s = CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs(),
+                            grace_timeout_s = POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs(),
                             local_summary = %local_summary,
-                            "Claude ACP stream silent after local activity; entering grace window"
+                            "ACP stream silent after local activity; entering grace window"
                         );
                     }
                     AcpSilenceDeadlineDecision::Continue => {}
                     AcpSilenceDeadlineDecision::Timeout => {
+                        if recover_claude_session_store_final_response(
+                            &mut completion_capture,
+                            &mut runtime_receipt,
+                            claude_local_activity.as_ref(),
+                        ) {
+                            runtime_receipt.push_event(
+                                "terminal_response_missing_session_store_final_available",
+                                Some("phase=idle_timeout".to_string()),
+                            );
+                            break 'streaming;
+                        }
+                        if let Some(provider_failure) =
+                            codex_local_activity.as_ref().and_then(|monitor| {
+                                monitor.provider_failure_event_from_local_activity()
+                            })
+                        {
+                            let receipt = self.provider_failure_receipt(
+                                &mut runtime_receipt,
+                                req,
+                                &provider_failure,
+                                None,
+                                None,
+                                None,
+                            );
+                            return Err(anyhow::Error::new(crate::AcpExecutionError::new(
+                                provider_failure.message,
+                                Some(receipt),
+                            )));
+                        }
                         let classification = provider_stream_silence_classification(
                             claude_local_activity.as_ref(),
                             codex_local_activity.as_ref(),
@@ -5000,46 +5220,112 @@ impl AcpTransportSession {
             let effective_last_progress =
                 max_instant_option(last_acp_progress, last_provider_local_progress);
             let progress_idle = effective_last_progress.elapsed();
-            if progress_idle >= PROGRESS_TIMEOUT {
-                let classification = provider_stream_silence_classification(
-                    claude_local_activity.as_ref(),
-                    codex_local_activity.as_ref(),
-                );
-                failure_phase = Some("progress_timeout".to_string());
-                let local_summary = provider_local_activity_summary(
-                    &mut runtime_receipt,
-                    claude_local_activity.as_ref(),
-                    codex_local_activity.as_ref(),
-                );
-                self.last_runtime_receipt = Some(runtime_receipt.build(
-                    &self.provider,
-                    self.model.as_ref(),
-                    &self.session_id,
-                    req.session_generation_id.as_ref(),
-                    self.xcode_shim_injected,
-                    self.requires_xcode_host_execution,
-                    "failed",
-                    failure_phase.clone(),
-                ));
-                return Err(anyhow::anyhow!(
+            let has_open_local_activity = claude_local_activity
+                .as_ref()
+                .is_some_and(|monitor| monitor.has_open_local_activity())
+                || codex_local_activity
+                    .as_ref()
+                    .is_some_and(|monitor| monitor.has_open_local_activity());
+            match local_activity_timeout_decision(
+                has_open_local_activity,
+                progress_idle,
+                claude_local_activity_progress_warning_recorded,
+            ) {
+                AcpSilenceDeadlineDecision::WarnGrace => {
+                    claude_local_activity_progress_warning_recorded = true;
+                    let local_summary = note_provider_silence_grace_receipt_event(
+                        &mut runtime_receipt,
+                        claude_local_activity.as_ref(),
+                        codex_local_activity.as_ref(),
+                        "progress_timeout",
+                        progress_idle,
+                    )
+                    .unwrap_or_else(|| "provider_local_activity=unavailable".to_string());
+                    warn!(
+                        session_id = %self.session_id,
+                        elapsed_s = progress_idle.as_secs(),
+                        grace_timeout_s = POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs(),
+                        local_summary = %local_summary,
+                        "ACP progress stalled with open local work; entering grace window"
+                    );
+                }
+                AcpSilenceDeadlineDecision::Continue => {}
+                AcpSilenceDeadlineDecision::Timeout => {
+                    if recover_claude_session_store_final_response(
+                        &mut completion_capture,
+                        &mut runtime_receipt,
+                        claude_local_activity.as_ref(),
+                    ) {
+                        runtime_receipt.push_event(
+                            "terminal_response_missing_session_store_final_available",
+                            Some("phase=progress_timeout".to_string()),
+                        );
+                        break 'streaming;
+                    }
+                    if let Some(provider_failure) = codex_local_activity
+                        .as_ref()
+                        .and_then(|monitor| monitor.provider_failure_event_from_local_activity())
+                    {
+                        let receipt = self.provider_failure_receipt(
+                            &mut runtime_receipt,
+                            req,
+                            &provider_failure,
+                            None,
+                            None,
+                            None,
+                        );
+                        return Err(anyhow::Error::new(crate::AcpExecutionError::new(
+                            provider_failure.message,
+                            Some(receipt),
+                        )));
+                    }
+                    let classification = provider_stream_silence_classification(
+                        claude_local_activity.as_ref(),
+                        codex_local_activity.as_ref(),
+                    );
+                    failure_phase = Some("progress_timeout".to_string());
+                    let local_summary = provider_local_activity_summary(
+                        &mut runtime_receipt,
+                        claude_local_activity.as_ref(),
+                        codex_local_activity.as_ref(),
+                    );
+                    self.last_runtime_receipt = Some(runtime_receipt.build(
+                        &self.provider,
+                        self.model.as_ref(),
+                        &self.session_id,
+                        req.session_generation_id.as_ref(),
+                        self.xcode_shim_injected,
+                        self.requires_xcode_host_execution,
+                        "failed",
+                        failure_phase.clone(),
+                    ));
+                    return Err(anyhow::anyhow!(
                     "ACP session progress timeout: {classification}; no meaningful progress for {}s (session={}, {local_summary})",
                     PROGRESS_TIMEOUT.as_secs(),
                     self.session_id
                 ));
+                }
             }
             let read_wait = if claude_local_activity.is_some() || codex_local_activity.is_some() {
                 let remaining_idle = IDLE_TIMEOUT.saturating_sub(idle);
-                let remaining_progress = PROGRESS_TIMEOUT.saturating_sub(progress_idle);
+                let remaining_progress =
+                    local_activity_progress_timeout_limit(has_open_local_activity)
+                        .saturating_sub(progress_idle);
                 remaining_idle
                     .min(remaining_progress)
-                    .min(CLAUDE_LOCAL_ACTIVITY_POLL_INTERVAL)
+                    .min(LOCAL_ACTIVITY_POLL_INTERVAL)
             } else {
                 let remaining_idle = IDLE_TIMEOUT.saturating_sub(idle);
-                let remaining_progress = PROGRESS_TIMEOUT.saturating_sub(progress_idle);
+                let remaining_progress =
+                    local_activity_progress_timeout_limit(has_open_local_activity)
+                        .saturating_sub(progress_idle);
                 remaining_idle.min(remaining_progress)
-            };
+            }
+            .min(PROVIDER_PROCESS_POLL_INTERVAL);
 
             let mut close_requested = false;
+            let mut deferred_provider_failure: Option<ProviderFailureEvent> = None;
+            let mut deferred_claude_final_response: Option<(String, &'static str)> = None;
             let n_result: Result<usize> = {
                 line.clear();
                 let session_id = self.session_id.clone();
@@ -5072,6 +5358,25 @@ impl AcpTransportSession {
                             }
                         }
                     };
+
+                    if matches!(&read_outcome, AcpPromptReadOutcome::PollElapsed) {
+                        match self.child.try_wait() {
+                            Ok(Some(status)) => {
+                                failure_phase = Some("provider_subprocess_exit".to_string());
+                                break Err(anyhow::anyhow!(
+                                    "ACP provider subprocess exited during active prompt: {status} (session={session_id})"
+                                ));
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                failure_phase =
+                                    Some("provider_subprocess_liveness_check_failed".to_string());
+                                break Err(error).context(
+                                    "ACP provider subprocess liveness check during active prompt",
+                                );
+                            }
+                        }
+                    }
 
                     match read_outcome {
                         AcpPromptReadOutcome::CloseRequested => {
@@ -5117,20 +5422,24 @@ impl AcpTransportSession {
                                 max_instant_option(last_acp_activity, last_provider_local_activity);
                             let idle = effective_last_activity.elapsed();
                             if idle >= IDLE_TIMEOUT {
-                                let has_observed_claude_activity = claude_local_activity
+                                let has_observed_local_activity = claude_local_activity
                                     .as_ref()
-                                    .is_some_and(|monitor| monitor.has_observed_activity());
-                                match claude_silent_after_activity_timeout_decision(
-                                    has_observed_claude_activity,
+                                    .is_some_and(|monitor| monitor.has_observed_activity())
+                                    || codex_local_activity
+                                        .as_ref()
+                                        .is_some_and(|monitor| monitor.has_observed_activity());
+                                match local_activity_timeout_decision(
+                                    has_observed_local_activity,
                                     idle,
                                     claude_local_activity_silence_warning_recorded,
                                 ) {
                                     AcpSilenceDeadlineDecision::WarnGrace => {
                                         claude_local_activity_silence_warning_recorded = true;
                                         let local_summary =
-                                            note_claude_silence_grace_receipt_event(
+                                            note_provider_silence_grace_receipt_event(
                                                 &mut runtime_receipt,
                                                 claude_local_activity.as_ref(),
+                                                codex_local_activity.as_ref(),
                                                 "idle_timeout_inner",
                                                 idle,
                                             )
@@ -5140,13 +5449,40 @@ impl AcpTransportSession {
                                         warn!(
                                             session_id = %session_id,
                                             elapsed_s = idle.as_secs(),
-                                            grace_timeout_s = CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs(),
+                                            grace_timeout_s = POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs(),
                                             local_summary = %local_summary,
-                                            "Claude ACP stream silent after local activity; entering grace window (inner)"
+                                            "ACP stream silent after local activity; entering grace window (inner)"
                                         );
                                     }
                                     AcpSilenceDeadlineDecision::Continue => {}
                                     AcpSilenceDeadlineDecision::Timeout => {
+                                        if let Some(final_response) =
+                                            claude_local_activity.as_ref().and_then(|monitor| {
+                                                monitor.latest_final_response_text()
+                                            })
+                                        {
+                                            deferred_claude_final_response =
+                                                Some((final_response, "idle_timeout_inner"));
+                                            break Err(anyhow::anyhow!(
+                                                "ACP terminal response missing but Claude session store final response is available (session={session_id})"
+                                            ));
+                                        }
+                                        if let Some(provider_failure) =
+                                            codex_local_activity.as_ref().and_then(|monitor| {
+                                                monitor.provider_failure_event_from_local_activity()
+                                            })
+                                        {
+                                            failure_phase =
+                                                Some(provider_failure.failure_phase.to_string());
+                                            deferred_provider_failure =
+                                                Some(provider_failure.clone());
+                                            break Err(anyhow::Error::new(
+                                                crate::AcpExecutionError::new(
+                                                    provider_failure.message,
+                                                    None,
+                                                ),
+                                            ));
+                                        }
                                         let classification = provider_stream_silence_classification(
                                             claude_local_activity.as_ref(),
                                             codex_local_activity.as_ref(),
@@ -5163,7 +5499,10 @@ impl AcpTransportSession {
                                             session_id,
                                             last_acp_activity.elapsed().as_secs(),
                                             last_provider_local_activity
-                                                .map(|instant| instant.elapsed().as_secs().to_string())
+                                                .map(|instant| instant
+                                                    .elapsed()
+                                                    .as_secs()
+                                                    .to_string())
                                                 .unwrap_or_else(|| "none".to_string())
                                         ));
                                     }
@@ -5172,7 +5511,38 @@ impl AcpTransportSession {
                             let effective_last_progress =
                                 max_instant_option(last_acp_progress, last_provider_local_progress);
                             let progress_idle = effective_last_progress.elapsed();
-                            if progress_idle >= PROGRESS_TIMEOUT {
+                            let progress_timeout_limit = local_activity_progress_timeout_limit(
+                                claude_local_activity
+                                    .as_ref()
+                                    .is_some_and(|monitor| monitor.has_open_local_activity())
+                                    || codex_local_activity
+                                        .as_ref()
+                                        .is_some_and(|monitor| monitor.has_open_local_activity()),
+                            );
+                            if progress_idle >= progress_timeout_limit {
+                                if let Some(final_response) = claude_local_activity
+                                    .as_ref()
+                                    .and_then(|monitor| monitor.latest_final_response_text())
+                                {
+                                    deferred_claude_final_response =
+                                        Some((final_response, "progress_timeout_inner"));
+                                    break Err(anyhow::anyhow!(
+                                        "ACP terminal response missing but Claude session store final response is available (session={session_id})"
+                                    ));
+                                }
+                                if let Some(provider_failure) =
+                                    codex_local_activity.as_ref().and_then(|monitor| {
+                                        monitor.provider_failure_event_from_local_activity()
+                                    })
+                                {
+                                    failure_phase =
+                                        Some(provider_failure.failure_phase.to_string());
+                                    deferred_provider_failure = Some(provider_failure.clone());
+                                    break Err(anyhow::Error::new(crate::AcpExecutionError::new(
+                                        provider_failure.message,
+                                        None,
+                                    )));
+                                }
                                 let classification = provider_stream_silence_classification(
                                     claude_local_activity.as_ref(),
                                     codex_local_activity.as_ref(),
@@ -5192,34 +5562,7 @@ impl AcpTransportSession {
                             continue;
                         }
                         AcpPromptReadOutcome::PollElapsed => {
-                            let effective_last_activity =
-                                max_instant_option(last_acp_activity, last_provider_local_activity);
-                            let idle = effective_last_activity.elapsed();
-                            if idle >= IDLE_TIMEOUT {
-                                failure_phase = Some("idle_timeout".to_string());
-                                break Err(anyhow::anyhow!(
-                                    "ACP session idle timeout: idle_hang_before_first_progress; no message for {}s (session={}, last_acp_activity_age_s={}, last_provider_local_activity_age_s=none, provider_local_activity=unavailable)",
-                                    IDLE_TIMEOUT.as_secs(),
-                                    session_id,
-                                    last_acp_activity.elapsed().as_secs()
-                                ));
-                            }
-                            let effective_last_progress =
-                                max_instant_option(last_acp_progress, last_provider_local_progress);
-                            let progress_idle = effective_last_progress.elapsed();
-                            if progress_idle >= PROGRESS_TIMEOUT {
-                                failure_phase = Some("progress_timeout".to_string());
-                                break Err(anyhow::anyhow!(
-                                    "ACP session progress timeout: idle_hang_before_first_progress; no meaningful progress for {}s (session={})",
-                                    PROGRESS_TIMEOUT.as_secs(),
-                                    session_id
-                                ));
-                            }
-                            failure_phase = Some("read_poll_elapsed_without_message".to_string());
-                            break Err(anyhow::anyhow!(
-                                "ACP session read poll elapsed before idle or progress deadline (session={})",
-                                session_id
-                            ));
+                            continue;
                         }
                     }
                 }
@@ -5230,20 +5573,50 @@ impl AcpTransportSession {
             let n = match n_result {
                 Ok(n) => n,
                 Err(error) => {
-                    self.last_runtime_receipt = Some(
-                        runtime_receipt.build(
-                            &self.provider,
-                            self.model.as_ref(),
-                            &self.session_id,
-                            req.session_generation_id.as_ref(),
-                            self.xcode_shim_injected,
-                            self.requires_xcode_host_execution,
-                            "failed",
-                            failure_phase
-                                .clone()
-                                .or_else(|| Some("prompt_stream_failed".to_string())),
-                        ),
-                    );
+                    if let Some((final_response, phase)) = deferred_claude_final_response {
+                        completion_capture
+                            .set_provider_session_store_final_response(&final_response);
+                        runtime_receipt.push_event(
+                            "provider_session_store_final_response_recovered",
+                            Some(format!(
+                                "captured_byte_count={}",
+                                final_response.len().min(COMPLETION_CAPTURE_RAW_BYTE_LIMIT)
+                            )),
+                        );
+                        runtime_receipt.push_event(
+                            "terminal_response_missing_session_store_final_available",
+                            Some(format!("phase={phase}")),
+                        );
+                        break 'streaming;
+                    } else if let Some(provider_failure) = deferred_provider_failure {
+                        let receipt = self.provider_failure_receipt(
+                            &mut runtime_receipt,
+                            req,
+                            &provider_failure,
+                            None,
+                            None,
+                            None,
+                        );
+                        return Err(anyhow::Error::new(crate::AcpExecutionError::new(
+                            provider_failure.message,
+                            Some(receipt),
+                        )));
+                    } else {
+                        self.last_runtime_receipt = Some(
+                            runtime_receipt.build(
+                                &self.provider,
+                                self.model.as_ref(),
+                                &self.session_id,
+                                req.session_generation_id.as_ref(),
+                                self.xcode_shim_injected,
+                                self.requires_xcode_host_execution,
+                                "failed",
+                                failure_phase
+                                    .clone()
+                                    .or_else(|| Some("prompt_stream_failed".to_string())),
+                            ),
+                        );
+                    }
                     return Err(error);
                 }
             };
@@ -5503,12 +5876,12 @@ impl AcpTransportSession {
                                     );
                                     self.last_runtime_receipt = Some(receipt.clone());
                                     return Err(anyhow::Error::new(crate::AcpExecutionError::new(
-                                    // SEC-MED-001: use sanitized label, not provider-controlled request_summary.
-                                    format!(
-                                        "p079_unsafe_continuation:symlink_escape_in_canonical_path_parent:{p079_safe_label}"
-                                    ),
-                                    Some(receipt),
-                                )));
+                                        // SEC-MED-001: use sanitized label, not provider-controlled request_summary.
+                                        format!(
+                                            "p079_unsafe_continuation:symlink_escape_in_canonical_path_parent:{p079_safe_label}"
+                                        ),
+                                        Some(receipt),
+                                    )));
                                 }
                                 // SEC-P079-002: in P079 mode log only sanitized fields.
                                 if p079_canonical_paths.is_some() {
@@ -5638,10 +6011,14 @@ impl AcpTransportSession {
                                             Some("p079_unsafe_continuation".to_string()),
                                         );
                                         self.last_runtime_receipt = Some(receipt.clone());
-                                        return Err(anyhow::Error::new(crate::AcpExecutionError::new(
-                                        format!("p079_unsafe_continuation:no_allow_once_option:{p079_safe_label}"),
-                                        Some(receipt),
-                                    )));
+                                        return Err(anyhow::Error::new(
+                                            crate::AcpExecutionError::new(
+                                                format!(
+                                                    "p079_unsafe_continuation:no_allow_once_option:{p079_safe_label}"
+                                                ),
+                                                Some(receipt),
+                                            ),
+                                        ));
                                     } else {
                                         warn!(
                                             session_id = %self.session_id,
@@ -5766,39 +6143,45 @@ impl AcpTransportSession {
                     if parsed.get("error").is_some() {
                         let err_msg = parsed["error"]["message"].as_str().unwrap_or("ACP error");
                         let jsonrpc_error_code = parsed["error"]["code"].as_i64();
-                        let provider_failure = classify_prompt_error_response(
-                            &self.provider,
+                        let provider_failure = codex_local_activity
+                            .as_mut()
+                            .and_then(|monitor| monitor.quota_failure_event_from_session_store())
+                            .unwrap_or_else(|| {
+                                classify_prompt_error_response(
+                                    &self.provider,
+                                    jsonrpc_error_code,
+                                    err_msg,
+                                )
+                            });
+                        let _receipt = self.provider_failure_receipt(
+                            &mut runtime_receipt,
+                            req,
+                            &provider_failure,
+                            Some("failed"),
                             jsonrpc_error_code,
-                            err_msg,
+                            Some(if provider_failure.failure_phase == "provider_quota" {
+                                provider_failure.message.as_str()
+                            } else {
+                                err_msg
+                            }),
                         );
-                        runtime_receipt
-                            .push_event("provider_failure", Some(provider_failure.detail.clone()));
-                        runtime_receipt.note_terminal_response("failed");
-                        let mut receipt = runtime_receipt.build(
-                            &self.provider,
-                            self.model.as_ref(),
-                            &self.session_id,
-                            req.session_generation_id.as_ref(),
-                            self.xcode_shim_injected,
-                            self.requires_xcode_host_execution,
-                            "failed",
-                            Some(provider_failure.failure_phase.to_string()),
-                        );
-                        receipt.jsonrpc_error_code = jsonrpc_error_code;
-                        receipt.provider_error_message_redacted =
-                            Some(truncate_runtime_receipt_detail(err_msg));
-                        self.last_runtime_receipt = Some(receipt);
                         warn!(
                             session_id = %self.session_id,
                             failure_phase = provider_failure.failure_phase,
                             "ACP session/prompt returned error: {err_msg}"
                         );
+                        let transcript_error = if provider_failure.failure_phase == "provider_quota"
+                        {
+                            provider_failure.message.as_str()
+                        } else {
+                            err_msg
+                        };
                         return Ok((
                             AgentStatus::Failed,
                             vec![],
                             vec![],
                             pre_prompt_expected_outputs,
-                            transcript_with_prompt_error(streamed_text, err_msg),
+                            transcript_with_prompt_error(streamed_text, transcript_error),
                             completion_capture
                                 .select_extraction_input_with_capped_stream(None, true)
                                 .metadata,
@@ -6696,6 +7079,207 @@ mod tests {
     }
 
     #[test]
+    fn open_provider_local_work_uses_bounded_progress_grace() {
+        assert_eq!(
+            local_activity_progress_timeout_limit(false),
+            PROGRESS_TIMEOUT,
+            "ordinary provider progress still uses the five-minute deadline"
+        );
+        assert_eq!(
+            local_activity_progress_timeout_limit(true),
+            POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT,
+            "unresolved provider-local work receives the bounded grace window"
+        );
+        assert_eq!(
+            local_activity_timeout_decision(true, PROGRESS_TIMEOUT, false,),
+            AcpSilenceDeadlineDecision::WarnGrace
+        );
+        assert_eq!(
+            local_activity_timeout_decision(true, POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT, true,),
+            AcpSilenceDeadlineDecision::Timeout
+        );
+    }
+
+    #[test]
+    fn codex_session_store_credits_exhausted_becomes_provider_quota() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let session_path = tempdir.path().join("codex-session.jsonl");
+        std::fs::write(
+            &session_path,
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "limit_id": "gpt-5.6-usage",
+                        "credits": {
+                            "has_credits": false,
+                            "balance": "0",
+                            "unlimited": false
+                        }
+                    }
+                }
+            })
+            .to_string()
+                + "\n",
+        )
+        .expect("write codex session store");
+
+        let failure =
+            codex_session_store_credits_exhausted_failure(&session_path).expect("quota failure");
+
+        assert_eq!(failure.failure_phase, "provider_quota");
+        assert!(failure.message.contains("Codex credits exhausted"));
+        assert!(failure.detail.contains("codex_credits_exhausted"));
+        assert!(failure.detail.contains("limit_id=gpt-5.6-usage"));
+    }
+
+    #[test]
+    fn codex_monitor_uses_explicit_runtime_home_before_bounded_workspace_scan() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let workspace_root = tempdir.path().join("workspace");
+        let historical_root = workspace_root.join(".forge-codex-acp");
+        for index in 0..513 {
+            std::fs::create_dir_all(historical_root.join(format!("historical-{index}")))
+                .expect("create historical runtime home");
+        }
+
+        let runtime_home = tempdir.path().join("runtime-home");
+        let session_path = runtime_home.join("sessions/codex-session-1.jsonl");
+        std::fs::create_dir_all(session_path.parent().expect("session parent"))
+            .expect("create exact runtime home");
+        std::fs::write(&session_path, "{}\n").expect("write exact session store");
+
+        let req = ExecutionRequest {
+            run_id: domain::ids::RunId::new(),
+            stage_execution_id: None,
+            stage_id: "stage-1".to_string(),
+            attempt_number: 1,
+            agent_execution_id: None,
+            agent_id: "agent-1".to_string(),
+            provider: "codex".to_string(),
+            model: None,
+            effort: None,
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            prompt: "test".to_string(),
+            worktree_root: None,
+            worktree_write_enabled: false,
+            worktree_strategy: None,
+            expected_output_paths: Vec::new(),
+            expected_outputs: Vec::new(),
+            keep_session_alive: false,
+            reuse_existing_session: false,
+            session_generation_id: None,
+            provider_session_id: None,
+            provider_runtime_home: Some(runtime_home.to_string_lossy().into_owned()),
+            p079_repair_canonical_paths: None,
+            mcp_servers: Vec::new(),
+            chainworks_meta_root: None,
+            legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
+            owner_kind: "stage_execution".to_string(),
+            owner_id: None,
+            origin_stage_id: None,
+            origin_stage_execution_id: None,
+            mediation_record_id: None,
+            toolchain_home: None,
+            toolchain_go_scope_enabled: false,
+        };
+
+        let mut monitor =
+            CodexLocalActivityMonitor::for_request(&req, "session-1").expect("Codex monitor");
+        assert_eq!(monitor.candidate_roots.first(), Some(&runtime_home));
+
+        monitor.ensure_session_path();
+        assert_eq!(
+            monitor.session_path.as_deref(),
+            Some(session_path.as_path())
+        );
+    }
+
+    #[test]
+    fn codex_local_activity_unbounded_output_becomes_tool_session_failure() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let session_path = tempdir.path().join("codex-session.jsonl");
+        let mut monitor = CodexLocalActivityMonitor::new_for_path(session_path.clone());
+        let output = "Original token count: 2479089\nTotal output lines: 5097";
+        std::fs::write(
+            &session_path,
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": output
+                }
+            })
+            .to_string()
+                + "\n",
+        )
+        .expect("write codex session store");
+
+        monitor.poll(Instant::now()).expect("poll codex store");
+        let failure = monitor
+            .provider_failure_event_from_local_activity()
+            .expect("tool-output pathology failure");
+
+        assert_eq!(failure.failure_phase, "codex_tool_session_control_failure");
+        assert!(failure.message.contains("codex_unbounded_tool_output"));
+        assert!(failure.detail.contains("max_original_token_count=2479089"));
+        assert!(failure.detail.contains("max_total_output_lines=5097"));
+    }
+
+    #[test]
+    fn codex_wait_agent_keeps_watchdog_open_until_its_result_arrives() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let session_path = tempdir.path().join("codex-session.jsonl");
+        let mut monitor = CodexLocalActivityMonitor::new_for_path(session_path.clone());
+        let wait_call = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "wait_agent",
+                "call_id": "wait-1"
+            }
+        });
+        std::fs::write(&session_path, format!("{wait_call}\n"))
+            .expect("write Codex wait-agent call");
+
+        let observation = monitor.poll(Instant::now()).expect("poll wait-agent call");
+        assert!(observation.should_extend_watchdog);
+        assert!(observation.has_open_local_activity);
+        assert!(monitor
+            .summary_for_error()
+            .contains("open_background_agent_waits=1"));
+
+        let wait_result = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "wait-1",
+                "output": "reviewer completed"
+            }
+        });
+        std::fs::write(&session_path, format!("{wait_call}\n{wait_result}\n"))
+            .expect("write Codex wait-agent result");
+
+        let observation = monitor
+            .poll(Instant::now())
+            .expect("poll wait-agent result");
+        assert!(observation.should_extend_watchdog);
+        assert!(!observation.has_open_local_activity);
+        assert!(monitor
+            .summary_for_error()
+            .contains("background_agent_waits_finished=1"));
+
+        let observation = monitor
+            .poll(Instant::now())
+            .expect("poll settled wait-agent result");
+        assert!(!observation.should_extend_watchdog);
+    }
+
+    #[test]
     fn proposal_053_acp_prompt_metadata_uses_discovery_filesystem_fake() {
         let output_path = "/tmp/run/proposal_review.json";
         let expected_output = ExpectedOutputSpec {
@@ -6739,7 +7323,7 @@ mod tests {
             agent_execution_id: Some(agent_execution_id),
             agent_id: "agent-1".to_string(),
             provider: "codex".to_string(),
-            model: Some("gpt-5.5".to_string()),
+            model: Some("gpt-5.6".to_string()),
             effort: Some("high".to_string()),
             workspace_root: "/tmp/run".to_string(),
             prompt: "write the output".to_string(),
@@ -6952,6 +7536,37 @@ mod tests {
     }
 
     #[test]
+    fn codex_acp_thought_chunk_preserves_declared_session_update_kind() {
+        let thought_update = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "codex-session",
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": "**Planning manual baseline comparison**"
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            session_update_observation(&thought_update),
+            (
+                "agent_thought_chunk",
+                true,
+                Some("agent_thought_chunk,text".to_string())
+            )
+        );
+        assert_eq!(
+            timeline_title_for_update("agent_thought_chunk"),
+            "Agent thought"
+        );
+    }
+
+    #[test]
     fn meaningful_session_updates_refresh_progress_deadline() {
         assert!(session_update_refreshes_progress_deadline(
             "provider_activity",
@@ -7061,6 +7676,19 @@ mod tests {
     }
 
     #[test]
+    fn claude_session_limit_prompt_error_is_provider_quota() {
+        let failure = classify_prompt_error_response(
+            "claude",
+            Some(-32603),
+            "Internal error: You've hit your session limit · resets 8pm (Asia/Nicosia)",
+        );
+
+        assert_eq!(failure.failure_phase, "provider_quota");
+        assert!(failure.message.contains("provider quota/capacity failure"));
+        assert!(failure.detail.contains("jsonrpc_error_code=-32603"));
+    }
+
+    #[test]
     fn proposal_089_completion_capture_uses_assistant_text_chunks_not_tool_or_thought_chunks() {
         let thought = serde_json::json!({
             "jsonrpc": "2.0",
@@ -7118,7 +7746,9 @@ mod tests {
         assert_eq!(extract_agent_message_chunk(&tool), None);
         assert_eq!(
             extract_agent_message_chunk(&message).as_deref(),
-            Some("{\"CHAINWORKS_OUTPUT\":{\"tests_result\":{\"status\":\"not_run\",\"commands\":[]}}}")
+            Some(
+                "{\"CHAINWORKS_OUTPUT\":{\"tests_result\":{\"status\":\"not_run\",\"commands\":[]}}}"
+            )
         );
         assert_eq!(
             extract_agent_message_chunk(&claude_text_chunk).as_deref(),
@@ -7161,6 +7791,45 @@ mod tests {
         assert_eq!(selected.metadata.extraction_input_truncated, false);
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].name, "implementation_progress");
+    }
+
+    #[test]
+    fn provider_session_store_final_response_is_used_before_streamed_tail() {
+        let expected_outputs = vec![ExpectedOutputSpec {
+            output_name: "tests_result".to_string(),
+            output_role: domain::discovery::ExpectedOutputRole::Machine,
+            target_path: "/tmp/run/implementation/tests-result.json".to_string(),
+            companion_of: None,
+            display_label: "Tests result".to_string(),
+            contract_id: None,
+            required: true,
+            reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+            max_bytes: 1024,
+            aggregate_acceptance_cap_bytes: 4096,
+            authorized_roots: vec![],
+            source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+        }];
+        let mut capture = CompletionTextCapture::default();
+        capture.push_streamed_update(
+            "\n<<<CHAINWORKS_OUTPUT:tests_result>>>{\"status\":\"stale\",\"commands\":[]}<<<END_CHAINWORKS_OUTPUT>>>",
+        );
+        capture.set_provider_session_store_final_response(
+            "\n<<<CHAINWORKS_OUTPUT:tests_result>>>{\"status\":\"passed\",\"commands\":[]}<<<END_CHAINWORKS_OUTPUT>>>",
+        );
+
+        let selected = capture.select_extraction_input();
+        let artifacts =
+            extract_output_envelopes(selected.text.as_deref().unwrap(), &expected_outputs);
+
+        assert_eq!(
+            selected.metadata.capture_source,
+            Some(crate::AcpCompletionCaptureSource::ProviderSessionStoreFinalResponse)
+        );
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].name, "tests_result");
+        let content =
+            std::str::from_utf8(&artifacts[0].content).expect("artifact content is utf-8");
+        assert!(content.contains("\"passed\""));
     }
 
     #[test]

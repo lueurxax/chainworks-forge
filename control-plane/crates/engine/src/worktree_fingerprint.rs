@@ -5,10 +5,15 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::time::timeout;
 
 pub const WORKTREE_FINGERPRINT_SCHEMA_VERSION: &str = "worktree_fingerprint_v1";
 pub const WORKTREE_FINGERPRINT_CLASSIFIER_VERSION: &str = "worktree_fingerprint_classifier_v1";
+const GIT_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct WorktreeFingerprintInput<'a> {
@@ -405,12 +410,7 @@ struct GitStatusEntry {
 }
 
 async fn read_git_status(root: &Path) -> Result<Vec<GitStatusEntry>> {
-    let output = Command::new("git")
-        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
-        .current_dir(root)
-        .output()
-        .await
-        .with_context(|| format!("running git status in {}", root.display()))?;
+    let output = run_git_status(root, Path::new("git"), GIT_STATUS_TIMEOUT).await?;
     if !output.status.success() {
         anyhow::bail!(
             "git status failed in {}: {}",
@@ -420,6 +420,74 @@ async fn read_git_status(root: &Path) -> Result<Vec<GitStatusEntry>> {
     }
 
     parse_git_status(root, &output.stdout)
+}
+
+#[derive(Debug)]
+struct GitStatusOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+async fn run_git_status(
+    root: &Path,
+    git_program: &Path,
+    command_timeout: Duration,
+) -> Result<GitStatusOutput> {
+    let mut child = Command::new(git_program)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("starting git status in {}", root.display()))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("git status stdout pipe was not captured")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("git status stderr pipe was not captured")?;
+    let stdout_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+
+    let status = match timeout(command_timeout, child.wait()).await {
+        Ok(wait_result) => {
+            wait_result.with_context(|| format!("waiting for git status in {}", root.display()))?
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            anyhow::bail!(
+                "git status timed out after {}s in {}",
+                command_timeout.as_secs(),
+                root.display()
+            );
+        }
+    };
+    let stdout = stdout_task
+        .await
+        .context("joining git status stdout reader")?
+        .context("reading git status stdout")?;
+    let stderr = stderr_task
+        .await
+        .context("joining git status stderr reader")?
+        .context("reading git status stderr")?;
+
+    Ok(GitStatusOutput {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn parse_git_status(root: &Path, bytes: &[u8]) -> Result<Vec<GitStatusEntry>> {
@@ -520,6 +588,7 @@ fn sort_json_object_keys(value: &mut Value) {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::time::{Duration, Instant};
     use tokio::process::Command;
 
     #[tokio::test]
@@ -730,6 +799,35 @@ mod tests {
                         | PathStatus::RenamedAfterPrompt
                 ))
                 .count()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proposal_088_git_status_timeout_returns_promptly() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = temp_repo().await;
+        let fake_git = repo.path().join("fake-git");
+        std::fs::write(&fake_git, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        let mut permissions = std::fs::metadata(&fake_git).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_git, permissions).unwrap();
+
+        let started = Instant::now();
+        let result = run_git_status(repo.path(), &fake_git, Duration::from_millis(100)).await;
+
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "git status timeout should not block fingerprint capture"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("git status timed out"),
+            "timeout error should be explicit"
         );
     }
 

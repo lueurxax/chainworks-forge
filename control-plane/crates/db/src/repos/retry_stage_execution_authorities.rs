@@ -150,7 +150,7 @@ pub async fn find_by_id(
     pool: &SqlitePool,
     id: &str,
 ) -> Result<Option<RetryStageExecutionAuthority>> {
-    let row = sqlx::query(select_sql("WHERE id = ?1").as_str())
+    let row = sqlx::query(sqlx::AssertSqlSafe(select_sql("WHERE id = ?1")))
         .bind(id)
         .fetch_optional(pool)
         .await
@@ -163,9 +163,9 @@ pub async fn find_active_by_run_stage(
     run_id: RunId,
     stage_id: &str,
 ) -> Result<Option<RetryStageExecutionAuthority>> {
-    let row = sqlx::query(
-        select_sql("WHERE run_id = ?1 AND stage_id = ?2 AND authority_state = 'active'").as_str(),
-    )
+    let row = sqlx::query(sqlx::AssertSqlSafe(select_sql(
+        "WHERE run_id = ?1 AND stage_id = ?2 AND authority_state = 'active'",
+    )))
     .bind(run_id.to_string())
     .bind(stage_id)
     .fetch_optional(pool)
@@ -178,9 +178,9 @@ pub async fn find_active_by_target(
     pool: &SqlitePool,
     target_stage_execution_id: StageExecutionId,
 ) -> Result<Option<RetryStageExecutionAuthority>> {
-    let row = sqlx::query(
-        select_sql("WHERE target_stage_execution_id = ?1 AND authority_state = 'active'").as_str(),
-    )
+    let row = sqlx::query(sqlx::AssertSqlSafe(select_sql(
+        "WHERE target_stage_execution_id = ?1 AND authority_state = 'active'",
+    )))
     .bind(target_stage_execution_id.to_string())
     .fetch_optional(pool)
     .await
@@ -192,11 +192,13 @@ pub async fn list_by_run(
     pool: &SqlitePool,
     run_id: RunId,
 ) -> Result<Vec<RetryStageExecutionAuthority>> {
-    let rows = sqlx::query(select_sql("WHERE run_id = ?1 ORDER BY created_at ASC").as_str())
-        .bind(run_id.to_string())
-        .fetch_all(pool)
-        .await
-        .context("list retry authorities by run")?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(select_sql(
+        "WHERE run_id = ?1 ORDER BY created_at ASC",
+    )))
+    .bind(run_id.to_string())
+    .fetch_all(pool)
+    .await
+    .context("list retry authorities by run")?;
     rows.iter().map(parse_row).collect()
 }
 

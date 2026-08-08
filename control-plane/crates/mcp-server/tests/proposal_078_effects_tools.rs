@@ -441,7 +441,7 @@ fn proposal_078_graphql_does_not_expose_effects_mutation() {
 #[tokio::test]
 async fn proposal_078_effects_reconcile_returns_file_backed_report_under_evidence_root() {
     let tempdir = tempfile::tempdir().unwrap();
-    let evidence_root = tempdir.path().join("effect-evidence");
+    let evidence_root = tempdir.path().join("run-artifacts").join("effect-evidence");
     std::fs::create_dir_all(&evidence_root).unwrap();
     let receipt_path = evidence_root.join("git-push.json");
     std::fs::write(
@@ -481,8 +481,10 @@ async fn proposal_078_effects_reconcile_returns_file_backed_report_under_evidenc
         std::path::Path::new(report_path).is_file(),
         "reconcile report must be written to disk"
     );
+    let canonical_report_path = std::fs::canonicalize(report_path).unwrap();
+    let canonical_evidence_root = std::fs::canonicalize(&evidence_root).unwrap();
     assert!(
-        report_path.starts_with(&evidence_root.to_string_lossy().to_string()),
+        canonical_report_path.starts_with(&canonical_evidence_root),
         "report path must stay under evidence_root"
     );
     assert_eq!(payload["report_details"]["effect_kind"], "git_push");
@@ -540,8 +542,10 @@ async fn proposal_078_effects_reconcile_uses_effect_scoped_fallback_report_path(
         .join("side-effects")
         .join(effect_id.to_string())
         .join("reconciliation");
+    let canonical_report_path = std::fs::canonicalize(report_path).unwrap();
+    let canonical_expected_prefix = std::fs::canonicalize(&expected_prefix).unwrap();
     assert!(
-        report_path.starts_with(&expected_prefix.to_string_lossy().to_string()),
+        canonical_report_path.starts_with(&canonical_expected_prefix),
         "fallback report path must be deterministic and effect-scoped"
     );
     assert_eq!(payload["report_details"]["effect_kind"], "connect_upload");

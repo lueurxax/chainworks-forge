@@ -718,6 +718,7 @@ async fn proposal_058_graphql_run_escalation_readback_exposes_live_parity_fields
         id: "ledger-p058-graphql-live-fields".into(),
         run_id,
         stage_id: "state_1".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "policy_escalation_v1".into(),
         policy_hash: "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"

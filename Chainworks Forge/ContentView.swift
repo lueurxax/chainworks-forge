@@ -105,12 +105,9 @@ struct ContentView: View {
                 }
                 .task {
                     await daemonStatus.startSnapshotPlusSubscribe()
-                }
-                .task {
-                    await schedulerHealth.refresh()
-                }
-                .task {
+                    async let schedulerRefresh: Void = schedulerHealth.refresh()
                     await runsModel.loadIfNeeded()
+                    await schedulerRefresh
                 }
             }
         }

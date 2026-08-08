@@ -240,6 +240,8 @@ pub async fn execute(
             let code_writer_completion_receipts =
                 code_writer_completion_receipts_json(pool, run_id).await?;
             let implementation_completion = implementation_completion_json(pool, run_id).await?;
+            let p094_boundary_readback = p094_boundary_readback_json(pool, run_id).await?;
+            let p094_rollout_decision = p094_rollout_decision_json(pool, run_id).await?;
             reports.push(serde_json::json!({
                 "id": uuid::Uuid::new_v4().to_string(),
                 "run_id": run_id.to_string(),
@@ -273,6 +275,8 @@ pub async fn execute(
                 "implementation_self_assessment_summary": implementation_self_assessment_summary_json(pool, run_id).await?,
                 "rollout_contract_readback": rollout_contract_readback,
                 "p082_recovery_matrix_readbacks": p082_readbacks,
+                "p094_boundary_readback": p094_boundary_readback.clone(),
+                "p094_rollout_decision": p094_rollout_decision.clone(),
                 // P080: top-level reconciliation section per proposal §8.1 placement.
                 "p080_reconciliation": db::repos::p080::p080_run_report_section_for_report(pool, &run_id.to_string()).await,
                 "implementation_closeout_readiness_summary": closeout_readiness_summary.clone(),
@@ -311,6 +315,8 @@ pub async fn execute(
                     "run_state_projection": projection.run_state_json,
                     "operator_overrides": overrides,
                     "legacy_discovery_overrides": legacy_discovery_overrides::list_by_run(pool, run_id).await?,
+                    "p094_boundary_readback": p094_boundary_readback,
+                    "p094_rollout_decision": p094_rollout_decision,
                 }));
             }
 
@@ -1486,6 +1492,74 @@ pub(crate) async fn rollout_contract_readback_json(
     Ok(serde_json::Value::Object(merged))
 }
 
+pub(crate) async fn p094_boundary_readback_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    artifact_contracts::p094_readback_json(pool, run_id)
+        .await
+        .map_err(Into::into)
+}
+
+pub(crate) async fn p094_rollout_decision_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let runtime = crate::tools::runtime::p094_quality_gate_boundary_readback();
+    let mut decision = runtime
+        .get("rolloutDecision")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let Some(check) =
+        rollout_contract_checks::find_terminal_rollout_contract_check_for_run(pool, run_id.inner())
+            .await?
+    else {
+        return Ok(decision);
+    };
+
+    let readback = check.operator_readback_json_for_lane("mcp");
+    let state = readback
+        .get("backend_decision")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!("hold"));
+    let enforcing_allowed = readback["status"] == serde_json::json!("pass")
+        && readback["enforcement_mode"] == serde_json::json!("enforce")
+        && readback["projection_integrity"] == serde_json::json!("valid");
+
+    if let Some(obj) = decision.as_object_mut() {
+        obj.insert(
+            "ownerDecision".to_string(),
+            serde_json::json!({
+                "state": state,
+                "source": "rollout_contract_checks",
+                "reason": "terminal rollout contract check selected the P094 rollout decision",
+                "commandJournalEntryId": serde_json::Value::Null,
+                "rolloutContractEntryId": check.id.to_string()
+            }),
+        );
+        obj.insert(
+            "promotionReadiness".to_string(),
+            serde_json::json!({
+                "enforcingAllowed": enforcing_allowed,
+                "blockedReason": if enforcing_allowed {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!("terminal_rollout_contract_not_enforcing")
+                },
+                "requiresBeforeEnforcing": if enforcing_allowed {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!("terminal pass check with enforce mode and valid projection")
+                }
+            }),
+        );
+        obj.insert("rolloutContractReadback".to_string(), readback);
+    }
+
+    Ok(decision)
+}
+
 /// P077: Serialize the active closeout readiness generation for MCP readback.
 /// Routes through CloseoutReadinessSummaryAccessor (R14 §architecture.single_accessor).
 /// Returns null when no active generation exists (run not yet at state_9 or gate not settled).
@@ -1541,41 +1615,6 @@ fn public_artifact_ref(artifact: &Artifact, linkage: &str) -> serde_json::Value 
         "report_kind": artifact.report_kind,
         "is_pinned": artifact.is_pinned,
         "linkage": linkage,
-    })
-}
-
-pub(crate) fn public_artifact_index_row(
-    row: &db::repos::projections::ArtifactIndexRow,
-) -> serde_json::Value {
-    serde_json::json!({
-        "id": row.id,
-        "run_id": row.run_id,
-        "stage_id": row.stage_id,
-        "agent_id": row.agent_id,
-        "name": row.name,
-        "contract_id": row.contract_id,
-        "format": row.format,
-        "artifact_metadata_pointer": artifact_metadata_pointer_value(
-            &row.id,
-            row.checksum_sha256.as_deref(),
-            row.size_bytes,
-        ),
-        "checksum_sha256": row.checksum_sha256,
-        "size_bytes": row.size_bytes,
-        "provider": row.provider,
-        "model": row.model,
-        "created_at": row.created_at,
-        "is_pinned": row.is_pinned,
-        "report_kind": row.report_kind,
-        "report_version": row.report_version,
-        "artifact_generation_id": row.artifact_generation_id,
-        "source_agent_execution_id": row.source_agent_execution_id,
-        "source_stage_execution_id": row.source_stage_execution_id,
-        "source_session_generation_id": row.source_session_generation_id,
-        "source_work_item_id": row.source_work_item_id,
-        "supersedes_artifact_generation_id": row.supersedes_artifact_generation_id,
-        "output_settlement": row.output_settlement,
-        "source_generation_verified": row.source_generation_verified,
     })
 }
 
@@ -1946,6 +1985,7 @@ mod tests {
                 action: "retry_failed_agent".to_string(),
                 explanation: "Retry the agent with the same inputs.".to_string(),
             },
+            diagnostic_artifact_paths: Vec::new(),
         }
     }
 
@@ -1958,6 +1998,10 @@ mod tests {
             .await
             .expect("register shared DbWriter for test pool");
         pool
+    }
+
+    fn reports_array(result: &serde_json::Value) -> &Vec<serde_json::Value> {
+        result["reports"].as_array().expect("reports array")
     }
 
     async fn seed_validation_attempt(
@@ -2496,9 +2540,9 @@ mod tests {
 
         // reports.get returns enriched serde_json::Value objects with file_path stripped,
         // so we extract names from the JSON array rather than deserializing as Vec<Artifact>.
-        let reports: Vec<serde_json::Value> = serde_json::from_value(result).unwrap();
+        let reports = reports_array(&result);
         let names: Vec<String> = reports
-            .into_iter()
+            .iter()
             .filter_map(|v| v["name"].as_str().map(String::from))
             .collect();
 
@@ -2541,7 +2585,7 @@ mod tests {
         .await
         .unwrap();
 
-        let reports = result.as_array().expect("reports array");
+        let reports = reports_array(&result);
         let mcp_truth = reports
             .iter()
             .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
@@ -2595,7 +2639,7 @@ mod tests {
         .await
         .unwrap();
 
-        let reports = result.as_array().expect("reports array");
+        let reports = reports_array(&result);
         let mcp_truth = reports
             .iter()
             .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
@@ -2639,7 +2683,7 @@ mod tests {
         .await
         .unwrap();
 
-        let reports = result.as_array().expect("reports array");
+        let reports = reports_array(&result);
         let mcp_truth = reports
             .iter()
             .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
@@ -2713,7 +2757,7 @@ mod tests {
         .await
         .unwrap();
 
-        let reports = result.as_array().expect("reports array");
+        let reports = reports_array(&result);
         let mcp_truth = reports
             .iter()
             .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
@@ -2760,7 +2804,7 @@ mod tests {
         .await
         .unwrap();
 
-        let reports = result.as_array().expect("reports array");
+        let reports = reports_array(&result);
         let mcp_truth = reports
             .iter()
             .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
@@ -2974,7 +3018,7 @@ mod tests {
         .await
         .unwrap();
 
-        let reports = result.as_array().expect("reports array");
+        let reports = reports_array(&result);
         let mcp_truth = reports
             .iter()
             .find(|r| r["report_kind"] == serde_json::json!("mcp_execution_truth"))
@@ -3133,7 +3177,7 @@ mod tests {
         .await
         .unwrap();
 
-        let reports = result.as_array().expect("array");
+        let reports = reports_array(&result);
         let validation_failure = reports
             .iter()
             .find(|artifact| artifact["report_kind"] == serde_json::json!("validation_failure"))
@@ -3180,7 +3224,7 @@ mod tests {
         .await
         .unwrap();
 
-        let reports = result.as_array().expect("reports array");
+        let reports = reports_array(&result);
         let mcp_truth = reports
             .iter()
             .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))
@@ -3243,7 +3287,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let reports = result.as_array().expect("reports array");
+        let reports = reports_array(&result);
         assert!(reports.iter().any(|report| {
             report["name"] == serde_json::json!("p041_operator_report")
                 && report["report_kind"] == serde_json::json!("operator_summary")
@@ -3332,7 +3376,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let reports = result.as_array().expect("reports array");
+        let reports = reports_array(&result);
         let evidence = reports
             .iter()
             .find(|report| report["report_kind"] == serde_json::json!("failed_stage_evidence"))
@@ -3408,7 +3452,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let reports = result.as_array().expect("reports array");
+        let reports = reports_array(&result);
         let evidence = reports
             .iter()
             .find(|report| report["report_kind"] == serde_json::json!("failed_stage_evidence"))

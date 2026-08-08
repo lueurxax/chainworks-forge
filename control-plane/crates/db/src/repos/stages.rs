@@ -62,7 +62,7 @@ const SELECT_COLS: &str = r#"id, run_id, stage_id, label, status, iteration, att
 pub async fn find_by_id(pool: &SqlitePool, id: StageExecutionId) -> Result<Option<StageExecution>> {
     let id_str = id.to_string();
     let query = format!("SELECT {SELECT_COLS} FROM stage_executions WHERE id = ?1");
-    let row = sqlx::query(&query)
+    let row = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(id_str)
         .fetch_optional(pool)
         .await
@@ -77,7 +77,7 @@ pub async fn find_by_id_tx(
 ) -> Result<Option<StageExecution>> {
     let id_str = id.to_string();
     let query = format!("SELECT {SELECT_COLS} FROM stage_executions WHERE id = ?1");
-    let row = sqlx::query(&query)
+    let row = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(id_str)
         .fetch_optional(&mut **tx)
         .await
@@ -91,7 +91,7 @@ pub async fn list_by_run(pool: &SqlitePool, run_id: RunId) -> Result<Vec<StageEx
     let query = format!(
         "SELECT {SELECT_COLS} FROM stage_executions WHERE run_id = ?1 ORDER BY started_at ASC"
     );
-    let rows = sqlx::query(&query)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(run_id_str)
         .fetch_all(pool)
         .await
@@ -108,7 +108,7 @@ pub async fn list_by_run_tx(
     let query = format!(
         "SELECT {SELECT_COLS} FROM stage_executions WHERE run_id = ?1 ORDER BY started_at ASC"
     );
-    let rows = sqlx::query(&query)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(run_id_str)
         .fetch_all(&mut **tx)
         .await

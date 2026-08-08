@@ -95,7 +95,7 @@ impl AcpAdapter for CodexAdapter {
         // effort separately. Codex's session/new silently falls back to
         // medium when given a combined "model/effort" string, so we pass a
         // bare model and set reasoning_effort via session/set_config_option.
-        let raw_model = req.model.as_deref().unwrap_or("gpt-5");
+        let raw_model = req.model.as_deref().unwrap_or("gpt-5.6");
         let (base_model, effort_from_model) = split_codex_model_effort(raw_model);
         let effort = req
             .effort
@@ -966,9 +966,11 @@ multi_agent = true
 
         let previous_target = std::env::var_os("CHAINWORKS_SHARED_CARGO_TARGET_DIR");
         let previous_sccache = std::env::var_os("RUSTC_WRAPPER");
+        let previous_explicit_sccache = std::env::var_os("CHAINWORKS_SCCACHE_BINARY");
         let previous_path = std::env::var_os("PATH");
         std::env::set_var("CHAINWORKS_SHARED_CARGO_TARGET_DIR", &shared_target);
         std::env::remove_var("RUSTC_WRAPPER");
+        std::env::remove_var("CHAINWORKS_SCCACHE_BINARY");
         std::env::set_var("PATH", fake_bin.to_string_lossy().as_ref());
 
         let env = make_session_environment(&runtime_home);
@@ -980,6 +982,10 @@ multi_agent = true
         match previous_sccache {
             Some(value) => std::env::set_var("RUSTC_WRAPPER", value),
             None => std::env::remove_var("RUSTC_WRAPPER"),
+        }
+        match previous_explicit_sccache {
+            Some(value) => std::env::set_var("CHAINWORKS_SCCACHE_BINARY", value),
+            None => std::env::remove_var("CHAINWORKS_SCCACHE_BINARY"),
         }
         match previous_path {
             Some(value) => std::env::set_var("PATH", value),

@@ -93,6 +93,7 @@ async fn p058_escalation_ledger_insert_and_read_roundtrip() {
         id: "ledger-test-001".into(),
         run_id,
         stage_id: "state_3_implementation".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "code_writer_default_escalation".into(),
         policy_hash: "sha256:testpolicyhash".into(),
@@ -138,6 +139,7 @@ async fn p058_escalation_ledger_paused_chain_persists_pause_reason() {
         id: "ledger-paused-001".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: Some("stage-exec-idempotent".into()),
         agent_id: "code_writer".into(),
         policy_id: "policy-x".into(),
         policy_hash: "sha256:test".into(),
@@ -179,6 +181,7 @@ async fn p058_escalation_event_journal_insert_and_read() {
         id: "ledger-events-001".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "policy-y".into(),
         policy_hash: "sha256:y".into(),
@@ -252,6 +255,7 @@ async fn p058_escalation_event_rejects_malformed_payload_json() {
         id: "ledger-json-bad-001".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "policy-j".into(),
         policy_hash: "sha256:j".into(),
@@ -306,6 +310,7 @@ async fn p058_escalation_event_accepts_valid_payload_json() {
         id: "ledger-json-good-001".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "policy-jg".into(),
         policy_hash: "sha256:jg".into(),
@@ -360,6 +365,7 @@ async fn p058_escalation_execution_metadata_insert_and_read() {
         id: "ledger-meta-001".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "policy-z".into(),
         policy_hash: "sha256:z".into(),
@@ -521,6 +527,7 @@ async fn p058_phase1b_shadow_readback_via_left_join() {
         id: "ledger-shadow-1b-001".into(),
         run_id,
         stage_id: "state_impl".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "p_shadow_test".into(),
         policy_hash: "sha256:shadow".into(),
@@ -687,6 +694,7 @@ async fn p058_escalation_tables_accept_unknown_future_raw_values() {
         id: "ledger-future-001".into(),
         run_id,
         stage_id: "state_x".into(),
+        stage_execution_id: None,
         agent_id: "future_agent_v99".into(),
         policy_id: "policy-future".into(),
         policy_hash: "sha256:future".into(),
@@ -735,6 +743,7 @@ async fn p058_escalation_event_rejects_missing_redaction_version() {
         id: "ledger-no-redact-001".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "policy-nr".into(),
         policy_hash: "sha256:nr".into(),
@@ -985,6 +994,7 @@ async fn p058_escalation_event_rejects_unknown_redaction_version() {
         id: "ledger-bad-redact-001".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "policy-br".into(),
         policy_hash: "sha256:br".into(),
@@ -1202,6 +1212,7 @@ async fn p058_update_ledger_tx_rejects_oversized_status_raw() {
         id: "ledger-update-cap-001".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "policy-cap".into(),
         policy_hash: "sha256:cap".into(),
@@ -1246,6 +1257,7 @@ async fn p058_update_ledger_tx_rejects_oversized_hint_fields() {
         id: "ledger-update-cap-002".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "policy-cap2".into(),
         policy_hash: "sha256:cap2".into(),
@@ -1278,8 +1290,7 @@ async fn p058_update_ledger_tx_rejects_oversized_hint_fields() {
     );
 }
 
-/// BLOCK-6: The unique index on (run_id, stage_id, agent_id, policy_id) must prevent
-/// two ledger rows for the same chain from being inserted.
+/// BLOCK-6: A chain is unique only within one concrete stage execution.
 #[tokio::test]
 async fn p058_escalation_ledger_unique_chain_constraint_rejects_duplicate() {
     let pool = create_pool("sqlite::memory:").await.unwrap();
@@ -1291,6 +1302,7 @@ async fn p058_escalation_ledger_unique_chain_constraint_rejects_duplicate() {
         id: "ledger-unique-001".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: Some("stage-exec-001".into()),
         agent_id: "code_writer".into(),
         policy_id: "policy-u".into(),
         policy_hash: "sha256:u1".into(),
@@ -1307,11 +1319,12 @@ async fn p058_escalation_ledger_unique_chain_constraint_rejects_duplicate() {
     };
     escalation::insert_ledger(&pool, &ledger_a).await.unwrap();
 
-    // Same run_id + stage_id + agent_id + policy_id, different ledger id — must be rejected.
+    // Same concrete stage execution and chain identity — must be rejected.
     let ledger_b = EscalationLedger {
         id: "ledger-unique-002".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: Some("stage-exec-001".into()),
         agent_id: "code_writer".into(),
         policy_id: "policy-u".into(),
         policy_hash: "sha256:u2".into(),
@@ -1329,8 +1342,18 @@ async fn p058_escalation_ledger_unique_chain_constraint_rejects_duplicate() {
     let result = escalation::insert_ledger(&pool, &ledger_b).await;
     assert!(
         result.is_err(),
-        "inserting a second ledger for the same (run_id, stage_id, agent_id, policy_id) must fail"
+        "inserting a second ledger for the same stage execution and chain identity must fail"
     );
+
+    // A later attempt of the same logical stage must get a fresh ledger and deadline.
+    let ledger_c = EscalationLedger {
+        id: "ledger-unique-003".into(),
+        stage_execution_id: Some("stage-exec-002".into()),
+        ..ledger_a
+    };
+    escalation::insert_ledger(&pool, &ledger_c)
+        .await
+        .expect("a different stage execution must own a distinct escalation chain");
 }
 
 /// SEC-003: insert_event_tx must enforce byte caps on event_kind_raw.
@@ -1346,6 +1369,7 @@ async fn p058_insert_event_tx_rejects_oversized_event_kind_raw() {
         id: "ledger-evt-cap-001".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "policy-evt-cap".into(),
         policy_hash: "sha256:cap".into(),
@@ -1401,6 +1425,7 @@ async fn p058_insert_event_tx_rejects_oversized_tier_and_trigger_fields() {
         id: "ledger-evt-cap-002".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "policy-evt-cap2".into(),
         policy_hash: "sha256:cap2".into(),
@@ -2144,6 +2169,7 @@ async fn p058_execution_metadata_idempotency_key_rejects_duplicate_attempt() {
         id: "ledger-idem-001".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "policy-idem".into(),
         policy_hash: "sha256:idem".into(),
@@ -2280,6 +2306,7 @@ async fn p058_escalation_ledger_unique_chain_allows_different_policy() {
             id: ledger_id.into(),
             run_id,
             stage_id: "state_3".into(),
+            stage_execution_id: None,
             agent_id: "code_writer".into(),
             policy_id: policy_id.into(),
             policy_hash: "sha256:hash".into(),
@@ -2424,6 +2451,7 @@ async fn p058_sec003_event_rejects_credential_bypass_in_ref_field() {
         id: "ledger-sec003-cred".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "policy-sec003".into(),
         policy_hash: "sha256:abc".into(),
@@ -2478,6 +2506,7 @@ async fn p058_sec003_event_rejects_url_bypass_in_ref_field() {
         id: "ledger-sec003-url".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "policy-sec003-url".into(),
         policy_hash: "sha256:url".into(),
@@ -2532,6 +2561,7 @@ async fn p058_sec003_event_rejects_absolute_path_bypass_in_ref_field() {
         id: "ledger-sec003-path".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "policy-sec003-path".into(),
         policy_hash: "sha256:path".into(),
@@ -2585,6 +2615,7 @@ async fn p058_sec003_event_accepts_valid_sha256_ref() {
         id: "ledger-sec003-good".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "policy-sec003-good".into(),
         policy_hash: "sha256:good".into(),
@@ -2869,6 +2900,7 @@ async fn p058_insert_or_ignore_ledger_idempotent() {
         id: "ledger-idempotent-1".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: Some("stage-exec-idempotent".into()),
         agent_id: "code_writer".into(),
         policy_id: "policy_a".into(),
         policy_hash: "sha256:abcdef1234".into(),
@@ -3294,6 +3326,7 @@ async fn p058_escalation_events_direct_insert_without_redaction_version_fails() 
         id: "ledger-block4-001".into(),
         run_id,
         stage_id: "state_block4".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "policy-block4".into(),
         policy_hash: "sha256:block4".into(),
@@ -3338,6 +3371,7 @@ async fn p058_escalation_events_direct_insert_with_invalid_redaction_version_fai
         id: "ledger-block4-002".into(),
         run_id,
         stage_id: "state_block4b".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "policy-block4b".into(),
         policy_hash: "sha256:block4b".into(),
@@ -3387,6 +3421,7 @@ async fn p058_insert_or_ignore_ledger_rejects_policy_hash_drift() {
         id: uuid::Uuid::new_v4().to_string(),
         run_id,
         stage_id: "impl_stage".into(),
+        stage_execution_id: Some("stage-exec-drift".into()),
         agent_id: "code_writer".into(),
         policy_id: "drift_test_policy".into(),
         policy_hash: "sha256:aaaaaaaaaaaaaaaa".into(),
@@ -3413,6 +3448,7 @@ async fn p058_insert_or_ignore_ledger_rejects_policy_hash_drift() {
         id: uuid::Uuid::new_v4().to_string(),
         run_id,
         stage_id: "impl_stage".into(),
+        stage_execution_id: Some("stage-exec-drift".into()),
         agent_id: "code_writer".into(),
         policy_id: "drift_test_policy".into(),
         policy_hash: "sha256:bbbbbbbbbbbbbbbb".into(), // different hash → drift
@@ -3472,6 +3508,7 @@ async fn p058_insert_or_ignore_ledger_returns_existing_id_on_matching_hash() {
         id: "idempotent-ledger-001".into(),
         run_id,
         stage_id: "idempotent_stage".into(),
+        stage_execution_id: Some("stage-exec-matching".into()),
         agent_id: "code_writer".into(),
         policy_id: "idempotent_policy".into(),
         policy_hash: "sha256:cccccccccccccccc".into(),
@@ -3530,6 +3567,7 @@ async fn p058_next_tier_attempt_index_increments_per_tier_prevents_idempotency_v
         id: "ledger-retry-idx-001".into(),
         run_id,
         stage_id: "state_impl".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "test_policy".into(),
         policy_hash: "sha256:aaaa".into(),

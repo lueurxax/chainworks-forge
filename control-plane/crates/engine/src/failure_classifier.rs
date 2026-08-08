@@ -14,7 +14,9 @@ pub enum RuntimeFailureObservation {
     ProviderToolSessionControlFailure,
     ToolOutputBudgetPreflightDenied,
     ToolOutputBudgetExceeded,
+    SessionIdentityConflict,
     ProviderInternalError,
+    AcpInitializeHandshakeFailed,
     TransportEpipe,
     TransportProtocolError,
     TransportClosed,
@@ -92,12 +94,26 @@ pub fn classify_observation(
             transport_error_code: Some("TOOL_OUTPUT_BUDGET_EXCEEDED".into()),
             supervision_classification: Some("tool_output_budget_exceeded".into()),
         },
+        SessionIdentityConflict => RuntimeFailureClassification {
+            failure_kind: AgentFailureKind::ProviderInternalError,
+            operator_action_hint: OperatorActionHint::Retry,
+            retry_after: None,
+            transport_error_code: Some("ACP_SESSION_IDENTITY_CONFLICT".into()),
+            supervision_classification: Some("session_identity_conflict".into()),
+        },
         ProviderInternalError => RuntimeFailureClassification {
             failure_kind: AgentFailureKind::ProviderInternalError,
             operator_action_hint: OperatorActionHint::Retry,
             retry_after: None,
             transport_error_code: None,
             supervision_classification: None,
+        },
+        AcpInitializeHandshakeFailed => RuntimeFailureClassification {
+            failure_kind: AgentFailureKind::ProviderInternalError,
+            operator_action_hint: OperatorActionHint::Retry,
+            retry_after: None,
+            transport_error_code: Some("ACP_INITIALIZE_HANDSHAKE_FAILED".into()),
+            supervision_classification: Some("acp_initialize_handshake_failed".into()),
         },
         TransportEpipe => RuntimeFailureClassification {
             failure_kind: AgentFailureKind::TransportEpipe,
@@ -192,6 +208,15 @@ pub fn observation_from_acp_error_message_at(
     }
     if lower.contains("epipe") || lower.contains("broken pipe") {
         return RuntimeFailureObservation::TransportEpipe;
+    }
+    if lower.contains("acp: initialize handshake") {
+        return RuntimeFailureObservation::AcpInitializeHandshakeFailed;
+    }
+    if lower.contains("provider_session_id mismatch before prompt")
+        || lower.contains("provider_session_id mismatch")
+        || lower.contains("session identity conflict")
+    {
+        return RuntimeFailureObservation::SessionIdentityConflict;
     }
     if lower.contains("provider_stream_silent_with_local_activity") {
         return RuntimeFailureObservation::ProviderTimeout {

@@ -12,12 +12,15 @@ CHAINWORKS_CARGO_CACHE_REPO_ROOT="$ROOT_DIR"
 # shellcheck source=scripts/cargo-cache-env.sh
 source "$ROOT_DIR/scripts/cargo-cache-env.sh"
 
+"$ROOT_DIR/scripts/maybe-clean-build-caches.sh"
+
 if [[ "${1:-}" == "--print-env" ]]; then
     printf 'CARGO_TARGET_DIR=%s\n' "${CARGO_TARGET_DIR:-}"
     printf 'CHAINWORKS_SHARED_CARGO_TARGET_DIR=%s\n' "${CHAINWORKS_SHARED_CARGO_TARGET_DIR:-}"
     printf 'CHAINWORKS_GATE_CARGO_TARGET_ROOT=%s\n' "${CHAINWORKS_GATE_CARGO_TARGET_ROOT:-}"
     printf 'CHAINWORKS_CARGO_WRAPPER_DIR=%s\n' "${CHAINWORKS_CARGO_WRAPPER_DIR:-}"
     printf 'CHAINWORKS_REAL_CARGO=%s\n' "${CHAINWORKS_REAL_CARGO:-}"
+    printf 'CARGO_INCREMENTAL=%s\n' "${CARGO_INCREMENTAL:-}"
     printf 'RUSTC_WRAPPER=%s\n' "${RUSTC_WRAPPER:-}"
     printf 'SCCACHE_DIR=%s\n' "${SCCACHE_DIR:-}"
     exit 0

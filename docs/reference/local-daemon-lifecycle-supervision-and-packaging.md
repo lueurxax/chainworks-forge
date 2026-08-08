@@ -54,7 +54,7 @@ The shared lifecycle shape is owned by `domain::lifecycle` and consumed by the d
 | State | Meaning | Liveness |
 |---|---|---|
 | `not_started` | Process object exists but lifecycle has not entered startup | Not live |
-| `starting` | Startup is in progress | Not ready |
+| `starting` | Startup is in progress and status probes are reachable | Live, not ready |
 | `ready` | Daemon can serve normal work | Live and ready |
 | `degraded` | Daemon is alive but a subsystem is impaired | Live, not ready |
 | `restarting` | Restart transition is being observed | Not ready |
@@ -65,14 +65,25 @@ The shared lifecycle shape is owned by `domain::lifecycle` and consumed by the d
 
 `DaemonStatus.failure` is populated only when `state == failed`. `DaemonStatus.degraded` is non-empty only when `state == degraded`.
 
+During `starting`, `DaemonStatus.startup_phase` and
+`DaemonStatus.startup_phase_started_at` identify the current startup step, such
+as `startup_recovery` or `http_full_handoff`. These fields are cleared when the
+daemon leaves `starting`.
+
 ## Readback surfaces
 
-| Surface | Auth | Ready | Degraded | Failed |
-|---|---|---|---|---|
-| `GET /health` | Unauthenticated loopback probe | HTTP 200 with status JSON | HTTP 200 with degraded JSON | HTTP 503 with failure JSON |
-| `GET /ready` | Unauthenticated loopback probe | HTTP 200 with status JSON | HTTP 503 with degraded JSON | HTTP 503 with failure JSON |
-| GraphQL `daemonStatus` | Operator bearer auth | Typed status | Typed status | Typed status with `failure` |
-| GraphQL `daemonStatusChanged` | Operator bearer auth | Pushes every transition | Pushes every transition | Pushes every transition |
+| Surface | Auth | Starting | Ready | Degraded | Failed |
+|---|---|---|---|---|---|
+| `GET /health` | Unauthenticated loopback probe | HTTP 200 with status JSON and startup phase | HTTP 200 with status JSON | HTTP 200 with degraded JSON | HTTP 503 with failure JSON |
+| `GET /ready` | Unauthenticated loopback probe | HTTP 503 with status JSON | HTTP 200 with status JSON | HTTP 503 with degraded JSON | HTTP 503 with failure JSON |
+| GraphQL `daemonStatus` | Operator bearer auth | Available after full server handoff | Typed status | Typed status | Typed status with `failure` |
+| GraphQL `daemonStatusChanged` | Operator bearer auth | Available after full server handoff | Pushes every transition | Pushes every transition | Pushes every transition |
+
+The daemon binds a probe listener and writes the endpoint snapshot before
+startup recovery enters its longer work. While that probe listener is active it
+serves only `/health` and `/ready`; GraphQL, MCP, subscriptions, and work
+claims remain unavailable until the full server handoff completes and
+`/ready` returns HTTP 200.
 
 Clients that need live lifecycle state use the snapshot-plus-subscribe pattern:
 

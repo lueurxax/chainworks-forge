@@ -32,7 +32,7 @@ nonisolated struct OutputContractRepairPresentation: Sendable, Equatable {
 }
 
 nonisolated enum OutputContractRepairPresenter {
-    /// Returns nil for pre-P079 runs and feature-disabled runs (nil evidence).
+    /// Returns nil for pre-P079 runs and executions without repair evidence.
     static func presentationIfPresent(
         for evidence: OutputContractRepairEvidence?
     ) -> OutputContractRepairPresentation? {

@@ -2344,28 +2344,6 @@ fn extract_filter(
         }};
     }
 
-    macro_rules! validate_uuid_field {
-        ($field:literal) => {{
-            match f[$field].as_str() {
-                None => None,
-                Some(s) => match sanitize_uuid_id(s) {
-                    Some(clean) => Some(clean),
-                    None => {
-                        return Err(p080_error_detail(
-                            "invalid_field",
-                            &format!("filter.{} must be a valid UUID", $field),
-                            serde_json::json!({
-                                "field_path": format!("filter.{}", $field),
-                                "reason": "not a valid UUID"
-                            }),
-                            None,
-                        ));
-                    }
-                },
-            }
-        }};
-    }
-
     macro_rules! validate_str_field {
         ($field:literal) => {{
             match f[$field].as_str() {

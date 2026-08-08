@@ -174,6 +174,9 @@ pub struct EscalationLedger {
     pub id: String,
     pub run_id: RunId,
     pub stage_id: String,
+    /// The concrete stage attempt that owns this chain. Legacy rows predate this field.
+    #[serde(default)]
+    pub stage_execution_id: Option<String>,
     pub agent_id: String,
     pub policy_id: String,
     pub policy_hash: String,

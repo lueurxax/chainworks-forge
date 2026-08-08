@@ -77,6 +77,13 @@ use crate::synthesizers::closeout_readiness::{
 };
 use crate::work_queue::WorkQueue;
 
+fn run_forbids_retry(run: &Run) -> bool {
+    matches!(
+        run.status,
+        RunStatus::Completed | RunStatus::Cancelled | RunStatus::Cancelling
+    ) || run.cancellation_settled_at.is_some()
+}
+
 fn p082_retry_identifier_rejection_envelope(
     command: &str,
     provided_identifier: &str,
@@ -2964,6 +2971,12 @@ impl CommandHandler {
                     }
                 };
 
+                let chainworks_meta_root = format!(
+                    "{}/.chainworks/runs/{}",
+                    c.workspace_root.trim_end_matches('/'),
+                    run_id
+                );
+
                 let run = Run {
                     id: run_id,
                     idea_id: c.idea_id,
@@ -3000,7 +3013,9 @@ impl CommandHandler {
                     drift_details_json: None,
                     // P050: Per-run workspace isolation. All YAML artifact paths
                     // resolve through this meta root instead of shared .chainworks/.
-                    chainworks_meta_root: Some(format!(".chainworks/runs/{}", run_id)),
+                    // Store the frozen meta root as an absolute path so artifact
+                    // discovery and transition checks do not depend on daemon cwd.
+                    chainworks_meta_root: Some(chainworks_meta_root),
                     // P060: Frozen review routing options.
                     review_routing_json: validated_review_routing_json,
                     // P077: Frozen closeout readiness mode from workflow snapshot metadata.
@@ -3760,6 +3775,19 @@ impl CommandHandler {
                 let run = runs::find_by_id_tx(&mut retry_tx, c.run_id)
                     .await?
                     .ok_or_else(|| anyhow!("Run {} not found", c.run_id))?;
+                if run_forbids_retry(&run) {
+                    let error = anyhow!("Run {} is {} and cannot be retried", c.run_id, run.status);
+                    command_journal::fail_entry_tx(
+                        &mut retry_tx,
+                        &journal.id,
+                        Utc::now(),
+                        &error.to_string(),
+                    )
+                    .await?;
+                    retry_tx.commit().await?;
+                    db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
+                    return Err(error);
+                }
                 ensure_run_meta_root_exists(&run)?;
                 let completed_current_stage_on_blocked_run =
                     if old_stage.status == StageStatus::Completed {
@@ -6492,10 +6520,17 @@ impl CommandHandler {
             .copied()
             .max_by_key(|s| s.started_at)
             .ok_or_else(|| anyhow!("Stage {} not found", stage_id))?;
+        let run = runs::find_by_id(&self.pool, run_id)
+            .await?
+            .ok_or_else(|| anyhow!("Run {} not found", run_id))?;
+        if run_forbids_retry(&run) {
+            return Err(anyhow!(
+                "Run {} is {} and cannot be retried",
+                run_id,
+                run.status
+            ));
+        }
         let completed_current_stage_on_blocked_run = if old_stage.status == StageStatus::Completed {
-            let run = runs::find_by_id(&self.pool, run_id)
-                .await?
-                .ok_or_else(|| anyhow!("Run {} not found", run_id))?;
             run.status == RunStatus::Blocked
                 && (run.current_state.as_deref() == Some(stage_id)
                     || old_stage.stage_id == stage_id)
@@ -6698,8 +6733,12 @@ impl CommandHandler {
         let run = runs::find_by_id(&self.pool, run_id)
             .await?
             .ok_or_else(|| anyhow!("Run {} not found", run_id))?;
-        if run.status.is_terminal() {
-            return Err(anyhow!("Run {} is already in terminal state", run_id));
+        if run_forbids_retry(&run) {
+            return Err(anyhow!(
+                "Run {} is {} and cannot be retried",
+                run_id,
+                run.status
+            ));
         }
 
         let target_exec = match agent_executions::find_by_id(&self.pool, agent_execution_id).await?
@@ -9017,12 +9056,9 @@ impl CommandHandler {
             }
         };
 
-        if matches!(
-            run.status,
-            RunStatus::Completed | RunStatus::Cancelled | RunStatus::Cancelling
-        ) {
+        if run_forbids_retry(&run) {
             let error = anyhow!(
-                "RUN_NOT_RETRIABLE: run {} is in terminal state '{}'",
+                "RUN_NOT_RETRIABLE: run {} is in terminal state '{}' and cannot be retried",
                 c.run_id,
                 run.status
             );

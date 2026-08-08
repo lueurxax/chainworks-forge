@@ -1432,9 +1432,18 @@ impl AcpSessionHandle {
             .await
     }
 
+    /// Signal an in-flight prompt to stop without waiting for its session lock.
+    pub fn request_close(&self) {
+        Self::send_close_signal(&self.close_tx);
+    }
+
+    fn send_close_signal(close_tx: &watch::Sender<bool>) {
+        let _ = close_tx.send(true);
+    }
+
     /// Close the live session.
     pub async fn close(&self) -> Result<()> {
-        let _ = self.close_tx.send(true);
+        self.request_close();
         let mut session = self.inner.lock().await;
         session.close().await?;
         Ok(())
@@ -1444,7 +1453,7 @@ impl AcpSessionHandle {
         &self,
         behavior: AcpSessionCloseBehavior,
     ) -> Result<AcpCloseOutcome> {
-        let _ = self.close_tx.send(true);
+        self.request_close();
         let mut session = self.inner.lock().await;
         session.close_with_behavior(behavior).await
     }
@@ -1480,6 +1489,16 @@ mod tests {
     use tempfile::tempdir;
 
     static SESSION_STORE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[tokio::test]
+    async fn close_signal_is_delivered_without_waiting_for_session_lock() {
+        let (close_tx, mut close_rx) = watch::channel(false);
+
+        AcpSessionHandle::send_close_signal(&close_tx);
+        close_rx.changed().await.expect("close signal");
+
+        assert!(*close_rx.borrow());
+    }
 
     fn write_file(path: &Path, body: &str) {
         if let Some(parent) = path.parent() {
@@ -1618,7 +1637,7 @@ mod tests {
             agent_execution_id: None,
             agent_id: "proposal_implementation_auditor".into(),
             provider: "codex".into(),
-            model: Some("gpt-5.5".into()),
+            model: Some("gpt-5.6".into()),
             effort: None,
             workspace_root: temp.path().to_string_lossy().into_owned(),
             prompt: "audit".into(),

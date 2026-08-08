@@ -80,6 +80,75 @@ use sqlx::SqlitePool;
 const EX_TEMPFAIL: i32 = 75;
 const DAEMON_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
 
+struct StartupProbeServer {
+    listener: tokio::net::TcpListener,
+    port: u16,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+async fn start_startup_probe_server(
+    paths: &ModePaths,
+    reporter: LifecycleReporter,
+    build_sha: &str,
+) -> Result<StartupProbeServer> {
+    let (listener, port) = packaging::bind_with_fallback(paths).await?;
+    packaging::write_daemon_endpoint_snapshot(paths, std::process::id(), port, build_sha)?;
+
+    let std_listener = listener
+        .into_std()
+        .context("convert startup probe listener to std listener")?;
+    let probe_std_listener = std_listener
+        .try_clone()
+        .context("clone startup probe listener")?;
+    let listener = tokio::net::TcpListener::from_std(std_listener)
+        .context("convert full server listener back to tokio")?;
+    let probe_listener = tokio::net::TcpListener::from_std(probe_std_listener)
+        .context("convert startup probe listener clone to tokio")?;
+
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let probe_reporter = reporter.clone();
+    let handle = tokio::spawn(async move {
+        let app = graphql_server::server::build_probe_router(probe_reporter);
+        let addr = probe_listener.local_addr().ok();
+        info!(
+            addr = ?addr,
+            "startup probe server listening on /health and /ready"
+        );
+        let result = axum::serve(probe_listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        if let Err(err) = result {
+            warn!(err = %err, "startup probe server stopped with error");
+        }
+    });
+
+    Ok(StartupProbeServer {
+        listener,
+        port,
+        shutdown,
+        handle,
+    })
+}
+
+async fn stop_startup_probe_server(server: StartupProbeServer) -> tokio::net::TcpListener {
+    let StartupProbeServer {
+        listener,
+        shutdown,
+        handle,
+        ..
+    } = server;
+    let _ = shutdown.send(());
+    match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await {
+        Ok(Ok(())) => info!("startup probe server stopped before full HTTP handoff"),
+        Ok(Err(err)) => warn!(err = %err, "startup probe server task join failed"),
+        Err(_) => warn!("startup probe server did not stop before full HTTP handoff deadline"),
+    }
+    listener
+}
+
 fn main() -> Result<()> {
     // P080: --p080-rollout-control-seed is a one-shot admin subcommand.
     // It seeds the rollout-control matrix (rejected if already seeded) and exits.
@@ -519,6 +588,13 @@ async fn run_daemon() -> Result<()> {
         "SQLite pool opened"
     );
 
+    reporter.set_startup_phase("http_probe_bind");
+    let mut startup_probe_server = if mode == DaemonMode::Mcp {
+        None
+    } else {
+        Some(start_startup_probe_server(&paths, reporter.clone(), build_sha).await?)
+    };
+
     let db_writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
     db::writer::register_shared_writer(&pool, db_writer.clone()).await?;
 
@@ -671,6 +747,7 @@ async fn run_daemon() -> Result<()> {
         events.clone(),
         db_writer.clone(),
     );
+    reporter.set_startup_phase("startup_recovery");
     let summary = recovery.run_startup_repair().await?;
     info!(
         runs_inspected = summary.runs_inspected,
@@ -679,6 +756,7 @@ async fn run_daemon() -> Result<()> {
         "startup recovery complete"
     );
     // P083: scan unresolved shutdown signals and identity-ambiguous provider sessions.
+    reporter.set_startup_phase("shutdown_recovery_scan");
     match engine::shutdown_service::recover_shutdown_state(&pool).await {
         Ok(report) => {
             info!(
@@ -696,6 +774,7 @@ async fn run_daemon() -> Result<()> {
     // SEC-P083-HIGH-001: dispatch any planned shutdown signals that were never issued.
     // Per shutdown_contract_v1.recovery_rules: planned rows recorded before a crash
     // must be dispatched through identity-checked OS signal issuance on restart.
+    reporter.set_startup_phase("shutdown_signal_dispatch");
     match engine::shutdown_service::dispatch_planned_shutdown_signals(&pool).await {
         Ok(dispatched) => {
             if dispatched > 0 {
@@ -714,9 +793,11 @@ async fn run_daemon() -> Result<()> {
     // recovery code can detect post-restart monotonic epoch drift.
     // Per durable_monotonic_clock_contract: baseline insert failure is FATAL.
     // Recovery relies on at least one baseline row existing after daemon start.
+    reporter.set_startup_phase("durable_clock_baseline");
     insert_durable_monotonic_clock_baseline(&pool)
         .await
         .context("P083 fatal: durable_monotonic_clock_samples baseline insert failed")?;
+    reporter.set_startup_phase("maintenance_reaper");
     match db::repos::maintenance::run_reaper(&pool).await {
         Ok(()) => {
             info!("P087 startup maintenance reaper complete");
@@ -729,28 +810,7 @@ async fn run_daemon() -> Result<()> {
         }
     }
     let _maintenance_reaper = db::repos::maintenance::spawn_maintenance_reaper(pool.clone());
-    match daemon::storage_startup::run_startup_evidence_orphan_sweep(&pool).await {
-        Ok(summary) => {
-            info!(
-                roots_inspected = summary.roots_inspected,
-                roots_missing = summary.roots_missing,
-                scanned_files = summary.scanned_files,
-                already_indexed = summary.already_indexed,
-                recovered_orphans = summary.recovered_orphans,
-                skipped_files = summary.skipped_files,
-                bytes_read = summary.bytes_read,
-                truncated = summary.truncated,
-                errors = summary.errors,
-                "P075 startup evidence orphan sweep complete"
-            );
-        }
-        Err(err) => {
-            warn!(
-                err = %err,
-                "P075 startup evidence orphan sweep could not enumerate active runs"
-            );
-        }
-    }
+    reporter.set_startup_phase("host_interruption_monitors");
     let host_interruption_service =
         HostInterruptionService::with_capacity_config_runtime_cleanup_and_db_writer(
             pool.clone(),
@@ -786,6 +846,8 @@ async fn run_daemon() -> Result<()> {
             );
             info!("BackgroundExecutor started");
             reporter.set_state(DaemonLifecycleState::Ready);
+            let _evidence_orphan_sweep =
+                daemon::storage_startup::spawn_startup_evidence_orphan_sweep(pool.clone());
             if let Err(e) = packaging::write_build_sha(&paths) {
                 warn!(err = %e, "failed to write build-sha.txt (non-fatal)");
             }
@@ -887,11 +949,24 @@ async fn run_daemon() -> Result<()> {
                 }
             });
 
-            // §7.3 port fallback: bind the listener here so the
-            // 4000→ephemeral fallback + `daemon.port` write runs before the
-            // GraphQL server takes the socket.
-            let (listener, port) = packaging::bind_with_fallback(&paths).await?;
-            packaging::write_daemon_endpoint_snapshot(&paths, std::process::id(), port, build_sha)?;
+            // §7.3 port fallback: bind during startup and serve probe-only
+            // `/health` + `/ready` while recovery runs. Now stop the probe
+            // clone and hand the same endpoint to the full GraphQL/MCP server.
+            reporter.set_startup_phase("http_full_handoff");
+            let (listener, port) = if let Some(probe) = startup_probe_server.take() {
+                let port = probe.port;
+                let listener = stop_startup_probe_server(probe).await;
+                (listener, port)
+            } else {
+                let (listener, port) = packaging::bind_with_fallback(&paths).await?;
+                packaging::write_daemon_endpoint_snapshot(
+                    &paths,
+                    std::process::id(),
+                    port,
+                    build_sha,
+                )?;
+                (listener, port)
+            };
             info!(port, "bound HTTP listener; handing off to graphql-server");
 
             let xcode_broker_pool =
@@ -944,6 +1019,8 @@ async fn run_daemon() -> Result<()> {
             // §5.1: Ready only AFTER HTTP bind so a client receiving
             // `state=ready` is guaranteed it can connect.
             reporter.set_state(DaemonLifecycleState::Ready);
+            let _evidence_orphan_sweep =
+                daemon::storage_startup::spawn_startup_evidence_orphan_sweep(pool.clone());
 
             // §9.4: write build-sha.txt after successful Ready so the
             // Swift diagnostics bundle only ever reports a sha for a
@@ -1277,6 +1354,31 @@ fn spawn_background_executor_watchdog(
                 Err(error) => warn!(
                     error = %error,
                     "BackgroundExecutor watchdog failed to inspect P092 retry payload recovery candidates"
+                ),
+            }
+
+            match work_items::complete_running_invoke_agents_with_terminal_valid_outputs_on_startup(
+                &pool,
+                "watchdog_repair_completed_agent_valid_outputs",
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(completed) => {
+                    warn!(
+                        completed,
+                        "BackgroundExecutor watchdog completed InvokeAgent work items whose agent executions already had valid outputs"
+                    );
+                    if let Err(error) = work_queue.refresh_scheduler_projection().await {
+                        warn!(
+                            error = %error,
+                            "BackgroundExecutor watchdog failed to refresh scheduler projection after terminal InvokeAgent recovery"
+                        );
+                    }
+                }
+                Err(error) => warn!(
+                    error = %error,
+                    "BackgroundExecutor watchdog failed to inspect terminal InvokeAgent work items"
                 ),
             }
 

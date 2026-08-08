@@ -442,10 +442,12 @@ pub async fn find_by_execution_id(
     pool: &SqlitePool,
     agent_execution_id: AgentExecutionId,
 ) -> Result<Option<CodeWriterCompletionReceiptReadback>> {
-    let row = sqlx::query(&receipt_select_sql("WHERE agent_execution_id = ?1"))
-        .bind(agent_execution_id.to_string())
-        .fetch_optional(pool)
-        .await?;
+    let row = sqlx::query(sqlx::AssertSqlSafe(receipt_select_sql(
+        "WHERE agent_execution_id = ?1",
+    )))
+    .bind(agent_execution_id.to_string())
+    .fetch_optional(pool)
+    .await?;
     match row {
         Some(row) => readback_for_row(pool, &row).await.map(Some),
         None => Ok(None),
@@ -456,9 +458,9 @@ pub async fn list_by_run(
     pool: &SqlitePool,
     run_id: RunId,
 ) -> Result<Vec<CodeWriterCompletionReceiptReadback>> {
-    let rows = sqlx::query(&receipt_select_sql(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(receipt_select_sql(
         "WHERE run_id = ?1 ORDER BY created_at ASC",
-    ))
+    )))
     .bind(run_id.to_string())
     .fetch_all(pool)
     .await?;
@@ -473,12 +475,12 @@ pub async fn list_canonical_by_run(
     pool: &SqlitePool,
     run_id: RunId,
 ) -> Result<Vec<CodeWriterCompletionReceiptReadback>> {
-    let rows = sqlx::query(&receipt_select_sql(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(receipt_select_sql(
         r#"INNER JOIN code_writer_completion_receipt_links cwc_link
              ON cwc_link.receipt_id = code_writer_completion_receipts.id
            WHERE cwc_link.run_id = ?1
            ORDER BY cwc_link.updated_at DESC, code_writer_completion_receipts.created_at DESC"#,
-    ))
+    )))
     .bind(run_id.to_string())
     .fetch_all(pool)
     .await?;

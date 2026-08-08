@@ -13,6 +13,9 @@ if [[ -f "$ROOT_DIR/scripts/cargo-cache-env.sh" ]]; then
   # shellcheck source=scripts/cargo-cache-env.sh
   source "$ROOT_DIR/scripts/cargo-cache-env.sh"
 fi
+if [[ -x "$ROOT_DIR/scripts/maybe-clean-build-caches.sh" ]]; then
+  "$ROOT_DIR/scripts/maybe-clean-build-caches.sh"
+fi
 
 chainworks_test_gate_cargo_target_dir() {
   if declare -F chainworks_gate_cargo_target_dir >/dev/null 2>&1; then
@@ -80,12 +83,13 @@ P077_ROLLOUT_EVIDENCE_PATH="docs/reference/p077-rollout-dependency-evidence.md"
 P077_UI_EVIDENCE_PATH="docs/reference/p077-closeout-readiness-ui-evidence.md"
 
 FAST_TESTS=(
-  "Chainworks ForgeTests/ProviderPlatformTests"
-  "Chainworks ForgeTests/OrchestratorTests"
-  "Chainworks ForgeTests/ResumeManagerTests"
-  "Chainworks ForgeTests/ArtifactManagerTests"
-  "Chainworks ForgeTests/RunTests"
-  "Chainworks ForgeTests/AgentSessionTests"
+  "Chainworks ForgeTests/Proposal081ApprovalActionAttemptStoreTests"
+  "Chainworks ForgeTests/ArtifactPathClipboardTests"
+  "Chainworks ForgeTests/ForgeGlassTests"
+  "Chainworks ForgeTests/ProcessSupportTests"
+  "Chainworks ForgeTests/Proposal046Tests"
+  "Chainworks ForgeTests/Proposal079ContractRepairReadbackTests"
+  "Chainworks ForgeTests/Proposal086ContinuationReadbackTests"
 )
 
 UI_SMOKE_TESTS=(
@@ -1296,7 +1300,7 @@ append_xcodebuild_signing_args() {
     return 0
   fi
 
-  if [[ "$hosted_tests" == "1" && "${CHAINWORKS_USE_UNSIGNED_HOSTED_TESTS:-0}" != "1" ]]; then
+  if [[ "$hosted_tests" == "1" && "${CHAINWORKS_USE_UNSIGNED_HOSTED_TESTS:-1}" != "1" ]]; then
     printf '%s\0' ENABLE_DEBUG_DYLIB=NO
     return 0
   fi
@@ -1710,10 +1714,33 @@ else:
         "CHAINWORKS_ALLOW_LOCAL_CARGO_TARGET_DIR",
         "CHAINWORKS_CARGO_WRAPPER_DIR",
         "CHAINWORKS_REAL_CARGO",
+        "CARGO_INCREMENTAL",
+        "maybe-clean-build-caches.sh",
     ]
     for fragment in required_helper_fragments:
         if fragment not in helper_text:
             violations.append(f"cargo-cache-env.sh missing {fragment!r}")
+
+auto_clean = root / "scripts" / "maybe-clean-build-caches.sh"
+if not auto_clean.exists():
+    violations.append("missing scripts/maybe-clean-build-caches.sh")
+else:
+    auto_clean_text = auto_clean.read_text(encoding="utf-8")
+    for fragment in [
+        "CHAINWORKS_AUTO_CACHE_CLEANUP_INTERVAL_SECONDS",
+        "CHAINWORKS_CACHE_MAINTENANCE_DIR",
+        "cleanup.lock",
+        "last-success",
+        "clean-build-caches.sh",
+    ]:
+        if fragment not in auto_clean_text:
+            violations.append(f"maybe-clean-build-caches.sh missing {fragment!r}")
+
+cargo_managed = root / "scripts" / "cargo-managed"
+if not cargo_managed.exists():
+    violations.append("missing scripts/cargo-managed")
+elif "maybe-clean-build-caches.sh" not in cargo_managed.read_text(encoding="utf-8"):
+    violations.append("cargo-managed does not service automatic cache cleanup")
 
 if not embed.exists():
     violations.append("missing scripts/embed-control-plane-daemon.sh")
@@ -1753,6 +1780,13 @@ if legacy_p082_target in gate_text:
     violations.append("proposal-082 gate still creates a dedicated target/proposal-082-gate cache")
 if "CHAINWORKS_PROPOSAL_082_CARGO_TARGET_DIR" not in gate_text:
     violations.append("proposal-082 gate does not expose a bounded reusable target dir override")
+for forbidden in [
+    'P079_CARGO="${CHAINWORKS_REAL_' + 'CARGO:-cargo}"',
+    'unset RUSTC_' + 'WRAPPER',
+    'CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_' + 'CARGO"',
+]:
+    if forbidden in gate_text:
+        violations.append(f"proposal-079 gate bypasses managed Cargo policy via {forbidden!r}")
 for fragment in [
     "chainworks_test_gate_cargo_target_dir",
     "CHAINWORKS_TEST_GATE_REMAP_CARGO_TARGET_DIR",
@@ -1760,6 +1794,12 @@ for fragment in [
 ]:
     if fragment not in gate_text:
         violations.append(f"test-gate.sh missing Cargo target remap guard {fragment!r}")
+for fragment in [
+    "maybe-clean-build-caches.sh",
+    "scripts/tests/cache-lifecycle-test.sh",
+]:
+    if fragment not in gate_text:
+        violations.append(f"test-gate.sh missing cache lifecycle integration {fragment!r}")
 
 if violations:
     print("Xcode Cargo cache policy violations:", file=sys.stderr)
@@ -2225,7 +2265,27 @@ run_test_plan() {
     -derivedDataPath "$derived_data" \
     -resultBundlePath "$result_bundle" \
     ${signing_args[@]+"${signing_args[@]}"}
+  assert_xcresult_has_tests "$gate_name" "$result_bundle"
   log "Result bundle: $result_bundle"
+}
+
+assert_xcresult_has_tests() {
+  local gate_name="$1"
+  local result_bundle="$2"
+
+  if [[ ! -d "$result_bundle" ]]; then
+    die "Test gate $gate_name did not produce result bundle: $result_bundle"
+  fi
+
+  local total_count
+  total_count="$(/usr/bin/xcrun xcresulttool get test-results summary --path "$result_bundle" --format json 2>/dev/null \
+    | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("totalTestCount", 0))' 2>/dev/null || true)"
+  if [[ -z "$total_count" ]]; then
+    die "Test gate $gate_name could not read test count from result bundle: $result_bundle"
+  fi
+  if [[ "$total_count" == "0" ]]; then
+    die "Test gate $gate_name executed 0 tests according to result bundle: $result_bundle"
+  fi
 }
 
 prepare_test_source_snapshot() {
@@ -2467,6 +2527,7 @@ PY
       && ! grep -Eq "Executed [1-9][0-9]* tests?|Test run with [1-9][0-9]* tests?" "$log_path"; then
       die "Test gate $gate_name executed 0 tests"
     fi
+    assert_xcresult_has_tests "$gate_name" "$result_bundle"
     log "xcodebuild log: $log_path"
     log "Result bundle: $result_bundle"
   fi
@@ -2642,6 +2703,8 @@ Available gates:
   proposal-094|p094  Proposal 094 workflow-owned blocker-boundary contract/readback gate
   proposal-096|p096  Proposal 096 bounded tool output and safe-search guard retained alias gate
   proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
+  proposal-089-temp-inventory|p089-temp-inventory
+                  Proposal 089 Managed Temporary Artifact Inventory smoke and contract fixture gate
   proposal-090|p090  Proposal 090 Junie runtime-hardening evidence inventory gate
   proposal-091|p091  Retained P091 targeted retry authority runtime proof gate
   proposal-046|p046  Proposal 046 session GraphQL observability gate (read-only queries, subscription, authorization, redaction)
@@ -2681,6 +2744,7 @@ case "$GATE" in
     fi
     guard_direct_run_insertion
     guard_xcode_cargo_cache_policy
+    "$ROOT_DIR/scripts/tests/cache-lifecycle-test.sh"
     guard_plan_tag_sync
     guard_proposal_number_hygiene
     "$ROOT_DIR/scripts/check-boundary-coverage.sh"
@@ -2704,11 +2768,7 @@ case "$GATE" in
     fi
     guard_direct_run_insertion
     run_build "fast"
-    if [[ "${USE_TEST_PLANS:-}" == "1" ]] && [[ -f "$TEST_PLANS_DIR/FastGate.xctestplan" ]]; then
-      run_test_plan "fast" "FastGate"
-    else
-      run_targeted_tests "fast" "${FAST_TESTS[@]}"
-    fi
+    run_targeted_tests "fast" "${FAST_TESTS[@]}"
     ;;
   ui-smoke)
     check_idle_environment strict
@@ -5840,6 +5900,10 @@ PY
     log "Proposal 042 Swift gate: DaemonLifecycleClient + DiagnosticsBundle + PackagedBinary"
     swift_gate_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
     swift_gate_derived_data="${TMP_BASE}/p042-swift-${swift_gate_stamp}-DerivedData"
+    swift_signing_args=()
+    while IFS= read -r -d '' arg; do
+      swift_signing_args+=("$arg")
+    done < <(append_xcodebuild_signing_args "proposal-042-swift" "0")
     # R13 disk-hygiene: each gate run stamps a fresh DerivedData dir
     # (~2.4 GB per run). Prune prior p042-swift-* stamps before the
     # new one is created so they don't silently accumulate — left
@@ -5863,6 +5927,7 @@ PY
         -destination 'platform=macOS,arch=arm64' \
         -configuration Debug \
         -derivedDataPath "$swift_gate_derived_data" \
+        ${swift_signing_args[@]+"${swift_signing_args[@]}"} \
         -only-testing:"Chainworks ForgeTests/DaemonLifecycleClientTests" \
         -only-testing:"Chainworks ForgeTests/DiagnosticsBundleTests" \
         -only-testing:"Chainworks ForgeTests/PackagedBinaryTests" \
@@ -7954,7 +8019,10 @@ root = pathlib.Path(sys.argv[1])
 main = (root / "control-plane/crates/daemon/src/main.rs").read_text()
 if "McpServer::new_with_storage_writer_and_boundary_policy" not in main:
     raise SystemExit("P081: daemon must construct MCP server with explicit BoundaryPolicy constructor")
-if "graphql_server::schema::build_schema_with_storage_writer_and_boundary_policy" not in main:
+if (
+    "graphql_server::schema::build_schema_with_storage_writer_and_boundary_policy" not in main
+    and "graphql_server::schema::build_schema_with_storage_writer_boundary_policy_and_handle" not in main
+):
     raise SystemExit("P081: daemon must construct GraphQL schema with explicit BoundaryPolicy constructor")
 if re.search(r"McpServer::new_with_storage_writer\s*\(", main):
     raise SystemExit("P081: production daemon must not use fail-open MCP constructor")
@@ -8276,7 +8344,7 @@ reference_expectations = {
         "Production providers remain fail-closed",
     ],
     "docs/reference/p079-recovery-attribution.md": [
-        "CHAINWORKS_P079_TRANSCRIPT_RECOVERY_ENABLED",
+        "Transcript recovery is always enabled",
         "DiscoveredArtifactSourceKind::ProviderEnvelope",
         "oversized_payload",
         "attribution_not_verified",
@@ -8310,6 +8378,22 @@ retired_proposal = root / "docs/proposals/079-contract-aware-output-repair-and-p
 if retired_proposal.exists():
     fail("retired P079 proposal file must not be the gate's operational source of truth")
 
+legacy_feature_disabled_fixture = (
+    root
+    / "docs/evidence/rollout-contract/p079/migration"
+    / ("p079_v1-feature-" + "disabled-rowset.fixture.json")
+)
+if legacy_feature_disabled_fixture.exists():
+    fail("P079 must not retain feature-" + "disabled migration evidence for core output repair")
+
+policy_flags_absent_fixture = (
+    root
+    / "docs/evidence/rollout-contract/p079/migration"
+    / "p079_v1-policy-flags-absent-rowset.fixture.json"
+)
+if not policy_flags_absent_fixture.exists():
+    fail("missing P079 policy-flags-absent legacy migration fixture")
+
 stable_reference = (root / "docs/reference/output-contracts-failure-evidence-and-recovery.md").read_text()
 for term in [
     "implemented for the current safe repair/recovery scope",
@@ -8322,6 +8406,34 @@ for term in [
 ]:
     if term not in stable_reference:
         fail(f"P079 stable reference scope alignment missing {term!r}")
+
+legacy_output_repair_flag = "CHAINWORKS_P079_" + "OUTPUT_REPAIR_ENABLED"
+scan_roots = [
+    "Chainworks Forge",
+    "Chainworks ForgeTests",
+    "control-plane/crates",
+    "docs/reference",
+    "docs/runbooks",
+    "examples",
+]
+for rel_root in scan_roots:
+    scan_root = root / rel_root
+    if not scan_root.exists():
+        continue
+    for path in scan_root.rglob("*"):
+        if not path.is_file():
+            continue
+        if any(part in {".build", "target", "DerivedData"} for part in path.parts):
+            continue
+        try:
+            text = path.read_text()
+        except UnicodeDecodeError:
+            continue
+        if legacy_output_repair_flag in text:
+            fail(
+                f"legacy output repair feature flag must not be referenced: "
+                f"{path.relative_to(root)}"
+            )
 
 domain = (root / "control-plane/crates/domain/src/output_contract_repair.rs").read_text()
 for term in [
@@ -8338,7 +8450,6 @@ for term in [
     "output_contract_repair_prompt(",
     "p079_attempt_transcript_recovery(",
     "p079_provider_supports_enforced_permissions",
-    "CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED",
     "ValidOutputsFromRepair",
 ]:
     if term not in executor:
@@ -8396,20 +8507,18 @@ print("proposal-079 static checks passed")
 PY
     (
       cd "$ROOT_DIR/control-plane"
-      unset RUSTC_WRAPPER
-      P079_CARGO="${CHAINWORKS_REAL_CARGO:-cargo}"
       P079_CARGO_TARGET_DIR="${CHAINWORKS_PROPOSAL_079_CARGO_TARGET_DIR:-target/proposal-079-gate}"
-      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p domain output_contract_repair -- --nocapture
-      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p db proposal_079_required_metric_names_are_declared_and_recordable -- --nocapture
-      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p db output_contract_repair -- --nocapture
-      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p db --test proposal_079_output_contract_repair -- --nocapture
-      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p engine --lib p079 -- --nocapture
-      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p engine --test integration invoke_agent_repairs_missing_required_output_in_same_live_session -- --nocapture
-      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p acp --lib p079 -- --nocapture
-      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p acp --test integration p079 -- --nocapture
-      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p graphql-server --lib p079 -- --nocapture
-      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p mcp-server --lib p079 -- --nocapture
-      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" "$P079_CARGO" test -p mcp-server --test proposal_058_runtime_facts p079_sec -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" cargo test -p domain output_contract_repair -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" cargo test -p db proposal_079_required_metric_names_are_declared_and_recordable -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" cargo test -p db output_contract_repair -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" cargo test -p db --test proposal_079_output_contract_repair -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" cargo test -p engine --lib p079 -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" cargo test -p engine --test integration invoke_agent_repairs_missing_required_output_in_same_live_session -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" cargo test -p acp --lib p079 -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" cargo test -p acp --test integration p079 -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" cargo test -p graphql-server --lib p079 -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" cargo test -p mcp-server --lib p079 -- --nocapture
+      CARGO_TARGET_DIR="$P079_CARGO_TARGET_DIR" cargo test -p mcp-server --test proposal_058_runtime_facts p079_sec -- --nocapture
     )
     run_targeted_tests "p079-swift-readback" "${PROPOSAL_079_SWIFT_TESTS[@]}"
     log "Proposal 079 contract-aware output repair gate passed"
@@ -8890,7 +8999,6 @@ require(catalog_binding.get("runtime_profile") == "junie_cli_acp", "catalog bind
 require(catalog_binding.get("outputs") == [
     "implementation_progress",
     "implementation_self_assessment",
-    "changed_files_manifest",
     "tests_result",
 ], "catalog binding outputs mismatch")
 catalog_path = catalog_binding.get("catalog_path")
@@ -8901,13 +9009,16 @@ if not catalog_abs.is_absolute():
 require(catalog_abs.resolve(strict=False) == (root / "examples/agents/agents.yaml").resolve(strict=False), "catalog binding path mismatch")
 require(catalog_binding.get("catalog_sha256") == sha256_file(root / "examples/agents/agents.yaml"), "catalog binding hash mismatch")
 
-expected_contracts = {
+expected_agent_contracts = {
     "implementation_progress": "implementation_progress",
     "implementation_self_assessment": "implementation_self_assessment_v2",
-    "changed_files_manifest": "changed_files_manifest",
     "tests_result": "tests_result",
 }
-require(catalog_binding.get("contract_ids") == expected_contracts, "catalog binding contract_ids mismatch")
+require(catalog_binding.get("contract_ids") == expected_agent_contracts, "catalog binding contract_ids mismatch")
+expected_contracts = {
+    **expected_agent_contracts,
+    "changed_files_manifest": "changed_files_manifest",
+}
 compiled = {item.get("name"): item for item in receipt.get("compiled_task_outputs") or []}
 require(set(compiled) == set(expected_contracts), "ACP compiled outputs must match production code_writer output set")
 for name, expected_contract in expected_contracts.items():
@@ -8942,7 +9053,7 @@ rows = {row.get("output_name"): row for row in settled.get("declared_outputs") o
 require(set(rows) == set(expected_contracts), "settled outputs must match full production output set")
 require(settled.get("settlement_boundary") == "engine::executor::generate_changed_files_manifest_if_declared_then_settle_agent_outputs_from_discovery_decisions", "settled outputs must come from production executor settlement boundary")
 require(settled.get("materialization_owner") == "engine_executor", "settled outputs materialization_owner mismatch")
-require(settled.get("changed_files_manifest_status") in {"available", "not_git_repository"}, "changed_files_manifest status mismatch")
+require(settled.get("changed_files_manifest_status") == "available", "changed_files_manifest must be available for quality-gate evidence")
 require(settled.get("decisions"), "settled outputs must include production discovery decisions")
 for name in ["implementation_progress", "implementation_self_assessment", "tests_result"]:
     row = rows[name]
@@ -9027,6 +9138,155 @@ validate_negative_fixtures()
 print("proposal-089 default evidence validation passed")
 PY
     log "Proposal 089 gate passed"
+    ;;
+  proposal-089-temp-inventory|p089-temp-inventory)
+    log "Proposal 089 temp-inventory gate: Managed Temporary Artifact Inventory smoke and contract fixture gate"
+    python3 - "$ROOT_DIR" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+gate = (root / "scripts/test-gate.sh").read_text()
+
+def fail(msg):
+    raise SystemExit(f"proposal-089-temp-inventory: {msg}")
+
+# (1) Verify aliases are registered in test-gate.sh list and dispatch sections.
+for alias_term in [
+    "proposal-089-temp-inventory",
+    "p089-temp-inventory",
+    "Managed Temporary Artifact Inventory",
+]:
+    if alias_term not in gate:
+        fail(f"test-gate.sh missing P089 temp-inventory alias/list term {alias_term!r}")
+
+# (2) Verify aliases are distinct from the Junie canary gate.
+# The Junie canary gate uses proposal-089|p089 as its exact alias; the temp-inventory
+# gate must use a non-colliding alias (proposal-089-temp-inventory|p089-temp-inventory).
+junie_marker = "Proposal 089 Junie structured-output proof and ACP canary evidence gate"
+if junie_marker not in gate:
+    fail("Junie canary gate entry must still be present and distinct from temp-inventory gate")
+
+# (3) Verify negative fixtures directory and all expected negative fixture files exist.
+neg_dir = root / "docs/evidence/rollout-contract/negative"
+required_negative_fixtures = [
+    "p089-temp-inventory-alias-collision.json",
+    "p089-temp-inventory-dry-run-mutation.json",
+    "p089-temp-inventory-incomplete-mcp-result-schema.json",
+    "p089-temp-inventory-invalid-test-root-override.json",
+    "p089-temp-inventory-readback-parity-missing.json",
+    "p089-temp-inventory-shutdown-persistence.json",
+    "p089-temp-inventory-test-root-symlink-escape.json",
+    "p089-temp-inventory-traversal-cycle-or-escape.json",
+    "p089-temp-inventory-unknown-enum-decoding.json",
+    "p089-temp-inventory-unsafe-path-redaction.json",
+]
+for fname in required_negative_fixtures:
+    fpath = neg_dir / fname
+    if not fpath.exists():
+        fail(f"missing negative fixture: {fpath.relative_to(root)}")
+    try:
+        data = json.loads(fpath.read_text())
+    except Exception as e:
+        fail(f"invalid JSON in negative fixture {fname}: {e}")
+    # Alias-collision fixture must assert the gate uses distinct aliases.
+    if fname == "p089-temp-inventory-alias-collision.json":
+        mutated = data.get("mutated_contract", {})
+        aliases = mutated.get("gate_aliases", [])
+        if "proposal-089" in aliases or "p089" in aliases:
+            pass  # Fixture correctly records that the colliding aliases must be rejected.
+        else:
+            fail(f"alias-collision fixture must reference colliding aliases proposal-089/p089: {fname}")
+    # Dry-run mutation fixture must prove before/after fixture digest differ.
+    if fname == "p089-temp-inventory-dry-run-mutation.json":
+        if data.get("expected_status") != "fail":
+            fail(f"dry-run mutation negative fixture expected_status must be 'fail': {fname}")
+    # Unsafe path redaction fixture must assert raw path is rejected.
+    if fname == "p089-temp-inventory-unsafe-path-redaction.json":
+        unsafe = data.get("unsafe_sample", {})
+        if "path_display" not in unsafe:
+            fail(f"unsafe path redaction fixture must contain unsafe_sample.path_display: {fname}")
+
+# (4) Verify the positive operator-readback fixture exists and has correct schema.
+pos_fixture = root / "docs/evidence/rollout-contract/operator-readback/p089-temp-inventory-full-surface.fixture.json"
+if not pos_fixture.exists():
+    fail(f"missing positive operator-readback fixture: {pos_fixture.relative_to(root)}")
+try:
+    pos_data = json.loads(pos_fixture.read_text())
+except Exception as e:
+    fail(f"invalid JSON in positive operator-readback fixture: {e}")
+if pos_data.get("schema_version") != "p089_temp_inventory_operator_readback_fixture_v1":
+    fail("positive fixture schema_version must be p089_temp_inventory_operator_readback_fixture_v1")
+if pos_data.get("proposal_id") != "p089-temp-inventory":
+    fail("positive fixture proposal_id must be p089-temp-inventory")
+expected_gate = "./scripts/test-gate.sh proposal-089-temp-inventory"
+if pos_data.get("gate") != expected_gate:
+    fail(f"positive fixture gate must be {expected_gate!r}, got {pos_data.get('gate')!r}")
+
+# (5) Verify the domain module is present and exports temp_artifact_inventory.
+domain_lib = root / "control-plane/crates/domain/src/lib.rs"
+if not domain_lib.exists():
+    fail("domain lib.rs not found")
+domain_lib_text = domain_lib.read_text()
+if "pub mod temp_artifact_inventory" not in domain_lib_text:
+    fail("domain/src/lib.rs must export pub mod temp_artifact_inventory")
+
+# (6) Verify the domain temp_artifact_inventory module contains key type definitions.
+domain_inv = root / "control-plane/crates/domain/src/temp_artifact_inventory.rs"
+if not domain_inv.exists():
+    fail("domain/src/temp_artifact_inventory.rs not found")
+domain_inv_text = domain_inv.read_text()
+for required_symbol in [
+    "TempArtifactInventoryMode",
+    "TempArtifactInventoryConfig",
+    "ByteCountString",
+    "disabled_inventory_response",
+    "CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE",
+]:
+    if required_symbol not in domain_inv_text:
+        fail(f"domain/src/temp_artifact_inventory.rs missing required symbol: {required_symbol!r}")
+
+# (7) Verify the GraphQL types file exists with ByteCountString scalar.
+gql_types = root / "control-plane/crates/graphql-server/src/types/temp_artifact_inventory.rs"
+if not gql_types.exists():
+    fail("graphql-server/src/types/temp_artifact_inventory.rs not found")
+gql_types_text = gql_types.read_text()
+for required_gql in [
+    "ByteCountString",
+    "GqlTempArtifactInventory",
+    "GqlInventoryStatus",
+    "UNKNOWN",
+]:
+    if required_gql not in gql_types_text:
+        fail(f"graphql-server types missing required symbol: {required_gql!r}")
+
+# (8) Verify the MCP tool file exists with correct tool name.
+mcp_tool = root / "control-plane/crates/mcp-server/src/tools/temp_artifact_inventory.rs"
+if not mcp_tool.exists():
+    fail("mcp-server/src/tools/temp_artifact_inventory.rs not found")
+mcp_tool_text = mcp_tool.read_text()
+if "temp_artifacts.inventory.preview" not in mcp_tool_text:
+    fail("mcp tool must be named temp_artifacts.inventory.preview")
+
+# (9) Verify TempArtifactInventoryPreview capability is in domain.
+domain_caps = root / "control-plane/crates/domain/src/capabilities.rs"
+if "TempArtifactInventoryPreview" not in domain_caps.read_text():
+    fail("domain/src/capabilities.rs missing TempArtifactInventoryPreview")
+
+print("proposal-089-temp-inventory static checks passed")
+PY
+    log "Running P089 temp-inventory Rust cargo tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-089-temp-inventory-gate \
+        cargo test -p domain p089_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-089-temp-inventory-gate \
+        cargo test -p graphql-server p089_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-089-temp-inventory-gate \
+        cargo test -p mcp-server p089_ -- --nocapture
+    )
+    log "Proposal 089 temp-inventory gate passed"
     ;;
   proposal-090|p090)
     log "Proposal 090 gate: Junie runtime-hardening evidence inventory"

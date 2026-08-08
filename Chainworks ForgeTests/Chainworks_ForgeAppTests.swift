@@ -90,6 +90,26 @@ struct Chainworks_ForgeAppTests {
         #expect(Chainworks_ForgeApp.packagedDaemonAgentPlistURL(in: bundleURL) == plistURL)
     }
 
+    @Test("Bundled daemon build SHA is read from app resources")
+    func bundledDaemonBuildSHAReadsResourceFile() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ChainworksForgeAppTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let bundleURL = root.appendingPathComponent("Chainworks Forge.app", isDirectory: true)
+        let resourcesURL = bundleURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Resources", isDirectory: true)
+        try FileManager.default.createDirectory(at: resourcesURL, withIntermediateDirectories: true)
+
+        #expect(Chainworks_ForgeApp.bundledDaemonBuildSHA(in: bundleURL) == nil)
+
+        let shaURL = resourcesURL.appendingPathComponent("bundled-daemon-build-sha.txt")
+        try Data("  123abcd\n".utf8).write(to: shaURL)
+
+        #expect(Chainworks_ForgeApp.bundledDaemonBuildSHA(in: bundleURL) == "123abcd")
+    }
+
     @Test("Packaged app bootstrap prefers bundled write-path guide over source checkout")
     @MainActor
     func packagedBootstrapPrefersBundledWritePathGuide() throws {
@@ -182,6 +202,23 @@ struct Chainworks_ForgeAppTests {
                 "kickstart",
                 "-k",
                 "gui/501/com.chainworks.forge.daemon",
+            ])
+        #endif
+    }
+
+    @Test("Daemon launch cleanup targets stale local-restart label only")
+    func daemonLaunchCleanupTargetsStaleLocalRestartLabel() {
+        #if os(macOS)
+        #expect(Chainworks_ForgeApp.staleDaemonLaunchAgentLabels() == [
+            "com.chainworks.forge.daemon.local-restart"
+        ])
+        #expect(
+            Chainworks_ForgeApp.launchctlBootoutArguments(
+                label: "com.chainworks.forge.daemon.local-restart",
+                uid: 501
+            ) == [
+                "bootout",
+                "gui/501/com.chainworks.forge.daemon.local-restart",
             ])
         #endif
     }

@@ -1075,6 +1075,14 @@ impl McpServer {
                                 }),
                             );
                         }
+                        if let Some(resp) = mcp_tool_input_error_response(
+                            id.clone(),
+                            canonical_tool_name,
+                            &error_text,
+                            rid.clone(),
+                        ) {
+                            return resp;
+                        }
                         tracing::error!(
                             error = %e,
                             request_id = ?rid,
@@ -1832,6 +1840,13 @@ impl McpServer {
             tools::automation::execute(tool_name, params, principal).await
         } else if tool_name.starts_with("p080.") {
             tools::p080::execute(tool_name, params, pool, principal).await
+        } else if tool_name == "temp_artifacts.inventory.preview" {
+            if !matches!(principal.class, auth::PrincipalClass::Operator) {
+                anyhow::bail!(
+                    "forbidden: temp_artifacts.inventory.preview requires Operator principal"
+                );
+            }
+            tools::temp_artifact_inventory::execute(params).await
         } else {
             Err(anyhow::anyhow!("Unknown tool namespace: {tool_name}"))
         }
@@ -1914,6 +1929,40 @@ where
             return Ok(total); // Complete line
         }
     }
+}
+
+fn mcp_tool_input_error_response(
+    id: Option<serde_json::Value>,
+    tool_name: &str,
+    error_text: &str,
+    request_id: Option<String>,
+) -> Option<JsonRpcResponse> {
+    let reason_code = if error_text.contains("Missing 'caller_request_id'")
+        || error_text.contains("requires 'caller_request_id'")
+        || error_text.contains("caller_request_id is required")
+    {
+        "missing_caller_request_id"
+    } else if error_text.starts_with("MALFORMED_REQUEST_ID:")
+        || error_text.contains("caller_request_id must be lowercase UUIDv4")
+    {
+        "malformed_caller_request_id"
+    } else if error_text.starts_with("Missing '") {
+        "missing_required_argument"
+    } else {
+        return None;
+    };
+
+    Some(JsonRpcResponse::error_with_data(
+        id,
+        -32602,
+        "invalid tool arguments",
+        serde_json::json!({
+            "code": "INVALID_TOOL_ARGUMENTS",
+            "reason_code": reason_code,
+            "tool_name": tool_name,
+            "request_id": request_id,
+        }),
+    ))
 }
 
 // ── P081 AC-13: MCP command idempotency helpers ──────────────────────────────
@@ -2036,6 +2085,8 @@ fn is_read_only_tool(tool_name: &str) -> bool {
             // P086: continuation readback tools are unconditionally read-only. (SEC-LOW-001)
             | "agents.continuation_status"
             | "agents.continuation_candidates"
+            // P089: temp artifact inventory preview is read-only (advisory dry-run, no mutation).
+            | "temp_artifacts.inventory.preview"
     )
 }
 
@@ -3495,6 +3546,7 @@ mod tests {
                 action: "retry_failed_agent".to_string(),
                 explanation: "Retry the agent with the same inputs.".to_string(),
             },
+            diagnostic_artifact_paths: Vec::new(),
         }
     }
 
@@ -4046,7 +4098,7 @@ mod tests {
     ) -> serde_json::Value {
         // P041 §6.5: exclude mcp_execution_truth (runtime-only) and
         // canonical_artifact_contracts (P057 system projection, not in golden fixtures).
-        let tool_reports = tool_value
+        let tool_reports = tool_value["reports"]
             .as_array()
             .cloned()
             .unwrap_or_default()
@@ -4063,7 +4115,7 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let tool_report_artifacts = report_artifact_names_from_reports(&tool_value);
+        let tool_report_artifacts = report_artifact_names_from_reports(&tool_value["reports"]);
         let resource_report_artifacts =
             report_artifact_names_from_reports(&resource_value["artifacts"]);
         serde_json::json!({
@@ -4258,12 +4310,12 @@ mod tests {
 
     /// Drive a `tools/call` request through `handle_request` and return the
     /// parsed inner payload from `result.content[0].text`.
-    async fn call_tool_and_parse(
+    async fn call_tool_raw(
         server: &McpServer,
         principal: &auth::Principal,
         tool_name: &str,
         arguments: serde_json::Value,
-    ) -> serde_json::Value {
+    ) -> crate::protocol::JsonRpcResponse {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: Some(serde_json::json!(1)),
@@ -4273,7 +4325,18 @@ mod tests {
                 "arguments": arguments,
             })),
         };
-        let resp = server.handle_request(req, principal).await;
+        server.handle_request(req, principal).await
+    }
+
+    /// Drive a `tools/call` request through `handle_request` and return the
+    /// parsed inner payload from `result.content[0].text`.
+    async fn call_tool_and_parse(
+        server: &McpServer,
+        principal: &auth::Principal,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let resp = call_tool_raw(server, principal, tool_name, arguments).await;
         let result = resp
             .result
             .expect("tools/call response must have result when the call succeeded");
@@ -4290,6 +4353,81 @@ mod tests {
 
     fn observer_principal() -> auth::Principal {
         auth::Principal::new("test-observer", auth::PrincipalClass::Observer)
+    }
+
+    #[tokio::test]
+    async fn stages_retry_missing_caller_request_id_returns_invalid_tool_arguments() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let (stage_execution_id, _) = seed_validation_attempt(&pool, run_id).await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+
+        let response = call_tool_raw(
+            &server,
+            &operator_principal(),
+            "stages.retry",
+            serde_json::json!({
+                "stage_execution_id": stage_execution_id.to_string(),
+            }),
+        )
+        .await;
+
+        let error = response
+            .error
+            .expect("missing caller_request_id must be a JSON-RPC error");
+        assert_eq!(error.code, -32602);
+        assert_eq!(error.message, "invalid tool arguments");
+        let data = error.data.expect("invalid argument error carries data");
+        assert_eq!(data["code"], "INVALID_TOOL_ARGUMENTS");
+        assert_eq!(data["reason_code"], "missing_caller_request_id");
+        assert_eq!(data["tool_name"], "stages.retry");
+    }
+
+    #[tokio::test]
+    async fn stages_retry_malformed_caller_request_id_returns_invalid_tool_arguments() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let (stage_execution_id, _) = seed_validation_attempt(&pool, run_id).await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+
+        let response = call_tool_raw(
+            &server,
+            &operator_principal(),
+            "stages.retry",
+            serde_json::json!({
+                "stage_execution_id": stage_execution_id.to_string(),
+                "caller_request_id": "not-a-uuid",
+            }),
+        )
+        .await;
+
+        let error = response
+            .error
+            .expect("malformed caller_request_id must be a JSON-RPC error");
+        assert_eq!(error.code, -32602);
+        assert_eq!(error.message, "invalid tool arguments");
+        let data = error.data.expect("invalid argument error carries data");
+        assert_eq!(data["code"], "INVALID_TOOL_ARGUMENTS");
+        assert_eq!(data["reason_code"], "malformed_caller_request_id");
+        assert_eq!(data["tool_name"], "stages.retry");
     }
 
     async fn force_p081_audit_budget_safe_mode(pool: &sqlx::SqlitePool) {
@@ -4492,9 +4630,9 @@ mod tests {
         )
         .await;
 
-        let journal_id = payload["journal_id"]
-            .as_str()
-            .expect("runs.cancel response must contain journal_id as a string");
+        let journal_id = payload["journal_id"].as_str().unwrap_or_else(|| {
+            panic!("runs.cancel response must contain journal_id as a string: {payload}")
+        });
         assert!(
             !journal_id.is_empty(),
             "journal_id must be non-empty (uuid from CommandHandler::handle)"

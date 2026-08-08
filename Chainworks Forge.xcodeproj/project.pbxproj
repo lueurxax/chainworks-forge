@@ -193,8 +193,8 @@
 			buildConfigurationList = CE89135C2F6FC30A006EC77C /* Build configuration list for PBXNativeTarget "Chainworks Forge" */;
 			buildPhases = (
 				CE8913352F6FC308006EC77C /* Sources */,
-				CE5347FE2F94332200F5D470 /* Embed Control-Plane Daemon */,
 				CE5347FF2F94338F00F5D470 /* Embed LaunchDaemon Plist */,
+				CE5347FE2F94332200F5D470 /* Embed Control-Plane Daemon */,
 				CE8913362F6FC308006EC77C /* Frameworks */,
 				CE8913372F6FC308006EC77C /* Resources */,
 			);
@@ -728,7 +728,7 @@
 			repositoryURL = "https://github.com/jpsim/Yams.git";
 			requirement = {
 				kind = upToNextMajorVersion;
-				minimumVersion = 6.0.0;
+				minimumVersion = 6.2.2;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */

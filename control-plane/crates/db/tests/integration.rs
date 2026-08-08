@@ -1825,6 +1825,7 @@ async fn stage_projection_validation_flag_is_attempt_scoped() {
                 action: "retry_failed_agent".into(),
                 explanation: "Retry the failed agent.".into(),
             },
+            diagnostic_artifact_paths: Vec::new(),
         },
     )
     .await

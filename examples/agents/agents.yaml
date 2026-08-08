@@ -307,6 +307,7 @@ contracts:
     machine_format: json
     validation_mode: strict_structured
     required_fields:
+      - status
       - files
   tests_result:
     format: json
@@ -619,7 +620,7 @@ backend_profiles:
     runtime_profile: claude_agent_acp
   codex_writer_high:
     provider: codex_acp
-    model: gpt-5.5
+    model: gpt-5.6
     effort: high
     temperature: 0.12
     max_turns: 18
@@ -649,7 +650,7 @@ backend_profiles:
     runtime_profile: claude_agent_acp
   codex_architect_high:
     provider: codex_acp
-    model: gpt-5.5
+    model: gpt-5.6
     effort: xhigh
     temperature: 0.1
     max_turns: 16
@@ -660,7 +661,7 @@ backend_profiles:
     runtime_profile: codex_acp
   codex_builder_high:
     provider: codex_acp
-    model: gpt-5.5
+    model: gpt-5.6
     effort: high
     temperature: 0.1
     max_turns: 24
@@ -681,7 +682,7 @@ backend_profiles:
     runtime_profile: claude_agent_acp
   codex_audit_high:
     provider: codex_acp
-    model: gpt-5.5
+    model: gpt-5.6
     effort: xhigh
     temperature: 0.0
     max_turns: 18
@@ -710,7 +711,7 @@ backend_profiles:
     runtime_profile: claude_agent_acp
   codex_ops_low:
     provider: codex_acp
-    model: gpt-5.5
+    model: gpt-5.6
     effort: low
     temperature: 0.0
     max_turns: 8
@@ -766,10 +767,10 @@ backend_profiles:
     max_turns: 16
     structured_output: required
     mcp: []
-  gemini_3_flash_preview_medium:
+  gemini_3_6_flash_medium:
     provider: gemini_acp
     runtime_profile: gemini_cli_acp
-    model: gemini-3-flash-preview
+    model: gemini-3.6-flash
     effort: medium
     temperature: 0.2
     max_turns: 12
@@ -796,7 +797,7 @@ backend_profiles:
   gemini_docs_flash:
     provider: gemini_acp
     runtime_profile: gemini_cli_acp
-    model: gemini-2.5-flash
+    model: gemini-3.6-flash
     effort: medium
     temperature: 0.2
     max_turns: 12
@@ -805,7 +806,7 @@ backend_profiles:
   gemini_ops_flash_lite:
     provider: gemini_acp
     runtime_profile: gemini_cli_acp
-    model: gemini-2.5-flash
+    model: gemini-3.5-flash-lite
     effort: low
     temperature: 0.0
     max_turns: 8
@@ -813,7 +814,7 @@ backend_profiles:
     mcp: []
   codex_orchestrator_acp:
     provider: codex_acp
-    model: gpt-5.5
+    model: gpt-5.6
     effort: medium
     temperature: 0.1
     max_turns: 12
@@ -822,7 +823,7 @@ backend_profiles:
     runtime_profile: codex_acp
   codex_orchestrator_high:
     provider: codex_acp
-    model: gpt-5.5
+    model: gpt-5.6
     effort: high
     temperature: 0.1
     max_turns: 16
@@ -927,12 +928,13 @@ permission_profiles:
       write:
         - ${CHAINWORKS_META_ROOT:-.chainworks}/review/**
       deny:
+        - ${CHAINWORKS_REPO_ROOT:-.}/.git
         - ${CHAINWORKS_REPO_ROOT:-.}/.git/**
         - ${CHAINWORKS_REPO_ROOT:-.}/**/.env*
         - ${CHAINWORKS_REPO_ROOT:-.}/**/secrets/**
     git:
-      status: true
-      diff: true
+      status: false
+      diff: false
       checkout: false
       commit: false
       push: false
@@ -943,9 +945,6 @@ permission_profiles:
         - find
         - ls
         - cat
-        - git status
-        - git diff --stat
-        - git diff --name-only
         - go test ./...
         - cargo test
         - cargo clippy
@@ -1014,12 +1013,13 @@ permission_profiles:
         - ${CHAINWORKS_META_ROOT:-.chainworks}/security/**
         - ${CHAINWORKS_META_ROOT:-.chainworks}/review/**
       deny:
+        - ${CHAINWORKS_REPO_ROOT:-.}/.git
         - ${CHAINWORKS_REPO_ROOT:-.}/.git/**
         - ${CHAINWORKS_REPO_ROOT:-.}/**/.env*
         - ${CHAINWORKS_REPO_ROOT:-.}/**/secrets/**
     git:
-      status: true
-      diff: true
+      status: false
+      diff: false
       checkout: false
       commit: false
       push: false
@@ -1030,9 +1030,6 @@ permission_profiles:
         - find
         - ls
         - cat
-        - git status
-        - git diff --stat
-        - git diff --name-only
         - go test ./...
         - cargo test
         - cargo clippy
@@ -1115,6 +1112,7 @@ permission_profiles:
         - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/Package.swift
         - ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/**
       deny:
+        - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/.git
         - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/.git/**
         - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**/.env*
         - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**/secrets/**
@@ -1122,9 +1120,9 @@ permission_profiles:
         - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/README*
         - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/CHANGELOG*
     git:
-      status: true
-      diff: true
-      checkout: true
+      status: false
+      diff: false
+      checkout: false
       commit: false
       push: false
     shell:
@@ -1134,9 +1132,6 @@ permission_profiles:
         - find
         - ls
         - cat
-        - git status
-        - git diff --stat
-        - git diff --name-only
         - go test ./...
         - cargo test
         - cargo clippy
@@ -2059,8 +2054,6 @@ agents:
       require_same_worktree: true
       require_no_unresolved_side_effects: true
     required_tools:
-      - git status
-      - git diff --stat
       - go test ./...
       - cargo test
       - swift build
@@ -2078,7 +2071,6 @@ agents:
     outputs:
       - implementation_progress
       - implementation_self_assessment
-      - changed_files_manifest
       - tests_result
     output_contract: implementation_self_assessment_v2
     requires_human_approval: false
@@ -2102,6 +2094,10 @@ agents:
       known_risks, tests_run, and docs_impacted must be arrays of strings. Do not set docs_impacted to true or false.
 
       Do not use seemingly_complete or tests_result.green as transition truth.
+
+      Do not run `git status`, `git diff`, or `git rev-parse`, and do not read `.git`.
+
+      Git evidence is generated by the control plane after provider execution. Publish only implementation_progress, implementation_self_assessment, and tests_result; do not publish changed_files_manifest.
 
       Do not commit, do not push, and do not edit repository docs unless the docs agent is invoked.
 
@@ -2142,7 +2138,7 @@ agents:
 
       Cover problem, goals, non-goals, UX/UI notes, architecture, rollout, metrics, risks, and open questions.
 
-      For every proposal where the rollout gate is applicable, include a strict inline rollout_contract_v1 that conforms to docs/reference/executable-rollout-gate-template.md before the proposal can be frozen for implementation.
+      For every proposal where the rollout gate is applicable, include a strict top-level rollout_contract_v1 object that conforms to docs/reference/executable-rollout-gate-template.md before the proposal can be frozen for implementation; do not nest the canonical rollout_contract_v1 only under rollout.
 
       Treat score_lift_backlog.review_pass_id and score_lift_backlog.items as the authoritative blocker list for this refine pass.
 
@@ -2162,8 +2158,6 @@ agents:
     permission_profile: RO_VERIFY
     skill_ref: proposal_implementation_audit
     required_tools:
-      - git diff --stat
-      - git diff --name-only
       - go test ./...
       - cargo test
       - swift test
@@ -2187,6 +2181,8 @@ agents:
 
       Be exact and evidence-based.
 
+      Use changed_files_manifest as the canonical control-plane-generated Git evidence. Do not run `git status`, `git diff`, or `git rev-parse`, and do not read `.git`.
+
       Keep discovery bounded: inspect changed files, proposal-relevant paths, and test evidence first; do not run broad rg/find over repo or worktree roots unless generated/build roots are excluded and output is capped.
 
       Output only the audit contract and set status to implemented only when the implementation truly matches the approved proposal."
@@ -2200,7 +2196,6 @@ agents:
       - scanner.readonly
       - dependency_scan.readonly
       - secrets_scan.readonly
-      - git diff --name-only
     inputs:
       - approved_proposal
       - implementation_progress
@@ -2215,6 +2210,8 @@ agents:
       Focus on auth/authz, secrets handling, unsafe defaults, injection, serialization, filesystem access, network boundaries, data leakage, and dependency risk.
 
       Use readonly scanners when available, but do not rely on scanners alone.
+
+      Use changed_files_manifest as the canonical control-plane-generated Git evidence. Do not run `git status`, `git diff`, or `git rev-parse`, and do not read `.git`.
 
       Output only the structured security report and mark status as pass only when no blocking issue remains."
   - id: commit_and_push_to_github
@@ -2255,8 +2252,6 @@ agents:
     permission_profile: RO_PREPUSH_VERIFY
     skill_ref: prepush_review_core
     required_tools:
-      - git diff --stat
-      - git diff --name-only
       - go test ./...
       - cargo test
       - swift test
@@ -2276,6 +2271,8 @@ agents:
       Focus on correctness, readability, maintainability, surprising side effects, regression risk, and missing tests.
 
       Do not propose gold-plating; prioritize issues that would make the release unsafe or expensive to maintain.
+
+      Use changed_files_manifest as the canonical control-plane-generated Git evidence. Do not run `git status`, `git diff`, or `git rev-parse`, and do not read `.git`.
 
       Keep discovery bounded: inspect changed files and implicated paths first; do not run broad rg/find over repo or worktree roots unless generated/build roots are excluded and output is capped.
 

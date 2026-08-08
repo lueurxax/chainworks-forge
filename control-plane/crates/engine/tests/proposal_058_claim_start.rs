@@ -250,6 +250,17 @@ async fn proposal_058_claim_start_precreates_execution_and_active_artifact_claim
         claimed_session_generation_id
     );
 
+    let mut facts =
+        agent_execution_runtime_facts::find_by_execution_id(&pool, claimed.agent_execution_id)
+            .await
+            .unwrap()
+            .expect("claim/start should persist runtime facts before completion");
+    facts.output_settlement = AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+    facts.valid_required_outputs = true;
+    agent_execution_runtime_facts::upsert(&pool, &facts)
+        .await
+        .unwrap();
+
     work_items::complete(&pool, &claimed.work_item_id)
         .await
         .unwrap();
@@ -354,7 +365,7 @@ async fn proposal_058_claim_start_without_session_scope_does_not_fabricate_gener
                 "stage_execution_id": stage_execution_id.to_string(),
                 "agent_id": "docs_guardian",
                 "provider": "gemini",
-                "model": "gemini-2.5-flash",
+                "model": "gemini-3.6-flash",
                 "prompt": "check docs",
                 "task_name": "docs",
                 "task_inputs": [],
@@ -496,7 +507,7 @@ async fn proposal_058_reclaimed_null_scope_payload_clears_legacy_fake_generation
             stage_execution_id: Some(stage_execution_id),
             agent_id: "docs_guardian".into(),
             provider: "gemini".into(),
-            model: Some("gemini-2.5-flash".into()),
+            model: Some("gemini-3.6-flash".into()),
             status: AgentStatus::Running,
             started_at: now,
             completed_at: None,
@@ -568,7 +579,7 @@ async fn proposal_058_reclaimed_null_scope_payload_clears_legacy_fake_generation
                 "stage_execution_id": stage_execution_id.to_string(),
                 "agent_id": "docs_guardian",
                 "provider": "gemini",
-                "model": "gemini-2.5-flash",
+                "model": "gemini-3.6-flash",
                 "prompt": "check docs",
                 "task_name": "docs",
                 "task_inputs": [],
@@ -2882,7 +2893,7 @@ async fn p058_claim_uses_quota_free_escalation_backend_before_provider_quota_wai
             },
             "codex_builder_high": {
                 "provider": "codex_acp",
-                "model": "gpt-5.5",
+                "model": "gpt-5.6",
                 "effort": "high",
                 "max_turns": 24
             },
@@ -3113,7 +3124,7 @@ async fn p058_claim_uses_quota_free_escalation_backend_before_provider_quota_wai
         .unwrap()
         .expect("claimed execution exists");
     assert_eq!(execution.provider, "codex");
-    assert_eq!(execution.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(execution.model.as_deref(), Some("gpt-5.6"));
     assert_eq!(
         execution.backend_profile_id.as_deref(),
         Some("codex_builder_high")

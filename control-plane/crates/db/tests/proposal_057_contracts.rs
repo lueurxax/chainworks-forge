@@ -338,10 +338,9 @@ async fn proposal_057_repairs_legacy_invalid_contract_statuses_after_vocab_expan
             .unwrap();
     assert_eq!(before, None);
 
-    let repaired =
-        artifact_contracts::repair_contract_status_normalization_and_rebuild(&pool, run_id)
-            .await
-            .unwrap();
+    let repaired = artifact_contracts::repair_contract_status_normalization(&pool, run_id)
+        .await
+        .unwrap();
     assert_eq!(repaired, 1);
 
     let after =

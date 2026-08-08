@@ -710,11 +710,9 @@ pub const RECOMMENDED_NEXT_ACTION_MANUAL_INVESTIGATION: &str = "manual_investiga
 /// Do NOT use `unknown_principal` in place of this constant.
 pub const ENGINE_REPAIR_SYSTEM_PRINCIPAL: &str = "system:engine:p079_repair_v1";
 
-// Feature flag names
+// Feature flag names for optional P079-adjacent capabilities.
 // ---------------------------------------------------------------------------
 
-pub const FLAG_OUTPUT_REPAIR_ENABLED: &str = "CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED";
-pub const FLAG_TRANSCRIPT_RECOVERY_ENABLED: &str = "CHAINWORKS_P079_TRANSCRIPT_RECOVERY_ENABLED";
 pub const FLAG_PROVIDER_FALLBACK_ENABLED: &str = "CHAINWORKS_P079_PROVIDER_FALLBACK_ENABLED";
 
 // ---------------------------------------------------------------------------

@@ -78,10 +78,10 @@ pub async fn find_active_by_request(
     principal_id: &str,
     request_id: &str,
 ) -> Result<Option<CommandIdempotencyLease>> {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{LEASE_SELECT} WHERE principal_id = ?1 AND request_id = ?2
          AND lease_state IN ('pending','committed','failed')"
-    ))
+    )))
     .bind(principal_id)
     .bind(request_id)
     .fetch_optional(pool)
@@ -98,10 +98,10 @@ pub async fn find_committed_by_intent(
     command: &str,
     intent_hash: &str,
 ) -> Result<Option<CommandIdempotencyLease>> {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{LEASE_SELECT} WHERE principal_id = ?1 AND command = ?2
          AND intent_hash = ?3 AND lease_state = 'committed'"
-    ))
+    )))
     .bind(principal_id)
     .bind(command)
     .bind(intent_hash)
@@ -122,11 +122,11 @@ pub async fn find_failed_by_intent(
     command: &str,
     intent_hash: &str,
 ) -> Result<Option<CommandIdempotencyLease>> {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{LEASE_SELECT} WHERE principal_id = ?1 AND command = ?2
          AND intent_hash = ?3 AND lease_state = 'failed'
          ORDER BY lease_generation DESC LIMIT 1"
-    ))
+    )))
     .bind(principal_id)
     .bind(command)
     .bind(intent_hash)

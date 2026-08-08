@@ -99,7 +99,7 @@ pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, run: &Run) -> Result<()
 pub async fn find_by_id(pool: &SqlitePool, id: RunId) -> Result<Option<Run>> {
     let id_str = id.to_string();
     let query = format!("SELECT {SELECT_COLS} FROM runs WHERE id = ?1");
-    let row = sqlx::query(&query)
+    let row = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(id_str)
         .fetch_optional(pool)
         .await
@@ -111,7 +111,7 @@ pub async fn find_by_id(pool: &SqlitePool, id: RunId) -> Result<Option<Run>> {
 pub async fn find_by_id_tx(tx: &mut Transaction<'_, Sqlite>, id: RunId) -> Result<Option<Run>> {
     let id_str = id.to_string();
     let query = format!("SELECT {SELECT_COLS} FROM runs WHERE id = ?1");
-    let row = sqlx::query(&query)
+    let row = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(id_str)
         .fetch_optional(&mut **tx)
         .await
@@ -124,7 +124,7 @@ pub async fn list_by_idea(pool: &SqlitePool, idea_id: IdeaId) -> Result<Vec<Run>
     let idea_id_str = idea_id.to_string();
     let query =
         format!("SELECT {SELECT_COLS} FROM runs WHERE idea_id = ?1 ORDER BY started_at DESC");
-    let rows = sqlx::query(&query)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(idea_id_str)
         .fetch_all(pool)
         .await
@@ -137,7 +137,7 @@ pub async fn list_active(pool: &SqlitePool) -> Result<Vec<Run>> {
     let query = format!(
         "SELECT {SELECT_COLS} FROM runs WHERE status NOT IN ('completed', 'failed', 'cancelled') ORDER BY started_at DESC"
     );
-    let rows = sqlx::query(&query)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .fetch_all(pool)
         .await
         .context("list active runs")?;
@@ -150,7 +150,7 @@ pub async fn list_completed(pool: &SqlitePool, limit: i64) -> Result<Vec<Run>> {
     let query = format!(
         "SELECT {SELECT_COLS} FROM runs WHERE status = 'completed' ORDER BY completed_at DESC, started_at DESC LIMIT ?1"
     );
-    let rows = sqlx::query(&query)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
         .bind(limit)
         .fetch_all(pool)
         .await

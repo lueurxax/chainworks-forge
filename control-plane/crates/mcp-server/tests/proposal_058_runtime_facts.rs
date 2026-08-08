@@ -397,9 +397,9 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
     .await
     .unwrap();
 
-    let canonical = payload
+    let canonical = payload["reports"]
         .as_array()
-        .unwrap()
+        .expect("reports array")
         .iter()
         .find(|item| item["report_kind"] == serde_json::json!("mcp_execution_truth"))
         .expect("mcp execution truth report");
@@ -589,9 +589,9 @@ async fn proposal_053_reports_get_projects_discovery_reconciliation_pending() {
     .await
     .unwrap();
 
-    let canonical = payload
+    let canonical = payload["reports"]
         .as_array()
-        .unwrap()
+        .expect("reports array")
         .iter()
         .find(|item| item["report_kind"] == serde_json::json!("mcp_execution_truth"))
         .expect("mcp execution truth report");
@@ -703,6 +703,7 @@ async fn p058_sec004_non_operator_summary_excludes_dominant_pause_reason() {
         id: "ledger-sec004-authz".into(),
         run_id,
         stage_id: "state_3".into(),
+        stage_execution_id: None,
         agent_id: "code_writer".into(),
         policy_id: "policy-sec004".into(),
         policy_hash: "sha256:s4authz".into(),

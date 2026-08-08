@@ -47,7 +47,7 @@ nonisolated enum DaemonLifecycleState: String, Codable, Sendable, CaseIterable {
     /// liveness probe should accept this state (§5.2).
     var isLive: Bool {
         switch self {
-        case .ready, .degraded: return true
+        case .starting, .ready, .degraded: return true
         default: return false
         }
     }
@@ -189,6 +189,8 @@ nonisolated struct DaemonStatus: Codable, Sendable, Equatable {
     let startedAt: Date?
     let lastStateChangeAt: Date
     let degraded: [DegradedReason]
+    let startupPhase: String?
+    let startupPhaseStartedAt: Date?
     let failure: FailureReason?
     let restartCountSinceBoot: Int
     let pid: Int
@@ -208,6 +210,8 @@ nonisolated struct DaemonStatus: Codable, Sendable, Equatable {
         case startedAt = "started_at"
         case lastStateChangeAt = "last_state_change_at"
         case degraded
+        case startupPhase = "startup_phase"
+        case startupPhaseStartedAt = "startup_phase_started_at"
         case failure
         case restartCountSinceBoot = "restart_count_since_boot"
         case pid
@@ -223,6 +227,8 @@ nonisolated struct DaemonStatus: Codable, Sendable, Equatable {
         startedAt = try c.decodeIfPresent(Date.self, forKey: .startedAt)
         lastStateChangeAt = try c.decode(Date.self, forKey: .lastStateChangeAt)
         degraded = (try? c.decode([DegradedReason].self, forKey: .degraded)) ?? []
+        startupPhase = try c.decodeIfPresent(String.self, forKey: .startupPhase)
+        startupPhaseStartedAt = try c.decodeIfPresent(Date.self, forKey: .startupPhaseStartedAt)
         failure = try c.decodeIfPresent(FailureReason.self, forKey: .failure)
         restartCountSinceBoot = try c.decode(Int.self, forKey: .restartCountSinceBoot)
         pid = try c.decode(Int.self, forKey: .pid)
@@ -240,6 +246,8 @@ nonisolated struct DaemonStatus: Codable, Sendable, Equatable {
         startedAt: Date?,
         lastStateChangeAt: Date,
         degraded: [DegradedReason],
+        startupPhase: String? = nil,
+        startupPhaseStartedAt: Date? = nil,
         failure: FailureReason?,
         restartCountSinceBoot: Int,
         pid: Int,
@@ -252,6 +260,8 @@ nonisolated struct DaemonStatus: Codable, Sendable, Equatable {
         self.startedAt = startedAt
         self.lastStateChangeAt = lastStateChangeAt
         self.degraded = degraded
+        self.startupPhase = startupPhase
+        self.startupPhaseStartedAt = startupPhaseStartedAt
         self.failure = failure
         self.restartCountSinceBoot = restartCountSinceBoot
         self.pid = pid
@@ -1199,6 +1209,10 @@ final class DaemonStatusViewModel: ObservableObject {
     @Published private(set) var status: DaemonStatus?
     @Published private(set) var lastError: DaemonClientError?
 
+    private static let defaultStartupRetryDelays =
+        Array(repeating: Duration.milliseconds(250), count: 8)
+        + Array(repeating: Duration.seconds(1), count: 28)
+
     /// True iff no successful snapshot has been observed. The UI uses
     /// this to render the Unavailable panel (restart, Export Diagnostics)
     /// instead of a lifecycle banner. We deliberately do NOT synthesize
@@ -1231,13 +1245,28 @@ final class DaemonStatusViewModel: ObservableObject {
     }
 
     /// Snapshot-plus-subscribe bootstrap (P042 §5.2 / P056 §5.5).
-    /// Issues a single `refresh()` to seed state, then opens a
-    /// `daemonStatusChanged` subscription so live transitions update
-    /// `status` without polling. Safe to call multiple times — any
-    /// existing subscription task is cancelled first.
-    func startSnapshotPlusSubscribe() async {
+    /// Retries only transient startup failures while the probe-only
+    /// router is being replaced, then opens the live subscription.
+    /// Safe to call multiple times — any existing subscription task
+    /// is cancelled first.
+    func startSnapshotPlusSubscribe(
+        startupRetryDelays: [Duration]? = nil
+    ) async {
         subscriptionTask?.cancel()
         await refresh()
+        for delay in startupRetryDelays ?? Self.defaultStartupRetryDelays {
+            guard status == nil, Self.isTransientStartupError(lastError) else {
+                break
+            }
+            do {
+                try await ContinuousClock().sleep(for: delay)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            await refresh()
+        }
+
         let subscription = client.subscribe()
         subscriptionTask = Task { [weak self] in
             for await frame in subscription.stream {
@@ -1257,6 +1286,17 @@ final class DaemonStatusViewModel: ObservableObject {
                     return
                 }
             }
+        }
+    }
+
+    private static func isTransientStartupError(_ error: DaemonClientError?) -> Bool {
+        switch error {
+        case .transport:
+            return true
+        case .httpFailure(let status, _):
+            return status == -1 || status == 404 || (502...504).contains(status)
+        case .graphqlErrors, .decoding, .malformedURL, .none:
+            return false
         }
     }
 

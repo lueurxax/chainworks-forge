@@ -8,6 +8,8 @@
 use anyhow::{Context, Result};
 use domain::ids::RunId;
 use std::path::Path;
+use std::time::Duration;
+use tokio::time::timeout;
 use tracing::{info, warn};
 
 /// Result of a successful worktree provisioning.
@@ -301,12 +303,34 @@ fn sanitize_slug(title: &str) -> String {
 
 /// Run a git command in the given directory and return stdout.
 async fn run_git(args: &[&str], dir: &Path) -> Result<String> {
-    let output = tokio::process::Command::new("git")
+    run_git_with_timeout("git", args, dir, Duration::from_secs(20)).await
+}
+
+async fn run_git_with_timeout(
+    git_bin: &str,
+    args: &[&str],
+    dir: &Path,
+    timeout_after: Duration,
+) -> Result<String> {
+    let child = tokio::process::Command::new(git_bin)
         .args(args)
         .current_dir(dir)
-        .output()
-        .await
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .with_context(|| format!("spawning git {}", args.join(" ")))?;
+
+    let output = match timeout(timeout_after, child.wait_with_output()).await {
+        Ok(output) => output.with_context(|| format!("waiting for git {}", args.join(" ")))?,
+        Err(_) => {
+            anyhow::bail!(
+                "git {} timed out after {}s",
+                args.join(" "),
+                timeout_after.as_secs()
+            );
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -324,4 +348,42 @@ async fn run_git(args: &[&str], dir: &Path) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn source_context_git_diff_timeout_returns_promptly() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake_git = temp.path().join("git-sleeps");
+        fs::write(&fake_git, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut permissions = fs::metadata(&fake_git).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_git, permissions).unwrap();
+
+        let started = Instant::now();
+        let err = run_git_with_timeout(
+            fake_git.to_str().unwrap(),
+            &["diff", "--name-only", "main"],
+            temp.path(),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "source context git timeout should not block advance_run"
+        );
+        assert!(
+            err.to_string()
+                .contains("git diff --name-only main timed out"),
+            "unexpected error: {err:#}"
+        );
+    }
 }
