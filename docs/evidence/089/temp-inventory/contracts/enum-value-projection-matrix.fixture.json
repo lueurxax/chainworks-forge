@@ -1,0 +1,64 @@
+{
+  "schema_version": "p089_temp_inventory_enum_matrix_v1",
+  "description": "P089 canonical enum value projection matrix. Each domain enum maps snake_case (JSON/MCP/report) to SCREAMING_SNAKE_CASE (GraphQL). All lanes must agree on values.",
+  "$comment": "PARTIALLY RECONCILED. Value coverage and casing for the seven proposal-era domains below agree with the shipped GraphQL projection in control-plane/crates/graphql-server/src/types/temp_artifact_inventory.rs. Two gaps remain: the refinement-added `inventory_mode` domain (disabled|hidden_readback|operator_visible, projected as the closed GraphQL enum InventoryMode) is not covered here at all, and the GraphQL *type name* for enabled_state is InventoryEnabledState in the implementation versus EnabledState in graphql-sdl.fixture.graphql. This file maps values only, not type names. See docs/reference/managed-temporary-artifact-inventory.md#44-graphql-projection-specifics-implemented.",
+  "inventory_status": {
+    "complete": "COMPLETE",
+    "partial": "PARTIAL",
+    "timeout": "TIMEOUT",
+    "cancelled": "CANCELLED",
+    "error": "ERROR",
+    "disabled": "DISABLED",
+    "resource_exhausted": "RESOURCE_EXHAUSTED",
+    "unknown": "UNKNOWN"
+  },
+  "enabled_state": {
+    "enabled": "ENABLED",
+    "disabled": "DISABLED",
+    "unknown": "UNKNOWN"
+  },
+  "lifecycle_classification": {
+    "active_or_recent": "ACTIVE_OR_RECENT",
+    "terminal_candidate": "TERMINAL_CANDIDATE",
+    "orphan_candidate": "ORPHAN_CANDIDATE",
+    "legacy_unmanaged": "LEGACY_UNMANAGED",
+    "scan_error": "SCAN_ERROR",
+    "unknown": "UNKNOWN"
+  },
+  "dry_run_recommendation": {
+    "would_keep_active": "WOULD_KEEP_ACTIVE",
+    "would_keep_recent": "WOULD_KEEP_RECENT",
+    "would_preserve_failure_evidence": "WOULD_PRESERVE_FAILURE_EVIDENCE",
+    "would_delete_after_future_approval": "WOULD_DELETE_AFTER_FUTURE_APPROVAL",
+    "would_migrate_legacy_manifest_after_future_migration_enabled": "WOULD_MIGRATE_LEGACY_MANIFEST_AFTER_FUTURE_MIGRATION_ENABLED",
+    "needs_operator_review": "NEEDS_OPERATOR_REVIEW",
+    "no_recommendation": "NO_RECOMMENDATION",
+    "unknown": "UNKNOWN"
+  },
+  "mutation_guard_status": {
+    "pass": "PASS",
+    "fail": "FAIL",
+    "skipped": "SKIPPED",
+    "unknown": "UNKNOWN"
+  },
+  "root_kind": {
+    "run_meta_root": "RUN_META_ROOT",
+    "control_plane_cache": "CONTROL_PLANE_CACHE",
+    "provider_home_copy": "PROVIDER_HOME_COPY",
+    "legacy_chainworks_tmp": "LEGACY_CHAINWORKS_TMP",
+    "diagnostic_test_root": "DIAGNOSTIC_TEST_ROOT",
+    "unknown": "UNKNOWN"
+  },
+  "error_code": {
+    "invalid_root_override": "INVALID_ROOT_OVERRIDE",
+    "root_unreadable": "ROOT_UNREADABLE",
+    "manifest_parse_failed": "MANIFEST_PARSE_FAILED",
+    "size_estimation_failed": "SIZE_ESTIMATION_FAILED",
+    "deadline_exceeded": "DEADLINE_EXCEEDED",
+    "cancelled": "CANCELLED",
+    "internal_error": "INTERNAL_ERROR",
+    "mutation_guard_failed": "MUTATION_GUARD_FAILED",
+    "resource_exhausted": "RESOURCE_EXHAUSTED",
+    "unknown": "UNKNOWN"
+  }
+}

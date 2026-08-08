@@ -68,6 +68,9 @@ use crate::types::stage::{
 use crate::types::steward::{
     GqlStewardAnalysis, GqlStewardAnalysisRunLink, GqlStewardRecommendation,
 };
+use crate::types::temp_artifact_inventory::{
+    GqlTempArtifactInventory, GqlTempArtifactInventoryInput,
+};
 
 pub type AppSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
 
@@ -3557,6 +3560,54 @@ impl QueryRoot {
             schema_version: "p080_diagnostics_connection_v1".to_string(),
             total_count,
         })
+    }
+
+    /// P089: Read-only advisory temporary artifact inventory preview.
+    /// Returns disabled readback when CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE=disabled (default).
+    /// Scans are not performed in disabled mode; rows and errors are empty. Delegates to the
+    /// daemon-installed backend (see `types::temp_artifact_inventory::install_backend`) so this
+    /// lane shares the exact mode-check/validation/scan/redaction/mutation-guard path as MCP.
+    async fn temp_artifact_inventory(
+        &self,
+        ctx: &Context<'_>,
+        input: GqlTempArtifactInventoryInput,
+    ) -> Result<GqlTempArtifactInventory> {
+        // Operator-only gate (SEC-P089-HIGH-002), matching MCP and the
+        // chainworks://runs/{run_id}/temp-artifact-inventory resource lane.
+        require_operator_read(ctx).await?;
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| Error::new("unauthorized"))?;
+        match crate::types::temp_artifact_inventory::backend() {
+            Some(backend) => {
+                let params = crate::types::temp_artifact_inventory::to_backend_params(&input);
+                match backend.inventory_preview(params, principal).await {
+                    // `backend.inventory_preview` (installed as `McpTempArtifactInventoryBackend`,
+                    // which delegates to `temp_artifacts::inventory_preview`) already runs `raw`
+                    // through `enforce_lane_parity_and_redaction("graphql", ..)` before returning
+                    // it, so `raw` here is already guaranteed redaction-safe and its parity metric
+                    // is already recorded once. A second independent check + a second metric
+                    // record here would double-count the same lane's parity metric per request,
+                    // and — since this duplicate check never substituted a safe payload on an
+                    // "unsafe" verdict — was itself a residual fail-open path. Project it directly.
+                    Ok(raw) => Ok(crate::types::temp_artifact_inventory::from_canonical_json(
+                        &raw,
+                    )),
+                    // A backend error means the scan attempt failed, not that the
+                    // feature is intentionally disabled. Collapsing this into a
+                    // disabled-shaped payload would let a real outage read as
+                    // "kill switch is off" to any consumer/monitor of this lane.
+                    Err(_) => Ok(
+                        crate::types::temp_artifact_inventory::build_integrity_error_inventory(),
+                    ),
+                }
+            }
+            None => Ok(
+                crate::types::temp_artifact_inventory::build_not_wired_inventory(
+                    input.include_dry_run,
+                ),
+            ),
+        }
     }
 }
 
@@ -9733,6 +9784,7 @@ mod tests {
             raw_output_exists: true,
             receipt_exists: false,
             transcript_exists: true,
+            diagnostic_artifact_paths: Vec::new(),
             recovery_recommendation: RecoveryRecommendation {
                 action: "retry_failed_agent".to_string(),
                 explanation: "Retry the agent with the same inputs.".to_string(),
@@ -15546,6 +15598,47 @@ mod tests {
 
     fn operator_principal() -> auth::Principal {
         auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
+    }
+
+    #[tokio::test]
+    async fn p089_temp_artifact_inventory_query_is_operator_only() {
+        let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot).finish();
+        let query = r#"{
+              tempArtifactInventory(input: {
+                runId: "00000000-0000-0000-0000-000000000089"
+              }) {
+                schemaVersion
+                status
+              }
+            }"#;
+
+        let missing_principal = schema.execute(Request::new(query)).await;
+        assert!(
+            missing_principal
+                .errors
+                .iter()
+                .any(|error| error.message.contains("unauthorized")),
+            "missing principal must be rejected: {missing_principal:?}"
+        );
+
+        let observer = schema
+            .execute(Request::new(query).data(observer_principal()))
+            .await;
+        assert!(
+            observer
+                .errors
+                .iter()
+                .any(|error| error.message.contains("forbidden")),
+            "observer must be rejected: {observer:?}"
+        );
+
+        let operator = schema
+            .execute(Request::new(query).data(operator_principal()))
+            .await;
+        assert!(
+            operator.errors.is_empty(),
+            "operator must reach the read-only resolver: {operator:?}"
+        );
     }
 
     async fn force_p081_audit_budget_safe_mode(pool: &SqlitePool) {

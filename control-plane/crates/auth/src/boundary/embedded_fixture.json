@@ -7,8 +7,14 @@
     {
       "row_id": "p081.ui_operator.graphql_query.read",
       "caller_class": "ui_operator",
-      "transports": ["graphql_query"],
-      "actions": ["runs.get", "approvals.get", "artifacts.get"],
+      "transports": [
+        "graphql_query"
+      ],
+      "actions": [
+        "runs.get",
+        "approvals.get",
+        "artifacts.get"
+      ],
       "allow": {
         "enabled": true,
         "wildcard": false,
@@ -40,8 +46,14 @@
     {
       "row_id": "p081.ui_operator.graphql_subscription.subscribe",
       "caller_class": "ui_operator",
-      "transports": ["graphql_subscription"],
-      "actions": ["runs.subscribe", "approvals.subscribe", "artifacts.subscribe"],
+      "transports": [
+        "graphql_subscription"
+      ],
+      "actions": [
+        "runs.subscribe",
+        "approvals.subscribe",
+        "artifacts.subscribe"
+      ],
       "allow": {
         "enabled": true,
         "wildcard": false,
@@ -73,8 +85,13 @@
     {
       "row_id": "p081.ui_operator.graphql_mutation.approval_action",
       "caller_class": "ui_operator",
-      "transports": ["graphql_mutation"],
-      "actions": ["approveApproval", "rejectApproval"],
+      "transports": [
+        "graphql_mutation"
+      ],
+      "actions": [
+        "approveApproval",
+        "rejectApproval"
+      ],
       "allow": {
         "enabled": true,
         "wildcard": false,
@@ -107,8 +124,12 @@
     {
       "row_id": "p081.agent_operator.mcp_initialize.capability",
       "caller_class": "agent_operator",
-      "transports": ["mcp_initialize"],
-      "actions": ["initialize"],
+      "transports": [
+        "mcp_initialize"
+      ],
+      "actions": [
+        "initialize"
+      ],
       "allow": {
         "enabled": true,
         "wildcard": false,
@@ -138,8 +159,14 @@
     {
       "row_id": "p081.agent_operator.mcp_tools_list.discovery",
       "caller_class": "agent_operator",
-      "transports": ["mcp_tools_list"],
-      "actions": ["tools/list", "resources.list", "resources.templates.list"],
+      "transports": [
+        "mcp_tools_list"
+      ],
+      "actions": [
+        "tools/list",
+        "resources.list",
+        "resources.templates.list"
+      ],
       "allow": {
         "enabled": true,
         "wildcard": false,
@@ -169,8 +196,24 @@
     {
       "row_id": "p081.agent_operator.mcp_tools_call.command",
       "caller_class": "agent_operator",
-      "transports": ["mcp_tools_call"],
-      "actions": ["runs.*", "ideas.*", "approvals.*", "stages.*", "reports.*", "artifacts.*", "steward.*", "storage.*", "runtime.*", "boundary.*", "effects.*", "resources.*"],
+      "transports": [
+        "mcp_tools_call"
+      ],
+      "actions": [
+        "runs.*",
+        "ideas.*",
+        "approvals.*",
+        "stages.*",
+        "reports.*",
+        "artifacts.*",
+        "steward.*",
+        "storage.*",
+        "runtime.*",
+        "boundary.*",
+        "effects.*",
+        "resources.*",
+        "temp_artifacts.*"
+      ],
       "allow": {
         "enabled": true,
         "wildcard": true,
@@ -203,8 +246,14 @@
     {
       "row_id": "p081.automation.mcp_tools_list.discovery",
       "caller_class": "automation",
-      "transports": ["mcp_tools_list"],
-      "actions": ["tools/list", "resources.list", "resources.templates.list"],
+      "transports": [
+        "mcp_tools_list"
+      ],
+      "actions": [
+        "tools/list",
+        "resources.list",
+        "resources.templates.list"
+      ],
       "allow": {
         "enabled": true,
         "wildcard": false,
@@ -234,8 +283,24 @@
     {
       "row_id": "p081.automation.mcp_tools_call.command",
       "caller_class": "automation",
-      "transports": ["mcp_tools_call"],
-      "actions": ["runs.*", "ideas.*", "approvals.*", "stages.*", "reports.*", "artifacts.*", "steward.*", "storage.*", "runtime.*", "boundary.*", "effects.*", "resources.*"],
+      "transports": [
+        "mcp_tools_call"
+      ],
+      "actions": [
+        "runs.*",
+        "ideas.*",
+        "approvals.*",
+        "stages.*",
+        "reports.*",
+        "artifacts.*",
+        "steward.*",
+        "storage.*",
+        "runtime.*",
+        "boundary.*",
+        "effects.*",
+        "resources.*",
+        "temp_artifacts.*"
+      ],
       "allow": {
         "enabled": true,
         "wildcard": true,
@@ -267,16 +332,25 @@
     {
       "row_id": "p081.observer.mcp_tools_call.compact_read",
       "caller_class": "observer",
-      "transports": ["mcp_tools_call"],
+      "transports": [
+        "mcp_tools_call"
+      ],
       "actions": [
-        "runtime.health", "boundary.runtime.get",
-        "runs.list", "runs.get",
-        "approvals.list", "approvals.get",
-        "stages.list", "stages.get",
-        "artifacts.list", "artifacts.get",
-        "reports.list", "reports.get",
+        "runtime.health",
+        "boundary.runtime.get",
+        "runs.list",
+        "runs.get",
+        "approvals.list",
+        "approvals.get",
+        "stages.list",
+        "stages.get",
+        "artifacts.list",
+        "artifacts.get",
+        "reports.list",
+        "reports.get",
         "steward.status",
-        "resources.list", "resources.read"
+        "resources.list",
+        "resources.read"
       ],
       "allow": {
         "enabled": true,
@@ -308,8 +382,12 @@
     {
       "row_id": "p081.observer.graphql_query.read_only_opt_in",
       "caller_class": "observer",
-      "transports": ["graphql_query"],
-      "actions": ["graphql.read_only"],
+      "transports": [
+        "graphql_query"
+      ],
+      "actions": [
+        "graphql.read_only"
+      ],
       "allow": {
         "enabled": true,
         "wildcard": false,
@@ -341,8 +419,12 @@
     {
       "row_id": "p081.developer_break_glass.debug_endpoint.disabled",
       "caller_class": "developer_break_glass",
-      "transports": ["debug_endpoint"],
-      "actions": ["debug.preflight"],
+      "transports": [
+        "debug_endpoint"
+      ],
+      "actions": [
+        "debug.preflight"
+      ],
       "allow": {
         "enabled": false,
         "wildcard": false,

@@ -222,15 +222,22 @@ pub async fn execute(
                     .await?;
             let all_artifacts = artifacts::list_by_run(pool, run_id).await?;
             let rollout_contract_readback = rollout_contract_readback_json(pool, run_id).await?;
+            // Compute the P089 temp artifact inventory once for the whole reports.get
+            // call and reuse it everywhere below. Each artifact independently
+            // re-scanning the filesystem (SR-HIGH-002) turns one read into N+1 full
+            // scans with no aggregate deadline/response-size bound.
+            let temp_artifact_inventory_dto =
+                p089_temp_artifact_inventory_run_report_section(run_id, &principal.class).await;
             let mut reports = Vec::new();
             for artifact in all_artifacts.into_iter() {
                 if artifact.report_kind.is_some() || is_release_report_artifact(&artifact.name) {
                     reports.push(
-                        artifact_report_json(
+                        artifact_report_json_with_temp_artifact_inventory(
                             pool,
                             &artifact,
                             Some(&rollout_contract_readback),
                             &principal.class,
+                            Some(&temp_artifact_inventory_dto),
                         )
                         .await?,
                     );
@@ -277,6 +284,7 @@ pub async fn execute(
                 "p080_reconciliation": db::repos::p080::p080_run_report_section_for_report(pool, &run_id.to_string()).await,
                 "implementation_closeout_readiness_summary": closeout_readiness_summary.clone(),
                 "closeout_readiness_summary": closeout_readiness_summary,
+                "temp_artifact_inventory": temp_artifact_inventory_dto.clone(),
             }));
             if let Some(projection) =
                 db::repos::artifact_contracts::find_run_state_projection(pool, run_id).await?
@@ -1585,6 +1593,28 @@ pub(crate) async fn artifact_report_json(
     rollout_contract_readback: Option<&serde_json::Value>,
     principal_class: &auth::PrincipalClass,
 ) -> Result<serde_json::Value> {
+    artifact_report_json_with_temp_artifact_inventory(
+        pool,
+        artifact,
+        rollout_contract_readback,
+        principal_class,
+        None,
+    )
+    .await
+}
+
+/// Same as [`artifact_report_json`], but accepts an already-computed P089 temp
+/// artifact inventory DTO to embed instead of scanning again. Callers that
+/// project multiple report/release artifacts for the same run MUST scan once
+/// and pass the result here; otherwise every artifact independently re-runs a
+/// full filesystem scan (SR-HIGH-002: reports.get N+1 amplification).
+pub(crate) async fn artifact_report_json_with_temp_artifact_inventory(
+    pool: &SqlitePool,
+    artifact: &Artifact,
+    rollout_contract_readback: Option<&serde_json::Value>,
+    principal_class: &auth::PrincipalClass,
+    temp_artifact_inventory: Option<&serde_json::Value>,
+) -> Result<serde_json::Value> {
     let mut value = serde_json::to_value(artifact)?;
     if let serde_json::Value::Object(ref mut map) = value {
         map.remove("file_path");
@@ -1618,6 +1648,41 @@ pub(crate) async fn artifact_report_json(
                     p082_lane,
                 )
                 .await?,
+            );
+            // P089: temp_artifact_inventory section in both run_report and release_receipt lanes.
+            // Reuses a precomputed DTO when supplied so N report/release artifacts for one
+            // run share a single scan instead of each triggering its own (SR-HIGH-002).
+            let lane = if is_release_report_artifact(&artifact.name) {
+                "release_receipt"
+            } else {
+                "run_report"
+            };
+            let temp_inventory_section = match temp_artifact_inventory {
+                // The DTO is reused across artifacts for one run (SR-HIGH-002), but each
+                // lane's own parity verdict must still be derived from what this lane is
+                // actually about to embed, not hardcoded — a hardcoded "pass" would keep
+                // recording success even if the reused DTO were ever unsafe.
+                Some(dto) => {
+                    crate::tools::temp_artifacts::record_and_enforce_lane_parity(lane, dto)
+                }
+                None if lane == "release_receipt" => {
+                    p089_temp_artifact_inventory_release_receipt_section(
+                        artifact.run_id,
+                        principal_class,
+                    )
+                    .await
+                }
+                None => {
+                    p089_temp_artifact_inventory_run_report_section(
+                        artifact.run_id,
+                        principal_class,
+                    )
+                    .await
+                }
+            };
+            map.insert(
+                "temp_artifact_inventory".to_string(),
+                temp_inventory_section,
             );
         }
     }
@@ -1822,6 +1887,127 @@ impl From<domain::validation::ValidationFailureRecord> for ValidationFailureReco
     }
 }
 
+// ── P089: temp artifact inventory report projections ─────────────────────────
+
+/// Error-shaped canonical DTO used only if the live scan path itself errors (e.g. the
+/// scan task panics) rather than returning its own disabled/error payload — the
+/// normal disabled-mode and error-mode responses are already produced by
+/// `temp_artifacts::inventory_preview_for_run_resource` and never reach this path.
+///
+/// This is intentionally `status: error`, not `status: disabled` — collapsing a
+/// genuine projection failure into a disabled-shaped payload would mask the failure
+/// from operators and from lane-parity evidence (audit/security-review fail-open
+/// defect: "converts preview failures into a disabled-shaped mode_disabled payload,
+/// masking errors and invalidating lane parity evidence").
+fn p089_temp_artifact_inventory_error_section() -> serde_json::Value {
+    use domain::temp_artifact_inventory::{
+        EnabledState, InventoryErrorCode, InventoryStatus, MutationGuardStatus,
+        TEMP_ARTIFACT_INVENTORY_SCHEMA_VERSION,
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    serde_json::json!({
+        "schema_version": TEMP_ARTIFACT_INVENTORY_SCHEMA_VERSION,
+        "status": InventoryStatus::Error.as_str(),
+        "enabled_state": EnabledState::Unknown.as_str(),
+        "disabled_reason_code": null,
+        "generated_at": now,
+        "limits_applied": {
+            "limit": 0,
+            "timeout_ms": 0,
+            "scan_deadline_at": null,
+            "queue_wait_ms": 0
+        },
+        "summary": {
+            "artifact_tree_count": 0,
+            "estimated_bytes": "0",
+            "active_or_recent_count": 0,
+            "terminal_candidate_count": 0,
+            "orphan_candidate_count": 0,
+            "legacy_unmanaged_count": 0,
+            "scan_error_count": 0,
+            "dry_run_candidate_count": 0,
+            "truncated": false,
+            "queue_wait_ms": 0
+        },
+        "rows": [],
+        "errors": [{"code": InventoryErrorCode::InternalError.as_str(), "message": "<redacted>"}],
+        "dry_run": {
+            "schema_version": "temp_artifact_dry_run_v1",
+            "generated_at": now,
+            "recommendation_counts": {},
+            "mutation_guard": {
+                "status": MutationGuardStatus::Skipped.as_str(),
+                "checked_at": now
+            }
+        },
+        "mutation_guard": {
+            "status": MutationGuardStatus::Skipped.as_str(),
+            "checked_at": now,
+            "no_delete": false,
+            "no_prune": false,
+            "no_chmod": false,
+            "no_persist": false,
+            "no_retry": false
+        }
+    })
+}
+
+/// Returns the P089 temp artifact inventory section for the run_report lane.
+///
+/// Delegates to `temp_artifacts::inventory_preview_raw` — the exact same
+/// mode-check/validation/scan/redaction/mutation-guard path the MCP tool and
+/// resource lane use — so run_report stays at readback parity with MCP. Disabled
+/// mode still short-circuits before any filesystem access, matching MCP exactly.
+/// Uses the `_raw` variant (no internal lane recording) because this function
+/// records its own `"run_report"` verdict below; the wrapped `inventory_preview`
+/// hardcodes a `"graphql"` verdict that would otherwise be misattributed to a
+/// request that never went through the GraphQL resolver.
+///
+/// The `run_report` lane-parity metric is derived from the actual returned DTO
+/// (via `dto_redaction_is_safe`, the same check the mcp/graphql lanes use) rather
+/// than hardcoded to `"pass"` — a hardcoded verdict would keep recording parity
+/// success even if this lane's own projection path ever returned unsafe or failed
+/// content (audit/security-review fail-open defect).
+pub(crate) async fn p089_temp_artifact_inventory_run_report_section(
+    run_id: RunId,
+    principal_class: &auth::PrincipalClass,
+) -> serde_json::Value {
+    let principal = auth::Principal::new(
+        "temp_artifact_inventory_projection",
+        principal_class.clone(),
+    );
+    match crate::tools::temp_artifacts::inventory_preview_raw(
+        serde_json::json!({
+            "run_id": run_id.to_string(),
+            "include_dry_run": true
+        }),
+        &principal,
+    )
+    .await
+    {
+        Ok(dto) => crate::tools::temp_artifacts::record_and_enforce_lane_parity("run_report", &dto),
+        Err(_) => {
+            db::metrics::record_p089_readback_parity("run_report", "fail");
+            p089_temp_artifact_inventory_error_section()
+        }
+    }
+}
+
+/// Returns the P089 temp artifact inventory section for the release_receipt lane.
+/// The release receipt carries the same complete canonical DTO as the run report;
+/// consumers that only need the promotion summary can ignore rows and limits, but
+/// the lane itself must remain lossless for parity checks.
+///
+/// The `release_receipt` lane-parity metric is derived independently from the same
+/// DTO the run_report lane already validated, rather than hardcoded to `"pass"`.
+pub(crate) async fn p089_temp_artifact_inventory_release_receipt_section(
+    run_id: RunId,
+    principal_class: &auth::PrincipalClass,
+) -> serde_json::Value {
+    let dto = p089_temp_artifact_inventory_run_report_section(run_id, principal_class).await;
+    crate::tools::temp_artifacts::record_and_enforce_lane_parity("release_receipt", &dto)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1946,6 +2132,7 @@ mod tests {
                 action: "retry_failed_agent".to_string(),
                 explanation: "Retry the agent with the same inputs.".to_string(),
             },
+            diagnostic_artifact_paths: vec![],
         }
     }
 
@@ -3581,5 +3768,280 @@ mod tests {
             op.get("fallback_principal_capability_hash").is_some(),
             "fallback_principal_capability_hash must be present for operator"
         );
+    }
+
+    #[tokio::test]
+    async fn p089_run_report_section_has_required_schema_fields() {
+        let _guard = crate::tools::temp_artifacts::temp_artifact_inventory_env_test_lock();
+        std::env::remove_var("CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE");
+        let section = p089_temp_artifact_inventory_run_report_section(
+            RunId::new(),
+            &auth::PrincipalClass::Operator,
+        )
+        .await;
+        assert_eq!(
+            section["schema_version"].as_str().unwrap_or(""),
+            "temp_artifact_inventory_v1",
+            "schema_version must match constant"
+        );
+        assert_eq!(section["status"].as_str().unwrap_or(""), "disabled");
+        assert_eq!(section["enabled_state"].as_str().unwrap_or(""), "disabled");
+        assert!(
+            section.get("generated_at").is_some(),
+            "generated_at required"
+        );
+        assert!(
+            section.get("limits_applied").is_some(),
+            "limits_applied required"
+        );
+        assert!(section.get("summary").is_some(), "summary required");
+        assert!(section["rows"].is_array(), "rows must be array");
+        assert!(section["errors"].is_array(), "errors must be array");
+        assert!(
+            section.get("mutation_guard").is_some(),
+            "mutation_guard required"
+        );
+    }
+
+    #[tokio::test]
+    async fn p089_run_report_section_mutation_guard_no_delete() {
+        let _guard = crate::tools::temp_artifacts::temp_artifact_inventory_env_test_lock();
+        std::env::remove_var("CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE");
+        let section = p089_temp_artifact_inventory_run_report_section(
+            RunId::new(),
+            &auth::PrincipalClass::Operator,
+        )
+        .await;
+        let guard = &section["mutation_guard"];
+        assert_eq!(guard["no_delete"], true);
+        assert_eq!(guard["no_prune"], true);
+        assert_eq!(guard["no_chmod"], true);
+        assert_eq!(guard["no_persist"], true);
+        assert_eq!(guard["no_retry"], true);
+    }
+
+    #[tokio::test]
+    async fn p089_run_report_section_summary_has_byte_count_string() {
+        let _guard = crate::tools::temp_artifacts::temp_artifact_inventory_env_test_lock();
+        std::env::remove_var("CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE");
+        let section = p089_temp_artifact_inventory_run_report_section(
+            RunId::new(),
+            &auth::PrincipalClass::Operator,
+        )
+        .await;
+        let summary = &section["summary"];
+        assert_eq!(
+            summary["estimated_bytes"].as_str().unwrap_or(""),
+            "0",
+            "estimated_bytes must be ByteCountString '0'"
+        );
+    }
+
+    #[tokio::test]
+    async fn p089_release_receipt_section_has_required_fields() {
+        let _guard = crate::tools::temp_artifacts::temp_artifact_inventory_env_test_lock();
+        std::env::remove_var("CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE");
+        let section = p089_temp_artifact_inventory_release_receipt_section(
+            RunId::new(),
+            &auth::PrincipalClass::Operator,
+        )
+        .await;
+        assert_eq!(
+            section["schema_version"].as_str().unwrap_or(""),
+            "temp_artifact_inventory_v1"
+        );
+        assert_eq!(section["status"].as_str().unwrap_or(""), "disabled");
+        assert_eq!(section["enabled_state"].as_str().unwrap_or(""), "disabled");
+        assert!(
+            section.get("generated_at").is_some(),
+            "generated_at required"
+        );
+        assert!(
+            section.get("mutation_guard").is_some(),
+            "mutation_guard required"
+        );
+    }
+
+    #[tokio::test]
+    async fn p089_release_receipt_section_mutation_guard_no_delete() {
+        let _guard = crate::tools::temp_artifacts::temp_artifact_inventory_env_test_lock();
+        std::env::remove_var("CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE");
+        let section = p089_temp_artifact_inventory_release_receipt_section(
+            RunId::new(),
+            &auth::PrincipalClass::Operator,
+        )
+        .await;
+        let guard = &section["mutation_guard"];
+        assert_eq!(guard["no_delete"], true);
+        assert_eq!(guard["no_prune"], true);
+        assert_eq!(guard["no_chmod"], true);
+    }
+
+    #[tokio::test]
+    async fn p089_release_receipt_section_is_full_canonical_dto() {
+        let _guard = crate::tools::temp_artifacts::temp_artifact_inventory_env_test_lock();
+        std::env::remove_var("CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE");
+        let section = p089_temp_artifact_inventory_release_receipt_section(
+            RunId::new(),
+            &auth::PrincipalClass::Operator,
+        )
+        .await;
+        for field in [
+            "limits_applied",
+            "summary",
+            "rows",
+            "errors",
+            "dry_run",
+            "mutation_guard",
+        ] {
+            assert!(
+                section.get(field).is_some(),
+                "release receipt must retain canonical field {field}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn p089_run_report_section_dry_run_present_by_default() {
+        let _guard = crate::tools::temp_artifacts::temp_artifact_inventory_env_test_lock();
+        std::env::remove_var("CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE");
+        let section = p089_temp_artifact_inventory_run_report_section(
+            RunId::new(),
+            &auth::PrincipalClass::Operator,
+        )
+        .await;
+        assert!(
+            !section["dry_run"].is_null(),
+            "run_report lane includes dry_run by default"
+        );
+        assert_eq!(
+            section["dry_run"]["schema_version"].as_str().unwrap_or(""),
+            "temp_artifact_dry_run_v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn p089_enabled_mcp_run_report_and_release_receipt_are_lossless() {
+        let _guard = crate::tools::temp_artifacts::temp_artifact_inventory_env_test_lock();
+        let meta_root = tempfile::TempDir::new().expect("meta root");
+        let cache_root = tempfile::TempDir::new().expect("cache root");
+        let provider_home_root = tempfile::TempDir::new().expect("provider home root");
+        let legacy_root = tempfile::TempDir::new().expect("legacy root");
+        let run_id = RunId::new();
+        let artifact_tree = meta_root
+            .path()
+            .join("runs")
+            .join(run_id.to_string())
+            .join("artifact-tree");
+        std::fs::create_dir_all(&artifact_tree).expect("artifact tree");
+        std::fs::write(artifact_tree.join("payload.bin"), b"inventory fixture")
+            .expect("fixture payload");
+
+        std::env::set_var("CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE", "hidden_readback");
+        std::env::set_var("CHAINWORKS_META_ROOT", meta_root.path());
+        std::env::set_var(
+            "CHAINWORKS_TEMP_ARTIFACT_CONTROL_PLANE_CACHE_ROOT",
+            cache_root.path(),
+        );
+        std::env::set_var(
+            "CHAINWORKS_TEMP_ARTIFACT_PROVIDER_HOME_FALLBACK_ROOT",
+            provider_home_root.path(),
+        );
+        std::env::set_var(
+            "CHAINWORKS_TEMP_ARTIFACT_LEGACY_TMP_ROOT",
+            legacy_root.path(),
+        );
+
+        let principal = auth::Principal::new("p089_parity_test", auth::PrincipalClass::Operator);
+        let mcp = crate::tools::temp_artifacts::inventory_preview(
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "include_dry_run": true
+            }),
+            &principal,
+        )
+        .await
+        .expect("mcp inventory");
+        let run_report = p089_temp_artifact_inventory_run_report_section(
+            run_id,
+            &auth::PrincipalClass::Operator,
+        )
+        .await;
+        let release_receipt = p089_temp_artifact_inventory_release_receipt_section(
+            run_id,
+            &auth::PrincipalClass::Operator,
+        )
+        .await;
+
+        for (lane, value) in [
+            ("run_report", &run_report),
+            ("release_receipt", &release_receipt),
+        ] {
+            assert_eq!(value["schema_version"], mcp["schema_version"], "{lane}");
+            assert_eq!(value["status"], mcp["status"], "{lane}");
+            assert_eq!(value["enabled_state"], mcp["enabled_state"], "{lane}");
+            // Compare summary fields individually, excluding `queue_wait_ms`: this
+            // test drives three independent live filesystem scans (mcp, run_report,
+            // release_receipt), and queue_wait_ms is a real wall-clock-derived
+            // duration that can legitimately differ by a millisecond or two between
+            // them. A whole-object equality here was flaky, not a real lossless-ness
+            // regression — queue_wait_ms is still asserted present/non-negative.
+            for field in [
+                "artifact_tree_count",
+                "estimated_bytes",
+                "active_or_recent_count",
+                "terminal_candidate_count",
+                "orphan_candidate_count",
+                "legacy_unmanaged_count",
+                "scan_error_count",
+                "dry_run_candidate_count",
+                "truncated",
+            ] {
+                assert_eq!(
+                    value["summary"][field], mcp["summary"][field],
+                    "{lane}.summary.{field}"
+                );
+            }
+            assert!(
+                value["summary"]["queue_wait_ms"].as_i64().unwrap_or(-1) >= 0,
+                "{lane}.summary.queue_wait_ms must be present and non-negative"
+            );
+            assert_eq!(value["errors"], mcp["errors"], "{lane}");
+            assert_eq!(
+                value["mutation_guard"]["status"], mcp["mutation_guard"]["status"],
+                "{lane}"
+            );
+            assert_eq!(value["rows"].as_array().map(Vec::len), Some(1), "{lane}");
+
+            for field in [
+                "path_display",
+                "path_hash",
+                "path_hash_short",
+                "correlation_key",
+                "root_kind",
+                "artifact_kind",
+                "manifest_state",
+                "lifecycle_classification",
+                "dry_run_recommendation",
+                "estimated_size_bytes",
+                "last_touched_at",
+                "active_process_evidence",
+                "owner",
+                "owner_inference",
+                "status_token",
+                "partial_errors",
+            ] {
+                assert_eq!(
+                    value["rows"][0][field], mcp["rows"][0][field],
+                    "{lane}.{field}"
+                );
+            }
+        }
+
+        std::env::remove_var("CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE");
+        std::env::remove_var("CHAINWORKS_META_ROOT");
+        std::env::remove_var("CHAINWORKS_TEMP_ARTIFACT_CONTROL_PLANE_CACHE_ROOT");
+        std::env::remove_var("CHAINWORKS_TEMP_ARTIFACT_PROVIDER_HOME_FALLBACK_ROOT");
+        std::env::remove_var("CHAINWORKS_TEMP_ARTIFACT_LEGACY_TMP_ROOT");
     }
 }

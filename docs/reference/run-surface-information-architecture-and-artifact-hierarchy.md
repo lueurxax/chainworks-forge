@@ -80,7 +80,7 @@ The implemented `Runs` pane contract is:
 
 `Artifacts` owns the canonical hierarchy browser plus promoted artifacts and authorized preview state.
 
-`Approvals` owns inline approval rows and fail-closed P085 actionability. `Timeline` owns active-agent readback and summary behavior. `Reports` owns report metadata and payload availability. `System` owns daemon, scheduler, readiness, and recovery evidence.
+`Approvals` owns inline approval rows and fail-closed P085 actionability. `Timeline` owns active-agent readback and summary behavior. `Reports` owns report metadata and payload availability, plus the read-only temporary artifact inventory diagnostics panel, which is visible only when the `TempArtifactDiagnosticsVisible` preference is true and the backend reports `mode = operator_visible` — see [managed-temporary-artifact-inventory.md](managed-temporary-artifact-inventory.md#12-packaged-app-surface-contract). `System` owns daemon, scheduler, readiness, and recovery evidence.
 
 ### Ideas owns compact projected status
 

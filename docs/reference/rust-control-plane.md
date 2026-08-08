@@ -174,6 +174,7 @@ Tools are namespaced:
 | `effects.*` | `effects.list`, `effects.inspect`, `effects.reconcile`, `effects.mark_unrecoverable`, `effects.clear_after_manual_verification` |
 | `reports.*` | `reports.get` |
 | `p080.*` | `p080.diagnostics.get.v1`, `p080.reconcile.request.v1`, `p080.clear_permanent_hold.v1` |
+| `temp_artifacts.*` | `temp_artifacts.inventory.preview` (read-only advisory inventory; disabled by default — see [managed-temporary-artifact-inventory.md](managed-temporary-artifact-inventory.md)) |
 
 **Implementation self-assessment detail extension:**
 `runs.get` and `runs.list` (detail view) include `implementation_self_assessment_summary` in the response payload.
@@ -204,6 +205,7 @@ Resources follow two URI families:
 - `chainworks://approvals/inbox` -- pending approvals
 - `chainworks://runs/{run_id}/stages` -- stage summaries
 - `chainworks://runs/{run_id}/artifacts` -- artifact index
+- `chainworks://runs/{run_id}/temp-artifact-inventory` -- read-only advisory temporary artifact inventory (Operator-only, disabled by default — see [managed-temporary-artifact-inventory.md](managed-temporary-artifact-inventory.md))
 
 Implementation: `crates/mcp-server/src/server.rs` (dispatch and resource reads), `crates/mcp-server/src/tools/` (per-namespace handlers).
 
@@ -868,6 +870,7 @@ The service returns a `RecoverySummary` with counts of inspected runs, repaired 
 | `CHAINWORKS_INVOKE_AGENT_GLOBAL_CAP` | `20` | Global active agent execution cap |
 | `CHAINWORKS_INVOKE_AGENT_PER_RUN_CAP` | `4` | Per-run active agent execution cap |
 | `CHAINWORKS_INVOKE_AGENT_PROVIDER_CAP_{PROVIDER}` | varies | Provider-specific active execution caps (e.g. `_CLAUDE`, `_GEMINI`, `_CODEX`) |
+| `CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE` | `disabled` | `disabled\|hidden_readback\|operator_visible` for the read-only temporary artifact inventory. `disabled` scans nothing. Root-discovery and diagnostic-allowlist overrides (`CHAINWORKS_TEMP_ARTIFACT_*`) are documented in [managed-temporary-artifact-inventory.md](managed-temporary-artifact-inventory.md#33-scan-root-discovery) |
 
 Provider binary paths (required when executing agents):
 

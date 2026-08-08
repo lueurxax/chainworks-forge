@@ -652,6 +652,9 @@ struct RunsHomeView: View {
                         )
                     case .reports:
                         P031ReportMetadataCard(rows: workbench.reportRows)
+                        if let runID = runDetail.runID {
+                            TempArtifactInventoryView(runID: runID)
+                        }
                     case .system:
                         if let health = workbench.freshnessAndHealth {
                             P036SystemReadinessCard(health: health)

@@ -1465,6 +1465,7 @@ dependencies = [
  "domain",
  "engine",
  "graphql-server",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

@@ -173,6 +173,27 @@ pub const P094_REQUIRED_METRICS: &[&str] = &[
     "quality_gate_blocker_boundary_route_total",
 ];
 
+/// P089 bounded operational metrics from rollout_contract_v1.
+pub const P089_REQUIRED_METRICS: &[&str] = &[
+    "p089_temp_inventory_smoke_gate_pass_total",
+    "temp_artifact_inventory_scan_total",
+    "temp_artifact_inventory_scan_duration_ms",
+    "temp_artifact_inventory_rows_total",
+    "temp_artifact_inventory_estimated_bytes",
+    "temp_artifact_inventory_scan_rejected_total",
+    "temp_artifact_inventory_cancel_total",
+    "temp_artifact_inventory_deadline_exceeded_total",
+    "temp_artifact_inventory_queue_wait_ms",
+    "temp_artifact_inventory_permit_reclaimed_total",
+    "temp_artifact_dry_run_recommendation_total",
+    "temp_artifact_inventory_scan_error_total",
+    "temp_artifact_inventory_mutation_guard_total",
+    "temp_artifact_inventory_readback_parity_total",
+    "temp_artifact_inventory_redaction_failure_total",
+    "temp_artifact_inventory_remote_ui_accessibility_total",
+    "temp_artifact_inventory_metric_health_total",
+];
+
 pub const P081_REQUIRED_METRICS: &[&str] = &[
     "p081_boundary_policy_enforcement_parity_percent",
     "boundary_policy_decisions_total",
@@ -264,6 +285,350 @@ pub const P080_REQUIRED_METRICS: &[&str] = &[
 
 fn metrics() -> &'static Mutex<SystemMetrics> {
     METRICS.get_or_init(|| Mutex::new(SystemMetrics::default()))
+}
+
+const P089_STATUS_DOMAIN: &[&str] = &[
+    "complete",
+    "partial",
+    "timeout",
+    "cancelled",
+    "error",
+    "disabled",
+    "resource_exhausted",
+    "unknown",
+];
+const P089_ROOT_KIND_DOMAIN: &[&str] = &[
+    "run_meta_root",
+    "control_plane_cache",
+    "provider_home_copy",
+    "legacy_chainworks_tmp",
+    "diagnostic_test_root",
+    "unknown",
+];
+const P089_MODE_DOMAIN: &[&str] = &["disabled", "hidden_readback", "operator_visible"];
+const P089_CLASSIFICATION_DOMAIN: &[&str] = &[
+    "active_or_recent",
+    "terminal_candidate",
+    "orphan_candidate",
+    "legacy_unmanaged",
+    "scan_error",
+    "unknown",
+];
+const P089_RECOMMENDATION_DOMAIN: &[&str] = &[
+    "would_keep_active",
+    "would_keep_recent",
+    "would_preserve_failure_evidence",
+    "would_delete_after_future_approval",
+    "would_migrate_legacy_manifest_after_future_migration_enabled",
+    "needs_operator_review",
+    "no_recommendation",
+    "unknown",
+];
+const P089_ERROR_CODE_DOMAIN: &[&str] = &[
+    "invalid_root_override",
+    "root_unreadable",
+    "manifest_parse_failed",
+    "size_estimation_failed",
+    "deadline_exceeded",
+    "cancelled",
+    "internal_error",
+    "mutation_guard_failed",
+    "resource_exhausted",
+    "unknown",
+];
+const P089_GUARD_STATUS_DOMAIN: &[&str] = &["pass", "fail", "skipped", "unknown"];
+const P089_LANE_DOMAIN: &[&str] = &["run_report", "mcp", "release_receipt", "graphql"];
+const P089_PARITY_STATUS_DOMAIN: &[&str] = &["pass", "fail", "unknown"];
+const P089_HEALTH_STATUS_DOMAIN: &[&str] = &["pass", "fail", "unknown"];
+
+/// rollout_contract_v1 decision_vocabulary, shared by the P089 gate-pass adoption metric.
+const P089_GATE_PASS_STATUS_DOMAIN: &[&str] =
+    &["pass", "fail", "waived", "not_applicable", "timeout"];
+
+fn p089_all_bounded(values: &[(&str, &[&str])]) -> bool {
+    values.iter().all(|(value, domain)| domain.contains(value))
+}
+
+pub fn record_p089_inventory_scan(status: &str, root_kind: &str, mode: &str, duration_ms: u64) {
+    if !p089_all_bounded(&[
+        (status, P089_STATUS_DOMAIN),
+        (root_kind, P089_ROOT_KIND_DOMAIN),
+        (mode, P089_MODE_DOMAIN),
+    ]) {
+        record_p089_metric_health("fail");
+        return;
+    }
+    increment_counter("temp_artifact_inventory_scan_total");
+    increment_counter_with_label(
+        "temp_artifact_inventory_scan_total",
+        &format!("status={status},root_kind={root_kind},mode={mode}"),
+    );
+    record_labeled_histogram(
+        "temp_artifact_inventory_scan_duration_ms",
+        &[("root_kind", root_kind), ("mode", mode)],
+        duration_ms,
+    );
+}
+
+pub fn record_p089_inventory_row(
+    root_kind: &str,
+    manifest_state: &str,
+    lifecycle_classification: &str,
+    artifact_kind: &str,
+    estimated_bytes: u64,
+) {
+    if !p089_all_bounded(&[
+        (root_kind, P089_ROOT_KIND_DOMAIN),
+        (lifecycle_classification, P089_CLASSIFICATION_DOMAIN),
+    ]) {
+        record_p089_metric_health("fail");
+        return;
+    }
+    let manifest_state = match manifest_state {
+        "present" | "missing" | "invalid" | "unknown" => manifest_state,
+        _ => "unknown",
+    };
+    let artifact_kind = match artifact_kind {
+        "run_output" | "provider_home" | "cache" | "legacy_tmp" | "unknown" => artifact_kind,
+        _ => "unknown",
+    };
+    increment_counter("temp_artifact_inventory_rows_total");
+    increment_counter_with_label(
+        "temp_artifact_inventory_rows_total",
+        &format!(
+            "root_kind={root_kind},manifest_state={manifest_state},lifecycle_classification={lifecycle_classification}"
+        ),
+    );
+    record_labeled_histogram(
+        "temp_artifact_inventory_estimated_bytes",
+        &[("root_kind", root_kind), ("artifact_kind", artifact_kind)],
+        estimated_bytes,
+    );
+}
+
+pub fn record_p089_scan_rejected(reason: &str, mode: &str) {
+    let reason = match reason {
+        "resource_exhausted" | "invalid_scope" | "invalid_request" => reason,
+        _ => "invalid_request",
+    };
+    if !P089_MODE_DOMAIN.contains(&mode) {
+        record_p089_metric_health("fail");
+        return;
+    }
+    increment_counter("temp_artifact_inventory_scan_rejected_total");
+    increment_counter_with_label(
+        "temp_artifact_inventory_scan_rejected_total",
+        &format!("reason={reason},mode={mode}"),
+    );
+}
+
+pub fn record_p089_cancel(source: &str, terminal_status: &str) {
+    let source = match source {
+        "explicit_operator" | "refresh_supersede" | "transport_close" | "daemon_shutdown" => source,
+        _ => {
+            record_p089_metric_health("fail");
+            return;
+        }
+    };
+    if !P089_STATUS_DOMAIN.contains(&terminal_status) {
+        record_p089_metric_health("fail");
+        return;
+    }
+    increment_counter("temp_artifact_inventory_cancel_total");
+    increment_counter_with_label(
+        "temp_artifact_inventory_cancel_total",
+        &format!("source={source},terminal_status={terminal_status}"),
+    );
+}
+
+pub fn record_p089_deadline_exceeded(phase: &str, mode: &str) {
+    let phase = match phase {
+        "queue_wait" | "enumeration" | "size_estimation" => phase,
+        _ => {
+            record_p089_metric_health("fail");
+            return;
+        }
+    };
+    if !P089_MODE_DOMAIN.contains(&mode) {
+        record_p089_metric_health("fail");
+        return;
+    }
+    increment_counter("temp_artifact_inventory_deadline_exceeded_total");
+    increment_counter_with_label(
+        "temp_artifact_inventory_deadline_exceeded_total",
+        &format!("phase={phase},mode={mode}"),
+    );
+}
+
+pub fn record_p089_queue_wait(mode: &str, queue_wait_ms: u64) {
+    if !P089_MODE_DOMAIN.contains(&mode) {
+        record_p089_metric_health("fail");
+        return;
+    }
+    record_labeled_histogram(
+        "temp_artifact_inventory_queue_wait_ms",
+        &[("mode", mode)],
+        queue_wait_ms,
+    );
+}
+
+pub fn record_p089_permit_reclaimed(scope: &str, reason: &str) {
+    let scope = match scope {
+        "context" | "global" => scope,
+        _ => {
+            record_p089_metric_health("fail");
+            return;
+        }
+    };
+    let reason = match reason {
+        "panic" | "unwind" | "shutdown_backstop" | "timeout" | "cancelled" => reason,
+        _ => {
+            record_p089_metric_health("fail");
+            return;
+        }
+    };
+    increment_counter("temp_artifact_inventory_permit_reclaimed_total");
+    increment_counter_with_label(
+        "temp_artifact_inventory_permit_reclaimed_total",
+        &format!("scope={scope},reason={reason}"),
+    );
+}
+
+pub fn record_p089_dry_run_recommendation(recommendation: &str) {
+    if !P089_RECOMMENDATION_DOMAIN.contains(&recommendation) {
+        record_p089_metric_health("fail");
+        return;
+    }
+    increment_counter("temp_artifact_dry_run_recommendation_total");
+    increment_counter_with_label(
+        "temp_artifact_dry_run_recommendation_total",
+        &format!("recommendation={recommendation}"),
+    );
+}
+
+pub fn record_p089_scan_error(error_code: &str, root_kind: &str, mode: &str) {
+    if !p089_all_bounded(&[
+        (error_code, P089_ERROR_CODE_DOMAIN),
+        (root_kind, P089_ROOT_KIND_DOMAIN),
+        (mode, P089_MODE_DOMAIN),
+    ]) {
+        record_p089_metric_health("fail");
+        return;
+    }
+    increment_counter("temp_artifact_inventory_scan_error_total");
+    increment_counter_with_label(
+        "temp_artifact_inventory_scan_error_total",
+        &format!("error_code={error_code},root_kind={root_kind},mode={mode}"),
+    );
+}
+
+pub fn record_p089_mutation_guard(guard_status: &str) {
+    if !P089_GUARD_STATUS_DOMAIN.contains(&guard_status) {
+        record_p089_metric_health("fail");
+        return;
+    }
+    increment_counter("temp_artifact_inventory_mutation_guard_total");
+    increment_counter_with_label(
+        "temp_artifact_inventory_mutation_guard_total",
+        &format!("guard_status={guard_status}"),
+    );
+}
+
+pub fn record_p089_readback_parity(lane: &str, parity_status: &str) {
+    if !p089_all_bounded(&[
+        (lane, P089_LANE_DOMAIN),
+        (parity_status, P089_PARITY_STATUS_DOMAIN),
+    ]) {
+        record_p089_metric_health("fail");
+        return;
+    }
+    increment_counter("temp_artifact_inventory_readback_parity_total");
+    increment_counter_with_label(
+        "temp_artifact_inventory_readback_parity_total",
+        &format!("lane={lane},parity_status={parity_status}"),
+    );
+}
+
+pub fn record_p089_redaction_failure(lane: &str) {
+    if !P089_LANE_DOMAIN.contains(&lane) {
+        record_p089_metric_health("fail");
+        return;
+    }
+    increment_counter("temp_artifact_inventory_redaction_failure_total");
+    increment_counter_with_label(
+        "temp_artifact_inventory_redaction_failure_total",
+        &format!("lane={lane}"),
+    );
+}
+
+pub fn record_p089_remote_ui_accessibility(status: &str) {
+    if !P089_HEALTH_STATUS_DOMAIN.contains(&status) {
+        record_p089_metric_health("fail");
+        return;
+    }
+    increment_counter("temp_artifact_inventory_remote_ui_accessibility_total");
+    increment_counter_with_label(
+        "temp_artifact_inventory_remote_ui_accessibility_total",
+        &format!("status={status}"),
+    );
+}
+
+const P089_METRIC_HEALTH_GAUGE: &str = "temp_artifact_inventory_metric_health_status";
+
+pub fn record_p089_metric_health(status: &str) {
+    let bounded = if P089_HEALTH_STATUS_DOMAIN.contains(&status) {
+        status
+    } else {
+        "fail"
+    };
+    increment_counter("temp_artifact_inventory_metric_health_total");
+    increment_counter_with_label(
+        "temp_artifact_inventory_metric_health_total",
+        &format!("status={bounded}"),
+    );
+    // Sticky/latched health gauge (1 = healthy, 0 = latched failure): a health
+    // signal that resets itself back to healthy on the very next successful
+    // request is worse than none, since it can never surface a real recurring
+    // failure to a monitor that samples periodically. Once any fail is recorded,
+    // the gauge stays at 0 until `reset_p089_metric_health_latch` is called
+    // explicitly (an operator/deploy action, never a P089 request-handling path).
+    if bounded == "fail" {
+        set_gauge(P089_METRIC_HEALTH_GAUGE, 0);
+    } else if get_gauge(P089_METRIC_HEALTH_GAUGE) != Some(0) {
+        set_gauge(P089_METRIC_HEALTH_GAUGE, 1);
+    }
+}
+
+/// Explicitly clears a latched P089 metric-health failure. Intentionally not
+/// called from any inventory request-handling path — only an operator/deploy
+/// action should un-latch a previously recorded failure signal.
+pub fn reset_p089_metric_health_latch() {
+    set_gauge(P089_METRIC_HEALTH_GAUGE, 1);
+}
+
+/// Emits the `p089_temp_inventory_smoke_gate_pass_total{status}` adoption metric
+/// declared in rollout_contract_v1. Recorded by the focused
+/// `proposal-089-temp-inventory`/`p089-temp-inventory` gate harness (see
+/// scripts/test-gate.sh) using the same OpenMetrics-shaped-line-on-gate-result
+/// pattern as `record_p082_recovery_matrix_gate_result`; an out-of-vocabulary
+/// status is bounded to `"unknown"` rather than admitted verbatim as a label value.
+pub fn record_p089_gate_pass(status: &str) {
+    let bounded = if P089_GATE_PASS_STATUS_DOMAIN.contains(&status) {
+        status
+    } else {
+        "unknown"
+    };
+    increment_counter("p089_temp_inventory_smoke_gate_pass_total");
+    increment_counter_with_label(
+        "p089_temp_inventory_smoke_gate_pass_total",
+        &format!("status={bounded}"),
+    );
+}
+
+/// Returns the current sticky health gauge value (`Some(0)` = latched failure,
+/// `Some(1)` = healthy, `None` = no P089 metric health event recorded yet).
+pub fn p089_metric_health_gauge() -> Option<u64> {
+    get_gauge(P089_METRIC_HEALTH_GAUGE)
 }
 
 pub fn record_projection_backlog(projection: &str, source: &str, rows: u64, bytes: u64) {
@@ -2287,5 +2652,149 @@ mod tests {
             get_gauge("p079_eligible_output_failures_recovered_percent"),
             Some(0)
         );
+    }
+
+    // `reset_for_tests` mutates the single process-wide metrics singleton, so any
+    // two tests calling it concurrently (the default `cargo test` behavior) can
+    // corrupt each other's assertions. This lock only serializes the P089 metrics
+    // tests against each other; it does not fix the same latent issue in other
+    // pre-existing tests in this module that call `reset_for_tests` unguarded.
+    static P089_METRICS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn proposal_089_metrics_are_declared_recordable_and_bounded() {
+        let _guard = P089_METRICS_TEST_LOCK.lock().unwrap();
+        reset_for_tests();
+        assert_eq!(P089_REQUIRED_METRICS.len(), 17);
+
+        record_p089_gate_pass("pass");
+        record_p089_inventory_scan("complete", "run_meta_root", "hidden_readback", 12);
+        record_p089_inventory_row(
+            "run_meta_root",
+            "present",
+            "active_or_recent",
+            "run_output",
+            3_000_000_000,
+        );
+        record_p089_queue_wait("hidden_readback", 4);
+        record_p089_dry_run_recommendation("would_keep_active");
+        record_p089_scan_error("size_estimation_failed", "run_meta_root", "hidden_readback");
+        record_p089_mutation_guard("pass");
+        record_p089_readback_parity("graphql", "pass");
+        record_p089_metric_health("pass");
+
+        assert_eq!(
+            get_counter("p089_temp_inventory_smoke_gate_pass_total:status=pass"),
+            1
+        );
+        assert_eq!(get_counter("temp_artifact_inventory_scan_total"), 1);
+        assert_eq!(get_counter("temp_artifact_inventory_rows_total"), 1);
+        assert_eq!(
+            get_hot_read_latest("temp_artifact_inventory_estimated_bytes"),
+            Some(3_000_000_000)
+        );
+        assert_eq!(
+            get_counter(
+                "temp_artifact_inventory_readback_parity_total:lane=graphql,parity_status=pass"
+            ),
+            1
+        );
+
+        let rows_before = get_counter("temp_artifact_inventory_rows_total");
+        record_p089_inventory_row(
+            "raw_unbounded_path",
+            "present",
+            "active_or_recent",
+            "run_output",
+            1,
+        );
+        assert_eq!(
+            get_counter("temp_artifact_inventory_rows_total"),
+            rows_before,
+            "unbounded root labels must not be recorded"
+        );
+        assert_eq!(
+            get_counter("temp_artifact_inventory_metric_health_total:status=fail"),
+            1
+        );
+        assert_eq!(
+            p089_metric_health_gauge(),
+            Some(0),
+            "a fail recorded after a pass must leave the sticky gauge latched failed"
+        );
+    }
+
+    #[test]
+    fn proposal_089_gate_pass_metric_bounds_out_of_vocabulary_status() {
+        let _guard = P089_METRICS_TEST_LOCK.lock().unwrap();
+        reset_for_tests();
+        record_p089_gate_pass("some_future_status");
+        assert_eq!(
+            get_counter("p089_temp_inventory_smoke_gate_pass_total:status=unknown"),
+            1,
+            "an out-of-vocabulary status must bound to unknown, not be admitted verbatim as a label"
+        );
+    }
+
+    #[test]
+    fn proposal_089_timeout_permit_reclaim_is_healthy_and_counted() {
+        let _guard = P089_METRICS_TEST_LOCK.lock().unwrap();
+        reset_for_tests();
+        record_p089_metric_health("pass");
+
+        record_p089_permit_reclaimed("context", "timeout");
+        record_p089_permit_reclaimed("global", "timeout");
+
+        assert_eq!(
+            get_counter("temp_artifact_inventory_permit_reclaimed_total"),
+            2
+        );
+        assert_eq!(
+            get_counter(
+                "temp_artifact_inventory_permit_reclaimed_total:scope=context,reason=timeout"
+            ),
+            1
+        );
+        assert_eq!(
+            get_counter(
+                "temp_artifact_inventory_permit_reclaimed_total:scope=global,reason=timeout"
+            ),
+            1
+        );
+        assert_eq!(
+            get_counter("temp_artifact_inventory_metric_health_total:status=fail"),
+            0,
+            "a normal post-timeout worker completion must not latch metric health"
+        );
+        assert_eq!(p089_metric_health_gauge(), Some(1));
+    }
+
+    #[test]
+    fn proposal_089_metric_health_gauge_is_sticky_across_a_later_pass() {
+        let _guard = P089_METRICS_TEST_LOCK.lock().unwrap();
+        reset_for_tests();
+        record_p089_metric_health("pass");
+        assert_eq!(p089_metric_health_gauge(), Some(1));
+
+        record_p089_metric_health("fail");
+        assert_eq!(
+            p089_metric_health_gauge(),
+            Some(0),
+            "a fail must latch the gauge to unhealthy"
+        );
+
+        // Regression: a later pass (e.g. the next successful scan) must not
+        // silently clear a previously latched failure — that would make the
+        // health signal reset itself on every request, which is worse than none.
+        record_p089_metric_health("pass");
+        assert_eq!(
+            p089_metric_health_gauge(),
+            Some(0),
+            "a later pass must not un-latch a prior failure"
+        );
+
+        // Only an explicit reset call clears the latch.
+        reset_p089_metric_health_latch();
+        assert_eq!(p089_metric_health_gauge(), Some(1));
     }
 }

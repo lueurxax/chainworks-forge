@@ -95,9 +95,10 @@ After the current recovery/output/ownership block stabilizes:
 - **P070** typed-boundary consolidation.
   - Refactor only after P082/P083/P088 stop moving the core contracts.
   - Do not use P070 to add product features.
-- **P089** managed temporary artifact lifecycle.
-  - Use if unmanaged temp roots / DerivedData / provider runtime homes continue to create disk pressure.
-  - Keep active worktrees and failure evidence safe.
+- **P089** managed temporary artifact inventory (read-only smoke slice implemented).
+  - Advisory read-only, dry-run-only managed temporary artifact inventory slice, `disabled` by default.
+  - Keeps active worktrees and failure evidence safe by design with no cleanup mutations.
+  - MCP, GraphQL, run-report, release-receipt, and packaged Swift lanes all share one scan path; `operator_visible` promotion is still held on redaction-key initialization reconciliation, contract-fixture reconciliation, and packaged remote UI/accessibility evidence. Deletion and cleanup remain future work — see [reference/managed-temporary-artifact-inventory.md](reference/managed-temporary-artifact-inventory.md#11-implementation-status-by-lane-current-slice).
 - **P093** live agent timeline UX and readability.
   - Improve active-agent timeline readability over existing control-plane readback.
   - Do not recreate Swift-local orchestration state.
@@ -145,7 +146,7 @@ implemented continuation baseline
 Conditional operator/product lanes:
 
 ```text
-P089 temp artifact lifecycle if disk pressure continues
+P089 managed temp artifact inventory read-only smoke slice (all readback lanes); lifecycle deletion future work
 P093 live timeline readability if active-agent visibility remains poor
 P038 compaction if run artifact noise remains high
 P032 productization/dogfood closeout when UI baseline is stable

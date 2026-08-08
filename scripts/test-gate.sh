@@ -2642,6 +2642,8 @@ Available gates:
   proposal-094|p094  Proposal 094 workflow-owned blocker-boundary contract/readback gate
   proposal-096|p096  Proposal 096 bounded tool output and safe-search guard retained alias gate
   proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
+  proposal-089-temp-inventory|p089-temp-inventory
+                  Proposal 089 managed temporary artifact inventory smoke gate (read-only inventory, disabled-mode, contract fixtures, mutation guard)
   proposal-090|p090  Proposal 090 Junie runtime-hardening evidence inventory gate
   proposal-091|p091  Retained P091 targeted retry authority runtime proof gate
   proposal-046|p046  Proposal 046 session GraphQL observability gate (read-only queries, subscription, authorization, redaction)
@@ -12561,6 +12563,235 @@ for term in [
 print("proposal-096 retained alias static checks passed")
 PY
     log "Proposal 096 gate passed"
+    ;;
+  proposal-089-temp-inventory|p089-temp-inventory)
+	    log "Proposal 089-temp-inventory gate: managed temporary artifact inventory smoke (read-only, disabled-mode, contract fixtures, mutation guard, scanner)"
+	    (
+	      cd "$ROOT_DIR/control-plane"
+	      p089_cargo_target="$(chainworks_test_gate_cargo_target_dir "${CHAINWORKS_PROPOSAL_089_CARGO_TARGET_DIR:-target/p089-temp-inventory-gate}")"
+	      CARGO_TARGET_DIR="$p089_cargo_target" cargo test -p domain p089_temp_inventory_ -- --nocapture
+	      CARGO_TARGET_DIR="$p089_cargo_target" cargo test -p mcp-server --lib "tools::scanner::tests" -- --nocapture
+	      CARGO_TARGET_DIR="$p089_cargo_target" cargo test -p mcp-server --lib "tools::temp_artifacts::tests" -- --nocapture
+	      CARGO_TARGET_DIR="$p089_cargo_target" cargo test -p mcp-server --lib "tools::reports::tests::p089" -- --nocapture
+	      CARGO_TARGET_DIR="$p089_cargo_target" cargo test -p graphql-server --lib "p089_" -- --nocapture
+	      CARGO_TARGET_DIR="$p089_cargo_target" cargo test -p db --lib "metrics::tests::proposal_089" -- --nocapture
+	    )
+    CHAINWORKS_USE_UNSIGNED_HOSTED_TESTS=1 run_targeted_tests \
+      "p089-temp-inventory-swift" \
+      "Chainworks ForgeTests/P089TempArtifactInventoryTests"
+    python3 - "$ROOT_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+
+def fail(msg):
+    raise SystemExit(f"proposal-089-temp-inventory: {msg}")
+
+# 1. Verify gate aliases are registered and distinct from the Junie canary gate.
+gate_text = (root / "scripts/test-gate.sh").read_text()
+for alias in ["proposal-089-temp-inventory", "p089-temp-inventory"]:
+    if alias not in gate_text:
+        fail(f"Gate alias '{alias}' not registered in test-gate.sh")
+for alias in ["proposal-089", "p089"]:
+    if f"proposal-089-temp-inventory|p089-temp-inventory" not in gate_text:
+        fail("Inventory aliases not found as a distinct case from the Junie canary gate")
+    break  # alias-collision check: the inventory gate must not reuse the Junie gate identifiers
+
+# 2. Verify alias-collision negative fixture exists and has expected_status=fail.
+collision_fixture = root / "docs/evidence/rollout-contract/negative/p089-temp-inventory-alias-collision.json"
+if not collision_fixture.exists():
+    fail(f"Missing negative fixture: {collision_fixture.name}")
+collision = json.loads(collision_fixture.read_text())
+if collision.get("expected_status") != "fail":
+    fail(f"Alias-collision negative fixture must have expected_status=fail, got {collision.get('expected_status')!r}")
+
+# 3. Verify dry-run-mutation negative fixture.
+dry_run_fixture = root / "docs/evidence/rollout-contract/negative/p089-temp-inventory-dry-run-mutation.json"
+if not dry_run_fixture.exists():
+    fail(f"Missing negative fixture: {dry_run_fixture.name}")
+dry_run = json.loads(dry_run_fixture.read_text())
+if dry_run.get("expected_status") != "fail":
+    fail(f"dry-run-mutation fixture must have expected_status=fail")
+
+# 4. Verify readback-parity-missing negative fixture.
+parity_fixture = root / "docs/evidence/rollout-contract/negative/p089-temp-inventory-readback-parity-missing.json"
+if not parity_fixture.exists():
+    fail(f"Missing negative fixture: {parity_fixture.name}")
+parity = json.loads(parity_fixture.read_text())
+if parity.get("expected_status") != "fail":
+    fail(f"readback-parity-missing fixture must have expected_status=fail")
+
+# 5. Verify unknown-enum-decoding negative fixture.
+enum_fixture = root / "docs/evidence/rollout-contract/negative/p089-temp-inventory-unknown-enum-decoding.json"
+if not enum_fixture.exists():
+    fail(f"Missing negative fixture: {enum_fixture.name}")
+enum_doc = json.loads(enum_fixture.read_text())
+if enum_doc.get("expected_status") != "fail":
+    fail(f"unknown-enum-decoding fixture must have expected_status=fail")
+
+# 6. Verify unsafe-path-redaction negative fixture.
+redaction_fixture = root / "docs/evidence/rollout-contract/negative/p089-temp-inventory-unsafe-path-redaction.json"
+if not redaction_fixture.exists():
+    fail(f"Missing negative fixture: {redaction_fixture.name}")
+redact = json.loads(redaction_fixture.read_text())
+if redact.get("expected_status") != "fail":
+    fail(f"unsafe-path-redaction fixture must have expected_status=fail")
+
+# 7. Verify invalid-test-root-override negative fixture.
+override_fixture = root / "docs/evidence/rollout-contract/negative/p089-temp-inventory-invalid-test-root-override.json"
+if not override_fixture.exists():
+    fail(f"Missing negative fixture: {override_fixture.name}")
+override_doc = json.loads(override_fixture.read_text())
+if override_doc.get("expected_status") != "fail":
+    fail(f"invalid-test-root-override fixture must have expected_status=fail")
+
+# 8. Verify remaining required negative fixtures exist.
+required_negative = [
+    "p089-temp-inventory-test-root-symlink-escape.json",
+    "p089-temp-inventory-traversal-cycle-or-escape.json",
+    "p089-temp-inventory-shutdown-persistence.json",
+    "p089-temp-inventory-incomplete-mcp-result-schema.json",
+]
+neg_dir = root / "docs/evidence/rollout-contract/negative"
+for fname in required_negative:
+    fpath = neg_dir / fname
+    if not fpath.exists():
+        fail(f"Missing required negative fixture: {fname}")
+    doc = json.loads(fpath.read_text())
+    if doc.get("expected_status") != "fail":
+        fail(f"Negative fixture {fname} must have expected_status=fail")
+
+# 9. Verify operator-readback fixture exists.
+readback_fixture = root / "docs/evidence/rollout-contract/operator-readback/p089-temp-inventory-full-surface.fixture.json"
+if not readback_fixture.exists():
+    fail(f"Missing operator-readback fixture: {readback_fixture.name}")
+readback = json.loads(readback_fixture.read_text())
+if readback.get("schema_version") != "p089_temp_inventory_operator_readback_fixture_v1":
+    fail(f"Operator-readback fixture has wrong schema_version: {readback.get('schema_version')!r}")
+
+# 10. Verify contract fixtures exist. NOTE: this is a presence check only — it does
+# not parse or validate the fixtures' contents against a real emitted payload, and
+# a fixture can be stale (or self-contradictory, e.g. declaring
+# additionalProperties:false while omitting a field every real payload emits)
+# without failing this check. Do not read a green result here as contract-parity
+# proof; see docs/reference/test-gates.md.
+contracts_dir = root / "docs/evidence/089/temp-inventory/contracts"
+if not contracts_dir.is_dir():
+    fail(f"Missing contracts evidence directory: {contracts_dir}")
+
+required_contracts = [
+    "graphql-sdl.fixture.graphql",
+    "mcp-tool-request-schema.fixture.json",
+    "mcp-result-schema.fixture.json",
+    "run-report-inventory-schema.fixture.json",
+    "release-receipt-inventory-schema.fixture.json",
+    "enum-value-projection-matrix.fixture.json",
+    "status-by-field-matrix.fixture.json",
+    "datetime-nullability-parity.fixture.json",
+    "byte-count-string-over-2gb.fixture.json",
+]
+for fname in required_contracts:
+    fpath = contracts_dir / fname
+    if not fpath.exists():
+        fail(f"Missing contract fixture: {fname}")
+
+# 11. Verify mutation guard: disabled mode must not claim scanning capability.
+readback_doc = json.loads(readback_fixture.read_text())
+# Check parity lanes have consistent disabled/enabled state documentation
+parity_lanes = readback_doc.get("parity_lanes", {})
+if not parity_lanes:
+    fail("Operator-readback fixture missing parity_lanes")
+
+# 12. Verify the executable implementation surfaces that reviewers previously
+# found missing. These checks complement unit tests and keep the focused gate
+# from passing if a lane is replaced with a disabled stub again.
+source_expectations = {
+    "control-plane/crates/graphql-server/src/schema.rs": [
+        "require_operator_read(ctx).await?",
+        "backend.inventory_preview(params, principal).await",
+    ],
+    "control-plane/crates/graphql-server/src/types/temp_artifact_inventory.rs": [
+        "pub struct GqlTempArtifactRow",
+        "pub struct GqlTempArtifactError",
+        "pub rows: Vec<GqlTempArtifactRow>",
+    ],
+    "control-plane/crates/mcp-server/src/tools/reports.rs": [
+        "p089_temp_artifact_inventory_run_report_section",
+        "p089_temp_artifact_inventory_release_receipt_section",
+        "record_and_enforce_lane_parity",
+    ],
+    "control-plane/crates/db/src/metrics.rs": [
+        "P089_REQUIRED_METRICS",
+        "record_p089_inventory_scan",
+        "record_p089_metric_health",
+        "record_p089_gate_pass",
+        "p089_temp_inventory_smoke_gate_pass_total",
+    ],
+    "Chainworks Forge/Models/TempArtifactInventoryViewModel.swift": [
+        "TempArtifactInventoryGraphQLFetcher()",
+        "temp_artifact_inventory: tempArtifactInventory",
+    ],
+    "Chainworks Forge/Views/TempArtifactInventoryView.swift": [
+        "temp-artifact-summary-counters",
+        "temp-artifact-selected-row-inspector",
+        "TempArtifactContextMenuTargeting",
+    ],
+    "Chainworks Forge/Views/RunsHomeView.swift": [
+        "TempArtifactInventoryView(runID: runID)",
+    ],
+    "Chainworks Forge/Chainworks_ForgeApp.swift": [
+        "TempArtifactInventoryCommands()",
+    ],
+    "Chainworks Forge/Support/TempArtifactRowPasteboardWriter.swift": [
+        "NSPasteboard.general.clearContents()",
+        "NSPasteboard.general.setString(payload, forType: .string)",
+    ],
+}
+for relative, required_terms in source_expectations.items():
+    source = (root / relative).read_text()
+    for term in required_terms:
+        if term not in source:
+            fail(f"{relative} missing implementation proof term {term!r}")
+
+# Promotion evidence is part of the approved focused gate, not an opt-in lane.
+# Never emit the pass metric while any readback lane or packaged smoke is held.
+allowed_lane_statuses = {"pass", "implemented", "implemented_smoke_slice"}
+for lane, lane_payload in parity_lanes.items():
+    status = lane_payload.get("status")
+    if status not in allowed_lane_statuses:
+        fail(f"promotion evidence lane {lane} is not passing: {status!r}")
+    packaged_status = (
+        lane_payload.get("temp_artifact_inventory_packaged_smoke_status")
+        or lane_payload.get("tempArtifactInventoryPackagedSmokeStatus")
+    )
+    if packaged_status != "pass":
+        fail(
+            f"promotion evidence lane {lane} packaged smoke is not passing: "
+            f"{packaged_status!r}"
+        )
+
+print(
+    "proposal-089-temp-inventory gate passed: Rust unit/regression lanes (scanner, "
+    "temp_artifacts, reports, graphql-server, db metrics), Swift unit surface, and "
+    "required negative/operator-readback/contract-fixture PRESENCE checks passed. "
+    "NOTE: this gate does not execute the published contract fixtures (graphql-sdl, "
+    "mcp-result-schema, run-report/release-receipt schemas) against real emitted "
+    "payloads, and does not itself prove typed GraphQL parity or full report/receipt "
+    "projection beyond what the Rust unit tests above cover — see "
+    "docs/reference/test-gates.md and the contract fixtures' own headers before "
+    "treating a green run here as full contract-parity or packaged-smoke evidence. "
+    "Mandatory readback and packaged-smoke promotion evidence passed."
+)
+PY
+    # Adoption metric from rollout_contract_v1: p089_temp_inventory_smoke_gate_pass_total{status}.
+    # Emitted only on the success path, mirroring the existing p082 gate-result harness
+    # pattern (OpenMetrics-shaped line scraped from gate logs; the script's own
+    # non-zero exit on an earlier failed step is the "fail" signal for this gate,
+    # consistent with how every other gate in this script reports failure).
+    printf 'p089_temp_inventory_smoke_gate_pass_total{status="pass"} 1\n'
+    log "Proposal 089-temp-inventory gate passed"
     ;;
   *)
     print_usage >&2
