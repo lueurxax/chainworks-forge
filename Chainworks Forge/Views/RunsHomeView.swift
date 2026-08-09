@@ -95,8 +95,10 @@ struct RunsHomeView: View {
                     P031FreshnessBadge(snapshot: freshness)
                         .help(model.runsHome?.refreshFeedbackText ?? "Read freshness")
                 }
+                #if compiler(>=6.4)
                 .visibilityPriority(.low)
                 .contentMarginsRemoved()
+                #endif
             }
 
             // Primary action — high priority so it always stays in the bar regardless of
@@ -114,7 +116,9 @@ struct RunsHomeView: View {
                 }
                 .disabled(model.isLoading)
             }
+            #if compiler(>=6.4)
             .visibilityPriority(.high)
+            #endif
 
             ToolbarItem(placement: .primaryAction) {
                 Menu {
@@ -125,7 +129,9 @@ struct RunsHomeView: View {
                 .disabled(!p083RunCommandState.hasSelectedRun)
                 .accessibilityLabel("Run actions")
             }
+            #if compiler(>=6.4)
             .visibilityPriority(.high)
+            #endif
 
             // Full-chrome redesign (macOS 27): toggle the trailing Inspector pane.
             // High priority so it never collapses into the overflow menu.
@@ -138,7 +144,9 @@ struct RunsHomeView: View {
                 .help("Toggle the run inspector")
                 .accessibilityIdentifier("run-inspector-toggle-button")
             }
+            #if compiler(>=6.4)
             .visibilityPriority(.high)
+            #endif
         }
         .focusedSceneValue(\.p083RunCommandState, p083RunCommandState)
         .focusedSceneValue(\.p083RunCommandActions, p083RunCommandActions)
@@ -693,7 +701,9 @@ struct RunsHomeView: View {
             }
             // macOS 27: enables `swipeActions` on rows that live outside a List
             // (e.g. the approval workbench cards in this scroll view).
+            #if compiler(>=6.4)
             .swipeActionsContainer()
+            #endif
             .onChange(of: closeoutReadinessScrollRequest) {
                 guard selectedRunDetailTab == .overview else { return }
                 withAnimation(.easeInOut(duration: 0.16)) {
@@ -7361,11 +7371,15 @@ private struct P036ApprovalWorkbenchCard: View {
                             .disabled(!row.canApprove || resolvingIDs.contains(row.id))
                         }
                     }
+                    #if compiler(>=6.4)
                     .reorderable()
+                    #endif
                 }
+                #if compiler(>=6.4)
                 .reorderContainer(for: RunsWorkbenchPresentationModel.ApprovalRow.self) { difference in
                     difference.apply(to: &orderedRows)
                 }
+                #endif
             }
         }
         .forgePanel(tint: rows.isEmpty ? ForgeColor.Surface.border : ForgeStatusColor.approval)
