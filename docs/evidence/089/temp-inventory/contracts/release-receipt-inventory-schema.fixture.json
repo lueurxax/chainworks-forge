@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ReleaseReceiptInventorySection",
+  "description": "P089 release receipt temp_artifact_inventory section schema fixture. Same canonical DTO; redacted advisory-only snapshot.",
+  "type": "object",
+  "required": ["schema_version", "status", "enabled_state"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "temp_artifact_inventory_v1"},
+    "status": {
+      "type": "string",
+      "enum": ["complete", "partial", "timeout", "cancelled", "error", "disabled", "resource_exhausted", "unknown"]
+    },
+    "enabled_state": {
+      "type": "string",
+      "enum": ["enabled", "disabled", "unknown"]
+    },
+    "disabled_reason_code": {"type": ["string", "null"]},
+    "generated_at": {"type": ["string", "null"]},
+    "mutation_guard": {"type": ["object", "null"]}
+  }
+}

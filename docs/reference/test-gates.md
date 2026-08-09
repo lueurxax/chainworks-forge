@@ -47,10 +47,15 @@ Cheapest possible structural gate.
 Scope:
 
 - no direct `Run(...)` construction outside `RunRepository`
+- Xcode Rust builds use the shared Cargo cache policy
+- `TestPlans/*.xctestplan` `selectedTests` stay in sync with the `.fast` / `.provider` Swift Testing tags in source
+- proposal numbers stay unique and `docs/ROADMAP.md` links resolve
+- `scripts/check-boundary-coverage.sh`: boundary-surface changes cite a `matrix_row`, carry a `boundary-no-op` label, or touch both `docs/reference/boundary-first-api-auth-contract.md` and its `.json` fixture together
 
 Use when:
 
 - editing persistence, repositories, constructors, or test scaffolding
+- editing test plans, proposal numbering, or the boundary/auth surface
 
 Command:
 
@@ -85,12 +90,16 @@ Scope:
 
 - source guardrails
 - app build
-- high-ROI unit/runtime slices:
-  - `ProviderPlatformTests`
-  - `OrchestratorTests`
-  - `ResumeManagerTests`
-  - `ArtifactManagerTests`
-  - `RunTests`
+- high-ROI unit/runtime slices, from the `FAST_TESTS` targeted test IDs in `scripts/test-gate.sh` (that array is what the default path runs):
+  - `ArtifactPathClipboardTests`
+  - `ForgeGlassTests`
+  - `P089TempArtifactInventoryTests`
+  - `ProcessSupportTests`
+  - `Proposal046Tests`
+  - `Proposal079ContractRepairReadbackTests`
+  - `Proposal086ContinuationReadbackTests`
+
+Setting `USE_TEST_PLANS=1` switches the same gate to `TestPlans/FastGate.xctestplan`. The plan and default targeted path contain the same suites, derived from the current Swift Testing `.fast` tags and enforced by the plan/tag guardrail.
 
 Use when:
 
@@ -2160,6 +2169,26 @@ Important:
 - diagnostic dirty-work mode writes non-signoff mutation readback and must exit non-zero
 - a default-mode pass requires checked-in evidence from a prior successful live-mode gate
 - the proof is intentionally narrow: it proves Junie structured-output capability plus the small ACP `code_writer` handoff boundary, not full scheduler/projection behavior and not a blanket fix for long-running P036-family failures
+
+### `proposal-089-temp-inventory|p089-temp-inventory`
+
+Focused gate for the read-only, dry-run-only managed temporary artifact inventory smoke and contract validation.
+
+Scope:
+- Verifies that the `proposal-089-temp-inventory` and `p089-temp-inventory` gate aliases are registered and remain distinct from the `proposal-089|p089` Junie canary gate.
+- Runs Rust unit tests for `domain` (`p089_temp_inventory_*`), `mcp-server` (`tools::scanner`, `tools::temp_artifacts`, `tools::reports::tests::p089`), `graphql-server` (`p089_*`), and `db` (`metrics::tests::proposal_089`) — scanner containment and traversal bounds, HMAC path hashing, deadlines, permit constraints, mutation guard, DTO serialization, and metric families. These tests do not prove the approved daemon-startup redaction-key initialization contract; the implementation currently initializes the key lazily on first hash use.
+- Runs the Swift targeted test class `Chainworks ForgeTests/P089TempArtifactInventoryTests` through the unsigned hosted-test path.
+- Verifies every required negative fixture exists with `expected_status: fail` (alias collision, dry-run mutation, readback-parity missing, unknown-enum decoding, unsafe path redaction, invalid/symlink-escaping test-root override, traversal cycle or escape, shutdown persistence, incomplete MCP result schema) and requires nine contract fixture paths under `docs/evidence/089/temp-inventory/contracts/`. Only eight are currently checked in: `status-by-field-matrix.fixture.json` is missing, so the gate remains red. Fixture **presence** is all that is asserted — no payload is validated against the GraphQL SDL or JSON Schema fixtures, and those fixtures currently diverge from the shipped schema, so eventual presence alone will not be readback-parity evidence (see [managed-temporary-artifact-inventory.md §4.4](managed-temporary-artifact-inventory.md#44-graphql-projection-specifics-implemented)).
+- Asserts source-level proof terms per lane so a lane cannot regress to a disabled stub: Operator gating plus backend delegation in the GraphQL resolver, typed row/error projections, run-report and release-receipt sections, `P089_REQUIRED_METRICS` and metric emitters, the Swift GraphQL fetcher, view identifiers, `RunsHomeView` embedding, app commands, and the pasteboard writer.
+- Confirms that the backend reports `disabled` status when configured so, preventing all file scans.
+
+Command:
+```bash
+./scripts/test-gate.sh proposal-089-temp-inventory
+./scripts/test-gate.sh p089-temp-inventory
+```
+
+Promotion evidence is mandatory, not opt-in: every lane in `docs/evidence/rollout-contract/operator-readback/p089-temp-inventory-full-surface.fixture.json` must report an allowed passing implementation status and `temp_artifact_inventory_packaged_smoke_status = pass` (or the camelCase projection of that field). There is no environment-variable bypass. The gate therefore remains red until the redaction-key initialization contract is reconciled and the operator-readback fixture is refreshed with captured packaged-app smoke evidence.
 
 ### `proposal-090|p090`
 

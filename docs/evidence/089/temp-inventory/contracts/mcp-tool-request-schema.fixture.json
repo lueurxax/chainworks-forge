@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TempArtifactInventoryRequest",
+  "description": "P089 MCP tool temp_artifacts.inventory.preview request schema fixture.",
+  "type": "object",
+  "oneOf": [
+    {"required": ["run_id"]},
+    {"required": ["workspace_context"]}
+  ],
+  "properties": {
+    "run_id": {
+      "type": "string",
+      "description": "Run ID for which to preview inventory. Mutually exclusive with workspace_context."
+    },
+    "workspace_context": {
+      "type": "object",
+      "description": "Workspace context for inventory. Mutually exclusive with run_id.",
+      "required": ["workspace_root"],
+      "properties": {
+        "workspace_root": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 500,
+      "default": 500,
+      "description": "Maximum rows to return. No clamping; values outside 0-500 are rejected."
+    },
+    "timeout_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 5000,
+      "default": 5000,
+      "description": "Total request deadline in milliseconds, including queue wait."
+    },
+    "include_dry_run": {
+      "type": "boolean",
+      "default": true,
+      "description": "When false, dry_run and row dry_run_recommendation are null."
+    },
+    "test_root_override": {
+      "type": "string",
+      "maxLength": 4096,
+      "description": "Diagnostic test root override. Absolute path only; accepted only under authorized diagnostic-test-root mode."
+    }
+  },
+  "additionalProperties": false
+}

@@ -1292,7 +1292,7 @@ fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolI
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 54] {
+fn all_tool_capabilities() -> [CapabilityToolId; 55] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -1351,6 +1351,8 @@ fn all_tool_capabilities() -> [CapabilityToolId; 54] {
         CapabilityToolId::P083SetEnforcementMode,
         CapabilityToolId::RetryRun,
         CapabilityToolId::SideEffectsForceReconcile,
+        // P089: read-only advisory temporary artifact inventory preview.
+        CapabilityToolId::TempArtifactsInventoryPreview,
     ]
 }
 
@@ -1496,6 +1498,11 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         CapabilityToolId::P083SetEnforcementMode => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::RetryRun => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::SideEffectsForceReconcile => matches!(class, PrincipalClass::Operator),
+        // P089: inventory preview exposes run-scoped metadata; restricted to Operator only
+        // (SEC-P089-HIGH-002: Observer cross-run disclosure risk).
+        CapabilityToolId::TempArtifactsInventoryPreview => {
+            matches!(class, PrincipalClass::Operator)
+        }
     }
 }
 
@@ -1508,7 +1515,7 @@ fn default_resource_capabilities(class: &PrincipalClass) -> BTreeSet<ResourceTem
         .collect()
 }
 
-pub fn all_resource_templates() -> [ResourceTemplateId; 10] {
+pub fn all_resource_templates() -> [ResourceTemplateId; 11] {
     [
         ResourceTemplateId::RunEntity,
         ResourceTemplateId::IdeaEntity,
@@ -1520,6 +1527,7 @@ pub fn all_resource_templates() -> [ResourceTemplateId; 10] {
         ResourceTemplateId::ChainworksApprovalsInbox,
         ResourceTemplateId::ChainworksRunStages,
         ResourceTemplateId::ChainworksRunArtifacts,
+        ResourceTemplateId::ChainworksRunTempArtifactInventory,
     ]
 }
 
@@ -1558,6 +1566,9 @@ fn resource_allowed_for_class(class: &PrincipalClass, id: ResourceTemplateId) ->
         }
         ResourceTemplateId::ChainworksRunArtifacts => {
             matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+        }
+        ResourceTemplateId::ChainworksRunTempArtifactInventory => {
+            matches!(class, PrincipalClass::Operator)
         }
     }
 }
@@ -1643,6 +1654,8 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
         "p083.set_enforcement_mode" => Some(CapabilityToolId::P083SetEnforcementMode),
         "runs.retry" => Some(CapabilityToolId::RetryRun),
         "side_effects.force_reconcile" => Some(CapabilityToolId::SideEffectsForceReconcile),
+        // P089: read-only temporary artifact inventory preview.
+        "temp_artifacts.inventory.preview" => Some(CapabilityToolId::TempArtifactsInventoryPreview),
         _ => None,
     }
 }
@@ -1890,6 +1903,10 @@ mod tests {
             &ob,
             ResourceTemplateId::ChainworksRunArtifacts
         ));
+        assert!(
+            !is_resource_allowed(&ob, ResourceTemplateId::ChainworksRunTempArtifactInventory),
+            "temp artifact inventory resource is Operator-only"
+        );
     }
 
     // ── P072 v2 schema tests ───────────────────────────────────────────
@@ -2772,6 +2789,26 @@ mod tests {
                 "Observer must NOT have {tool} (P078 Operator-only)"
             );
         }
+    }
+
+    // ── SEC-P089-HIGH-002: temp_artifacts.inventory.preview authorization ───
+    // Operator-only: inventory exposes run-scoped metadata and must not be
+    // accessible to Observer principals (cross-run disclosure risk).
+
+    #[test]
+    fn p089_temp_artifacts_inventory_preview_surface_policy() {
+        let op = Principal::new("op", PrincipalClass::Operator);
+        let ag = Principal::new("ag", PrincipalClass::Agent);
+        let ob = Principal::new("ob", PrincipalClass::Observer);
+
+        let tool = "temp_artifacts.inventory.preview";
+
+        assert!(is_tool_allowed(&op, tool), "Operator must have {tool}");
+        assert!(
+            !is_tool_allowed(&ob, tool),
+            "Observer must NOT have {tool} (SEC-P089-HIGH-002: cross-run disclosure risk)"
+        );
+        assert!(!is_tool_allowed(&ag, tool), "Agent must NOT have {tool}");
     }
 
     // ── HIGH-002 bootstrap log redaction ────────────────────────────────

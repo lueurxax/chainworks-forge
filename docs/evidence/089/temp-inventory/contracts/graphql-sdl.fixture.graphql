@@ -1,0 +1,179 @@
+"""
+P089 Managed Temporary Artifact Inventory — Executable GraphQL SDL fixture.
+Status: pre-implementation skeleton. NOT YET RECONCILED with the shipped schema in
+control-plane/crates/graphql-server/src/types/temp_artifact_inventory.rs — type names,
+the canonical mode field/enum, and the dry-run and mutation-guard shapes diverge.
+The seven enum domains shared by this fixture and the implementation agree on value
+coverage and casing. Do not read this file as GraphQL parity evidence until it is
+reconciled; the divergences are itemized in
+docs/reference/managed-temporary-artifact-inventory.md §4.4.
+ByteCountString and DateTime scalars are required; the camelCase projection is intended to
+be a lossless mapping of the snake_case canonical DTO.
+"""
+
+scalar ByteCountString
+scalar DateTime
+
+enum InventoryStatus {
+  COMPLETE
+  PARTIAL
+  TIMEOUT
+  CANCELLED
+  ERROR
+  DISABLED
+  RESOURCE_EXHAUSTED
+  UNKNOWN
+}
+
+enum EnabledState {
+  ENABLED
+  DISABLED
+  UNKNOWN
+}
+
+enum LifecycleClassification {
+  ACTIVE_OR_RECENT
+  TERMINAL_CANDIDATE
+  ORPHAN_CANDIDATE
+  LEGACY_UNMANAGED
+  SCAN_ERROR
+  UNKNOWN
+}
+
+enum DryRunRecommendation {
+  WOULD_KEEP_ACTIVE
+  WOULD_KEEP_RECENT
+  WOULD_PRESERVE_FAILURE_EVIDENCE
+  WOULD_DELETE_AFTER_FUTURE_APPROVAL
+  WOULD_MIGRATE_LEGACY_MANIFEST_AFTER_FUTURE_MIGRATION_ENABLED
+  NEEDS_OPERATOR_REVIEW
+  NO_RECOMMENDATION
+  UNKNOWN
+}
+
+enum MutationGuardStatus {
+  PASS
+  FAIL
+  SKIPPED
+  UNKNOWN
+}
+
+enum RootKind {
+  RUN_META_ROOT
+  CONTROL_PLANE_CACHE
+  PROVIDER_HOME_COPY
+  LEGACY_CHAINWORKS_TMP
+  DIAGNOSTIC_TEST_ROOT
+  UNKNOWN
+}
+
+enum InventoryErrorCode {
+  INVALID_ROOT_OVERRIDE
+  ROOT_UNREADABLE
+  MANIFEST_PARSE_FAILED
+  SIZE_ESTIMATION_FAILED
+  DEADLINE_EXCEEDED
+  CANCELLED
+  INTERNAL_ERROR
+  MUTATION_GUARD_FAILED
+  RESOURCE_EXHAUSTED
+  UNKNOWN
+}
+
+input TempArtifactWorkspaceContextInput {
+  workspaceRoot: String!
+}
+
+input TempArtifactInventoryInput {
+  runId: ID
+  workspaceContext: TempArtifactWorkspaceContextInput
+  limit: Int = 500
+  timeoutMs: Int = 5000
+  includeDryRun: Boolean = true
+  testRootOverride: String
+}
+
+type TempArtifactLimitsApplied {
+  limit: Int!
+  timeoutMs: Int!
+  scanDeadlineAt: DateTime
+  queueWaitMs: Int!
+}
+
+type TempArtifactSummary {
+  artifactTreeCount: Int!
+  estimatedBytes: ByteCountString!
+  activeOrRecentCount: Int!
+  terminalCandidateCount: Int!
+  orphanCandidateCount: Int!
+  legacyUnmanagedCount: Int!
+  scanErrorCount: Int!
+  dryRunCandidateCount: Int!
+  truncated: Boolean!
+}
+
+type TempArtifactDryRun {
+  generatedAt: DateTime
+  mutationGuard: MutationGuardStatus!
+  recommendationCounts: TempArtifactDryRunCounts!
+}
+
+type TempArtifactDryRunCounts {
+  wouldKeepActive: Int!
+  wouldKeepRecent: Int!
+  wouldPreserveFailureEvidence: Int!
+  wouldDeleteAfterFutureApproval: Int!
+  wouldMigrateLegacyManifestAfterFutureMigrationEnabled: Int!
+  needsOperatorReview: Int!
+  noRecommendation: Int!
+  unknown: Int!
+}
+
+type TempArtifactMutationGuard {
+  status: MutationGuardStatus!
+  evidence: String
+}
+
+type TempArtifactRow {
+  pathDisplay: String!
+  pathHash: String!
+  pathHashShort: String!
+  correlationKey: String!
+  rootKind: RootKind!
+  artifactKind: String
+  manifestState: String
+  lifecycleClassification: LifecycleClassification!
+  dryRunRecommendation: DryRunRecommendation
+  estimatedSizeBytes: ByteCountString!
+  lastTouchedAt: DateTime
+  activeProcessEvidence: String
+  owner: String
+  ownerInference: String
+  statusToken: String!
+  generatedAt: DateTime!
+  partialErrors: [String!]!
+}
+
+type TempArtifactError {
+  code: InventoryErrorCode!
+  message: String!
+  rootKind: RootKind
+}
+
+type TempArtifactInventory {
+  schemaVersion: String!
+  status: InventoryStatus!
+  enabledState: EnabledState!
+  disabledReasonCode: String
+  generatedAt: DateTime!
+  limitsApplied: TempArtifactLimitsApplied!
+  summary: TempArtifactSummary!
+  rows: [TempArtifactRow!]!
+  errors: [TempArtifactError!]!
+  dryRun: TempArtifactDryRun
+  mutationGuard: TempArtifactMutationGuard!
+}
+
+type Query {
+  tempArtifactInventory(input: TempArtifactInventoryInput!): TempArtifactInventory!
+}

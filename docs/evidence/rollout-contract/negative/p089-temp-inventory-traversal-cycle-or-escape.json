@@ -1,0 +1,10 @@
+{
+  "schema_version": "p089_temp_inventory_negative_fixture_v1",
+  "expected_status": "fail",
+  "negative_condition": "A filesystem traversal that encounters a directory cycle (via hardlink or duplicate inode) or attempts to cross device boundaries must not loop and must not produce unbounded partial errors.",
+  "mutated_contract": {
+    "traversal_scenario": "cycle_via_duplicate_inode",
+    "violation": "Cycle or device boundary cross without bounding — traversal loops or produces >100 partial errors per payload."
+  },
+  "assertion": "Cycles are detected via device+inode identity tracking and skipped with at most one partial error per identity. Cross-device entries produce bounded partial errors (capped at 100 per payload). The scan terminates and returns partial or complete status — never loops indefinitely."
+}

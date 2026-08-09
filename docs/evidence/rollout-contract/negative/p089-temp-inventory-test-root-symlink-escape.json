@@ -1,0 +1,10 @@
+{
+  "schema_version": "p089_temp_inventory_negative_fixture_v1",
+  "expected_status": "fail",
+  "negative_condition": "A testRootOverride whose symlink target resolves outside the diagnostic_test_roots allowlist must be rejected as invalid_root_override, not followed.",
+  "mutated_contract": {
+    "test_root_override": "/tmp/symlink-to-escape -> /Users/user/.ssh",
+    "violation": "Symlink escape: symlink inside allowlist but target resolves outside allowlist boundary."
+  },
+  "assertion": "The backend must return status=error with error_code=invalid_root_override and must not traverse the symlink target path. No raw path must appear in the error message."
+}

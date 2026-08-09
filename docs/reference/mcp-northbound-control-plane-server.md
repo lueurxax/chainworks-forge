@@ -117,6 +117,7 @@ Implementation: `control-plane/crates/domain/src/commands.rs` (`PrincipalClass`,
 | `P080DiagnosticsGet` | `p080.diagnostics.get.v1` | no (direct) |
 | `P080ReconcileRequest` | `p080.reconcile.request.v1` | no (direct) |
 | `P080ClearPermanentHold` | `p080.clear_permanent_hold.v1` | no (direct) |
+| `TempArtifactsInventoryPreview` | `temp_artifacts.inventory.preview` | no (direct) |
 
 Command tools build a typed `Command` enum value and call `CommandHandler::handle`; they emit a `command_journal` row and return `journal_id`. Direct tools call repo functions directly and do not produce journal rows or `journal_id`.
 
@@ -125,6 +126,8 @@ The stale-execution reconciliation tools (`p080.diagnostics.get.v1`, `p080.recon
 The retained P086 continuation tools (`agents.continue_work`, `agents.continuation_status`, `agents.continuation_candidates`) have typed `CapabilityToolId` variants (`AgentsContinueWork`, `AgentsContinuationStatus`, `AgentsContinuationCandidates`) so they participate in standard `tools/list` capability filtering. The read tools are exposed to `Operator` and `Observer` principals; `agents.continue_work` is exposed only to `Operator`. They are dispatched by prefix into a separate `tools::agents` namespace in `control-plane/crates/mcp-server/src/server.rs` rather than through `CommandHandler::handle`: `agents.continue_work` runs its own atomic admission transaction that persists a `command_journal_id` on the `agent_work_continuations` row alongside the canonical request fingerprint, while the read tools omit unauthorized rows without leaking existence. See [`agent-work-continuation.md`](agent-work-continuation.md) for the request/response schemas and admission semantics.
 
 The `agents.attach_receipt.get` tool (fetches the `provider_session_attach_receipt_v2` body for a `provider_session_resurrection` continuation) is also dispatched through the same `agents.*` prefix route. It is advertised in `tools::agents::tool_specs()` but does not currently have a `CapabilityToolId` variant; its access matrix (Operator → raw, Observer → reviewer-redacted, Agent → minimal existence + `resurrection_phase`, wrong-run Operator → `auth_failure`) is enforced inside the handler. Every access path writes a row to `p086_receipt_access_audit`. See [`agent-work-continuation.md`](agent-work-continuation.md#resurrection-durable-state-and-readback-infrastructure) for the full principal access matrix and response shapes.
+
+The P089 inventory tool (`temp_artifacts.inventory.preview`) has a typed `CapabilityToolId` variant (`TempArtifactsInventoryPreview`) so it participates in standard `tools/list` capability filtering. It is a read-only advisory preview restricted to `Operator` principals only — `Observer`, `Agent`, and `ReadOnlyOperator` are all denied because the preview exposes run-scoped metadata with cross-run disclosure risk (SEC-P089-HIGH-002) — and is dispatched directly without emitting `command_journal` rows. It returns disabled readback — with no filesystem access at all — when `CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE=disabled` (the default), and performs bounded read-only scanning in `hidden_readback` and `operator_visible` modes. No mode deletes, mutates, or persists anything. See [`managed-temporary-artifact-inventory.md`](managed-temporary-artifact-inventory.md) for the canonical DTO contract, redaction, and scanner bounds.
 
 ### MCP tool payloads
 
@@ -162,6 +165,7 @@ Both subtypes route through `ResolveApprovalCmd` so the approval-mutation idempo
 | `ChainworksApprovalsInbox` | `chainworks://approvals/inbox` |
 | `ChainworksRunStages` | `chainworks://runs/{run_id}/stages` |
 | `ChainworksRunArtifacts` | `chainworks://runs/{run_id}/artifacts` |
+| `ChainworksRunTempArtifactInventory` | `chainworks://runs/{run_id}/temp-artifact-inventory` (Operator-only; read-only advisory inventory, disabled by default — see [managed-temporary-artifact-inventory.md](managed-temporary-artifact-inventory.md)) |
 
 ### Execution-truth report readback
 

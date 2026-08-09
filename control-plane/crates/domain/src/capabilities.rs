@@ -79,6 +79,8 @@ pub enum CapabilityToolId {
     SideEffectsForceReconcile,
     /// P083: operator confirms provider process is absent for identity-ambiguous hold.
     ProviderSessionMarkProcessAbsent,
+    /// P089: read-only advisory temporary artifact inventory preview (disabled-mode readback).
+    TempArtifactsInventoryPreview,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -93,4 +95,5 @@ pub enum ResourceTemplateId {
     ChainworksApprovalsInbox,
     ChainworksRunStages,
     ChainworksRunArtifacts,
+    ChainworksRunTempArtifactInventory,
 }

@@ -1,0 +1,10 @@
+{
+  "schema_version": "p089_temp_inventory_negative_fixture_v1",
+  "expected_status": "fail",
+  "negative_condition": "A scan cancelled by daemon graceful shutdown must not persist inventory rows, must not enqueue recovery work, and must not trigger a startup recovery scan on next daemon start.",
+  "mutated_contract": {
+    "shutdown_scenario": "graceful_shutdown_during_active_scan",
+    "violation": "Shutdown-cancelled scan persists inventory rows or enqueues startup recovery work."
+  },
+  "assertion": "Shutdown cancellation is a first-class cancellation source. The response returns status=cancelled with error_code=cancelled. All permits are released before shutdown completes. No inventory rows are written. No recovery work is enqueued. Daemon startup performs no inventory recovery scan."
+}

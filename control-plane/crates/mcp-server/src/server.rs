@@ -1238,8 +1238,14 @@ impl McpServer {
                         | auth::boundary::PolicyDecision::LegacyPassthrough => {}
                     }
                 }
-                // No parameterized resource templates yet.
-                JsonRpcResponse::success(id, serde_json::json!({ "resourceTemplates": [] }))
+                let filtered: Vec<_> =
+                    auth::filter_resources(principal, &auth::all_resource_templates())
+                        .into_iter()
+                        .filter(|id| resource_template_uri(*id).contains('{'))
+                        .map(resource_template_definition_value)
+                        .collect();
+
+                JsonRpcResponse::success(id, serde_json::json!({ "resourceTemplates": filtered }))
             }
 
             "resources/read" => {
@@ -1489,14 +1495,23 @@ impl McpServer {
                 db::repos::artifacts::list_by_run(&self.pool, run_id_parsed).await?;
             let (mcp_rollout_readback, run_report_rollout_readback) =
                 rollout_contract_readback_lanes_json(&self.pool, run_id_parsed).await?;
+            // Scan once per resource read and reuse across every artifact projected
+            // below (SR-HIGH-002: avoids one full filesystem scan per report artifact).
+            let temp_artifact_inventory_dto =
+                tools::reports::p089_temp_artifact_inventory_run_report_section(
+                    run_id_parsed,
+                    &principal.class,
+                )
+                .await;
             let mut artifact_payloads = Vec::with_capacity(run_artifacts.len());
             for artifact in &run_artifacts {
                 artifact_payloads.push(
-                    tools::reports::artifact_report_json(
+                    tools::reports::artifact_report_json_with_temp_artifact_inventory(
                         &self.pool,
                         artifact,
                         Some(&run_report_rollout_readback),
                         &principal.class,
+                        Some(&temp_artifact_inventory_dto),
                     )
                     .await?,
                 );
@@ -1621,6 +1636,9 @@ impl McpServer {
                     })
                     .collect();
                 return Ok(serde_json::to_value(redacted)?);
+            } else if let Some(rid) = run_id.strip_suffix("/temp-artifact-inventory") {
+                return tools::temp_artifacts::inventory_preview_for_run_resource(rid, principal)
+                    .await;
             } else {
                 return self.read_canonical_run_resource(run_id, principal).await;
             }
@@ -1832,6 +1850,8 @@ impl McpServer {
             tools::automation::execute(tool_name, params, principal).await
         } else if tool_name.starts_with("p080.") {
             tools::p080::execute(tool_name, params, pool, principal).await
+        } else if tool_name.starts_with("temp_artifacts.") {
+            tools::temp_artifacts::execute(tool_name, params, principal).await
         } else {
             Err(anyhow::anyhow!("Unknown tool namespace: {tool_name}"))
         }
@@ -2036,6 +2056,8 @@ fn is_read_only_tool(tool_name: &str) -> bool {
             // P086: continuation readback tools are unconditionally read-only. (SEC-LOW-001)
             | "agents.continuation_status"
             | "agents.continuation_candidates"
+            // P089: inventory preview is read-only advisory (no scanning or mutation).
+            | "temp_artifacts.inventory.preview"
     )
 }
 
@@ -2543,6 +2565,9 @@ fn resource_template_uri(id: ResourceTemplateId) -> &'static str {
         ResourceTemplateId::ChainworksApprovalsInbox => "chainworks://approvals/inbox",
         ResourceTemplateId::ChainworksRunStages => "chainworks://runs/{run_id}/stages",
         ResourceTemplateId::ChainworksRunArtifacts => "chainworks://runs/{run_id}/artifacts",
+        ResourceTemplateId::ChainworksRunTempArtifactInventory => {
+            "chainworks://runs/{run_id}/temp-artifact-inventory"
+        }
     }
 }
 
@@ -2638,7 +2663,23 @@ fn resource_template_value(id: ResourceTemplateId) -> serde_json::Value {
             "description": "Artifact list for a run (artifact_index projection)",
             "mimeType": "application/json"
         }),
+        ResourceTemplateId::ChainworksRunTempArtifactInventory => serde_json::json!({
+            "uri": "chainworks://runs/{run_id}/temp-artifact-inventory",
+            "name": "Temporary Artifact Inventory",
+            "description": "Read-only advisory managed temporary artifact inventory for a run",
+            "mimeType": "application/json"
+        }),
     }
+}
+
+fn resource_template_definition_value(id: ResourceTemplateId) -> serde_json::Value {
+    let mut value = resource_template_value(id);
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(uri) = obj.remove("uri") {
+            obj.insert("uriTemplate".to_string(), uri);
+        }
+    }
+    value
 }
 
 #[cfg(test)]
@@ -2690,7 +2731,26 @@ mod resource_tests {
             resource_template_id_for_uri("chainworks://runs/run-1/artifacts"),
             Some(ResourceTemplateId::ChainworksRunArtifacts)
         );
+        assert_eq!(
+            resource_template_id_for_uri("chainworks://runs/run-1/temp-artifact-inventory"),
+            Some(ResourceTemplateId::ChainworksRunTempArtifactInventory)
+        );
         assert_eq!(resource_template_id_for_uri("workflow://wf-1"), None);
+    }
+
+    #[test]
+    fn p089_temp_artifact_inventory_resource_template_uses_mcp_uri_template_key() {
+        let value = resource_template_definition_value(
+            ResourceTemplateId::ChainworksRunTempArtifactInventory,
+        );
+        assert_eq!(
+            value["uriTemplate"],
+            serde_json::json!("chainworks://runs/{run_id}/temp-artifact-inventory")
+        );
+        assert!(
+            value.get("uri").is_none(),
+            "resources/templates/list entries must use uriTemplate"
+        );
     }
 }
 
@@ -2899,6 +2959,7 @@ mod p029_capability_tests {
             "chainworks://approvals/inbox",
             "chainworks://runs/{run_id}/stages",
             "chainworks://runs/{run_id}/artifacts",
+            "chainworks://runs/{run_id}/temp-artifact-inventory",
             "artifact://{artifact_id}",
             "report://{run_id}",
         ] {
@@ -2918,6 +2979,10 @@ mod p029_capability_tests {
         assert!(
             !ob_uris.contains("report://{run_id}"),
             "observer must not see report://"
+        );
+        assert!(
+            !ob_uris.contains("chainworks://runs/{run_id}/temp-artifact-inventory"),
+            "observer must not see temp artifact inventory resource"
         );
     }
 
@@ -3495,6 +3560,7 @@ mod tests {
                 action: "retry_failed_agent".to_string(),
                 explanation: "Retry the agent with the same inputs.".to_string(),
             },
+            diagnostic_artifact_paths: vec![],
         }
     }
 

@@ -1,0 +1,10 @@
+{
+  "schema_version": "p089_temp_inventory_negative_fixture_v1",
+  "expected_status": "fail",
+  "negative_condition": "An MCP result schema that omits required fields (e.g., missing mutation_guard, missing errors array, or missing schema_version) must fail the contract fixture check.",
+  "mutated_contract": {
+    "missing_fields": ["mutation_guard", "errors", "schema_version"],
+    "violation": "Incomplete MCP result schema: required top-level fields are absent."
+  },
+  "assertion": "The P089 smoke gate must reject an MCP result schema fixture that does not declare all required top-level fields: schema_version, status, enabled_state, generated_at, limits_applied, summary, rows, errors, mutation_guard."
+}

@@ -12,3 +12,4 @@ pub mod session;
 pub mod stage;
 pub mod steward;
 pub mod storage;
+pub mod temp_artifact_inventory;
