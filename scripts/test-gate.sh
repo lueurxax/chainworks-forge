@@ -12595,10 +12595,8 @@ gate_text = (root / "scripts/test-gate.sh").read_text()
 for alias in ["proposal-089-temp-inventory", "p089-temp-inventory"]:
     if alias not in gate_text:
         fail(f"Gate alias '{alias}' not registered in test-gate.sh")
-for alias in ["proposal-089", "p089"]:
-    if f"proposal-089-temp-inventory|p089-temp-inventory" not in gate_text:
-        fail("Inventory aliases not found as a distinct case from the Junie canary gate")
-    break  # alias-collision check: the inventory gate must not reuse the Junie gate identifiers
+if "proposal-089-temp-inventory|p089-temp-inventory" not in gate_text:
+    fail("Inventory aliases not found as a distinct case from the Junie canary gate")
 
 # 2. Verify alias-collision negative fixture exists and has expected_status=fail.
 collision_fixture = root / "docs/evidence/rollout-contract/negative/p089-temp-inventory-alias-collision.json"
