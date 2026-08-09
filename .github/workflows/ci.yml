@@ -18,18 +18,9 @@ jobs:
           xcodebuild -version
 
       - name: Fast Gate
+        env:
+          CHAINWORKS_USE_UNSIGNED_HOSTED_TESTS: "1"
         run: ./scripts/test-gate.sh fast
 
-  ui-smoke-gate:
-    runs-on: xcode-27
-    needs: fast-gate
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Select Xcode
-        run: |
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-          xcodebuild -version
-
-      - name: UI Smoke Gate
-        run: ./scripts/test-gate.sh ui-smoke
+  # UI gates are intentionally absent here. Repository policy requires them to
+  # run through the approved interactive host: test@SMacBook.local.
