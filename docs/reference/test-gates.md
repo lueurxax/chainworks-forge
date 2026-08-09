@@ -91,14 +91,15 @@ Scope:
 - source guardrails
 - app build
 - high-ROI unit/runtime slices, from the `FAST_TESTS` targeted test IDs in `scripts/test-gate.sh` (that array is what the default path runs):
-  - `ProviderPlatformTests`
-  - `OrchestratorTests`
-  - `ResumeManagerTests`
-  - `ArtifactManagerTests`
-  - `RunTests`
-  - `AgentSessionTests`
+  - `ArtifactPathClipboardTests`
+  - `ForgeGlassTests`
+  - `P089TempArtifactInventoryTests`
+  - `ProcessSupportTests`
+  - `Proposal046Tests`
+  - `Proposal079ContractRepairReadbackTests`
+  - `Proposal086ContinuationReadbackTests`
 
-Setting `USE_TEST_PLANS=1` switches the same gate to `TestPlans/FastGate.xctestplan` instead, whose `selectedTests` list is the plan-side selection and includes `P089TempArtifactInventoryTests`. The two selections are not identical: the default targeted path does not run the P089 Swift class, which is proven by the focused [`proposal-089-temp-inventory|p089-temp-inventory`](#proposal-089-temp-inventoryp089-temp-inventory) gate.
+Setting `USE_TEST_PLANS=1` switches the same gate to `TestPlans/FastGate.xctestplan`. The plan and default targeted path contain the same suites, derived from the current Swift Testing `.fast` tags and enforced by the plan/tag guardrail.
 
 Use when:
 

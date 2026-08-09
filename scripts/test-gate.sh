@@ -80,12 +80,13 @@ P077_ROLLOUT_EVIDENCE_PATH="docs/reference/p077-rollout-dependency-evidence.md"
 P077_UI_EVIDENCE_PATH="docs/reference/p077-closeout-readiness-ui-evidence.md"
 
 FAST_TESTS=(
-  "Chainworks ForgeTests/ProviderPlatformTests"
-  "Chainworks ForgeTests/OrchestratorTests"
-  "Chainworks ForgeTests/ResumeManagerTests"
-  "Chainworks ForgeTests/ArtifactManagerTests"
-  "Chainworks ForgeTests/RunTests"
-  "Chainworks ForgeTests/AgentSessionTests"
+  "Chainworks ForgeTests/ArtifactPathClipboardTests"
+  "Chainworks ForgeTests/ForgeGlassTests"
+  "Chainworks ForgeTests/P089TempArtifactInventoryTests"
+  "Chainworks ForgeTests/ProcessSupportTests"
+  "Chainworks ForgeTests/Proposal046Tests"
+  "Chainworks ForgeTests/Proposal079ContractRepairReadbackTests"
+  "Chainworks ForgeTests/Proposal086ContinuationReadbackTests"
 )
 
 UI_SMOKE_TESTS=(
