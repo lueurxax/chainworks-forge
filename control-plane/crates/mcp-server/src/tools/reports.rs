@@ -1909,6 +1909,7 @@ fn p089_temp_artifact_inventory_error_section() -> serde_json::Value {
         "schema_version": TEMP_ARTIFACT_INVENTORY_SCHEMA_VERSION,
         "status": InventoryStatus::Error.as_str(),
         "enabled_state": EnabledState::Unknown.as_str(),
+        "mode": crate::tools::temp_artifacts::current_inventory_mode().as_str(),
         "disabled_reason_code": null,
         "generated_at": now,
         "limits_applied": {
@@ -3917,6 +3918,17 @@ mod tests {
         assert_eq!(
             section["dry_run"]["schema_version"].as_str().unwrap_or(""),
             "temp_artifact_dry_run_v1"
+        );
+    }
+
+    #[test]
+    fn p089_error_fallback_includes_current_inventory_mode() {
+        let _guard = crate::tools::temp_artifacts::temp_artifact_inventory_env_test_lock();
+        let payload = p089_temp_artifact_inventory_error_section();
+
+        assert_eq!(
+            payload["mode"],
+            crate::tools::temp_artifacts::current_inventory_mode().as_str()
         );
     }
 

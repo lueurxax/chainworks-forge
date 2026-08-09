@@ -224,6 +224,20 @@ private struct ImmediateCompleteFetcher: TempArtifactInventoryFetching {
     }
 }
 
+private struct OperatorVisibleCapabilityDisabledRefreshFetcher: TempArtifactInventoryFetching {
+    func fetchInventory(runID: String) async -> Result<TempArtifactInventoryResponse, Error> {
+        let data = disabledPayloadJSON.data(using: .utf8)!
+        let response = try! JSONDecoder().decode(TempArtifactInventoryResponse.self, from: data)
+        return .success(response)
+    }
+
+    func fetchInventoryCapability(runID: String) async -> Result<TempArtifactInventoryResponse, Error> {
+        let data = completeRowPayloadJSON.data(using: .utf8)!
+        let response = try! JSONDecoder().decode(TempArtifactInventoryResponse.self, from: data)
+        return .success(response)
+    }
+}
+
 private struct NullAnnouncer: TempArtifactAccessibilityAnnouncing {
     @MainActor func announce(_ message: String) {}
 }
@@ -349,6 +363,28 @@ struct P089TempArtifactInventoryTests {
         viewModel.resolveBackendVisibility(runID: "run-1")
         await Task.yield()
         await Task.yield()
+        #expect(viewModel.backendVisibilityMode == "disabled")
+        #expect(viewModel.isBackendAuthorizedForVisibleSurface == false)
+    }
+
+    @Test("Accepted refresh mode revokes stale operator-visible capability")
+    func acceptedRefreshModeRevokesStaleCapability() async {
+        let viewModel = TempArtifactInventoryViewModel(
+            fetcher: OperatorVisibleCapabilityDisabledRefreshFetcher(),
+            announcer: NullAnnouncer()
+        )
+
+        viewModel.resolveBackendVisibility(runID: "run-1")
+        for _ in 0..<20 where viewModel.backendVisibilityMode == nil {
+            await Task.yield()
+        }
+        #expect(viewModel.backendVisibilityMode == "operator_visible")
+
+        viewModel.beginRefresh(runID: "run-1")
+        for _ in 0..<20 where viewModel.inFlightGenerationID != nil {
+            await Task.yield()
+        }
+
         #expect(viewModel.backendVisibilityMode == "disabled")
         #expect(viewModel.isBackendAuthorizedForVisibleSurface == false)
     }
@@ -714,6 +750,26 @@ struct P089TempArtifactInventoryTests {
         vm.onFocusTransfer()
         #expect(vm.focusedCopyCommandEnabled == false)
         #expect(vm.selectedRowIdentity != nil)
+    }
+
+    @Test("Focus transfer clears an in-flight refresh without a cancellation banner")
+    func focusTransferClearsInFlightRefresh() async {
+        let announcer = SpyAnnouncer()
+        let vm = TempArtifactInventoryViewModel(
+            fetcher: CancellationAcknowledgingFetcher(),
+            announcer: announcer
+        )
+        vm.setSceneActivity(isVisible: true, isFocused: true)
+        vm.beginRefresh(runID: "run-1")
+        #expect(vm.inFlightGenerationID != nil)
+
+        vm.onFocusTransfer()
+
+        #expect(vm.inFlightGenerationID == nil)
+        #expect(vm.viewState == .firstLoad)
+        await Task.yield()
+        await Task.yield()
+        #expect(announcer.messages.isEmpty)
     }
 
     @MainActor

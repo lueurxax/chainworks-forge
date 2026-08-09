@@ -245,6 +245,7 @@ final class TempArtifactInventoryViewModel {
         // Accepted stale rows are preserved; only the pending request is cancelled.
         refreshTaskHandle?.cancel()
         refreshTaskHandle = nil
+        inFlightGenerationID = nil
         explicitCancellationGenerationID = nil
     }
 
@@ -268,6 +269,10 @@ final class TempArtifactInventoryViewModel {
         lastRefreshCancelled = false
         switch result {
         case .success(let payload):
+            // Every accepted response carries the daemon's current kill-switch mode.
+            // Apply it immediately so a runtime rollback cannot leave a previously
+            // authorized diagnostics surface visible.
+            backendVisibilityMode = payload.mode
             let shouldPreserveStaleRows = payload.rows.isEmpty
                 && (payload.status == "resource_exhausted" || payload.status == "error")
                 && staleSnapshot != nil

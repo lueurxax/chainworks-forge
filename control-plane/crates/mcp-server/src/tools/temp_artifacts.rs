@@ -2877,6 +2877,7 @@ mod tests {
     #[tokio::test]
     async fn p089_include_dry_run_false_rows_have_null_dry_run_recommendation() {
         let _guard = temp_artifact_inventory_env_test_lock();
+        let _managed_roots = isolate_managed_roots();
         let meta = tempfile::TempDir::new().expect("temp meta dir");
         let run_dir = meta.path().join("runs").join(TEST_RUN_ID);
         std::fs::create_dir_all(&run_dir).expect("create run dir");
