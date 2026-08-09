@@ -8,7 +8,7 @@ on:
 
 jobs:
   fast-gate:
-    runs-on: macos-26
+    runs-on: xcode-27
     steps:
       - uses: actions/checkout@v4
 
@@ -21,7 +21,7 @@ jobs:
         run: ./scripts/test-gate.sh fast
 
   ui-smoke-gate:
-    runs-on: macos-26
+    runs-on: xcode-27
     needs: fast-gate
     steps:
       - uses: actions/checkout@v4

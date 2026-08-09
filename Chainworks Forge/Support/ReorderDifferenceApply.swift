@@ -1,6 +1,5 @@
 import SwiftUI
 
-#if compiler(>=6.4)
 // macOS 27 drag-to-reorder support. SwiftUI's `reorderContainer(for:)` hands back a
 // `ReorderDifference` describing the move; this helper applies it in one in-place pass to
 // any single-collection array of Identifiable elements. Scoped to single-collection
@@ -32,4 +31,3 @@ extension ReorderDifference where CollectionID == ReorderableSingleCollectionIde
         }
     }
 }
-#endif
