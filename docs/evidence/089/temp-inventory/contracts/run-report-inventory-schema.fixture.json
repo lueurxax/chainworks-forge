@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RunReportInventorySection",
+  "description": "P089 run report temp_artifact_inventory section schema fixture. Same canonical DTO as MCP; snake_case; RFC3339 timestamps.",
+  "type": "object",
+  "required": ["schema_version", "status", "enabled_state", "generated_at"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "temp_artifact_inventory_v1"},
+    "status": {
+      "type": "string",
+      "enum": ["complete", "partial", "timeout", "cancelled", "error", "disabled", "resource_exhausted", "unknown"]
+    },
+    "enabled_state": {
+      "type": "string",
+      "enum": ["enabled", "disabled", "unknown"]
+    },
+    "disabled_reason_code": {"type": ["string", "null"]},
+    "generated_at": {"type": "string"},
+    "limits_applied": {"type": ["object", "null"]},
+    "summary": {"type": ["object", "null"]},
+    "rows": {"type": "array"},
+    "errors": {"type": "array"},
+    "dry_run": {"type": ["object", "null"]},
+    "mutation_guard": {"type": "object"}
+  }
+}

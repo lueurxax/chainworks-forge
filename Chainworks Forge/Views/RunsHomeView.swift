@@ -95,8 +95,8 @@ struct RunsHomeView: View {
                     P031FreshnessBadge(snapshot: freshness)
                         .help(model.runsHome?.refreshFeedbackText ?? "Read freshness")
                 }
-                .visibilityPriority(.low)
-                .contentMarginsRemoved()
+                .forgeVisibilityPriority(.low)
+                .forgeContentMarginsRemovedWhenAvailable()
             }
 
             // Primary action — high priority so it always stays in the bar regardless of
@@ -114,7 +114,7 @@ struct RunsHomeView: View {
                 }
                 .disabled(model.isLoading)
             }
-            .visibilityPriority(.high)
+            .forgeVisibilityPriority(.high)
 
             ToolbarItem(placement: .primaryAction) {
                 Menu {
@@ -125,7 +125,7 @@ struct RunsHomeView: View {
                 .disabled(!p083RunCommandState.hasSelectedRun)
                 .accessibilityLabel("Run actions")
             }
-            .visibilityPriority(.high)
+            .forgeVisibilityPriority(.high)
 
             // Full-chrome redesign (macOS 27): toggle the trailing Inspector pane.
             // High priority so it never collapses into the overflow menu.
@@ -138,7 +138,7 @@ struct RunsHomeView: View {
                 .help("Toggle the run inspector")
                 .accessibilityIdentifier("run-inspector-toggle-button")
             }
-            .visibilityPriority(.high)
+            .forgeVisibilityPriority(.high)
         }
         .focusedSceneValue(\.p083RunCommandState, p083RunCommandState)
         .focusedSceneValue(\.p083RunCommandActions, p083RunCommandActions)
@@ -652,6 +652,9 @@ struct RunsHomeView: View {
                         )
                     case .reports:
                         P031ReportMetadataCard(rows: workbench.reportRows)
+                        if let runID = runDetail.runID {
+                            TempArtifactInventoryView(runID: runID)
+                        }
                     case .system:
                         if let health = workbench.freshnessAndHealth {
                             P036SystemReadinessCard(health: health)
@@ -690,7 +693,7 @@ struct RunsHomeView: View {
             }
             // macOS 27: enables `swipeActions` on rows that live outside a List
             // (e.g. the approval workbench cards in this scroll view).
-            .swipeActionsContainer()
+            .forgeSwipeActionsContainerWhenAvailable()
             .onChange(of: closeoutReadinessScrollRequest) {
                 guard selectedRunDetailTab == .overview else { return }
                 withAnimation(.easeInOut(duration: 0.16)) {
@@ -7353,16 +7356,35 @@ private struct P036ApprovalWorkbenchCard: View {
                             .disabled(!row.canApprove || resolvingIDs.contains(row.id))
                         }
                     }
-                    .reorderable()
+                    .forgeReorderableWhenAvailable()
                 }
-                .reorderContainer(for: RunsWorkbenchPresentationModel.ApprovalRow.self) { difference in
-                    difference.apply(to: &orderedRows)
-                }
+                .p036ApprovalReorderContainer(orderedRows: $orderedRows)
             }
         }
         .forgePanel(tint: rows.isEmpty ? ForgeColor.Surface.border : ForgeStatusColor.approval)
         .onAppear { reconcileOrder() }
         .onChange(of: rows.map(\.id)) { reconcileOrder() }
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func p036ApprovalReorderContainer(
+        orderedRows: Binding<[RunsWorkbenchPresentationModel.ApprovalRow]>
+    ) -> some View {
+        #if compiler(>=6.4)
+        if #available(macOS 27.0, *) {
+            reorderContainer(for: RunsWorkbenchPresentationModel.ApprovalRow.self) { difference in
+                var rows = orderedRows.wrappedValue
+                difference.apply(to: &rows)
+                orderedRows.wrappedValue = rows
+            }
+        } else {
+            self
+        }
+        #else
+        self
+        #endif
     }
 }
 

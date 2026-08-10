@@ -1,0 +1,200 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TempArtifactInventoryResult",
+  "description": "P089 MCP tool temp_artifacts.inventory.preview result schema fixture. ByteCountString fields are decimal strings. DateTime fields are RFC3339/ISO-8601 strings or null.",
+  "$comment": "NOT YET RECONCILED with the shipped implementation. A real MCP result does not validate against this file as checked in: the top level sets additionalProperties=false while omitting the canonical `mode` field, and `summary` sets additionalProperties=false while omitting `queue_wait_ms`, which every real payload emits. The authoritative MCP output schema is the one declared by the tool itself in control-plane/crates/mcp-server/src/tools/temp_artifacts.rs. Do not read this file as MCP contract-parity evidence until it is reconciled; the focused gate asserts presence only. See docs/reference/managed-temporary-artifact-inventory.md#44-graphql-projection-specifics-implemented.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "status",
+    "enabled_state",
+    "generated_at",
+    "limits_applied",
+    "summary",
+    "rows",
+    "errors",
+    "mutation_guard"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "temp_artifact_inventory_v1"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["complete", "partial", "timeout", "cancelled", "error", "disabled", "resource_exhausted", "unknown"]
+    },
+    "enabled_state": {
+      "type": "string",
+      "enum": ["enabled", "disabled", "unknown"]
+    },
+    "disabled_reason_code": {
+      "type": ["string", "null"]
+    },
+    "generated_at": {
+      "type": "string",
+      "description": "RFC3339/ISO-8601 timestamp"
+    },
+    "limits_applied": {
+      "type": "object",
+      "required": ["limit", "timeout_ms", "queue_wait_ms"],
+      "properties": {
+        "limit": {"type": "integer"},
+        "timeout_ms": {"type": "integer"},
+        "scan_deadline_at": {"type": ["string", "null"]},
+        "queue_wait_ms": {"type": "integer"}
+      },
+      "additionalProperties": false
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "artifact_tree_count",
+        "estimated_bytes",
+        "active_or_recent_count",
+        "terminal_candidate_count",
+        "orphan_candidate_count",
+        "legacy_unmanaged_count",
+        "scan_error_count",
+        "dry_run_candidate_count",
+        "truncated"
+      ],
+      "properties": {
+        "artifact_tree_count": {"type": "integer"},
+        "estimated_bytes": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)$",
+          "description": "ByteCountString: unsigned decimal string only"
+        },
+        "active_or_recent_count": {"type": "integer"},
+        "terminal_candidate_count": {"type": "integer"},
+        "orphan_candidate_count": {"type": "integer"},
+        "legacy_unmanaged_count": {"type": "integer"},
+        "scan_error_count": {"type": "integer"},
+        "dry_run_candidate_count": {"type": "integer"},
+        "truncated": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "rows": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "required": [
+          "path_display",
+          "path_hash",
+          "path_hash_short",
+          "correlation_key",
+          "root_kind",
+          "lifecycle_classification",
+          "estimated_size_bytes",
+          "status_token",
+          "generated_at",
+          "partial_errors"
+        ],
+        "properties": {
+          "path_display": {"type": "string"},
+          "path_hash": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
+          "path_hash_short": {"type": "string", "minLength": 12, "maxLength": 20, "pattern": "^[0-9a-f]{12,20}$"},
+          "correlation_key": {"type": "string"},
+          "root_kind": {
+            "type": "string",
+            "enum": ["run_meta_root", "control_plane_cache", "provider_home_copy", "legacy_chainworks_tmp", "diagnostic_test_root", "unknown"]
+          },
+          "artifact_kind": {"type": ["string", "null"]},
+          "manifest_state": {"type": ["string", "null"]},
+          "lifecycle_classification": {
+            "type": "string",
+            "enum": ["active_or_recent", "terminal_candidate", "orphan_candidate", "legacy_unmanaged", "scan_error", "unknown"]
+          },
+          "dry_run_recommendation": {
+            "type": ["string", "null"],
+            "enum": ["would_keep_active", "would_keep_recent", "would_preserve_failure_evidence", "would_delete_after_future_approval", "would_migrate_legacy_manifest_after_future_migration_enabled", "needs_operator_review", "no_recommendation", "unknown", null]
+          },
+          "estimated_size_bytes": {
+            "type": "string",
+            "pattern": "^(0|[1-9][0-9]*)$"
+          },
+          "last_touched_at": {"type": ["string", "null"]},
+          "active_process_evidence": {"type": ["string", "null"]},
+          "owner": {"type": ["string", "null"]},
+          "owner_inference": {"type": ["string", "null"]},
+          "status_token": {"type": "string"},
+          "generated_at": {"type": "string"},
+          "partial_errors": {"type": "array", "items": {"type": "string"}, "maxItems": 10}
+        },
+        "additionalProperties": false
+      }
+    },
+    "errors": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": ["invalid_root_override", "root_unreadable", "manifest_parse_failed", "size_estimation_failed", "deadline_exceeded", "cancelled", "internal_error", "mutation_guard_failed", "resource_exhausted", "unknown"]
+          },
+          "message": {"type": "string"},
+          "root_kind": {
+            "type": ["string", "null"],
+            "enum": ["run_meta_root", "control_plane_cache", "provider_home_copy", "legacy_chainworks_tmp", "diagnostic_test_root", "unknown", null]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "dry_run": {
+      "type": ["object", "null"],
+      "properties": {
+        "schema_version": {"type": "string"},
+        "generated_at": {"type": ["string", "null"]},
+        "mutation_guard": {
+          "type": "object",
+          "required": ["status", "checked_at"],
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": ["pass", "fail", "skipped", "unknown"]
+            },
+            "checked_at": {"type": ["string", "null"]}
+          }
+        },
+        "recommendation_counts": {
+          "type": "object",
+          "properties": {
+            "would_keep_active": {"type": "integer"},
+            "would_keep_recent": {"type": "integer"},
+            "would_preserve_failure_evidence": {"type": "integer"},
+            "would_delete_after_future_approval": {"type": "integer"},
+            "would_migrate_legacy_manifest_after_future_migration_enabled": {"type": "integer"},
+            "needs_operator_review": {"type": "integer"},
+            "no_recommendation": {"type": "integer"},
+            "unknown": {"type": "integer"}
+          }
+        }
+      }
+    },
+    "mutation_guard": {
+      "type": "object",
+      "required": ["status", "checked_at"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["pass", "fail", "skipped", "unknown"]
+        },
+        "checked_at": {"type": ["string", "null"]},
+        "no_delete": {"type": "boolean"},
+        "no_prune": {"type": "boolean"},
+        "no_chmod": {"type": "boolean"},
+        "no_persist": {"type": "boolean"},
+        "no_retry": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -3,12 +3,17 @@
 | Field | Value |
 |---|---|
 | Date | 2026-05-16 |
-| Status | Draft |
+| Status | Partially superseded — inventory subset implemented; cleanup/lifecycle sections remain open design intent |
+| Superseded in part by | [Managed Temporary Artifact Inventory](../reference/managed-temporary-artifact-inventory.md) |
 | Author | Codex |
 | Depends on | P037 ACP execution supervision, [auto-retry observation ledger](../reference/auto-retry-observation-ledger.md), [execution-truth ownership invariants](../reference/execution-truth-and-recovery.md#durable-execution-truth-ownership), P088 code-writer completion receipts |
 | Related | `docs/reference/rust-control-plane.md`, `docs/reference/test-gates.md`, `scripts/test-gate.sh`, Rust ACP provider runtime homes |
 | Scope | Bound uncontrolled temporary file growth by making Chainworks temporary artifacts owned, discoverable, and lifecycle-managed. |
 | Non-goal | No daemon-wide hard quota/watermark policy, no provider token-budget policy, no deletion of active worktrees, no weakening of failure evidence preservation. |
+
+---
+
+> **Note**: Only the read-only, dry-run-only inventory subset of this proposal was approved and implemented. Its implemented truth lives in the canonical reference document — [Managed Temporary Artifact Inventory](../reference/managed-temporary-artifact-inventory.md) — and that document, not this file, is authoritative for inventory behavior. The deletion, cleanup, retention-policy, and manifest-migration sections below are **not implemented** and are retained here only as design intent for a future lifecycle proposal.
 
 ---
 

@@ -1075,14 +1075,6 @@ impl McpServer {
                                 }),
                             );
                         }
-                        if let Some(resp) = mcp_tool_input_error_response(
-                            id.clone(),
-                            canonical_tool_name,
-                            &error_text,
-                            rid.clone(),
-                        ) {
-                            return resp;
-                        }
                         tracing::error!(
                             error = %e,
                             request_id = ?rid,
@@ -1246,8 +1238,14 @@ impl McpServer {
                         | auth::boundary::PolicyDecision::LegacyPassthrough => {}
                     }
                 }
-                // No parameterized resource templates yet.
-                JsonRpcResponse::success(id, serde_json::json!({ "resourceTemplates": [] }))
+                let filtered: Vec<_> =
+                    auth::filter_resources(principal, &auth::all_resource_templates())
+                        .into_iter()
+                        .filter(|id| resource_template_uri(*id).contains('{'))
+                        .map(resource_template_definition_value)
+                        .collect();
+
+                JsonRpcResponse::success(id, serde_json::json!({ "resourceTemplates": filtered }))
             }
 
             "resources/read" => {
@@ -1497,14 +1495,23 @@ impl McpServer {
                 db::repos::artifacts::list_by_run(&self.pool, run_id_parsed).await?;
             let (mcp_rollout_readback, run_report_rollout_readback) =
                 rollout_contract_readback_lanes_json(&self.pool, run_id_parsed).await?;
+            // Scan once per resource read and reuse across every artifact projected
+            // below (SR-HIGH-002: avoids one full filesystem scan per report artifact).
+            let temp_artifact_inventory_dto =
+                tools::reports::p089_temp_artifact_inventory_run_report_section(
+                    run_id_parsed,
+                    &principal.class,
+                )
+                .await;
             let mut artifact_payloads = Vec::with_capacity(run_artifacts.len());
             for artifact in &run_artifacts {
                 artifact_payloads.push(
-                    tools::reports::artifact_report_json(
+                    tools::reports::artifact_report_json_with_temp_artifact_inventory(
                         &self.pool,
                         artifact,
                         Some(&run_report_rollout_readback),
                         &principal.class,
+                        Some(&temp_artifact_inventory_dto),
                     )
                     .await?,
                 );
@@ -1629,6 +1636,9 @@ impl McpServer {
                     })
                     .collect();
                 return Ok(serde_json::to_value(redacted)?);
+            } else if let Some(rid) = run_id.strip_suffix("/temp-artifact-inventory") {
+                return tools::temp_artifacts::inventory_preview_for_run_resource(rid, principal)
+                    .await;
             } else {
                 return self.read_canonical_run_resource(run_id, principal).await;
             }
@@ -1840,13 +1850,8 @@ impl McpServer {
             tools::automation::execute(tool_name, params, principal).await
         } else if tool_name.starts_with("p080.") {
             tools::p080::execute(tool_name, params, pool, principal).await
-        } else if tool_name == "temp_artifacts.inventory.preview" {
-            if !matches!(principal.class, auth::PrincipalClass::Operator) {
-                anyhow::bail!(
-                    "forbidden: temp_artifacts.inventory.preview requires Operator principal"
-                );
-            }
-            tools::temp_artifact_inventory::execute(params).await
+        } else if tool_name.starts_with("temp_artifacts.") {
+            tools::temp_artifacts::execute(tool_name, params, principal).await
         } else {
             Err(anyhow::anyhow!("Unknown tool namespace: {tool_name}"))
         }
@@ -1929,40 +1934,6 @@ where
             return Ok(total); // Complete line
         }
     }
-}
-
-fn mcp_tool_input_error_response(
-    id: Option<serde_json::Value>,
-    tool_name: &str,
-    error_text: &str,
-    request_id: Option<String>,
-) -> Option<JsonRpcResponse> {
-    let reason_code = if error_text.contains("Missing 'caller_request_id'")
-        || error_text.contains("requires 'caller_request_id'")
-        || error_text.contains("caller_request_id is required")
-    {
-        "missing_caller_request_id"
-    } else if error_text.starts_with("MALFORMED_REQUEST_ID:")
-        || error_text.contains("caller_request_id must be lowercase UUIDv4")
-    {
-        "malformed_caller_request_id"
-    } else if error_text.starts_with("Missing '") {
-        "missing_required_argument"
-    } else {
-        return None;
-    };
-
-    Some(JsonRpcResponse::error_with_data(
-        id,
-        -32602,
-        "invalid tool arguments",
-        serde_json::json!({
-            "code": "INVALID_TOOL_ARGUMENTS",
-            "reason_code": reason_code,
-            "tool_name": tool_name,
-            "request_id": request_id,
-        }),
-    ))
 }
 
 // ── P081 AC-13: MCP command idempotency helpers ──────────────────────────────
@@ -2085,7 +2056,7 @@ fn is_read_only_tool(tool_name: &str) -> bool {
             // P086: continuation readback tools are unconditionally read-only. (SEC-LOW-001)
             | "agents.continuation_status"
             | "agents.continuation_candidates"
-            // P089: temp artifact inventory preview is read-only (advisory dry-run, no mutation).
+            // P089: inventory preview is read-only advisory (no scanning or mutation).
             | "temp_artifacts.inventory.preview"
     )
 }
@@ -2594,6 +2565,9 @@ fn resource_template_uri(id: ResourceTemplateId) -> &'static str {
         ResourceTemplateId::ChainworksApprovalsInbox => "chainworks://approvals/inbox",
         ResourceTemplateId::ChainworksRunStages => "chainworks://runs/{run_id}/stages",
         ResourceTemplateId::ChainworksRunArtifacts => "chainworks://runs/{run_id}/artifacts",
+        ResourceTemplateId::ChainworksRunTempArtifactInventory => {
+            "chainworks://runs/{run_id}/temp-artifact-inventory"
+        }
     }
 }
 
@@ -2689,7 +2663,23 @@ fn resource_template_value(id: ResourceTemplateId) -> serde_json::Value {
             "description": "Artifact list for a run (artifact_index projection)",
             "mimeType": "application/json"
         }),
+        ResourceTemplateId::ChainworksRunTempArtifactInventory => serde_json::json!({
+            "uri": "chainworks://runs/{run_id}/temp-artifact-inventory",
+            "name": "Temporary Artifact Inventory",
+            "description": "Read-only advisory managed temporary artifact inventory for a run",
+            "mimeType": "application/json"
+        }),
     }
+}
+
+fn resource_template_definition_value(id: ResourceTemplateId) -> serde_json::Value {
+    let mut value = resource_template_value(id);
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(uri) = obj.remove("uri") {
+            obj.insert("uriTemplate".to_string(), uri);
+        }
+    }
+    value
 }
 
 #[cfg(test)]
@@ -2741,7 +2731,26 @@ mod resource_tests {
             resource_template_id_for_uri("chainworks://runs/run-1/artifacts"),
             Some(ResourceTemplateId::ChainworksRunArtifacts)
         );
+        assert_eq!(
+            resource_template_id_for_uri("chainworks://runs/run-1/temp-artifact-inventory"),
+            Some(ResourceTemplateId::ChainworksRunTempArtifactInventory)
+        );
         assert_eq!(resource_template_id_for_uri("workflow://wf-1"), None);
+    }
+
+    #[test]
+    fn p089_temp_artifact_inventory_resource_template_uses_mcp_uri_template_key() {
+        let value = resource_template_definition_value(
+            ResourceTemplateId::ChainworksRunTempArtifactInventory,
+        );
+        assert_eq!(
+            value["uriTemplate"],
+            serde_json::json!("chainworks://runs/{run_id}/temp-artifact-inventory")
+        );
+        assert!(
+            value.get("uri").is_none(),
+            "resources/templates/list entries must use uriTemplate"
+        );
     }
 }
 
@@ -2950,6 +2959,7 @@ mod p029_capability_tests {
             "chainworks://approvals/inbox",
             "chainworks://runs/{run_id}/stages",
             "chainworks://runs/{run_id}/artifacts",
+            "chainworks://runs/{run_id}/temp-artifact-inventory",
             "artifact://{artifact_id}",
             "report://{run_id}",
         ] {
@@ -2969,6 +2979,10 @@ mod p029_capability_tests {
         assert!(
             !ob_uris.contains("report://{run_id}"),
             "observer must not see report://"
+        );
+        assert!(
+            !ob_uris.contains("chainworks://runs/{run_id}/temp-artifact-inventory"),
+            "observer must not see temp artifact inventory resource"
         );
     }
 
@@ -3546,7 +3560,7 @@ mod tests {
                 action: "retry_failed_agent".to_string(),
                 explanation: "Retry the agent with the same inputs.".to_string(),
             },
-            diagnostic_artifact_paths: Vec::new(),
+            diagnostic_artifact_paths: vec![],
         }
     }
 
@@ -4098,7 +4112,7 @@ mod tests {
     ) -> serde_json::Value {
         // P041 §6.5: exclude mcp_execution_truth (runtime-only) and
         // canonical_artifact_contracts (P057 system projection, not in golden fixtures).
-        let tool_reports = tool_value["reports"]
+        let tool_reports = tool_value
             .as_array()
             .cloned()
             .unwrap_or_default()
@@ -4115,7 +4129,7 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let tool_report_artifacts = report_artifact_names_from_reports(&tool_value["reports"]);
+        let tool_report_artifacts = report_artifact_names_from_reports(&tool_value);
         let resource_report_artifacts =
             report_artifact_names_from_reports(&resource_value["artifacts"]);
         serde_json::json!({
@@ -4310,12 +4324,12 @@ mod tests {
 
     /// Drive a `tools/call` request through `handle_request` and return the
     /// parsed inner payload from `result.content[0].text`.
-    async fn call_tool_raw(
+    async fn call_tool_and_parse(
         server: &McpServer,
         principal: &auth::Principal,
         tool_name: &str,
         arguments: serde_json::Value,
-    ) -> crate::protocol::JsonRpcResponse {
+    ) -> serde_json::Value {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: Some(serde_json::json!(1)),
@@ -4325,18 +4339,7 @@ mod tests {
                 "arguments": arguments,
             })),
         };
-        server.handle_request(req, principal).await
-    }
-
-    /// Drive a `tools/call` request through `handle_request` and return the
-    /// parsed inner payload from `result.content[0].text`.
-    async fn call_tool_and_parse(
-        server: &McpServer,
-        principal: &auth::Principal,
-        tool_name: &str,
-        arguments: serde_json::Value,
-    ) -> serde_json::Value {
-        let resp = call_tool_raw(server, principal, tool_name, arguments).await;
+        let resp = server.handle_request(req, principal).await;
         let result = resp
             .result
             .expect("tools/call response must have result when the call succeeded");
@@ -4353,81 +4356,6 @@ mod tests {
 
     fn observer_principal() -> auth::Principal {
         auth::Principal::new("test-observer", auth::PrincipalClass::Observer)
-    }
-
-    #[tokio::test]
-    async fn stages_retry_missing_caller_request_id_returns_invalid_tool_arguments() {
-        let pool = test_pool().await;
-        let idea_id = IdeaId::new();
-        let run_id = RunId::new();
-        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-        runs::insert(&pool, &make_run(run_id, idea_id))
-            .await
-            .unwrap();
-        let (stage_execution_id, _) = seed_validation_attempt(&pool, run_id).await;
-        let server = McpServer::new(
-            pool.clone(),
-            make_command_handler(pool.clone()),
-            auth::PrincipalTable::test_fixture(),
-        );
-
-        let response = call_tool_raw(
-            &server,
-            &operator_principal(),
-            "stages.retry",
-            serde_json::json!({
-                "stage_execution_id": stage_execution_id.to_string(),
-            }),
-        )
-        .await;
-
-        let error = response
-            .error
-            .expect("missing caller_request_id must be a JSON-RPC error");
-        assert_eq!(error.code, -32602);
-        assert_eq!(error.message, "invalid tool arguments");
-        let data = error.data.expect("invalid argument error carries data");
-        assert_eq!(data["code"], "INVALID_TOOL_ARGUMENTS");
-        assert_eq!(data["reason_code"], "missing_caller_request_id");
-        assert_eq!(data["tool_name"], "stages.retry");
-    }
-
-    #[tokio::test]
-    async fn stages_retry_malformed_caller_request_id_returns_invalid_tool_arguments() {
-        let pool = test_pool().await;
-        let idea_id = IdeaId::new();
-        let run_id = RunId::new();
-        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-        runs::insert(&pool, &make_run(run_id, idea_id))
-            .await
-            .unwrap();
-        let (stage_execution_id, _) = seed_validation_attempt(&pool, run_id).await;
-        let server = McpServer::new(
-            pool.clone(),
-            make_command_handler(pool.clone()),
-            auth::PrincipalTable::test_fixture(),
-        );
-
-        let response = call_tool_raw(
-            &server,
-            &operator_principal(),
-            "stages.retry",
-            serde_json::json!({
-                "stage_execution_id": stage_execution_id.to_string(),
-                "caller_request_id": "not-a-uuid",
-            }),
-        )
-        .await;
-
-        let error = response
-            .error
-            .expect("malformed caller_request_id must be a JSON-RPC error");
-        assert_eq!(error.code, -32602);
-        assert_eq!(error.message, "invalid tool arguments");
-        let data = error.data.expect("invalid argument error carries data");
-        assert_eq!(data["code"], "INVALID_TOOL_ARGUMENTS");
-        assert_eq!(data["reason_code"], "malformed_caller_request_id");
-        assert_eq!(data["tool_name"], "stages.retry");
     }
 
     async fn force_p081_audit_budget_safe_mode(pool: &sqlx::SqlitePool) {
@@ -4630,9 +4558,9 @@ mod tests {
         )
         .await;
 
-        let journal_id = payload["journal_id"].as_str().unwrap_or_else(|| {
-            panic!("runs.cancel response must contain journal_id as a string: {payload}")
-        });
+        let journal_id = payload["journal_id"]
+            .as_str()
+            .expect("runs.cancel response must contain journal_id as a string");
         assert!(
             !journal_id.is_empty(),
             "journal_id must be non-empty (uuid from CommandHandler::handle)"

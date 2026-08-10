@@ -59,6 +59,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 - [reference/structured-output-envelope-and-contract-validation.md](reference/structured-output-envelope-and-contract-validation.md) — Named envelopes, contract binding, validation, Junie canary proof, failure substrate
 - [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, quality-gate blocker boundary contracts/readback, implementation self-assessment and handoff, failed-stage evidence, Junie code-writer completion-boundary subtypes, staged repair settlement, narrow recovery
 - [reference/implementation-closeout-readiness.md](reference/implementation-closeout-readiness.md) — Active closeout readiness authority, state-9 release routing, readback, rollout evidence, and retained gate aliases
+- [reference/managed-temporary-artifact-inventory.md](reference/managed-temporary-artifact-inventory.md) — Read-only and dry-run-only managed temporary artifact inventory slice, GraphQL/MCP/report readback, ByteCountString validation, path redaction contract, and scanner boundaries
 - [reference/proposal-loop-feedback-fidelity-and-rereview.md](reference/proposal-loop-feedback-fidelity-and-rereview.md) — Review-corpus fidelity, backlog carry-forward, targeted rereview
 - [reference/context-strategy-and-experiment-framework.md](reference/context-strategy-and-experiment-framework.md) — Strategy-profile freezing, handoff compilation, normalized telemetry
 

@@ -1,39 +1,10 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "p089_temp_inventory_negative_fixture_v1",
+  "expected_status": "fail",
+  "negative_condition": "An MCP result schema that omits required fields (e.g., missing mutation_guard, missing errors array, or missing schema_version) must fail the contract fixture check.",
+  "mutated_contract": {
+    "missing_fields": ["mutation_guard", "errors", "schema_version"],
+    "violation": "Incomplete MCP result schema: required top-level fields are absent."
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-089-temp-inventory",
-    "p089-temp-inventory"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:incomplete_mcp_result_schema",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "assertion": "The P089 smoke gate must reject an MCP result schema fixture that does not declare all required top-level fields: schema_version, status, enabled_state, generated_at, limits_applied, summary, rows, errors, mutation_guard."
 }

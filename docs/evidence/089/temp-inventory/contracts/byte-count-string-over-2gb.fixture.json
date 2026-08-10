@@ -1,0 +1,26 @@
+{
+  "schema_version": "p089_temp_inventory_byte_count_string_v1",
+  "description": "P089 ByteCountString fixture proving values greater than 2 GB (2,147,483,648 bytes) are accepted as unsigned decimal strings across all readback lanes.",
+  "valid_cases": [
+    {"value": "0", "description": "Zero bytes"},
+    {"value": "1", "description": "One byte"},
+    {"value": "2147483648", "description": "Exactly 2 GB"},
+    {"value": "2147483649", "description": "One byte over 2 GB"},
+    {"value": "3000000000", "description": "3 GB"},
+    {"value": "10000000000", "description": "10 GB"},
+    {"value": "1099511627776", "description": "1 TiB in bytes"},
+    {"value": "9999999999999999999", "description": "Large value well above 2 GB"}
+  ],
+  "invalid_cases": [
+    {"value": "", "reason": "empty string rejected"},
+    {"value": "-1", "reason": "negative rejected"},
+    {"value": "1.5", "reason": "non-decimal (dot) rejected"},
+    {"value": "1e9", "reason": "non-decimal (exponent) rejected"},
+    {"value": "01", "reason": "leading zero rejected"},
+    {"value": "007", "reason": "leading zero rejected"},
+    {"value": "abc", "reason": "non-decimal letters rejected"},
+    {"value": " 1", "reason": "whitespace rejected"},
+    {"value": "1 ", "reason": "trailing whitespace rejected"}
+  ],
+  "parity_contract": "All readback lanes (GraphQL ByteCountString scalar, MCP JSON string, run-report JSON string, release-receipt JSON string) must accept the valid_cases and reject the invalid_cases using the same validation rule: ^(0|[1-9][0-9]*)$"
+}

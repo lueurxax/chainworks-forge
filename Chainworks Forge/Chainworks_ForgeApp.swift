@@ -82,6 +82,7 @@ struct Chainworks_ForgeApp: App {
                 .keyboardShortcut("4", modifiers: .command)
             }
             P083RunCommands()
+            TempArtifactInventoryCommands()
         }
         MenuBarExtra {
             EscalationMenuBarList(snapshots: notificationService.p058EscalationSnapshots) { runID in

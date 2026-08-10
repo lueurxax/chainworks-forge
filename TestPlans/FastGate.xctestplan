@@ -19,6 +19,7 @@
         "Proposal081ApprovalActionAttemptStoreTests",
         "ArtifactPathClipboardTests",
         "ForgeGlassTests",
+        "P089TempArtifactInventoryTests",
         "ProcessSupportTests",
         "Proposal046Tests",
         "Proposal079ContractRepairReadbackTests",

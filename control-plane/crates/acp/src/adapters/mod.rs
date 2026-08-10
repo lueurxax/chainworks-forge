@@ -1410,7 +1410,10 @@ pub(crate) fn find_sccache_binary() -> Option<String> {
         .map(|candidate| candidate.to_string_lossy().into_owned())
 }
 
-fn chainworks_cache_root() -> PathBuf {
+/// P089: exposed so the temp artifact inventory scanner can discover the
+/// `control_plane_cache` root_kind at the same path this module writes cargo
+/// target/sccache/wrapper caches to — single source of truth for the location.
+pub fn chainworks_cache_root() -> PathBuf {
     dirs::home_dir()
         .map(|home| home.join("Library").join("Caches").join("Chainworks Forge"))
         .unwrap_or_else(|| std::env::temp_dir().join("chainworks-forge-cache"))

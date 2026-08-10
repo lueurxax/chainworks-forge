@@ -200,6 +200,13 @@ async fn run_p080_rollout_control_seed() -> Result<()> {
 }
 
 async fn run_daemon() -> Result<()> {
+    // P089: install the MCP-backed temp artifact inventory backend so the GraphQL
+    // resolver reuses the exact mode-check, validation, redaction, permit-guard, and
+    // scanner path as the MCP tool and resource lane (readback parity requirement).
+    graphql_server::types::temp_artifact_inventory::install_backend(std::sync::Arc::new(
+        mcp_server::tools::temp_artifacts::McpTempArtifactInventoryBackend,
+    ));
+
     // ── §7.1 mode + paths ──────────────────────────────────────────────
     // Resolve mode/paths first so the log-sink decision below can route
     // packaged modes to the app-support log file per §9.1.
@@ -1074,19 +1081,37 @@ async fn run_daemon() -> Result<()> {
                 wait_for_shutdown_signal().await;
                 info!("shutdown signal received; transitioning to Shutdown");
                 shutdown_reporter.set_state(DaemonLifecycleState::Shutdown);
+                // Signal any in-progress temp-artifact inventory scans to stop cooperatively.
+                mcp_server::tools::scanner::request_global_shutdown();
                 match tokio::time::timeout(
                     SHUTDOWN_DRAIN_DEADLINE,
-                    shutdown_acp.close_all_sessions(),
+                    async {
+                        tokio::join!(
+                            shutdown_acp.close_all_sessions(),
+                            mcp_server::tools::scanner::drain_global_scan_permits()
+                        )
+                    },
                 )
                 .await
                 {
-                    Ok(closed_sessions) => info!(
-                        closed_sessions,
-                        "closed live ACP sessions during daemon shutdown"
-                    ),
+                    Ok((closed_sessions, inventory_drain)) => {
+                        info!(
+                            closed_sessions,
+                            "closed live ACP sessions during daemon shutdown"
+                        );
+                        match inventory_drain {
+                            Ok(()) => info!(
+                                "released all temporary-artifact scan permits during daemon shutdown"
+                            ),
+                            Err(error) => warn!(
+                                error = %error,
+                                "temporary-artifact scan permit drain failed"
+                            ),
+                        }
+                    }
                     Err(_) => warn!(
                         deadline_secs = SHUTDOWN_DRAIN_DEADLINE.as_secs(),
-                        "timed out closing live ACP sessions during daemon shutdown"
+                        "timed out draining ACP sessions and temporary-artifact scans during daemon shutdown"
                     ),
                 }
                 // Notify the main task that the drain window has started.

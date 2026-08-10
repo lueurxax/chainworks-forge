@@ -120,10 +120,11 @@ A clean `ready` period of 5 minutes clears the budget. The Swift app also expose
 SIGTERM and SIGINT trigger a two-phase shutdown:
 
 1. Emit `shutdown`.
-2. Drain in-flight background work with a 5-second deadline.
-3. Gracefully stop HTTP servers with a 5-second deadline.
-4. Close the SQLite pool.
-5. Release the PID lock by dropping the guard.
+2. Signal in-progress temporary artifact inventory scans to cancel cooperatively (`scanner::request_global_shutdown()`; see [managed-temporary-artifact-inventory.md](managed-temporary-artifact-inventory.md#8-scanner-reliability-and-resource-bounds)).
+3. Drain in-flight background work with a 5-second deadline.
+4. Gracefully stop HTTP servers with a 5-second deadline.
+5. Close the SQLite pool.
+6. Release the PID lock by dropping the guard.
 
 Exit code 0 means clean drain. Exit code 75 means drain timeout.
 

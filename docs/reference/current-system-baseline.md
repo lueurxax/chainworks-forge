@@ -77,6 +77,7 @@ When implementation landed outside proposal closeout, the following code surface
 | Quality-gate blocker boundary routing and readback | `control-plane/crates/engine/src/quality_gate_boundary.rs`, `control-plane/crates/engine/src/orchestrator.rs`, `control-plane/crates/db/src/repos/artifact_contracts.rs`, `control-plane/crates/mcp-server/src/tools/runtime.rs` | [workflow-execution-engine.md](workflow-execution-engine.md), [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md) |
 | Boundary policy, caller class, audit log, idempotency, and operator alerts | `control-plane/crates/auth/src/`, `control-plane/crates/db/src/repos/audit_log.rs`, `control-plane/crates/graphql-server/src/schema.rs`, `control-plane/crates/mcp-server/src/tools/runtime.rs` | [boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md), [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md), [ui-action-boundary.md](ui-action-boundary.md) |
 | Bounded tool-output and safe-search guard | `control-plane/crates/domain/src/tool_policy.rs`, `control-plane/crates/acp/src/transport.rs`, `control-plane/crates/acp/src/adapters/codex.rs`, `control-plane/crates/mcp-server/src/tools/runtime.rs` | [bounded-tool-output-and-safe-search-policy.md](bounded-tool-output-and-safe-search-policy.md), [acp-runtime-transport.md](acp-runtime-transport.md), [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md) |
+| Managed temporary artifact inventory (read-only, dry-run-only) | `control-plane/crates/domain/src/temp_artifact_inventory.rs`, `control-plane/crates/mcp-server/src/tools/temp_artifacts.rs`, `control-plane/crates/mcp-server/src/tools/scanner.rs`, `control-plane/crates/graphql-server/src/types/temp_artifact_inventory.rs`, `Chainworks Forge/Views/TempArtifactInventoryView.swift`, `Chainworks Forge/Models/TempArtifactInventoryViewModel.swift` | [managed-temporary-artifact-inventory.md](managed-temporary-artifact-inventory.md) |
 
 This inventory is intentionally code-first. If a proposal file is missing, stale, or never closed out, update the matching reference doc from these owners rather than re-promoting proposal text.
 
@@ -124,6 +125,7 @@ Use these reference docs as the current source of truth:
 | UI action boundary | [ui-action-boundary.md](ui-action-boundary.md) |
 | GraphQL read contract | [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) |
 | Agent work continuation API contracts | [agent-work-continuation.md](agent-work-continuation.md) |
+| Managed temporary artifact inventory (read-only, dry-run-only smoke slice) | [managed-temporary-artifact-inventory.md](managed-temporary-artifact-inventory.md), [test-gates.md](test-gates.md#proposal-089-temp-inventoryp089-temp-inventory) |
 
 ## Canonical product boundaries
 

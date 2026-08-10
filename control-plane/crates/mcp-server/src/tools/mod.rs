@@ -8,10 +8,11 @@ pub mod p080;
 pub mod reports;
 pub mod runs;
 pub mod runtime;
+pub mod scanner;
 pub mod stages;
 pub mod steward;
 pub mod storage;
-pub mod temp_artifact_inventory;
+pub mod temp_artifacts;
 
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
@@ -72,8 +73,7 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 55] {
         CapabilityToolId::RetryRun,
         CapabilityToolId::SideEffectsForceReconcile,
         CapabilityToolId::ProviderSessionMarkProcessAbsent,
-        // P089: read-only temp artifact inventory preview.
-        CapabilityToolId::TempArtifactInventoryPreview,
+        CapabilityToolId::TempArtifactsInventoryPreview,
     ]
 }
 
@@ -160,8 +160,7 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "p083.set_enforcement_mode" => Some(CapabilityToolId::P083SetEnforcementMode),
         "runs.retry" => Some(CapabilityToolId::RetryRun),
         "side_effects.force_reconcile" => Some(CapabilityToolId::SideEffectsForceReconcile),
-        // P089: read-only temp artifact inventory preview.
-        "temp_artifacts.inventory.preview" => Some(CapabilityToolId::TempArtifactInventoryPreview),
+        "temp_artifacts.inventory.preview" => Some(CapabilityToolId::TempArtifactsInventoryPreview),
         _ => None,
     }
 }
@@ -377,8 +376,8 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
         CapabilityToolId::SideEffectsForceReconcile => {
             tool_spec_by_name(runs::tool_specs(), "side_effects.force_reconcile")
         }
-        CapabilityToolId::TempArtifactInventoryPreview => tool_spec_by_name(
-            temp_artifact_inventory::tool_specs(),
+        CapabilityToolId::TempArtifactsInventoryPreview => tool_spec_by_name(
+            temp_artifacts::tool_specs(),
             "temp_artifacts.inventory.preview",
         ),
     }
@@ -399,7 +398,7 @@ pub fn all_tool_specs() -> Vec<McpTool> {
     specs.extend(automation::tool_specs());
     specs.extend(agents::tool_specs());
     specs.extend(p080::tool_specs());
-    specs.extend(temp_artifact_inventory::tool_specs());
+    specs.extend(temp_artifacts::tool_specs());
     specs
 }
 

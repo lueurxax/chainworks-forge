@@ -1,39 +1,10 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "p089_temp_inventory_negative_fixture_v1",
+  "expected_status": "fail",
+  "negative_condition": "A filesystem traversal that encounters a directory cycle (via hardlink or duplicate inode) or attempts to cross device boundaries must not loop and must not produce unbounded partial errors.",
+  "mutated_contract": {
+    "traversal_scenario": "cycle_via_duplicate_inode",
+    "violation": "Cycle or device boundary cross without bounding — traversal loops or produces >100 partial errors per payload."
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-089-temp-inventory",
-    "p089-temp-inventory"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:traversal_cycle_or_escape",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "assertion": "Cycles are detected via device+inode identity tracking and skipped with at most one partial error per identity. Cross-device entries produce bounded partial errors (capped at 100 per payload). The scan terminates and returns partial or complete status — never loops indefinitely."
 }
