@@ -12670,12 +12670,16 @@ readback = json.loads(readback_fixture.read_text())
 if readback.get("schema_version") != "p089_temp_inventory_operator_readback_fixture_v1":
     fail(f"Operator-readback fixture has wrong schema_version: {readback.get('schema_version')!r}")
 
-# 10. Verify contract fixtures exist. NOTE: this is a presence check only — it does
-# not parse or validate the fixtures' contents against a real emitted payload, and
-# a fixture can be stale (or self-contradictory, e.g. declaring
-# additionalProperties:false while omitting a field every real payload emits)
-# without failing this check. Do not read a green result here as contract-parity
-# proof; see docs/reference/test-gates.md.
+# 10. Verify contract fixtures exist. NOTE: this loop itself is a presence check
+# only. Payload conformance for graphql-sdl.fixture.graphql, mcp-result-schema.
+# fixture.json, enum-value-projection-matrix.fixture.json, datetime-nullability-
+# parity.fixture.json, and status-by-field-matrix.fixture.json is proven by Rust
+# tests in the domain/mcp-server/graphql-server `cargo test` invocations above
+# (P089 B6), not by this presence loop. run-report-inventory-schema.fixture.json
+# and release-receipt-inventory-schema.fixture.json remain presence-only — a
+# fixture for either of those two can still be stale (or self-contradictory,
+# e.g. declaring additionalProperties:false while omitting a field every real
+# payload emits) without failing this check; see docs/reference/test-gates.md.
 contracts_dir = root / "docs/evidence/089/temp-inventory/contracts"
 if not contracts_dir.is_dir():
     fail(f"Missing contracts evidence directory: {contracts_dir}")
@@ -12775,12 +12779,18 @@ print(
     "proposal-089-temp-inventory gate passed: Rust unit/regression lanes (scanner, "
     "temp_artifacts, reports, graphql-server, db metrics), Swift unit surface, and "
     "required negative/operator-readback/contract-fixture PRESENCE checks passed. "
-    "NOTE: this gate does not execute the published contract fixtures (graphql-sdl, "
-    "mcp-result-schema, run-report/release-receipt schemas) against real emitted "
-    "payloads, and does not itself prove typed GraphQL parity or full report/receipt "
-    "projection beyond what the Rust unit tests above cover — see "
+    "The domain/mcp-server/graphql-server cargo test invocations above also include "
+    "payload-conformance tests (P089 B6) that diff graphql-sdl.fixture.graphql, "
+    "mcp-result-schema.fixture.json, enum-value-projection-matrix.fixture.json, "
+    "datetime-nullability-parity.fixture.json, and status-by-field-matrix.fixture.json "
+    "against a live introspected schema / real emitted MCP payloads / the shipped "
+    "domain enums and classifier — not just fixture presence. "
+    "NOTE: run-report-inventory-schema.fixture.json and release-receipt-inventory-"
+    "schema.fixture.json are still presence-only (no payload-conformance test wired "
+    "for those two), and this gate still does not prove full report/receipt "
+    "projection or packaged remote UI/accessibility smoke — see "
     "docs/reference/test-gates.md and the contract fixtures' own headers before "
-    "treating a green run here as full contract-parity or packaged-smoke evidence. "
+    "treating a green run here as complete contract-parity or packaged-smoke evidence. "
     "Mandatory readback and packaged-smoke promotion evidence passed."
 )
 PY

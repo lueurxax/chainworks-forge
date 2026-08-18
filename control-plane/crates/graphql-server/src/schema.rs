@@ -16362,4 +16362,274 @@ mod tests {
             "error must cite surface policy denial; got: {error_msg}"
         );
     }
+
+    // ── P089 §4.4/B6: graphql-sdl.fixture.graphql conformance ───────────────
+    //
+    // Reconciling the fixture text by hand (as done for this proposal slice)
+    // proves nothing on its own — a later schema change could silently drift
+    // back out of sync. This test introspects the *actual* schema via
+    // `Schema::sdl()` and diffs each fixture-declared scalar/enum/type/input
+    // block against the live block, so drift fails a test instead of only
+    // being caught by the fixture-presence check in the focused gate.
+
+    fn strip_graphql_docstrings(sdl: &str) -> String {
+        // GraphQL SDL descriptions are `"""..."""` blocks; splitting on the
+        // delimiter and keeping only the even-indexed (outside-comment)
+        // segments removes them without needing a full SDL parser.
+        sdl.split("\"\"\"")
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 0)
+            .map(|(_, s)| s)
+            .collect()
+    }
+
+    /// Extracts the `{ ... }` body of a top-level `keyword name { ... }`
+    /// declaration (brace-matched, so nested braces in field arguments are
+    /// handled correctly even though none of our fixture blocks use them).
+    fn extract_sdl_block(sdl_no_docs: &str, keyword: &str, name: &str) -> String {
+        let header = format!("{keyword} {name} {{");
+        let start = sdl_no_docs
+            .find(&header)
+            .unwrap_or_else(|| panic!("SDL missing top-level declaration `{header}`"));
+        let body_start = start + header.len();
+        let bytes = sdl_no_docs.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        assert!(depth == 0, "unbalanced braces while extracting `{header}`");
+        sdl_no_docs[body_start..i - 1].to_string()
+    }
+
+    fn normalized_sdl_lines(block: &str) -> std::collections::BTreeSet<String> {
+        block
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    fn sdl_fixture_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .expect("graphql crate should be under control-plane/crates")
+            .join("docs/evidence/089/temp-inventory/contracts/graphql-sdl.fixture.graphql")
+    }
+
+    #[test]
+    fn p089_graphql_sdl_fixture_matches_shipped_schema() {
+        let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot).finish();
+        let live_sdl = strip_graphql_docstrings(&schema.sdl());
+
+        let fixture_path = sdl_fixture_root();
+        let fixture_text = std::fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", fixture_path.display()));
+        let fixture_sdl = strip_graphql_docstrings(&fixture_text);
+
+        for scalar in ["ByteCountString", "DateTime", "JSON"] {
+            let needle = format!("scalar {scalar}");
+            assert!(
+                fixture_sdl.contains(&needle),
+                "fixture missing `{needle}`"
+            );
+            assert!(live_sdl.contains(&needle), "live SDL missing `{needle}`");
+        }
+
+        let enums = [
+            "InventoryStatus",
+            "InventoryEnabledState",
+            "InventoryMode",
+            "LifecycleClassification",
+            "DryRunRecommendation",
+            "MutationGuardStatus",
+            "RootKind",
+            "InventoryErrorCode",
+        ];
+        for name in enums {
+            let fixture_block = extract_sdl_block(&fixture_sdl, "enum", name);
+            let live_block = extract_sdl_block(&live_sdl, "enum", name);
+            assert_eq!(
+                normalized_sdl_lines(&fixture_block),
+                normalized_sdl_lines(&live_block),
+                "enum {name} values diverge between fixture and shipped schema"
+            );
+        }
+
+        let object_types = [
+            "TempArtifactInventoryLimitsApplied",
+            "TempArtifactInventorySummary",
+            "TempArtifactDryRunMutationGuard",
+            "TempArtifactDryRun",
+            "TempArtifactMutationGuard",
+            "TempArtifactRow",
+            "TempArtifactError",
+            "TempArtifactInventory",
+        ];
+        for name in object_types {
+            let fixture_block = extract_sdl_block(&fixture_sdl, "type", name);
+            let live_block = extract_sdl_block(&live_sdl, "type", name);
+            assert_eq!(
+                normalized_sdl_lines(&fixture_block),
+                normalized_sdl_lines(&live_block),
+                "type {name} fields diverge between fixture and shipped schema"
+            );
+        }
+
+        let input_types = [
+            "TempArtifactWorkspaceContextInput",
+            "TempArtifactInventoryInput",
+        ];
+        for name in input_types {
+            let fixture_block = extract_sdl_block(&fixture_sdl, "input", name);
+            let live_block = extract_sdl_block(&live_sdl, "input", name);
+            assert_eq!(
+                normalized_sdl_lines(&fixture_block),
+                normalized_sdl_lines(&live_block),
+                "input {name} fields diverge between fixture and shipped schema"
+            );
+        }
+
+        // The live root operation type is named `QueryRoot` (from the Rust
+        // struct `QueryRoot`, not renamed via `#[Object(name = "Query")]`);
+        // the fixture keeps the GraphQL-conventional `Query` name for its
+        // minimal standalone schema fragment.
+        let fixture_query_block = extract_sdl_block(&fixture_sdl, "type", "Query");
+        let live_query_block = extract_sdl_block(&live_sdl, "type", "QueryRoot");
+        let field_line =
+            "tempArtifactInventory(input: TempArtifactInventoryInput!): TempArtifactInventory!"
+                .to_string();
+        assert!(
+            normalized_sdl_lines(&fixture_query_block).contains(&field_line),
+            "fixture Query type missing tempArtifactInventory field"
+        );
+        assert!(
+            normalized_sdl_lines(&live_query_block).contains(&field_line),
+            "live Query type missing tempArtifactInventory field"
+        );
+    }
+
+    // ── P089 §4.4/B6: enum-value-projection-matrix.fixture.json conformance ──
+    //
+    // Checks the fixture's snake_case→SCREAMING_SNAKE_CASE value mapping
+    // against the real `From<Domain> for Gql*` conversions and the live SDL
+    // enum bodies, so a value added to one side without the other fails here.
+    #[test]
+    fn p089_enum_value_projection_matrix_fixture_matches_shipped_projection() {
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .expect("graphql crate should be under control-plane/crates")
+            .join("docs/evidence/089/temp-inventory/contracts/enum-value-projection-matrix.fixture.json");
+        let fixture_text = std::fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", fixture_path.display()));
+        let fixture: serde_json::Value =
+            serde_json::from_str(&fixture_text).expect("fixture must be valid JSON");
+
+        let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot).finish();
+        let live_sdl = strip_graphql_docstrings(&schema.sdl());
+
+        let domains: &[(&str, &str)] = &[
+            ("inventory_status", "InventoryStatus"),
+            ("enabled_state", "InventoryEnabledState"),
+            ("inventory_mode", "InventoryMode"),
+            ("lifecycle_classification", "LifecycleClassification"),
+            ("dry_run_recommendation", "DryRunRecommendation"),
+            ("mutation_guard_status", "MutationGuardStatus"),
+            ("root_kind", "RootKind"),
+            ("error_code", "InventoryErrorCode"),
+        ];
+
+        for (domain_key, gql_enum_name) in domains {
+            let mapping = fixture
+                .get(domain_key)
+                .and_then(|v| v.as_object())
+                .unwrap_or_else(|| panic!("fixture missing domain {domain_key:?}"));
+            let live_block = extract_sdl_block(&live_sdl, "enum", gql_enum_name);
+            let live_values = normalized_sdl_lines(&live_block);
+            for gql_value in mapping.values() {
+                let gql_value = gql_value.as_str().expect("enum value must be a string");
+                assert!(
+                    live_values.contains(gql_value),
+                    "fixture domain {domain_key:?} claims GraphQL value {gql_value:?} but live enum {gql_enum_name} does not declare it: {live_values:?}"
+                );
+            }
+            assert_eq!(
+                mapping.len(),
+                live_values.len(),
+                "fixture domain {domain_key:?} has {} values but live enum {gql_enum_name} has {}",
+                mapping.len(),
+                live_values.len()
+            );
+        }
+    }
+
+    // ── P089 §4.4/§4.3/B6: datetime-nullability-parity.fixture.json conformance ──
+    //
+    // Checks the fixture's claimed GraphQL nullability for each DateTime field
+    // against the live `TempArtifactInventory` SDL block (`Field: DateTime` is
+    // nullable, `Field: DateTime!` is not).
+    #[test]
+    fn p089_datetime_nullability_parity_fixture_matches_shipped_graphql_schema() {
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .expect("graphql crate should be under control-plane/crates")
+            .join("docs/evidence/089/temp-inventory/contracts/datetime-nullability-parity.fixture.json");
+        let fixture_text = std::fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", fixture_path.display()));
+        let fixture: serde_json::Value =
+            serde_json::from_str(&fixture_text).expect("fixture must be valid JSON");
+
+        let schema = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot).finish();
+        let live_sdl = strip_graphql_docstrings(&schema.sdl());
+
+        // (fixture field key, GraphQL type block, field line to look for)
+        let checks: &[(&str, &str, &str)] = &[
+            ("generatedAt", "TempArtifactInventory", "generatedAt: DateTime"),
+            (
+                "limitsApplied.scanDeadlineAt",
+                "TempArtifactInventoryLimitsApplied",
+                "scanDeadlineAt: DateTime",
+            ),
+            ("rows[].lastTouchedAt", "TempArtifactRow", "lastTouchedAt: DateTime"),
+            ("dryRun.generatedAt", "TempArtifactDryRun", "generatedAt: DateTime"),
+        ];
+
+        for (fixture_key, gql_type, expected_line) in checks {
+            let claimed_nullable = fixture["fields"][fixture_key]["nullable_in_graphql"]
+                .as_bool()
+                .unwrap_or_else(|| panic!("fixture missing nullable_in_graphql for {fixture_key}"));
+            let live_block = extract_sdl_block(&live_sdl, "type", gql_type);
+            let live_lines = normalized_sdl_lines(&live_block);
+            let non_null_line = format!("{expected_line}!");
+            let actually_nullable = if claimed_nullable {
+                assert!(
+                    live_lines.contains(&expected_line.to_string())
+                        && !live_lines.contains(&non_null_line),
+                    "{fixture_key}: fixture claims nullable but live {gql_type} declares `{non_null_line}`"
+                );
+                true
+            } else {
+                assert!(
+                    live_lines.contains(&non_null_line),
+                    "{fixture_key}: fixture claims non-null but live {gql_type} does not declare `{non_null_line}`"
+                );
+                false
+            };
+            assert_eq!(
+                claimed_nullable, actually_nullable,
+                "{fixture_key}: nullability mismatch"
+            );
+        }
+    }
 }

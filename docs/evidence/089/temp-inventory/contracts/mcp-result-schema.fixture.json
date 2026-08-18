@@ -2,17 +2,20 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "TempArtifactInventoryResult",
   "description": "P089 MCP tool temp_artifacts.inventory.preview result schema fixture. ByteCountString fields are decimal strings. DateTime fields are RFC3339/ISO-8601 strings or null.",
-  "$comment": "NOT YET RECONCILED with the shipped implementation. A real MCP result does not validate against this file as checked in: the top level sets additionalProperties=false while omitting the canonical `mode` field, and `summary` sets additionalProperties=false while omitting `queue_wait_ms`, which every real payload emits. The authoritative MCP output schema is the one declared by the tool itself in control-plane/crates/mcp-server/src/tools/temp_artifacts.rs. Do not read this file as MCP contract-parity evidence until it is reconciled; the focused gate asserts presence only. See docs/reference/managed-temporary-artifact-inventory.md#44-graphql-projection-specifics-implemented.",
+  "$comment": "Reconciled with the shipped implementation's declared output_schema in control-plane/crates/mcp-server/src/tools/temp_artifacts.rs: the top-level `mode` field and `summary.queue_wait_ms` are now present, and the errors-item `phase` field (always emitted, string or null, by scanner.rs's error-list builder) is included so a real MCP result validates. Verified against the tool's own advertised output_schema by a Rust conformance test rather than presence-only checks. See docs/reference/managed-temporary-artifact-inventory.md#44-graphql-projection-specifics-implemented.",
   "type": "object",
   "required": [
     "schema_version",
     "status",
     "enabled_state",
+    "mode",
+    "disabled_reason_code",
     "generated_at",
     "limits_applied",
     "summary",
     "rows",
     "errors",
+    "dry_run",
     "mutation_guard"
   ],
   "properties": {
@@ -27,6 +30,10 @@
     "enabled_state": {
       "type": "string",
       "enum": ["enabled", "disabled", "unknown"]
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["disabled", "hidden_readback", "operator_visible"]
     },
     "disabled_reason_code": {
       "type": ["string", "null"]
@@ -57,7 +64,8 @@
         "legacy_unmanaged_count",
         "scan_error_count",
         "dry_run_candidate_count",
-        "truncated"
+        "truncated",
+        "queue_wait_ms"
       ],
       "properties": {
         "artifact_tree_count": {"type": "integer"},
@@ -72,7 +80,8 @@
         "legacy_unmanaged_count": {"type": "integer"},
         "scan_error_count": {"type": "integer"},
         "dry_run_candidate_count": {"type": "integer"},
-        "truncated": {"type": "boolean"}
+        "truncated": {"type": "boolean"},
+        "queue_wait_ms": {"type": "integer"}
       },
       "additionalProperties": false
     },
@@ -132,7 +141,7 @@
       "maxItems": 100,
       "items": {
         "type": "object",
-        "required": ["code", "message"],
+        "required": ["code", "message", "root_kind", "phase"],
         "properties": {
           "code": {
             "type": "string",
@@ -142,7 +151,8 @@
           "root_kind": {
             "type": ["string", "null"],
             "enum": ["run_meta_root", "control_plane_cache", "provider_home_copy", "legacy_chainworks_tmp", "diagnostic_test_root", "unknown", null]
-          }
+          },
+          "phase": {"type": ["string", "null"]}
         },
         "additionalProperties": false
       }

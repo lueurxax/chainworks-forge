@@ -2990,4 +2990,247 @@ mod tests {
         assert!(root_kinds.contains("provider_home_copy"));
         assert!(root_kinds.contains("legacy_chainworks_tmp"));
     }
+
+    // ── P089 §4.4/B6: mcp-result-schema.fixture.json conformance ────────────
+    //
+    // A minimal JSON Schema (draft-07 subset) validator scoped to exactly what
+    // the checked-in fixture uses (const/enum/type/pattern/minLength/maxLength/
+    // properties/required/additionalProperties/items/maxItems). This exists so
+    // the fixture is checked against a *real emitted payload*, not just proven
+    // to exist on disk — the gap the reference doc calls out at
+    // docs/reference/managed-temporary-artifact-inventory.md §4.4. `pattern` is
+    // deliberately not backed by a general regex engine: only the exact
+    // patterns the fixture uses are recognized, so an unrecognized pattern
+    // fails loudly (extend `matches_known_pattern`) instead of being silently
+    // skipped.
+    fn json_schema_type_matches(ty: &str, instance: &serde_json::Value) -> bool {
+        match ty {
+            "string" => instance.is_string(),
+            "integer" => instance.is_i64() || instance.is_u64(),
+            "number" => instance.is_number(),
+            "boolean" => instance.is_boolean(),
+            "object" => instance.is_object(),
+            "array" => instance.is_array(),
+            "null" => instance.is_null(),
+            other => panic!("unrecognized JSON Schema \"type\" in fixture: {other:?}"),
+        }
+    }
+
+    fn matches_known_pattern(pattern: &str, value: &str) -> bool {
+        match pattern {
+            "^(0|[1-9][0-9]*)$" => {
+                !value.is_empty()
+                    && value.bytes().all(|b| b.is_ascii_digit())
+                    && (value == "0" || !value.starts_with('0'))
+            }
+            "^[0-9a-f]{64}$" => {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            }
+            "^[0-9a-f]{12,20}$" => {
+                (12..=20).contains(&value.len())
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            }
+            other => panic!(
+                "unrecognized JSON Schema \"pattern\" in fixture; extend matches_known_pattern: {other:?}"
+            ),
+        }
+    }
+
+    fn validate_json_schema(
+        schema: &serde_json::Value,
+        instance: &serde_json::Value,
+        path: &str,
+        errors: &mut Vec<String>,
+    ) {
+        if let Some(const_val) = schema.get("const") {
+            if instance != const_val {
+                errors.push(format!(
+                    "{path}: expected const {const_val}, got {instance}"
+                ));
+            }
+        }
+        if let Some(enum_vals) = schema.get("enum").and_then(|v| v.as_array()) {
+            if !enum_vals.contains(instance) {
+                errors.push(format!("{path}: {instance} not in enum {enum_vals:?}"));
+            }
+        }
+        if let Some(ty) = schema.get("type") {
+            let allowed: Vec<&str> = match ty {
+                serde_json::Value::String(s) => vec![s.as_str()],
+                serde_json::Value::Array(arr) => {
+                    arr.iter().filter_map(|v| v.as_str()).collect()
+                }
+                _ => vec![],
+            };
+            if !allowed.is_empty()
+                && !allowed
+                    .iter()
+                    .any(|t| json_schema_type_matches(t, instance))
+            {
+                errors.push(format!(
+                    "{path}: type mismatch, expected one of {allowed:?}, got {instance}"
+                ));
+            }
+        }
+        if let (Some(pattern), Some(s)) =
+            (schema.get("pattern").and_then(|v| v.as_str()), instance.as_str())
+        {
+            if !matches_known_pattern(pattern, s) {
+                errors.push(format!(
+                    "{path}: value {s:?} does not match pattern {pattern:?}"
+                ));
+            }
+        }
+        if let (Some(min_len), Some(s)) = (
+            schema.get("minLength").and_then(|v| v.as_u64()),
+            instance.as_str(),
+        ) {
+            if (s.len() as u64) < min_len {
+                errors.push(format!("{path}: length {} < minLength {min_len}", s.len()));
+            }
+        }
+        if let (Some(max_len), Some(s)) = (
+            schema.get("maxLength").and_then(|v| v.as_u64()),
+            instance.as_str(),
+        ) {
+            if (s.len() as u64) > max_len {
+                errors.push(format!("{path}: length {} > maxLength {max_len}", s.len()));
+            }
+        }
+        if schema.get("properties").is_some() || schema.get("required").is_some() {
+            if let Some(obj) = instance.as_object() {
+                let required: Vec<&str> = schema
+                    .get("required")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                for key in &required {
+                    if !obj.contains_key(*key) {
+                        errors.push(format!("{path}: missing required property {key:?}"));
+                    }
+                }
+                let properties = schema.get("properties").and_then(|v| v.as_object());
+                let additional_allowed = schema
+                    .get("additionalProperties")
+                    .map(|v| v != &serde_json::Value::Bool(false))
+                    .unwrap_or(true);
+                for (key, value) in obj {
+                    match properties.and_then(|p| p.get(key)) {
+                        Some(prop_schema) => validate_json_schema(
+                            prop_schema,
+                            value,
+                            &format!("{path}.{key}"),
+                            errors,
+                        ),
+                        None if !additional_allowed => errors.push(format!(
+                            "{path}: unexpected property {key:?} not permitted by additionalProperties:false"
+                        )),
+                        None => {}
+                    }
+                }
+            }
+        }
+        if let Some(items_schema) = schema.get("items") {
+            if let Some(arr) = instance.as_array() {
+                if let Some(max_items) = schema.get("maxItems").and_then(|v| v.as_u64()) {
+                    if (arr.len() as u64) > max_items {
+                        errors.push(format!(
+                            "{path}: array length {} > maxItems {max_items}",
+                            arr.len()
+                        ));
+                    }
+                }
+                for (i, item) in arr.iter().enumerate() {
+                    validate_json_schema(items_schema, item, &format!("{path}[{i}]"), errors);
+                }
+            }
+        }
+    }
+
+    fn workspace_root_for_fixtures() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::parent)
+            .expect("mcp-server crate should be under control-plane/crates")
+            .to_path_buf()
+    }
+
+    fn load_mcp_result_schema_fixture() -> serde_json::Value {
+        let path = workspace_root_for_fixtures()
+            .join("docs/evidence/089/temp-inventory/contracts/mcp-result-schema.fixture.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        serde_json::from_str(&raw).expect("fixture must be valid JSON")
+    }
+
+    fn assert_validates_against_mcp_result_schema(instance: &serde_json::Value) {
+        let schema = load_mcp_result_schema_fixture();
+        let mut errors = Vec::new();
+        validate_json_schema(&schema, instance, "$", &mut errors);
+        assert!(
+            errors.is_empty(),
+            "mcp-result-schema.fixture.json validation failed against a real emitted payload:\n{}\npayload: {}",
+            errors.join("\n"),
+            serde_json::to_string_pretty(instance).unwrap_or_default()
+        );
+    }
+
+    #[tokio::test]
+    async fn p089_mcp_result_schema_fixture_validates_real_disabled_payload() {
+        let _guard = temp_artifact_inventory_env_test_lock();
+        std::env::set_var("CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE", "disabled");
+        let params = serde_json::json!({});
+        let result = execute_inventory_preview(params, &operator_principal())
+            .await
+            .expect("ok");
+        std::env::remove_var("CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE");
+
+        assert_eq!(result["status"], "disabled");
+        assert_validates_against_mcp_result_schema(&result);
+    }
+
+    #[tokio::test]
+    async fn p089_mcp_result_schema_fixture_validates_real_error_payload_with_populated_errors() {
+        let _guard = temp_artifact_inventory_env_test_lock();
+        std::env::remove_var("CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE");
+        let params = serde_json::json!({"limit": 501});
+        let result = execute_inventory_preview(params, &operator_principal())
+            .await
+            .expect("ok");
+
+        assert_eq!(result["status"], "error");
+        assert!(!result["errors"].as_array().expect("errors array").is_empty());
+        assert_validates_against_mcp_result_schema(&result);
+    }
+
+    #[tokio::test]
+    async fn p089_mcp_result_schema_fixture_validates_real_scanned_payload_with_rows() {
+        let _guard = temp_artifact_inventory_env_test_lock();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join("artifact.txt"), b"test content").expect("write");
+        let dir_path = dir.path().to_str().expect("valid path");
+
+        std::env::set_var("CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE", "hidden_readback");
+        std::env::set_var("CHAINWORKS_TEMP_ARTIFACT_DIAGNOSTIC_TEST_ROOTS", dir_path);
+        let params = serde_json::json!({
+            "run_id": TEST_RUN_ID,
+            "test_root_override": dir_path
+        });
+        let result = execute_inventory_preview(params, &automation_principal())
+            .await
+            .expect("ok");
+        std::env::remove_var("CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE");
+        std::env::remove_var("CHAINWORKS_TEMP_ARTIFACT_DIAGNOSTIC_TEST_ROOTS");
+
+        assert_eq!(result["status"], "complete");
+        assert_eq!(result["rows"].as_array().expect("rows array").len(), 1);
+        assert!(result["dry_run"].is_object(), "default include_dry_run=true");
+        assert_validates_against_mcp_result_schema(&result);
+    }
 }
