@@ -1,18 +1,21 @@
 """
 P089 Managed Temporary Artifact Inventory — Executable GraphQL SDL fixture.
-Status: pre-implementation skeleton. NOT YET RECONCILED with the shipped schema in
-control-plane/crates/graphql-server/src/types/temp_artifact_inventory.rs — type names,
-the canonical mode field/enum, and the dry-run and mutation-guard shapes diverge.
-The seven enum domains shared by this fixture and the implementation agree on value
-coverage and casing. Do not read this file as GraphQL parity evidence until it is
-reconciled; the divergences are itemized in
-docs/reference/managed-temporary-artifact-inventory.md §4.4.
-ByteCountString and DateTime scalars are required; the camelCase projection is intended to
-be a lossless mapping of the snake_case canonical DTO.
+Status: reconciled with the shipped schema in
+control-plane/crates/graphql-server/src/types/temp_artifact_inventory.rs (type
+names, the canonical `mode` field/`InventoryMode` enum, and the dry-run and
+mutation-guard shapes all match). Type/enum/field declarations below are
+verified against live `Schema::build(...).sdl()` introspection output by the
+`p089_graphql_sdl_fixture_matches_shipped_schema` gate test in
+control-plane/crates/graphql-server/src/schema.rs — a passing gate test is
+required payload-conformance evidence, not just fixture presence.
+ByteCountString and DateTime scalars are required; the camelCase projection is
+a lossless mapping of the snake_case canonical DTO (see
+docs/reference/managed-temporary-artifact-inventory.md §4).
 """
 
 scalar ByteCountString
 scalar DateTime
+scalar JSON
 
 enum InventoryStatus {
   COMPLETE
@@ -25,10 +28,16 @@ enum InventoryStatus {
   UNKNOWN
 }
 
-enum EnabledState {
+enum InventoryEnabledState {
   ENABLED
   DISABLED
   UNKNOWN
+}
+
+enum InventoryMode {
+  DISABLED
+  HIDDEN_READBACK
+  OPERATOR_VISIBLE
 }
 
 enum LifecycleClassification {
@@ -87,20 +96,20 @@ input TempArtifactWorkspaceContextInput {
 input TempArtifactInventoryInput {
   runId: ID
   workspaceContext: TempArtifactWorkspaceContextInput
-  limit: Int = 500
-  timeoutMs: Int = 5000
-  includeDryRun: Boolean = true
+  limit: Int! = 500
+  timeoutMs: Int! = 5000
+  includeDryRun: Boolean! = true
   testRootOverride: String
 }
 
-type TempArtifactLimitsApplied {
+type TempArtifactInventoryLimitsApplied {
   limit: Int!
   timeoutMs: Int!
   scanDeadlineAt: DateTime
   queueWaitMs: Int!
 }
 
-type TempArtifactSummary {
+type TempArtifactInventorySummary {
   artifactTreeCount: Int!
   estimatedBytes: ByteCountString!
   activeOrRecentCount: Int!
@@ -110,28 +119,29 @@ type TempArtifactSummary {
   scanErrorCount: Int!
   dryRunCandidateCount: Int!
   truncated: Boolean!
+  queueWaitMs: Int!
+}
+
+type TempArtifactDryRunMutationGuard {
+  status: MutationGuardStatus!
+  checkedAt: DateTime!
 }
 
 type TempArtifactDryRun {
+  schemaVersion: String!
   generatedAt: DateTime
-  mutationGuard: MutationGuardStatus!
-  recommendationCounts: TempArtifactDryRunCounts!
-}
-
-type TempArtifactDryRunCounts {
-  wouldKeepActive: Int!
-  wouldKeepRecent: Int!
-  wouldPreserveFailureEvidence: Int!
-  wouldDeleteAfterFutureApproval: Int!
-  wouldMigrateLegacyManifestAfterFutureMigrationEnabled: Int!
-  needsOperatorReview: Int!
-  noRecommendation: Int!
-  unknown: Int!
+  recommendationCounts: JSON!
+  mutationGuard: TempArtifactDryRunMutationGuard!
 }
 
 type TempArtifactMutationGuard {
   status: MutationGuardStatus!
-  evidence: String
+  checkedAt: DateTime!
+  noDelete: Boolean!
+  noPrune: Boolean!
+  noChmod: Boolean!
+  noPersist: Boolean!
+  noRetry: Boolean!
 }
 
 type TempArtifactRow {
@@ -158,16 +168,18 @@ type TempArtifactError {
   code: InventoryErrorCode!
   message: String!
   rootKind: RootKind
+  phase: String
 }
 
 type TempArtifactInventory {
   schemaVersion: String!
   status: InventoryStatus!
-  enabledState: EnabledState!
+  enabledState: InventoryEnabledState!
+  mode: InventoryMode!
   disabledReasonCode: String
   generatedAt: DateTime!
-  limitsApplied: TempArtifactLimitsApplied!
-  summary: TempArtifactSummary!
+  limitsApplied: TempArtifactInventoryLimitsApplied!
+  summary: TempArtifactInventorySummary!
   rows: [TempArtifactRow!]!
   errors: [TempArtifactError!]!
   dryRun: TempArtifactDryRun

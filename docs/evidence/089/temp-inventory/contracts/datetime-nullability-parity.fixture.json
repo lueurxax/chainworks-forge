@@ -1,7 +1,7 @@
 {
   "schema_version": "p089_temp_inventory_datetime_parity_v1",
   "description": "P089 DateTime field nullability parity fixture. GraphQL uses DateTime scalar; MCP/run-report/release-receipt use RFC3339 strings or null. All lanes must agree on nullability for each field.",
-  "$comment": "NOT YET RECONCILED with the shipped implementation. `generatedAt` records nullable_in_release_receipt=true, but the release receipt carries the same canonical temp_artifact_inventory_v1 DTO as the run report and always supplies top-level generated_at, so this entry asserts a lane disagreement that does not exist. Do not read this file as DateTime parity evidence until it is reconciled; the focused gate asserts presence only. See docs/reference/managed-temporary-artifact-inventory.md#43-implemented-datetime-shape.",
+  "$comment": "Reconciled with the shipped implementation: the release receipt carries the same canonical temp_artifact_inventory_v1 DTO as the run report and always supplies top-level generated_at, so nullable_in_release_receipt is false for that field, matching every other lane. See docs/reference/managed-temporary-artifact-inventory.md#43-implemented-datetime-shape.",
   "fields": {
     "generatedAt": {
       "json_field": "generated_at",
@@ -9,7 +9,7 @@
       "nullable_in_graphql": false,
       "nullable_in_mcp_json": false,
       "nullable_in_run_report": false,
-      "nullable_in_release_receipt": true,
+      "nullable_in_release_receipt": false,
       "sample_value": "2026-06-27T00:00:00Z",
       "null_sample": null
     },

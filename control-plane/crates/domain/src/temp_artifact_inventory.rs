@@ -382,8 +382,9 @@ pub const PATH_HASH_SHORT_MAX_LEN: usize = 20;
 
 // ── Path hash infrastructure ──────────────────────────────────────────────────
 
-/// Process-scoped 256-bit HMAC key. Generated once at first use; never serialized
-/// or shared outside the daemon process.
+/// Process-scoped 256-bit HMAC key. Materialized eagerly at daemon startup via
+/// `init_process_path_hash_key`; never serialized or shared outside the
+/// daemon process.
 static PROCESS_PATH_HASH_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 
 fn get_process_path_hash_key() -> &'static [u8; 32] {
@@ -396,6 +397,21 @@ fn get_process_path_hash_key() -> &'static [u8; 32] {
         key[16..].copy_from_slice(u2.as_bytes());
         key
     })
+}
+
+/// Eagerly materializes the process-scoped redaction key. Callers (the daemon
+/// startup path) must invoke this before any inventory scan can reach
+/// `compute_path_hash`, so key generation happens deterministically at
+/// startup rather than racing the first hash use. Idempotent — the
+/// underlying `OnceLock` only ever runs the generator once per process.
+pub fn init_process_path_hash_key() {
+    get_process_path_hash_key();
+}
+
+/// Returns `true` once the process-scoped redaction key has been materialized,
+/// by eager startup init or an earlier `compute_path_hash` call.
+pub fn process_path_hash_key_initialized() -> bool {
+    PROCESS_PATH_HASH_KEY.get().is_some()
 }
 
 /// HMAC-SHA256 using the sha2 crate. Key must be exactly 32 bytes (≤ SHA-256
@@ -930,6 +946,30 @@ mod tests {
         assert_ne!(h1, h2, "distinct paths must produce distinct hashes");
     }
 
+    /// P089 §6.1: the redaction key must be materialized by an explicit
+    /// startup call (`init_process_path_hash_key`, invoked from the daemon's
+    /// `run_daemon` entry point) rather than lazily on first `compute_path_hash`
+    /// use, and must stay identical across the first and every later hash call
+    /// in the same process — no lazy-init race.
+    #[test]
+    fn p089_temp_inventory_redaction_key_initialized_eagerly_and_stable() {
+        init_process_path_hash_key();
+        assert!(
+            process_path_hash_key_initialized(),
+            "eager startup init must materialize the redaction key"
+        );
+
+        let first = compute_path_hash(b"/tmp/startup-order-check", RootKind::Unknown);
+        // A defensive second startup-style call must not regenerate the key
+        // (OnceLock::get_or_init only ever runs the generator once).
+        init_process_path_hash_key();
+        let later = compute_path_hash(b"/tmp/startup-order-check", RootKind::Unknown);
+        assert_eq!(
+            first, later,
+            "redaction key must be stable across the first and a later compute_path_hash call"
+        );
+    }
+
     #[test]
     fn p089_temp_inventory_path_hash_different_root_kinds_differ() {
         let h1 = compute_path_hash(b"/tmp/test", RootKind::RunMetaRoot);
@@ -1213,5 +1253,182 @@ mod tests {
                 "mutation guard variant must not imply mutation: {s}"
             );
         }
+    }
+
+    // ── P089 §4.4/B6: status-by-field-matrix fixture conformance ───────────────
+    //
+    // The fixture's `enum_domains` map is meant to be a machine-readable copy of
+    // reference doc §5's enum table. Rather than only checking the fixture file
+    // exists, this reads it and checks every listed value against the shipped
+    // enum's own `as_str()` output (and vice versa), so a future enum change
+    // that isn't mirrored into the fixture fails this test instead of silently
+    // rotting evidence.
+
+    fn workspace_root_for_fixtures() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::parent)
+            .expect("domain crate should be under control-plane/crates")
+            .to_path_buf()
+    }
+
+    fn load_status_by_field_matrix_fixture() -> serde_json::Value {
+        let path = workspace_root_for_fixtures().join(
+            "docs/evidence/089/temp-inventory/contracts/status-by-field-matrix.fixture.json",
+        );
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        serde_json::from_str(&raw).expect("fixture must be valid JSON")
+    }
+
+    fn fixture_domain_values(fixture: &serde_json::Value, domain: &str) -> Vec<String> {
+        fixture["enum_domains"][domain]
+            .as_array()
+            .unwrap_or_else(|| panic!("enum_domains.{domain} must be an array"))
+            .iter()
+            .map(|v| v.as_str().expect("enum value must be a string").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn p089_temp_inventory_status_by_field_matrix_fixture_matches_shipped_enums() {
+        let fixture = load_status_by_field_matrix_fixture();
+
+        assert_eq!(
+            fixture_domain_values(&fixture, "inventory_status"),
+            [
+                InventoryStatus::Complete,
+                InventoryStatus::Partial,
+                InventoryStatus::Timeout,
+                InventoryStatus::Cancelled,
+                InventoryStatus::Error,
+                InventoryStatus::Disabled,
+                InventoryStatus::ResourceExhausted,
+                InventoryStatus::Unknown,
+            ]
+            .map(|v| v.as_str().to_string())
+        );
+
+        assert_eq!(
+            fixture_domain_values(&fixture, "enabled_state"),
+            [EnabledState::Enabled, EnabledState::Disabled, EnabledState::Unknown]
+                .map(|v| v.as_str().to_string())
+        );
+
+        assert_eq!(
+            fixture_domain_values(&fixture, "inventory_mode"),
+            [
+                InventoryMode::Disabled,
+                InventoryMode::HiddenReadback,
+                InventoryMode::OperatorVisible,
+            ]
+            .map(|v| v.as_str().to_string())
+        );
+
+        assert_eq!(
+            fixture_domain_values(&fixture, "lifecycle_classification"),
+            [
+                LifecycleClassification::ActiveOrRecent,
+                LifecycleClassification::TerminalCandidate,
+                LifecycleClassification::OrphanCandidate,
+                LifecycleClassification::LegacyUnmanaged,
+                LifecycleClassification::ScanError,
+                LifecycleClassification::Unknown,
+            ]
+            .map(|v| v.as_str().to_string())
+        );
+
+        assert_eq!(
+            fixture_domain_values(&fixture, "dry_run_recommendation"),
+            [
+                DryRunRecommendation::WouldKeepActive,
+                DryRunRecommendation::WouldKeepRecent,
+                DryRunRecommendation::WouldPreserveFailureEvidence,
+                DryRunRecommendation::WouldDeleteAfterFutureApproval,
+                DryRunRecommendation::WouldMigrateLegacyManifestAfterFutureMigrationEnabled,
+                DryRunRecommendation::NeedsOperatorReview,
+                DryRunRecommendation::NoRecommendation,
+                DryRunRecommendation::Unknown,
+            ]
+            .map(|v| v.as_str().to_string())
+        );
+
+        assert_eq!(
+            fixture_domain_values(&fixture, "mutation_guard_status"),
+            [
+                MutationGuardStatus::Pass,
+                MutationGuardStatus::Fail,
+                MutationGuardStatus::Skipped,
+                MutationGuardStatus::Unknown,
+            ]
+            .map(|v| v.as_str().to_string())
+        );
+
+        assert_eq!(
+            fixture_domain_values(&fixture, "root_kind"),
+            [
+                RootKind::RunMetaRoot,
+                RootKind::ControlPlaneCache,
+                RootKind::ProviderHomeCopy,
+                RootKind::LegacyChainworksTmp,
+                RootKind::DiagnosticTestRoot,
+                RootKind::Unknown,
+            ]
+            .map(|v| v.as_str().to_string())
+        );
+
+        assert_eq!(
+            fixture_domain_values(&fixture, "error_code"),
+            [
+                InventoryErrorCode::InvalidRootOverride,
+                InventoryErrorCode::RootUnreadable,
+                InventoryErrorCode::ManifestParseFailed,
+                InventoryErrorCode::SizeEstimationFailed,
+                InventoryErrorCode::DeadlineExceeded,
+                InventoryErrorCode::Cancelled,
+                InventoryErrorCode::InternalError,
+                InventoryErrorCode::MutationGuardFailed,
+                InventoryErrorCode::ResourceExhausted,
+                InventoryErrorCode::Unknown,
+            ]
+            .map(|v| v.as_str().to_string())
+        );
+    }
+
+    #[test]
+    fn p089_temp_inventory_status_by_field_matrix_fixture_unknown_fallback_lists_are_consistent() {
+        let fixture = load_status_by_field_matrix_fixture();
+        let with_unknown: Vec<String> = fixture["enum_domains_with_unknown_fallback"]
+            .as_array()
+            .expect("enum_domains_with_unknown_fallback must be an array")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        let closed: Vec<String> = fixture["enum_domains_closed_without_unknown"]
+            .as_array()
+            .expect("enum_domains_closed_without_unknown must be an array")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        // Every domain with an "unknown" fallback must actually list "unknown"
+        // as its last enum value; the one closed domain (inventory_mode) must not.
+        for domain in &with_unknown {
+            let values = fixture_domain_values(&fixture, domain);
+            assert_eq!(
+                values.last().map(String::as_str),
+                Some("unknown"),
+                "{domain} is declared to have an unknown fallback but its value list doesn't end with \"unknown\""
+            );
+        }
+        for domain in &closed {
+            let values = fixture_domain_values(&fixture, domain);
+            assert!(
+                !values.iter().any(|v| v == "unknown"),
+                "{domain} is declared closed (no unknown member) but its value list contains \"unknown\""
+            );
+        }
+        assert_eq!(closed, vec!["inventory_mode".to_string()]);
     }
 }

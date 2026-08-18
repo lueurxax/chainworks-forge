@@ -130,7 +130,20 @@ async fn run_p080_rollout_control_seed() -> Result<()> {
     Ok(())
 }
 
+/// P089 §6.1: eagerly materializes the process-scoped temp-artifact-inventory
+/// redaction key at daemon startup, ahead of any inventory scan or lazy
+/// first-use `compute_path_hash` call. Extracted as its own function so the
+/// startup contract is directly unit-testable (see `tests` below).
+fn init_p089_redaction_key_at_startup() {
+    domain::temp_artifact_inventory::init_process_path_hash_key();
+}
+
 async fn run_daemon() -> Result<()> {
+    // P089 §6.1: materialize the process-scoped HMAC redaction key eagerly, before
+    // any inventory scan could reach `compute_path_hash` and trigger lazy first-use
+    // init. Must run before the backend below (or any other P089 lane) is reachable.
+    init_p089_redaction_key_at_startup();
+
     // P089: install the MCP-backed temp artifact inventory backend so the GraphQL
     // resolver reuses the exact mode-check, validation, redaction, permit-guard, and
     // scanner path as the MCP tool and resource lane (readback parity requirement).
@@ -1766,6 +1779,18 @@ async fn insert_durable_monotonic_clock_baseline(pool: &SqlitePool) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P089 §6.1: the daemon startup path must materialize the redaction key
+    /// before any inventory lane can reach it lazily. This exercises the exact
+    /// helper `run_daemon` calls first.
+    #[test]
+    fn init_p089_redaction_key_at_startup_materializes_key() {
+        init_p089_redaction_key_at_startup();
+        assert!(
+            domain::temp_artifact_inventory::process_path_hash_key_initialized(),
+            "startup helper must materialize the process-scoped redaction key"
+        );
+    }
 
     #[test]
     fn daemon_xcode_broker_pool_has_process_backend() {

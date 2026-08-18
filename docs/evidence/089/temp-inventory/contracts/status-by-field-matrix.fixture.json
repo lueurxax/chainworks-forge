@@ -1,0 +1,71 @@
+{
+  "schema_version": "p089_temp_inventory_status_field_matrix_v1",
+  "description": "P089 status-by-field matrix: the canonical enum domains and their allowed values (reference doc §5), plus the advisory lifecycle-classification / dry-run-recommendation mapping derived from last-touched age and root kind (reference doc §9).",
+  "$comment": "Verified against the shipped domain enums (control-plane/crates/domain/src/temp_artifact_inventory.rs) and the classifier (control-plane/crates/mcp-server/src/tools/scanner.rs::classify_row plus the row-level partial-error override) by a Rust conformance test, not fixture presence alone.",
+  "enum_domains": {
+    "inventory_status": ["complete", "partial", "timeout", "cancelled", "error", "disabled", "resource_exhausted", "unknown"],
+    "enabled_state": ["enabled", "disabled", "unknown"],
+    "inventory_mode": ["disabled", "hidden_readback", "operator_visible"],
+    "lifecycle_classification": ["active_or_recent", "terminal_candidate", "orphan_candidate", "legacy_unmanaged", "scan_error", "unknown"],
+    "dry_run_recommendation": ["would_keep_active", "would_keep_recent", "would_preserve_failure_evidence", "would_delete_after_future_approval", "would_migrate_legacy_manifest_after_future_migration_enabled", "needs_operator_review", "no_recommendation", "unknown"],
+    "mutation_guard_status": ["pass", "fail", "skipped", "unknown"],
+    "root_kind": ["run_meta_root", "control_plane_cache", "provider_home_copy", "legacy_chainworks_tmp", "diagnostic_test_root", "unknown"],
+    "error_code": ["invalid_root_override", "root_unreadable", "manifest_parse_failed", "size_estimation_failed", "deadline_exceeded", "cancelled", "internal_error", "mutation_guard_failed", "resource_exhausted", "unknown"]
+  },
+  "enum_domains_with_unknown_fallback": [
+    "inventory_status",
+    "enabled_state",
+    "lifecycle_classification",
+    "dry_run_recommendation",
+    "mutation_guard_status",
+    "root_kind",
+    "error_code"
+  ],
+  "enum_domains_closed_without_unknown": ["inventory_mode"],
+  "classification_dry_run_mapping": [
+    {
+      "condition": "root_kind = legacy_chainworks_tmp (any age)",
+      "lifecycle_classification": "legacy_unmanaged",
+      "dry_run_recommendation": "would_migrate_legacy_manifest_after_future_migration_enabled"
+    },
+    {
+      "condition": "last-touched timestamp missing or unparsable",
+      "lifecycle_classification": "unknown",
+      "dry_run_recommendation": "needs_operator_review"
+    },
+    {
+      "condition": "touched under 1 hour ago",
+      "lifecycle_classification": "active_or_recent",
+      "dry_run_recommendation": "would_keep_active"
+    },
+    {
+      "condition": "touched under 24 hours ago",
+      "lifecycle_classification": "active_or_recent",
+      "dry_run_recommendation": "would_keep_recent"
+    },
+    {
+      "condition": "touched under 7 days ago",
+      "lifecycle_classification": "terminal_candidate",
+      "dry_run_recommendation": "needs_operator_review"
+    },
+    {
+      "condition": "touched 7 days ago or older",
+      "lifecycle_classification": "orphan_candidate",
+      "dry_run_recommendation": "would_delete_after_future_approval"
+    },
+    {
+      "condition": "row accumulated any row-level partial error (overrides the age-derived pair above)",
+      "lifecycle_classification": "scan_error",
+      "dry_run_recommendation": "needs_operator_review"
+    }
+  ],
+  "age_thresholds_seconds": {
+    "AGE_ACTIVE_SECS": 3600,
+    "AGE_RECENT_SECS": 86400,
+    "AGE_TERMINAL_SECS": 604800
+  },
+  "unmapped_contract_values": {
+    "dry_run_recommendation": ["would_preserve_failure_evidence", "no_recommendation"],
+    "note": "Contract values this slice's classifier does not yet emit (reference doc §9); reserved for future recommendation logic, not dead values."
+  }
+}
