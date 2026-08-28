@@ -279,6 +279,54 @@ inactive event or an event with another key. The closed directive-kind invariant
 table validates value type and key prefix. Free-text semantic conflict judgement
 is never delegated to a provider.
 
+#### EffectiveAuthorityProjectionV1 and RuntimeConstraintPolicyV1
+
+Authority becomes executable through two normative contracts, not through
+prompt interpretation. `EffectiveAuthorityProjectionV1` binds the run, base
+ledger, overlay head and decimal-string context revision; ordered active event
+IDs/directive digests; effective mission digest; sorted hard and advisory
+directive rows; resolved scheduler priority; runtime-policy digest; and
+`effective_authority_sha256`. Every directive row retains conflict key, kind,
+enforcement, value digest, source event, and the resolved policy-entry ID. The
+projection contains no unbounded source prose.
+
+`RuntimeConstraintPolicyV1` is a candidate-owned, versioned registry. Each
+entry names one exact conflict key or bounded key family, directive kind and
+value schema, allowed bounds, affected operation kinds, evaluation function,
+enforcement points, and one closed supersession action:
+
+- `next_claim_only` for scheduler priority;
+- `reprepare_before_prompt` for constraints whose new value must be compiled
+  into provider context;
+- `cancel_before_prompt` for a newly prohibited provider invocation;
+- `cancel_and_quarantine_after_prompt` when an already-sent prompt must not
+  create further trusted output or effects;
+- `deny_new_effects_allow_settlement` when existing observation may settle but
+  no skill script, control-plane command, workspace write, Git, publish, or
+  external side effect may begin.
+
+A hard `execution_constraint` or `priority` is invalid unless exactly one
+policy entry accepts its key and value. Advisory directives may be displayed
+and included in the mission but never grant permission or bypass a hard entry.
+One policy contains at most 256 entries and one run at most 256 active conflict
+keys; exceeding either cap fails the append before mutation. Historical events
+remain append-only but active projection/readback is therefore bounded.
+The Rust `RuntimeConstraintEvaluator` is the only production evaluator. It is
+called by the unified execution-admission service for claim, spawn,
+`provider_bound`, prompt commit, broker call, side-effect prepare/start,
+settlement and retry. Provider output cannot reinterpret or waive its result.
+
+Every authority-head append recomputes the complete projection in its SQLite
+transaction. When any active hard row or its resolved policy effect changes,
+the append also CAS-updates one run-level `AuthorityRecheckFenceV1` containing
+old/new head, revision, projection digests, affected operation classes and
+one bounded epoch/token per runtime operation class plus
+`authority_fence_sha256`. Only classes selected by the changed policy entries
+increment. This is O(1) durable fencing rather than an unbounded scan of active
+attempts. Advisory-only changes increment no runtime class;
+`next_claim_only` increments only the scheduler-claim class and atomically
+updates queued priority, so neither cancels prepared work.
+
 #### Authority append command
 
 The only external mutation is operator-only MCP `runs.authority.append`. It is
@@ -431,15 +479,22 @@ IDs and effective authority bytes normative.
 
 #### Per-invocation pinning
 
-Every `AgentExecution` owns one durable `InvocationDispatchIntentV2`. Its
-`prepared` row pins these fields before any provider process can exist:
+One logical `AgentExecution` may own multiple attempts. The immutable identity
+is `AgentExecutionAttemptV1 { agent_execution_id, attempt_generation }`; every
+dispatch, grant, prompt, receipt, projection entity and artifact path uses both
+components. `attempt_generation` starts at one and increments by CAS. No retry
+overwrites or reuses bytes from an earlier attempt.
+
+Every attempt owns one durable `InvocationDispatchIntentV2`. Its `prepared` row
+pins these fields before any provider process can exist:
 
 - run ID, stage/task ID, agent execution ID, attempt generation, and logical
   invocation idempotency key;
 - immutable run snapshot hash, run context generation, candidate manifest and
   promotion receipt digests, and base authority head;
 - overlay `authority_chain_head` and `context_revision`;
-- effective mission digest;
+- effective mission, effective-authority projection, runtime-constraint policy,
+  authority-fence digest, and every policy-selected operation-class fence token;
 - role, assignment, ordered aggregate skill, prompt-envelope manifest, and exact
   spooled prompt-byte digests;
 - provider profile, adapter, model, effort, permission profile, and session
@@ -452,14 +507,17 @@ transaction the worker claims the work item, reads the current authority head,
 verifies the run-generation binding, materializes all context references, and
 inserts the immutable execution pin plus `prepared` dispatch intent. If the head
 or generation CAS loses, no pin is written and preparation restarts from current
-truth. An authority append committed after `prepared` affects only later
-invocations; it does not rewrite or invalidate the prepared one. A queued work
-item has no pin and therefore observes the latest head when preparation begins.
+truth. An authority append committed after `prepared` does not rewrite the pin:
+it advances the run fence and makes every stale pre-prompt transition fail its
+fence check. A queued work item has no pin and therefore observes the latest
+head when preparation begins.
 
 The dispatch state machine is:
 
 ```text
 prepared -> launching -> provider_bound -> prompt_committed -> observing -> settled
+prepared|launching|provider_bound -> authority_recheck_required
+authority_recheck_required -> cancelled|failed_closed|identity_ambiguous_hold
 prepared|launching|provider_bound -> cancelled|failed_closed|identity_ambiguous_hold
 prompt_committed|observing -> settled|reconciliation_required
 reconciliation_required -> settled|failed_closed
@@ -467,7 +525,20 @@ identity_ambiguous_hold -> failed_closed
 ```
 
 Each transition is a compare-and-swap over execution ID, attempt generation,
-current state, and lease epoch. `identity_ambiguous_hold` is terminal for the
+current state, lease epoch, and every policy-selected operation-class fence
+token pinned for that transition. The overall fence digest remains readback and
+reconstruction evidence but is not an over-broad cancellation token. The
+supervisor rechecks current authority before spawn registration, before
+`provider_bound`, and immediately before `prompt_committed`; broker and
+side-effect admission recheck it again. If a relevant hard operation-class
+token changed before prompt, the attempt enters `authority_recheck_required`,
+any verified process is
+terminated/reaped, and a new attempt generation prepares from current truth.
+If append races with `provider_bound`, SQLite serialization makes either the
+bind or the new fence win, and the prompt-commit check still rejects the stale
+pin. After prompt commit the evaluator applies the entry's declared post-prompt
+action; it never resends the prompt or trusts late output from a cancelled
+attempt. `identity_ambiguous_hold` is terminal for the
 attempt and blocks work-item reclaim, retry, provider resurrection, skill-script
 execution, and side-effect preparation for that execution until verified
 clearance. It cannot expire on a timer.
@@ -527,7 +598,9 @@ Crash outcomes are normative:
 | Durable observation after restart | Recovery action |
 |---|---|
 | no dispatch row | no provider launch occurred through the V2 path; normal work-item reclaim may prepare once |
-| `prepared` | reacquire lease and launch the same immutable pin |
+| `prepared` with broker grant `unissued` | reacquire lease, issue a fresh install epoch, and launch the same immutable attempt pin |
+| broker grant `installing` with no registered provider process/transport | CAS the prior install epoch to `abandoned`, rotate token hash, and issue a new install epoch for the same attempt |
+| broker grant `installing` with a registered process but no matching install attestation | terminate/reap and settle or enter `identity_ambiguous_hold`; never rotate while that process may hold the token |
 | `launching` without a registered wrapper | inspect the supervisor spawn receipt; verified absence or verified reap settles `failed_closed`, while any ownership ambiguity enters `identity_ambiguous_hold` |
 | `launching` or `provider_bound` with verified process and no prompt commit | terminate/reap it, then create a new attempt generation from current authority |
 | `prompt_committed` or later | attach/reconcile by pinned turn identity; never send the prompt again |
@@ -547,6 +620,15 @@ The authority head is part of the provider-session binding fingerprint. A head
 change prevents reuse or resurrection of a session that was primed with an
 older mission. Historical readback and deterministic reconstruction use the
 head stored on the execution, never the run's current head.
+
+Operator MCP attempt readback and the GraphQL dispatch connection expose, for
+every attempt generation, its pinned authority head/revision, effective mission
+and effective-authority digests, runtime-policy, pinned/current overall fence
+digests, sorted bounded relevant operation-class token relations and hard-
+constraint summaries, current fence relation
+`current | recheck_required | post_prompt_restricted`, and the resulting
+allowed next actions. Non-Operator report policy continues to redact these
+operator diagnostics. No UI infers constraints from prompt or artifact text.
 
 ### RunMissionV1
 
@@ -587,8 +669,9 @@ Every new production run stores one immutable
 `RunContextGenerationBindingV2` inside its `RunPlanSnapshot`. It contains the
 cutover generation, `AgentContextCandidateManifestV1` digest, promotion receipt
 digest, workflow and catalog snapshot digests, skill-registry and ordered
-resolved-skill digests, context compiler and prompt builder identities, and all
-required wire-version discriminators.
+resolved-skill digests, proof-matrix and client-capability support-policy
+digests, context compiler and prompt builder identities, and all required
+wire-version discriminators.
 
 `runs.start` V2 requires an `AgentContextStartSelectionV2` with the caller's
 expected cutover generation and every promoted digest. Before the database
@@ -597,7 +680,9 @@ descriptors, publishes referenced skill snapshots, and computes the candidate
 binding without trusting path names after open. The transaction then:
 
 1. verifies the live marker is `open_v2`, its generation equals the expected
-   generation, and all supplied digests equal the promoted candidate;
+   generation, all supplied digests equal the promoted candidate, and the
+   connection-bound `ClientCapabilityReceiptV1` is fresh, release-signed and a
+   member of the open proof matrix;
 2. verifies the compiled workflow, catalog, assignment templates, and skills
    are exact members of that candidate manifest; run-specific mission, input,
    blocker, and artifact generations are then bound separately in the frozen
@@ -771,6 +856,9 @@ The schema inventory is:
 | `base_authority_ledger_v1` | genesis, ordered base events, base head | `base_ledger_sha256` |
 | `authority_directive_v1` | `directive_kind`, `conflict_key`, `enforcement`, tagged `value` | `directive_sha256` |
 | `authority_event_v1` | event/run IDs, source kind/ref/anchor/ordinal/digest/revision, directive, prior head, supersedes, accepted principal/capability/table revision, timestamps | `event_sha256` |
+| `effective_authority_projection_v1` | run/base/overlay heads and revision, ordered active events, effective mission, hard/advisory rows, priority and policy | `effective_authority_sha256` |
+| `runtime_constraint_policy_v1` | version, exact key/family entries, value schemas/bounds, operation/enforcement sets and supersession actions | `runtime_policy_sha256` |
+| `authority_recheck_fence_v1` | run, old/new head/revision/projection and bounded operation-class epochs/tokens | `authority_fence_sha256` |
 | `approval_authority_template_v1` | approval/run/schema/presentation digest and head-independent decision map | `approval_authority_template_sha256` |
 | `approval_authority_binding_v1` | approval/template IDs, binding generation/state, presented head, resolved decision map, predecessor and presentation revision | `approval_authority_binding_sha256` |
 | `approval_authority_binding_event_v1` | approval/generation, prior/new state and digests, cause command/head and timestamp | `binding_event_sha256` |
@@ -779,32 +867,58 @@ The schema inventory is:
 | `effective_run_mission_v1` | base mission digest, overlay head/revision, ordered active event IDs, effective objective/scope/non-goals/success criteria | `effective_mission_sha256` |
 | `agent_role_v1` | agent ID, mission, owns, does-not-own, success criteria | `role_sha256` |
 | `task_assignment_v1` | state/task IDs and purposes, done-when, typed input/blocker/output refs, consumers, permission profile ID, ordered skill IDs | `assignment_sha256` |
+| `agent_skills_upstream_lock_v1` | upstream repository/commit, vendored paths/files and skills-ref corpus/tool digests | `upstream_lock_sha256` |
+| `prompt_token_budget_policy_v1` | tokenizer version/corpus, provider compatibility rows and per-skill/composition limits | `prompt_token_budget_policy_sha256` |
 | `skill_bundle_manifest_v1` | skill ID/name/spec revision, immutable source tree, sorted files and totals | `bundle_sha256` |
 | `skill_composition_v1` | ordered entries and aggregate resource totals | `skill_composition_sha256` |
 | `prompt_envelope_manifest_v2` | ordered section names/digests/byte counts, exact prompt byte count, context generation and all protected component digests | `prompt_envelope_sha256` |
+| `agent_execution_attempt_v1` | agent-execution ID and canonical decimal attempt generation | `attempt_identity_sha256` |
 | `invocation_dispatch_intent_v2` | execution/attempt/work, context/provider/session pins, lease/process and dispatch state | `dispatch_intent_sha256` |
 | `invocation_identity_hold_v1` | execution/attempt/session/epoch, process evidence, ambiguity reason and clearance action | `dispatch_hold_sha256` |
 | `runtime_self_admission_receipt_v1` | daemon instance/process/build and observed candidate identities | `self_admission_sha256` |
 | `observed_provider_binding_receipt_v1` | dispatch, process, provider/model/tool/session and handshake identities | `provider_binding_sha256` |
 | `skill_broker_grant_v1` | invocation/attempt/session/generation/composition scope and expiry | `grant_sha256` |
+| `skill_broker_grant_install_receipt_v1` | grant/attempt/install epoch, token hash, adapter transport, provider sandbox and session identities | `grant_install_receipt_sha256` |
+| `provider_execution_sandbox_v1` | adapter, profile version/bytes, root table, network class and executable identities | `provider_sandbox_policy_sha256` |
+| `provider_sandbox_attestation_v1` | dispatch/attempt/process identity, policy/root/runtime-home identities, handshake and denial-probe results | `provider_sandbox_attestation_sha256` |
+| `skill_resource_read_request_v1` / `skill_resource_read_result_v1` | logical URI/range, bounded base64 chunk, exact offsets/EOF and object/chunk digests | none; tool wire schemas |
+| `skill_script_run_request_v1` / `skill_script_run_result_v1` | request key/script/closed arguments and terminal outcome/effect/intent/receipt/output contract | none; tool wire schemas |
+| `skill_script_effect_identity_v1` | attempt/composition/bundle/script/arguments/contract and normalized target-set identities | `effect_id` |
+| `skill_broker_error_v1` | code, retryability/mode, authorized request ID and bounded safe detail | none; error schema |
 | `skill_script_execution_contract_v1` | script/input/sandbox/runtime/side-effect/retry policy | `script_contract_sha256` |
 | `skill_script_execution_intent_v1` | grant/request/script/input/contract/sandbox and side-effect identity | `script_intent_sha256` |
 | `skill_script_apply_journal_v1` | ordered write entries, pre/post/staging digests, directory capabilities and apply states | `apply_journal_sha256` |
 | `skill_script_execution_receipt_v1` | grant/request/process/sandbox/output/staging/apply/cancellation evidence | `script_receipt_sha256` |
 | `legacy_skill_migration_manifest_v1` | source revision/nodes, exact fragment partition, dispositions, modes/effects/failure policies and targets | `legacy_skill_migration_sha256` |
+| `reviewer_result_envelope_v1` | selection plan/candidate/reviewer/attempt/evidence identities and terminal review result | `reviewer_result_sha256` |
+| `agent_quality_ci_selection_v1` | base/head commits, governed-path matches, selector version, applicable/not-applicable decision and CI provenance | `ci_selection_sha256` |
 | `agent_context_candidate_manifest_v1` | complete behavior candidate identities defined below | `candidate_sha256` |
+| `evaluation_worker_lease_v1` | candidate/baseline/epoch/pair inventory, worker/provider/sandbox identities, lease epoch/deadline and signing key | `evaluation_worker_lease_sha256` |
+| `agent_quality_evidence_admission_v1` | signed lease, submitter/attempt/observation identities, raw evidence digest and computed assertions | `evidence_admission_sha256` |
 | `agent_quality_promotion_receipt_v1` | candidate/baseline/policy/suite identities, pair receipts, metrics, bounds, resource ratios, decision | `receipt_sha256` |
-| `agent_context_probe_receipt_v1` | probe epoch/run/generation/candidate, observed identities, outcome and evidence | `probe_receipt_sha256` |
-| `agent_context_proof_admission_v1` | admission/generation/candidate IDs, state, mint/consume command and proof run/epoch | `proof_admission_sha256` |
+| `agent_context_proof_matrix_v1` | complete production provider/effect cells, supported app rows and required assertion contracts | `proof_matrix_sha256` |
+| `client_capability_manifest_v1` | app bundle/build/source/signing identity, supported schemas and qualifying matrix cell | `client_capability_manifest_sha256` |
+| `client_capability_receipt_v1` | manifest, daemon challenge, principal/session, cutover generation and release signature | `client_capability_receipt_sha256` |
+| `agent_context_probe_receipt_v1` | probe epoch/run/generation/candidate/matrix, complete cell receipts, observed identities, outcome and evidence | `probe_receipt_sha256` |
+| `agent_context_proof_admission_v1` | admission/generation/candidate/matrix IDs, state, mint/consume command and proof run/epoch | `proof_admission_sha256` |
 | `process_clearance_set_v1` | generation, sorted held sessions/epochs/hold and clearance digests, completeness revision | `process_clearance_set_sha256` |
 | `agent_context_migration_phase_event_v1` | prior phase/head, migration version/checksum, daemon/command/invariant identities and timestamp | `migration_event_sha256` |
+| `agent_context_migration_lease_v1` | owner/process identity, epoch, correlated clock baseline/budget, heartbeat/deadline and phase/head/candidate/cutover pins | `migration_lease_sha256` |
+| `migration_replacement_admission_v1` | proposed candidate/receipt/schema/proof policy, old candidate, lease/command binding and expiry | `replacement_admission_sha256` |
+| `agent_context_candidate_replacement_v1` | old/new candidates/receipts, phase/head/cutover/lease, inventory/zero-unsafe, invalidations and command identities | `replacement_receipt_sha256` |
 | `legacy_cutover_inventory_v1` | producer/process/effect/approval/retry inventory, settlement actions, blockers and freshness | `cutover_inventory_sha256` |
 | `legacy_execution_settlement_v1` | run, prior state, retired work/approval/retry rows and preserved ledger digests | `settlement_sha256` |
 | `agent_context_projection_intent_v1` | projection/entity, canonical source revision/head/payload and target/status | `projection_intent_sha256` |
+| `projection_worker_lease_v1` | projection/entity, worker/process, lease epoch, correlated clock deadline and exact intent/source/payload pins | `projection_worker_lease_sha256` |
 | `mutation_projection_receipt_v1` | sorted projection intents, canonical revisions/heads and commit-time status | `projection_receipt_sha256` |
-| `agent_context_cutover_readback_v2` | singleton cutover/migration/generation/proof/process-clearance/version/projection truth | none; readback schema |
-| `agent_context_cursor_v1` | cursor scope/run/list, snapshot revision, expiry, last ordering tuple | none; opaque readback cursor |
+| `agent_context_cutover_readback_v2` | singleton cutover/migration/lease/repair/inventory/generation/proof/process-clearance/version/projection truth | none; readback schema |
+| `agent_context_attempt_readback_v1` | attempt state and pinned authority/mission/policy/fence/constraint/provider/sandbox/grant/prompt/projection truth | none; readback schema |
+| `agent_context_client_challenge_v1` | challenge/session identity, nonce and bounded issue/expiry times | none; initialize handshake schema |
+| `agent_context_cursor_v1` | cursor scope/run/list, snapshot revision, expiry, last ordering tuple, signing-key ID and MAC | none; opaque readback cursor |
 | `agent_context_command_error_v1` | classification, retryability/mode, safe request and expected/current fields | none; error schema |
+| `agent_context_graphql_error_v1` | code/classification/retryability/mode, authorized request ID and bounded expected/current fields | none; GraphQL error schema |
+| `agent_context_request_error_v1` | bounded JSON Pointer and closed validation reason | none; schema-error detail |
+| `agent_context_admission_error_v1` | bounded expected/current generation/revision/state/schema fields | none; admission-error detail |
 | `agent_context_start_selection_v2` | cutover revision/generation, versions and selected candidate/workflow/catalog/skill digests | `selection_sha256` |
 | `run_context_generation_binding_v2` | cutover generation and every promoted/compiled digest selected by run start | `binding_sha256` |
 | `agent_context_envelope_v2` | generation binding, base/effective mission, authority projection, role, assignment, skill composition, input/output refs, runtime IDs | `envelope_sha256` |
@@ -815,9 +929,13 @@ mission source refs by `(source_kind, source_id, revision)`, role ownership and
 criteria strings by UTF-8 bytes, skill manifest files by portable path, legacy
 source nodes by source-node ID, migration fragments by `fragment_id`, process
 clearances by `(provider_session_id, cancellation_epoch)`, and projection
-intents by `(projection_kind, entity_id)`. Typed assignment inputs, blockers,
-outputs, skill composition, write-journal entries and connection edges remain
-ordered because prompt, effect and keyset order are semantic.
+intents by `(projection_kind, entity_id)`, active authority rows by
+`(conflict_key, event_id)`, proof cells by their canonical dimension tuple,
+evaluation pairs by pair identity, reviewer results by selected-reviewer
+ordinal, and sandbox roots by normalized capability kind/path bytes. Typed
+assignment inputs, blockers, outputs, skill composition, write-journal entries
+and connection edges remain ordered because prompt, effect and keyset order are
+semantic.
 
 ### Northbound Mutation and Discovery Contract
 
@@ -851,6 +969,7 @@ required `workflow_id`. In one SQLite read transaction it returns
   `skill_snapshot_schema_version`, `digest_contract_version`, and
   `promotion_policy_version`;
 - `candidate_id`, `candidate_sha256`, `promotion_receipt_sha256`,
+  `proof_matrix_sha256`, `client_capability_support_policy_sha256`,
   `catalog_snapshot_sha256`, and `skill_registry_sha256`;
 - `workflow_source_sha256`, `workflow_normalized_plan_sha256`, and ordered
   `assignment_templates`, whose closed entries contain `state_id`, `task_name`,
@@ -864,22 +983,33 @@ cutover states return the authorized `-32009` admission envelope.
 `runtime.health` advertises this tool and its schema version but is not itself
 selection truth.
 
+For each authorized MCP connection, initialize also returns one
+`agent_context_client_challenge_v1` with challenge ID, 256-bit base64url nonce,
+authenticated session fingerprint, issued/expiry times and a 60-second TTL.
+`ClientCapabilityReceiptV1` binds that challenge to the release-signed embedded
+manifest and selection generation. A challenge is single-use on successful
+`runs.start`; failed validation does not reveal whether another app version is
+supported. The challenge and receipt are compatibility evidence, never a
+replacement for principal/caller/capability authorization.
+
 The exact northbound schemas are:
 
 | Tool | Request schema and required fields | Result schema and required fields |
 |---|---|---|
 | `runtime.agent_context.start_selection.get` | `agent_context_start_selection_request_v2`: `schema_version`, `workflow_id`; no idempotency field because the tool is read-only | the complete `agent_context_start_selection_v2` object above |
-| `runtime.agent_context.cutover.get` | `agent_context_cutover_get_request_v2`: only `schema_version`; read-only | `agent_context_cutover_readback_v2`: cutover/migration state and revision, generation/candidate state, proof-admission state/ID, probe epoch/run/latest receipt, process-clearance status/digest, allowed next actions, required versions, and current projection health |
+| `runtime.agent_context.cutover.get` | `agent_context_cutover_get_request_v2`: only `schema_version`; read-only | `agent_context_cutover_readback_v2`: cutover/migration state, head and revision; generation/candidate/repair/replacement-admission state; inventory freshness/blockers; migration lease owner/epoch/deadline; self-admission and zero-unsafe digests; proof admission/matrix/epoch/run/latest receipt; process-clearance status/digest; allowed next actions, required versions and current projection health |
+| `runtime.agent_context.attempt.get` | `agent_context_attempt_get_request_v1`: `schema_version`, `run_id`, `agent_execution_id`, canonical decimal `attempt_generation`; read-only | `agent_context_attempt_readback_v1`: attempt identity/state, pinned authority head/revision, mission/effective-authority/policy, pinned/current overall fence digests, bounded operation-class token relations and hard constraints, allowed actions, provider/sandbox/grant/prompt identities and projection health |
 | `approvals.authority.get` | `approval_authority_get_request_v1`: `schema_version`, `approval_id`; read-only | the complete `approval_authority_readback_v1` object defined above |
-| `runs.authority.append` | `run_authority_append_request_v1`: `schema_version`, `idempotency_key`, `caller_request_id`, `run_id`, `expected_authority_chain_head`, `directive`, sorted `supersedes` | `run_authority_append_result_v1`: `status = applied | replayed`, `authority_event_id`, `previous_authority_chain_head`, `current_authority_chain_head`, decimal-string `context_revision`, `directive_sha256`, `canonical_request_id`, `journal_id` |
-| `approvals.reissue` | `approval_authority_reissue_request_v1`: `schema_version`, both request IDs, `approval_id`, decimal-string `expected_binding_generation`, `expected_binding_sha256`, `expected_authority_chain_head` | `approval_authority_reissue_result_v1`: `status = rebound | replayed`, `approval_id`, decimal-string `binding_generation` and `presentation_revision`, `approval_authority_binding_sha256`, `binding_state = rebound`, `current_authority_chain_head`, `canonical_request_id`, `journal_id` |
-| `approvals.resolve` when authority-bound | `schema_version = approval_resolve_authority_v1`, required `subject_kind = stage_approval`, `approval_id`, `resolution = approve | reject`, optional bounded `comment`, decimal-string `binding_generation`, `approval_authority_binding_sha256`, `expected_authority_chain_head`, `caller_request_id`; MCP also requires `idempotency_key` | `approval_resolve_authority_result_v1`: `status = applied | replayed`, `approval_id`, `resolution`, decimal-string `binding_generation`, `approval_authority_binding_sha256`, optional `authority_event_id`, `current_authority_chain_head`, decimal-string `context_revision`, `canonical_request_id`, `journal_id` |
-| `runtime.agent_context.promote` | `agent_context_promote_request_v2`: `schema_version`, both request IDs, `candidate_id`, `candidate_sha256`, `promotion_receipt_sha256`, `expected_candidate_state = live_passed`, decimal-string `expected_cutover_generation`, `expected_cutover_revision` | `agent_context_promote_result_v2`: `status = probe_admitted | replayed`, `candidate_state = probe_active`, `cutover_state = probe_v2`, decimal-string `cutover_generation`, `cutover_revision`, `proof_admission_id`, `proof_admission_state = available`, `generation_row_sha256`, `canonical_request_id`, `journal_id` |
-| `runtime.agent_context.probe_start` | `agent_context_probe_start_request_v2`: `schema_version`, both request IDs, decimal-string `expected_cutover_generation`, `expected_cutover_revision`, `candidate_sha256`, `proof_admission_id`, `probe_workflow_sha256` | `agent_context_probe_start_result_v2`: `status = started | replayed`, `proof_admission_id`, `proof_admission_state = consumed`, `proof_run_id`, decimal-string `probe_epoch`, `probe_state = running`, `cutover_generation`, `cutover_revision`, `canonical_request_id`, `journal_id` |
-| `runtime.agent_context.reprobe` | `agent_context_reprobe_request_v2`: `schema_version`, both request IDs, decimal-string `expected_cutover_generation`, `expected_cutover_revision`, `candidate_id`, `candidate_sha256`, `expected_candidate_state = probe_active | promoted`, `reprobe_reason = infrastructure_inconclusive | process_hold_cleared`, `expected_probe_epoch`, conditional evidence digest, and `probe_workflow_sha256` | `agent_context_reprobe_result_v2`: `status = started | replayed`, `reprobe_reason`, `candidate_state = probe_active`, `cutover_state = probe_v2`, internally minted-and-consumed `proof_admission_id`, `proof_admission_state = consumed`, `proof_run_id`, decimal-string `probe_epoch`, `canonical_request_id`, `journal_id` |
-| `runtime.agent_context.open` | `agent_context_open_request_v2`: `schema_version`, both request IDs, decimal-string `expected_cutover_generation`, `expected_cutover_revision`, `expected_probe_epoch`, `candidate_sha256`, `proof_run_id`, `probe_receipt_sha256` | `agent_context_open_result_v2`: `status = opened | replayed`, `candidate_state = promoted`, `cutover_state = open_v2`, decimal-string `cutover_generation`, `cutover_revision`, `probe_receipt_sha256`, `canonical_request_id`, `journal_id` |
-| `provider_session.mark_process_absent` | `schema_version = provider_session_mark_process_absent_v2`, both request IDs, `provider_session_id`, integer `cancellation_epoch`, `dispatch_hold_sha256` | extended P083 result: `status = absent_verified | replayed`, `process_fate = absent_verified`, `agent_execution_id`, integer `attempt_generation`, `dispatch_state = failed_closed`, `cleared_dispatch_hold_sha256`, `generation_reprobe_status = not_required | waiting_for_other_clearances | ready`, optional `process_clearance_set_sha256`, `canonical_request_id`, `journal_id`; it does not mutate candidate/cutover state |
-| `runs.start` | `run_start_request_v2`: `schema_version`, `idea_id`, `workflow_id`, `workflow_title`, `workspace_root`, `artifact_root`, `workflow_yaml_path`, `agent_catalog_yaml_path`, UUIDv7 `idempotency_key`, `context_selection`; only `delivery_configuration_json`, `review_routing_json`, and `rollout_contract_preflight_policy_json` are optional | `run_start_result_v2`: `status = started | replayed`, `run_id`, `idea_id`, `workflow_id`, `run_status`, `context_admission`, `canonical_request_id`, `journal_id` |
+| `runs.authority.append` | `run_authority_append_request_v1`: `schema_version`, `idempotency_key`, `caller_request_id`, `run_id`, `expected_authority_chain_head`, `directive`, sorted `supersedes` | `run_authority_append_result_v1`: `status = applied`, `authority_event_id`, `previous_authority_chain_head`, `current_authority_chain_head`, decimal-string `context_revision`, `directive_sha256`, `canonical_request_id`, `journal_id` |
+| `approvals.reissue` | `approval_authority_reissue_request_v1`: `schema_version`, both request IDs, `approval_id`, decimal-string `expected_binding_generation`, `expected_binding_sha256`, `expected_authority_chain_head` | `approval_authority_reissue_result_v1`: `status = rebound`, `approval_id`, decimal-string `binding_generation` and `presentation_revision`, `approval_authority_binding_sha256`, `binding_state = rebound`, `current_authority_chain_head`, `canonical_request_id`, `journal_id` |
+| `approvals.resolve` when authority-bound | `schema_version = approval_resolve_authority_v1`, required `subject_kind = stage_approval`, `approval_id`, `resolution = approve or reject`, optional bounded `comment`, decimal-string `binding_generation`, `approval_authority_binding_sha256`, `expected_authority_chain_head`, `caller_request_id`; MCP also requires `idempotency_key` | `approval_resolve_authority_result_v1`: `status = applied`, `approval_id`, `resolution`, decimal-string `binding_generation`, `approval_authority_binding_sha256`, optional `authority_event_id`, `current_authority_chain_head`, decimal-string `context_revision`, `canonical_request_id`, `journal_id` |
+| `runtime.agent_context.promote` | `agent_context_promote_request_v2`: `schema_version`, both request IDs, `candidate_id`, `candidate_sha256`, `promotion_receipt_sha256`, `proof_matrix_sha256`, `expected_candidate_state = live_passed`, decimal-string `expected_cutover_generation`, `expected_cutover_revision` | `agent_context_promote_result_v2`: `status = probe_admitted`, `candidate_state = probe_active`, `cutover_state = probe_v2`, decimal-string `cutover_generation`, `cutover_revision`, `proof_admission_id`, `proof_admission_state = available`, `proof_matrix_sha256`, `generation_row_sha256`, `canonical_request_id`, `journal_id` |
+| `runtime.agent_context.probe_start` | `agent_context_probe_start_request_v2`: `schema_version`, both request IDs, decimal-string `expected_cutover_generation`, `expected_cutover_revision`, `candidate_sha256`, `proof_admission_id`, `proof_matrix_sha256`, `probe_workflow_sha256` | `agent_context_probe_start_result_v2`: `status = started`, `proof_admission_id`, `proof_admission_state = consumed`, `proof_matrix_sha256`, `proof_run_id`, decimal-string `probe_epoch`, `probe_state = running`, `cutover_generation`, `cutover_revision`, `canonical_request_id`, `journal_id` |
+| `runtime.agent_context.reprobe` | `agent_context_reprobe_request_v2`: `schema_version`, both request IDs, decimal-string `expected_cutover_generation`, `expected_cutover_revision`, `candidate_id`, `candidate_sha256`, `expected_candidate_state = probe_active or promoted`, `reprobe_reason = infrastructure_inconclusive or process_hold_cleared`, `expected_probe_epoch`, conditional evidence digest, `proof_matrix_sha256`, and `probe_workflow_sha256` | `agent_context_reprobe_result_v2`: `status = started`, `reprobe_reason`, `candidate_state = probe_active`, `cutover_state = probe_v2`, internally minted-and-consumed `proof_admission_id`, `proof_admission_state = consumed`, `proof_matrix_sha256`, `proof_run_id`, decimal-string `probe_epoch`, `canonical_request_id`, `journal_id` |
+| `runtime.agent_context.open` | `agent_context_open_request_v2`: `schema_version`, both request IDs, decimal-string `expected_cutover_generation`, `expected_cutover_revision`, `expected_probe_epoch`, `candidate_sha256`, `proof_matrix_sha256`, `proof_run_id`, `probe_receipt_sha256` | `agent_context_open_result_v2`: `status = opened`, `candidate_state = promoted`, `cutover_state = open_v2`, decimal-string `cutover_generation`, `cutover_revision`, `proof_matrix_sha256`, `probe_receipt_sha256`, `canonical_request_id`, `journal_id` |
+| `runtime.agent_context.replace_candidate` | `agent_context_replace_candidate_request_v1`: `schema_version`, both request IDs, expected migration phase/head, expected cutover generation/revision, old candidate digest, new candidate ID/digest, passing promotion receipt, proof-matrix digest, migration-lease epoch/digest, inventory digest and zero-unsafe digest | `agent_context_replace_candidate_result_v1`: `status = replacement_bound`, unchanged migration phase, new migration head/cutover revision, replacement generation, old/new candidate digests, `repair_state = replacement_bound`, `replacement_receipt_sha256`, canonical request ID and journal ID |
+| `provider_session.mark_process_absent` | `schema_version = provider_session_mark_process_absent_v2`, both request IDs, `provider_session_id`, integer `cancellation_epoch`, `dispatch_hold_sha256` | extended P083 result: `status = absent_verified`, `process_fate = absent_verified`, `agent_execution_id`, canonical decimal-string `attempt_generation`, `dispatch_state = failed_closed`, `cleared_dispatch_hold_sha256`, `generation_reprobe_status = not_required, waiting_for_other_clearances, or ready`, optional `process_clearance_set_sha256`, `canonical_request_id`, `journal_id`; it does not mutate candidate/cutover state |
+| `runs.start` | `run_start_request_v2`: `schema_version`, `idea_id`, `workflow_id`, `workflow_title`, `workspace_root`, `artifact_root`, `workflow_yaml_path`, `agent_catalog_yaml_path`, UUIDv7 `idempotency_key`, `context_selection`, `client_capability_receipt`; only `delivery_configuration_json`, `review_routing_json`, and `rollout_contract_preflight_policy_json` are optional | `run_start_result_v2`: `status = started`, `run_id`, `idea_id`, `workflow_id`, `run_status`, `context_admission`, `canonical_request_id`, `journal_id` |
 
 Every state-changing result schema in this table also requires
 `projection_status = pending` and field `projection_receipt` containing one
@@ -891,6 +1021,12 @@ revision/head), `status_at_commit = pending`, and
 exact and alias replay return the original bytes even when projection workers
 have since applied or degraded an intent. Current status is read only through
 SQLite-backed readback surfaces.
+
+`replayed` is not a result status in any schema. The first committed canonical
+result, including its original action status, canonical request ID, journal ID
+and pending projection receipt, is the only success representation. Exact MCP,
+same-caller and different-caller semantic alias replay return those stored bytes
+unchanged; replay provenance exists only in command/audit readback.
 
 For `agent_context_reprobe_request_v2`, `reprobe_reason =
 infrastructure_inconclusive` requires `prior_probe_receipt_sha256` and forbids
@@ -915,10 +1051,11 @@ field, timestamp, or lease metadata is included:
 | `runs.authority.append` | `run_id`, `expected_authority_chain_head`, adapter-derived `source_kind`, `directive_sha256`, sorted `supersedes` |
 | `approvals.reissue` | `approval_id`, `expected_binding_generation`, `expected_binding_sha256`, `expected_authority_chain_head` |
 | `approvals.resolve` | `approval_id`, `resolution`, canonical digest of present/absent bounded comment, `binding_generation`, `approval_authority_binding_sha256`, `expected_authority_chain_head` |
-| `runtime.agent_context.promote` | `candidate_id`, `candidate_sha256`, `promotion_receipt_sha256`, `expected_candidate_state`, `expected_cutover_generation`, `expected_cutover_revision` |
-| `runtime.agent_context.probe_start` | `expected_cutover_generation`, `expected_cutover_revision`, `candidate_sha256`, `proof_admission_id`, `probe_workflow_sha256` |
-| `runtime.agent_context.reprobe` | `expected_cutover_generation`, `expected_cutover_revision`, `candidate_id`, `candidate_sha256`, `expected_candidate_state`, `reprobe_reason`, `expected_probe_epoch`, the one conditionally required evidence digest, `probe_workflow_sha256` |
-| `runtime.agent_context.open` | `expected_cutover_generation`, `expected_cutover_revision`, `expected_probe_epoch`, `candidate_sha256`, `proof_run_id`, `probe_receipt_sha256` |
+| `runtime.agent_context.promote` | `candidate_id`, `candidate_sha256`, `promotion_receipt_sha256`, `proof_matrix_sha256`, `expected_candidate_state`, `expected_cutover_generation`, `expected_cutover_revision` |
+| `runtime.agent_context.probe_start` | `expected_cutover_generation`, `expected_cutover_revision`, `candidate_sha256`, `proof_admission_id`, `proof_matrix_sha256`, `probe_workflow_sha256` |
+| `runtime.agent_context.reprobe` | `expected_cutover_generation`, `expected_cutover_revision`, `candidate_id`, `candidate_sha256`, `expected_candidate_state`, `reprobe_reason`, `expected_probe_epoch`, the one conditionally required evidence digest, `proof_matrix_sha256`, `probe_workflow_sha256` |
+| `runtime.agent_context.open` | `expected_cutover_generation`, `expected_cutover_revision`, `expected_probe_epoch`, `candidate_sha256`, `proof_matrix_sha256`, `proof_run_id`, `probe_receipt_sha256` |
+| `runtime.agent_context.replace_candidate` | expected migration phase/head, expected cutover generation/revision, old candidate digest, new candidate ID/digest, passing promotion receipt, proof-matrix digest, migration-lease epoch/digest, inventory digest and zero-unsafe digest |
 | `provider_session.mark_process_absent` | `provider_session_id`, integer `cancellation_epoch`, `dispatch_hold_sha256` |
 
 `runs.start` intentionally has no second semantic-alias layer: its existing
@@ -935,29 +1072,59 @@ payload with `classification`, Boolean `retryable`, `retry_mode`, safe request
 IDs and the bounded expected/current fields allowed below. Rust and Swift share
 these exact outcomes:
 
-| Condition | JSON-RPC/code | Classification | `retryable` / `retry_mode` |
-|---|---|---|---|
-| live principal/class/capability denial | `-32004` existing boundary code | `authorization_denied` | `false / terminal` |
-| schema, bounds or conditional-field failure | `-32602` | `invalid_request` | `false / correct_payload` |
-| same MCP key and same hash committed | success, original bytes | `exact_replay` | not applicable |
-| same MCP key and same hash pending | `-32603 / IDEMPOTENCY_IN_FLIGHT` | `mcp_request_in_flight` | `true / exact_retry_after` |
-| same MCP key and different hash | `-32603 / IDEMPOTENCY_CONFLICT` | `mcp_request_conflict` | `false / new_key_for_new_intent` |
-| same caller request ID and same semantic intent committed | success, original bytes | `exact_replay` | not applicable |
-| different caller request ID and same semantic intent committed | success, original bytes; alias row recorded separately | `alias_replay` | not applicable |
-| same caller request ID and different command/intent | `-32009 / COMMAND_IDEMPOTENCY_CONFLICT` | `command_request_conflict` | `false / new_request_for_new_intent` |
-| same semantic lease still pending | `-32009 / COMMAND_IN_FLIGHT` | `command_in_flight` | `true / exact_retry_after` |
-| stale head/generation/revision/binding | `-32009 / STALE_PRECONDITION` | `stale_precondition` | `true / refresh_then_new_request` |
-| current-head semantic duplicate | `-32009 / SEMANTIC_DUPLICATE` | `semantic_duplicate` | `false / terminal` |
-| authorized resource is absent | existing `-32002` | `resource_missing` | `false / correct_identifier` |
-| pending authority-bound approval cap reached | `-32009 / PENDING_APPROVAL_CAP_EXCEEDED` | `resource_limit` | `true / settle_existing_then_new_request` |
-| malformed or wrong-scope connection cursor | `invalid_cursor / malformed, filter_changed` | `invalid_cursor` | `false / restart_pagination` |
-| expired or unavailable cursor snapshot | `invalid_cursor / expired, snapshot_unavailable` | `invalid_cursor` | `true / restart_pagination` |
-| required projection-intent write rolls back | `-32603 / PROJECTION_INTENT_COMMIT_FAILED` | `storage_not_committed` | `true / exact_retry` |
-| committed outcome or alias row is corrupt | `-32603 / IDEMPOTENCY_REPLAY_CORRUPT` | `durable_truth_corrupt` | `false / operator_repair` |
+| Condition | MCP JSON-RPC / `data.code` | GraphQL `extensions.code` | Classification | `retryable` / `retry_mode` |
+|---|---|---|---|---|
+| live principal/class/capability denial | `-32004 / authorization_denied` | `authorization_denied` | `authorization_denied` | `false / terminal` |
+| schema, bounds or conditional-field failure | `-32602 / invalid_request` | `invalid_request` | `invalid_request` | `false / correct_payload` |
+| same boundary or command identity committed | success, original bytes | success, original fields | `exact_replay` | not applicable |
+| different caller request ID and same semantic intent committed | success, original bytes; alias row recorded separately | success, original fields | `alias_replay` | not applicable |
+| same MCP key and same hash pending | `-32603 / idempotency_in_flight` | not applicable | `mcp_request_in_flight` | `true / exact_retry_after` |
+| same MCP key and different hash | `-32603 / idempotency_conflict` | not applicable | `mcp_request_conflict` | `false / new_key_for_new_intent` |
+| same caller request ID and different command/intent | `-32009 / command_idempotency_conflict` | `command_idempotency_conflict` | `command_request_conflict` | `false / new_request_for_new_intent` |
+| same semantic lease still pending | `-32009 / command_in_flight` | `command_in_flight` | `command_in_flight` | `true / exact_retry_after` |
+| stale head/generation/revision/binding or approval no longer actionable | `-32009 / stale_precondition` | `stale_precondition` | `stale_precondition` | `true / refresh_then_new_request` |
+| current-head semantic duplicate | `-32009 / semantic_duplicate` | `semantic_duplicate` | `semantic_duplicate` | `false / terminal` |
+| authorized resource is absent | `-32002 / resource_missing` | `resource_missing` | `resource_missing` | `false / correct_identifier` |
+| pending authority-bound approval cap reached | `-32009 / pending_approval_cap_exceeded` | `pending_approval_cap_exceeded` | `resource_limit` | `true / settle_existing_then_new_request` |
+| attempt fenced by newer hard authority | `-32009 / authority_recheck_required` | `authority_recheck_required` | `policy_denial` | `true / prepare_new_attempt` |
+| provider sandbox missing, mismatched or escaped | `-32009 / provider_sandbox_unavailable` | `provider_sandbox_unavailable` | `policy_denial` | `false / replace_candidate_or_host` |
+| evidence lease/signature/identity invalid | `-32009 / agent_quality_evidence_admission_invalid` | `agent_quality_evidence_admission_invalid` | `evidence_incomplete` | `false / issue_new_lease` |
+| proof matrix incomplete or cell mismatched | `-32009 / agent_context_proof_matrix_incomplete` | `agent_context_proof_matrix_incomplete` | `evidence_incomplete` | `true / complete_same_matrix` |
+| client capability receipt missing/stale/unsupported | `-32009 / client_capability_incompatible` | `client_capability_incompatible` | `compatibility_denial` | `false / update_client` |
+| migration writer has stale lease epoch | `-32009 / agent_context_migration_lease_fenced` | `agent_context_migration_lease_fenced` | `ownership_conflict` | `true / refresh_lease_readback` |
+| forward replacement has unsafe or stale evidence | `-32009 / agent_context_candidate_replacement_blocked` | `agent_context_candidate_replacement_blocked` | `reconciliation_required` | `true / settle_blockers_then_new_request` |
+| malformed or wrong-scope connection cursor | `-32009 / invalid_cursor`, reason `malformed` or `filter_changed` | `invalid_cursor` | `invalid_cursor` | `false / restart_pagination` |
+| expired or unavailable cursor snapshot | `-32009 / invalid_cursor`, reason `expired` or `snapshot_unavailable` | `invalid_cursor` | `invalid_cursor` | `true / restart_pagination` |
+| required projection-intent write rolls back | `-32603 / projection_intent_commit_failed` | `projection_intent_commit_failed` | `storage_not_committed` | `true / exact_retry` |
+| committed outcome or alias row is corrupt | `-32603 / idempotency_replay_corrupt` | `idempotency_replay_corrupt` | `durable_truth_corrupt` | `false / operator_repair` |
 
 Concurrent same-intent losers observe in-flight or alias replay according to
 whether the winner committed; different-intent CAS losers observe
 `stale_precondition`. No race-dependent generic `INTERNAL` outcome is allowed.
+
+Known domain denials never collapse to `internal`. `agent_context_cutover_not_ready`,
+`agent_context_version_incompatible`, `agent_context_proof_admission_invalid`,
+`agent_context_reprobe_precondition_failed`, `agent_context_emergency_hold`,
+`agent_context_migration_phase_conflict`, `legacy_cutover_inventory_blocked`,
+`authority_recheck_required`, `provider_sandbox_unavailable`,
+`agent_quality_evidence_admission_invalid`,
+`agent_context_proof_matrix_incomplete`, `client_capability_incompatible`,
+`agent_context_migration_lease_fenced`,
+`agent_context_candidate_replacement_blocked`, `execution_admission_denied`,
+`legacy_context_retired`, and
+`legacy_context_execution_prohibited` use MCP `-32009` with the same lowercase
+code in `data.code` and GraphQL `extensions.code`. Their normative schema row
+declares classification and retry mode; neither adapter may substitute a
+surface-specific string. Evaluation and sandbox failures use their exact typed
+code with classification `evidence_incomplete`, `policy_denial`, or
+`reconciliation_required` as declared in the same registry.
+
+GraphQL errors implement `agent_context_graphql_error_v1`: exact `code`,
+`classification`, `retryable`, `retryMode`, authorized `requestId`, and only the
+same bounded expected/current detail allowed in MCP. MCP and GraphQL fixture
+generation reads one checked-in error registry; adding a domain failure without
+both mappings fails schema generation and the gate. Only an unclassified defect
+may return `internal`, and that path emits no domain or resource detail.
 
 All UUID/ID strings are canonical lowercase ASCII and at most 200 bytes unless
 their existing domain type is stricter; digests are exactly `sha256:` plus 64
@@ -977,8 +1144,9 @@ the run-start transaction; the client does not edit or omit fields. A successful
 canonical decimal-string `cutover_generation` and `cutover_revision`,
 `candidate_sha256`, `promotion_receipt_sha256`, `workflow_source_sha256`,
 `workflow_normalized_plan_sha256`, `catalog_snapshot_sha256`,
-`skill_registry_sha256`, `binding_sha256`, `context_schema_version`, and
-`base_authority_chain_head`.
+`skill_registry_sha256`, `proof_matrix_sha256`,
+`client_capability_manifest_sha256`, `client_capability_receipt_sha256`,
+`binding_sha256`, `context_schema_version`, and `base_authority_chain_head`.
 
 The boundary authorization matrix is closed:
 
@@ -986,6 +1154,7 @@ The boundary authorization matrix is closed:
 |---|---|---|---|
 | MCP start-selection readback | `Operator` | `AgentOperator` | `RuntimeAgentContextStartSelectionGet` |
 | MCP cutover singleton readback | `Operator` | `AgentOperator` | `RuntimeAgentContextCutoverGet` |
+| MCP attempt authority/readback | `Operator` | `AgentOperator` | `RuntimeAgentContextAttemptRead` |
 | MCP approval-authority readback | `Operator` | `AgentOperator` | `ApprovalsAuthorityRead` |
 | MCP `runs.start` | `Operator` | `AgentOperator` | `RunsStart` |
 | MCP authority append | `Operator` | `AgentOperator` | `RunsAuthorityAppend` |
@@ -994,9 +1163,12 @@ The boundary authorization matrix is closed:
 | MCP initial probe start | `Operator` | `AgentOperator` | `RuntimeAgentContextProbeStart` |
 | MCP atomic reprobe | `Operator` | `AgentOperator` | `RuntimeAgentContextReprobe` |
 | MCP open | `Operator` | `AgentOperator` | `RuntimeAgentContextOpen` |
+| MCP forward candidate replacement | `Operator` | `AgentOperator` | `RuntimeAgentContextReplaceCandidate` |
 | MCP process-absence clearance | `Operator` | `AgentOperator` | `ProviderSessionMarkProcessAbsent` |
 | MCP approval resolution | `Operator` | `AgentOperator` | `ApprovalsResolve` |
+| Internal evidence submission boundary | dedicated `Agent` principal | stored `Automation` override | `AgentQualityEvidenceSubmit` plus matching signed worker lease |
 | GraphQL cutover singleton readback | `Operator` | `UiOperator` | `RuntimeAgentContextCutoverGet` |
+| GraphQL attempt authority/readback | `Operator` | `UiOperator` | `RuntimeAgentContextAttemptRead` |
 | GraphQL approval-authority readback | `Operator` | `UiOperator` | `ApprovalsAuthorityRead` |
 | GraphQL approval reissue | `Operator` | `UiOperator` | `ApprovalsReissue` |
 | GraphQL approval resolution | `Operator` | `UiOperator` | `ApprovalsResolve` |
@@ -1005,8 +1177,11 @@ These checks are conjunctive. An `Agent` principal also derives
 `AgentOperator` on MCP, but fails the required principal class even if its
 principal entry was mistakenly granted one of these capabilities. Automation,
 Observer, ReadOnlyOperator, DeveloperBreakGlass, caller-class overrides, and
-caller-supplied provenance cannot perform these mutations. GraphQL exposes no
-run-start, append, promote, probe, reprobe, or open mutation.
+caller-supplied provenance cannot perform these production mutations. The sole
+Automation exception is the lease-bound evidence-submission row above; it has
+no candidate, promotion, cutover, run or effect authority. GraphQL exposes no
+run-start, append, promote, probe, reprobe, open or candidate-replacement
+mutation.
 
 Validation precedence is normative and shared by HTTP MCP and stdio MCP:
 
@@ -1053,18 +1228,32 @@ All cross-runtime structured digests use
 1. Construct the contract payload without its self-digest field. The excluded
    field is explicit per schema: `genesis_sha256`, `base_ledger_sha256`,
    `directive_sha256`, `event_sha256`, `approval_authority_template_sha256`,
+   `effective_authority_sha256`, `runtime_policy_sha256`,
+   `authority_fence_sha256`,
    `approval_authority_binding_sha256`, `binding_event_sha256`,
    `content_sha256`, `effective_mission_sha256`, `role_sha256`,
-   `assignment_sha256`, `bundle_sha256`, `skill_composition_sha256`,
+   `assignment_sha256`, `upstream_lock_sha256`,
+   `prompt_token_budget_policy_sha256`, `bundle_sha256`,
+   `skill_composition_sha256`,
    `prompt_envelope_sha256`, `dispatch_intent_sha256`, `dispatch_hold_sha256`,
+   `attempt_identity_sha256`,
    `self_admission_sha256`,
-   `provider_binding_sha256`, `grant_sha256`, `script_contract_sha256`,
-   `script_intent_sha256`, `apply_journal_sha256`, `script_receipt_sha256`,
-   `legacy_skill_migration_sha256`, `candidate_sha256`, `receipt_sha256`,
+   `provider_binding_sha256`, `grant_sha256`,
+   `grant_install_receipt_sha256`, `provider_sandbox_policy_sha256`,
+   `provider_sandbox_attestation_sha256`, `effect_id`,
+   `script_contract_sha256`, `script_intent_sha256`, `apply_journal_sha256`,
+   `script_receipt_sha256`, `legacy_skill_migration_sha256`,
+   `reviewer_result_sha256`, `ci_selection_sha256`, `candidate_sha256`,
+   `evaluation_worker_lease_sha256`, `evidence_admission_sha256`,
+   `receipt_sha256`, `proof_matrix_sha256`,
+   `client_capability_manifest_sha256`, `client_capability_receipt_sha256`,
    `probe_receipt_sha256`, `proof_admission_sha256`,
    `process_clearance_set_sha256`, `migration_event_sha256`,
+   `migration_lease_sha256`, `replacement_admission_sha256`,
+   `replacement_receipt_sha256`,
    `cutover_inventory_sha256`, `settlement_sha256`,
-   `projection_intent_sha256`, `projection_receipt_sha256`,
+   `projection_intent_sha256`, `projection_worker_lease_sha256`,
+   `projection_receipt_sha256`,
    `selection_sha256`, `binding_sha256`, or `envelope_sha256`.
 2. Normalize fields that are semantic sets by sorting them according to the
    schema's declared key before serialization. Arrays that express workflow or
@@ -1129,23 +1318,34 @@ role or prompt field remains. It does not perform a heuristic runtime migration.
 
 ### Standards Baseline
 
-Bundles follow the official Agent Skills specification and guidance:
+Bundles follow the Agent Skills specification and guidance as published from
+the official [`agentskills/agentskills`](https://github.com/agentskills/agentskills/tree/69ef37e9424c0a7ea9dd2293b559e43ec8176379)
+repository at immutable commit
+`69ef37e9424c0a7ea9dd2293b559e43ec8176379`, observed on 2026-08-28. The
+repository stores `docs/reference/agent-skills-upstream-lock.json` with that
+commit, the exact specification, best-practice, description-optimization and
+evaluation source paths, every vendored file SHA-256, the `skills-ref` source
+tree digest and its validation-corpus digest. A dependency update is a reviewed
+candidate-manifest change; a branch, tag, website response or host-installed
+package is never an implicit production input.
 
-- <https://agentskills.io/specification>
-- <https://agentskills.io/skill-creation/best-practices>
-- <https://agentskills.io/skill-creation/optimizing-descriptions>
-- <https://agentskills.io/skill-creation/evaluating-skills>
+A Rust `SkillBundleAdmissionV1` implementation is the production admission
+authority on every host. A host-installed `skills-ref` executable is never used
+to decide whether a run can start. Gates compare the Rust result with the
+lockfile-built `skills-ref` binary and vendored corpus; a missing, mismatched or
+network-fetched installation fails the gate and cannot change admission truth.
 
-The repository pins one Agent Skills specification revision and vendors its
-official validation corpus. A Rust `SkillBundleAdmissionV1` implementation is
-the production admission authority on every host. A host-installed
-`skills-ref` executable is never used to decide whether a run can start. Gates
-may compare the Rust result with a repository-pinned `skills-ref` build, but a
-missing or different host installation cannot change admission truth.
-
-Core `SKILL.md` bodies follow progressive disclosure and target fewer than 500
-lines and 5,000 tokens. Longer schemas, rubrics, examples, and templates belong
-in bundle resources rather than the injected body.
+Progressive disclosure is mechanical. Checked-in
+`PromptTokenBudgetPolicyV1` pins `chainworks_prompt_tokenizer_v1`, its merge
+table/corpus digest and the complete production provider/model tokenizer
+compatibility table. Admission requires each `SKILL.md` body to contain at most
+500 lines and at most 5,000 policy tokens under every compatible production
+profile. A task composition may inject at most 12,000 policy tokens across at
+most four bodies, in addition to the byte limits below. Unknown tokenizer
+identity, token-count overflow or a provider profile without a pinned
+compatibility row fails candidate admission. Longer schemas, rubrics, examples
+and templates must be referenced bundle resources and are not injected into
+the initial prompt.
 
 ### Canonical Layout
 
@@ -1269,16 +1469,33 @@ the permission profile, runtime timeout, and P096 line/byte caps.
 
 ### Invocation-Scoped Skill Broker
 
-Preparation creates one durable `SkillBrokerGrantV1` in the same transaction as
-the invocation pin. It binds run, stage/task, agent execution, attempt
-generation, daemon instance, provider session and session fingerprint, context
-generation, permission profile, `SkillCompositionV1` digest, the exact allowed
-resource/script manifest entries, dispatch states in which the grant is usable,
-expiry, and revocation state. A 256-bit capability token is generated by the OS
-CSPRNG; only its hash is stored. The trusted adapter installs the plaintext in
-the isolated provider MCP transport, never in prompt text, argv, logs, receipts,
-or workspace files. Settlement, cancellation, session replacement, generation
-hold, or attempt replacement revokes it transactionally.
+Preparation creates one durable `SkillBrokerGrantV1` in state `unissued` in the
+same transaction as the attempt pin. It binds run, stage/task, agent execution,
+attempt generation, daemon instance, provider session and session fingerprint,
+context generation, permission profile, `SkillCompositionV1` digest, exact
+allowed resource/script entries, usable dispatch states, expiry, revocation
+state, and decimal-string `grant_install_epoch`. No plaintext token exists at
+`prepared` commit.
+
+When the registered adapter transport is ready, the broker CASes `unissued` or
+a verified-absent prior installation to `installing`, increments the install
+epoch, generates a 256-bit token with the OS CSPRNG, persists only its
+domain-separated hash plus handoff nonce, and sends plaintext once through an
+anonymous inherited pipe to the exact adapter transport. The adapter returns a
+`SkillBrokerGrantInstallReceiptV1` binding grant/attempt/install epoch, token
+hash, adapter transport identity, provider sandbox identity and session
+fingerprint. Only that receipt can CAS `installing -> installed`.
+
+A crash before issuance simply issues the first epoch. A crash after hash commit
+but before installation rotates the token only after supervisor evidence proves
+that no registered process or transport from that epoch can possess it; the old
+epoch becomes `abandoned`. A registered or ambiguous process requires verified
+reap or identity hold and never receives a second token. Installed grants
+survive daemon restart only through the already-attested live session transport;
+session loss revokes the grant and requires a new attempt/session. Plaintext
+never enters SQLite, Keychain, files, prompt, argv, environment, logs, receipts,
+or crash reports. Settlement, cancellation, session replacement, generation
+hold, or attempt replacement revokes the grant transactionally.
 
 Broker tool payloads do not accept run ID, execution ID, attempt generation,
 session ID, snapshot path, or bundle path. The authenticated grant and live ACP
@@ -1290,6 +1507,104 @@ dispatch state, generation continuation state, permission profile, composition
 membership, manifest entry, and exact object digest before revealing object
 existence. Any wrong run/session/generation/composition/bundle combination
 returns the same non-enumerating `skill_resource_unavailable` denial.
+
+#### Broker wire and semantic effect identity
+
+The broker surface has two exact, unknown-field-denying schemas. Neither
+accepts grant, run, execution, attempt, session, filesystem path, or target-root
+identity from the provider:
+
+| Tool | Exact request | Exact successful result |
+|---|---|---|
+| `skills.resource.read` | `skill_resource_read_request_v1 { schema_version, uri, offset, max_bytes }`, where `offset` is a canonical unsigned decimal string and `max_bytes` is `1...32768` | `skill_resource_read_result_v1 { schema_version, uri, resource_sha256, offset, bytes_read, next_offset, eof, content_encoding = base64, data_base64, chunk_sha256 }` |
+| `skills.script.run` | `skill_script_run_request_v1 { schema_version, idempotency_key, script_uri, arguments }`, where the key is lowercase UUIDv7 and `arguments` must match the contract's closed schema | `skill_script_run_result_v1 { schema_version, outcome, effect_id, script_intent_sha256, script_receipt_sha256, output_contract_sha256, output_json }` |
+
+At exact EOF, resource read returns zero bytes, unchanged next offset and
+`eof = true`; an offset beyond EOF is `skill_resource_range_invalid`. Base64 and
+decoded lengths, chunk digest, manifest digest and P096 cumulative budget are
+verified before return. Script `outcome` is exactly `completed`,
+`failed_no_effect`, or `failed_reconciled`; `reconciliation_required` is a typed
+non-retryable error until operator reconciliation settles the existing effect.
+All result objects are bounded by P096 and contain no raw stderr or path.
+
+The provider never chooses semantic effect identity. Before accepting a write
+script, the broker builds `SkillScriptEffectIdentityV1` from the authenticated
+grant's agent-execution ID and attempt generation, composition digest, bundle
+and script digests, canonical complete arguments digest, contract digest, and
+`normalized_target_set_sha256`. A production write contract declares closed
+JSON pointers and `target_resolver_version`; the broker resolves their logical
+targets under the grant's directory capabilities before spawn. A target that
+cannot be completely derived is not executable. Read-only scripts use the
+canonical empty target set. `effect_id` is the domain-separated digest of that
+complete object.
+
+A unique `(grant_id, effect_id)` claim is committed with the script intent.
+Repeating the same effect with a new UUIDv7 key returns the original terminal
+bytes or `skill_effect_in_flight`; it cannot spawn or apply again. Reusing one
+UUIDv7 key with different canonical request bytes is
+`skill_request_idempotency_conflict`. The closed `skill_broker_error_v1` wire
+contains code, retryability, retry mode, canonical request ID when authorized,
+and bounded safe detail. Its codes are exactly `invalid_request`,
+`skill_resource_unavailable`, `skill_resource_range_invalid`,
+`skill_request_in_flight`, `skill_request_idempotency_conflict`,
+`skill_effect_in_flight`, `skill_script_runtime_unavailable`,
+`skill_script_output_budget_exceeded`, and
+`skill_script_reconciliation_required`. Grant/scope/session/object mismatch and
+revocation all collapse to the same non-enumerating unavailable response.
+
+### ProviderExecutionSandboxV1
+
+The skill broker is not a security boundary while the same-UID provider can
+open its backing stores directly. Every V2 production adapter therefore launches
+the provider wrapper and all descendants under one outer
+`ProviderExecutionSandboxV1` Seatbelt profile before provider initialization.
+Provider-native sandbox settings are defense in depth only and cannot relax the
+outer profile. `danger-full-access`, advisory-only execution, or unsandboxed
+fallback is invalid for a V2 candidate.
+
+The profile is default-deny for filesystem and local IPC. It always denies
+the checkout `.git` entry, resolved linked-worktree gitdir and shared common Git
+directory, `.agents/skills`, `.agent-evals`, the eval
+vault, content-addressed skill snapshots, control-plane database/auth/state,
+other run meta-roots, source provider homes, user credentials/keychains, and
+daemon sockets except the invocation-scoped authenticated broker transport.
+It allows only:
+
+- the isolated provider runtime home and exact adapter-owned transport paths;
+- sealed provider/wrapper/tool executables and declared read-only toolchain
+  roots;
+- invocation scratch/cache roots with bounded ownership and lifetime;
+- declared run output roots and workspace source/test roots with read or write
+  mode derived from the frozen permission profile, while nested deny roots above
+  remain denied;
+- the adapter-specific remote network class required for model transport. No
+  profile grants generic localhost discovery or access to another provider's
+  runtime home.
+
+The trusted launcher resolves every configured root component with no-follow
+directory descriptors, records device/inode and canonical path, rejects
+symlink/alias overlap between allow and deny roots, and emits Seatbelt literals
+only from that table. Workspace allowances are capabilities for the declared
+run root, not broad home/repository prefixes; protected nested roots remain
+denied even when their parent workspace is readable.
+
+The wrapper owns the Seatbelt profile bytes, canonical allow/deny root table,
+network class, executable identities and policy version. Their digest is pinned
+by the candidate, generation and dispatch intent. Before `provider_bound`, the
+trusted wrapper emits `ProviderSandboxAttestationV1` with process-group/birth
+identity, adapter/profile digest, runtime-home identity, effective root table,
+outer-sandbox handshake, and results of versioned denial probes against
+sentinels in every protected root class. The adapter receipt is accepted only
+when the attestation and observed provider binding match the pin.
+
+Codex, Claude, Gemini, Auggie and Junie each have retained launch/escape
+fixtures that attempt direct skill, Git, workspace-outside-profile, eval,
+control-plane, sibling runtime-home, credential and local-IPC access from the
+actual provider process and an allowed child. Every protected access must fail,
+while declared workspace/output and broker operations must succeed. An adapter
+that cannot produce this evidence is excluded from production profiles; if it
+is still referenced by a production catalog, candidate evaluation and
+`open_v2` fail closed.
 
 ### SkillScriptExecutionContractV1
 
@@ -1501,6 +1816,17 @@ failures:
 Every case records frozen mission, role, assignment, skill version, inputs,
 provider profile, assertions, and expected evidence anchors. Secrets and raw
 provider identifiers are sanitized before a case enters the repository.
+Each case also records `source_kind = observed_run | sibling_run |
+synthetic_positive | synthetic_near_miss | adversarial`, a non-enumerating
+source receipt digest, observed failure class, sanitization receipt, semantic
+deduplication digest and corpus-split assignment. The initial corpus contains
+both current-run observations and independently failing sibling-run
+observations; every trigger-bearing skill has at least one observed case from
+either source plus positive, near-miss and instruction-injection variants. Two
+cases with the same semantic/source digest
+cannot straddle train and holdout. Provider output, expected labels and reviewer
+decisions are removed before prompt text enters the public corpus, preventing
+answer leakage.
 
 ### Suites
 
@@ -1530,6 +1856,17 @@ model, and effort profiles used by production agents.
 
 `holdout` contains unseen paraphrases and adjacent cases. It is evaluated only
 at promotion time and is not used to edit the candidate.
+
+Proposal review uses the existing typed `AgentSelectionPlanV1` produced by the
+review router; prose reviewer lists are not routing authority. The
+`proposal-review-router` skill must consume that exact plan digest. Every
+selected reviewer returns one `ReviewerResultEnvelopeV1` bound to selection
+plan, candidate revision, reviewer agent/profile, attempt generation and
+evidence-set digest. The aggregator accepts exactly one terminal envelope per
+selected reviewer, rejects contributions from rejected/unselected reviewers,
+and blocks readiness on missing, duplicate, stale or identity-mismatched
+envelopes. Reviewer fan-out and aggregation therefore remain reproducible
+without granting any reviewer candidate-state mutation authority.
 
 ### Assertions and Metrics
 
@@ -1568,6 +1905,9 @@ Live evidence is valid only for one complete behavior candidate. The immutable
 - Swift app source commit, bundle build identity, and supported request/readback
   capability versions;
 - canonical digest/JCS implementation version and every wire-schema digest;
+- Agent Skills upstream lock, prompt-token-budget policy/tokenizer, runtime
+  constraint policy, provider-sandbox policy, evidence-admission public-key set,
+  proof-matrix policy and client-capability support-policy digests;
 - exact workflow source and compiled normalized-plan digests, plus compiled
   assignment-template digests for every task in every production workflow;
 - catalog, role registry, permission policy, output-contract registry, skill
@@ -1624,6 +1964,30 @@ repetition, baseline/candidate arm, and attempt. Exact submission replay returns
 the stored row; conflicting bytes fail closed. Lease expiry never implies pass
 or absence of provider work. A replacement worker reconciles each expected pair
 and resumes the same epoch.
+
+Evidence admission has an independent trust boundary. The service issues an
+immutable `EvaluationWorkerLeaseV1`, signed with the current Operator/CI-owned
+Ed25519 evidence-admission key, to a dedicated principal-table entry with
+`PrincipalClass::Agent`, stored `CallerClass::Automation` override and only
+capability `AgentQualityEvidenceSubmit`. The lease binds candidate and baseline
+digests, evaluation epoch, exact pair/arm/profile/repetition inventory,
+provider-sandbox policy, worker binary identity, lease epoch/deadline and key
+ID. Its private key resides in Keychain/HSM custody outside provider and
+candidate workspaces; the candidate manifest pins the accepted public key set
+and rotation overlap. An expired or superseded lease cannot submit or renew
+itself, and takeover increments the epoch after reconciling every prior attempt.
+
+Workers receive one opaque case at a time through the trusted harness and may
+submit only bounded raw observations plus provider/runtime attestations. They
+cannot register or supersede candidates, compute a pass decision, alter the
+expected pair inventory, read expected labels/holdout indexes, promote, probe
+or open. Candidate/provider processes have no evidence-submit credential or
+route. `AgentQualityEvidenceAdmissionV1` verifies the signed lease, principal,
+worker binary, attempt, observed candidate/provider/sandbox identities and raw
+evidence digest, then computes deterministic assertions inside the evaluation
+service. Writer and evaluator credentials are distinct; no artifact asserting
+its own pass state is admissible. Key rotation, lease expiry, worker crash and
+duplicate/conflicting submission have byte-exact fixtures.
 
 The service can create `live_passed` only in the transaction that verifies all
 required deterministic, trigger, retained, holdout, profile, and identity
@@ -1751,6 +2115,56 @@ by digest and never reinterprets mutable dashboard state. A candidate manifest
 or observed-identity mismatch makes the receipt invalid rather than merely
 stale.
 
+### Production Proof Matrix and Client Capability
+
+`live_passed` is necessary but does not by itself authorize production open.
+`AgentContextProofMatrixV1` is derived from the immutable candidate manifest and
+contains no caller-selected omissions. It inventories:
+
+- the Cartesian product of every provider/model/effort/permission-profile
+  combination referenced by a production agent with effect modes `read_only`,
+  `workspace_write_staged`, `control_plane_command_fixture`, and
+  `external_effect_reconcile_fixture`;
+- one compatibility row for every Swift app build capability version still
+  supported by the release policy, against every request, readback, cursor,
+  replay and error schema required by that version;
+- required sandbox, broker, output-contract, effect-reconciliation and
+  projection assertions for each cell, plus the exact fixture namespace and
+  expected receipt schema.
+
+Effect fixtures run in isolated probe workspaces and an Operator/CI-owned test
+namespace. They exercise prepare, apply, replay, cancellation and reconciliation
+but cannot publish, push, mutate a real external system or access another run.
+Every provider/effect cell must produce an observed-provider binding,
+`ProviderSandboxAttestationV1`, broker/effect receipts and terminal assertion
+receipt. A mode prohibited by that permission profile passes only by producing
+the exact pre-effect policy denial and zero effect intent; allowed modes must
+complete their declared fixture. Every app row must produce a signed
+compatibility receipt from the checked-in Swift contract harness. Unsupported
+or infrastructure-inconclusive
+cells keep the matrix incomplete; removing a cell requires first removing that
+profile/app version from production support in a new candidate.
+
+The proof orchestrator may execute the matrix as one fan-out proof run, but
+`AgentContextProbeReceiptV1` is terminal only after it binds the matrix digest,
+complete sorted cell inventory, every cell receipt and the recomputed aggregate
+digest. `runtime.agent_context.promote`, probe, reprobe and open all bind the
+same `proof_matrix_sha256`. A passing receipt for a subset, another generation
+or another support matrix cannot open production.
+
+Each supported macOS release embeds a signed `ClientCapabilityManifestV1` with
+bundle/build/source and designated-requirement identity, supported request and
+readback schema versions, and the proof-matrix cell that qualified it. During
+connection negotiation the app returns a bounded
+`ClientCapabilityReceiptV1` over that manifest, daemon challenge, authenticated
+principal/session and current cutover generation. The daemon verifies the
+release signature, freshness, challenge and open matrix membership before
+`runs.start`; the receipt grants no principal capability and cannot outlive the
+connection. Missing, copied, stale, unsupported or schema-incomplete receipts
+fail `client_capability_incompatible` before run mutation. The compatibility
+fixtures cover every supported old/new app and daemon pair; there is no feature
+flag or optimistic fallback.
+
 ### Production Promotion and Cutover
 
 Promotion state is durable rather than inferred from files or the currently
@@ -1768,7 +2182,9 @@ Only the MCP command `runtime.agent_context.promote`, protected by the
 `RuntimeAgentContextPromote` capability and the northbound boundary matrix, may
 move a `live_passed` candidate to `probe_active`. It requires both request IDs,
 candidate ID and digest, passing receipt digest, expected candidate state,
-cutover generation, and cutover revision. The command-specific fields in the
+proof-matrix digest, cutover generation, and cutover revision. The service
+recomputes the matrix from the candidate and production support registries; a
+caller cannot select or omit cells. The command-specific fields in the
 intent table, never either request ID, form its semantic hash. Command outcome,
 audit event, catalog and skill registry heads, generation row, cutover marker,
 and one `AgentContextProofAdmissionV1` in state `available` commit atomically.
@@ -1785,8 +2201,9 @@ SQLite owns a singleton `agent_context_cutover_v1` row with:
 - required context, prompt-envelope, role, assignment, skill-snapshot, digest,
   and promotion-policy versions;
 - production catalog, skill registry, and passing promotion-receipt digests;
-- candidate manifest digest, proof admission ID, optional proof run/receipt
-  IDs, promoting/opening command IDs, audit event IDs, and timestamps.
+- candidate manifest, proof-matrix and client-capability support-policy digests,
+  proof admission ID, optional proof run/receipt IDs, promoting/opening command
+  IDs, audit event IDs, and timestamps.
 
 SQLite also stores one immutable `agent_context_generations` row per promoted
 generation. It identifies the complete candidate and has independent
@@ -1801,7 +2218,7 @@ The state transitions are closed and durable:
 legacy_bridge --schema_prepared--> closed_v2_pending
 closed_v2_pending --promote passing candidate--> probe_v2
 open_v2 --promote passing candidate--> probe_v2
-emergency_hold_v2 --promote forward fix--> probe_v2
+emergency_hold_v2 --promote explicit replacement-bound forward fix--> probe_v2
 emergency_hold_v2 --atomic process-hold reprobe--> probe_v2
 probe_v2 --open with passing proof receipt--> open_v2
 probe_v2|open_v2 --typed invariant breach--> emergency_hold_v2
@@ -1819,19 +2236,23 @@ and entry point and cannot write production run rows.
 `runtime.agent_context.probe_start` and capability
 `RuntimeAgentContextProbeStart`. The initial command supplies the one-use proof
 admission ID returned by promote, expected generation/revision, candidate
-digest, fixed read-only `agent-context-cutover-probe` workflow digest, and both
-request IDs. In one transaction it changes that exact admission from
+digest, exact `AgentContextProofMatrixV1` digest, fixed
+`agent-context-cutover-proof-matrix` workflow digest, and both request IDs. In
+one transaction it changes that exact admission from
 `available` to `consumed`, increments `probe_epoch`, creates one real V2 run,
 and stores `proof_run_id`. A unique active-epoch constraint and admission CAS
 make a second run impossible. Exact replay returns the original run; a consumed,
 wrong-generation, or unknown admission is a typed denial. Ordinary run creation
 and every other candidate remain closed before, during, and after a crash.
 
-The probe workflow uses the production compiler, prompt renderer, skill broker,
-provider adapter, and persistence path but has no code-write, Git, publish, or
-external side-effect capability. Terminal settlement writes one immutable
-`AgentContextProbeReceiptV1` that binds run, generation, candidate, actual
-binary/context/skill identities, and required output proof. The trusted probe
+The proof workflow uses the production compiler, prompt renderer, outer provider
+sandbox, skill broker, provider adapters, persistence and projection paths. It
+fans out only the complete matrix described above. Write/effect cells use
+staging and typed reconciliation fixtures, never production publication or real
+external targets. Terminal settlement writes one immutable
+`AgentContextProbeReceiptV1` that binds run, generation, candidate, proof
+matrix, complete cell receipts, actual binary/context/skill/provider/app
+identities, and required output/effect proof. The trusted probe
 settler classifies the terminal result as exactly `pass`, `candidate_failure`,
 or `infrastructure_inconclusive`:
 
@@ -1877,10 +2298,12 @@ epoch. Replay returns that run; a new hold invalidates the clearance set. No
 hold path selects legacy behavior.
 
 The daemon advertises `AgentContextV2`, `PromptEnvelopeV2`,
-`SkillBundleSnapshotV1`, `AgentQualityPromotionPolicyV1`, the supported
-snapshot-read versions, and the cutover generation through MCP initialize,
-`runtime.health`, and the GraphQL capability readback. The Swift app advertises
-its supported request and readback versions on `runs.start`. After
+`SkillBundleSnapshotV1`, `ProviderExecutionSandboxV1`,
+`AgentQualityPromotionPolicyV1`, `AgentContextProofMatrixV1`, the supported
+snapshot/read/client-capability versions, current challenge schema and cutover
+generation through MCP initialize, `runtime.health`, and the GraphQL capability
+readback. The Swift app supplies its release-signed manifest and
+connection-bound capability receipt on `runs.start`. After
 `open_v2`, a start request must explicitly select the marker's required V2
 versions. For an authorized caller omission is malformed `-32602`; a supplied
 but stale or mismatched selection fails with
@@ -1896,7 +2319,8 @@ migrations before live candidate evaluation. Those migrations add readers,
 candidate/evidence stores and phase state but do not permit V2 or context-absent
 mixed writes. Every phase event binds prior phase/head, database migration version and
 checksum, daemon self-admission identity, command/journal ID, invariant receipt
-digest, timestamp, and event hash. The closed phases are:
+digest, active migration-lease epoch/digest, timestamp, and event hash. The
+closed phases are:
 
 ```text
 not_started -> schema_prepared -> admission_closed -> legacy_draining -> legacy_settled
@@ -1915,6 +2339,59 @@ receipt described above. Transition from
 `emergency_hold` requires either a newly passing forward-fix candidate or the
 verified process-only clearance allowed by the cutover state machine; both
 paths re-enter `candidate_probe_admitted` and must execute a fresh proof epoch.
+
+Migration ownership is one renewable `AgentContextMigrationLeaseV1`, not an
+informal daemon lock. It binds owner daemon-instance ID and P083 process
+birth identity, monotonic lease epoch, acquired/heartbeat/deadline timestamps,
+P083 durable clock-baseline ID and monotonic remaining-budget evidence, current
+migration phase/head, selected candidate and self-admission digests, cutover
+revision, and `migration_lease_sha256`. The lease duration is 60 seconds and
+heartbeat interval is 15 seconds; deadline evaluation uses the correlated P083
+clock rather than mutable wall time alone. Every migration, drain,
+reconciliation, replacement and cutover proof-admission write CASes both the
+expected lease epoch and migration head in its canonical transaction.
+
+A deadline alone never proves ownership absence. Takeover is allowed only after
+the deadline and a current P083 verified-absence receipt for the exact former
+process birth identity; the winner increments the epoch, appends a takeover
+event and reconciles all prior in-flight rows before acting. A paused but live
+owner therefore cannot be stolen from. Any late write from an old owner fails
+`agent_context_migration_lease_fenced` without side effects. Lease expiry,
+holder identity, epoch, heartbeat age, takeover eligibility and allowed next
+action are Operator readback and alert fields.
+
+Forward repair never rewrites a phase or prior candidate. Operator-only
+`runtime.agent_context.replace_candidate` can bind one corrected
+`live_passed` candidate after `schema_prepared`, including from a durable
+`emergency_hold`, while keeping the current migration phase. The transaction
+requires the active migration lease, expected migration head/phase, cutover
+generation/revision, old candidate digest, new candidate and passing promotion
+receipt, new proof-matrix digest, current fresh inventory and one
+`zero_unsafe_digest` proving no unverified provider process or external effect.
+An existing effect must first reach a typed terminal/reconciled state; a
+process must have P083 absence proof. No timeout or Operator assertion can
+stand in for those receipts.
+
+The committed `AgentContextCandidateReplacementV1` records old/new candidate
+and receipt digests, phase/head, cutover generation/revision, lease epoch,
+inventory and zero-unsafe digests, invalidated admission/proof/self-admission
+receipts, replacement generation, command/journal/audit IDs and
+`replacement_receipt_sha256`. It atomically supersedes the selected candidate,
+invalidates old proof admissions and client-capability receipts, increments the
+cutover revision, closes ordinary admission, and sets orthogonal
+`migration_repair_state = replacement_bound`. It does not start a provider,
+move backward, resurrect legacy work or reuse old evidence.
+
+Only a daemon matching the new candidate may then self-admit. Successful
+self-admission appends the next forward phase event or resumes the same phase,
+sets repair state back to `none`, and requires a complete new proof matrix
+before open. A bounded failed self-admission or reconciliation sets
+`repair_blocked` with exact blockers and allowed actions. Another explicit
+replace command may move `repair_blocked -> replacement_bound`; there is no
+automatic candidate loop. The closed repair transitions are therefore
+`none -> replacement_bound -> none | repair_blocked` and
+`repair_blocked -> replacement_bound`. Original ledger, policy, inventory,
+attempt, phase and candidate histories remain immutable and linked.
 
 The additive migration creates migration phase `not_started` and cutover state
 `legacy_bridge` together. Before the `not_started -> schema_prepared`
@@ -1940,15 +2417,34 @@ receipts, recording selected candidate/receipt digests, changing cutover state
 `not_started -> schema_prepared` is one SQLite transaction. Before its commit,
 legacy bridge behavior remains authoritative; after commit, no new legacy start
 or producer admission is possible. The marker rejects any binary whose
-candidate digest differs. Every replacement daemon instance must append and
-verify its own
-`RuntimeSelfAdmissionReceiptV1` against the pinned candidate before it may run a
-maintenance transition; each phase event binds the exact current receipt.
-Recovery is forward-only with an admitted binary.
+candidate digest differs from ordinary work or phase transitions. A daemon
+matching the pinned candidate must append and verify its own
+`RuntimeSelfAdmissionReceiptV1` before those transitions; each phase event binds
+the exact current receipt.
+
+The sole mismatch exception is a `MigrationReplacementAdmissionV1` for the
+minimal replacement boundary. It is issued only to a binary that exactly
+matches the proposed new `live_passed` candidate, passing receipt, schema/
+migration compatibility range and proof-matrix policy; it binds the active
+migration lease epoch or the expired lease plus P083 owner-absence receipt,
+expected old candidate and replacement command lease. It authorizes only
+cutover/lease readback, the fenced lease acquire/takeover needed by that exact
+replacement, and
+`runtime.agent_context.replace_candidate`, expires in five minutes, cannot
+renew itself, claim work or write another phase, and is consumed by the
+replacement transaction. Once replacement commits, that same binary must
+append a normal `RuntimeSelfAdmissionReceiptV1` against the newly pinned
+candidate before any other maintenance transition. Recovery is forward-only
+with either the currently admitted binary or this bounded replacement bootstrap.
 On first startup the new daemon automatically advances to
 `admission_closed`; there is no operator command to reopen legacy admission.
-It does not bind northbound mutation surfaces or start workers between
-`schema_prepared` and the durable `admission_closed` commit. The schema commit
+It does not bind ordinary run/approval/effect mutation surfaces or start workers
+between `schema_prepared` and the durable `admission_closed` commit. A minimal
+live-auth maintenance boundary remains available only for `runtime.health`,
+cutover/lease/blocker readback, P083 process-absence proof, fenced lease
+acquire/takeover for an admitted replacement and
+`runtime.agent_context.replace_candidate`; it cannot create or continue work.
+The schema commit
 that installed the additive V2 tables is the database-compatibility point of no
 return for binaries that do not know those migrations; `schema_prepared` is the
 start of the one-way production cutover.
@@ -2037,7 +2533,12 @@ Recovery is total:
 | `probe_inconclusive` | remain closed; allow only atomic same-generation infrastructure reprobe |
 | `probe_passed` | verify receipt again and replay/execute open |
 | `open` | verify marker, generation, self-admission and proof digests; mismatch enters emergency hold |
-| `emergency_hold` | keep admission/dispatch closed; after a forward-fixed candidate promote or complete process-clearance set, use the authorized promote/reprobe transaction to enter `candidate_probe_admitted` with a fresh proof epoch |
+| any phase with an unexpired migration lease | only the exact owner/epoch may resume; other daemons remain failed-serve/readback-only |
+| any phase with an expired lease and live/unknown former owner | retain phase and admission closure; require P083 verified process absence, never time-only takeover |
+| any phase after verified lease-owner absence | CAS-increment lease epoch, append takeover evidence, reconcile prior work, then continue that same phase |
+| `replacement_bound` | admit only the replacement candidate daemon; invalidate old proof/client receipts and require new self-admission plus complete proof matrix |
+| `repair_blocked` | retain current forward phase and closed admission; expose blockers and allow only a new explicit replacement or the named reconciliation |
+| `emergency_hold` | keep admission/dispatch closed; after an explicit forward-fix replacement or complete process-clearance set, use the authorized promote/reprobe transaction to enter `candidate_probe_admitted` with a fresh proof epoch |
 
 #### Unified Execution Admission
 
@@ -2095,14 +2596,16 @@ new context-absent run after cutover.
 | new | new daemon, `closed_v2_pending` | `agent_context_cutover_not_ready` |
 | new | new daemon, `probe_v2` | only one active proof epoch; explicit infrastructure retry is admitted after an inconclusive receipt |
 | new | new daemon, `emergency_hold_v2` | `agent_context_emergency_hold` |
-| new | new daemon, `open_v2` | generation-bound V2 start only |
+| new with missing/stale/unqualified capability receipt | new daemon, `open_v2` | `client_capability_incompatible`; no Run row |
+| qualified new | new daemon, `open_v2` | generation- and client-receipt-bound V2 start only |
 
 Rollback is forward-fix only. There is no runtime disable control, legacy fallback,
 or downgrade transition. Restoring a pre-cutover database backup would fork
 execution truth and is not an operational rollback; it is allowed only as an
 offline forensic copy under a separate operator recovery decision. A broken
-V2 release persists `emergency_hold_v2` until a corrected candidate passes a
-new probe; existing historical readback remains available throughout.
+V2 release persists `emergency_hold_v2` until an explicitly replacement-bound
+corrected candidate self-admits and passes a complete new proof matrix; existing
+historical readback remains available throughout.
 
 ### Historical Readback Versus Live Continuation
 
@@ -2153,6 +2656,8 @@ New typed failures include:
 - `authority_duplicate_event`;
 - `authority_head_conflict`;
 - `authority_supersession_invalid`;
+- `authority_recheck_required`;
+- `runtime_constraint_policy_invalid`;
 - `approval_authority_binding_invalid`;
 - `approval_authority_binding_stale`;
 - `approval_authority_binding_superseded`;
@@ -2167,6 +2672,11 @@ New typed failures include:
 - `skill_composition_invalid`;
 - `skill_resource_unavailable`;
 - `skill_broker_grant_invalid`;
+- `skill_broker_grant_install_ambiguous`;
+- `skill_request_idempotency_conflict`;
+- `skill_effect_in_flight`;
+- `provider_sandbox_unavailable`;
+- `provider_sandbox_attestation_invalid`;
 - `skill_script_sandbox_violation`;
 - `skill_script_runtime_unavailable`;
 - `skill_script_apply_conflict`;
@@ -2180,6 +2690,8 @@ New typed failures include:
 - `invocation_identity_ambiguous_hold`;
 - `agent_context_generation_conflict`;
 - `agent_quality_evidence_incomplete`;
+- `agent_quality_evidence_admission_invalid`;
+- `agent_quality_self_certification_denied`;
 - `agent_quality_identity_mismatch`;
 - `agent_quality_numeric_overflow`;
 - `agent_quality_promotion_inconclusive`;
@@ -2189,14 +2701,19 @@ New typed failures include:
 - `agent_context_version_incompatible`;
 - `agent_context_probe_already_consumed`;
 - `agent_context_proof_admission_invalid`;
+- `agent_context_proof_matrix_incomplete`;
+- `client_capability_incompatible`;
 - `agent_context_reprobe_precondition_failed`;
 - `agent_context_probe_infrastructure_inconclusive`;
 - `agent_context_probe_failed`;
 - `agent_context_emergency_hold`;
 - `agent_context_migration_phase_conflict`;
+- `agent_context_migration_lease_fenced`;
+- `agent_context_candidate_replacement_blocked`;
 - `legacy_cutover_inventory_blocked`;
 - `projection_intent_commit_failed`;
 - `agent_context_projection_degraded`;
+- `agent_context_projection_worker_fenced`;
 - `agent_context_invalid_cursor`;
 - `execution_admission_denied`;
 - `legacy_context_retired`;
@@ -2224,38 +2741,52 @@ Run-local artifacts include:
 <run-meta-root>/context/run-mission-base.json
 <run-meta-root>/context/base-authority-ledger.json
 <run-meta-root>/context/authority-overlay/<authority-head>.json
-<run-meta-root>/context/effective-missions/<agent-execution-id>.json
-<run-meta-root>/context/assignments/<agent-execution-id>.json
+<run-meta-root>/context/effective-missions/<agent-execution-id>/attempts/<attempt-generation>.json
+<run-meta-root>/context/effective-authority/<agent-execution-id>/attempts/<attempt-generation>.json
+<run-meta-root>/context/runtime-constraints/<agent-execution-id>/attempts/<attempt-generation>.json
+<run-meta-root>/context/authority-fences/<agent-execution-id>/attempts/<attempt-generation>.json
+<run-meta-root>/context/assignments/<agent-execution-id>/attempts/<attempt-generation>.json
 <run-meta-root>/context/generation-binding.json
 <run-meta-root>/skills/<skill-id>/manifest.json
-<run-meta-root>/skills/compositions/<agent-execution-id>.json
-<run-meta-root>/runtime/<agent-execution-id>/prompt-envelope-manifest.json
-<run-meta-root>/runtime/<agent-execution-id>/dispatch-intent.json
+<run-meta-root>/skills/compositions/<agent-execution-id>/attempts/<attempt-generation>.json
+<run-meta-root>/runtime/<agent-execution-id>/attempts/<attempt-generation>/prompt-envelope-manifest.json
+<run-meta-root>/runtime/<agent-execution-id>/attempts/<attempt-generation>/dispatch-intent.json
+<run-meta-root>/runtime/<agent-execution-id>/attempts/<attempt-generation>/provider-sandbox-attestation.json
+<run-meta-root>/runtime/<agent-execution-id>/attempts/<attempt-generation>/skill-broker-grant-install-receipt.json
 ```
 
-`run-mission-base.json` and every execution artifact are immutable. Authority
-overlay files are bounded projections of one SQLite head and never mutation
-inputs.
+`run-mission-base.json` and every execution artifact are immutable. Canonical
+decimal attempt generation is part of every execution-artifact identity; retry
+never replaces a prior attempt path, and a path lacking the attempt component
+is invalid for V2. Authority overlay files are bounded projections of one
+SQLite head and never mutation inputs.
 
 SQLite is authoritative for:
 
-- `run_authority_events` and `run_authority_heads`;
+- `run_authority_events`, `run_authority_heads`, effective-authority projections,
+  runtime-constraint policies and run authority-recheck fences;
 - base-ledger indexes, approval authority templates/binding generations and
   append-only binding lifecycle events, and `agent_context_projection_intents`;
-- `run_context_generation_bindings`, `agent_invocation_dispatches`, and
-  execution context pins, including base/overlay heads, launch phase, and all
-  effective context digests;
+- `run_context_generation_bindings`, attempt-qualified
+  `agent_invocation_dispatches`, versioned connection rows and execution context
+  pins, including base/overlay heads, launch phase, all effective context
+  digests and attempt identity;
 - skill snapshot publication receipts, materialized legacy migration manifest,
   script apply journals/staging quarantine, and the bundle digest referenced by
   each run snapshot;
-- candidate manifests, immutable sample, promotion, and probe receipt indexes,
-  promotion state, and command outcomes;
+- candidate manifests, reviewer envelopes, signed evaluation worker leases,
+  evidence-admission rows, immutable samples, promotion/proof-matrix/client-
+  capability and probe receipt indexes, promotion state, and command outcomes;
 - `agent_context_generations` continuation policy and the singleton
   `agent_context_cutover_v1` state, generation, proof fence, and required
   versions;
-- proof admissions, process-clearance sets, cutover inventory and migration
-  phase events; legacy settlement rows, daemon self-admission, provider-binding
-  receipts, broker grants, script intents/receipts and process identity holds.
+- proof admissions, process-clearance sets, cutover inventory, fenced migration
+  lease, candidate-replacement/repair state and migration phase events; legacy
+  settlement rows, daemon self-admission, provider-binding and provider-sandbox
+  receipts, broker grants/install receipts, semantic effects, script intents/
+  receipts and process identity holds;
+- projection worker leases, applied immutable target identities, cursor signing
+  key metadata/retention epochs, CI selection receipts and rollout alert state.
 
 Large skill resources, raw bounded eval evidence, and prompt evidence remain
 file-spooled and content-addressed. SQLite references them by digest and stores
@@ -2286,12 +2817,26 @@ agent-context intent. SQLite/storage failure to upsert the required row aborts
 the canonical transaction; scheduler saturation after commit leaves the row
 durably `pending`.
 
-The projection worker rereads canonical SQLite truth by the intent's exact
-source revision, renders bounded bytes, writes and fsyncs a request-owned temp
-file, performs no-replace/replace atomic rename under the run meta-root, fsyncs
-the parent, verifies the final digest, and only then marks `applied`. It cannot
-mark a newer intent applied with older bytes. Failure leaves `pending` or
-`degraded` with a typed safe error and never changes the canonical head.
+Each claim creates a renewable `ProjectionWorkerLeaseV1` with projection/entity,
+owner worker/process identity, monotonic lease epoch, P083 clock baseline and
+deadline budget, exact intent revision/source head and expected payload digest.
+A newer latest-head upsert
+fences the old lease in the same transaction. Lease takeover requires deadline
+expiry and worker-process absence proof; every publish/apply write CASes intent
+revision plus lease epoch.
+
+The projection worker rereads canonical SQLite truth at the claimed source
+revision and renders bounded bytes to an immutable content-addressed target
+`projections/<projection-kind>/<entity-id>/<payload-sha256>.json`. It writes and
+fsyncs a request-owned temp file, performs no-replace atomic rename, fsyncs the
+parent and verifies final bytes. There is no replaceable `current` file. It may
+mark `applied` only by CAS over the still-current intent revision, source head,
+payload digest and worker lease epoch, recording that immutable target. A stale
+worker can therefore create at most an unreferenced content-addressed file; it
+cannot overwrite or publish current truth. Bounded orphan cleanup deletes only
+unreferenced known-digest files after all live lease and cursor retention
+windows. Failure leaves `pending` or `degraded` with a typed safe error and
+never changes the canonical head.
 
 Startup reconciliation is deterministic:
 
@@ -2300,21 +2845,29 @@ Startup reconciliation is deterministic:
 - applied intent plus missing/mismatched file becomes degraded and is rebuilt;
 - a file for an older head is retained only as bounded historical evidence and
   is never served as current;
+- an expired worker lease is taken over only after process-absence proof; a
+  live/ambiguous owner leaves the intent pending and raises an alert;
+- an orphan immutable file is ignored unless its exact intent wins the apply
+  CAS, then is removed only by the bounded cleanup rule;
 - an intent whose canonical source row is missing or digest-mismatched enters
   emergency hold instead of synthesizing truth.
 
-GraphQL, MCP and report generation read the SQLite head first and join the
-projection status. They never fall back from a missing current projection to a
-stale file. A mutation success and every replay return the immutable commit
+GraphQL, MCP and report generation read the SQLite head and its exact applied
+immutable target first, then join projection status. They never discover a
+current file by path convention or fall back from a missing current projection
+to a stale file. A mutation success and every replay return the immutable commit
 receipt with `projection_status = pending`; they never substitute a later
 worker state. Current readback may report `pending`, `applied`, or `degraded`
 for that same canonical revision and always exposes explicit repair state.
 
 ### GraphQL and Swift Compatibility Contract
 
-The GraphQL SDL adds this exact nullable boundary. State-like values are
-`String!`, not GraphQL enums, so a future server value remains decodable by an
-older client.
+The checked-in post-migration GraphQL schema contains the following exact
+replacement excerpt. Existing approval mutation fields are replaced by these
+signatures rather than extended informally. Unchanged fields from the full
+`Mutation` type remain in the normative generated SDL fixture. State-like values
+are `String!`, not GraphQL enums, so a future server value remains decodable by
+an older client.
 
 ```graphql
 extend type Query {
@@ -2329,13 +2882,35 @@ extend type Approval {
   authorityBinding: ApprovalAuthorityReadback
 }
 
-extend type Mutation {
+type Mutation {
+  approveApproval(
+    approvalId: ID!
+    comment: String
+    requestId: CallerRequestId!
+    authority: ApprovalAuthoritySettlementInput
+  ): ApproveApprovalPayload!
+
+  rejectApproval(
+    approvalId: ID!
+    reason: String!
+    requestId: CallerRequestId!
+    authority: ApprovalAuthoritySettlementInput
+  ): RejectApprovalPayload!
+
+  approvalsResolve(
+    approvalId: ID!
+    resolution: ApprovalResolution!
+    callerRequestId: CallerRequestId!
+    comment: String
+    authority: ApprovalAuthoritySettlementInput
+  ): ApprovalsResolvePayload!
+
   reissueApprovalAuthority(
     approvalId: ID!
     expectedBindingGeneration: String!
     expectedBindingSha256: String!
     expectedAuthorityChainHead: String!
-    requestId: String!
+    requestId: CallerRequestId!
   ): ApprovalAuthorityReissuePayload!
 }
 
@@ -2369,6 +2944,8 @@ type AgentContextGenerationReadback {
   selfAdmissionStatus: String!
   evalSuiteSha256: String!
   promotionPolicySha256: String!
+  proofMatrixSha256: String!
+  clientCapabilitySupportPolicySha256: String!
 }
 
 type AgentContextRoleAssignmentReadback {
@@ -2393,11 +2970,41 @@ type AgentContextRoleAssignmentConnection {
 type AgentContextDispatchReadback {
   agentExecutionId: ID!
   attemptGeneration: String!
+  attemptIdentitySha256: String!
   state: String!
   identityStatus: String!
+  authorityChainHead: String!
+  contextRevision: String!
+  effectiveMissionSha256: String!
+  effectiveAuthoritySha256: String!
+  runtimeConstraintPolicySha256: String!
+  pinnedAuthorityFenceSha256: String!
+  currentAuthorityFenceSha256: String!
+  authorityFenceRelation: String!
+  relevantFenceTokens: [AgentContextFenceTokenSummary!]!
+  hardConstraints: [AgentContextConstraintSummary!]!
   providerBindingSha256: String
+  providerSandboxAttestationSha256: String
   skillBrokerStatus: String!
+  skillBrokerGrantSha256: String!
+  skillBrokerGrantInstallReceiptSha256: String
   promptEnvelopeManifestSha256: String!
+}
+
+type AgentContextFenceTokenSummary {
+  operationClass: String!
+  pinnedEpoch: String!
+  currentEpoch: String!
+  relation: String!
+}
+
+type AgentContextConstraintSummary {
+  conflictKey: String!
+  directiveKind: String!
+  valueType: String!
+  canonicalValueJson: String!
+  policyEntryId: String!
+  supersessionAction: String!
 }
 
 type AgentContextDispatchEdge {
@@ -2440,21 +3047,56 @@ type AgentContextCutoverReadback {
   visibility: String!
   state: String!
   migrationPhase: String!
+  migrationHeadSha256: String!
   cutoverRevision: String!
-  generation: String!
-  candidateState: String!
-  candidateManifestSha256: String!
-  promotionReceiptSha256: String!
+  generation: String
+  candidateState: String
+  candidateManifestSha256: String
+  promotionReceiptSha256: String
   proofAdmissionId: ID
-  proofAdmissionState: String!
-  probeEpoch: String!
+  proofAdmissionState: String
+  proofMatrixSha256: String
+  probeEpoch: String
   proofRunId: ID
   latestProbeReceiptSha256: String
   processClearanceStatus: String!
   processClearanceSetSha256: String
+  inventorySha256: String
+  inventoryFreshness: String!
+  blockers: [AgentContextCutoverBlocker!]!
+  migrationLease: AgentContextMigrationLeaseReadback
+  repairState: String!
+  replacementAdmissionState: String!
+  replacementAdmissionSha256: String
+  replacementReceiptSha256: String
+  selfAdmissionStatus: String!
+  selfAdmissionReceiptSha256: String
+  zeroUnsafeDigest: String
   allowedNextActions: [String!]!
   requiredCapabilityVersions: [String!]!
   projection: AgentContextProjectionHealth!
+}
+
+type AgentContextCutoverBlocker {
+  code: String!
+  entityKind: String!
+  safeEntityId: ID
+  firstObservedRevision: String!
+  requiredAction: String!
+}
+
+type AgentContextMigrationLeaseReadback {
+  state: String!
+  ownerInstanceId: ID!
+  ownerProcessBirthSha256: String!
+  epoch: String!
+  deadline: String!
+  heartbeatAt: String!
+  clockBaselineId: ID!
+  remainingBudgetMs: String!
+  takeoverEligibility: String!
+  requiredAction: String!
+  leaseSha256: String!
 }
 
 type ApprovalAuthorityReadback {
@@ -2472,11 +3114,43 @@ type ApprovalAuthorityReadback {
   projection: AgentContextProjectionHealth!
 }
 
+type ApproveApprovalPayload {
+  approval: Approval!
+  journalId: ID!
+  conflictResultCode: MutationConflictResultCode
+  authorityBinding: ApprovalAuthorityReadback
+  canonicalRequestId: CallerRequestId!
+  projectionStatus: String!
+  projectionReceipt: MutationProjectionReceipt!
+}
+
+type RejectApprovalPayload {
+  approval: Approval!
+  journalId: ID!
+  conflictResultCode: MutationConflictResultCode
+  authorityBinding: ApprovalAuthorityReadback
+  canonicalRequestId: CallerRequestId!
+  projectionStatus: String!
+  projectionReceipt: MutationProjectionReceipt!
+}
+
+type ApprovalsResolveSuccess {
+  approval: Approval!
+  journalId: ID!
+  conflictResultCode: MutationConflictResultCode
+  authorityBinding: ApprovalAuthorityReadback
+  canonicalRequestId: CallerRequestId!
+  projectionStatus: String!
+  projectionReceipt: MutationProjectionReceipt!
+}
+
+union ApprovalsResolvePayload = ApprovalsResolveSuccess | DenialPayload
+
 type ApprovalAuthorityReissuePayload {
   status: String!
   approval: Approval!
   authorityBinding: ApprovalAuthorityReadback!
-  canonicalRequestId: String!
+  canonicalRequestId: CallerRequestId!
   journalId: ID!
   projectionStatus: String!
   projectionReceipt: MutationProjectionReceipt!
@@ -2514,6 +3188,25 @@ input ApprovalAuthoritySettlementInput {
 }
 ```
 
+Cutover nullability is phase-valid and tested. `migrationHeadSha256`, state,
+migration phase, cutover revision, freshness/status strings, blocker and action
+arrays, required versions, and projection are always present. In
+`legacy_bridge`, generation, candidate, promotion, proof and replacement fields
+are null. In `closed_v2_pending` before promotion, the selected candidate and
+passing receipt may be present but generation and proof fields are null. In
+`probe_v2` and `open_v2`, generation, candidate, passing receipt and proof
+matrix are non-null; proof admission/run/receipt fields are present only after
+their corresponding durable transition. `emergency_hold_v2` preserves whichever
+verified generation/proof fields existed on entry. Lease, inventory,
+self-admission, replacement and zero-unsafe receipt fields are null until their
+own phase creates them. No resolver invents zero UUIDs, empty digests, or
+generation zero to satisfy GraphQL non-nullability.
+
+The normative MCP JSON object omits those phase-inapplicable optional fields in
+accordance with the no-JSON-null rule; the GraphQL resolver maps omission to the
+nullable fields shown above. Required MCP fields and non-null GraphQL fields are
+the same phase-independent set. Shared phase vectors prove both projections.
+
 `agentContext`, all three connections, their edge lists/page info, and
 projection are non-null for every readable Run. `mode` is
 `legacy_readback_only`, `v2`, or `unknown_readback_only` for known readers.
@@ -2540,13 +3233,13 @@ The root `agentContextCutover` query and `Approval.authorityBinding` are
 Operator-only. The former is the singleton GraphQL equivalent of
 `runtime.agent_context.cutover.get`; it never requires a Run ID and returns one
 SQLite transaction's cutover, migration, proof, process-clearance and projection
-truth. Existing `approveApproval`, `rejectApproval`, and unified
-`approvalsResolve` gain a conditionally required
-`authority: ApprovalAuthoritySettlementInput` argument: it is required exactly
-when the approval readback has a binding and rejected for an unbound approval.
+truth. The three replacement approval signatures above require
+`authority: ApprovalAuthoritySettlementInput` exactly when the approval readback
+has a binding and reject it for an unbound approval.
 `reissueApprovalAuthority` performs only the reissue transition defined above.
-GraphQL `requestId` is the UUIDv4 caller request ID; MCP additionally uses its
-UUIDv7 boundary key.
+`CallerRequestId` is the existing lowercase UUIDv4 scalar; MCP additionally
+uses its UUIDv7 boundary key. Exact replay returns the original payload fields,
+including its original canonical request ID and projection receipt.
 
 Every GraphQL payload for a V2 state mutation, including existing approval
 resolve payloads when authority-bound, contains `projectionStatus = pending`
@@ -2558,15 +3251,22 @@ Connection pagination follows one `agent_context_cursor_v1` contract shared by
 the three fields. `first` defaults to 50 and must be `1...100`; `after` is an
 opaque base64url canonical JSON cursor of at most 2048 bytes and expires after
 one hour. It binds cursor version/scope, authenticated run, list kind, a
-monotonic `snapshot_revision`, expiry, and the last ordering tuple. Ordering is
+monotonic `snapshot_revision`, expiry, last ordering tuple, signing-key ID and
+HMAC-SHA256 over every other cursor field. The daemon cursor key is outside
+SQLite/provider access; current and immediately previous keys remain usable for
+at least cursor TTL plus one hour. Signature failure is `malformed`. Ordering is
 `agent_execution_id` for role/assignment and skill composition, and
 `(prepared_revision, agent_execution_id, attempt_generation)` for dispatches.
-The first page pins the maximum creation revision; later pages filter out rows
-created after it. Readback identities are append-only, so concurrent inserts
-cannot appear mid-snapshot or cause a skip/duplicate. A cursor for another
-run/list, malformed/expired cursor, or unavailable snapshot returns the shared
-`invalid_cursor` error with reason `filter_changed | malformed | expired |
-snapshot_unavailable`; there is no offset fallback.
+The first page pins the current read-model revision. Connection projections are
+versioned rows with `valid_from_revision` and optional
+`valid_through_revision`; changing state, digests, constraints, sandbox/grant
+status, or any other node field closes the prior version and inserts the new
+version in the canonical transaction. Later pages select the exact version
+valid at the pinned revision, not current mutable rows, and exclude later
+inserts. Versions are retained for at least cursor TTL plus one hour. A cursor
+for another run/list, malformed/expired cursor, or pruned/unavailable snapshot
+returns the shared `invalid_cursor` error with reason `filter_changed |
+malformed | expired | snapshot_unavailable`; there is no offset fallback.
 
 Swift drains pages until `hasNextPage = false`, rejects repeated cursors or node
 identities, and never treats a first page as a complete list. Legacy and unknown
@@ -2592,7 +3292,8 @@ GraphQL, MCP reports, run reports, and the macOS read-only run surface expose:
 - ordered skill IDs, bundle digests, aggregate composition digest, and broker
   health;
 - prompt-envelope manifest digest;
-- candidate manifest, promotion receipt, run generation, and dispatch phase;
+- candidate manifest, promotion receipt, proof matrix, client-capability support
+  policy, run generation, attempt generation, and dispatch phase;
 - eval-suite and promotion-policy versions associated with the production
   skill/model promotion;
 - current cutover state, proof state, generation continuation status, and
@@ -2601,6 +3302,30 @@ GraphQL, MCP reports, run reports, and the macOS read-only run surface expose:
 Operator readback is bounded and authorization-aware. It does not expose full
 operator directives, raw prompts, secrets, or unrestricted artifact content to
 non-operator principals.
+
+## Rollout Alerts
+
+The daemon emits these monotonic counters/gauges through existing
+`runtime.health`, run reports and Steward evidence. Alert thresholds are
+release gates, not advisory dashboard decoration:
+
+| Signal and exact threshold | Owner | Required action |
+|---|---|---|
+| `agent_context_emergency_hold_active == 1` for any generation | runtime on-call | page immediately; retain admission closure, inspect typed invariant and use only process clearance or a passing forward candidate |
+| any increment of `provider_sandbox_attestation_failure_total` on a production profile | security plus adapter owner | block candidate/open; if current generation, enter typed emergency hold and preserve attestation/escape evidence |
+| `agent_context_projection_degraded_current > 0` or `agent_context_projection_oldest_pending_seconds > 120` | persistence on-call | page; stop promotion/open, repair exact intent/lease and verify current immutable target; never serve stale files |
+| `agent_context_projection_oldest_pending_seconds > 30` for two samples | runtime owner | warning and backlog diagnosis before the page threshold |
+| migration heartbeat age exceeds 45 seconds or deadline expires | migration Operator | alert immediately; do not take over until deadline plus P083 process-absence proof; then CAS a new lease epoch |
+| `agent_context_cutover_blocker_count > 0` for five minutes or `migration_repair_state = repair_blocked` | rollout owner | keep admission closed and execute the blocker/readback-listed reconciliation or explicit replacement |
+| any increment of `agent_quality_evidence_admission_invalid_total` | evaluation/security owner | invalidate the affected epoch, rotate/revoke worker lease when indicated and rerun missing pairs |
+| three consecutive `agent_quality_promotion_inconclusive` decisions for one candidate/profile | model operations owner | investigate provider infrastructure; no threshold waiver or promotion |
+| any `client_capability_incompatible` from a release marked supported | macOS release owner | block release/open compatibility claim until the signed manifest/matrix row is corrected |
+| any increment of `skill_script_reconciliation_required_total` | effect owner plus runtime on-call | stop new effects for that grant/target, reconcile the durable effect identity and replay the terminal receipt |
+
+Phase promotion receipts include the current values and alert-state digest.
+Missing telemetry is `unknown` and blocks promotion/open. Thresholds cannot be
+relaxed by feature flag, environment or operator preference; changing them is a
+new reviewed promotion-policy candidate.
 
 ## Gates
 
@@ -2617,9 +3342,27 @@ Add canonical gates:
 change touches workflow definitions, catalog definitions, prompt assembly,
 skill bundles, production agent bindings, or eval assertions.
 
+The implementation adds an always-present `agent-quality` job to
+`.github/workflows/ci.yml`; branch protection requires check name
+`CI / agent-quality`. A trusted diff selector emits
+`agent_quality_ci_selection_v1` with base/head commits, matched governed paths,
+selector version and receipt digest. Relevant changes execute
+`./scripts/test-gate.sh agent-quality`; irrelevant changes emit an explicit
+`not_applicable` receipt attested by the GitHub Actions OIDC job and still
+satisfy the same required check. Labels, commit messages, environment flags and
+fork-controlled scripts cannot select `not_applicable`. Gate aliases and exact
+constituent commands are registered in `scripts/test-gate.sh list` and
+`docs/reference/test-gates.md`. Nightly/Steward live-provider evals are separate
+checks and cannot replace this deterministic PR gate.
+Promotion/open also requires a retained GitHub branch-protection readback
+receipt bound to repository/ruleset revision and check name; workflow presence
+without proof that the check is required is incomplete rollout evidence.
+
 The gates execute these behavioral proofs:
 
-- `agent-skill-compliance`: the pinned Agent Skills corpus; unknown metadata;
+- `agent-skill-compliance`: the exact pinned Agent Skills commit/lockfile,
+  `skills-ref` parity, mechanical line/token budgets for every production
+  tokenizer profile and aggregate composition; unknown metadata;
   traversal, Git symlink/submodule/special-mode, case-collision, and every
   normative cap; immutable tree/blob identity; concurrent working-tree
   add/remove/rename/write that cannot affect the selected tree; stable raw-byte
@@ -2637,7 +3380,10 @@ The gates execute these behavioral proofs:
   credential, network, IPC, symlink, replacement-race and escape attacks;
   cancellation group reap and crash at every spawn/runner-settlement/apply-
   journal entry/fsync boundary, proving no unjournaled workspace effect or blind
-  rerun for either script side-effect class.
+  rerun for either script side-effect class; exact resource range/EOF/base64
+  and broker error bytes; broker-derived semantic effect identity proving a new
+  UUID cannot duplicate the same write; provider-level sandbox launch,
+  attestation and parent/child escape denial for every production adapter.
 - `agent-context`: canonical bytes and Rust/Swift digest parity for every
   normative schema; genesis/base-ledger order, empty/non-empty base chains and
   atomic head initialization; bounded approval creation, authority-head
@@ -2654,6 +3400,11 @@ The gates execute these behavioral proofs:
   PrincipalClass plus CallerClass/capability checks, AgentOperator confusion,
   live revocation/re-scope, malformed-before/after-auth precedence; CAS,
   supersession, duplicate, and concurrent append;
+  effective-authority/runtime-policy projection vectors, hard-directive fence
+  races at prepared/launching/provider-bound/prompt/effect boundaries,
+  operation-class isolation proving `next_claim_only` does not cancel prepared
+  work,
+  attempt-qualified immutable artifacts and per-attempt MCP/GraphQL readback;
   run-start/promotion generation race; daemon self-admission, launch credential
   secrecy/replay/expiry, observed provider mismatch, invocation
   prepare/launch/prompt crash recovery, identity hold/verified clearance,
@@ -2663,18 +3414,25 @@ The gates execute these behavioral proofs:
   access; every legacy phase/operation matrix cell and go/no-go inventory effect
   class across crash/restart; GraphQL legacy/V2/unknown/degraded decoding;
   mutation pending-receipt exact replay, singleton cutover readback, projection
-  crash reconciliation, and keyset pages of 0/1/100/101/10,000 rows with
-  concurrent inserts, invalid cursors, no skip/duplicate/truncation; and denial
+  crash reconciliation and stale-worker no-overwrite fencing; keyset pages of
+  0/1/100/101/10,000 versioned rows with concurrent inserts and mutable-node
+  updates, signed invalid/expired cursors and no skip/duplicate/truncation;
+  exact phase-valid GraphQL nullability and byte-identical replay; app
+  capability challenge/receipt compatibility for every supported version; and denial
   of every context-absent live continuation command and producer path.
-- `agent-evals`: all ten retained failures, holdout isolation, deterministic
+- `agent-evals`: all ten retained failures, observed-current-run, sibling-run,
+  positive, near-miss and adversarial trigger provenance/sanitization/dedup;
+  typed `AgentSelectionPlanV1` fan-out and complete
+  `ReviewerResultEnvelopeV1` aggregation; holdout isolation, deterministic
   hard assertions, exact trigger repetitions and per-profile precision/recall/
   specificity thresholds, single-writer state CAS and crash recovery, stable
   sample pairing, bounded retries, infra-inconclusive handling, fixed-point
   overflow/ties/median/p95 and SHA-256 counter bootstrap vectors, cost/latency
   ceilings, and offline byte-for-byte promotion-receipt replay; complete candidate identity
   observation; invalidation after every behavior-input mutation, including
-  workflow-only changes; and proof that candidate code cannot enumerate or read
-  holdout custody.
+  workflow-only changes; signed worker lease issue/expiry/takeover/key rotation,
+  principal/capability admission and proof that candidate/provider/worker code
+  cannot self-certify, enumerate or read holdout custody.
 - `agent-quality`: invokes the three gates rather than scanning source, rejects
   missing constituent evidence, and runs the old-app/new-app by
   old-daemon/new-daemon cutover matrix; `closed_v2_pending`, one active probe
@@ -2683,6 +3441,10 @@ The gates execute these behavioral proofs:
   `emergency_hold_v2` transitions; active provider/side-effect drain outcomes;
   every migration phase/operation crash/restart row, pre-cutover blocker
   rejection before phase mutation, atomic point-of-no-return legacy settlement,
+  migration lease heartbeat/expiry/live-owner denial/verified-absence takeover
+  fencing; replacement-only admission expiry/capability denial, successful and
+  blocked forward candidate replacement without phase rollback; complete
+  provider/effect/app proof matrix and receipt aggregation;
   zero claimable legacy work across the complete producer inventory, unified
   transactional admission proof, promotion/probe/reprobe/open command replay,
   stale generation, invalid receipt, required projection-intent rollback,
@@ -2707,39 +3469,51 @@ the gate.
 3. Add genesis/base-ledger serialization, `AuthorityDirectiveV1`,
    `ApprovalAuthorityTemplateV1`, versioned `ApprovalAuthorityBindingV1`,
    bounded rebinding/readback/reissue, atomic run head initialization, the
-   Rust-owned authority overlay, and the single authority admission service with
-   complete CAS/idempotency/auth parity tests.
+   Rust-owned authority overlay, `EffectiveAuthorityProjectionV1`,
+   `RuntimeConstraintPolicyV1`, run-level recheck fence and the single authority
+   admission/evaluation service with complete supersession-race, CAS,
+   idempotency, auth and per-attempt readback tests.
 4. Publish exact northbound discovery/request/result/error schemas and boundary
    rows. Implement PrincipalClass plus CallerClass/capability checks, coherent
-   start selection, per-command semantic intent fields, the closed retry matrix,
-   and shared MCP/Swift vectors before exposing mutations.
-5. Pin the Agent Skills baseline; generate the complete planned legacy-fragment
-   migration manifest; move evals outside bundles; add immutable Git tree
-   admission, content-addressed publication, ordered composition,
-   invocation-scoped broker grants, and the versioned macOS Seatbelt runner,
-   startup self-test, script/apply journals and recovery. Keep the Swift loader
-   diagnostic.
+   start selection, attempt readback, client challenge/receipt, forward candidate
+   replacement, per-command semantic intent fields, canonical replay, phase
+   nullability, the closed retry matrix, and shared MCP/GraphQL/Swift vectors
+   before exposing mutations.
+5. Pin the exact Agent Skills commit/corpus and tokenizer budget policy;
+   generate the complete planned legacy-fragment migration manifest; move evals
+   outside bundles; add immutable Git tree admission, content-addressed
+   publication, ordered composition, attempt-scoped broker grant installation,
+   exact resource/script wire and semantic effect identity; add the outer
+   provider Seatbelt profile for every production adapter plus the inner script
+   runner, startup/escape attestations, script/apply journals and recovery. Keep
+   the Swift loader diagnostic.
 6. Rewrite every production role, `skill_role`, prompt, inline/builtin skill,
    workflow assignment, and skill composition exactly from the planned rows,
    then materialize target digests and require independent Rust/Swift fragment
    coverage plus all-mode package golden tests before V2 compile accepts it.
-7. Add `RunContextGenerationBindingV2`, daemon self-admission, durable dispatch
-   intents, one-use wrapper credentials, provider-binding receipts, identity
-   holds/clearance, prompt fencing, and crash-recovery tests.
+7. Add `RunContextGenerationBindingV2`, daemon self-admission,
+   `AgentExecutionAttemptV1`, attempt-qualified immutable paths, durable dispatch
+   intents, one-use wrapper credentials, provider-binding/sandbox/grant-install
+   receipts, identity holds/clearance, authority/prompt fencing, and every
+   pre/post-install crash-recovery test.
 8. Replace prompt assembly with `PromptEnvelopeV2`, include all pin digests in
    session binding, add the additive V2 persistence/migration-ledger schema,
-   atomic latest-head projection intents and immutable mutation receipts,
-   startup reconciliation, singleton cutover readback, bounded keyset
-   connections, and the exact GraphQL/Swift compatibility contract. The
+   atomic latest-head projection intents, fenced worker leases,
+   content-addressed projection publication and immutable mutation receipts;
+   add signed versioned-row keyset cursors, startup reconciliation, singleton
+   cutover readback and the exact GraphQL/Swift compatibility contract. The
    migration head remains `not_started` and V2 execution is not yet admitted.
-9. Add the protected holdout vault, historical corpus, complete candidate
-   manifest, single-writer evaluation service, fixed-point evaluator, exact
-   trigger policy, deterministic gates, candidate/probe state stores, and
-   capability handshake.
+9. Add the protected holdout vault, observed/sibling/adversarial corpus, typed
+   reviewer fan-out, complete candidate manifest, signed worker-lease evidence
+   admission with anti-self-certification, single-writer evaluation service,
+   fixed-point evaluator, exact trigger policy, deterministic required CI gates,
+   rollout alerts, candidate/probe state stores, complete proof matrix and
+   client capability handshake.
 10. Run the complete five-repetition baseline/candidate live evaluation and
    retain a passing `AgentQualityPromotionReceiptV1` for the exact production
    candidate manifest.
-11. Stop the bridge daemon, self-admit the final candidate binary, build and
+11. Stop the bridge daemon, acquire the fenced migration lease, self-admit the
+    final candidate binary, build and
     verify the complete go/no-go inventory and every external-effect
     classification/settlement action, then atomically advance
     `not_started / legacy_bridge -> schema_prepared / closed_v2_pending`; verify
@@ -2748,13 +3522,16 @@ the gate.
     all-or-nothing `legacy_execution_sealed` settlement, and prove zero legacy
     producer row remains claimable.
 13. Verify runtime self-admission, execute promotion to `probe_v2`, consume one
-    proof epoch, classify its receipt, and execute open only after pass.
+    complete provider/effect/app proof-matrix epoch, classify its aggregate
+    receipt, and execute open only after every cell passes.
     Infrastructure-inconclusive or process-clearance proof uses the atomic
     same-generation reprobe command.
-14. Read back `open_v2`, migration/projection heads, generation and proof/self-
-    admission receipts before allowing an ordinary start.
+14. Read back `open_v2`, migration lease/head/repair state, projection heads,
+    generation, proof/self-admission receipts and client capability receipt
+    before allowing an ordinary start.
 15. Prove mixed-version errors, complete northbound auth/idempotency vectors,
-    generation-CAS, migration-phase recovery, emergency hold, and
+    generation-CAS, migration lease takeover/fencing, bounded blocked repair and
+    explicit candidate replacement without phase rollback, emergency hold, and
     context-absent live-execution denial matrices.
 16. Run a small roadmap proposal end to end and let Steward perform the first
     post-run analysis.
@@ -2773,7 +3550,9 @@ records only.
 
 1. Every newly compiled production invocation contains
    `agent_context_envelope_v2`, a valid immutable `RunMissionV1` base, pinned
-   `EffectiveRunMissionV1`, `AgentRoleV1`, `TaskAssignmentV1`, ordered
+   `EffectiveRunMissionV1`, `EffectiveAuthorityProjectionV1`,
+   `RuntimeConstraintPolicyV1`, authority-fence digest,
+   `AgentExecutionAttemptV1`, `AgentRoleV1`, `TaskAssignmentV1`, ordered
    `SkillCompositionV1`, `PromptEnvelopeV2`, and a durable generation binding.
 2. Every production agent has an explicit role charter and no production agent
    uses `inline_skill`, `builtin_agent`, `skill_role`, an arbitrary catalog
@@ -2803,12 +3582,15 @@ records only.
    intent conflict, in-flight winner/loser, semantic duplicate, stale CAS and
    concurrent-loser outcomes match the closed Rust/Swift error/retry matrix for
    every mutation and never double-apply it.
-8. An accepted mid-run directive changes only invocations that prepare after its
-   durable head. A running or historically reconstructed invocation uses its
-   original head and byte-identical effective context without rewriting
-   `RunPlanSnapshot`.
-9. Every production skill passes Agent Skills metadata, immutable Git
-   tree/object validation, exact resource limits, and same-byte publication.
+8. An advisory or `next_claim_only` directive changes only the operations named
+   by its policy. Every changed hard directive atomically advances the run
+   authority fence: queued work prepares from current truth, stale pre-prompt
+   attempts cancel/reprepare before provider prompt, and prompt-committed work
+   applies the declared deny/quarantine/settlement action. Historical readback
+   retains the original attempt pin without rewriting `RunPlanSnapshot`.
+9. Every production skill passes the exact pinned Agent Skills upstream corpus,
+   immutable Git tree/object validation, mechanical per-provider line/token and
+   aggregate composition budgets, exact resource limits, and same-byte publication.
    The materialized migration manifest accounts for every byte of every legacy
    source fragment exactly once as a typed target or reviewed retirement and
    preserves execution mode, effect owner and partial-failure semantics;
@@ -2817,51 +3599,70 @@ records only.
 10. Multi-skill prompt assembly is ordered and byte-exact. Broker grants are
     bound to active execution/attempt/session/generation/composition truth;
     wrong-scope requests reveal no object existence, and source bundles,
-    snapshot storage and holdout custody remain inaccessible.
-11. `SkillScriptExecutionContractV1` tests prove fixed stdin/argv/env/cwd and
-    the exact `macos_seatbelt_exec_v1` startup identity/escape self-test on every
-    supported macOS build, with no advisory or unsandboxed fallback. Immutable
+    snapshot storage and holdout custody remain inaccessible. Exact resource
+    range/EOF and script result/error bytes are deterministic; broker-derived
+    effect identity prevents a new UUID from repeating one semantic write.
+11. Every production adapter proves `ProviderExecutionSandboxV1` startup
+    attestation and parent/child denial of Git, skills, eval/control-plane,
+    credential, sibling-home and out-of-scope workspace roots before
+    `provider_bound`. `SkillScriptExecutionContractV1` tests additionally prove
+    fixed stdin/argv/env/cwd and the exact `macos_seatbelt_exec_v1` startup
+    identity/escape self-test on every supported macOS build, with no advisory
+    or unsandboxed fallback. Immutable
     verify-to-exec identity, deny-by-default filesystem/network/IPC/credential/
     child-process confinement, read-only workspace plus staging-only writes,
     bounded output and full process-group cancellation hold under replacement
     races. Crash at every spawn, runner-settlement and apply-journal/fsync
     boundary either resumes the durable entry, proves no effect, or enters typed
     reconciliation without overwrite or script rerun.
-12. `prepared` invocation creation atomically pins generation, authority,
+12. `prepared` invocation creation atomically pins generation, attempt-qualified authority,
    assignment, skill, prompt, provider, and session-binding truth before launch.
-   Crash-before-launch, launch-before-prompt, prompt-committed, ambiguous
-   process, and late-output tests produce the specified durable outcomes with no
-   blind prompt resend.
+    Crash-before-grant issuance, grant-hash-before-install, launch-before-prompt,
+    prompt-committed, ambiguous process, and late-output tests produce the
+    specified durable outcomes with token rotation only after absence proof, no
+    path overwrite and no blind prompt resend.
 13. A daemon without a matching self-admission receipt cannot claim work. A
     launch credential is secret, one-use, expiry-bound and replay-proof; actual
     daemon/provider/model/tool identity must match an observed provider-binding
     receipt before `prompt_committed`. Identity ambiguity blocks every retry
     until the existing process-absence command verifies clearance.
 14. `runs.start` atomically binds the open cutover generation, complete candidate
-   manifest, promotion receipt, workflow/catalog bytes, skill registry, and
-   assignment templates; invocation pins bind run-specific assignments.
+    manifest, promotion receipt, workflow/catalog bytes, skill registry, and
+    assignment templates; it requires a fresh release-signed
+    `ClientCapabilityReceiptV1` admitted by the open proof matrix. Invocation
+    pins bind run-specific assignments.
    Concurrent promotion/start cannot create a mixed-generation run, and exact
    start replay returns the original run.
 15. Rust and Swift accept and reject identical normative schema/canonical-byte
     vectors for legacy pre-P066, P066, and V2 readers, every hashed contract,
-    unknown discriminator, null/default behavior, and exact MCP/GraphQL error
-    payload.
+    unknown discriminator, null/default behavior, canonical original-result
+    replay, and exact MCP/GraphQL request/result/error payload.
 16. The exact GraphQL SDL and Swift DTO fixtures decode legacy, V2, unknown
     version/status, redacted and degraded rows without optimistic defaults or
     exhaustive-enum failure. Singleton cutover readback and all three cursor
-    connections are bounded; 0/1/100/101/10,000-row and concurrent-insert
-    vectors have no skip, duplicate, hidden truncation or offset fallback.
+    connections are bounded; 0/1/100/101/10,000-row, concurrent-insert and
+    mutable-node-update vectors pin signed versioned snapshots with no skip,
+    duplicate, hidden truncation or offset fallback.
 17. Every canonical state mutation commits every required projection intent
     atomically and returns `projection_status = pending` plus the complete
     immutable commit receipt. Exact and alias replay remain byte-identical after
     worker progress. Crash and filesystem-failure tests prove current readback
     returns the SQLite head with pending/applied/degraded health and never a
-    stale file; inability to persist an intent rolls back the mutation.
-18. The ten initial historical cases fail against their retained faulty baseline
-   where applicable and pass against the candidate implementation.
-19. Deterministic `agent-quality` gates pass on the implementation tree and no
-    selected test lane succeeds with zero tests.
+    stale file; stale projection workers are lease-fenced and cannot replace a
+    newer content-addressed target; inability to persist an intent rolls back
+    the mutation.
+18. The ten initial historical cases plus observed current-run, sibling-run,
+    positive, near-miss and adversarial trigger cases have retained provenance,
+    sanitization and leakage-safe splits; faulty baselines fail where applicable
+    and the candidate passes.
+19. Deterministic `agent-quality` gates pass on the implementation tree, the
+    always-present required CI check cannot be bypassed by path/label/env input,
+    retained branch-protection readback proves that exact check is required, and
+    no selected test lane succeeds with zero tests.
 20. The Rust evaluation service is the only early candidate-state writer.
+    Dedicated workers submit only under signed principal/capability-bound leases;
+    candidate, provider and worker code cannot self-certify. Typed reviewer
+    aggregation accepts exactly the reviewers in `AgentSelectionPlanV1`.
     Trigger repetition/precision/recall/specificity, fixed-point arithmetic,
     SHA-256 counter bootstrap, rounding, percentile and crash/CAS vectors always
     produce one byte-identical receipt and decision; incomplete, inconclusive or
@@ -2871,20 +3672,28 @@ records only.
     and cost/latency ceilings. Changing any daemon/compiler/app/schema/workflow/assignment/catalog/role/
     permission/output-contract/skill/tool/provider/model/eval input changes the
     candidate manifest and invalidates the receipt. Workflow-only changes run
-    the full live lane, and candidate code cannot enumerate holdout cases.
+    the full live lane, and candidate code cannot enumerate holdout cases. The
+    exact provider/effect/app proof matrix is complete and byte-bound to the
+    candidate before promotion/open.
 22. Promotion keeps ordinary admission closed across crashes through
     `closed_v2_pending` and one active probe epoch. A black-box Operator can use
     only documented MCP/readback fields to promote, read and consume the initial
     proof admission, replay it, settle an inconclusive probe, atomically reprobe,
     open, clear a process-only hold and atomically reprobe the same generation.
     Candidate failure or another typed invariant persists `emergency_hold_v2`;
-    only a current passing receipt can open `open_v2`.
+    only a current passing aggregate receipt for every proof-matrix cell can
+    open `open_v2`.
 23. Failure at every migration/probe phase has the documented restart action,
     and every producer operation is decided by the single phase/operation
     matrix. A missing, stale, unknown or unbounded external-effect inventory
     blocks before phase mutation. The `legacy_execution_sealed` transaction is
     an atomic, auditable point of no return and leaves no pending legacy
-    approval/work/retry falsely runnable.
+    approval/work/retry falsely runnable. Migration writes are fenced by
+    renewable owner/epoch/head leases; takeover requires deadline plus verified
+    owner absence. An explicit replacement transaction can bind a corrected
+    candidate through a five-minute replacement-only admission without phase
+    rollback, history rewrite or unsafe process/effect; that admission cannot
+    claim work or advance another phase.
 24. Every work producer uses the same transaction-scoped execution-admission
     predicate. Inventory and startup tests prove zero claimable context-absent
     row after seal and quarantine any producer lacking proof.
@@ -2903,7 +3712,8 @@ records only.
     database downgrade, or legacy fallback can bypass V2. Emergency hold closes
     admission only on typed evidence and never selects another implementation.
 27. A small roadmap run reaches its expected terminal state and Steward records
-    context, role, skill, convergence, and quality evidence for it.
+    context, role, skill, convergence, quality and alert-state evidence for it;
+    all rollout signals are present and below their exact promotion thresholds.
 
 ## Readiness Review Disposition
 
@@ -2911,13 +3721,15 @@ records only.
 |---|---|
 | Prior `P0-01` | Frozen mission base plus Rust-owned SQLite overlay remains the single authority model |
 | Prior readiness rounds | Directive, generation, discriminator, immutable skills, candidate identity, dispatch recovery, deterministic evaluator, cutover states and legacy readback contracts remain retained |
-| Latest `P1-01` | Per-command semantic-intent fields exclude both request IDs; the closed Rust/Swift command error and retry matrix defines exact, alias, conflict, in-flight, stale and concurrent outcomes |
-| Latest `P1-02` | Operator MCP/GraphQL binding readback, bounded head-driven `rebound`/`superseded` generations, explicit reissue and old-generation settlement denial complete the approval lifecycle |
-| Latest `P1-03` | Promote/readback expose the one-use proof admission; one atomic reprobe command safely mints and consumes admissions for both inconclusive and process-clearance paths |
-| Latest `P1-04` | `legacy_bridge`, pre-cutover inventory go/no-go and one phase-by-producer-operation matrix remove the `closed_v2_pending` cutoff ambiguity |
-| Latest `P1-05` | Materialized `LegacySkillMigrationManifestV1` partitions every legacy source byte into one disposition with mode, effect and partial-failure ownership, enforced by package goldens |
-| Latest `P1-06` | `macos_seatbelt_exec_v1`, startup escape self-test, immutable verify-to-exec root, staging-only writes and durable apply-journal recovery make executable confinement testable and fail-closed |
-| Latest `P1-07` | Every mutation has an immutable pending projection receipt; singleton cutover readback and bounded snapshot keyset connections define exact MCP/GraphQL/Swift projection truth |
+| Prior readiness findings | Semantic command identity, approval rebinding, one-use proof/reprobe, legacy cutoff, legacy skill partitioning, script confinement and projection receipts remain retained |
+| Current `P1-01` | `EffectiveAuthorityProjectionV1`, closed runtime policy and a run-level recheck fence govern every prepared/prompt/effect race; MCP and GraphQL expose each attempt pin |
+| Current `P1-02` | `AgentExecutionAttemptV1` qualifies every immutable path and receipt; broker token issuance/install uses CAS epochs, one-time pipe delivery and absence-proven rotation across both crash windows |
+| Current `P1-03` | Every production provider and child runs in a digest-pinned outer Seatbelt profile with startup attestation and adapter-specific escape fixtures before `provider_bound` |
+| Current `P1-04` | Exact resource/script/error wire schemas plus broker-derived target-bound effect identity make same-effect/new-UUID replay deterministic and non-duplicating |
+| Current `P1-05` | Original result bytes are the only replay representation; exact GraphQL signatures, phase-valid nullability and one generated MCP/GraphQL error registry remove boundary contradictions |
+| Current `P1-06` | Signed worker leases, principal/capability admission and anti-self-certification protect evidence; complete provider/effect/app proof matrix and client receipt are required before open/start |
+| Current `P1-07` | Renewable owner/epoch/head migration leases fence takeover; explicit candidate replacement preserves forward phase/history and has bounded replacement/blocked recovery states |
+| Current `P2` | Content-addressed projection fencing, versioned signed cursors, required CI registration, exact alerts/upstream pin/token budgets, typed reviewer fan-out and observed/sibling/adversarial corpus are normative and gate-owned |
 
 ## Implementation Boundary
 
