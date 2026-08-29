@@ -113,21 +113,23 @@ compatibility: Chainworks Forge security review stages with frozen mission, evid
 
 The Markdown body must instruct the reviewer to:
 
-1. stay within the frozen proposal, mission, changed-files evidence, and test
-   evidence;
+1. stay within the frozen proposal, mission, and only the evidence declared by
+   the compiled task; inspect test evidence directly only when `tests_result`
+   is declared, and otherwise never invent or fetch that missing input;
 2. inspect authentication, authorization, secrets, unsafe defaults, injection,
    serialization, filesystem and symlink boundaries, network boundaries, data
    leakage, and dependency risk when implicated by the change;
 3. use read-only scanner results as evidence rather than as a substitute for
    reasoning;
-4. use `changed_files_manifest` as canonical Git evidence and never invoke
-   `git status`, `git diff`, `git rev-parse`, or read `.git`;
+4. accept only the declared control-plane-generated `changed_files_manifest` as
+   canonical Git evidence and never invoke `git status`, `git diff`,
+   `git rev-parse`, read `.git`, or substitute another manifest;
 5. keep discovery bounded to changed and implicated paths;
 6. return `pass` only when no blocking security issue remains and required
    evidence is sufficient;
-7. emit exactly one `security_report_v1` and perform no mutation beyond that
-   declared report output; source, proposal, release, and external effects are
-   forbidden.
+7. publish only the logical output `security_report` under
+   `security_report_v1` and perform no mutation beyond that declared report;
+   source, proposal, release, and external effects are forbidden.
 
 The catalog prompt retains only role specialization: apply the frozen procedure
 to the current implementation and output the declared security contract. It
@@ -154,15 +156,17 @@ The Markdown body must instruct the reviewer to:
    security evidence declared by the compiled task; assess test truth directly
    only when `tests_result` is declared by that task, and otherwise use the
    implementation audit without inventing a missing direct input;
-4. use `changed_files_manifest` as canonical Git evidence and never invoke
-   `git status`, `git diff`, `git rev-parse`, or read `.git`;
+4. accept only the declared control-plane-generated `changed_files_manifest` as
+   canonical Git evidence and never invoke `git status`, `git diff`,
+   `git rev-parse`, read `.git`, or substitute another manifest;
 5. keep discovery bounded to changed and implicated paths;
 6. return `block` when required evidence is missing, invalid, red, or contains
    an unresolved blocking finding; never reinterpret a blocking security or
    audit result as pass;
-7. emit exactly one `prepush_review_v1` and perform no mutation beyond that
-   declared report output; source edits, commits, pushes, approvals, releases,
-   and external effects are forbidden.
+7. publish only the logical output `prepush_review_report` under
+   `prepush_review_v1` and perform no mutation beyond that declared report;
+   source edits, commits, pushes, approvals, releases, and external effects are
+   forbidden.
 
 The catalog prompt retains only role specialization: perform the final review
 using the frozen procedure and declared evidence, then output the contract. It
@@ -228,7 +232,9 @@ contains:
 
 - the frozen operator objective and security assignment;
 - `RO_VERIFY` and `security_report_v1` truth;
-- canonical `changed_files_manifest` guidance;
+- exactly `approved_proposal` and `changed_files_manifest` as production inputs,
+  with no direct `tests_result`;
+- control-plane-generated provenance for canonical `changed_files_manifest`;
 - scanner-as-evidence guidance;
 - bounded discovery and no direct Git access;
 - no source-write, approval, release, or external-effect authority;
@@ -256,7 +262,8 @@ finalized prompt contains:
 - `RO_PREPUSH_VERIFY` and `prepush_review_v1` truth;
 - exactly the four production evidence inputs and no direct `tests_result`;
 - explicit fail-closed handling of missing, invalid, red, or blocking evidence;
-- canonical changed-files guidance and bounded discovery;
+- control-plane-generated provenance for canonical changed-files evidence and
+  bounded discovery;
 - no edit, commit, push, approval, release, or external-effect authority;
 - the next-execution-phase consumer
   `aggregate_implementation_reviews/lead_orchestrator`.
@@ -278,6 +285,7 @@ closed mutation union that regenerates the final prompt for every case:
 - `procedure_remove`: remove one named clause from the resolved frozen procedure;
 - `task_input_remove`: remove one declared compiled-task input and regenerate
   the deterministic materialized task body;
+- `task_input_add`: inject one undeclared input and regenerate the task body;
 - `task_body_remove`: remove one named evidence or policy clause from the task body.
 
 Each expected claim has a stable `claim_id` and exactly one targeted negative
@@ -286,6 +294,16 @@ must equal the fixture's exact claim set; each mutation must remove its named
 claim and no unrelated claim. Deleting or weakening a scorer rule therefore
 also breaks the positive exact-set assertion rather than silently making the
 mutation pass.
+
+`CTX-007` exact-sets `approved_proposal` and `changed_files_manifest`, proves
+that direct `tests_result` is absent, and includes `task_input_add` for an
+undeclared `tests_result`. The corresponding `no_undeclared_test_evidence`
+claim must fail. The parity fixture separately preserves direct `tests_result`
+for the security task in `workflow.yaml`, where it is genuinely declared.
+
+Both cases have an independent `control_plane_manifest_provenance` claim.
+Removing `control-plane-generated` or changing the procedure to permit a
+caller/provider-authored alternative manifest must fail that claim.
 
 Consumer assertions use the current `task_consumers` meaning: the task or tasks
 in the next execution phase, or state transitions when no later phase exists.
@@ -314,8 +332,10 @@ The gate must execute:
 9. exact `CTX-001..008` corpus membership;
 10. active-workflow compilation plus positive and independent V2 mutation
     scoring for `CTX-007/008`;
-11. unchanged procedure bytes for every skill outside the five migrated
-    bindings.
+11. unchanged skill definitions and procedure bytes for every skill outside
+    the two newly migrated bindings, including byte-pinned SHA-256 values for
+    `proposal-review-router/SKILL.md`, `code-implementation/SKILL.md`, and
+    `implementation-audit/SKILL.md`.
 
 The before-state fixture stores canonical JSON for the two inline skill
 definitions, both complete agent entries, both referenced backend profiles,
@@ -326,6 +346,12 @@ specialization. Exact comparison rejects all other drift.
 Mutation tests cover backend profile, model/effort/MCP, permission rules,
 required tools, task inputs, outputs, output contract, approval requirement,
 worktree policy, phase/parallel placement, and workflow task identity.
+
+The fixture also stores exact full-file SHA-256 values for the three existing
+external bundles. A one-byte mutation in each file is an independent negative
+case and must fail before catalog compilation is accepted. The only permitted
+bundle-byte additions or changes are the two new directories named by this
+slice.
 
 The proof manifest maps each requirement above to named executable tests. Gate
 preflight fails when a named test is absent or renamed, and the tests themselves
@@ -385,10 +411,14 @@ disabled.
    independently falsifiable; `CTX-001..008` pass.
 9. Complete before-state parity rejects drift in every affected agent, profile,
    permission, tool, task, output, approval, and write-policy field.
-10. The provider-free focused gate passes locally without remote execution.
-11. No unrelated skill, runtime, API, persistence, UI, or workflow surface is
+10. Both procedures require the declared control-plane-generated manifest and
+    reject alternate provenance; `CTX-007` rejects undeclared direct test input.
+11. All three previously migrated bundle files are byte-pinned and independently
+    mutation-tested.
+12. The provider-free focused gate passes locally without remote execution.
+13. No unrelated skill, runtime, API, persistence, UI, or workflow surface is
    changed.
-12. After implementation merge, one new normal run exercises both procedures
+14. After implementation merge, one new normal run exercises both procedures
     with no disable flag or special workflow.
 
 ## Review R1 Resolution
@@ -402,6 +432,9 @@ disabled.
 | P2-01 consumer ambiguity | consumer means next execution phase; exact task/agent tuples are specified |
 | P2-02 pre-migration proof | pinned V2 inline snapshot and exact golden prompts are required |
 | P2-03 proof manifest | every new requirement maps to an executable named test and gate preflight checks the mapping |
+| R2 P1-01 security input fidelity | security evidence is task-conditional; `CTX-007` rejects injected undeclared `tests_result`, while parity preserves the workflow that declares it |
+| R2 P1-02 manifest provenance | both procedures and cases require the control-plane-generated manifest and reject alternate provenance |
+| R2 P1-03 existing bundle drift | full SHA-256 values and one-byte mutations pin all three previously migrated bundles |
 
 ## Review Guidance
 
