@@ -148,7 +148,11 @@ fn active_catalog_preserves_affected_contracts_and_unrelated_skill_bytes() {
         .unwrap(),
     )
     .unwrap();
-    let affected_skill_refs = ["proposal_review_router_skill", "code_writer_core"];
+    let affected_skill_refs = [
+        "proposal_review_router_skill",
+        "code_writer_core",
+        "proposal_implementation_audit",
+    ];
 
     let mut actual = source
         .agents
@@ -181,6 +185,10 @@ fn active_catalog_preserves_affected_contracts_and_unrelated_skill_bytes() {
             "skills/proposal-review-router",
         ),
         ("code_writer_core", "skills/code-implementation"),
+        (
+            "proposal_implementation_audit",
+            "skills/implementation-audit",
+        ),
     ] {
         let skill = serde_json::to_value(&source.skills[skill_id]).unwrap();
         assert_eq!(skill["type"], "external_skill");

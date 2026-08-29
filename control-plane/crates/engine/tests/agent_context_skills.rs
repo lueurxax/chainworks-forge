@@ -659,6 +659,62 @@ fn v1_task_prompt_orders_mission_before_skill_and_projects_authoritative_outputs
 }
 
 #[test]
+fn implementation_auditor_uses_external_procedure_without_prompt_duplication() {
+    let plan = compile_plan();
+    let (state, task) = task_for_agent(&plan, "proposal_implementation_auditor");
+    let skill = task
+        .agent
+        .resolved_skill
+        .as_ref()
+        .expect("implementation auditor should resolve a procedure");
+
+    assert_eq!(skill.skill_type, "external");
+    assert!(
+        skill
+            .injected_content
+            .contains("Use changed_files_manifest as canonical Git evidence")
+    );
+    assert!(
+        !task
+            .agent
+            .prompt
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Use changed_files_manifest as canonical Git evidence")
+    );
+
+    let idea = idea(
+        "Audit the approved implementation".into(),
+        "Keep conformance and readiness evidence exact.".into(),
+    );
+    let run = run(&plan, &idea, &state.id);
+    let prompt = finalize_task_prompt_v1(
+        &plan,
+        &run,
+        state,
+        task,
+        &idea,
+        "## Task Body\nAudit this implementation.",
+    )
+    .expect("implementation auditor prompt should finalize");
+
+    let mission = prompt.find("## Mission Context").unwrap();
+    let procedure = prompt
+        .find("## Skill: proposal_implementation_audit")
+        .unwrap();
+    let body = prompt.find("## Task Body").unwrap();
+    assert!(mission < procedure && procedure < body);
+    assert_eq!(
+        prompt
+            .matches("Use changed_files_manifest as canonical Git evidence")
+            .count(),
+        1
+    );
+    assert!(prompt.contains("\"permission_profile\":\"RO_VERIFY\""));
+    assert!(prompt.contains("\"provider_outputs\":[\"audit_report\"]"));
+}
+
+#[test]
 fn mission_consumers_cover_next_phase_and_transitions() {
     let plan = compile_plan();
     let idea = idea(
@@ -930,7 +986,11 @@ fn active_catalog_preserves_procedure_kinds_and_does_not_duplicate_bundle_body_i
             );
             if matches!(
                 agent.skill_ref.as_deref(),
-                Some("proposal_review_router_skill" | "code_writer_core")
+                Some(
+                    "proposal_review_router_skill"
+                        | "code_writer_core"
+                        | "proposal_implementation_audit"
+                )
             ) {
                 let skill = agent.resolved_skill.as_ref().unwrap();
                 assert_eq!(skill.skill_type, "external");

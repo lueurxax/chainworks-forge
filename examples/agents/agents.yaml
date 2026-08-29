@@ -103,13 +103,8 @@ skills:
     type: external_skill
     path: skills/proposal-review-router
   proposal_implementation_audit:
-    type: inline_skill
-    description: >-
-      Proposal-vs-implementation audit skill. Compare the approved proposal against
-      the current implementation with evidence-first requirement conformance and
-      readiness findings. Inspect only relevant code, tests, configs, docs, and
-      artifacts; run focused validation when useful; write exactly one structured
-      audit report and do not modify implementation or proposal files.
+    type: external_skill
+    path: skills/implementation-audit
   docs_quality_guardian:
     type: builtin_agent
     name: docs-quality-guardian
@@ -2170,17 +2165,11 @@ agents:
     output_contract: audit_report_v1
     requires_human_approval: false
     prompt:
-      "Compare the approved proposal against the implementation in the implementation worktree.
+      "Audit the approved proposal against the implementation in the implementation worktree.
 
-      Identify missing work, extra work, mismatches in behavior, broken acceptance criteria, and signs that the proposal was interpreted incorrectly.
+      Apply the frozen implementation-audit procedure within the mission context and declared evidence inputs.
 
-      Be exact and evidence-based.
-
-      Use changed_files_manifest as the canonical control-plane-generated Git evidence. Do not run `git status`, `git diff`, or `git rev-parse`, and do not read `.git`.
-
-      Keep discovery bounded: inspect changed files, proposal-relevant paths, and test evidence first; do not run broad rg/find over repo or worktree roots unless generated/build roots are excluded and output is capped.
-
-      Output only the audit contract and set status to implemented only when the implementation truly matches the approved proposal."
+      Output only the audit contract."
   - id: security_checker
     title: Security Checker
     mode: security
