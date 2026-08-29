@@ -118,11 +118,11 @@ skills:
     type: external_skill
     path: skills/code-implementation
   security_checker_core:
-    type: inline_skill
-    description: Threat-model and review the implementation for security, privacy, secrets, auth, and unsafe defaults.
+    type: external_skill
+    path: skills/security-review
   prepush_review_core:
-    type: inline_skill
-    description: Final code review barrier before commit/push; looks for correctness, readability, regressions, and missing tests.
+    type: external_skill
+    path: skills/prepush-review
   github_commit_push:
     type: inline_skill
     description: Use deterministic git/github tools to commit and push only after human release approval.
@@ -2189,15 +2189,11 @@ agents:
       - security_report
     output_contract: security_report_v1
     requires_human_approval: false
-    prompt: "Review the current implementation for security and privacy risks.
+    prompt: "Review the current implementation using the frozen security-review procedure and declared evidence.
 
-      Focus on auth/authz, secrets handling, unsafe defaults, injection, serialization, filesystem access, network boundaries, data leakage, and dependency risk.
+      Apply only the authority and outputs declared by the assignment.
 
-      Use readonly scanners when available, but do not rely on scanners alone.
-
-      Use changed_files_manifest as the canonical control-plane-generated Git evidence. Do not run `git status`, `git diff`, or `git rev-parse`, and do not read `.git`.
-
-      Output only the structured security report and mark status as pass only when no blocking issue remains."
+      Output only the declared security report contract."
   - id: commit_and_push_to_github
     title: Commit and Push to GitHub
     mode: release_git
@@ -2250,17 +2246,11 @@ agents:
       - prepush_review_report
     output_contract: prepush_review_v1
     requires_human_approval: false
-    prompt: "Perform the last human-like code review before commit and push.
+    prompt: "Perform the final code review using the frozen prepush-review procedure and declared evidence.
 
-      Focus on correctness, readability, maintainability, surprising side effects, regression risk, and missing tests.
+      Apply only the authority and outputs declared by the assignment.
 
-      Do not propose gold-plating; prioritize issues that would make the release unsafe or expensive to maintain.
-
-      Use changed_files_manifest as the canonical control-plane-generated Git evidence. Do not run `git status`, `git diff`, or `git rev-parse`, and do not read `.git`.
-
-      Keep discovery bounded: inspect changed files and implicated paths first; do not run broad rg/find over repo or worktree roots unless generated/build roots are excluded and output is capped.
-
-      Output only the structured pre-push review contract."
+      Output only the declared pre-push review contract."
   - id: build_archive_and_push_connect
     title: Build Archive and Push to Connect
     mode: release_publish

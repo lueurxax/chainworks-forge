@@ -1,0 +1,115 @@
+{
+  "case_id": "CTX-007",
+  "workflow_path": "examples/workflows/full-mvp-live.yaml",
+  "state_id": "state_9_implementation_reviewed",
+  "task_name": "check_implementation_security",
+  "idea": {
+    "title": "Review authorization and filesystem containment",
+    "body": "Verify the implementation without expanding reviewer authority or fabricating evidence."
+  },
+  "task_body": "## Security Assignment\nReview the changed authorization and symlink-boundary implementation against the declared evidence.",
+  "expected_inputs": [
+    "approved_proposal",
+    "changed_files_manifest"
+  ],
+  "expected_output": "security_report",
+  "expected_contract": "security_report_v1",
+  "expected_permission_profile": "RO_VERIFY",
+  "expected_skill_ref": "security_checker_core",
+  "expected_system_prompt_clause": "Review the current implementation using the frozen security-review procedure and declared evidence.",
+  "expected_consumer_task": "audit_implementation_against_proposal",
+  "expected_consumer_agent": "proposal_implementation_auditor",
+  "expected_claim_ids": [
+    "bounded_discovery",
+    "control_plane_manifest_provenance",
+    "external_procedure",
+    "logical_output",
+    "next_phase_consumer",
+    "no_direct_git",
+    "no_mutation_authority",
+    "no_undeclared_test_evidence",
+    "operator_objective",
+    "output_contract",
+    "permission_profile",
+    "required_evidence_inputs",
+    "review_assignment",
+    "scanner_as_evidence"
+  ],
+  "negative_mutations": [
+    {
+      "kind": "mission_json_replace",
+      "claim_id": "operator_objective",
+      "json_pointer": "/mission/operator_request_title",
+      "replacement": "Broaden the security review"
+    },
+    {
+      "kind": "system_prompt_remove",
+      "claim_id": "review_assignment",
+      "needle": "Review the current implementation using the frozen security-review procedure and declared evidence."
+    },
+    {
+      "kind": "mission_json_replace",
+      "claim_id": "external_procedure",
+      "json_pointer": "/runtime/procedure/source_kind",
+      "replacement": "inline"
+    },
+    {
+      "kind": "mission_json_replace",
+      "claim_id": "permission_profile",
+      "json_pointer": "/runtime/permission_profile",
+      "replacement": "CODE_WRITE"
+    },
+    {
+      "kind": "mission_json_replace",
+      "claim_id": "logical_output",
+      "json_pointer": "/assignment/declared_outputs/0",
+      "replacement": "release_manifest"
+    },
+    {
+      "kind": "task_body_remove",
+      "claim_id": "output_contract",
+      "needle": "Output contract: security_report_v1."
+    },
+    {
+      "kind": "task_input_remove",
+      "claim_id": "required_evidence_inputs",
+      "input": "approved_proposal"
+    },
+    {
+      "kind": "task_input_add",
+      "claim_id": "no_undeclared_test_evidence",
+      "input": "tests_result"
+    },
+    {
+      "kind": "procedure_remove",
+      "claim_id": "control_plane_manifest_provenance",
+      "needle": "control-plane-generated"
+    },
+    {
+      "kind": "procedure_remove",
+      "claim_id": "scanner_as_evidence",
+      "needle": "read-only scanner results as evidence rather than as a substitute for reasoning"
+    },
+    {
+      "kind": "procedure_remove",
+      "claim_id": "bounded_discovery",
+      "needle": "Keep discovery bounded to changed and implicated paths."
+    },
+    {
+      "kind": "procedure_remove",
+      "claim_id": "no_direct_git",
+      "needle": "Never invoke `git status`, `git diff`, or `git rev-parse`, and never read `.git`."
+    },
+    {
+      "kind": "procedure_remove",
+      "claim_id": "no_mutation_authority",
+      "needle": "Publish only the logical output `security_report` under `security_report_v1`; do not mutate source, proposal, approval, release, or external state."
+    },
+    {
+      "kind": "mission_json_replace",
+      "claim_id": "next_phase_consumer",
+      "json_pointer": "/assignment/consumers/0/task",
+      "replacement": "release_without_audit"
+    }
+  ]
+}

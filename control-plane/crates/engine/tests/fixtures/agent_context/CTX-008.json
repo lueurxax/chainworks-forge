@@ -1,0 +1,123 @@
+{
+  "case_id": "CTX-008",
+  "workflow_path": "examples/workflows/full-mvp-live.yaml",
+  "state_id": "state_9_implementation_reviewed",
+  "task_name": "prepush_review",
+  "idea": {
+    "title": "Settle final review fail closed",
+    "body": "Do not release when required implementation audit or security evidence is invalid or blocking."
+  },
+  "task_body": "## Pre-Push Assignment\nThe audit_report is invalid and security_report contains an unresolved blocking finding. Apply the frozen final-review contract.",
+  "expected_inputs": [
+    "approved_proposal",
+    "changed_files_manifest",
+    "audit_report",
+    "security_report"
+  ],
+  "expected_output": "prepush_review_report",
+  "expected_contract": "prepush_review_v1",
+  "expected_permission_profile": "RO_PREPUSH_VERIFY",
+  "expected_skill_ref": "prepush_review_core",
+  "expected_system_prompt_clause": "Perform the final code review using the frozen prepush-review procedure and declared evidence.",
+  "expected_consumer_task": "aggregate_implementation_reviews",
+  "expected_consumer_agent": "lead_orchestrator",
+  "expected_claim_ids": [
+    "blocking_upstream_evidence",
+    "bounded_discovery",
+    "control_plane_manifest_provenance",
+    "external_procedure",
+    "fail_closed",
+    "logical_output",
+    "next_phase_consumer",
+    "no_direct_git",
+    "no_release_authority",
+    "no_undeclared_test_evidence",
+    "operator_objective",
+    "output_contract",
+    "permission_profile",
+    "required_evidence_inputs",
+    "review_assignment"
+  ],
+  "negative_mutations": [
+    {
+      "kind": "mission_json_replace",
+      "claim_id": "operator_objective",
+      "json_pointer": "/mission/operator_request_title",
+      "replacement": "Ignore blocking evidence"
+    },
+    {
+      "kind": "system_prompt_remove",
+      "claim_id": "review_assignment",
+      "needle": "Perform the final code review using the frozen prepush-review procedure and declared evidence."
+    },
+    {
+      "kind": "mission_json_replace",
+      "claim_id": "external_procedure",
+      "json_pointer": "/runtime/procedure/source_kind",
+      "replacement": "inline"
+    },
+    {
+      "kind": "mission_json_replace",
+      "claim_id": "permission_profile",
+      "json_pointer": "/runtime/permission_profile",
+      "replacement": "RELEASE_GIT"
+    },
+    {
+      "kind": "mission_json_replace",
+      "claim_id": "logical_output",
+      "json_pointer": "/assignment/declared_outputs/0",
+      "replacement": "git_push_receipt"
+    },
+    {
+      "kind": "task_body_remove",
+      "claim_id": "output_contract",
+      "needle": "Output contract: prepush_review_v1."
+    },
+    {
+      "kind": "task_input_remove",
+      "claim_id": "required_evidence_inputs",
+      "input": "approved_proposal"
+    },
+    {
+      "kind": "task_input_add",
+      "claim_id": "no_undeclared_test_evidence",
+      "input": "tests_result"
+    },
+    {
+      "kind": "procedure_remove",
+      "claim_id": "control_plane_manifest_provenance",
+      "needle": "control-plane-generated"
+    },
+    {
+      "kind": "procedure_remove",
+      "claim_id": "bounded_discovery",
+      "needle": "Keep discovery bounded to changed and implicated paths."
+    },
+    {
+      "kind": "procedure_remove",
+      "claim_id": "no_direct_git",
+      "needle": "Never invoke `git status`, `git diff`, or `git rev-parse`, and never read `.git`."
+    },
+    {
+      "kind": "procedure_remove",
+      "claim_id": "fail_closed",
+      "needle": "Return `block` when required evidence is missing, invalid, red, or contains an unresolved blocking finding."
+    },
+    {
+      "kind": "procedure_remove",
+      "claim_id": "no_release_authority",
+      "needle": "Publish only the logical output `prepush_review_report` under `prepush_review_v1`; do not edit source, commit, push, approve, release, or cause external effects."
+    },
+    {
+      "kind": "mission_json_replace",
+      "claim_id": "next_phase_consumer",
+      "json_pointer": "/assignment/consumers/0/task",
+      "replacement": "commit_and_push_release_candidate"
+    },
+    {
+      "kind": "task_body_remove",
+      "claim_id": "blocking_upstream_evidence",
+      "needle": "audit_report is invalid and security_report contains an unresolved blocking finding"
+    }
+  ]
+}

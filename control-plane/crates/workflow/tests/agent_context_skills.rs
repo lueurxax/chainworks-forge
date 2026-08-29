@@ -152,6 +152,8 @@ fn active_catalog_preserves_affected_contracts_and_unrelated_skill_bytes() {
         "proposal_review_router_skill",
         "code_writer_core",
         "proposal_implementation_audit",
+        "security_checker_core",
+        "prepush_review_core",
     ];
 
     let mut actual = source
@@ -189,6 +191,8 @@ fn active_catalog_preserves_affected_contracts_and_unrelated_skill_bytes() {
             "proposal_implementation_audit",
             "skills/implementation-audit",
         ),
+        ("security_checker_core", "skills/security-review"),
+        ("prepush_review_core", "skills/prepush-review"),
     ] {
         let skill = serde_json::to_value(&source.skills[skill_id]).unwrap();
         assert_eq!(skill["type"], "external_skill");
@@ -212,6 +216,411 @@ fn active_catalog_preserves_affected_contracts_and_unrelated_skill_bytes() {
         fixture.unrelated_skills_sha256,
         "unrelated skill definitions changed"
     );
+}
+
+fn yaml_json(path: &Path) -> serde_json::Value {
+    serde_json::to_value(
+        serde_yaml::from_slice::<serde_yaml::Value>(&fs::read(path).unwrap()).unwrap(),
+    )
+    .unwrap()
+}
+
+fn selected_object_entries(
+    source: &serde_json::Value,
+    field: &str,
+    keys: &[&str],
+) -> serde_json::Value {
+    let object = source[field].as_object().unwrap();
+    serde_json::Value::Object(
+        keys.iter()
+            .map(|key| ((*key).to_string(), object[*key].clone()))
+            .collect(),
+    )
+}
+
+fn selected_agents(source: &serde_json::Value, ids: &[&str]) -> serde_json::Value {
+    let agents = source["agents"].as_array().unwrap();
+    serde_json::Value::Object(
+        ids.iter()
+            .map(|id| {
+                let agent = agents
+                    .iter()
+                    .find(|agent| agent["id"] == **id)
+                    .unwrap_or_else(|| panic!("agent {id} must exist"));
+                ((*id).to_string(), agent.clone())
+            })
+            .collect(),
+    )
+}
+
+fn selected_workflow_task(
+    workflow: &serde_json::Value,
+    state_id: &str,
+    task_name: &str,
+) -> serde_json::Value {
+    let run = &workflow["states"][state_id]["run"];
+    ["parallel", "sequence", "then"]
+        .iter()
+        .filter_map(|lane| run[*lane].as_array())
+        .flatten()
+        .find(|task| task["task"] == task_name)
+        .cloned()
+        .unwrap_or_else(|| panic!("task {task_name} must exist in {state_id}"))
+}
+
+fn current_review_skill_surface(root: &Path) -> serde_json::Value {
+    let catalog_path = root.join("examples/agents/agents.yaml");
+    let catalog = yaml_json(&catalog_path);
+    let mut workflow_tasks = serde_json::Map::new();
+
+    for (workflow_file, task_names) in [
+        (
+            "full-mvp-live.yaml",
+            ["check_implementation_security", "prepush_review"],
+        ),
+        ("workflow.yaml", ["review_security", "review_before_push"]),
+    ] {
+        let workflow_path = root.join("examples/workflows").join(workflow_file);
+        let workflow = yaml_json(&workflow_path);
+        let plan = compiler::compile(path_string(&workflow_path), path_string(&catalog_path))
+            .expect("active workflow should compile");
+        let state = &plan.states["state_9_implementation_reviewed"];
+
+        for task_name in task_names {
+            let mut source_task =
+                selected_workflow_task(&workflow, "state_9_implementation_reviewed", task_name);
+            let compiled_task = state
+                .tasks
+                .iter()
+                .chain(&state.post_approval_tasks)
+                .find(|task| task.task_name == task_name)
+                .unwrap_or_else(|| panic!("compiled task {task_name} must exist"));
+            let source = source_task.as_object_mut().unwrap();
+            source.insert(
+                "compiled_phase".into(),
+                serde_json::json!(compiled_task.phase),
+            );
+            source.insert(
+                "compiled_parallel".into(),
+                serde_json::json!(compiled_task.parallel),
+            );
+            workflow_tasks.insert(
+                format!("{workflow_file}:state_9_implementation_reviewed:{task_name}"),
+                source_task,
+            );
+        }
+    }
+
+    let existing_bundle_sha256 = [
+        (
+            "proposal-review-router",
+            "examples/agents/skills/proposal-review-router/SKILL.md",
+        ),
+        (
+            "code-implementation",
+            "examples/agents/skills/code-implementation/SKILL.md",
+        ),
+        (
+            "implementation-audit",
+            "examples/agents/skills/implementation-audit/SKILL.md",
+        ),
+    ]
+    .into_iter()
+    .map(|(id, relative)| {
+        let bytes = fs::read(root.join(relative)).unwrap();
+        (
+            id.to_string(),
+            serde_json::json!(format!("{:x}", Sha256::digest(bytes))),
+        )
+    })
+    .collect::<serde_json::Map<_, _>>();
+
+    serde_json::json!({
+        "inline_skill_definitions": selected_object_entries(
+            &catalog,
+            "skills",
+            &["security_checker_core", "prepush_review_core"],
+        ),
+        "agents": selected_agents(
+            &catalog,
+            &["security_checker", "prepush_code_reviewer"],
+        ),
+        "backend_profiles": selected_object_entries(
+            &catalog,
+            "backend_profiles",
+            &["claude_security_high", "claude_prepush_medium"],
+        ),
+        "permission_profiles": selected_object_entries(
+            &catalog,
+            "permission_profiles",
+            &["RO_VERIFY", "RO_PREPUSH_VERIFY"],
+        ),
+        "workflow_tasks": workflow_tasks,
+        "existing_bundle_sha256": existing_bundle_sha256,
+    })
+}
+
+fn expected_review_skill_surface_after_migration(
+    mut before: serde_json::Value,
+) -> serde_json::Value {
+    before["inline_skill_definitions"]["security_checker_core"] = serde_json::json!({
+        "type": "external_skill",
+        "path": "skills/security-review",
+    });
+    before["inline_skill_definitions"]["prepush_review_core"] = serde_json::json!({
+        "type": "external_skill",
+        "path": "skills/prepush-review",
+    });
+    before["agents"]["security_checker"]["prompt"] = serde_json::json!(
+        "Review the current implementation using the frozen security-review procedure and declared evidence.\nApply only the authority and outputs declared by the assignment.\nOutput only the declared security report contract."
+    );
+    before["agents"]["prepush_code_reviewer"]["prompt"] = serde_json::json!(
+        "Perform the final code review using the frozen prepush-review procedure and declared evidence.\nApply only the authority and outputs declared by the assignment.\nOutput only the declared pre-push review contract."
+    );
+    before
+}
+
+fn assert_review_surface_matches(
+    expected: &serde_json::Value,
+    actual: &serde_json::Value,
+) -> Result<(), String> {
+    (expected == actual)
+        .then_some(())
+        .ok_or_else(|| "security/prepush migration surface drifted".to_string())
+}
+
+#[test]
+fn security_and_prepush_migration_preserves_complete_before_state() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let before: serde_json::Value = serde_json::from_slice(
+        &fs::read(root.join(
+            "control-plane/crates/workflow/tests/fixtures/agent_context/\
+             security_prepush_before_state.json",
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let expected = expected_review_skill_surface_after_migration(before);
+    let actual = current_review_skill_surface(&root);
+
+    assert_review_surface_matches(&expected, &actual).unwrap();
+
+    for pointer in [
+        "/agents/security_checker/backend_profile",
+        "/agents/security_checker/permission_profile",
+        "/agents/security_checker/required_tools/0",
+        "/agents/security_checker/inputs/0",
+        "/agents/security_checker/outputs/0",
+        "/agents/security_checker/output_contract",
+        "/agents/security_checker/requires_human_approval",
+        "/agents/prepush_code_reviewer/backend_profile",
+        "/agents/prepush_code_reviewer/permission_profile",
+        "/agents/prepush_code_reviewer/required_tools/0",
+        "/agents/prepush_code_reviewer/inputs/0",
+        "/agents/prepush_code_reviewer/outputs/0",
+        "/agents/prepush_code_reviewer/output_contract",
+        "/agents/prepush_code_reviewer/requires_human_approval",
+        "/backend_profiles/claude_security_high/provider",
+        "/backend_profiles/claude_security_high/model",
+        "/backend_profiles/claude_security_high/effort",
+        "/backend_profiles/claude_security_high/mcp/0",
+        "/backend_profiles/claude_prepush_medium/provider",
+        "/backend_profiles/claude_prepush_medium/model",
+        "/backend_profiles/claude_prepush_medium/effort",
+        "/backend_profiles/claude_prepush_medium/mcp",
+        "/permission_profiles/RO_VERIFY/git/status",
+        "/permission_profiles/RO_VERIFY/filesystem/write/0",
+        "/permission_profiles/RO_PREPUSH_VERIFY/git/status",
+        "/permission_profiles/RO_PREPUSH_VERIFY/filesystem/write/0",
+        "/workflow_tasks/full-mvp-live.yaml:state_9_implementation_reviewed:check_implementation_security/task",
+        "/workflow_tasks/full-mvp-live.yaml:state_9_implementation_reviewed:check_implementation_security/inputs/0",
+        "/workflow_tasks/full-mvp-live.yaml:state_9_implementation_reviewed:check_implementation_security/compiled_phase",
+        "/workflow_tasks/full-mvp-live.yaml:state_9_implementation_reviewed:check_implementation_security/compiled_parallel",
+        "/workflow_tasks/full-mvp-live.yaml:state_9_implementation_reviewed:prepush_review/task",
+        "/workflow_tasks/full-mvp-live.yaml:state_9_implementation_reviewed:prepush_review/inputs/0",
+        "/workflow_tasks/full-mvp-live.yaml:state_9_implementation_reviewed:prepush_review/compiled_phase",
+        "/workflow_tasks/full-mvp-live.yaml:state_9_implementation_reviewed:prepush_review/compiled_parallel",
+        "/workflow_tasks/workflow.yaml:state_9_implementation_reviewed:review_security/task",
+        "/workflow_tasks/workflow.yaml:state_9_implementation_reviewed:review_security/inputs/0",
+        "/workflow_tasks/workflow.yaml:state_9_implementation_reviewed:review_security/compiled_phase",
+        "/workflow_tasks/workflow.yaml:state_9_implementation_reviewed:review_security/compiled_parallel",
+        "/workflow_tasks/workflow.yaml:state_9_implementation_reviewed:review_before_push/task",
+        "/workflow_tasks/workflow.yaml:state_9_implementation_reviewed:review_before_push/inputs/0",
+        "/workflow_tasks/workflow.yaml:state_9_implementation_reviewed:review_before_push/compiled_phase",
+        "/workflow_tasks/workflow.yaml:state_9_implementation_reviewed:review_before_push/compiled_parallel",
+    ] {
+        let mut mutated = expected.clone();
+        *mutated
+            .pointer_mut(pointer)
+            .unwrap_or_else(|| panic!("parity pointer must exist: {pointer}")) =
+            serde_json::json!("mutated");
+        assert!(
+            assert_review_surface_matches(&expected, &mutated).is_err(),
+            "authority mutation must fail parity: {pointer}"
+        );
+    }
+
+    for agent_id in ["security_checker", "prepush_code_reviewer"] {
+        let mut mutated = expected.clone();
+        mutated["agents"][agent_id].as_object_mut().unwrap().insert(
+            "worktree_policy".into(),
+            serde_json::json!({"write_enabled": true}),
+        );
+        assert!(assert_review_surface_matches(&expected, &mutated).is_err());
+    }
+
+    for (bundle, relative) in [
+        (
+            "proposal-review-router",
+            "examples/agents/skills/proposal-review-router/SKILL.md",
+        ),
+        (
+            "code-implementation",
+            "examples/agents/skills/code-implementation/SKILL.md",
+        ),
+        (
+            "implementation-audit",
+            "examples/agents/skills/implementation-audit/SKILL.md",
+        ),
+    ] {
+        let mut bytes = fs::read(root.join(relative)).unwrap();
+        let expected_digest = expected["existing_bundle_sha256"][bundle].as_str().unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), expected_digest);
+        bytes[0] ^= 1;
+        assert_ne!(format!("{:x}", Sha256::digest(&bytes)), expected_digest);
+    }
+}
+
+#[test]
+fn active_security_and_prepush_bundles_are_strict_single_file_documents() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    for (relative, expected_name) in [
+        ("examples/agents/skills/security-review", "security-review"),
+        ("examples/agents/skills/prepush-review", "prepush-review"),
+    ] {
+        let directory = root.join(relative);
+        let entries = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, ["SKILL.md"]);
+        let skill_path = directory.join("SKILL.md");
+        let metadata = fs::symlink_metadata(&skill_path).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert!(!metadata.file_type().is_symlink());
+        let bytes = fs::read(&skill_path).unwrap();
+        assert!(bytes.len() <= 65_536);
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.lines().count() <= 500);
+        assert!(text.contains(&format!("name: {expected_name}")));
+        assert!(!text.contains("allowed-tools"));
+    }
+
+    compiler::compile(
+        path_string(&root.join("examples/workflows/full-mvp-live.yaml")),
+        path_string(&root.join("examples/agents/agents.yaml")),
+    )
+    .expect("strict active security and pre-push bundles should compile");
+}
+
+#[test]
+fn security_and_prepush_frozen_bundles_ignore_live_source_drift() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let workflow_path = root.join("examples/workflows/full-mvp-live.yaml");
+    let catalog_path = root.join("examples/agents/agents.yaml");
+    let initial = compiler::compile(path_string(&workflow_path), path_string(&catalog_path))
+        .expect("migrated active catalog should compile");
+    let catalog: serde_json::Value = serde_json::from_str(&initial.catalog_snapshot_json).unwrap();
+
+    for (skill_id, relative) in [
+        (
+            "security_checker_core",
+            "examples/agents/skills/security-review/SKILL.md",
+        ),
+        (
+            "prepush_review_core",
+            "examples/agents/skills/prepush-review/SKILL.md",
+        ),
+    ] {
+        let expected_bytes = fs::read(root.join(relative)).unwrap();
+        let bundle = &catalog["chainworks_compiled"]["skill_bundles"][skill_id];
+        assert_eq!(
+            bundle["skill_md"].as_str().unwrap().as_bytes(),
+            expected_bytes
+        );
+        assert_eq!(
+            bundle["skill_bundle_sha256"],
+            format!("{:x}", Sha256::digest(&expected_bytes))
+        );
+    }
+
+    let missing_catalog = std::env::temp_dir()
+        .join("chainworks-agent-context-missing-security-prepush")
+        .join("catalog.yaml");
+    let frozen = compiler::compile_from_snapshot_json(
+        &initial.workflow_snapshot_json,
+        &initial.catalog_snapshot_json,
+        path_string(&missing_catalog),
+    )
+    .expect("stored V2 bundle bytes must not consult changed or removed live sources");
+    let initial_state = &initial.states["state_9_implementation_reviewed"];
+    let frozen_state = &frozen.states["state_9_implementation_reviewed"];
+    for task_name in ["check_implementation_security", "prepush_review"] {
+        let initial_agent = &initial_state
+            .tasks
+            .iter()
+            .find(|task| task.task_name == task_name)
+            .unwrap()
+            .agent;
+        let frozen_agent = &frozen_state
+            .tasks
+            .iter()
+            .find(|task| task.task_name == task_name)
+            .unwrap()
+            .agent;
+        assert_eq!(
+            frozen_agent.skill_snapshot_hash,
+            initial_agent.skill_snapshot_hash
+        );
+        assert_eq!(
+            frozen_agent
+                .resolved_skill
+                .as_ref()
+                .map(|skill| &skill.injected_content),
+            initial_agent
+                .resolved_skill
+                .as_ref()
+                .map(|skill| &skill.injected_content)
+        );
+    }
+
+    for skill_id in ["security_checker_core", "prepush_review_core"] {
+        let mut changed_bytes = catalog.clone();
+        let original = changed_bytes["chainworks_compiled"]["skill_bundles"][skill_id]["skill_md"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        changed_bytes["chainworks_compiled"]["skill_bundles"][skill_id]["skill_md"] =
+            serde_json::json!(format!("{original}\nmutation"));
+        let error = compiler::compile_from_snapshot_json(
+            &initial.workflow_snapshot_json,
+            &serde_json::to_string(&changed_bytes).unwrap(),
+            path_string(&missing_catalog),
+        )
+        .expect_err("changed embedded bundle bytes must fail closed");
+        assert!(format!("{error:#}").contains("digest mismatch"));
+
+        let mut changed_hash = catalog.clone();
+        changed_hash["chainworks_compiled"]["skill_bundles"][skill_id]["skill_bundle_sha256"] =
+            serde_json::json!("0".repeat(64));
+        let error = compiler::compile_from_snapshot_json(
+            &initial.workflow_snapshot_json,
+            &serde_json::to_string(&changed_hash).unwrap(),
+            path_string(&missing_catalog),
+        )
+        .expect_err("changed embedded bundle digest must fail closed");
+        assert!(format!("{error:#}").contains("digest mismatch"));
+    }
 }
 
 #[test]

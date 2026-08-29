@@ -16,21 +16,40 @@ use engine::work_queue::WorkQueue;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use workflow::plan::{
     CompiledState, CompiledTask, CompiledTransition, DegradedOutputPolicy, ResolvedAgent,
     ResolvedSkill, RunPlan,
 };
 
 fn compile_plan() -> RunPlan {
+    compile_workflow("full-mvp-live.yaml")
+}
+
+fn compile_workflow(workflow_file: &str) -> RunPlan {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
     workflow::compiler::compile(
-        root.join("examples/workflows/full-mvp-live.yaml")
+        root.join("examples/workflows")
+            .join(workflow_file)
             .to_str()
             .unwrap(),
         root.join("examples/agents/agents.yaml").to_str().unwrap(),
     )
     .expect("active workflow should compile")
+}
+
+fn task_for_name<'a>(
+    plan: &'a RunPlan,
+    state_id: &str,
+    task_name: &str,
+) -> (&'a CompiledState, &'a CompiledTask) {
+    let state = plan.states.get(state_id).expect("state should exist");
+    let task = state
+        .tasks
+        .iter()
+        .find(|task| task.task_name == task_name)
+        .expect("task should exist");
+    (state, task)
 }
 
 fn idea(title: String, body: String) -> Idea {
@@ -193,6 +212,70 @@ struct ContextEvalMutation {
     replacement: serde_json::Value,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActiveReviewContextCase {
+    case_id: String,
+    workflow_path: String,
+    state_id: String,
+    task_name: String,
+    idea: ContextEvalIdea,
+    task_body: String,
+    expected_inputs: Vec<String>,
+    expected_output: String,
+    expected_contract: String,
+    expected_permission_profile: String,
+    expected_skill_ref: String,
+    expected_system_prompt_clause: String,
+    expected_consumer_task: String,
+    expected_consumer_agent: String,
+    expected_claim_ids: BTreeSet<String>,
+    negative_mutations: Vec<PromptMutation>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum PromptMutation {
+    MissionJsonReplace {
+        claim_id: String,
+        json_pointer: String,
+        replacement: serde_json::Value,
+    },
+    SystemPromptRemove {
+        claim_id: String,
+        needle: String,
+    },
+    ProcedureRemove {
+        claim_id: String,
+        needle: String,
+    },
+    TaskInputRemove {
+        claim_id: String,
+        input: String,
+    },
+    TaskInputAdd {
+        claim_id: String,
+        input: String,
+    },
+    TaskBodyRemove {
+        claim_id: String,
+        needle: String,
+    },
+}
+
+impl PromptMutation {
+    fn claim_id(&self) -> &str {
+        match self {
+            Self::MissionJsonReplace { claim_id, .. }
+            | Self::SystemPromptRemove { claim_id, .. }
+            | Self::ProcedureRemove { claim_id, .. }
+            | Self::TaskInputRemove { claim_id, .. }
+            | Self::TaskInputAdd { claim_id, .. }
+            | Self::TaskBodyRemove { claim_id, .. } => claim_id,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InvokeAgentProducerFixture {
@@ -201,6 +284,23 @@ struct InvokeAgentProducerFixture {
     function: String,
     classification: String,
     guard: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecurityPrepushSnapshotFixture {
+    schema_version: String,
+    source_commit: String,
+    workflow_snapshot: serde_json::Value,
+    catalog_snapshot: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecurityPrepushGoldenPrompts {
+    schema_version: String,
+    security_prompt: String,
+    prepush_prompt: String,
 }
 
 fn context_eval_agent(fixture: &ContextEvalAgent) -> ResolvedAgent {
@@ -396,20 +496,709 @@ fn score_context_case(
     Ok(())
 }
 
+fn materialized_review_task_body(fixture: &ActiveReviewContextCase, task: &CompiledTask) -> String {
+    let direct_test_evidence = if task.inputs.iter().any(|input| input == "tests_result") {
+        "Direct tests_result evidence: declared by the compiled task; assess it directly."
+    } else {
+        "Direct tests_result evidence: not declared by the compiled task; do not invent or fetch it."
+    };
+    format!(
+        "{}\n\nDeclared task inputs: {}\nLogical output: {}\nOutput contract: {}.\n{}",
+        fixture.task_body,
+        serde_json::to_string(&task.inputs).unwrap(),
+        task.outputs.join(","),
+        task.agent.output_contract.as_deref().unwrap_or("none"),
+        direct_test_evidence,
+    )
+}
+
+fn replacement_string<'a>(
+    fixture: &ActiveReviewContextCase,
+    pointer: &str,
+    replacement: &'a serde_json::Value,
+) -> &'a str {
+    replacement.as_str().unwrap_or_else(|| {
+        panic!(
+            "{} mutation {} replacement must be a string",
+            fixture.case_id, pointer
+        )
+    })
+}
+
+fn apply_mission_source_mutation(
+    fixture: &ActiveReviewContextCase,
+    plan: &mut RunPlan,
+    task: &mut CompiledTask,
+    idea: &mut Idea,
+    json_pointer: &str,
+    replacement: &serde_json::Value,
+) {
+    let replacement = replacement_string(fixture, json_pointer, replacement).to_string();
+    match json_pointer {
+        "/mission/operator_request_title" => idea.title = replacement,
+        "/runtime/permission_profile" => task.agent.permission_profile = Some(replacement),
+        "/runtime/procedure/source_kind" => {
+            task.agent
+                .resolved_skill
+                .as_mut()
+                .expect("review task should resolve a procedure")
+                .skill_type = replacement;
+        }
+        "/assignment/declared_outputs/0" => {
+            *task
+                .outputs
+                .first_mut()
+                .expect("review task should declare one output") = replacement;
+        }
+        "/assignment/consumers/0/task" => {
+            let state = plan
+                .states
+                .get_mut(&fixture.state_id)
+                .expect("review state should exist");
+            let next_phase = state
+                .tasks
+                .iter()
+                .map(|candidate| candidate.phase)
+                .filter(|phase| *phase > task.phase)
+                .min()
+                .expect("review task should have a next execution phase");
+            state
+                .tasks
+                .iter_mut()
+                .find(|candidate| candidate.phase == next_phase)
+                .expect("next execution phase should contain a task")
+                .task_name = replacement;
+        }
+        other => panic!(
+            "{} has unsupported source mutation pointer {other}",
+            fixture.case_id
+        ),
+    }
+}
+
+fn finalized_active_review_case(
+    fixture: &ActiveReviewContextCase,
+    mutation: Option<&PromptMutation>,
+) -> (CompiledTask, String, serde_json::Value) {
+    let workflow_file = std::path::Path::new(&fixture.workflow_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .expect("fixture workflow path should have a file name");
+    let mut plan = compile_workflow(workflow_file);
+    let (_, compiled_task) = task_for_name(&plan, &fixture.state_id, &fixture.task_name);
+    let mut task = compiled_task.clone();
+    let mut idea = idea(fixture.idea.title.clone(), fixture.idea.body.clone());
+    let mut body_removal = None;
+
+    if let Some(mutation) = mutation {
+        match mutation {
+            PromptMutation::MissionJsonReplace {
+                json_pointer,
+                replacement,
+                ..
+            } => apply_mission_source_mutation(
+                fixture,
+                &mut plan,
+                &mut task,
+                &mut idea,
+                json_pointer,
+                replacement,
+            ),
+            PromptMutation::SystemPromptRemove { needle, .. } => {
+                let prompt = task
+                    .agent
+                    .prompt
+                    .as_mut()
+                    .expect("review task should have a system prompt");
+                assert!(
+                    prompt.contains(needle),
+                    "{} system mutation needle must exist",
+                    fixture.case_id
+                );
+                *prompt = prompt.replacen(needle, "", 1);
+            }
+            PromptMutation::ProcedureRemove { needle, .. } => {
+                let procedure = &mut task
+                    .agent
+                    .resolved_skill
+                    .as_mut()
+                    .expect("review task should resolve a procedure")
+                    .injected_content;
+                assert!(
+                    procedure.contains(needle),
+                    "{} procedure mutation needle must exist",
+                    fixture.case_id
+                );
+                *procedure = procedure.replacen(needle, "", 1);
+            }
+            PromptMutation::TaskInputRemove { input, .. } => {
+                let original_len = task.inputs.len();
+                task.inputs.retain(|candidate| candidate != input);
+                assert_eq!(
+                    task.inputs.len() + 1,
+                    original_len,
+                    "{} input-removal mutation must remove one input",
+                    fixture.case_id
+                );
+            }
+            PromptMutation::TaskInputAdd { input, .. } => {
+                assert!(
+                    !task.inputs.contains(input),
+                    "{} input-add mutation must add an undeclared input",
+                    fixture.case_id
+                );
+                task.inputs.push(input.clone());
+            }
+            PromptMutation::TaskBodyRemove { needle, .. } => {
+                body_removal = Some(needle.as_str());
+            }
+        }
+    }
+
+    let mut body = materialized_review_task_body(fixture, &task);
+    if let Some(needle) = body_removal {
+        assert!(
+            body.contains(needle),
+            "{} task-body mutation needle must exist",
+            fixture.case_id
+        );
+        body = body.replacen(needle, "", 1);
+    }
+    let state = plan
+        .states
+        .get(&fixture.state_id)
+        .expect("review state should exist");
+    let run = run(&plan, &idea, &state.id);
+    let prompt = finalize_task_prompt_v1(&plan, &run, state, &task, &idea, &body)
+        .expect("active review prompt should finalize");
+    let mission = extract_mission_context(&prompt);
+    (task, prompt, mission)
+}
+
+fn string_array(value: Option<&serde_json::Value>) -> Vec<&str> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect()
+}
+
+fn score_active_review_case(
+    fixture: &ActiveReviewContextCase,
+    task: &CompiledTask,
+    prompt: &str,
+    mission: &serde_json::Value,
+) -> BTreeSet<String> {
+    let mut claims = BTreeSet::new();
+    let body = prompt
+        .rsplit_once("## Security Assignment")
+        .or_else(|| prompt.rsplit_once("## Pre-Push Assignment"))
+        .map(|(_, body)| body)
+        .unwrap_or_default();
+
+    if mission
+        .pointer("/mission/operator_request_title")
+        .and_then(|v| v.as_str())
+        == Some(fixture.idea.title.as_str())
+        && mission
+            .pointer("/mission/operator_request_body")
+            .and_then(|value| value.as_str())
+            == Some(fixture.idea.body.as_str())
+    {
+        claims.insert("operator_objective".to_string());
+    }
+    if prompt.contains(&fixture.expected_system_prompt_clause) {
+        claims.insert("review_assignment".to_string());
+    }
+    if mission
+        .pointer("/runtime/procedure/kind")
+        .and_then(|value| value.as_str())
+        == Some("resolved")
+        && mission
+            .pointer("/runtime/procedure/id")
+            .and_then(|value| value.as_str())
+            == Some(fixture.expected_skill_ref.as_str())
+        && mission
+            .pointer("/runtime/procedure/source_kind")
+            .and_then(|value| value.as_str())
+            == Some("external")
+    {
+        claims.insert("external_procedure".to_string());
+    }
+    if mission
+        .pointer("/runtime/permission_profile")
+        .and_then(|value| value.as_str())
+        == Some(fixture.expected_permission_profile.as_str())
+    {
+        claims.insert("permission_profile".to_string());
+    }
+    if string_array(mission.pointer("/assignment/declared_outputs"))
+        == [fixture.expected_output.as_str()]
+        && string_array(mission.pointer("/assignment/provider_outputs"))
+            == [fixture.expected_output.as_str()]
+        && body.contains(&format!("Logical output: {}", fixture.expected_output))
+    {
+        claims.insert("logical_output".to_string());
+    }
+    if task.agent.output_contract.as_deref() == Some(fixture.expected_contract.as_str())
+        && body.contains(&format!("Output contract: {}.", fixture.expected_contract))
+    {
+        claims.insert("output_contract".to_string());
+    }
+    let actual_non_test_inputs = task
+        .inputs
+        .iter()
+        .filter(|input| input.as_str() != "tests_result")
+        .cloned()
+        .collect::<Vec<_>>();
+    let expected_non_test_inputs = fixture
+        .expected_inputs
+        .iter()
+        .filter(|input| input.as_str() != "tests_result")
+        .cloned()
+        .collect::<Vec<_>>();
+    if actual_non_test_inputs == expected_non_test_inputs {
+        claims.insert("required_evidence_inputs".to_string());
+    }
+    let procedure_has_conditional_test_rule = prompt.contains(
+        "Inspect `tests_result` directly only when it is declared by the compiled task; otherwise do not invent or fetch it.",
+    );
+    if fixture.expected_inputs.iter().any(|input| input == "tests_result") {
+        if task.inputs.iter().any(|input| input == "tests_result")
+            && body.contains(
+                "Direct tests_result evidence: declared by the compiled task; assess it directly.",
+            )
+            && procedure_has_conditional_test_rule
+        {
+            claims.insert("declared_test_evidence_available".to_string());
+        }
+    } else if !task.inputs.iter().any(|input| input == "tests_result")
+        && body.contains(
+            "Direct tests_result evidence: not declared by the compiled task; do not invent or fetch it.",
+        )
+        && procedure_has_conditional_test_rule
+    {
+        claims.insert("no_undeclared_test_evidence".to_string());
+    }
+    if prompt.contains(
+        "only the declared control-plane-generated `changed_files_manifest` as canonical Git evidence",
+    ) {
+        claims.insert("control_plane_manifest_provenance".to_string());
+    }
+    if prompt
+        .contains("read-only scanner results as evidence rather than as a substitute for reasoning")
+    {
+        claims.insert("scanner_as_evidence".to_string());
+    }
+    if prompt.contains("Keep discovery bounded to changed and implicated paths.") {
+        claims.insert("bounded_discovery".to_string());
+    }
+    if prompt.contains(
+        "Never invoke `git status`, `git diff`, or `git rev-parse`, and never read `.git`.",
+    ) {
+        claims.insert("no_direct_git".to_string());
+    }
+    if prompt.contains(
+        "Publish only the logical output `security_report` under `security_report_v1`; do not mutate source, proposal, approval, release, or external state.",
+    ) {
+        claims.insert("no_mutation_authority".to_string());
+    }
+    if prompt.contains(
+        "Return `block` when required evidence is missing, invalid, red, or contains an unresolved blocking finding.",
+    ) {
+        claims.insert("fail_closed".to_string());
+    }
+    if prompt.contains(
+        "Publish only the logical output `prepush_review_report` under `prepush_review_v1`; do not edit source, commit, push, approve, release, or cause external effects.",
+    ) {
+        claims.insert("no_release_authority".to_string());
+    }
+    let consumers = mission
+        .pointer("/assignment/consumers")
+        .and_then(serde_json::Value::as_array);
+    if consumers.is_some_and(|values| {
+        values.len() == 1
+            && values[0].get("kind").and_then(|value| value.as_str()) == Some("task")
+            && values[0].get("task").and_then(|value| value.as_str())
+                == Some(fixture.expected_consumer_task.as_str())
+            && values[0].get("agent_id").and_then(|value| value.as_str())
+                == Some(fixture.expected_consumer_agent.as_str())
+    }) {
+        claims.insert("next_phase_consumer".to_string());
+    }
+    if body.contains(
+        "audit_report is invalid and security_report contains an unresolved blocking finding",
+    ) {
+        claims.insert("blocking_upstream_evidence".to_string());
+    }
+    claims
+}
+
+#[test]
+fn ctx_007_and_008_compile_active_tasks_and_reject_each_prompt_mutation() {
+    let fixture_dir =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent_context");
+    for case_id in ["CTX-007", "CTX-008"] {
+        let path = fixture_dir.join(format!("{case_id}.json"));
+        let fixture: ActiveReviewContextCase =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(fixture.case_id, case_id);
+        let mutation_claims = fixture
+            .negative_mutations
+            .iter()
+            .map(|mutation| mutation.claim_id().to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            mutation_claims, fixture.expected_claim_ids,
+            "{case_id} must target every expected claim exactly once"
+        );
+        assert_eq!(
+            fixture.negative_mutations.len(),
+            fixture.expected_claim_ids.len(),
+            "{case_id} must have one mutation per expected claim"
+        );
+
+        let (task, prompt, mission) = finalized_active_review_case(&fixture, None);
+        let baseline = score_active_review_case(&fixture, &task, &prompt, &mission);
+        assert_eq!(
+            baseline, fixture.expected_claim_ids,
+            "{case_id} baseline claim set drifted"
+        );
+
+        for mutation in &fixture.negative_mutations {
+            let (task, prompt, mission) = finalized_active_review_case(&fixture, Some(mutation));
+            let actual = score_active_review_case(&fixture, &task, &prompt, &mission);
+            let mut expected = fixture.expected_claim_ids.clone();
+            expected.remove(mutation.claim_id());
+            assert_eq!(
+                actual,
+                expected,
+                "{case_id} mutation for {} must remove only its named claim",
+                mutation.claim_id()
+            );
+        }
+    }
+}
+
+#[test]
+fn active_review_tasks_cover_conditional_test_evidence_branches() {
+    struct Case<'a> {
+        workflow: &'a str,
+        task: &'a str,
+        inputs: &'a [&'a str],
+        output: &'a str,
+        contract: &'a str,
+        consumer_task: &'a str,
+        consumer_agent: &'a str,
+    }
+    let cases = [
+        Case {
+            workflow: "full-mvp-live.yaml",
+            task: "check_implementation_security",
+            inputs: &["approved_proposal", "changed_files_manifest"],
+            output: "security_report",
+            contract: "security_report_v1",
+            consumer_task: "audit_implementation_against_proposal",
+            consumer_agent: "proposal_implementation_auditor",
+        },
+        Case {
+            workflow: "full-mvp-live.yaml",
+            task: "prepush_review",
+            inputs: &[
+                "approved_proposal",
+                "changed_files_manifest",
+                "audit_report",
+                "security_report",
+            ],
+            output: "prepush_review_report",
+            contract: "prepush_review_v1",
+            consumer_task: "aggregate_implementation_reviews",
+            consumer_agent: "lead_orchestrator",
+        },
+        Case {
+            workflow: "workflow.yaml",
+            task: "review_security",
+            inputs: &[
+                "approved_proposal",
+                "implementation_progress",
+                "changed_files_manifest",
+                "tests_result",
+            ],
+            output: "security_report",
+            contract: "security_report_v1",
+            consumer_task: "sync_docs_for_review",
+            consumer_agent: "docs_guardian",
+        },
+        Case {
+            workflow: "workflow.yaml",
+            task: "review_before_push",
+            inputs: &[
+                "approved_proposal",
+                "implementation_progress",
+                "changed_files_manifest",
+                "tests_result",
+                "audit_report",
+                "security_report",
+            ],
+            output: "prepush_review_report",
+            contract: "prepush_review_v1",
+            consumer_task: "aggregate_implementation_reviews",
+            consumer_agent: "lead_orchestrator",
+        },
+    ];
+
+    for case in cases {
+        let plan = compile_workflow(case.workflow);
+        let (state, task) = task_for_name(&plan, "state_9_implementation_reviewed", case.task);
+        assert_eq!(
+            task.inputs,
+            case.inputs
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(task.outputs, [case.output]);
+        assert_eq!(task.agent.output_contract.as_deref(), Some(case.contract));
+        assert_eq!(
+            task.agent
+                .resolved_skill
+                .as_ref()
+                .map(|skill| skill.skill_type.as_str()),
+            Some("external")
+        );
+
+        let fixture = ActiveReviewContextCase {
+            case_id: format!("{}:{}", case.workflow, case.task),
+            workflow_path: format!("examples/workflows/{}", case.workflow),
+            state_id: state.id.clone(),
+            task_name: task.task_name.clone(),
+            idea: ContextEvalIdea {
+                title: "Conditional evidence compatibility".into(),
+                body: "Use exactly the evidence declared by the compiled task.".into(),
+            },
+            task_body: if case.contract == "security_report_v1" {
+                "## Security Assignment\nReview the declared evidence.".into()
+            } else {
+                "## Pre-Push Assignment\nReview the declared evidence.".into()
+            },
+            expected_inputs: case.inputs.iter().map(|value| value.to_string()).collect(),
+            expected_output: case.output.into(),
+            expected_contract: case.contract.into(),
+            expected_permission_profile: task
+                .agent
+                .permission_profile
+                .clone()
+                .expect("review permission should be declared"),
+            expected_skill_ref: task
+                .agent
+                .skill_ref
+                .clone()
+                .expect("review skill should be declared"),
+            expected_system_prompt_clause: task.agent.prompt.clone().unwrap_or_default(),
+            expected_consumer_task: case.consumer_task.into(),
+            expected_consumer_agent: case.consumer_agent.into(),
+            expected_claim_ids: BTreeSet::new(),
+            negative_mutations: Vec::new(),
+        };
+        let (baseline_task, baseline_prompt, baseline_mission) =
+            finalized_active_review_case(&fixture, None);
+        let baseline = score_active_review_case(
+            &fixture,
+            &baseline_task,
+            &baseline_prompt,
+            &baseline_mission,
+        );
+        let expected_test_claim = if case.inputs.contains(&"tests_result") {
+            "declared_test_evidence_available"
+        } else {
+            "no_undeclared_test_evidence"
+        };
+        assert!(
+            baseline.contains(expected_test_claim),
+            "{} must take its declared test-evidence branch",
+            fixture.case_id
+        );
+        assert!(baseline.contains("logical_output"));
+        assert!(baseline.contains("output_contract"));
+        assert!(baseline.contains("required_evidence_inputs"));
+        assert!(baseline.contains("next_phase_consumer"));
+
+        let mutation = if case.inputs.contains(&"tests_result") {
+            PromptMutation::TaskInputRemove {
+                claim_id: expected_test_claim.into(),
+                input: "tests_result".into(),
+            }
+        } else {
+            PromptMutation::TaskInputAdd {
+                claim_id: expected_test_claim.into(),
+                input: "tests_result".into(),
+            }
+        };
+        let (mutated_task, mutated_prompt, mutated_mission) =
+            finalized_active_review_case(&fixture, Some(&mutation));
+        let mutated =
+            score_active_review_case(&fixture, &mutated_task, &mutated_prompt, &mutated_mission);
+        assert!(
+            !mutated.contains(expected_test_claim),
+            "{} test-evidence mutation must fail its branch claim",
+            fixture.case_id
+        );
+    }
+}
+
+fn security_prepush_compatibility_prompts(plan: &RunPlan) -> (String, String) {
+    let state = &plan.states["state_9_implementation_reviewed"];
+    let mut compatibility_idea = idea(
+        "Preserve pre-migration review prompts".into(),
+        "Existing frozen runs must retain their exact inline security and pre-push procedures."
+            .into(),
+    );
+    compatibility_idea.id = "00000000-0000-4000-8000-000000002829".parse().unwrap();
+    let mut compatibility_run = run(plan, &compatibility_idea, &state.id);
+    compatibility_run.id = "00000000-0000-4000-8000-000000002830".parse().unwrap();
+
+    let security_task = state
+        .tasks
+        .iter()
+        .find(|task| task.task_name == "check_implementation_security")
+        .unwrap();
+    let security_prompt = finalize_task_prompt_v1(
+        plan,
+        &compatibility_run,
+        state,
+        security_task,
+        &compatibility_idea,
+        "## Security Assignment\nReview the historical inline security procedure.",
+    )
+    .unwrap();
+
+    let prepush_task = state
+        .tasks
+        .iter()
+        .find(|task| task.task_name == "prepush_review")
+        .unwrap();
+    let prepush_prompt = finalize_task_prompt_v1(
+        plan,
+        &compatibility_run,
+        state,
+        prepush_task,
+        &compatibility_idea,
+        "## Pre-Push Assignment\nReview the historical inline pre-push procedure.",
+    )
+    .unwrap();
+    (security_prompt, prepush_prompt)
+}
+
+#[test]
+fn pre_migration_v2_inline_snapshot_survives_external_bundle_migration() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let fixture: SecurityPrepushSnapshotFixture = serde_json::from_slice(
+        &std::fs::read(root.join(
+            "control-plane/crates/workflow/tests/fixtures/agent_context/\
+             security_prepush_catalog_v2.json",
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let golden: SecurityPrepushGoldenPrompts = serde_json::from_slice(
+        &std::fs::read(root.join(
+            "control-plane/crates/workflow/tests/fixtures/agent_context/\
+             security_prepush_golden_prompts.json",
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        fixture.schema_version,
+        "security_prepush_catalog_v2_fixture_v1"
+    );
+    assert_eq!(
+        fixture.source_commit,
+        "465fa72a880333347fbc0988f788f0f82d8b2523"
+    );
+    assert_eq!(golden.schema_version, "security_prepush_golden_prompts_v1");
+    assert_eq!(
+        fixture.catalog_snapshot["catalog_snapshot_format_version"],
+        2
+    );
+    assert!(
+        fixture.catalog_snapshot["chainworks_compiled"]["skill_bundles"]
+            .get("security_checker_core")
+            .is_none()
+    );
+    assert!(
+        fixture.catalog_snapshot["chainworks_compiled"]["skill_bundles"]
+            .get("prepush_review_core")
+            .is_none()
+    );
+
+    let plan = workflow::compiler::compile_from_snapshot_json(
+        &serde_json::to_string(&fixture.workflow_snapshot).unwrap(),
+        &serde_json::to_string(&fixture.catalog_snapshot).unwrap(),
+        "/tmp/chainworks-agent-context-missing-live-catalog/catalog.yaml",
+    )
+    .expect("pre-migration V2 snapshot must not consult the live catalog or new bundles");
+    let state = &plan.states["state_9_implementation_reviewed"];
+    for task_name in ["check_implementation_security", "prepush_review"] {
+        let procedure = state
+            .tasks
+            .iter()
+            .find(|task| task.task_name == task_name)
+            .and_then(|task| task.agent.resolved_skill.as_ref())
+            .expect("pre-migration review procedure should resolve from snapshot");
+        assert_eq!(procedure.skill_type, "inline");
+    }
+    let (security_prompt, prepush_prompt) = security_prepush_compatibility_prompts(&plan);
+    assert_eq!(
+        security_prompt.as_bytes(),
+        golden.security_prompt.as_bytes()
+    );
+    assert_eq!(prepush_prompt.as_bytes(), golden.prepush_prompt.as_bytes());
+}
+
+#[test]
+#[ignore = "fixture regeneration requires explicit historical source paths"]
+fn regenerate_security_prepush_compatibility_fixtures() {
+    let workflow_path = std::env::var("CHAINWORKS_PREMIGRATION_WORKFLOW_PATH")
+        .expect("set CHAINWORKS_PREMIGRATION_WORKFLOW_PATH");
+    let catalog_path = std::env::var("CHAINWORKS_PREMIGRATION_CATALOG_PATH")
+        .expect("set CHAINWORKS_PREMIGRATION_CATALOG_PATH");
+    let plan = workflow::compiler::compile(&workflow_path, &catalog_path)
+        .expect("historical workflow and catalog should compile");
+    let (security_prompt, prepush_prompt) = security_prepush_compatibility_prompts(&plan);
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let fixture_dir = root.join("control-plane/crates/workflow/tests/fixtures/agent_context");
+    let snapshot = serde_json::json!({
+        "schema_version": "security_prepush_catalog_v2_fixture_v1",
+        "source_commit": "465fa72a880333347fbc0988f788f0f82d8b2523",
+        "workflow_snapshot": serde_json::from_str::<serde_json::Value>(&plan.workflow_snapshot_json).unwrap(),
+        "catalog_snapshot": serde_json::from_str::<serde_json::Value>(&plan.catalog_snapshot_json).unwrap(),
+    });
+    let golden = serde_json::json!({
+        "schema_version": "security_prepush_golden_prompts_v1",
+        "security_prompt": security_prompt,
+        "prepush_prompt": prepush_prompt,
+    });
+    std::fs::write(
+        fixture_dir.join("security_prepush_catalog_v2.json"),
+        serde_json::to_vec_pretty(&snapshot).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        fixture_dir.join("security_prepush_golden_prompts.json"),
+        serde_json::to_vec_pretty(&golden).unwrap(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn ctx_001_through_ctx_006_have_exact_positive_and_mutation_negative_scores() {
     let fixture_dir =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent_context");
-    let mut paths = std::fs::read_dir(&fixture_dir)
-        .expect("CTX fixture directory must exist")
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|value| value.to_str())
-                .is_some_and(|name| name.starts_with("CTX-") && name.ends_with(".json"))
-        })
+    let paths = (1..=6)
+        .map(|index| fixture_dir.join(format!("CTX-{index:03}.json")))
         .collect::<Vec<_>>();
-    paths.sort();
     let expected_names = (1..=6)
         .map(|index| format!("CTX-{index:03}.json"))
         .collect::<Vec<_>>();
@@ -669,19 +1458,15 @@ fn implementation_auditor_uses_external_procedure_without_prompt_duplication() {
         .expect("implementation auditor should resolve a procedure");
 
     assert_eq!(skill.skill_type, "external");
-    assert!(
-        skill
-            .injected_content
-            .contains("Use changed_files_manifest as canonical Git evidence")
-    );
-    assert!(
-        !task
-            .agent
-            .prompt
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Use changed_files_manifest as canonical Git evidence")
-    );
+    assert!(skill
+        .injected_content
+        .contains("Use changed_files_manifest as canonical Git evidence"));
+    assert!(!task
+        .agent
+        .prompt
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Use changed_files_manifest as canonical Git evidence"));
 
     let idea = idea(
         "Audit the approved implementation".into(),
@@ -712,6 +1497,58 @@ fn implementation_auditor_uses_external_procedure_without_prompt_duplication() {
     );
     assert!(prompt.contains("\"permission_profile\":\"RO_VERIFY\""));
     assert!(prompt.contains("\"provider_outputs\":[\"audit_report\"]"));
+}
+
+#[test]
+fn security_and_prepush_external_procedures_inject_once_after_mission() {
+    let plan = compile_plan();
+    let idea = idea(
+        "Review the implementation safely".into(),
+        "Preserve the frozen evidence and authority boundaries.".into(),
+    );
+    for (agent_id, skill_id, unique_clause, body_header) in [
+        (
+            "security_checker",
+            "security_checker_core",
+            "read-only scanner results as evidence rather than as a substitute for reasoning",
+            "## Security Assignment",
+        ),
+        (
+            "prepush_code_reviewer",
+            "prepush_review_core",
+            "Never reinterpret a blocking security or audit result as `pass`.",
+            "## Pre-Push Assignment",
+        ),
+    ] {
+        let (state, task) = task_for_agent(&plan, agent_id);
+        let procedure = task
+            .agent
+            .resolved_skill
+            .as_ref()
+            .expect("review procedure should resolve");
+        assert_eq!(procedure.skill_type, "external");
+        assert!(!task
+            .agent
+            .prompt
+            .as_deref()
+            .unwrap_or_default()
+            .contains(unique_clause));
+        let run = run(&plan, &idea, &state.id);
+        let prompt = finalize_task_prompt_v1(
+            &plan,
+            &run,
+            state,
+            task,
+            &idea,
+            &format!("{body_header}\nReview only the declared evidence."),
+        )
+        .unwrap();
+        let mission = prompt.find("## Mission Context").unwrap();
+        let procedure = prompt.find(&format!("## Skill: {skill_id}")).unwrap();
+        let body = prompt.find(body_header).unwrap();
+        assert!(mission < procedure && procedure < body);
+        assert_eq!(prompt.matches(unique_clause).count(), 1);
+    }
 }
 
 #[test]
@@ -990,6 +1827,8 @@ fn active_catalog_preserves_procedure_kinds_and_does_not_duplicate_bundle_body_i
                     "proposal_review_router_skill"
                         | "code_writer_core"
                         | "proposal_implementation_audit"
+                        | "security_checker_core"
+                        | "prepush_review_core"
                 )
             ) {
                 let skill = agent.resolved_skill.as_ref().unwrap();

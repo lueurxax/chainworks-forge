@@ -1,0 +1,4692 @@
+{
+  "catalog_snapshot": {
+    "agents": [
+      {
+        "backend_profile": "codex_orchestrator_high",
+        "id": "lead_orchestrator",
+        "inputs": [
+          "idea_brief",
+          "proposal_current",
+          "proposal_review_summary",
+          "review_corpus_bundle",
+          "review_corpus_bundle_v2",
+          "approved_proposal",
+          "implementation_review_summary",
+          "audit_report",
+          "security_report",
+          "prepush_review_report",
+          "docs_report",
+          "implementation_self_assessment",
+          "blocker_boundary_status",
+          "run_state"
+        ],
+        "lead_resolution_contract": "LeadResolutionContract",
+        "mode": "orchestration",
+        "notes": "Owns fan-out/fan-in, loop control, and approval gates.",
+        "output_contract": null,
+        "outputs": [
+          "proposal_review_summary",
+          "review_corpus_bundle",
+          "review_corpus_bundle_v2",
+          "score_lift_backlog",
+          "proposal_fact_digest",
+          "reviewer_scope_plan",
+          "approved_proposal",
+          "implementation_plan",
+          "implementation_backlog",
+          "implementation_review_summary",
+          "proposal_decomposition_plan",
+          "quality_gate_blocker_assessment",
+          "blocker_boundary_approval_request",
+          "followup_proposal_seed",
+          "run_state",
+          "orchestrator_summary",
+          "approval_request",
+          "final_feature_report"
+        ],
+        "permission_profile": "ORCH",
+        "prompt": "You are the lead orchestrator for the full proposal -> implementation -> release lifecycle.\nMove the workflow forward one safe state at a time.\nDelegate all authoring, review, implementation, audit, docs, and release work to specialized agents.\nAggregate only structured outputs, track loop counters, enforce gates, and stop on contradictions.\nFor assess_quality_gate_blockers, emit schema_version quality_gate_blocker_assessment_v1 and make blockers a JSON array, never prose. Each blocker object must include id, summary, blocker_signature_id, evidence_fingerprint, source_artifact_generation_id, observed_after_stage_execution_id, observed_after_agent_execution_id, owner_class, blocker_class, evidence_freshness, severity, release_blocking, allowed_workflow_routes, forbidden_routes, gate_command, and evidence_refs. Use an empty blockers array only when all canonical implementation review artifacts are release-ready.\nNever edit product code, never commit, never push, and never publish artifacts yourself.\nEscalate only for the three workflow approval checkpoints, or when loop budgets are exhausted.",
+        "required_tools": null,
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": null,
+        "session_family_id": "orchestration_loop",
+        "session_reuse_scope": "same_agent_family_within_run",
+        "skill_ref": "orchestrator_core",
+        "skill_role": null,
+        "system_role": "lead",
+        "title": "Lead / Orchestrator",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "claude_product_high",
+        "id": "proposal_reviewer_product_owner",
+        "inputs": [
+          "idea_brief",
+          "proposal_current",
+          "proposal_feedback_coverage",
+          "reviewer_scope_plan",
+          "score_lift_backlog"
+        ],
+        "mode": "proposal_review.product_owner",
+        "notes": null,
+        "output_contract": "proposal_review_v1",
+        "outputs": [
+          "proposal_review_po"
+        ],
+        "permission_profile": "RO_REVIEW",
+        "prompt": "Review the proposal as a product owner.\nFocus on user problem clarity, business value, scope discipline, acceptance criteria, rollout risk, metrics, and dependency realism.\nBe strict about missing assumptions, hidden scope, and ambiguous success criteria.\nOutput only the structured review contract with a numeric score from 0 to 10.\nMark blocking issues only when they would materially reduce the chance of shipping the right thing.",
+        "required_tools": null,
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": {
+          "capabilities": [
+            "product",
+            "rollout",
+            "user-trust"
+          ],
+          "close_alternatives": [
+            "proposal_reviewer_ux"
+          ],
+          "enabled_for_proposal_review": true,
+          "family": "product",
+          "mandatory_when": [
+            "user-trust"
+          ],
+          "risks": [
+            "user-trust"
+          ],
+          "rollout_wave": "phase_3_core",
+          "routing_id": "product_owner",
+          "score_weights": {
+            "baseline_gap_matches": 1,
+            "cross_stack_dependency_matches": 2,
+            "force_include": 5,
+            "overlap_penalty": 3,
+            "repo_signal_matches": 2,
+            "risk_matches": 3,
+            "stack_matches": 4,
+            "strong_keyword_matches": 2,
+            "surface_matches": 3
+          },
+          "stacks": [
+            "any"
+          ],
+          "strong_proposal_keywords": [],
+          "strong_repo_files": [],
+          "strong_repo_symbols": [],
+          "surfaces": [
+            "ux",
+            "rollout"
+          ],
+          "usually_pair_with": [
+            "proposal_reviewer_ux",
+            "proposal_reviewer_observability_rollout"
+          ]
+        },
+        "session_family_id": null,
+        "session_reuse_scope": "same_invocation_owner",
+        "skill_ref": "proposal_review_router_skill",
+        "skill_role": "product_owner",
+        "title": "Proposal Reviewer / Product Owner",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "gemini_review_pro",
+        "id": "proposal_reviewer_ux",
+        "inputs": [
+          "idea_brief",
+          "proposal_current",
+          "proposal_feedback_coverage",
+          "reviewer_scope_plan",
+          "score_lift_backlog"
+        ],
+        "mode": "proposal_review.ux",
+        "notes": null,
+        "output_contract": "proposal_review_v1",
+        "outputs": [
+          "proposal_review_ux"
+        ],
+        "permission_profile": "RO_REVIEW",
+        "prompt": "Review the proposal as a UX designer.\nFocus on task flow, user friction, discoverability, error states, accessibility implications, onboarding, and edge cases across the journey.\nBe concrete: call out where the proposal skips transitions, recovery paths, or mental model mismatches.\nOutput only the structured review contract with a numeric score from 0 to 10.\nPrefer actionable suggestions over abstract taste.",
+        "required_tools": null,
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": {
+          "capabilities": [
+            "ux",
+            "accessibility",
+            "navigation"
+          ],
+          "close_alternatives": [
+            "proposal_reviewer_product_owner",
+            "proposal_reviewer_ui"
+          ],
+          "enabled_for_proposal_review": true,
+          "family": "design",
+          "mandatory_when": [
+            "ux",
+            "accessibility"
+          ],
+          "risks": [
+            "user-trust",
+            "privacy-sensitive"
+          ],
+          "rollout_wave": "phase_3_core",
+          "routing_id": "ux",
+          "score_weights": {
+            "baseline_gap_matches": 1,
+            "cross_stack_dependency_matches": 2,
+            "force_include": 5,
+            "overlap_penalty": 3,
+            "repo_signal_matches": 2,
+            "risk_matches": 3,
+            "stack_matches": 4,
+            "strong_keyword_matches": 2,
+            "surface_matches": 3
+          },
+          "stacks": [
+            "apple-client",
+            "cross-stack"
+          ],
+          "strong_proposal_keywords": [],
+          "strong_repo_files": [],
+          "strong_repo_symbols": [],
+          "surfaces": [
+            "ux",
+            "navigation",
+            "accessibility"
+          ],
+          "usually_pair_with": [
+            "proposal_reviewer_ui"
+          ]
+        },
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "proposal_review_router_skill",
+        "skill_role": "ux_designer",
+        "title": "Proposal Reviewer / UX",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "gemini_review_pro",
+        "id": "proposal_reviewer_ui",
+        "inputs": [
+          "idea_brief",
+          "proposal_current",
+          "proposal_feedback_coverage",
+          "reviewer_scope_plan",
+          "score_lift_backlog"
+        ],
+        "mode": "proposal_review.ui",
+        "notes": null,
+        "output_contract": "proposal_review_v1",
+        "outputs": [
+          "proposal_review_ui"
+        ],
+        "permission_profile": "RO_REVIEW",
+        "prompt": "Review the proposal as a UI designer.\nFocus on component consistency, screen states, empty/loading/error states, visual hierarchy, density, and cross-screen coherence.\nFlag places where the proposal is too vague to build a consistent interface.\nOutput only the structured review contract with a numeric score from 0 to 10.\nKeep suggestions specific enough that the proposal writer can apply them directly.",
+        "required_tools": null,
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": {
+          "capabilities": [
+            "ui",
+            "swiftui",
+            "macos"
+          ],
+          "close_alternatives": [
+            "proposal_reviewer_ux"
+          ],
+          "enabled_for_proposal_review": true,
+          "family": "design",
+          "mandatory_when": [
+            "ui"
+          ],
+          "risks": [
+            "platform-mismatch"
+          ],
+          "rollout_wave": "phase_3_core",
+          "routing_id": "ui",
+          "score_weights": {
+            "baseline_gap_matches": 1,
+            "cross_stack_dependency_matches": 2,
+            "force_include": 5,
+            "overlap_penalty": 3,
+            "repo_signal_matches": 2,
+            "risk_matches": 3,
+            "stack_matches": 4,
+            "strong_keyword_matches": 2,
+            "surface_matches": 3
+          },
+          "stacks": [
+            "ios",
+            "macos",
+            "apple-client"
+          ],
+          "strong_proposal_keywords": [],
+          "strong_repo_files": [],
+          "strong_repo_symbols": [],
+          "surfaces": [
+            "ui",
+            "navigation"
+          ],
+          "usually_pair_with": [
+            "proposal_reviewer_ux",
+            "proposal_reviewer_apple_architect"
+          ]
+        },
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "proposal_review_router_skill",
+        "skill_role": "architect",
+        "title": "Proposal Reviewer / UI",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "codex_architect_high",
+        "id": "proposal_reviewer_architect",
+        "inputs": [
+          "idea_brief",
+          "proposal_current",
+          "proposal_feedback_coverage",
+          "reviewer_scope_plan",
+          "score_lift_backlog"
+        ],
+        "mode": "proposal_review.architect",
+        "notes": null,
+        "output_contract": "proposal_review_v1",
+        "outputs": [
+          "proposal_review_architect"
+        ],
+        "permission_profile": "RO_REVIEW",
+        "prompt": "Review the proposal as a software architect.\nFocus on architecture fit, component boundaries, data flow, operational risk, migration cost, testability, failure modes, and implementation sequencing.\nFlag over-engineering, missing interfaces, unsafe coupling, and vague runtime assumptions.\nOutput only the structured review contract with a numeric score from 0 to 10.\nPrefer practical implementation concerns over theoretical purity.",
+        "required_tools": null,
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": {
+          "capabilities": [
+            "architecture",
+            "state-management",
+            "integration"
+          ],
+          "close_alternatives": [
+            "proposal_reviewer_rust_architect",
+            "proposal_reviewer_apple_architect"
+          ],
+          "enabled_for_proposal_review": true,
+          "family": "architecture",
+          "mandatory_when": [
+            "architecture"
+          ],
+          "risks": [
+            "availability-sensitive",
+            "backward-compatibility"
+          ],
+          "rollout_wave": "phase_3_core",
+          "routing_id": "architect",
+          "score_weights": {
+            "baseline_gap_matches": 1,
+            "cross_stack_dependency_matches": 2,
+            "force_include": 5,
+            "overlap_penalty": 3,
+            "repo_signal_matches": 2,
+            "risk_matches": 3,
+            "stack_matches": 4,
+            "strong_keyword_matches": 2,
+            "surface_matches": 3
+          },
+          "stacks": [
+            "any",
+            "cross-stack"
+          ],
+          "strong_proposal_keywords": [],
+          "strong_repo_files": [],
+          "strong_repo_symbols": [],
+          "surfaces": [
+            "architecture",
+            "state-management"
+          ],
+          "usually_pair_with": [
+            "proposal_reviewer_reliability"
+          ]
+        },
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "proposal_review_router_skill",
+        "skill_role": "architect",
+        "title": "Proposal Reviewer / Architect",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "junie_planner_acp",
+        "id": "proposal_review_router",
+        "inputs": [
+          "proposal_current",
+          "idea_brief",
+          "agent_catalog_snapshot"
+        ],
+        "mode": "system.routing",
+        "notes": null,
+        "output_contract": "agent_selection_plan_v1",
+        "outputs": [
+          "agent_selection_plan_v1"
+        ],
+        "permission_profile": "RO_REVIEW",
+        "prompt": "System routing task. Build an evidence-backed proposal fingerprint and emit AgentSelectionPlanV1. This agent is catalog truth for P060; the runtime executes the deterministic system.routing implementation without invoking a provider.",
+        "required_tools": null,
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": null,
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "proposal_review_router_skill",
+        "skill_role": null,
+        "title": "Proposal Review Router",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "codex_architect_high",
+        "id": "proposal_reviewer_apple_architect",
+        "inputs": [
+          "idea_brief",
+          "proposal_current",
+          "proposal_feedback_coverage",
+          "reviewer_scope_plan",
+          "score_lift_backlog"
+        ],
+        "mode": "proposal_review.apple_architecture",
+        "notes": null,
+        "output_contract": "proposal_review_v1",
+        "outputs": [
+          "proposal_review_architect"
+        ],
+        "permission_profile": "RO_REVIEW",
+        "prompt": "Review the proposal as an Apple platform architect. Focus on SwiftUI/AppKit boundaries, state ownership, concurrency, persistence, platform conventions, and migration risk. Output only the proposal_review_v1 contract.",
+        "required_tools": null,
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": {
+          "capabilities": [
+            "apple-client",
+            "swiftui",
+            "appkit",
+            "concurrency",
+            "persistence"
+          ],
+          "close_alternatives": [
+            "proposal_reviewer_architect"
+          ],
+          "enabled_for_proposal_review": true,
+          "family": "architecture",
+          "mandatory_when": [
+            "apple-client",
+            "macos",
+            "ios"
+          ],
+          "risks": [
+            "platform-mismatch",
+            "data-loss"
+          ],
+          "rollout_wave": "phase_3_core",
+          "routing_id": "apple_architect",
+          "score_weights": {
+            "baseline_gap_matches": 1,
+            "cross_stack_dependency_matches": 2,
+            "force_include": 5,
+            "overlap_penalty": 3,
+            "repo_signal_matches": 2,
+            "risk_matches": 3,
+            "stack_matches": 4,
+            "strong_keyword_matches": 2,
+            "surface_matches": 3
+          },
+          "stacks": [
+            "ios",
+            "macos",
+            "apple-client"
+          ],
+          "strong_proposal_keywords": [],
+          "strong_repo_files": [],
+          "strong_repo_symbols": [],
+          "surfaces": [
+            "architecture",
+            "state-management",
+            "concurrency",
+            "persistence",
+            "ui"
+          ],
+          "usually_pair_with": [
+            "proposal_reviewer_ui",
+            "proposal_reviewer_ux"
+          ]
+        },
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "proposal_review_router_skill",
+        "skill_role": "architect",
+        "title": "Proposal Reviewer / Apple Architecture",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "gemini_review_pro",
+        "id": "proposal_reviewer_macos",
+        "inputs": [
+          "idea_brief",
+          "proposal_current",
+          "proposal_feedback_coverage",
+          "reviewer_scope_plan",
+          "score_lift_backlog"
+        ],
+        "mode": "proposal_review.macos",
+        "notes": null,
+        "output_contract": "proposal_review_v1",
+        "outputs": [
+          "proposal_review_macos"
+        ],
+        "permission_profile": "RO_REVIEW",
+        "prompt": "Review the proposal as a macOS specialist. Focus on native macOS interaction patterns, SwiftUI/AppKit fit, accessibility, windowing, menus, keyboard workflows, and platform-specific UX risk. Output only the proposal_review_v1 contract.",
+        "required_tools": null,
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": {
+          "capabilities": [
+            "macos",
+            "swiftui",
+            "appkit",
+            "ui",
+            "accessibility"
+          ],
+          "close_alternatives": [
+            "proposal_reviewer_ui"
+          ],
+          "enabled_for_proposal_review": true,
+          "family": "platform",
+          "mandatory_when": [
+            "macos"
+          ],
+          "risks": [
+            "platform-mismatch",
+            "user-trust"
+          ],
+          "rollout_wave": "phase_3_core",
+          "routing_id": "macos",
+          "score_weights": {
+            "baseline_gap_matches": 1,
+            "cross_stack_dependency_matches": 2,
+            "force_include": 5,
+            "overlap_penalty": 3,
+            "repo_signal_matches": 2,
+            "risk_matches": 3,
+            "stack_matches": 4,
+            "strong_keyword_matches": 2,
+            "surface_matches": 3
+          },
+          "stacks": [
+            "macos",
+            "apple-client"
+          ],
+          "strong_proposal_keywords": [],
+          "strong_repo_files": [],
+          "strong_repo_symbols": [],
+          "surfaces": [
+            "ui",
+            "navigation",
+            "accessibility",
+            "architecture"
+          ],
+          "usually_pair_with": [
+            "proposal_reviewer_apple_architect",
+            "proposal_reviewer_ui"
+          ]
+        },
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "proposal_review_router_skill",
+        "skill_role": "ui_designer",
+        "title": "Proposal Reviewer / macOS",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "codex_architect_high",
+        "id": "proposal_reviewer_rust_architect",
+        "inputs": [
+          "idea_brief",
+          "proposal_current",
+          "proposal_feedback_coverage",
+          "reviewer_scope_plan",
+          "score_lift_backlog"
+        ],
+        "mode": "proposal_review.rust_architecture",
+        "notes": null,
+        "output_contract": "proposal_review_v1",
+        "outputs": [
+          "proposal_review_architect"
+        ],
+        "permission_profile": "RO_REVIEW",
+        "prompt": "Review the proposal as a Rust control-plane architect. Focus on ownership boundaries, async execution, storage contracts, migration safety, and API compatibility. Output only the proposal_review_v1 contract.",
+        "required_tools": null,
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": {
+          "capabilities": [
+            "rust-backend",
+            "async",
+            "persistence",
+            "api-contract"
+          ],
+          "close_alternatives": [
+            "proposal_reviewer_architect"
+          ],
+          "enabled_for_proposal_review": true,
+          "family": "architecture",
+          "mandatory_when": [
+            "rust-backend"
+          ],
+          "risks": [
+            "availability-sensitive",
+            "backward-compatibility"
+          ],
+          "rollout_wave": "phase_3_core",
+          "routing_id": "rust_architect",
+          "score_weights": {
+            "baseline_gap_matches": 1,
+            "cross_stack_dependency_matches": 2,
+            "force_include": 5,
+            "overlap_penalty": 3,
+            "repo_signal_matches": 2,
+            "risk_matches": 3,
+            "stack_matches": 4,
+            "strong_keyword_matches": 2,
+            "surface_matches": 3
+          },
+          "stacks": [
+            "rust-backend"
+          ],
+          "strong_proposal_keywords": [],
+          "strong_repo_files": [],
+          "strong_repo_symbols": [],
+          "surfaces": [
+            "architecture",
+            "concurrency",
+            "persistence",
+            "api-contract"
+          ],
+          "usually_pair_with": [
+            "proposal_reviewer_reliability",
+            "proposal_reviewer_api_contract"
+          ]
+        },
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "proposal_review_router_skill",
+        "skill_role": "architect",
+        "title": "Proposal Reviewer / Rust Architecture",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "claude_product_high",
+        "id": "proposal_reviewer_reliability",
+        "inputs": [
+          "idea_brief",
+          "proposal_current",
+          "proposal_feedback_coverage",
+          "reviewer_scope_plan",
+          "score_lift_backlog"
+        ],
+        "mode": "proposal_review.reliability",
+        "notes": null,
+        "output_contract": "proposal_review_v1",
+        "outputs": [
+          "proposal_review_architect"
+        ],
+        "permission_profile": "RO_REVIEW",
+        "prompt": "Review the proposal as a reliability engineer. Focus on retries, idempotency, cancellation, deadlines, backpressure, shutdown, recovery, and stuck-state risks. Output only the proposal_review_v1 contract.",
+        "required_tools": null,
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": {
+          "capabilities": [
+            "retry",
+            "idempotency",
+            "cancellation",
+            "backpressure",
+            "recovery"
+          ],
+          "close_alternatives": [
+            "proposal_reviewer_architect"
+          ],
+          "enabled_for_proposal_review": true,
+          "family": "reliability",
+          "mandatory_when": [
+            "background-work",
+            "idempotency",
+            "availability-sensitive"
+          ],
+          "risks": [
+            "idempotency",
+            "availability-sensitive",
+            "operability-sensitive",
+            "data-loss"
+          ],
+          "rollout_wave": "phase_3_core",
+          "routing_id": "reliability",
+          "score_weights": {
+            "baseline_gap_matches": 1,
+            "cross_stack_dependency_matches": 2,
+            "force_include": 5,
+            "overlap_penalty": 3,
+            "repo_signal_matches": 2,
+            "risk_matches": 3,
+            "stack_matches": 4,
+            "strong_keyword_matches": 2,
+            "surface_matches": 3
+          },
+          "stacks": [
+            "any",
+            "rust-backend",
+            "cross-stack"
+          ],
+          "strong_proposal_keywords": [
+            "retry",
+            "retries",
+            "idempotency",
+            "cancellation",
+            "backpressure",
+            "recovery",
+            "resume",
+            "stuck",
+            "timeout",
+            "sleep",
+            "wake",
+            "queue",
+            "scheduler"
+          ],
+          "strong_repo_files": [
+            "control-plane/crates/engine/src/executor.rs",
+            "control-plane/crates/engine/src/orchestrator.rs",
+            "control-plane/crates/engine/src/work_queue.rs",
+            "control-plane/crates/domain/src/routing.rs"
+          ],
+          "strong_repo_symbols": [
+            "WorkQueue",
+            "BackgroundExecutor",
+            "advance_run",
+            "retry_stage",
+            "cancellation_requested_at",
+            "ReviewRoutingMode"
+          ],
+          "surfaces": [
+            "background-work",
+            "concurrency",
+            "persistence"
+          ],
+          "usually_pair_with": [
+            "proposal_reviewer_rust_architect",
+            "proposal_reviewer_observability_rollout"
+          ]
+        },
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "proposal_review_router_skill",
+        "skill_role": "architect",
+        "title": "Proposal Reviewer / Reliability",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "claude_product_high",
+        "id": "proposal_reviewer_performance",
+        "inputs": [
+          "idea_brief",
+          "proposal_current",
+          "proposal_feedback_coverage",
+          "reviewer_scope_plan",
+          "score_lift_backlog"
+        ],
+        "mode": "proposal_review.performance",
+        "notes": null,
+        "output_contract": "proposal_review_v1",
+        "outputs": [
+          "proposal_review_architect"
+        ],
+        "permission_profile": "RO_REVIEW",
+        "prompt": "Review the proposal as a performance engineer. Focus on latency, throughput, allocation, lock contention, serialization hot paths, and load behavior. Output only the proposal_review_v1 contract.",
+        "required_tools": null,
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": {
+          "capabilities": [
+            "latency",
+            "throughput",
+            "allocation",
+            "lock-contention"
+          ],
+          "close_alternatives": [
+            "proposal_reviewer_reliability"
+          ],
+          "enabled_for_proposal_review": false,
+          "family": "performance",
+          "mandatory_when": [
+            "performance-hot-path",
+            "latency-sensitive"
+          ],
+          "risks": [
+            "latency-sensitive",
+            "availability-sensitive"
+          ],
+          "rollout_wave": "later_wave",
+          "routing_id": "performance",
+          "score_weights": {
+            "baseline_gap_matches": 1,
+            "cross_stack_dependency_matches": 2,
+            "force_include": 5,
+            "overlap_penalty": 3,
+            "repo_signal_matches": 2,
+            "risk_matches": 3,
+            "stack_matches": 4,
+            "strong_keyword_matches": 2,
+            "surface_matches": 3
+          },
+          "stacks": [
+            "any",
+            "rust-backend",
+            "apple-client"
+          ],
+          "strong_proposal_keywords": [],
+          "strong_repo_files": [],
+          "strong_repo_symbols": [],
+          "surfaces": [
+            "performance-hot-path",
+            "concurrency"
+          ],
+          "usually_pair_with": [
+            "proposal_reviewer_rust_architect"
+          ]
+        },
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "proposal_review_router_skill",
+        "skill_role": "architect",
+        "title": "Proposal Reviewer / Performance",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "claude_product_high",
+        "id": "proposal_reviewer_security",
+        "inputs": [
+          "idea_brief",
+          "proposal_current",
+          "proposal_feedback_coverage",
+          "reviewer_scope_plan",
+          "score_lift_backlog"
+        ],
+        "mode": "proposal_review.security",
+        "notes": null,
+        "output_contract": "proposal_review_v1",
+        "outputs": [
+          "proposal_review_architect"
+        ],
+        "permission_profile": "RO_REVIEW",
+        "prompt": "Review the proposal as a security engineer. Focus on auth, secrets, trust boundaries, unsafe/FFI, deserialization, public interfaces, and leakage risk. Output only the proposal_review_v1 contract.",
+        "required_tools": null,
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": {
+          "capabilities": [
+            "auth",
+            "secrets",
+            "unsafe",
+            "deserialization",
+            "trust-boundary"
+          ],
+          "close_alternatives": [
+            "proposal_reviewer_rust_architect"
+          ],
+          "enabled_for_proposal_review": true,
+          "family": "security",
+          "mandatory_when": [
+            "auth",
+            "security-sensitive",
+            "privacy-sensitive"
+          ],
+          "risks": [
+            "security-sensitive",
+            "privacy-sensitive"
+          ],
+          "rollout_wave": "phase_3_core",
+          "routing_id": "security",
+          "score_weights": {
+            "baseline_gap_matches": 1,
+            "cross_stack_dependency_matches": 2,
+            "force_include": 5,
+            "overlap_penalty": 3,
+            "repo_signal_matches": 2,
+            "risk_matches": 3,
+            "stack_matches": 4,
+            "strong_keyword_matches": 2,
+            "surface_matches": 3
+          },
+          "stacks": [
+            "any",
+            "rust-backend",
+            "shared-api"
+          ],
+          "strong_proposal_keywords": [
+            "auth",
+            "authorization",
+            "permission",
+            "secret",
+            "secrets",
+            "token",
+            "redaction",
+            "trust-boundary",
+            "unsafe",
+            "deserialization",
+            "privacy"
+          ],
+          "strong_repo_files": [
+            "control-plane/crates/auth/src/lib.rs",
+            "control-plane/crates/mcp-server/src/request_context.rs",
+            "control-plane/crates/domain/src/routing.rs",
+            "Chainworks Forge/Providers/KeychainSecretStore.swift"
+          ],
+          "strong_repo_symbols": [
+            "Principal",
+            "PrincipalClass",
+            "CapabilityToolId",
+            "KeychainSecretStore",
+            "trust_boundary"
+          ],
+          "surfaces": [
+            "auth",
+            "security-boundary",
+            "api-contract"
+          ],
+          "usually_pair_with": [
+            "proposal_reviewer_api_contract"
+          ]
+        },
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "proposal_review_router_skill",
+        "skill_role": "architect",
+        "title": "Proposal Reviewer / Security",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "codex_architect_high",
+        "id": "proposal_reviewer_api_contract",
+        "inputs": [
+          "idea_brief",
+          "proposal_current",
+          "proposal_feedback_coverage",
+          "reviewer_scope_plan",
+          "score_lift_backlog"
+        ],
+        "mode": "proposal_review.api_contract",
+        "notes": null,
+        "output_contract": "proposal_review_v1",
+        "outputs": [
+          "proposal_review_architect"
+        ],
+        "permission_profile": "RO_REVIEW",
+        "prompt": "Review the proposal as an API contract reviewer. Focus on GraphQL, MCP, YAML, artifact contracts, migrations, compatibility, and versioning. Output only the proposal_review_v1 contract.",
+        "required_tools": null,
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": {
+          "capabilities": [
+            "graphql",
+            "mcp",
+            "yaml",
+            "artifact-contract",
+            "migration"
+          ],
+          "close_alternatives": [
+            "proposal_reviewer_architect"
+          ],
+          "enabled_for_proposal_review": true,
+          "family": "api_contract",
+          "mandatory_when": [
+            "api-contract",
+            "backward-compatibility"
+          ],
+          "risks": [
+            "backward-compatibility",
+            "multi-service-coordination"
+          ],
+          "rollout_wave": "phase_3_core",
+          "routing_id": "api_contract",
+          "score_weights": {
+            "baseline_gap_matches": 1,
+            "cross_stack_dependency_matches": 2,
+            "force_include": 5,
+            "overlap_penalty": 3,
+            "repo_signal_matches": 2,
+            "risk_matches": 3,
+            "stack_matches": 4,
+            "strong_keyword_matches": 2,
+            "surface_matches": 3
+          },
+          "stacks": [
+            "shared-api",
+            "cross-stack",
+            "rust-backend"
+          ],
+          "strong_proposal_keywords": [
+            "graphql",
+            "mcp",
+            "yaml",
+            "artifact-contract",
+            "schema",
+            "migration",
+            "contract",
+            "wire-shape",
+            "backward-compatible",
+            "compatibility"
+          ],
+          "strong_repo_files": [
+            "control-plane/crates/graphql-server/src/schema.rs",
+            "control-plane/crates/mcp-server/src/tools/runs.rs",
+            "control-plane/crates/workflow/src/compiler.rs",
+            "examples/workflows/workflow.yaml",
+            "examples/agents/agents.yaml"
+          ],
+          "strong_repo_symbols": [
+            "StartRunCmd",
+            "ReviewRoutingOptions",
+            "selected_outputs_from",
+            "agent_selection_plan_v1",
+            "review_corpus_bundle_v2"
+          ],
+          "surfaces": [
+            "api-contract",
+            "migration",
+            "persistence"
+          ],
+          "usually_pair_with": [
+            "proposal_reviewer_rust_architect",
+            "proposal_reviewer_security"
+          ]
+        },
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "proposal_review_router_skill",
+        "skill_role": "architect",
+        "title": "Proposal Reviewer / API Contract",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "claude_product_high",
+        "id": "proposal_reviewer_observability_rollout",
+        "inputs": [
+          "idea_brief",
+          "proposal_current",
+          "proposal_feedback_coverage",
+          "reviewer_scope_plan",
+          "score_lift_backlog"
+        ],
+        "mode": "proposal_review.observability_rollout",
+        "notes": null,
+        "output_contract": "proposal_review_v1",
+        "outputs": [
+          "proposal_review_po"
+        ],
+        "permission_profile": "RO_REVIEW",
+        "prompt": "Review the proposal as an observability and rollout reviewer. Focus on telemetry, feature flags, migration evidence, rollback, supportability, and operator confidence. Output only the proposal_review_v1 contract.",
+        "required_tools": null,
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": {
+          "capabilities": [
+            "telemetry",
+            "feature-flag",
+            "rollout",
+            "rollback",
+            "support"
+          ],
+          "close_alternatives": [
+            "proposal_reviewer_product_owner"
+          ],
+          "enabled_for_proposal_review": true,
+          "family": "rollout",
+          "mandatory_when": [
+            "rollout",
+            "telemetry",
+            "feature-flag",
+            "operability-sensitive"
+          ],
+          "risks": [
+            "operability-sensitive",
+            "user-trust"
+          ],
+          "rollout_wave": "phase_3_core",
+          "routing_id": "observability_rollout",
+          "score_weights": {
+            "baseline_gap_matches": 1,
+            "cross_stack_dependency_matches": 2,
+            "force_include": 5,
+            "overlap_penalty": 3,
+            "repo_signal_matches": 2,
+            "risk_matches": 3,
+            "stack_matches": 4,
+            "strong_keyword_matches": 2,
+            "surface_matches": 3
+          },
+          "stacks": [
+            "any",
+            "cross-stack"
+          ],
+          "strong_proposal_keywords": [
+            "telemetry",
+            "metrics",
+            "rollout",
+            "rollback",
+            "feature-flag",
+            "release",
+            "evidence",
+            "support",
+            "diagnostics",
+            "gate"
+          ],
+          "strong_repo_files": [
+            "scripts/test-gate.sh",
+            "docs/reference/test-gates.md",
+            "control-plane/crates/db/src/repos/routing_receipts.rs",
+            "control-plane/crates/db/src/repos/system_executions.rs"
+          ],
+          "strong_repo_symbols": [
+            "RoutingReceipt",
+            "SystemExecution",
+            "p060_dispatch_mode",
+            "proposal_060",
+            "rollout_wave"
+          ],
+          "surfaces": [
+            "telemetry",
+            "feature-flag",
+            "rollout",
+            "migration"
+          ],
+          "usually_pair_with": [
+            "proposal_reviewer_reliability"
+          ]
+        },
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "proposal_review_router_skill",
+        "skill_role": "product_owner",
+        "title": "Proposal Reviewer / Observability and Rollout",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "claude_builder_high",
+        "continuation_capability": {
+          "allowed_session_scope": [
+            "same_agent",
+            "same_agent_family_within_run"
+          ],
+          "allowed_triggers": [
+            "operator_mcp",
+            "lead_auto"
+          ],
+          "enabled": true,
+          "forbidden_stage_kinds": [
+            "release",
+            "publish",
+            "git_push",
+            "upload",
+            "distribution"
+          ],
+          "live_handle_continuation": {
+            "enabled": true,
+            "require_live_session": true
+          },
+          "output_only_recovery": {
+            "allowed_triggers": [
+              "operator_mcp"
+            ],
+            "enabled": true,
+            "require_live_session": true,
+            "source_edit_allowance": false
+          },
+          "provider_session_resurrection": {
+            "allowed_triggers": [
+              "operator_mcp"
+            ],
+            "enabled": true,
+            "fail_closed_when_unsupported": true,
+            "require_recorded_provider_session_id": true
+          },
+          "require_no_unresolved_side_effects": true,
+          "require_same_worktree": true
+        },
+        "id": "code_writer",
+        "inputs": [
+          "approved_proposal",
+          "implementation_plan",
+          "implementation_backlog",
+          "audit_report",
+          "security_report",
+          "prepush_review_report"
+        ],
+        "mode": "implementation",
+        "notes": null,
+        "output_contract": "implementation_self_assessment_v2",
+        "outputs": [
+          "implementation_progress",
+          "implementation_self_assessment",
+          "tests_result"
+        ],
+        "permission_profile": "CODE_WRITE",
+        "prompt": "Implement the approved proposal incrementally in the dedicated implementation worktree.\nPrefer small, reversible changes that keep the project buildable.\nKeep a running progress artifact, write or update tests with the code, and record a self-assessment after each pass.\nWrite implementation_self_assessment as strict implementation_self_assessment_v2 JSON with implementation_complete, verification_green, remaining_code_tasks, handoff_tasks, known_risks, tests_run, and docs_impacted.\nPut code-writer-owned source or test blockers only in remaining_code_tasks; each entry must be an object with summary, owner, blocking, and evidence.\nIf all remaining_code_tasks are blocking=false and verification_green is true, do not report the implementation as needs_code_fixes or keep implementation_complete=false just to hold deferred rollout/non-code work; move downstream work to handoff_tasks and let the contract settle as handoff_required.\nPut docs, manual evidence, release, ops, product, or human-operator work in handoff_tasks; each entry must be an object with summary, owner_class, target_stage, blocking_review, and evidence.\nUse only these owner_class values: docs, manual_evidence, release, ops, product, human_operator, unknown. Do not use docs-agent, docs_agent, operator, security-owner, release-owner, or slash-qualified owner_class values.\nknown_risks, tests_run, and docs_impacted must be arrays of strings. Do not set docs_impacted to true or false.\nDo not use seemingly_complete or tests_result.green as transition truth.\nDo not run `git status`, `git diff`, or `git rev-parse`, and do not read `.git`.\nGit evidence is generated by the control plane after provider execution. Publish only implementation_progress, implementation_self_assessment, and tests_result; do not publish changed_files_manifest.\nDo not commit, do not push, and do not edit repository docs unless the docs agent is invoked.\nWhen in doubt, choose the simplest implementation that satisfies the approved proposal and current review findings.",
+        "required_tools": [
+          "go test ./...",
+          "cargo test",
+          "swift build",
+          "swift test",
+          "xcodebuild -project \"Chainworks Forge.xcodeproj\" -scheme \"Chainworks Forge\" -destination \"platform=macOS\" build",
+          "xcodebuild -project \"Chainworks Forge.xcodeproj\" -scheme \"Chainworks Forge\" -destination \"platform=macOS\" test"
+        ],
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": true,
+        "routing": null,
+        "session_family_id": "implementation_loop",
+        "session_reuse_scope": "same_agent_family_within_run",
+        "skill_ref": "code_writer_core",
+        "skill_role": null,
+        "title": "Code Writer",
+        "worktree_policy": {
+          "base_branch": "${CHAINWORKS_BASE_BRANCH:-main}",
+          "path": "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}",
+          "strategy": "dedicated",
+          "write_enabled": true
+        },
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "codex_writer_high",
+        "id": "proposal_writer",
+        "inputs": [
+          "idea_brief",
+          "proposal_current",
+          "proposal_review_po",
+          "proposal_review_ux",
+          "proposal_review_ui",
+          "proposal_review_architect",
+          "proposal_review_summary",
+          "review_corpus_bundle",
+          "review_corpus_bundle_v2",
+          "score_lift_backlog",
+          "proposal_fact_digest"
+        ],
+        "mode": "proposal_authoring",
+        "notes": null,
+        "output_contract": null,
+        "outputs": [
+          "proposal_current",
+          "proposal_revision_summary",
+          "proposal_feedback_coverage"
+        ],
+        "permission_profile": "PROPOSAL_WRITE",
+        "prompt": "Draft and refine the proposal from the current idea and all reviewer feedback.\nProduce one clear proposal document that is easy to review and easy to implement.\nCover problem, goals, non-goals, UX/UI notes, architecture, rollout, metrics, risks, and open questions.\nFor every proposal where the rollout gate is applicable, include a strict top-level rollout_contract_v1 object that conforms to docs/reference/executable-rollout-gate-template.md before the proposal can be frozen for implementation; do not nest the canonical rollout_contract_v1 only under rollout.\nTreat score_lift_backlog.review_pass_id and score_lift_backlog.items as the authoritative blocker list for this refine pass.\nIf proposal_current contains older reviewer_feedback_resolution text, blocker mappings, or self-summaries that disagree with the current score_lift_backlog, rewrite or remove the stale material instead of carrying it forward.\nproposal_feedback_coverage.source_review_pass_id must match the current score_lift_backlog.review_pass_id, and every backlog item listed as addressed, unresolved, deferred, or disputed must come from that current score_lift_backlog.\nproposal_revision_summary and proposal_current must not claim blocker IDs that are absent from the current score_lift_backlog.\nResolve reviewer feedback explicitly; do not silently ignore disagreements.\nOptimize for a proposal that can reach an aggregate score above 9 without hiding trade-offs.",
+        "required_tools": null,
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": null,
+        "session_family_id": "proposal_authoring_loop",
+        "session_reuse_scope": "same_agent_family_within_run",
+        "skill_ref": "proposal_writer_core",
+        "skill_role": null,
+        "title": "Proposal Writer",
+        "worktree_policy": {
+          "base_branch": null,
+          "path": "${CHAINWORKS_META_ROOT:-.chainworks}/proposals",
+          "strategy": "meta_only",
+          "write_enabled": true
+        },
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "codex_audit_high",
+        "id": "proposal_implementation_auditor",
+        "inputs": [
+          "approved_proposal",
+          "implementation_progress",
+          "changed_files_manifest",
+          "tests_result",
+          "docs_report"
+        ],
+        "mode": "audit",
+        "notes": null,
+        "output_contract": "audit_report_v1",
+        "outputs": [
+          "audit_report"
+        ],
+        "permission_profile": "RO_VERIFY",
+        "prompt": "Audit the approved proposal against the implementation in the implementation worktree.\nApply the frozen implementation-audit procedure within the mission context and declared evidence inputs.\nOutput only the audit contract.",
+        "required_tools": [
+          "go test ./...",
+          "cargo test",
+          "swift test",
+          "xcodebuild -project \"Chainworks Forge.xcodeproj\" -scheme \"Chainworks Forge\" -destination \"platform=macOS\" build",
+          "xcodebuild -project \"Chainworks Forge.xcodeproj\" -scheme \"Chainworks Forge\" -destination \"platform=macOS\" test"
+        ],
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": true,
+        "routing": null,
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "proposal_implementation_audit",
+        "skill_role": null,
+        "title": "Proposal vs Implementation Auditor",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "claude_security_high",
+        "id": "security_checker",
+        "inputs": [
+          "approved_proposal",
+          "implementation_progress",
+          "changed_files_manifest",
+          "tests_result"
+        ],
+        "mode": "security",
+        "notes": null,
+        "output_contract": "security_report_v1",
+        "outputs": [
+          "security_report"
+        ],
+        "permission_profile": "RO_VERIFY",
+        "prompt": "Review the current implementation for security and privacy risks.\nFocus on auth/authz, secrets handling, unsafe defaults, injection, serialization, filesystem access, network boundaries, data leakage, and dependency risk.\nUse readonly scanners when available, but do not rely on scanners alone.\nUse changed_files_manifest as the canonical control-plane-generated Git evidence. Do not run `git status`, `git diff`, or `git rev-parse`, and do not read `.git`.\nOutput only the structured security report and mark status as pass only when no blocking issue remains.",
+        "required_tools": [
+          "scanner.readonly",
+          "dependency_scan.readonly",
+          "secrets_scan.readonly"
+        ],
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": null,
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "security_checker_core",
+        "skill_role": null,
+        "title": "Security Checker",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "gemini_ops_flash_lite",
+        "id": "commit_and_push_to_github",
+        "inputs": [
+          "approved_proposal",
+          "implementation_review_summary",
+          "docs_report",
+          "prepush_review_report"
+        ],
+        "mode": "release_git",
+        "notes": null,
+        "output_contract": "git_push_receipt_v1",
+        "outputs": [
+          "release_manifest",
+          "git_push_receipt"
+        ],
+        "permission_profile": "RELEASE_GIT",
+        "prompt": "Commit and push the already approved implementation.\nThis agent is for release mechanics only, not for code changes.\nUse deterministic git/github tools, record the resulting commit SHA and branch, and write a release manifest.\nNever modify source files, never bypass approval, and never run before the final release approval gate is green.",
+        "required_tools": [
+          "git.commit",
+          "git.push",
+          "github.read"
+        ],
+        "requires_human_approval": true,
+        "requires_xcode_host_execution": null,
+        "routing": null,
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "github_commit_push",
+        "skill_role": null,
+        "title": "Commit and Push to GitHub",
+        "worktree_policy": {
+          "base_branch": null,
+          "path": "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}",
+          "strategy": "dedicated",
+          "write_enabled": false
+        },
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "claude_prepush_medium",
+        "id": "prepush_code_reviewer",
+        "inputs": [
+          "approved_proposal",
+          "implementation_progress",
+          "changed_files_manifest",
+          "tests_result",
+          "audit_report",
+          "security_report"
+        ],
+        "mode": "prepush_review",
+        "notes": null,
+        "output_contract": "prepush_review_v1",
+        "outputs": [
+          "prepush_review_report"
+        ],
+        "permission_profile": "RO_PREPUSH_VERIFY",
+        "prompt": "Perform the last human-like code review before commit and push.\nFocus on correctness, readability, maintainability, surprising side effects, regression risk, and missing tests.\nDo not propose gold-plating; prioritize issues that would make the release unsafe or expensive to maintain.\nUse changed_files_manifest as the canonical control-plane-generated Git evidence. Do not run `git status`, `git diff`, or `git rev-parse`, and do not read `.git`.\nKeep discovery bounded: inspect changed files and implicated paths first; do not run broad rg/find over repo or worktree roots unless generated/build roots are excluded and output is capped.\nOutput only the structured pre-push review contract.",
+        "required_tools": [
+          "go test ./...",
+          "cargo test",
+          "swift test"
+        ],
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": null,
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "prepush_review_core",
+        "skill_role": null,
+        "title": "Pre-push Code Reviewer",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "gemini_ops_flash_lite",
+        "id": "build_archive_and_push_connect",
+        "inputs": [
+          "git_push_receipt",
+          "release_manifest"
+        ],
+        "mode": "release_publish",
+        "notes": null,
+        "output_contract": "connect_upload_receipt_v1",
+        "outputs": [
+          "release_bundle_manifest",
+          "connect_upload_receipt"
+        ],
+        "permission_profile": "RELEASE_PUBLISH",
+        "prompt": "Build the release archive from the approved implementation, compute checksums, and upload the artifact to Connect.\nUse deterministic build and upload tools only.\nRecord the artifact id, checksum, destination, and any release metadata required for traceability.\nNever edit source code and never run before final release approval and commit/push have succeeded.",
+        "required_tools": [
+          "build.archive",
+          "connect.upload"
+        ],
+        "requires_human_approval": true,
+        "requires_xcode_host_execution": null,
+        "routing": null,
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "connect_publisher",
+        "skill_role": null,
+        "title": "Build Archive and Push to Connect",
+        "worktree_policy": {
+          "base_branch": null,
+          "path": "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}",
+          "strategy": "dedicated",
+          "write_enabled": false
+        },
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "gemini_docs_flash",
+        "id": "docs_guardian",
+        "inputs": [
+          "approved_proposal",
+          "implementation_progress",
+          "changed_files_manifest",
+          "audit_report"
+        ],
+        "mode": "docs",
+        "notes": null,
+        "output_contract": "docs_report_v1",
+        "outputs": [
+          "docs_report",
+          "docs_delta"
+        ],
+        "permission_profile": "DOC_WRITE",
+        "prompt": "Keep documentation consistent with the approved proposal and the implemented behavior.\nUpdate only the docs that are genuinely impacted: README, docs pages, changelog, runbooks, or usage notes.\nPrefer small exact edits over broad rewrites.\nWhen docs are already aligned, output that no doc change is needed and explain why.",
+        "required_tools": null,
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": null,
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "docs_quality_guardian",
+        "skill_role": null,
+        "title": "Docs Guardian",
+        "worktree_policy": {
+          "base_branch": null,
+          "path": "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}",
+          "strategy": "shared_implementation_worktree",
+          "write_enabled": true
+        },
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "claude_steward_high",
+        "id": "system_steward",
+        "inputs": [
+          "metrics_window",
+          "baseline_window",
+          "implicated_run_dossiers",
+          "agent_catalog_snapshot",
+          "workflow_snapshot",
+          "config_change_log"
+        ],
+        "mode": "meta_analysis",
+        "notes": null,
+        "output_contract": "sdlc_health_report_v1",
+        "outputs": [
+          "sdlc_health_report",
+          "degradation_alert",
+          "agent_tuning_proposal",
+          "workflow_tuning_proposal",
+          "experiment_plan"
+        ],
+        "permission_profile": "RO_VERIFY",
+        "prompt": "You are Forge Steward, the system-level SDLC health analyst for Chainworks.\nYour job is to observe the performance of the agent workflow across many runs,\nidentify meaningful degradations or improvements, separate symptoms from likely causes,\nand produce concrete, testable change proposals.\nStay evidence-first, precise, and practical. If evidence is weak, say so plainly.",
+        "required_tools": null,
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": null,
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "steward_core",
+        "skill_role": "sdlc_health",
+        "title": "Forge Steward",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "claude_auditor_medium",
+        "id": "steward_auditor",
+        "inputs": [
+          "sdlc_health_report",
+          "implicated_run_dossiers",
+          "metrics_window",
+          "baseline_window"
+        ],
+        "mode": "meta_audit",
+        "notes": null,
+        "output_contract": "stewardship_audit_report_v1",
+        "outputs": [
+          "stewardship_audit_report"
+        ],
+        "permission_profile": "RO_VERIFY",
+        "prompt": "You are Steward Auditor, an independent critic of the Forge Steward analysis.\nChallenge the current explanation and test whether the evidence really supports it.\nBe adversarial toward weak reasoning, not toward people.\nKeep discovery bounded: inspect implicated run dossiers and cited files first; do not run broad rg/find over repo or worktree roots unless generated/build roots are excluded and output is capped.\nKeep criticism concrete and evidence-linked.",
+        "required_tools": null,
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": null,
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "steward_core",
+        "skill_role": "critical_auditor",
+        "title": "Steward Auditor",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      },
+      {
+        "backend_profile": "claude_retrospective_medium",
+        "id": "agent_retrospective_interviewer",
+        "inputs": [
+          "implicated_agent_dossier",
+          "source_artifacts",
+          "review_feedback",
+          "final_outcome"
+        ],
+        "mode": "retrospective",
+        "notes": null,
+        "output_contract": "agent_retrospective_report_v1",
+        "outputs": [
+          "agent_retrospective_report"
+        ],
+        "permission_profile": "RO_VERIFY",
+        "prompt": "You are Agent Retrospective Interviewer.\nReconstruct why a specific agent execution produced a weak or degraded outcome.\nReason only from the dossier you are given. No imaginary memory. No vague psychologizing.",
+        "required_tools": null,
+        "requires_human_approval": false,
+        "requires_xcode_host_execution": null,
+        "routing": null,
+        "session_family_id": null,
+        "session_reuse_scope": null,
+        "skill_ref": "steward_core",
+        "skill_role": "agent_retro",
+        "title": "Agent Retrospective Interviewer",
+        "worktree_policy": null,
+        "xcode_broker_required": null,
+        "xcode_shim_injection_signal": null
+      }
+    ],
+    "app": {
+      "description": "Multi-agent catalog for a single-engineer workflow constructor/executor.",
+      "idea_input_mode": "text_with_optional_file",
+      "name": "Chainworks",
+      "required_providers": [
+        "codex_acp",
+        "claude_acp",
+        "gemini_acp",
+        "junie"
+      ],
+      "run_resume_policy": "automatic_on_launch",
+      "runtime": "acp",
+      "single_active_run_per_idea": true,
+      "transport": "acp_stdio"
+    },
+    "artifacts": {
+      "agent_catalog_snapshot": "${CHAINWORKS_META_ROOT:-.chainworks}/steward/catalog-snapshot.json",
+      "agent_retrospective_report": "${CHAINWORKS_META_ROOT:-.chainworks}/steward/reports/retrospective-report.json",
+      "agent_selection_plan_v1": "${CHAINWORKS_META_ROOT:-.chainworks}/routing/agent-selection-plan.v1.json",
+      "agent_tuning_proposal": "${CHAINWORKS_META_ROOT:-.chainworks}/steward/proposals/agent-tuning.json",
+      "approval_request": "${CHAINWORKS_META_ROOT:-.chainworks}/approvals/current-request.json",
+      "approved_proposal": "${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.md",
+      "audit_report": "${CHAINWORKS_META_ROOT:-.chainworks}/audit/proposal-vs-implementation.json",
+      "baseline_window": "${CHAINWORKS_META_ROOT:-.chainworks}/steward/baseline-window.json",
+      "blocker_boundary_approval_request": "${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/blocker-boundary-approval-request.json",
+      "blocker_boundary_human_decision": "${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/blocker-boundary-human-decision.json",
+      "blocker_boundary_status": "${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/blocker-boundary-status.json",
+      "changed_files_manifest": "${CHAINWORKS_META_ROOT:-.chainworks}/implementation/changed-files.json",
+      "config_change_log": "${CHAINWORKS_META_ROOT:-.chainworks}/steward/config-change-log.json",
+      "connect_upload_receipt": "${CHAINWORKS_META_ROOT:-.chainworks}/release/connect-upload.json",
+      "degradation_alert": "${CHAINWORKS_META_ROOT:-.chainworks}/steward/reports/degradation-alert.json",
+      "delivery_receipt": "${CHAINWORKS_META_ROOT:-.chainworks}/release/delivery-receipt.json",
+      "docs_delta": "${CHAINWORKS_META_ROOT:-.chainworks}/docs/changed-files.json",
+      "docs_report": "${CHAINWORKS_META_ROOT:-.chainworks}/docs/report.json",
+      "experiment_plan": "${CHAINWORKS_META_ROOT:-.chainworks}/steward/proposals/experiment-plan.json",
+      "final_feature_report": "${CHAINWORKS_META_ROOT:-.chainworks}/summaries/final-feature-report.json",
+      "final_outcome": "${CHAINWORKS_META_ROOT:-.chainworks}/steward/dossiers/final-outcome.json",
+      "followup_proposal_seed": "${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/followup-proposal-seed.json",
+      "git_push_receipt": "${CHAINWORKS_META_ROOT:-.chainworks}/release/git-push.json",
+      "idea_brief": "${CHAINWORKS_META_ROOT:-.chainworks}/context/idea.md",
+      "implementation_backlog": "${CHAINWORKS_META_ROOT:-.chainworks}/implementation/backlog.yaml",
+      "implementation_plan": "${CHAINWORKS_META_ROOT:-.chainworks}/implementation/plan.md",
+      "implementation_progress": "${CHAINWORKS_META_ROOT:-.chainworks}/implementation/progress.md",
+      "implementation_review_summary": "${CHAINWORKS_META_ROOT:-.chainworks}/review/implementation-summary.json",
+      "implementation_self_assessment": "${CHAINWORKS_META_ROOT:-.chainworks}/implementation/self-assessment.json",
+      "implementation_self_assessment_v2": "${CHAINWORKS_META_ROOT:-.chainworks}/implementation/self-assessment.json",
+      "implicated_agent_dossier": "${CHAINWORKS_META_ROOT:-.chainworks}/steward/dossiers/agent/",
+      "implicated_run_dossiers": "${CHAINWORKS_META_ROOT:-.chainworks}/steward/dossiers/",
+      "lead_resolution": "${CHAINWORKS_META_ROOT:-.chainworks}/mediation/lead-resolution.json",
+      "metrics_window": "${CHAINWORKS_META_ROOT:-.chainworks}/steward/metrics-window.json",
+      "orchestrator_summary": "${CHAINWORKS_META_ROOT:-.chainworks}/summaries/orchestrator.md",
+      "prepush_review_report": "${CHAINWORKS_META_ROOT:-.chainworks}/review/prepush.json",
+      "proposal_current": "${CHAINWORKS_META_ROOT:-.chainworks}/proposals/current/proposal.md",
+      "proposal_decomposition_plan": "${CHAINWORKS_META_ROOT:-.chainworks}/proposal/decomposition-plan.json",
+      "proposal_fact_digest": "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/fact-digest.json",
+      "proposal_feedback_coverage": "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/feedback-coverage.json",
+      "proposal_review_architect": "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/architect.json",
+      "proposal_review_po": "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/product-owner.json",
+      "proposal_review_summary": "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/summary.json",
+      "proposal_review_ui": "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/ui.json",
+      "proposal_review_ux": "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/ux.json",
+      "proposal_revision_summary": "${CHAINWORKS_META_ROOT:-.chainworks}/proposals/current/revision-summary.md",
+      "quality_gate_blocker_assessment": "${CHAINWORKS_META_ROOT:-.chainworks}/quality-gate/blocker-assessment.json",
+      "release_bundle_manifest": "${CHAINWORKS_META_ROOT:-.chainworks}/release/bundle.json",
+      "release_manifest": "${CHAINWORKS_META_ROOT:-.chainworks}/release/manifest.json",
+      "review_corpus_bundle": "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/review-corpus-bundle.json",
+      "review_corpus_bundle_v2": "${CHAINWORKS_META_ROOT:-.chainworks}/routing/review-corpus-bundle.v2.json",
+      "review_feedback": "${CHAINWORKS_META_ROOT:-.chainworks}/steward/dossiers/review-feedback.json",
+      "reviewer_scope_plan": "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/reviewer-scope-plan.json",
+      "run_report": "${CHAINWORKS_META_ROOT:-.chainworks}/reports/run-report.json",
+      "run_state": "${CHAINWORKS_META_ROOT:-.chainworks}/state/run-state.json",
+      "score_lift_backlog": "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/score-lift-backlog.json",
+      "sdlc_health_report": "${CHAINWORKS_META_ROOT:-.chainworks}/steward/reports/health-report.json",
+      "security_report": "${CHAINWORKS_META_ROOT:-.chainworks}/security/report.json",
+      "source_artifacts": "${CHAINWORKS_META_ROOT:-.chainworks}/steward/dossiers/source-artifacts/",
+      "stewardship_audit_report": "${CHAINWORKS_META_ROOT:-.chainworks}/steward/reports/audit-report.json",
+      "tests_result": "${CHAINWORKS_META_ROOT:-.chainworks}/implementation/tests.json",
+      "workflow_snapshot": "${CHAINWORKS_META_ROOT:-.chainworks}/steward/workflow-snapshot.json",
+      "workflow_tuning_proposal": "${CHAINWORKS_META_ROOT:-.chainworks}/steward/proposals/workflow-tuning.json"
+    },
+    "backend_profiles": {
+      "auggie_orchestrator_acp": {
+        "effort": "medium",
+        "max_turns": 12,
+        "mcp": [],
+        "model": "auggie-default",
+        "provider": "auggie",
+        "runtime_profile": "auggie_cli_acp",
+        "structured_output": "preferred",
+        "temperature": 0.1
+      },
+      "claude_auditor_medium": {
+        "effort": "medium",
+        "max_turns": 14,
+        "mcp": [
+          "context7"
+        ],
+        "model": "opus",
+        "provider": "claude_acp",
+        "runtime_profile": "claude_agent_acp",
+        "structured_output": "required",
+        "temperature": 0.0
+      },
+      "claude_builder_high": {
+        "effort": "high",
+        "max_turns": 24,
+        "mcp": [
+          "xcode"
+        ],
+        "model": "sonnet",
+        "provider": "claude_acp",
+        "runtime_profile": "claude_agent_acp",
+        "structured_output": "required",
+        "temperature": 0.1
+      },
+      "claude_design_medium": {
+        "effort": "medium",
+        "max_turns": 12,
+        "mcp": [],
+        "model": "opus",
+        "provider": "claude_acp",
+        "runtime_profile": "claude_agent_acp",
+        "structured_output": "required",
+        "temperature": 0.2
+      },
+      "claude_docs_medium": {
+        "effort": "medium",
+        "max_turns": 12,
+        "mcp": [
+          "xcode"
+        ],
+        "model": "opus",
+        "provider": "claude_acp",
+        "runtime_profile": "claude_agent_acp",
+        "structured_output": "required",
+        "temperature": 0.2
+      },
+      "claude_orchestrator_high": {
+        "effort": "high",
+        "max_turns": 20,
+        "mcp": [],
+        "model": "opus",
+        "provider": "claude_acp",
+        "runtime_profile": "claude_agent_acp",
+        "structured_output": "required",
+        "temperature": 0.1
+      },
+      "claude_prepush_medium": {
+        "effort": "medium",
+        "max_turns": 12,
+        "mcp": [],
+        "model": "opus",
+        "provider": "claude_acp",
+        "runtime_profile": "claude_agent_acp",
+        "structured_output": "required",
+        "temperature": 0.1
+      },
+      "claude_product_high": {
+        "effort": "high",
+        "max_turns": 14,
+        "mcp": [
+          "xcode"
+        ],
+        "model": "opus",
+        "provider": "claude_acp",
+        "runtime_profile": "claude_agent_acp",
+        "structured_output": "required",
+        "temperature": 0.1
+      },
+      "claude_retrospective_medium": {
+        "effort": "medium",
+        "max_turns": 12,
+        "mcp": [
+          "context7"
+        ],
+        "model": "opus",
+        "provider": "claude_acp",
+        "runtime_profile": "claude_agent_acp",
+        "structured_output": "required",
+        "temperature": 0.1
+      },
+      "claude_security_high": {
+        "effort": "high",
+        "max_turns": 16,
+        "mcp": [
+          "context7"
+        ],
+        "model": "opus",
+        "provider": "claude_acp",
+        "runtime_profile": "claude_agent_acp",
+        "structured_output": "required",
+        "temperature": 0.0
+      },
+      "claude_steward_high": {
+        "effort": "high",
+        "max_turns": 16,
+        "mcp": [
+          "context7"
+        ],
+        "model": "opus",
+        "provider": "claude_acp",
+        "runtime_profile": "claude_agent_acp",
+        "structured_output": "required",
+        "temperature": 0.1
+      },
+      "claude_writer_high": {
+        "effort": "high",
+        "max_turns": 18,
+        "mcp": [],
+        "model": "opus",
+        "provider": "claude_acp",
+        "runtime_profile": "claude_agent_acp",
+        "structured_output": "preferred",
+        "temperature": 0.15
+      },
+      "codex_architect_high": {
+        "effort": "xhigh",
+        "max_turns": 16,
+        "mcp": [
+          "xcode",
+          "context7"
+        ],
+        "model": "gpt-5.6",
+        "provider": "codex_acp",
+        "runtime_profile": "codex_acp",
+        "structured_output": "required",
+        "temperature": 0.1
+      },
+      "codex_audit_high": {
+        "effort": "xhigh",
+        "max_turns": 18,
+        "mcp": [
+          "xcode"
+        ],
+        "model": "gpt-5.6",
+        "provider": "codex_acp",
+        "runtime_profile": "codex_acp",
+        "structured_output": "required",
+        "temperature": 0.0
+      },
+      "codex_builder_high": {
+        "effort": "high",
+        "max_turns": 24,
+        "mcp": [
+          "context7",
+          "xcode"
+        ],
+        "model": "gpt-5.6",
+        "provider": "codex_acp",
+        "runtime_profile": "codex_acp",
+        "structured_output": "required",
+        "temperature": 0.1
+      },
+      "codex_ops_low": {
+        "effort": "low",
+        "max_turns": 8,
+        "mcp": [],
+        "model": "gpt-5.6",
+        "provider": "codex_acp",
+        "runtime_profile": "codex_acp",
+        "structured_output": "required",
+        "temperature": 0.0
+      },
+      "codex_orchestrator_acp": {
+        "effort": "medium",
+        "max_turns": 12,
+        "mcp": [],
+        "model": "gpt-5.6",
+        "provider": "codex_acp",
+        "runtime_profile": "codex_acp",
+        "structured_output": "preferred",
+        "temperature": 0.1
+      },
+      "codex_orchestrator_high": {
+        "effort": "high",
+        "max_turns": 16,
+        "mcp": [],
+        "model": "gpt-5.6",
+        "provider": "codex_acp",
+        "runtime_profile": "codex_acp",
+        "structured_output": "required",
+        "temperature": 0.1
+      },
+      "codex_writer_high": {
+        "effort": "high",
+        "max_turns": 18,
+        "mcp": [
+          "xcode",
+          "context7"
+        ],
+        "model": "gpt-5.6",
+        "provider": "codex_acp",
+        "runtime_profile": "codex_acp",
+        "structured_output": "preferred",
+        "temperature": 0.12
+      },
+      "gemini_3_1_pro_preview_high": {
+        "effort": "high",
+        "max_turns": 16,
+        "mcp": [],
+        "model": "gemini-3.1-pro-preview",
+        "provider": "gemini_acp",
+        "runtime_profile": "gemini_cli_acp",
+        "structured_output": "required",
+        "temperature": 0.1
+      },
+      "gemini_3_6_flash_medium": {
+        "effort": "medium",
+        "max_turns": 12,
+        "mcp": [],
+        "model": "gemini-3.6-flash",
+        "provider": "gemini_acp",
+        "runtime_profile": "gemini_cli_acp",
+        "structured_output": "required",
+        "temperature": 0.2
+      },
+      "gemini_docs_flash": {
+        "effort": "medium",
+        "max_turns": 12,
+        "mcp": [],
+        "model": "gemini-3.6-flash",
+        "provider": "gemini_acp",
+        "runtime_profile": "gemini_cli_acp",
+        "structured_output": "required",
+        "temperature": 0.2
+      },
+      "gemini_ops_flash_lite": {
+        "effort": "low",
+        "max_turns": 8,
+        "mcp": [],
+        "model": "gemini-3.5-flash-lite",
+        "provider": "gemini_acp",
+        "runtime_profile": "gemini_cli_acp",
+        "structured_output": "required",
+        "temperature": 0.0
+      },
+      "gemini_reasoning_pro_high": {
+        "effort": "high",
+        "max_turns": 16,
+        "mcp": [],
+        "model": "gemini-3.1-pro-preview",
+        "provider": "gemini_acp",
+        "runtime_profile": "gemini_cli_acp",
+        "structured_output": "required",
+        "temperature": 0.1
+      },
+      "gemini_review_pro": {
+        "effort": "medium",
+        "max_turns": 12,
+        "mcp": [],
+        "model": "gemini-3.1-pro-preview",
+        "provider": "gemini_acp",
+        "runtime_profile": "gemini_cli_acp",
+        "structured_output": "required",
+        "temperature": 0.2
+      },
+      "junie_code_editor_acp": {
+        "effort": "high",
+        "max_turns": 24,
+        "mcp": [],
+        "model": "junie-default",
+        "provider": "junie",
+        "runtime_profile": "junie_cli_acp",
+        "structured_output": "preferred",
+        "temperature": 0.1
+      },
+      "junie_explorer_acp": {
+        "effort": "medium",
+        "max_turns": 10,
+        "mcp": [],
+        "model": "junie-default",
+        "provider": "junie",
+        "runtime_profile": "junie_cli_acp",
+        "structured_output": "preferred",
+        "temperature": 0.1
+      },
+      "junie_orchestrator_acp": {
+        "effort": "medium",
+        "max_turns": 12,
+        "mcp": [],
+        "model": "junie-default",
+        "provider": "junie",
+        "runtime_profile": "junie_cli_acp",
+        "structured_output": "preferred",
+        "temperature": 0.1
+      },
+      "junie_planner_acp": {
+        "effort": "medium",
+        "max_turns": 12,
+        "mcp": [],
+        "model": "junie-default",
+        "provider": "junie",
+        "runtime_profile": "junie_cli_acp",
+        "structured_output": "preferred",
+        "temperature": 0.1
+      }
+    },
+    "catalog_snapshot_format_version": 2,
+    "chainworks_compiled": {
+      "mission_context_version": "agent_mission_context_v1",
+      "schema_version": 1,
+      "skill_bundles": {
+        "code_writer_core": {
+          "skill_bundle_sha256": "6b50320cbac48626b2f836ece4299f59ce7f9397252404ebd74bb724fed2a9a4",
+          "skill_md": "---\nname: code-implementation\ndescription: Implements an approved proposal incrementally with focused tests and explicit remaining-work evidence.\ncompatibility: Chainworks Forge implementation stages with a dedicated writable worktree and frozen output contracts.\n---\n# Code Implementation Procedure\n\n1. Treat the frozen operator request and approved proposal as the implementation boundary. Use review artifacts to resolve defects inside that boundary, not to add adjacent scope.\n2. Inspect the existing subsystem before editing. Follow established ownership, persistence, API, and test patterns.\n3. Implement the smallest coherent change that closes the approved acceptance criteria. Keep unrelated dirty work intact.\n4. Add focused regression coverage proportional to the changed behavior and run the narrowest authoritative local gates available.\n5. Report completed work, verification, remaining code-owned tasks, and known risk through the declared provider outputs. Control-plane-owned Git evidence is not a provider output.\n\nThis procedure does not grant Git metadata access, release authority, extra tools, or permission beyond the frozen agent binding.\n",
+          "source_encoding": "utf-8"
+        },
+        "proposal_implementation_audit": {
+          "skill_bundle_sha256": "19d192036f063963948e7dba6b0f08ed1f4214fc39d35fdaeada9c04e8336547",
+          "skill_md": "---\nname: implementation-audit\ndescription: Use when deciding whether an approved Chainworks proposal is fully implemented and ready to close.\ncompatibility: Chainworks Forge implementation-review stages with frozen proposal, evidence, and output contracts.\n---\n# Implementation Audit Procedure\n\n1. Treat the frozen mission context and approved proposal as the complete scope boundary. Do not add requirements from historical reviews, deferred documents, or adjacent proposals.\n2. Map every proposal-owned requirement and acceptance criterion to current implementation evidence. Identify missing, partial, extra, mismatched, or unverifiable behavior explicitly.\n3. Use changed_files_manifest as canonical Git evidence. Do not run `git status`, `git diff`, or `git rev-parse`, and do not read `.git`.\n4. Inspect changed files, proposal-relevant paths, tests, configuration, and declared artifacts first. Keep discovery bounded and exclude generated or build roots from any broader search.\n5. Separate implementation conformance from current-worktree readiness. Mark conformance implemented only when every proposal-owned requirement is evidenced; report unavailable verification and unrelated baseline failures without converting them into hidden success.\n6. Run the narrowest authoritative local checks needed to validate material claims. Do not require remote, live-provider, UI, or full-regression evidence unless the approved proposal or assignment requires it.\n7. Write exactly one `audit_report_v1` result. Do not edit the proposal, implementation, or evidence merely to improve the verdict.\n\nThis procedure grants no additional tools, filesystem access, mutation authority, or output ownership beyond the frozen agent binding.\n",
+          "source_encoding": "utf-8"
+        },
+        "proposal_review_router_skill": {
+          "skill_bundle_sha256": "7f13a84b65fe13c1a5fab2dd0f49d3e2c5038df076a74a9bd8365fe6915fbbcd",
+          "skill_md": "---\nname: proposal-review-router\ndescription: Routes proposal review to the smallest sufficient specialist set and performs evidence-backed specialist review.\ncompatibility: Chainworks Forge proposal-readiness workflows using frozen proposal and agent catalog snapshots.\n---\n# Proposal Review Procedure\n\n1. Read the frozen mission context, proposal revision, and declared review role before using supporting artifacts.\n2. In routing mode, derive stack, surface, and risk tags from local evidence and select the smallest reviewer set that covers material risks.\n3. In specialist mode, inspect only the concerns assigned to the declared role. Use the proposal and relevant local reference evidence before historical review prose.\n4. Separate proposal defects from implementation or runtime evidence gaps. Do not require builds, daemon startup, UI smoke, benchmarks, fuzzing, or live-provider proof during proposal-readiness review unless the assignment explicitly requests it.\n5. Report concrete evidence and actionable findings through the declared structured output contract. Do not edit implementation files or broaden the review role.\n\nThis procedure does not grant tools, filesystem access, output ownership, or permission beyond the frozen agent binding.\n",
+          "source_encoding": "utf-8"
+        }
+      }
+    },
+    "contracts": {
+      "LeadResolutionContract": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": "lead_resolution",
+        "raw_artifact_name": "lead_resolution_raw",
+        "required_fields": [
+          "resolution_mode",
+          "requires_operator_confirmation",
+          "recommended_action",
+          "rationale_summary"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "agent_retrospective_report_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": null,
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "analysis_id",
+          "agent_id",
+          "run_id",
+          "situation_reconstruction",
+          "expected_vs_actual",
+          "likely_failure_modes",
+          "evidence_refs",
+          "suggested_changes",
+          "confidence"
+        ],
+        "validation_mode": null
+      },
+      "agent_selection_plan_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": "agent_selection_plan_v1",
+        "raw_artifact_name": "agent_selection_plan_raw",
+        "required_fields": [
+          "schema_version",
+          "routing_rules_version",
+          "proposal_md5",
+          "plan_hash",
+          "mode",
+          "fingerprint",
+          "selected_agents",
+          "rejected_alternatives",
+          "ineligible_candidates",
+          "warnings",
+          "input_snapshot_hashes"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "agent_tuning_proposal": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "analysis_id",
+          "category",
+          "summary",
+          "target_metric",
+          "proposed_patch_path",
+          "confidence_level",
+          "status"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "audit_report_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": null,
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "status",
+          "matches_proposal",
+          "missing_items",
+          "extra_items",
+          "defects",
+          "required_fixes"
+        ],
+        "validation_mode": null
+      },
+      "blocker_boundary_approval_request_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "schema_version",
+          "question",
+          "allowed_decisions",
+          "label_to_approval_state"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "blocker_boundary_human_decision_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "schema_version",
+          "decision_label"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "blocker_boundary_status_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "schema_version",
+          "status",
+          "assessment_generation_id",
+          "projection_integrity",
+          "followup_proposal_required",
+          "has_release_blocking_external_blockers",
+          "has_no_release_blocking_external_blockers",
+          "workflow_route_hint"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "changed_files_manifest": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "status",
+          "files"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "connect_upload_receipt_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": null,
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "status",
+          "artifact_id",
+          "checksum",
+          "destination"
+        ],
+        "validation_mode": null
+      },
+      "degradation_alert": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "analysis_id",
+          "metric_name",
+          "metric_family",
+          "observed_value",
+          "baseline_value",
+          "delta_percentage",
+          "threshold_used",
+          "implicated_run_ids",
+          "severity",
+          "likely_causes",
+          "confidence"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "docs_delta": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "files",
+          "summary"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "docs_report_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": null,
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "status",
+          "changed_docs",
+          "missing_docs",
+          "followups"
+        ],
+        "validation_mode": null
+      },
+      "experiment_plan": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "analysis_id",
+          "experiment_type",
+          "control_config_hash",
+          "treatment_config_hash",
+          "minimum_sample_size",
+          "rollback_condition",
+          "status"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "final_feature_report_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": null,
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "final_status",
+          "summary",
+          "started_at",
+          "completed_at",
+          "duration_seconds",
+          "total_cost",
+          "cost_currency"
+        ],
+        "validation_mode": null
+      },
+      "followup_proposal_seed_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "schema_version",
+          "title",
+          "problem",
+          "proposed_scope"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "git_push_receipt_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": null,
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "status",
+          "branch",
+          "commit_sha",
+          "remote"
+        ],
+        "validation_mode": null
+      },
+      "implementation_progress": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "status",
+          "current_phase",
+          "completed_items",
+          "deferred_items",
+          "notes"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "implementation_review_summary_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": null,
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "status",
+          "open_blockers",
+          "must_fix",
+          "recommended_next_step"
+        ],
+        "validation_mode": null
+      },
+      "implementation_self_assessment_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "seemingly_complete",
+          "remaining_tasks",
+          "known_risks",
+          "tests_run",
+          "docs_impacted"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "implementation_self_assessment_v2": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "implementation_complete",
+          "verification_green",
+          "remaining_code_tasks",
+          "handoff_tasks",
+          "known_risks",
+          "tests_run",
+          "docs_impacted"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "prepush_review_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": null,
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "status",
+          "major_concerns",
+          "cleanup_items",
+          "test_coverage_notes",
+          "release_note"
+        ],
+        "validation_mode": null
+      },
+      "proposal_decomposition_plan_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "schema_version",
+          "requires_split",
+          "implementation_start_decision"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "proposal_fact_digest_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": "proposal_fact_digest",
+        "raw_artifact_name": "proposal_fact_digest_raw",
+        "required_fields": [
+          "proposal_revision_id",
+          "claims"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "proposal_feedback_coverage_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": "proposal_feedback_coverage",
+        "raw_artifact_name": "proposal_feedback_coverage_raw",
+        "required_fields": [
+          "proposal_revision_id",
+          "source_review_pass_id",
+          "backlog_items_addressed",
+          "backlog_items_unresolved",
+          "backlog_items_deferred",
+          "backlog_items_disputed",
+          "sections_changed",
+          "factual_claims_added_or_corrected",
+          "notes"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "proposal_review_summary_v2": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": "proposal_review_summary",
+        "raw_artifact_name": "proposal_review_summary_raw",
+        "required_fields": [
+          "pass",
+          "average_score",
+          "aggregate_score",
+          "min_individual_score",
+          "blocker_count",
+          "blocking_issues",
+          "summary",
+          "blocking_required_changes",
+          "advisory_follow_ups",
+          "recurring_themes",
+          "decision"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "proposal_review_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": "proposal_review_normalized",
+        "raw_artifact_name": "proposal_review_raw",
+        "required_fields": [
+          "agent_id",
+          "role",
+          "score",
+          "decision",
+          "verdict",
+          "summary",
+          "issues",
+          "blocking_issues",
+          "non_blocking_issues",
+          "suggestions",
+          "assumptions"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "quality_gate_blocker_assessment_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "schema_version",
+          "blockers"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "release_bundle_manifest": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "bundleIdentifier",
+          "bundleVersion",
+          "buildNumber",
+          "archivePath",
+          "checksumSHA256",
+          "sizeBytes",
+          "timestamp"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "release_manifest": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "commitSHA",
+          "branch",
+          "remote",
+          "commitMessage",
+          "filesChanged",
+          "insertions",
+          "deletions",
+          "timestamp"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "review_corpus_bundle_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": "review_corpus_bundle",
+        "raw_artifact_name": "review_corpus_bundle_raw",
+        "required_fields": [
+          "review_pass_id",
+          "review_iteration_id",
+          "source_proposal_artifact",
+          "raw_review_artifacts",
+          "aggregate_summary_artifact"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "review_corpus_bundle_v2": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": "review_corpus_bundle_v2",
+        "raw_artifact_name": "review_corpus_bundle_v2_raw",
+        "required_fields": [
+          "selected_review_artifacts",
+          "selected_reviewer_ids",
+          "reviewer_count",
+          "selection_plan_hash",
+          "selection_plan",
+          "legacy_fixed_mode"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "score_lift_backlog_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": "score_lift_backlog",
+        "raw_artifact_name": "score_lift_backlog_raw",
+        "required_fields": [
+          "review_pass_id",
+          "source_proposal_artifact",
+          "items"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "sdlc_health_report_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": null,
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "analysis_id",
+          "window_start",
+          "window_end",
+          "cohort_keys",
+          "cohort_quality",
+          "run_count",
+          "metrics_summary",
+          "baseline_summary",
+          "degradations",
+          "improvements",
+          "executive_summary",
+          "confidence"
+        ],
+        "validation_mode": null
+      },
+      "security_report_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": null,
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "status",
+          "critical",
+          "high",
+          "medium",
+          "low",
+          "findings",
+          "required_fixes"
+        ],
+        "validation_mode": null
+      },
+      "stewardship_audit_report_v1": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": null,
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "analysis_id",
+          "claims_reviewed",
+          "claims_supported",
+          "claims_undersupported",
+          "alternate_explanations",
+          "recommendation_risk_review",
+          "safer_next_step",
+          "confidence"
+        ],
+        "validation_mode": null
+      },
+      "tests_result": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "status",
+          "summary"
+        ],
+        "validation_mode": "strict_structured"
+      },
+      "workflow_tuning_proposal": {
+        "format": "json",
+        "human_format": null,
+        "machine_format": "json",
+        "normalized_artifact_name": null,
+        "raw_artifact_name": null,
+        "required_fields": [
+          "analysis_id",
+          "category",
+          "summary",
+          "target_metric",
+          "proposed_patch_path",
+          "confidence_level",
+          "status"
+        ],
+        "validation_mode": "strict_structured"
+      }
+    },
+    "escalation_policies": [
+      {
+        "applies_to": {
+          "stage_id": "state_7_implementation_started"
+        },
+        "enabled_default": true,
+        "max_chain_attempts": 3,
+        "max_chain_wall_clock_seconds": 7200,
+        "policy_id": "lead_implementation_start_quota_escalation",
+        "schema_version": "escalation_policy_v1",
+        "tiers": [
+          {
+            "backend_profile_id": "claude_orchestrator_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "claude_opus_orchestrator"
+          },
+          {
+            "backend_profile_id": "gemini_reasoning_pro_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "gemini_reasoning_fallback"
+          },
+          {
+            "kind": "pause",
+            "tier_id": "human_pause"
+          }
+        ],
+        "triggers": [
+          "provider_quota_exhausted",
+          "transport_failure",
+          "contract_output_failure",
+          "stale_no_output"
+        ]
+      },
+      {
+        "applies_to": {
+          "backend_profile_id": "claude_builder_high"
+        },
+        "enabled_default": true,
+        "max_chain_attempts": 3,
+        "max_chain_wall_clock_seconds": 7200,
+        "policy_id": "code_writer_quota_escalation",
+        "schema_version": "escalation_policy_v1",
+        "tiers": [
+          {
+            "backend_profile_id": "codex_builder_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "codex_builder_fallback"
+          },
+          {
+            "backend_profile_id": "claude_builder_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "claude_builder_same_backend"
+          },
+          {
+            "backend_profile_id": "gemini_reasoning_pro_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "gemini_reasoning_fallback"
+          },
+          {
+            "kind": "pause",
+            "tier_id": "human_pause"
+          }
+        ],
+        "triggers": [
+          "provider_quota_exhausted",
+          "transport_failure",
+          "contract_output_failure",
+          "stale_no_output"
+        ]
+      },
+      {
+        "applies_to": {
+          "stage_id": "state_10_implementation_refined"
+        },
+        "enabled_default": true,
+        "max_chain_attempts": 3,
+        "max_chain_wall_clock_seconds": 7200,
+        "policy_id": "implementation_refinement_codex_quota_escalation",
+        "schema_version": "escalation_policy_v1",
+        "tiers": [
+          {
+            "backend_profile_id": "codex_builder_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "codex_builder_fallback"
+          },
+          {
+            "backend_profile_id": "claude_builder_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "claude_builder_same_backend"
+          },
+          {
+            "backend_profile_id": "gemini_reasoning_pro_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "gemini_reasoning_fallback"
+          },
+          {
+            "kind": "pause",
+            "tier_id": "human_pause"
+          }
+        ],
+        "triggers": [
+          "provider_quota_exhausted",
+          "transport_failure",
+          "contract_output_failure",
+          "stale_no_output"
+        ]
+      },
+      {
+        "applies_to": {
+          "backend_profile_id": "codex_writer_high"
+        },
+        "enabled_default": true,
+        "max_chain_attempts": 3,
+        "max_chain_wall_clock_seconds": 7200,
+        "policy_id": "proposal_writer_quota_escalation",
+        "schema_version": "escalation_policy_v1",
+        "tiers": [
+          {
+            "backend_profile_id": "codex_writer_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "codex_writer_same_backend"
+          },
+          {
+            "backend_profile_id": "claude_writer_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "claude_writer_fallback"
+          },
+          {
+            "backend_profile_id": "gemini_reasoning_pro_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "gemini_reasoning_fallback"
+          },
+          {
+            "kind": "pause",
+            "tier_id": "human_pause"
+          }
+        ],
+        "triggers": [
+          "provider_quota_exhausted",
+          "transport_failure",
+          "contract_output_failure",
+          "stale_no_output"
+        ]
+      },
+      {
+        "applies_to": {
+          "backend_profile_id": "gemini_review_pro"
+        },
+        "enabled_default": true,
+        "max_chain_attempts": 3,
+        "max_chain_wall_clock_seconds": 7200,
+        "policy_id": "gemini_reviewer_quota_escalation",
+        "schema_version": "escalation_policy_v1",
+        "tiers": [
+          {
+            "backend_profile_id": "gemini_review_pro",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "gemini_review_same_backend"
+          },
+          {
+            "backend_profile_id": "codex_architect_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "codex_architect_fallback"
+          },
+          {
+            "backend_profile_id": "claude_product_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "claude_product_fallback"
+          },
+          {
+            "kind": "pause",
+            "tier_id": "human_pause"
+          }
+        ],
+        "triggers": [
+          "provider_quota_exhausted",
+          "transport_failure",
+          "contract_output_failure",
+          "stale_no_output"
+        ]
+      },
+      {
+        "applies_to": {
+          "backend_profile_id": "claude_product_high"
+        },
+        "enabled_default": true,
+        "max_chain_attempts": 3,
+        "max_chain_wall_clock_seconds": 7200,
+        "policy_id": "claude_reviewer_quota_escalation",
+        "schema_version": "escalation_policy_v1",
+        "tiers": [
+          {
+            "backend_profile_id": "claude_product_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "claude_product_same_backend"
+          },
+          {
+            "backend_profile_id": "codex_architect_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "codex_architect_fallback"
+          },
+          {
+            "backend_profile_id": "gemini_review_pro",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "gemini_review_fallback"
+          },
+          {
+            "kind": "pause",
+            "tier_id": "human_pause"
+          }
+        ],
+        "triggers": [
+          "provider_quota_exhausted",
+          "transport_failure",
+          "contract_output_failure",
+          "stale_no_output"
+        ]
+      },
+      {
+        "applies_to": {
+          "backend_profile_id": "codex_architect_high"
+        },
+        "enabled_default": true,
+        "max_chain_attempts": 3,
+        "max_chain_wall_clock_seconds": 7200,
+        "policy_id": "codex_reviewer_quota_escalation",
+        "schema_version": "escalation_policy_v1",
+        "tiers": [
+          {
+            "backend_profile_id": "codex_architect_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "codex_architect_same_backend"
+          },
+          {
+            "backend_profile_id": "claude_product_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "claude_product_fallback"
+          },
+          {
+            "backend_profile_id": "gemini_review_pro",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "gemini_review_fallback"
+          },
+          {
+            "kind": "pause",
+            "tier_id": "human_pause"
+          }
+        ],
+        "triggers": [
+          "provider_quota_exhausted",
+          "transport_failure",
+          "contract_output_failure",
+          "stale_no_output"
+        ]
+      },
+      {
+        "applies_to": {
+          "backend_profile_id": "codex_audit_high"
+        },
+        "enabled_default": true,
+        "max_chain_attempts": 3,
+        "max_chain_wall_clock_seconds": 7200,
+        "policy_id": "implementation_auditor_quota_escalation",
+        "schema_version": "escalation_policy_v1",
+        "tiers": [
+          {
+            "backend_profile_id": "codex_audit_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "codex_audit_same_backend"
+          },
+          {
+            "backend_profile_id": "claude_auditor_medium",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "claude_auditor_fallback"
+          },
+          {
+            "backend_profile_id": "gemini_reasoning_pro_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "gemini_reasoning_fallback"
+          },
+          {
+            "kind": "pause",
+            "tier_id": "human_pause"
+          }
+        ],
+        "triggers": [
+          "provider_quota_exhausted",
+          "transport_failure",
+          "contract_output_failure",
+          "stale_no_output"
+        ]
+      },
+      {
+        "applies_to": {
+          "backend_profile_id": "claude_security_high"
+        },
+        "enabled_default": true,
+        "max_chain_attempts": 3,
+        "max_chain_wall_clock_seconds": 7200,
+        "policy_id": "security_checker_quota_escalation",
+        "schema_version": "escalation_policy_v1",
+        "tiers": [
+          {
+            "backend_profile_id": "claude_security_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "claude_security_same_backend"
+          },
+          {
+            "backend_profile_id": "codex_architect_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "codex_architect_fallback"
+          },
+          {
+            "backend_profile_id": "gemini_review_pro",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "gemini_review_fallback"
+          },
+          {
+            "kind": "pause",
+            "tier_id": "human_pause"
+          }
+        ],
+        "triggers": [
+          "provider_quota_exhausted",
+          "transport_failure",
+          "contract_output_failure",
+          "stale_no_output"
+        ]
+      },
+      {
+        "applies_to": {
+          "backend_profile_id": "claude_prepush_medium"
+        },
+        "enabled_default": true,
+        "max_chain_attempts": 3,
+        "max_chain_wall_clock_seconds": 7200,
+        "policy_id": "prepush_reviewer_quota_escalation",
+        "schema_version": "escalation_policy_v1",
+        "tiers": [
+          {
+            "backend_profile_id": "claude_prepush_medium",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "claude_prepush_same_backend"
+          },
+          {
+            "backend_profile_id": "codex_audit_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "codex_audit_fallback"
+          },
+          {
+            "backend_profile_id": "gemini_review_pro",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "gemini_review_fallback"
+          },
+          {
+            "kind": "pause",
+            "tier_id": "human_pause"
+          }
+        ],
+        "triggers": [
+          "provider_quota_exhausted",
+          "transport_failure",
+          "contract_output_failure",
+          "stale_no_output"
+        ]
+      },
+      {
+        "applies_to": {
+          "backend_profile_id": "gemini_docs_flash"
+        },
+        "enabled_default": true,
+        "max_chain_attempts": 3,
+        "max_chain_wall_clock_seconds": 7200,
+        "policy_id": "docs_guardian_quota_escalation",
+        "schema_version": "escalation_policy_v1",
+        "tiers": [
+          {
+            "backend_profile_id": "gemini_docs_flash",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "gemini_docs_same_backend"
+          },
+          {
+            "backend_profile_id": "claude_docs_medium",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "claude_docs_fallback"
+          },
+          {
+            "backend_profile_id": "codex_audit_high",
+            "kind": "backend_profile",
+            "max_attempts": 1,
+            "tier_id": "codex_audit_fallback"
+          },
+          {
+            "kind": "pause",
+            "tier_id": "human_pause"
+          }
+        ],
+        "triggers": [
+          "provider_quota_exhausted",
+          "transport_failure",
+          "contract_output_failure",
+          "stale_no_output"
+        ]
+      }
+    ],
+    "paths": {
+      "implementation_worktree": "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}",
+      "meta_root": "${CHAINWORKS_META_ROOT:-.chainworks}",
+      "repo_root": "${CHAINWORKS_REPO_ROOT:-.}",
+      "worktrees_root": "${CHAINWORKS_WORKTREES_ROOT:-.chainworks/worktrees}"
+    },
+    "permission_profiles": {
+      "CODE_WRITE": {
+        "filesystem": {
+          "deny": [
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/.git",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/.git/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**/.env*",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**/secrets/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/docs/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/README*",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/CHANGELOG*"
+          ],
+          "read": [
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/**",
+            "${CHAINWORKS_REPO_ROOT:-.}/**"
+          ],
+          "write": [
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/src/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/app/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/lib/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/internal/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/cmd/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/crates/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/packages/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/Chainworks Forge/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/Chainworks ForgeTests/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/Chainworks ForgeUITests/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/Chainworks Forge.xcodeproj/project.pbxproj",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/tests/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/Cargo.toml",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/Cargo.lock",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/go.mod",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/go.sum",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/Package.swift",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/implementation/**"
+          ]
+        },
+        "git": {
+          "checkout": false,
+          "commit": false,
+          "diff": false,
+          "push": false,
+          "status": false
+        },
+        "mcp": {
+          "legacy_allow": [],
+          "runtime_authority": false
+        },
+        "network": {
+          "allow": []
+        },
+        "shell": {
+          "allow": [
+            "rg",
+            "fd",
+            "find",
+            "ls",
+            "cat",
+            "go test ./...",
+            "cargo test",
+            "cargo clippy",
+            "swift build",
+            "swift test",
+            "xcodebuild -project \"Chainworks Forge.xcodeproj\" -scheme \"Chainworks Forge\" -destination \"platform=macOS\" build",
+            "xcodebuild -project \"Chainworks Forge.xcodeproj\" -scheme \"Chainworks Forge\" -destination \"platform=macOS\" test",
+            "npm test",
+            "pnpm test",
+            "yarn test",
+            "make test",
+            "make build",
+            "just test",
+            "just build"
+          ],
+          "deny": [
+            "git commit*",
+            "git push*",
+            "rm -rf *"
+          ]
+        }
+      },
+      "DOC_WRITE": {
+        "filesystem": {
+          "deny": [
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/.git/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**/.env*",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**/secrets/**"
+          ],
+          "read": [
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/**"
+          ],
+          "write": [
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/docs/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/README*",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/CHANGELOG*",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/docs/**"
+          ]
+        },
+        "git": {
+          "checkout": false,
+          "commit": false,
+          "diff": true,
+          "push": false,
+          "status": true
+        },
+        "mcp": {
+          "legacy_allow": [],
+          "runtime_authority": false
+        },
+        "network": {
+          "allow": []
+        },
+        "shell": {
+          "allow": [
+            "rg",
+            "fd",
+            "find",
+            "ls",
+            "cat",
+            "git diff --stat",
+            "git diff --name-only"
+          ],
+          "deny": [
+            "git commit*",
+            "git push*",
+            "rm -rf *"
+          ]
+        }
+      },
+      "ORCH": {
+        "filesystem": {
+          "deny": [
+            "${CHAINWORKS_REPO_ROOT:-.}/.git/**",
+            "${CHAINWORKS_REPO_ROOT:-.}/**/.env*",
+            "${CHAINWORKS_REPO_ROOT:-.}/**/secrets/**"
+          ],
+          "read": [
+            "${CHAINWORKS_REPO_ROOT:-.}/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/**"
+          ],
+          "write": [
+            "${CHAINWORKS_META_ROOT:-.chainworks}/state/**",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/summaries/**",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/approvals/**",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/implementation/plan.md",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/implementation/backlog.yaml",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/**",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/**"
+          ]
+        },
+        "git": {
+          "checkout": false,
+          "commit": false,
+          "diff": true,
+          "push": false,
+          "status": true
+        },
+        "mcp": {
+          "legacy_allow": [],
+          "runtime_authority": false
+        },
+        "network": {
+          "allow": []
+        },
+        "shell": {
+          "allow": [
+            "rg",
+            "fd",
+            "find",
+            "ls",
+            "cat",
+            "git status",
+            "git diff --stat",
+            "git diff --name-only"
+          ],
+          "deny": [
+            "git commit*",
+            "git push*",
+            "rm -rf *"
+          ]
+        }
+      },
+      "PROPOSAL_WRITE": {
+        "filesystem": {
+          "deny": [
+            "${CHAINWORKS_REPO_ROOT:-.}/.git/**",
+            "${CHAINWORKS_REPO_ROOT:-.}/**/.env*",
+            "${CHAINWORKS_REPO_ROOT:-.}/**/secrets/**"
+          ],
+          "read": [
+            "${CHAINWORKS_META_ROOT:-.chainworks}/**",
+            "${CHAINWORKS_REPO_ROOT:-.}/docs/**/*.md",
+            "${CHAINWORKS_REPO_ROOT:-.}/README*"
+          ],
+          "write": [
+            "${CHAINWORKS_META_ROOT:-.chainworks}/proposals/**",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/summaries/**"
+          ]
+        },
+        "git": {
+          "checkout": false,
+          "commit": false,
+          "diff": false,
+          "push": false,
+          "status": true
+        },
+        "mcp": {
+          "legacy_allow": [],
+          "runtime_authority": false
+        },
+        "network": {
+          "allow": []
+        },
+        "shell": {
+          "allow": [
+            "rg",
+            "fd",
+            "find",
+            "ls",
+            "cat"
+          ],
+          "deny": [
+            "git commit*",
+            "git push*",
+            "rm -rf *"
+          ]
+        }
+      },
+      "RELEASE_GIT": {
+        "filesystem": {
+          "deny": [
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/.git/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**/.env*",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**/secrets/**"
+          ],
+          "read": [
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/**"
+          ],
+          "write": [
+            "${CHAINWORKS_META_ROOT:-.chainworks}/release/**"
+          ]
+        },
+        "git": {
+          "checkout": false,
+          "commit": true,
+          "diff": true,
+          "push": true,
+          "status": true
+        },
+        "mcp": {
+          "legacy_allow": [],
+          "runtime_authority": false
+        },
+        "network": {
+          "allow": [
+            "github"
+          ]
+        },
+        "shell": {
+          "allow": [
+            "git status",
+            "git diff --stat",
+            "git diff --name-only"
+          ],
+          "deny": [
+            "rm -rf *"
+          ]
+        }
+      },
+      "RELEASE_PUBLISH": {
+        "filesystem": {
+          "deny": [
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/.git/**"
+          ],
+          "read": [
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/**"
+          ],
+          "write": [
+            "${CHAINWORKS_META_ROOT:-.chainworks}/release/**"
+          ]
+        },
+        "git": {
+          "checkout": false,
+          "commit": false,
+          "diff": false,
+          "push": false,
+          "status": false
+        },
+        "mcp": {
+          "legacy_allow": [],
+          "runtime_authority": false
+        },
+        "network": {
+          "allow": [
+            "connect"
+          ]
+        },
+        "shell": {
+          "allow": [],
+          "deny": [
+            "*"
+          ]
+        }
+      },
+      "RO_PREPUSH_VERIFY": {
+        "filesystem": {
+          "deny": [
+            "${CHAINWORKS_REPO_ROOT:-.}/.git",
+            "${CHAINWORKS_REPO_ROOT:-.}/.git/**",
+            "${CHAINWORKS_REPO_ROOT:-.}/**/.env*",
+            "${CHAINWORKS_REPO_ROOT:-.}/**/secrets/**"
+          ],
+          "read": [
+            "${CHAINWORKS_REPO_ROOT:-.}/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/**"
+          ],
+          "write": [
+            "${CHAINWORKS_META_ROOT:-.chainworks}/review/**"
+          ]
+        },
+        "git": {
+          "checkout": false,
+          "commit": false,
+          "diff": false,
+          "push": false,
+          "status": false
+        },
+        "mcp": {
+          "legacy_allow": [],
+          "runtime_authority": false
+        },
+        "network": {
+          "allow": []
+        },
+        "shell": {
+          "allow": [
+            "rg",
+            "fd",
+            "find",
+            "ls",
+            "cat",
+            "go test ./...",
+            "cargo test",
+            "cargo clippy",
+            "swift build",
+            "swift test",
+            "npm test",
+            "pnpm test",
+            "yarn test",
+            "make test",
+            "just test"
+          ],
+          "deny": [
+            "git commit*",
+            "git push*",
+            "rm -rf *"
+          ]
+        }
+      },
+      "RO_REVIEW": {
+        "filesystem": {
+          "deny": [
+            "${CHAINWORKS_REPO_ROOT:-.}/.git/**",
+            "${CHAINWORKS_REPO_ROOT:-.}/**/.env*",
+            "${CHAINWORKS_REPO_ROOT:-.}/**/secrets/**"
+          ],
+          "read": [
+            "${CHAINWORKS_REPO_ROOT:-.}/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/**"
+          ],
+          "write": [
+            "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/**",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/summaries/**"
+          ]
+        },
+        "git": {
+          "checkout": false,
+          "commit": false,
+          "diff": true,
+          "push": false,
+          "status": true
+        },
+        "mcp": {
+          "legacy_allow": [],
+          "runtime_authority": false
+        },
+        "network": {
+          "allow": []
+        },
+        "shell": {
+          "allow": [
+            "rg",
+            "fd",
+            "find",
+            "ls",
+            "cat",
+            "git status",
+            "git diff --stat",
+            "git diff --name-only"
+          ],
+          "deny": [
+            "git commit*",
+            "git push*",
+            "rm -rf *"
+          ]
+        }
+      },
+      "RO_VERIFY": {
+        "filesystem": {
+          "deny": [
+            "${CHAINWORKS_REPO_ROOT:-.}/.git",
+            "${CHAINWORKS_REPO_ROOT:-.}/.git/**",
+            "${CHAINWORKS_REPO_ROOT:-.}/**/.env*",
+            "${CHAINWORKS_REPO_ROOT:-.}/**/secrets/**"
+          ],
+          "read": [
+            "${CHAINWORKS_REPO_ROOT:-.}/**",
+            "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/**"
+          ],
+          "write": [
+            "${CHAINWORKS_META_ROOT:-.chainworks}/audit/**",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/security/**",
+            "${CHAINWORKS_META_ROOT:-.chainworks}/review/**"
+          ]
+        },
+        "git": {
+          "checkout": false,
+          "commit": false,
+          "diff": false,
+          "push": false,
+          "status": false
+        },
+        "mcp": {
+          "legacy_allow": [],
+          "runtime_authority": false
+        },
+        "network": {
+          "allow": []
+        },
+        "shell": {
+          "allow": [
+            "rg",
+            "fd",
+            "find",
+            "ls",
+            "cat",
+            "go test ./...",
+            "cargo test",
+            "cargo clippy",
+            "swift build",
+            "swift test",
+            "xcodebuild -project \"Chainworks Forge.xcodeproj\" -scheme \"Chainworks Forge\" -destination \"platform=macOS\" build",
+            "xcodebuild -project \"Chainworks Forge.xcodeproj\" -scheme \"Chainworks Forge\" -destination \"platform=macOS\" test",
+            "npm test",
+            "pnpm test",
+            "yarn test",
+            "make test",
+            "just test"
+          ],
+          "deny": [
+            "git commit*",
+            "git push*",
+            "rm -rf *"
+          ]
+        }
+      }
+    },
+    "runtime_profiles": {
+      "auggie_cli_acp": {
+        "adapter_family": "auggie_cli_acp",
+        "capability_class": "control_capable",
+        "mcp_realization_path": "acp_native",
+        "requires": [
+          "streaming",
+          "tools"
+        ],
+        "transport_kind": "acp_stdio"
+      },
+      "claude_agent_acp": {
+        "adapter_family": "claude_agent_acp",
+        "capability_class": "operator_grade",
+        "mcp_realization_path": "acp_native",
+        "requires": [
+          "streaming",
+          "tools",
+          "permission_callbacks"
+        ],
+        "transport_kind": "acp_stdio"
+      },
+      "codex_acp": {
+        "adapter_family": "codex_acp",
+        "capability_class": "control_capable",
+        "mcp_realization_path": "acp_native",
+        "requires": [
+          "streaming",
+          "tools",
+          "session_resume"
+        ],
+        "transport_kind": "acp_stdio"
+      },
+      "gemini_cli_acp": {
+        "adapter_family": "gemini_cli_acp",
+        "capability_class": "control_capable",
+        "mcp_realization_path": "acp_native",
+        "requires": [
+          "streaming",
+          "tools"
+        ],
+        "transport_kind": "acp_stdio"
+      },
+      "junie_cli_acp": {
+        "adapter_family": "junie_cli_acp",
+        "capability_class": "control_capable",
+        "mcp_realization_path": "acp_native",
+        "requires": [
+          "streaming",
+          "tools"
+        ],
+        "transport_kind": "acp_stdio"
+      }
+    },
+    "schema_version": 1,
+    "skills": {
+      "code_writer_core": {
+        "description": null,
+        "name": null,
+        "notes": null,
+        "path": "skills/code-implementation",
+        "type": "external_skill"
+      },
+      "connect_publisher": {
+        "description": "Build release archive, compute checksum, and upload to Connect through deterministic tools.",
+        "name": null,
+        "notes": null,
+        "path": null,
+        "type": "inline_skill"
+      },
+      "docs_quality_guardian": {
+        "description": null,
+        "name": "docs-quality-guardian",
+        "notes": null,
+        "path": null,
+        "type": "builtin_agent"
+      },
+      "github_commit_push": {
+        "description": "Use deterministic git/github tools to commit and push only after human release approval.",
+        "name": null,
+        "notes": null,
+        "path": null,
+        "type": "inline_skill"
+      },
+      "orchestrator_core": {
+        "description": "Lead orchestration, fan-out/fan-in, gatekeeping, loop control, artifact routing.",
+        "name": null,
+        "notes": null,
+        "path": null,
+        "type": "inline_skill"
+      },
+      "prepush_review_core": {
+        "description": "Final code review barrier before commit/push; looks for correctness, readability, regressions, and missing tests.",
+        "name": null,
+        "notes": null,
+        "path": null,
+        "type": "inline_skill"
+      },
+      "proposal_implementation_audit": {
+        "description": null,
+        "name": null,
+        "notes": null,
+        "path": "skills/implementation-audit",
+        "type": "external_skill"
+      },
+      "proposal_review_router_skill": {
+        "description": null,
+        "name": null,
+        "notes": null,
+        "path": "skills/proposal-review-router",
+        "type": "external_skill"
+      },
+      "proposal_review_triad": {
+        "description": "Deprecated compatibility alias for old snapshots that still reference the proposal review triad. Use proposal_review_router_skill for all current proposal reviewer agents. Run proposal-first, evidence-backed review through the requested role lens and output only the proposal_review_v1 contract.",
+        "name": null,
+        "notes": null,
+        "path": null,
+        "type": "inline_skill"
+      },
+      "proposal_writer_core": {
+        "description": "Draft and refine product/technical proposals from idea + review feedback.",
+        "name": null,
+        "notes": null,
+        "path": null,
+        "type": "inline_skill"
+      },
+      "security_checker_core": {
+        "description": "Threat-model and review the implementation for security, privacy, secrets, auth, and unsafe defaults.",
+        "name": null,
+        "notes": null,
+        "path": null,
+        "type": "inline_skill"
+      },
+      "steward_core": {
+        "description": "System-level SDLC health analysis, anomaly detection, and change proposal generation.",
+        "name": null,
+        "notes": null,
+        "path": null,
+        "type": "inline_skill"
+      }
+    }
+  },
+  "schema_version": "security_prepush_catalog_v2_fixture_v1",
+  "source_commit": "465fa72a880333347fbc0988f788f0f82d8b2523",
+  "workflow_snapshot": {
+    "failure_policy": {
+      "on_error": "pause_and_require_human",
+      "on_loop_budget_exhausted": "pause_and_require_human",
+      "preserve_artifacts": true
+    },
+    "initial_state": "state_1_idea_received",
+    "schema_version": 1,
+    "scoring": {
+      "implementation": {
+        "implemented_when": [
+          "audit_report.status == vars.audit_target_status",
+          "security_report.status == 'pass'",
+          "prepush_review_report.status == 'pass'",
+          "docs_report.status in ['pass', 'not_needed']",
+          "tests_result.status == 'green'"
+        ]
+      },
+      "proposal": {
+        "aggregate_formula": "proposal_review_summary.average_score_from_selected_reviewers",
+        "pass_when": [
+          "average_score >= vars.proposal_score_target",
+          "min_individual_score >= vars.min_individual_proposal_score",
+          "blocker_count == 0"
+        ]
+      }
+    },
+    "states": {
+      "state_10_implementation_refined": {
+        "approval": null,
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Implementation refined",
+        "loop": {
+          "counter": "implementation_revision_count",
+          "max": "vars.max_implementation_revision_cycles"
+        },
+        "owner": "code_writer",
+        "run": {
+          "dynamic_parallel": null,
+          "parallel": null,
+          "sequence": [
+            {
+              "agent": "code_writer",
+              "inputs": [
+                "approved_proposal",
+                "audit_report",
+                "security_report",
+                "prepush_review_report",
+                "implementation_review_summary"
+              ],
+              "outputs": [
+                "implementation_progress",
+                "implementation_self_assessment",
+                "changed_files_manifest",
+                "tests_result"
+              ],
+              "task": "refine_implementation"
+            },
+            {
+              "agent": "docs_guardian",
+              "inputs": [
+                "approved_proposal",
+                "changed_files_manifest"
+              ],
+              "outputs": [
+                "docs_report",
+                "docs_delta"
+              ],
+              "task": "sync_docs_after_refinement"
+            }
+          ],
+          "system_task": null,
+          "then": null
+        },
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_9_implementation_reviewed",
+            "when": "true"
+          }
+        ],
+        "type": null
+      },
+      "state_11_manual_release": {
+        "approval": "required",
+        "approval_policy": "manual_release",
+        "degraded_output_policy": null,
+        "label": "Manual release",
+        "loop": null,
+        "owner": "lead_orchestrator",
+        "run": null,
+        "run_after_approval": {
+          "dynamic_parallel": null,
+          "parallel": null,
+          "sequence": [
+            {
+              "agent": "commit_and_push_to_github",
+              "inputs": [
+                "approved_proposal",
+                "implementation_review_summary",
+                "docs_report",
+                "prepush_review_report"
+              ],
+              "outputs": [
+                "release_manifest",
+                "git_push_receipt"
+              ],
+              "task": "commit_and_push"
+            },
+            {
+              "agent": "build_archive_and_push_connect",
+              "inputs": [
+                "git_push_receipt",
+                "release_manifest"
+              ],
+              "outputs": [
+                "release_bundle_manifest",
+                "connect_upload_receipt"
+              ],
+              "task": "build_and_distribute"
+            }
+          ],
+          "system_task": null,
+          "then": null
+        },
+        "transitions": [
+          {
+            "to": "state_12_workflow_complete",
+            "when": "exists('git_push_receipt')"
+          }
+        ],
+        "type": "manual_gate"
+      },
+      "state_12_workflow_complete": {
+        "approval": null,
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Workflow complete",
+        "loop": null,
+        "owner": "lead_orchestrator",
+        "run": {
+          "dynamic_parallel": null,
+          "parallel": null,
+          "sequence": [
+            {
+              "agent": "lead_orchestrator",
+              "inputs": [
+                "approved_proposal",
+                "implementation_review_summary",
+                "release_manifest",
+                "git_push_receipt",
+                "release_bundle_manifest",
+                "connect_upload_receipt"
+              ],
+              "outputs": [
+                "delivery_receipt",
+                "run_report",
+                "run_state"
+              ],
+              "task": "finalize_run_and_produce_receipts"
+            }
+          ],
+          "system_task": null,
+          "then": null
+        },
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_12_workflow_complete",
+            "when": "true"
+          }
+        ],
+        "type": "end"
+      },
+      "state_1_idea_received": {
+        "approval": null,
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Idea received",
+        "loop": null,
+        "owner": "lead_orchestrator",
+        "run": {
+          "dynamic_parallel": null,
+          "parallel": null,
+          "sequence": [
+            {
+              "agent": "lead_orchestrator",
+              "inputs": [
+                "input.idea",
+                "input.file"
+              ],
+              "outputs": [
+                "idea_brief",
+                "run_state",
+                "orchestrator_summary"
+              ],
+              "task": "normalize_idea_and_open_run"
+            }
+          ],
+          "system_task": null,
+          "then": null
+        },
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_2_proposal_drafted",
+            "when": "exists('idea_brief')"
+          }
+        ],
+        "type": "start"
+      },
+      "state_2_proposal_drafted": {
+        "approval": null,
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Proposal drafted",
+        "loop": null,
+        "owner": "proposal_writer",
+        "run": {
+          "dynamic_parallel": null,
+          "parallel": null,
+          "sequence": [
+            {
+              "agent": "proposal_writer",
+              "inputs": [
+                "idea_brief",
+                "run_state"
+              ],
+              "outputs": [
+                "proposal_current",
+                "proposal_revision_summary"
+              ],
+              "task": "draft_initial_proposal"
+            }
+          ],
+          "system_task": null,
+          "then": null
+        },
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_3_initial_proposal_approval",
+            "when": "exists('proposal_current')"
+          }
+        ],
+        "type": null
+      },
+      "state_3_initial_proposal_approval": {
+        "approval": "required",
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Human approval: initial proposal matches intent",
+        "loop": null,
+        "owner": "lead_orchestrator",
+        "run": null,
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_4_proposal_reviewed",
+            "when": "approval.granted == true"
+          }
+        ],
+        "type": "manual_gate"
+      },
+      "state_4_proposal_reviewed": {
+        "approval": null,
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Proposal reviewed",
+        "loop": null,
+        "owner": "lead_orchestrator",
+        "run": {
+          "dynamic_parallel": {
+            "inputs": [
+              "idea_brief",
+              "proposal_current",
+              "proposal_feedback_coverage",
+              "reviewer_scope_plan",
+              "score_lift_backlog"
+            ],
+            "output_contract": "proposal_review_v1",
+            "selector_artifact": "agent_selection_plan_v1"
+          },
+          "parallel": null,
+          "sequence": null,
+          "system_task": {
+            "executor_mode": "system.routing",
+            "task_type": "proposal_review_router"
+          },
+          "then": [
+            {
+              "agent": "lead_orchestrator",
+              "inputs": [
+                "proposal_current"
+              ],
+              "outputs": [
+                "proposal_review_summary",
+                "review_corpus_bundle_v2",
+                "score_lift_backlog",
+                "proposal_fact_digest",
+                "reviewer_scope_plan",
+                "orchestrator_summary",
+                "run_state"
+              ],
+              "selected_outputs_from": {
+                "output_contract": "proposal_review_v1",
+                "source_plan": "agent_selection_plan_v1"
+              },
+              "task": "aggregate_proposal_reviews"
+            }
+          ]
+        },
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_5_proposal_refined",
+            "when": "proposal_review_summary.average_score < vars.proposal_score_target or proposal_review_summary.min_individual_score < vars.min_individual_proposal_score or proposal_review_summary.blocker_count > 0"
+          },
+          {
+            "to": "state_5a_proposal_decomposition_reviewed",
+            "when": "proposal_review_summary.average_score >= vars.proposal_score_target and proposal_review_summary.min_individual_score >= vars.min_individual_proposal_score and proposal_review_summary.blocker_count == 0"
+          }
+        ],
+        "type": null
+      },
+      "state_5_proposal_refined": {
+        "approval": null,
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Proposal refined",
+        "loop": {
+          "counter": "proposal_revision_count",
+          "max": "vars.max_proposal_revision_cycles"
+        },
+        "owner": "proposal_writer",
+        "run": {
+          "dynamic_parallel": null,
+          "parallel": null,
+          "sequence": [
+            {
+              "agent": "proposal_writer",
+              "inputs": [
+                "idea_brief",
+                "proposal_current",
+                "proposal_review_summary",
+                "review_corpus_bundle_v2",
+                "score_lift_backlog",
+                "proposal_fact_digest",
+                "run_state"
+              ],
+              "outputs": [
+                "proposal_current",
+                "proposal_revision_summary",
+                "proposal_feedback_coverage"
+              ],
+              "task": "refine_proposal"
+            }
+          ],
+          "system_task": null,
+          "then": null
+        },
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_4_proposal_reviewed",
+            "when": "true"
+          }
+        ],
+        "type": null
+      },
+      "state_5a_proposal_decomposition_reviewed": {
+        "approval": null,
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Proposal decomposition reviewed",
+        "loop": null,
+        "owner": "lead_orchestrator",
+        "run": {
+          "dynamic_parallel": null,
+          "parallel": null,
+          "sequence": [
+            {
+              "agent": "lead_orchestrator",
+              "inputs": [
+                "proposal_current",
+                "proposal_review_summary",
+                "run_state"
+              ],
+              "outputs": [
+                "proposal_decomposition_plan"
+              ],
+              "task": "decompose_proposal_before_implementation"
+            }
+          ],
+          "system_task": null,
+          "then": null
+        },
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_5_proposal_refined",
+            "when": "proposal_decomposition_plan.requires_split == true"
+          },
+          {
+            "to": "state_6_implementation_approval",
+            "when": "proposal_decomposition_plan.requires_split == false and proposal_decomposition_plan.implementation_start_decision == 'ready_with_declared_boundaries'"
+          }
+        ],
+        "type": null
+      },
+      "state_6_implementation_approval": {
+        "approval": "required",
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Human approval: proceed to implementation",
+        "loop": null,
+        "owner": "lead_orchestrator",
+        "run": null,
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_7_implementation_started",
+            "when": "approval.granted == true"
+          },
+          {
+            "to": "state_5_proposal_refined",
+            "when": "approval.rejected == true"
+          }
+        ],
+        "type": "manual_gate"
+      },
+      "state_7_implementation_started": {
+        "approval": null,
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Implementation started",
+        "loop": null,
+        "owner": "lead_orchestrator",
+        "run": {
+          "dynamic_parallel": null,
+          "parallel": null,
+          "sequence": [
+            {
+              "agent": "lead_orchestrator",
+              "inputs": [
+                "proposal_current",
+                "proposal_review_summary",
+                "run_state"
+              ],
+              "outputs": [
+                "approved_proposal",
+                "implementation_plan",
+                "implementation_backlog",
+                "run_state"
+              ],
+              "task": "freeze_proposal_and_provision_worktree"
+            },
+            {
+              "agent": "code_writer",
+              "inputs": [
+                "approved_proposal",
+                "implementation_plan",
+                "implementation_backlog"
+              ],
+              "outputs": [
+                "implementation_progress",
+                "implementation_self_assessment",
+                "changed_files_manifest",
+                "tests_result"
+              ],
+              "task": "initial_implementation"
+            }
+          ],
+          "system_task": null,
+          "then": null
+        },
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_8_implementation_continued",
+            "when": "implementation_self_assessment_v2.status == 'needs_code_fixes' or implementation_self_assessment_v2.status == 'invalid' or implementation_self_assessment_v2.status == 'unknown'"
+          },
+          {
+            "to": "state_9_implementation_reviewed",
+            "when": "implementation_self_assessment_v2.status == 'complete' or implementation_self_assessment_v2.status == 'handoff_required' or implementation_self_assessment_v2.status == 'blocked'"
+          }
+        ],
+        "type": null
+      },
+      "state_8_implementation_continued": {
+        "approval": null,
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Implementation continued until code-owned work is resolved",
+        "loop": {
+          "counter": "implementation_progress_count",
+          "max": "vars.max_implementation_progress_cycles"
+        },
+        "owner": "code_writer",
+        "run": {
+          "dynamic_parallel": null,
+          "parallel": null,
+          "sequence": [
+            {
+              "agent": "code_writer",
+              "inputs": [
+                "approved_proposal",
+                "implementation_plan",
+                "implementation_progress",
+                "implementation_self_assessment"
+              ],
+              "outputs": [
+                "implementation_progress",
+                "implementation_self_assessment",
+                "changed_files_manifest",
+                "tests_result"
+              ],
+              "task": "continue_implementation"
+            }
+          ],
+          "system_task": null,
+          "then": null
+        },
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_9_implementation_reviewed",
+            "when": "implementation_self_assessment_v2.status == 'complete' or implementation_self_assessment_v2.status == 'handoff_required' or implementation_self_assessment_v2.status == 'blocked'"
+          },
+          {
+            "to": "state_8_implementation_continued",
+            "when": "implementation_self_assessment_v2.status == 'needs_code_fixes' or implementation_self_assessment_v2.status == 'invalid' or implementation_self_assessment_v2.status == 'unknown'"
+          }
+        ],
+        "type": null
+      },
+      "state_9_blocker_boundary_accepted": {
+        "approval": null,
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Blocker boundary accepted",
+        "loop": null,
+        "owner": "lead_orchestrator",
+        "run": {
+          "dynamic_parallel": null,
+          "parallel": null,
+          "sequence": [
+            {
+              "agent": "lead_orchestrator",
+              "inputs": [
+                "blocker_boundary_status",
+                "implementation_review_summary"
+              ],
+              "outputs": [
+                "orchestrator_summary"
+              ],
+              "task": "emit_blocker_boundary_closeout"
+            }
+          ],
+          "system_task": null,
+          "then": null
+        },
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_9_followup_proposal_seeded",
+            "when": "blocker_boundary_status.followup_proposal_required == true"
+          },
+          {
+            "to": "state_9_external_evidence_blocked",
+            "when": "blocker_boundary_status.has_release_blocking_external_blockers == true and blocker_boundary_status.has_no_release_blocking_external_blockers == false and blocker_boundary_status.followup_proposal_required == false"
+          },
+          {
+            "to": "state_11_manual_release",
+            "when": "blocker_boundary_status.has_release_blocking_external_blockers == false and blocker_boundary_status.has_no_release_blocking_external_blockers == true and blocker_boundary_status.followup_proposal_required == false"
+          }
+        ],
+        "type": null
+      },
+      "state_9_blocker_boundary_approval": {
+        "approval": "required",
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Human approval: blocker boundary assessment",
+        "loop": null,
+        "owner": "lead_orchestrator",
+        "run": null,
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_9_blocker_boundary_accepted",
+            "when": "approval.granted == true"
+          },
+          {
+            "to": "state_9_implementation_reviewed",
+            "when": "approval.rejected == true"
+          }
+        ],
+        "type": "manual_gate"
+      },
+      "state_9_external_evidence_blocked": {
+        "approval": null,
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "External evidence blocked",
+        "loop": null,
+        "owner": "lead_orchestrator",
+        "run": {
+          "dynamic_parallel": null,
+          "parallel": null,
+          "sequence": [
+            {
+              "agent": "lead_orchestrator",
+              "inputs": [
+                "blocker_boundary_status",
+                "followup_proposal_seed"
+              ],
+              "outputs": [
+                "orchestrator_summary",
+                "run_state"
+              ],
+              "task": "record_external_evidence_hold"
+            }
+          ],
+          "system_task": null,
+          "then": null
+        },
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_9_external_evidence_blocked",
+            "when": "false"
+          }
+        ],
+        "type": null
+      },
+      "state_9_followup_proposal_seeded": {
+        "approval": null,
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Follow-up proposal seed generated",
+        "loop": null,
+        "owner": "lead_orchestrator",
+        "run": {
+          "dynamic_parallel": null,
+          "parallel": null,
+          "sequence": [
+            {
+              "agent": "lead_orchestrator",
+              "inputs": [
+                "blocker_boundary_status",
+                "approved_proposal"
+              ],
+              "outputs": [
+                "followup_proposal_seed"
+              ],
+              "task": "generate_followup_proposal_seed"
+            }
+          ],
+          "system_task": null,
+          "then": null
+        },
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_9_external_evidence_blocked",
+            "when": "exists('followup_proposal_seed')"
+          }
+        ],
+        "type": null
+      },
+      "state_9_implementation_reviewed": {
+        "approval": null,
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Implementation reviewed against proposal",
+        "loop": null,
+        "owner": "lead_orchestrator",
+        "run": {
+          "dynamic_parallel": null,
+          "parallel": [
+            {
+              "agent": "security_checker",
+              "inputs": [
+                "approved_proposal",
+                "changed_files_manifest"
+              ],
+              "outputs": [
+                "security_report"
+              ],
+              "task": "check_implementation_security"
+            },
+            {
+              "agent": "docs_guardian",
+              "inputs": [
+                "approved_proposal",
+                "changed_files_manifest"
+              ],
+              "outputs": [
+                "docs_report",
+                "docs_delta"
+              ],
+              "task": "review_and_sync_docs"
+            }
+          ],
+          "sequence": null,
+          "system_task": null,
+          "then": [
+            {
+              "agent": "proposal_implementation_auditor",
+              "inputs": [
+                "approved_proposal",
+                "implementation_progress",
+                "changed_files_manifest",
+                "tests_result",
+                "docs_report"
+              ],
+              "outputs": [
+                "audit_report"
+              ],
+              "task": "audit_implementation_against_proposal"
+            },
+            {
+              "agent": "prepush_code_reviewer",
+              "inputs": [
+                "approved_proposal",
+                "changed_files_manifest",
+                "audit_report",
+                "security_report"
+              ],
+              "outputs": [
+                "prepush_review_report"
+              ],
+              "task": "prepush_review"
+            },
+            {
+              "agent": "lead_orchestrator",
+              "inputs": [
+                "security_report",
+                "docs_report",
+                "audit_report",
+                "prepush_review_report",
+                "approved_proposal",
+                "implementation_self_assessment"
+              ],
+              "outputs": [
+                "implementation_review_summary",
+                "orchestrator_summary",
+                "run_state"
+              ],
+              "task": "aggregate_implementation_reviews"
+            }
+          ]
+        },
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_11_manual_release",
+            "when": "implementation_closeout_readiness_v1.decision == 'enter_manual_release'"
+          },
+          {
+            "to": "state_9_quality_gate_blocker_assessed",
+            "when": "implementation_closeout_readiness_v1.decision == 'return_to_code_refine'"
+          }
+        ],
+        "type": null
+      },
+      "state_9_output_settlement_recovery": {
+        "approval": null,
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Output settlement recovery",
+        "loop": null,
+        "owner": "lead_orchestrator",
+        "run": {
+          "dynamic_parallel": null,
+          "parallel": null,
+          "sequence": [
+            {
+              "agent": "lead_orchestrator",
+              "inputs": [
+                "blocker_boundary_status",
+                "implementation_review_summary"
+              ],
+              "outputs": [
+                "orchestrator_summary",
+                "run_state"
+              ],
+              "task": "recover_quality_gate_output_settlement"
+            }
+          ],
+          "system_task": null,
+          "then": null
+        },
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_9_implementation_reviewed",
+            "when": "exists('orchestrator_summary')"
+          }
+        ],
+        "type": null
+      },
+      "state_9_quality_gate_blocker_assessed": {
+        "approval": null,
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Quality-gate blocker assessment",
+        "loop": null,
+        "owner": "lead_orchestrator",
+        "run": {
+          "dynamic_parallel": null,
+          "parallel": null,
+          "sequence": [
+            {
+              "agent": "lead_orchestrator",
+              "inputs": [
+                "approved_proposal",
+                "implementation_self_assessment",
+                "implementation_review_summary",
+                "audit_report",
+                "security_report",
+                "prepush_review_report",
+                "docs_report",
+                "changed_files_manifest",
+                "tests_result"
+              ],
+              "outputs": [
+                "quality_gate_blocker_assessment"
+              ],
+              "task": "assess_quality_gate_blockers"
+            }
+          ],
+          "system_task": null,
+          "then": null
+        },
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_9_quality_gate_boundary_evaluated",
+            "when": "exists('quality_gate_blocker_assessment')"
+          }
+        ],
+        "type": null
+      },
+      "state_9_quality_gate_boundary_evaluated": {
+        "approval": null,
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Quality-gate blocker boundary evaluated",
+        "loop": null,
+        "owner": "lead_orchestrator",
+        "run": {
+          "dynamic_parallel": null,
+          "parallel": null,
+          "sequence": null,
+          "system_task": {
+            "executor_mode": "system.quality_gate_boundary",
+            "task_type": "quality_gate_boundary_evaluator"
+          },
+          "then": null
+        },
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_9_output_settlement_recovery",
+            "when": "blocker_boundary_status.status == 'output_settlement_required'"
+          },
+          {
+            "to": "state_9_side_effect_reconciliation",
+            "when": "blocker_boundary_status.status == 'side_effect_reconciliation_required'"
+          },
+          {
+            "to": "state_9_runtime_recovery",
+            "when": "blocker_boundary_status.status == 'runtime_recovery_required'"
+          },
+          {
+            "to": "state_9_implementation_reviewed",
+            "when": "blocker_boundary_status.status == 'review_refresh_required'"
+          },
+          {
+            "to": "state_10_implementation_refined",
+            "when": "blocker_boundary_status.status == 'local_code_tail_present'"
+          },
+          {
+            "to": "state_9_implementation_reviewed",
+            "when": "blocker_boundary_status.status == 'invalid_claim'"
+          },
+          {
+            "to": "state_9_blocker_boundary_approval",
+            "when": "blocker_boundary_status.status == 'blocked_no_progress'"
+          },
+          {
+            "to": "state_9_blocker_boundary_approval",
+            "when": "blocker_boundary_status.status == 'awaiting_human_boundary_approval'"
+          },
+          {
+            "to": "state_11_manual_release",
+            "when": "blocker_boundary_status.status == 'pass'"
+          }
+        ],
+        "type": null
+      },
+      "state_9_runtime_recovery": {
+        "approval": null,
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Runtime recovery",
+        "loop": null,
+        "owner": "lead_orchestrator",
+        "run": {
+          "dynamic_parallel": null,
+          "parallel": null,
+          "sequence": [
+            {
+              "agent": "lead_orchestrator",
+              "inputs": [
+                "blocker_boundary_status",
+                "implementation_review_summary"
+              ],
+              "outputs": [
+                "orchestrator_summary",
+                "run_state"
+              ],
+              "task": "recover_quality_gate_runtime"
+            }
+          ],
+          "system_task": null,
+          "then": null
+        },
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_9_implementation_reviewed",
+            "when": "exists('orchestrator_summary')"
+          }
+        ],
+        "type": null
+      },
+      "state_9_side_effect_reconciliation": {
+        "approval": null,
+        "approval_policy": null,
+        "degraded_output_policy": null,
+        "label": "Side-effect reconciliation",
+        "loop": null,
+        "owner": "lead_orchestrator",
+        "run": {
+          "dynamic_parallel": null,
+          "parallel": null,
+          "sequence": [
+            {
+              "agent": "lead_orchestrator",
+              "inputs": [
+                "blocker_boundary_status",
+                "implementation_review_summary"
+              ],
+              "outputs": [
+                "orchestrator_summary",
+                "run_state"
+              ],
+              "task": "reconcile_quality_gate_side_effects"
+            }
+          ],
+          "system_task": null,
+          "then": null
+        },
+        "run_after_approval": null,
+        "transitions": [
+          {
+            "to": "state_9_implementation_reviewed",
+            "when": "exists('orchestrator_summary')"
+          }
+        ],
+        "type": null
+      }
+    },
+    "variables": {
+      "audit_target_status": "implemented",
+      "implementation_review_target_status": "code_complete",
+      "max_implementation_progress_cycles": 50,
+      "max_implementation_revision_cycles": 22,
+      "max_proposal_revision_cycles": 15,
+      "min_individual_proposal_score": 8,
+      "proposal_score_target": 8.5
+    },
+    "workflow": {
+      "description": "First repo-backed end-to-end dogfood workflow. Idea through proposal, implementation in a dedicated worktree, review quartet, manual release gate, and durable receipts.",
+      "execution": {
+        "requires_project_access": true,
+        "resume_policy": "automatic_on_launch",
+        "single_active_run_per_idea": true
+      },
+      "family": null,
+      "id": "full_mvp_live",
+      "idea_input": {
+        "mode": "text_with_optional_file"
+      },
+      "name": "Full MVP Live",
+      "required_providers": [
+        "codex_acp",
+        "claude_acp",
+        "junie"
+      ],
+      "risk_class": null,
+      "stack": null,
+      "uses_agent_catalog": "./agents.yaml"
+    }
+  }
+}

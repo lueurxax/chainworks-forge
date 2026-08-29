@@ -30,7 +30,8 @@
       "clause": 4,
       "proofs": [
         {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "v1_task_prompt_orders_mission_before_skill_and_projects_authoritative_outputs"},
-        {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "active_catalog_preserves_affected_contracts_and_unrelated_skill_bytes"}
+        {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "active_catalog_preserves_affected_contracts_and_unrelated_skill_bytes"},
+        {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "security_and_prepush_migration_preserves_complete_before_state"}
       ]
     },
     {
@@ -38,7 +39,9 @@
       "proofs": [
         {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "mission_consumers_cover_next_phase_and_transitions"},
         {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "consumer_grammar_covers_multi_transition_owner_and_terminal_shapes"},
-        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "ctx_001_through_ctx_006_have_exact_positive_and_mutation_negative_scores"}
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "ctx_001_through_ctx_006_have_exact_positive_and_mutation_negative_scores"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "ctx_007_and_008_compile_active_tasks_and_reject_each_prompt_mutation"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "active_review_tasks_cover_conditional_test_evidence_branches"}
       ]
     },
     {
@@ -47,6 +50,7 @@
         {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "strict_bundle_rejects_auxiliary_entry_and_allowed_tools"},
         {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "strict_bundle_rejects_oversized_malformed_and_non_utf8_documents"},
         {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "strict_bundle_rejects_symlinked_skill_file_and_parent_escape"},
+        {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "active_security_and_prepush_bundles_are_strict_single_file_documents"},
         {"source": "control-plane/crates/workflow/src/skill_bundle.rs", "test": "final_entry_rename_swap_fails_closed"},
         {"source": "control-plane/crates/workflow/src/skill_bundle.rs", "test": "intermediate_directory_symlink_swap_fails_closed"}
       ]
@@ -58,6 +62,7 @@
         {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "declared_unknown_skill_fails_compilation"},
         {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "bundle_and_role_specialization_mutations_change_declared_hashes"},
         {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "implementation_auditor_uses_external_procedure_without_prompt_duplication"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "security_and_prepush_external_procedures_inject_once_after_mission"},
         {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "active_catalog_preserves_procedure_kinds_and_does_not_duplicate_bundle_body_in_prompts"}
       ]
     },
@@ -66,6 +71,8 @@
       "proofs": [
         {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "frozen_v2_recompile_uses_embedded_skill_after_source_is_removed"},
         {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "frozen_v2_rejects_corrupted_bundle_digest"},
+        {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "security_and_prepush_frozen_bundles_ignore_live_source_drift"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "pre_migration_v2_inline_snapshot_survives_external_bundle_migration"},
         {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "agent_context_corrupted_frozen_snapshot_enqueues_zero_provider_work"}
       ]
     },
@@ -73,14 +80,18 @@
       "clause": 9,
       "proofs": [
         {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "active_catalog_preserves_affected_contracts_and_unrelated_skill_bytes"},
+        {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "security_and_prepush_migration_preserves_complete_before_state"},
         {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "implementation_auditor_uses_external_procedure_without_prompt_duplication"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "security_and_prepush_external_procedures_inject_once_after_mission"},
         {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "active_catalog_preserves_procedure_kinds_and_does_not_duplicate_bundle_body_in_prompts"}
       ]
     },
     {
       "clause": 10,
       "proofs": [
-        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "ctx_001_through_ctx_006_have_exact_positive_and_mutation_negative_scores"}
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "ctx_001_through_ctx_006_have_exact_positive_and_mutation_negative_scores"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "ctx_007_and_008_compile_active_tasks_and_reject_each_prompt_mutation"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "active_review_tasks_cover_conditional_test_evidence_branches"}
       ]
     },
     {

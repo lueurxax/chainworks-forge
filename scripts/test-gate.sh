@@ -12632,10 +12632,10 @@ for clause in clauses:
 
 ctx_dir = root / "control-plane/crates/engine/tests/fixtures/agent_context"
 actual_ctx_cases = sorted(path.name for path in ctx_dir.glob("CTX-*.json"))
-expected_ctx_cases = [f"CTX-{index:03}.json" for index in range(1, 7)]
+expected_ctx_cases = [f"CTX-{index:03}.json" for index in range(1, 9)]
 if actual_ctx_cases != expected_ctx_cases:
     raise SystemExit(
-        "agent-context-skills: CTX corpus must contain CTX-001..006 exactly; "
+        "agent-context-skills: CTX corpus must contain CTX-001..008 exactly; "
         f"got {actual_ctx_cases}"
     )
 
@@ -12644,6 +12644,8 @@ expected_bindings = {
     "proposal_review_router_skill": "skills/proposal-review-router",
     "code_writer_core": "skills/code-implementation",
     "proposal_implementation_audit": "skills/implementation-audit",
+    "security_checker_core": "skills/security-review",
+    "prepush_review_core": "skills/prepush-review",
 }
 for binding, relative in expected_bindings.items():
     if f"  {binding}:\n    type: external_skill\n    path: {relative}" not in catalog:
