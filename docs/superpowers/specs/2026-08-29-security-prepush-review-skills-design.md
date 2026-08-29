@@ -305,6 +305,26 @@ Both cases have an independent `control_plane_manifest_provenance` claim.
 Removing `control-plane-generated` or changing the procedure to permit a
 caller/provider-authored alternative manifest must fail that claim.
 
+### Conditional Evidence Compatibility Matrix
+
+The named test
+`active_review_tasks_cover_conditional_test_evidence_branches` compiles both
+checked-in workflows with the active catalog and finalizes all four real tasks:
+
+| Workflow | Task | Exact inputs | Logical output | Contract | Direct test branch |
+|---|---|---|---|---|---|
+| `full-mvp-live.yaml` | `check_implementation_security` | `approved_proposal`, `changed_files_manifest` | `security_report` | `security_report_v1` | absent; adding `tests_result` is rejected |
+| `full-mvp-live.yaml` | `prepush_review` | `approved_proposal`, `changed_files_manifest`, `audit_report`, `security_report` | `prepush_review_report` | `prepush_review_v1` | absent; adding `tests_result` is rejected |
+| `workflow.yaml` | `review_security` | `approved_proposal`, `implementation_progress`, `changed_files_manifest`, `tests_result` | `security_report` | `security_report_v1` | present and accepted |
+| `workflow.yaml` | `review_before_push` | `approved_proposal`, `implementation_progress`, `changed_files_manifest`, `tests_result`, `audit_report`, `security_report` | `prepush_review_report` | `prepush_review_v1` | present and accepted |
+
+For the two direct-test tasks, `task_input_remove(tests_result)` regenerates the
+prompt, removes exactly the `declared_test_evidence_available` claim, and must
+fail the scorer. For the two no-direct-test tasks, the existing
+`task_input_add(tests_result)` mutation removes exactly
+`no_undeclared_test_evidence` and must fail. Every finalized prompt separately
+asserts the logical output name and output contract listed above.
+
 Consumer assertions use the current `task_consumers` meaning: the task or tasks
 in the next execution phase, or state transitions when no later phase exists.
 They do not claim to enumerate every artifact reader.
@@ -335,7 +355,10 @@ The gate must execute:
 11. unchanged skill definitions and procedure bytes for every skill outside
     the two newly migrated bindings, including byte-pinned SHA-256 values for
     `proposal-review-router/SKILL.md`, `code-implementation/SKILL.md`, and
-    `implementation-audit/SKILL.md`.
+    `implementation-audit/SKILL.md`;
+12. `active_review_tasks_cover_conditional_test_evidence_branches` finalizes
+    the four-task compatibility matrix, proves both conditional branches, and
+    independently mutates direct-test presence for every task.
 
 The before-state fixture stores canonical JSON for the two inline skill
 definitions, both complete agent entries, both referenced backend profiles,
@@ -356,6 +379,8 @@ slice.
 The proof manifest maps each requirement above to named executable tests. Gate
 preflight fails when a named test is absent or renamed, and the tests themselves
 must execute rather than satisfy string-only presence checks.
+The compatibility-matrix test is a required proof entry and cannot be replaced
+by YAML source comparison alone.
 
 The existing gate name remains unchanged because this extends the same contract
 surface. Documentation must update its case count and active-bundle inventory.
@@ -415,10 +440,13 @@ disabled.
     reject alternate provenance; `CTX-007` rejects undeclared direct test input.
 11. All three previously migrated bundle files are byte-pinned and independently
     mutation-tested.
-12. The provider-free focused gate passes locally without remote execution.
-13. No unrelated skill, runtime, API, persistence, UI, or workflow surface is
+12. All four real review tasks are compiled and finalized; both direct-test
+    conditional branches, exact input sets, logical outputs, and contracts are
+    mutation-tested.
+13. The provider-free focused gate passes locally without remote execution.
+14. No unrelated skill, runtime, API, persistence, UI, or workflow surface is
    changed.
-14. After implementation merge, one new normal run exercises both procedures
+15. After implementation merge, one new normal run exercises both procedures
     with no disable flag or special workflow.
 
 ## Review R1 Resolution
@@ -435,6 +463,7 @@ disabled.
 | R2 P1-01 security input fidelity | security evidence is task-conditional; `CTX-007` rejects injected undeclared `tests_result`, while parity preserves the workflow that declares it |
 | R2 P1-02 manifest provenance | both procedures and cases require the control-plane-generated manifest and reject alternate provenance |
 | R2 P1-03 existing bundle drift | full SHA-256 values and one-byte mutations pin all three previously migrated bundles |
+| R3 P1-01 positive conditional branch | named compatibility test compiles/finalizes all four real tasks; direct-test removal and undeclared-test addition independently fail their claims |
 
 ## Review Guidance
 
