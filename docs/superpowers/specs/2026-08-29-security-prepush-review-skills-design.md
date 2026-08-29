@@ -1,7 +1,7 @@
 # Security and Pre-Push Review Skills: Default-On Slice
 
 Date: 2026-08-29
-Status: Draft for proposal-readiness review; implementation prohibited until Ready
+Status: Revised after proposal-readiness review; implementation prohibited until Ready
 
 ## Summary
 
@@ -45,6 +45,8 @@ Out of scope:
 - scanner implementation or new scanner tools;
 - live-provider benchmarks, repeated A/B evaluation, or nightly evaluation;
 - skill resources, scripts, assets, registries, installers, or `allowed-tools`;
+- a new authenticated persisted-prompt digest or a copy-prompt-to-skill-hash
+  runtime validator;
 - production-hardening backlog refinement;
 - rewriting or recompiling an existing run.
 
@@ -65,6 +67,14 @@ In `full-mvp-live.yaml`, security review runs in the parallel portion of
 `state_9_implementation_reviewed`; pre-push review runs later in the same state
 after audit evidence exists. This provides a natural end-to-end observation
 without a special workflow.
+
+The compiled production task, rather than the broader catalog agent entry,
+defines materialized evidence. In this workflow the security task receives
+`approved_proposal` and `changed_files_manifest`. The pre-push task receives
+`approved_proposal`, `changed_files_manifest`, `audit_report`, and
+`security_report`. It does not directly receive `tests_result`; test truth is
+available only through the implementation audit, whose immediately preceding
+task does receive `tests_result`. This slice does not change that topology.
 
 ## Decision
 
@@ -140,8 +150,10 @@ The Markdown body must instruct the reviewer to:
 1. treat the approved proposal and frozen mission as scope;
 2. evaluate correctness, maintainability, regression risk, surprising side
    effects, and missing tests without adding unrelated improvements;
-3. consume the canonical changed-files, test, implementation-audit, and security
-   evidence declared by the assignment;
+3. consume exactly the canonical changed-files, implementation-audit, and
+   security evidence declared by the compiled task; assess test truth directly
+   only when `tests_result` is declared by that task, and otherwise use the
+   implementation audit without inventing a missing direct input;
 4. use `changed_files_manifest` as canonical Git evidence and never invoke
    `git status`, `git diff`, `git rev-parse`, or read `.git`;
 5. keep discovery bounded to changed and implicated paths;
@@ -186,10 +198,21 @@ For each affected agent in a newly compiled run:
 5. frontmatter never enters the provider prompt;
 6. retry and resume reuse the frozen prompt bytes;
 7. changed or removed live bundle files do not alter a frozen run;
-8. a corrupted stored bundle or prompt hash fails closed before provider work.
+8. corrupted stored catalog bytes, embedded bundle bytes, or their existing
+   catalog/bundle hashes fail closed before provider work.
 
 Existing runs are not drift-upgraded. Retrying an existing run cannot pick up
 these bundles; the end-to-end observation therefore requires a new run.
+
+This slice does not claim that the current copy validator authenticates an
+arbitrary persisted prompt against `skill_snapshot_hash`. It continues to
+validate the V1 mission-block shape and reuse stored bytes under the existing
+runtime contract. Adding a new persisted-prompt digest is separate runtime work.
+
+A checked-in pre-migration V2 snapshot fixture must preserve the current inline
+definitions for these two skills. After live catalog migration and removal of
+the new source directories, compilation from that fixture must reproduce exact
+golden security and pre-push prompt bytes without consulting live files.
 
 ## Deterministic Cases
 
@@ -198,7 +221,10 @@ these bundles; the end-to-end observation therefore requires a new run.
 The fixture represents a security review of an implementation that changes an
 authorization or filesystem boundary.
 
-Positive assertions prove that the finalized prompt contains:
+The test compiles the real `check_implementation_security` task from the active
+`full-mvp-live.yaml` and `agents.yaml`; it does not construct a synthetic task
+with additional inputs. Positive assertions prove that the finalized prompt
+contains:
 
 - the frozen operator objective and security assignment;
 - `RO_VERIFY` and `security_report_v1` truth;
@@ -206,7 +232,8 @@ Positive assertions prove that the finalized prompt contains:
 - scanner-as-evidence guidance;
 - bounded discovery and no direct Git access;
 - no source-write, approval, release, or external-effect authority;
-- the correct downstream consumer.
+- the next-execution-phase consumer
+  `audit_implementation_against_proposal/proposal_implementation_auditor`.
 
 Mutation negatives independently remove or alter mission, permission, output,
 canonical evidence, no-mutation, and consumer truth. Every mutation must fail
@@ -214,25 +241,55 @@ the deterministic scorer.
 
 ### `CTX-008`: Pre-Push Fail-Closed Settlement
 
-The fixture represents final review with declared test, audit, and security
-evidence, including one blocking or invalid upstream condition.
+The fixture represents final review with the exact compiled production inputs:
+`approved_proposal`, `changed_files_manifest`, `audit_report`, and
+`security_report`. Its deterministic task body contains one blocking or invalid
+upstream audit/security condition. It does not inject a direct `tests_result`.
+The procedure must not invent direct test evidence; any test assessment is
+transitive through `audit_report` in this workflow.
 
-Positive assertions prove that the finalized prompt contains:
+The test compiles the real `prepush_review` task from active
+`full-mvp-live.yaml` and `agents.yaml`. Positive assertions prove that the
+finalized prompt contains:
 
 - the frozen operator objective and pre-push assignment;
 - `RO_PREPUSH_VERIFY` and `prepush_review_v1` truth;
-- all declared upstream evidence inputs;
+- exactly the four production evidence inputs and no direct `tests_result`;
 - explicit fail-closed handling of missing, invalid, red, or blocking evidence;
 - canonical changed-files guidance and bounded discovery;
 - no edit, commit, push, approval, release, or external-effect authority;
-- the correct downstream consumer.
+- the next-execution-phase consumer
+  `aggregate_implementation_reviews/lead_orchestrator`.
 
-Mutation negatives independently weaken permission, output, evidence set,
-fail-closed policy, no-release authority, and consumer truth. Every mutation
-must fail the deterministic scorer.
+Mutation negatives independently weaken permission, output, exact evidence set,
+fail-closed policy, no-release authority, and next-phase consumer truth. Every
+mutation must fail the deterministic scorer.
 
 The cases score prompt contract truth, not model intelligence. They make no
 claim that a provider will always obey the procedure.
+
+### Mutation Harness V2
+
+`CTX-001..006` retain their current JSON-pointer mutations. `CTX-007/008` use a
+closed mutation union that regenerates the final prompt for every case:
+
+- `mission_json_replace`: replace one mission-context JSON pointer;
+- `system_prompt_remove`: remove one named system-prompt clause before finalization;
+- `procedure_remove`: remove one named clause from the resolved frozen procedure;
+- `task_input_remove`: remove one declared compiled-task input and regenerate
+  the deterministic materialized task body;
+- `task_body_remove`: remove one named evidence or policy clause from the task body.
+
+Each expected claim has a stable `claim_id` and exactly one targeted negative
+mutation. The scorer returns the complete satisfied-claim set. The baseline
+must equal the fixture's exact claim set; each mutation must remove its named
+claim and no unrelated claim. Deleting or weakening a scorer rule therefore
+also breaks the positive exact-set assertion rather than silently making the
+mutation pass.
+
+Consumer assertions use the current `task_consumers` meaning: the task or tasks
+in the next execution phase, or state transitions when no later phase exists.
+They do not claim to enumerate every artifact reader.
 
 ## Required Tests and Gate
 
@@ -243,16 +300,36 @@ The gate must execute:
 
 1. catalog parity for all five migrated external bindings;
 2. strict bundle validation for both new directories;
-3. exact permission, tool, input, output, approval, and write-policy parity;
+3. complete before-state parity for the two affected catalog agent entries,
+   their full referenced backend and permission profiles, and every task object
+   using those agents in `full-mvp-live.yaml` and `workflow.yaml`;
 4. prompt ordering and exact-once procedure injection for both agents;
 5. frontmatter exclusion and no duplicated catalog procedure prose;
-6. frozen-snapshot reuse after both live bundle directories are changed or
-   removed;
-7. corrupted bundle/hash fail-closed behavior with zero provider work;
-8. exact `CTX-001..008` corpus membership;
-9. positive and independent mutation-negative scoring for `CTX-007/008`;
-10. unchanged procedure bytes for every skill outside the five migrated
+6. post-migration frozen-snapshot reuse after both live bundle directories are
+   changed or removed;
+7. exact pre-migration V2 inline snapshot and golden-prompt reuse after the live
+   catalog and new bundle directories are unavailable;
+8. corrupted catalog/bundle bytes or existing hashes fail closed with zero
+   provider work;
+9. exact `CTX-001..008` corpus membership;
+10. active-workflow compilation plus positive and independent V2 mutation
+    scoring for `CTX-007/008`;
+11. unchanged procedure bytes for every skill outside the five migrated
     bindings.
+
+The before-state fixture stores canonical JSON for the two inline skill
+definitions, both complete agent entries, both referenced backend profiles,
+both referenced permission profiles, and the four workflow task objects that
+use the agents. One deterministic transform may change only the two skill
+definitions and replace each long prompt with its specified concise
+specialization. Exact comparison rejects all other drift.
+Mutation tests cover backend profile, model/effort/MCP, permission rules,
+required tools, task inputs, outputs, output contract, approval requirement,
+worktree policy, phase/parallel placement, and workflow task identity.
+
+The proof manifest maps each requirement above to named executable tests. Gate
+preflight fails when a named test is absent or renamed, and the tests themselves
+must execute rather than satisfy string-only presence checks.
 
 The existing gate name remains unchanged because this extends the same contract
 surface. Documentation must update its case count and active-bundle inventory.
@@ -283,7 +360,8 @@ disabled.
 - Missing, malformed, oversized, escaping, or multi-entry bundle fails new-run
   compilation.
 - Missing skill resolution never degrades to an inline or empty procedure.
-- Prompt-finalization or frozen-hash failure creates zero provider work.
+- Prompt-finalization or existing catalog/bundle hash failure creates zero
+  provider work.
 - Security and pre-push evidence failure uses existing `block`, `invalid`, or
   `unknown` settlement; this slice creates no waiver.
 - Existing frozen runs remain readable and retry only with their stored bytes.
@@ -298,14 +376,32 @@ disabled.
    settlement contracts remain unchanged.
 4. Reusable procedure is removed from both catalog prompts and injected exactly
    once from frozen bundle bytes.
-5. Existing frozen runs preserve exact stored behavior.
+5. Post-migration frozen runs reuse embedded bundle bytes; the pinned
+   pre-migration V2 fixture preserves exact inline prompt bytes.
 6. New runs fail closed on invalid source or stored bundle state.
-7. `CTX-001..008` and all declared mutation negatives pass.
-8. The provider-free focused gate passes locally without remote execution.
-9. No unrelated skill, runtime, API, persistence, UI, or workflow surface is
+7. `CTX-007/008` compile the real active state-9 tasks with their exact inputs,
+   next-phase consumers, and no synthetic direct test evidence.
+8. The V2 mutation harness regenerates prompts and makes every named claim
+   independently falsifiable; `CTX-001..008` pass.
+9. Complete before-state parity rejects drift in every affected agent, profile,
+   permission, tool, task, output, approval, and write-policy field.
+10. The provider-free focused gate passes locally without remote execution.
+11. No unrelated skill, runtime, API, persistence, UI, or workflow surface is
    changed.
-10. After implementation merge, one new normal run exercises both procedures
+12. After implementation merge, one new normal run exercises both procedures
     with no disable flag or special workflow.
+
+## Review R1 Resolution
+
+| Finding | Resolution |
+|---|---|
+| P1-01 production evidence mismatch | `CTX-008` compiles active `prepush_review`, uses its exact four inputs, and treats test truth only as transitive through `audit_report` |
+| P1-02 unsupported prompt integrity | authenticated persisted-prompt digest is explicitly out of scope; claims are limited to existing catalog and bundle digest enforcement |
+| P1-03 non-falsifiable prompt mutations | closed Mutation Harness V2 regenerates final prompts and exact-sets stable claim IDs |
+| P1-04 incomplete parity | canonical before-state covers complete agents, profiles, permissions, and workflow task objects with authority-field mutations |
+| P2-01 consumer ambiguity | consumer means next execution phase; exact task/agent tuples are specified |
+| P2-02 pre-migration proof | pinned V2 inline snapshot and exact golden prompts are required |
+| P2-03 proof manifest | every new requirement maps to an executable named test and gate preflight checks the mapping |
 
 ## Review Guidance
 
