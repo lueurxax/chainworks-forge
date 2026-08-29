@@ -57,6 +57,7 @@
         {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "initial_compile_embeds_valid_external_skill_in_catalog_v2"},
         {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "declared_unknown_skill_fails_compilation"},
         {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "bundle_and_role_specialization_mutations_change_declared_hashes"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "implementation_auditor_uses_external_procedure_without_prompt_duplication"},
         {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "active_catalog_preserves_procedure_kinds_and_does_not_duplicate_bundle_body_in_prompts"}
       ]
     },
@@ -72,6 +73,7 @@
       "clause": 9,
       "proofs": [
         {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "active_catalog_preserves_affected_contracts_and_unrelated_skill_bytes"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "implementation_auditor_uses_external_procedure_without_prompt_duplication"},
         {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "active_catalog_preserves_procedure_kinds_and_does_not_duplicate_bundle_body_in_prompts"}
       ]
     },

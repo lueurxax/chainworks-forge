@@ -1,5 +1,5 @@
 {
-  "unrelated_skills_sha256": "bdb5ffb96a037b735ddf1737e35a2f6add2412670aae868314ac7733448dfb62",
+  "unrelated_skills_sha256": "9c4b83207653627dab9fe05c1e06b9b39cd8ee13e29ba0600552a3a22410093c",
   "affected_agents": [
     {
       "agent_id": "code_writer",
@@ -8,6 +8,14 @@
       "outputs": ["implementation_progress", "implementation_self_assessment", "tests_result"],
       "output_contract": "implementation_self_assessment_v2",
       "worktree_write_enabled": true
+    },
+    {
+      "agent_id": "proposal_implementation_auditor",
+      "skill_ref": "proposal_implementation_audit",
+      "permission_profile": "RO_VERIFY",
+      "outputs": ["audit_report"],
+      "output_contract": "audit_report_v1",
+      "worktree_write_enabled": false
     },
     {
       "agent_id": "proposal_review_router",

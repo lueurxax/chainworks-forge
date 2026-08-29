@@ -147,6 +147,45 @@ Important:
 - this is the proving path for the fast lane
 - do not substitute it with raw `xcodebuild -testPlan FastGate test` and assume the result is equivalent
 
+### `agent-context-skills`
+
+Provider-free contract gate for default-on mission context and frozen local
+Agent Skills bundles.
+
+Scope:
+
+- validates the closed `CTX-001..006` corpus and the twelve-clause proof manifest
+- verifies `proposal_review_router_skill`, `code_writer_core`, and
+  `proposal_implementation_audit` resolve from single-file external bundles
+- proves the implementation auditor keeps `RO_VERIFY`, `audit_report`, and
+  `audit_report_v1` while injecting its procedure exactly once after mission
+  context and before the task body
+- verifies frozen bundle reuse, catalog parity, prompt finalization, producer
+  inventory, mutation-negative cases, and zero-provider-work failure paths
+
+Use when:
+
+- changing mission context assembly, skill bundle compilation, active skill
+  bindings, or the proposal implementation auditor procedure
+
+Host policy:
+
+- local Rust toolchain and Python 3 only; no daemon, network, UI host, or live
+  provider required
+
+Command:
+
+```bash
+./scripts/test-gate.sh agent-context-skills
+```
+
+Important:
+
+- the gate rejects missing or auxiliary bundle files and any `allowed-tools`
+  declaration in these procedure-only skills
+- frozen runs retain their catalog snapshot; the third bundle applies only to
+  newly compiled runs
+
 ### `ui-smoke`
 
 Focused operator-shell UI smoke gate.

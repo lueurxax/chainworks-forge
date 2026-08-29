@@ -12643,6 +12643,7 @@ catalog = (root / "examples/agents/agents.yaml").read_text()
 expected_bindings = {
     "proposal_review_router_skill": "skills/proposal-review-router",
     "code_writer_core": "skills/code-implementation",
+    "proposal_implementation_audit": "skills/implementation-audit",
 }
 for binding, relative in expected_bindings.items():
     if f"  {binding}:\n    type: external_skill\n    path: {relative}" not in catalog:
