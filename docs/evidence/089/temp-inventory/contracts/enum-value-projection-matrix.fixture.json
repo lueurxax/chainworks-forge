@@ -1,7 +1,7 @@
 {
   "schema_version": "p089_temp_inventory_enum_matrix_v1",
   "description": "P089 canonical enum value projection matrix. Each domain enum maps snake_case (JSON/MCP/report) to SCREAMING_SNAKE_CASE (GraphQL). All lanes must agree on values.",
-  "$comment": "PARTIALLY RECONCILED. Value coverage and casing for the seven proposal-era domains below agree with the shipped GraphQL projection in control-plane/crates/graphql-server/src/types/temp_artifact_inventory.rs. Two gaps remain: the refinement-added `inventory_mode` domain (disabled|hidden_readback|operator_visible, projected as the closed GraphQL enum InventoryMode) is not covered here at all, and the GraphQL *type name* for enabled_state is InventoryEnabledState in the implementation versus EnabledState in graphql-sdl.fixture.graphql. This file maps values only, not type names. See docs/reference/managed-temporary-artifact-inventory.md#44-graphql-projection-specifics-implemented.",
+  "$comment": "Reconciled with the shipped GraphQL projection in control-plane/crates/graphql-server/src/types/temp_artifact_inventory.rs. Value coverage and casing for the seven proposal-era domains agree with the implementation. The refinement-added `inventory_mode` domain (disabled|hidden_readback|operator_visible, projected as the closed GraphQL enum InventoryMode, no `unknown` member) is now covered below. The GraphQL type name for enabled_state is InventoryEnabledState, matching graphql-sdl.fixture.graphql after reconciliation. This file maps values only, not type names. See docs/reference/managed-temporary-artifact-inventory.md#44-graphql-projection-specifics-implemented.",
   "inventory_status": {
     "complete": "COMPLETE",
     "partial": "PARTIAL",
@@ -16,6 +16,11 @@
     "enabled": "ENABLED",
     "disabled": "DISABLED",
     "unknown": "UNKNOWN"
+  },
+  "inventory_mode": {
+    "disabled": "DISABLED",
+    "hidden_readback": "HIDDEN_READBACK",
+    "operator_visible": "OPERATOR_VISIBLE"
   },
   "lifecycle_classification": {
     "active_or_recent": "ACTIVE_OR_RECENT",

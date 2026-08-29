@@ -1684,6 +1684,143 @@ mod tests {
         );
     }
 
+    // ── P089 §4.4/B6: status-by-field-matrix fixture conformance ────────────
+    //
+    // The checked-in fixture's `classification_dry_run_mapping` and
+    // `age_thresholds_seconds` are meant to mirror this file's `classify_row`
+    // and its `AGE_*` constants (reference doc §9). This test reads the
+    // fixture and drives `classify_row` with the same representative ages the
+    // per-bucket unit tests above use, so a drift between the fixture text and
+    // this file's actual behavior fails a test instead of only being caught by
+    // fixture presence checks.
+
+    fn workspace_root_for_fixtures() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::parent)
+            .expect("mcp-server crate should be under control-plane/crates")
+            .to_path_buf()
+    }
+
+    fn load_status_by_field_matrix_fixture() -> serde_json::Value {
+        let path = workspace_root_for_fixtures().join(
+            "docs/evidence/089/temp-inventory/contracts/status-by-field-matrix.fixture.json",
+        );
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        serde_json::from_str(&raw).expect("fixture must be valid JSON")
+    }
+
+    fn mapping_entry<'a>(fixture: &'a serde_json::Value, condition: &str) -> &'a serde_json::Value {
+        fixture["classification_dry_run_mapping"]
+            .as_array()
+            .expect("classification_dry_run_mapping must be an array")
+            .iter()
+            .find(|entry| entry["condition"] == condition)
+            .unwrap_or_else(|| panic!("fixture missing mapping entry for condition {condition:?}"))
+    }
+
+    fn assert_mapping_entry_matches(
+        fixture: &serde_json::Value,
+        condition: &str,
+        classification: LifecycleClassification,
+        recommendation: DryRunRecommendation,
+    ) {
+        let entry = mapping_entry(fixture, condition);
+        assert_eq!(
+            entry["lifecycle_classification"], classification.as_str(),
+            "condition {condition:?}: lifecycle_classification mismatch"
+        );
+        assert_eq!(
+            entry["dry_run_recommendation"], recommendation.as_str(),
+            "condition {condition:?}: dry_run_recommendation mismatch"
+        );
+    }
+
+    #[test]
+    fn p089_status_by_field_matrix_fixture_age_thresholds_match_scanner_constants() {
+        let fixture = load_status_by_field_matrix_fixture();
+        let thresholds = &fixture["age_thresholds_seconds"];
+        assert_eq!(thresholds["AGE_ACTIVE_SECS"], AGE_ACTIVE_SECS);
+        assert_eq!(thresholds["AGE_RECENT_SECS"], AGE_RECENT_SECS);
+        assert_eq!(thresholds["AGE_TERMINAL_SECS"], AGE_TERMINAL_SECS);
+    }
+
+    #[test]
+    fn p089_status_by_field_matrix_fixture_classification_mapping_matches_classify_row() {
+        let fixture = load_status_by_field_matrix_fixture();
+
+        let (legacy_classification, legacy_recommendation) =
+            classify_row(None, RootKind::LegacyChainworksTmp);
+        assert_mapping_entry_matches(
+            &fixture,
+            "root_kind = legacy_chainworks_tmp (any age)",
+            legacy_classification,
+            legacy_recommendation,
+        );
+
+        let (missing_classification, missing_recommendation) =
+            classify_row(None, RootKind::RunMetaRoot);
+        assert_mapping_entry_matches(
+            &fixture,
+            "last-touched timestamp missing or unparsable",
+            missing_classification,
+            missing_recommendation,
+        );
+
+        let recent_ts = Utc::now().to_rfc3339();
+        let (recent_classification, recent_recommendation) =
+            classify_row(Some(&recent_ts), RootKind::RunMetaRoot);
+        assert_mapping_entry_matches(
+            &fixture,
+            "touched under 1 hour ago",
+            recent_classification,
+            recent_recommendation,
+        );
+
+        let hours_ts = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        let (hours_classification, hours_recommendation) =
+            classify_row(Some(&hours_ts), RootKind::RunMetaRoot);
+        assert_mapping_entry_matches(
+            &fixture,
+            "touched under 24 hours ago",
+            hours_classification,
+            hours_recommendation,
+        );
+
+        let days_ts = (Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+        let (days_classification, days_recommendation) =
+            classify_row(Some(&days_ts), RootKind::RunMetaRoot);
+        assert_mapping_entry_matches(
+            &fixture,
+            "touched under 7 days ago",
+            days_classification,
+            days_recommendation,
+        );
+
+        let weeks_ts = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let (weeks_classification, weeks_recommendation) =
+            classify_row(Some(&weeks_ts), RootKind::RunMetaRoot);
+        assert_mapping_entry_matches(
+            &fixture,
+            "touched 7 days ago or older",
+            weeks_classification,
+            weeks_recommendation,
+        );
+
+        // The row-level partial-error override lives inline in the scan loop
+        // (not inside classify_row itself), so it can't be driven through
+        // classify_row directly; assert the fixture's claimed override target
+        // against the same enum constants that code path assigns.
+        assert_mapping_entry_matches(
+            &fixture,
+            "row accumulated any row-level partial error (overrides the age-derived pair above)",
+            LifecycleClassification::ScanError,
+            DryRunRecommendation::NeedsOperatorReview,
+        );
+    }
+
     #[test]
     fn p089_hidden_readback_row_carries_real_classification_not_unknown() {
         let _guard = scan_execution_test_lock();
