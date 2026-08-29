@@ -1,0 +1,58 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "applicability": "required",
+  "gate_aliases": [
+    "proposal-095",
+    "p095"
+  ],
+  "commands": {
+    "allowlist": [
+      "./scripts/test-gate.sh proposal-095"
+    ]
+  },
+  "migrations": {
+    "not_applicable": false,
+    "description": "Forward-only additive migration 100_p095_two_phase_code_writer.sql."
+  },
+  "metrics": {
+    "adoption_metric": "p095_two_phase_dispatch_percent",
+    "operational_metrics": [
+      "p095_phase_turn_total{phase,outcome}"
+    ]
+  },
+  "readback_lanes": [
+    "run_report",
+    "mcp",
+    "release_receipt",
+    "graphql"
+  ],
+  "readback_fields": [
+    "rollout_contract_status",
+    "rollout_contract_decision",
+    "rollout_contract_failure_reasons",
+    "rollout_contract_waiver_state",
+    "rollout_contract_waiver_expires_at",
+    "rollout_contract_enforcement_mode",
+    "rollout_contract_enforcement_mode_reason",
+    "rollout_contract_hold_conditions",
+    "rollout_contract_rollback_disposition",
+    "rollout_contract_source_lane",
+    "rollout_contract_enabled_state",
+    "rollout_contract_disabled_reason_code",
+    "rollout_contract_action_id",
+    "rollout_contract_operator_message",
+    "rollout_contract_projection_integrity",
+    "rollout_contract_cutover_policy_revision",
+    "rollout_contract_diagnostic_redaction",
+    "rollout_contract_next_steps"
+  ],
+  "decision_vocabulary": [
+    "pass",
+    "fail",
+    "not_applicable",
+    "timeout"
+  ],
+  "negative_fixtures": {
+    "invalid_contract": "docs/evidence/rollout-contract/negative/p095-invalid-contract.json"
+  }
+}

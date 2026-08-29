@@ -148,6 +148,39 @@ pub async fn mark_delivered_tx(tx: &mut Transaction<'_, Sqlite>, delivery_id: &s
     Ok(())
 }
 
+/// Mark a pending delivery as delivered and bind it to the invocation that
+/// received the augmented prompt.
+pub async fn mark_delivered_for_agent_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    delivery_id: &str,
+    agent_execution_id: AgentExecutionId,
+) -> Result<()> {
+    let now = Utc::now();
+    let agent_execution_id = agent_execution_id.to_string();
+    let rows = sqlx::query(
+        r#"UPDATE retry_operator_instruction_deliveries
+           SET status = 'delivered',
+               agent_execution_id = ?1,
+               updated_at = ?2,
+               delivered_at = ?2
+           WHERE delivery_id = ?3
+             AND status = 'pending'
+             AND (agent_execution_id IS NULL OR agent_execution_id = ?1)"#,
+    )
+    .bind(&agent_execution_id)
+    .bind(now.to_rfc3339())
+    .bind(delivery_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if rows != 1 {
+        anyhow::bail!(
+            "retry instruction delivery {delivery_id} not bound to agent execution {agent_execution_id} (expected pending, got 0 rows)"
+        );
+    }
+    Ok(())
+}
+
 /// Mark a pending delivery as failed.
 pub async fn mark_failed_tx(
     tx: &mut Transaction<'_, Sqlite>,
@@ -242,6 +275,26 @@ pub async fn find_pending_delivery_for_work_item_tx(
                   d.status, d.failure_reason, d.created_at, d.updated_at, d.delivered_at
            FROM retry_operator_instruction_deliveries d
            WHERE d.work_item_id = ?1 AND d.status = 'pending'
+           LIMIT 1"#,
+    )
+    .bind(work_item_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.as_ref().map(parse_delivery_row).transpose()
+}
+
+/// Find the delivery for a work item regardless of status. The executor uses
+/// this for idempotent work-item replay after prompt augmentation was already
+/// persisted.
+pub async fn find_delivery_for_work_item_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item_id: &str,
+) -> Result<Option<RetryOperatorInstructionDelivery>> {
+    let row = sqlx::query(
+        r#"SELECT d.delivery_id, d.binding_id, d.work_item_id, d.agent_execution_id,
+                  d.status, d.failure_reason, d.created_at, d.updated_at, d.delivered_at
+           FROM retry_operator_instruction_deliveries d
+           WHERE d.work_item_id = ?1
            LIMIT 1"#,
     )
     .bind(work_item_id)

@@ -22,8 +22,10 @@
         "P089TempArtifactInventoryTests",
         "ProcessSupportTests",
         "Proposal046Tests",
+        "Proposal058Tests",
         "Proposal079ContractRepairReadbackTests",
-        "Proposal086ContinuationReadbackTests"
+        "Proposal086ContinuationReadbackTests",
+        "RuntimeTimelineSubscriptionRecoveryTests"
       ],
       "target": {
         "containerPath": "container:Chainworks Forge.xcodeproj",

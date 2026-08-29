@@ -1960,6 +1960,8 @@ fn is_state_changing_tool(tool_name: &str) -> bool {
             | "runs.main_sync.repair_state"
             | "runs.main_sync.record_recovery_decision"
             | "runs.knowledge_capsule.ignore"
+            | "runs.resume_escalation_deadline"
+            | "runs.resume_escalation_chain"
             | "runs.settle_proposal_gate"
             | "ideas.create"
             | "stages.consume_provider_quota_hold"
@@ -2817,6 +2819,8 @@ mod p029_capability_tests {
             "runs.list",
             "runs.get",
             "runs.cancel",
+            "runs.resume_escalation_deadline",
+            "runs.resume_escalation_chain",
             "approvals.list",
             "approvals.resolve",
             "stages.retry",
@@ -2878,6 +2882,8 @@ mod p029_capability_tests {
             "stages.consume_provider_quota_hold",
             "legacy_discovery_override_create",
             "runs.cancel",
+            "runs.resume_escalation_deadline",
+            "runs.resume_escalation_chain",
             "steward.run_analysis",
             "steward.list_analyses",
             "steward.get_analysis",
@@ -2912,6 +2918,8 @@ mod p029_capability_tests {
             "ideas.create",
             "runs.start",
             "runs.cancel",
+            "runs.resume_escalation_deadline",
+            "runs.resume_escalation_chain",
             "approvals.resolve",
             "stages.retry",
             "stages.consume_provider_quota_hold",
@@ -2937,6 +2945,8 @@ mod p029_capability_tests {
         assert!(!tools_call_allowed(&ob, "runs.start"));
         assert!(!tools_call_allowed(&ob, "approvals.resolve"));
         assert!(!tools_call_allowed(&ob, "runs.cancel"));
+        assert!(!tools_call_allowed(&ob, "runs.resume_escalation_deadline"));
+        assert!(!tools_call_allowed(&ob, "runs.resume_escalation_chain"));
         assert!(!tools_call_allowed(&ob, "legacy_discovery_override_create"));
 
         // Unknown tool name also denied (capability_id_for returns None).

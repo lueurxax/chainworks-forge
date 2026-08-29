@@ -1494,6 +1494,74 @@ pub(crate) async fn rollout_contract_readback_json(
     Ok(serde_json::Value::Object(merged))
 }
 
+pub(crate) async fn p094_boundary_readback_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    artifact_contracts::p094_readback_json(pool, run_id)
+        .await
+        .map_err(Into::into)
+}
+
+pub(crate) async fn p094_rollout_decision_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let runtime = crate::tools::runtime::p094_quality_gate_boundary_readback();
+    let mut decision = runtime
+        .get("rolloutDecision")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let Some(check) =
+        rollout_contract_checks::find_terminal_rollout_contract_check_for_run(pool, run_id.inner())
+            .await?
+    else {
+        return Ok(decision);
+    };
+
+    let readback = check.operator_readback_json_for_lane("mcp");
+    let state = readback
+        .get("backend_decision")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!("hold"));
+    let enforcing_allowed = readback["status"] == serde_json::json!("pass")
+        && readback["enforcement_mode"] == serde_json::json!("enforce")
+        && readback["projection_integrity"] == serde_json::json!("valid");
+
+    if let Some(obj) = decision.as_object_mut() {
+        obj.insert(
+            "ownerDecision".to_string(),
+            serde_json::json!({
+                "state": state,
+                "source": "rollout_contract_checks",
+                "reason": "terminal rollout contract check selected the P094 rollout decision",
+                "commandJournalEntryId": serde_json::Value::Null,
+                "rolloutContractEntryId": check.id.to_string()
+            }),
+        );
+        obj.insert(
+            "promotionReadiness".to_string(),
+            serde_json::json!({
+                "enforcingAllowed": enforcing_allowed,
+                "blockedReason": if enforcing_allowed {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!("terminal_rollout_contract_not_enforcing")
+                },
+                "requiresBeforeEnforcing": if enforcing_allowed {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!("terminal pass check with enforce mode and valid projection")
+                }
+            }),
+        );
+        obj.insert("rolloutContractReadback".to_string(), readback);
+    }
+
+    Ok(decision)
+}
+
 /// P077: Serialize the active closeout readiness generation for MCP readback.
 /// Routes through CloseoutReadinessSummaryAccessor (R14 §architecture.single_accessor).
 /// Returns null when no active generation exists (run not yet at state_9 or gate not settled).

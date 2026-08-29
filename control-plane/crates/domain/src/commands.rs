@@ -89,6 +89,14 @@ pub enum Command {
     /// Moves process_fate to absent_verified and transitions held intent back to requested
     /// so settlement can resume. Requires CallerRequestId and operator confirmation.
     MarkProviderSessionProcessAbsent(MarkProviderSessionProcessAbsentCmd),
+    /// P058: operator-only recovery for an escalation paused specifically because
+    /// its wall-clock deadline elapsed. Opens a new bounded deadline window and
+    /// schedules the ledger's current tier without rewriting prior history.
+    ResumeEscalationDeadline(ResumeEscalationDeadlineCmd),
+    /// P058: operator-only one-shot recovery for an escalation whose frozen chain
+    /// reached its terminal human pause. Opens a linked bounded window for an
+    /// explicit frozen backend-profile tier without resetting attempt history.
+    ResumeEscalationChain(ResumeEscalationChainCmd),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -173,6 +181,30 @@ pub struct ConsumeProviderQuotaHoldCmd {
     pub run_id: RunId,
     pub stage_id: String,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResumeEscalationDeadlineCmd {
+    pub run_id: RunId,
+    pub escalation_ledger_id: String,
+    pub reason: String,
+    /// UUIDv7 supplied by the caller. The engine stores it on the deadline window
+    /// as a second replay fence in addition to MCP command idempotency.
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResumeEscalationChainCmd {
+    pub run_id: RunId,
+    pub escalation_ledger_id: String,
+    pub target_tier_id: String,
+    pub reason: String,
+    /// Optional one-shot operator instruction for the recovery-created invocation scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_instruction: Option<String>,
+    /// UUIDv7 supplied by the caller. The linked window provides the durable
+    /// replay fence for the complete stage/authority/work-item transaction.
+    pub idempotency_key: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

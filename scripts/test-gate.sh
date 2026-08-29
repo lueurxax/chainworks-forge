@@ -89,8 +89,11 @@ FAST_TESTS=(
   "Chainworks ForgeTests/P089TempArtifactInventoryTests"
   "Chainworks ForgeTests/ProcessSupportTests"
   "Chainworks ForgeTests/Proposal046Tests"
+  "Chainworks ForgeTests/Proposal058Tests"
   "Chainworks ForgeTests/Proposal079ContractRepairReadbackTests"
   "Chainworks ForgeTests/Proposal086ContinuationReadbackTests"
+  "Chainworks ForgeTests/RuntimeTimelineSubscriptionRecoveryTests"
+  "Chainworks ForgeTests/StewardConfigDefaultsTests"
 )
 
 UI_SMOKE_TESTS=(
@@ -234,6 +237,7 @@ PROPOSAL_036_TESTS=(
 )
 
 PROPOSAL_093_TESTS=(
+  "Chainworks ForgeTests/RuntimeTimelineSubscriptionRecoveryTests"
   "Chainworks ForgeTests/Proposal036UXConsolidationTests/testRuntimeTimelineAppendsChunksIntoOneLiveResponse()"
   "Chainworks ForgeTests/Proposal036UXConsolidationTests/testRuntimeTimelineBufferKeepsStableResponseIdentityWhileAppendingChunks()"
   "Chainworks ForgeTests/Proposal036UXConsolidationTests/testRuntimeTimelineCollapsesChunksOnlyAfterResponseEndsIntoSummaryCard()"
@@ -2701,6 +2705,7 @@ Available gates:
   p086-continuation-operator-report
                   Proposal 086 Phase 1 operator-report gate: operator report field coverage
   proposal-087|p087  Proposal 087 read-path liveness and storage tiering gate
+  agent-context-skills  Provider-free mission context, frozen Agent Skills, and source-inventory gate
   proposal-094|p094  Proposal 094 workflow-owned blocker-boundary contract/readback gate
   proposal-096|p096  Proposal 096 bounded tool output and safe-search guard retained alias gate
   proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
@@ -5479,6 +5484,7 @@ PY
       cargo test -p db --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
       cargo test -p db --test proposal_058_claim_start -- --test-threads=1 --nocapture &&
       cargo test -p engine --test proposal_058_claim_start -- --test-threads=1 --nocapture &&
+      cargo test -p engine --test proposal_058_deadline_resume -- --test-threads=1 --nocapture &&
       cargo test -p graphql-server --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
       cargo test -p mcp-server --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
       cargo test -p engine --test proposal_058_escalation_schema -- --test-threads=1 --nocapture &&
@@ -6035,6 +6041,11 @@ PLIST
     daemon_bin="$bundle/Contents/MacOS/chainworks-forge-daemon"
     if [[ ! -x "$daemon_bin" ]]; then
       echo "proposal-042-packaging: FAIL — embedded daemon binary missing or not executable: $daemon_bin" | tee -a "$evidence_log"
+      exit 1
+    fi
+    daemon_catalog="$bundle/Contents/Resources/agents.yaml"
+    if [[ ! -f "$daemon_catalog" ]]; then
+      echo "proposal-042-packaging: FAIL — embedded daemon agent catalog missing: $daemon_catalog" | tee -a "$evidence_log"
       exit 1
     fi
 
@@ -12566,6 +12577,98 @@ PY
       run_p082_cargo_test -p mcp-server --test proposal_082_recovery_readback -- --nocapture
     )
     log "Proposal 082 gate passed"
+    ;;
+  agent-context-skills)
+    log "Agent context and skills gate: provider-free frozen context, bundle, and enqueue proofs"
+    # agent_context_skills_provider_free_command_allowlist: python3 and managed cargo tests only
+    python3 - "$ROOT_DIR" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+proof_manifest_path = root / "control-plane/crates/engine/tests/fixtures/agent_context/proof_manifest.json"
+proof_manifest = json.loads(proof_manifest_path.read_text())
+if proof_manifest.get("schema_version") != "agent_context_skills_proof_manifest_v1":
+    raise SystemExit("agent-context-skills: unsupported proof manifest schema")
+
+clauses = proof_manifest.get("clauses")
+if not isinstance(clauses, list):
+    raise SystemExit("agent-context-skills: proof manifest clauses must be an array")
+actual_clauses = [entry.get("clause") for entry in clauses if isinstance(entry, dict)]
+expected_clauses = list(range(1, 13))
+if actual_clauses != expected_clauses:
+    raise SystemExit(
+        "agent-context-skills: proof manifest must cover clauses 1..12 exactly once "
+        f"and in order; got {actual_clauses}"
+    )
+
+for clause in clauses:
+    proofs = clause.get("proofs")
+    if not isinstance(proofs, list) or not proofs:
+        raise SystemExit(
+            f"agent-context-skills: clause {clause['clause']} has no executable proof"
+        )
+    for proof in proofs:
+        if set(proof) != {"source", "test"}:
+            raise SystemExit(
+                f"agent-context-skills: clause {clause['clause']} has malformed proof {proof}"
+            )
+        source = root / proof["source"]
+        if not source.is_file():
+            raise SystemExit(
+                f"agent-context-skills: clause {clause['clause']} proof source is missing: {source}"
+            )
+        source_text = source.read_text()
+        if clause["clause"] == 12:
+            marker = "agent_context_skills_provider_free_command_allowlist"
+            if proof["test"] != marker or marker not in source_text:
+                raise SystemExit("agent-context-skills: provider-free command allowlist marker is missing")
+        elif f"fn {proof['test']}" not in source_text:
+            raise SystemExit(
+                f"agent-context-skills: clause {clause['clause']} test is missing: "
+                f"{proof['test']} in {proof['source']}"
+            )
+
+ctx_dir = root / "control-plane/crates/engine/tests/fixtures/agent_context"
+actual_ctx_cases = sorted(path.name for path in ctx_dir.glob("CTX-*.json"))
+expected_ctx_cases = [f"CTX-{index:03}.json" for index in range(1, 7)]
+if actual_ctx_cases != expected_ctx_cases:
+    raise SystemExit(
+        "agent-context-skills: CTX corpus must contain CTX-001..006 exactly; "
+        f"got {actual_ctx_cases}"
+    )
+
+catalog = (root / "examples/agents/agents.yaml").read_text()
+expected_bindings = {
+    "proposal_review_router_skill": "skills/proposal-review-router",
+    "code_writer_core": "skills/code-implementation",
+}
+for binding, relative in expected_bindings.items():
+    if f"  {binding}:\n    type: external_skill\n    path: {relative}" not in catalog:
+        raise SystemExit(f"agent-context-skills: active binding {binding} is not external")
+    bundle_dir = root / "examples/agents" / relative
+    entries = sorted(path.name for path in bundle_dir.iterdir())
+    if entries != ["SKILL.md"]:
+        raise SystemExit(
+            f"agent-context-skills: {relative} must contain exactly SKILL.md; got {entries}"
+        )
+    skill = (bundle_dir / "SKILL.md").read_text()
+    if "allowed-tools:" in skill:
+        raise SystemExit(f"agent-context-skills: {relative} must not declare allowed-tools")
+
+print("agent-context-skills closed proof manifest, CTX corpus, and active bundle checks passed")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      agent_context_cargo_target="$(chainworks_test_gate_cargo_target_dir "${CHAINWORKS_AGENT_CONTEXT_SKILLS_CARGO_TARGET_DIR:-target/agent-context-skills}")"
+      CARGO_TARGET_DIR="$agent_context_cargo_target" cargo test -p workflow skill_bundle::tests:: --lib -- --nocapture
+      CARGO_TARGET_DIR="$agent_context_cargo_target" cargo test -p workflow --test agent_context_skills -- --nocapture
+      CARGO_TARGET_DIR="$agent_context_cargo_target" cargo test -p engine --test agent_context_skills -- --nocapture
+      CARGO_TARGET_DIR="$agent_context_cargo_target" cargo test -p engine agent_context_ --lib -- --nocapture
+      CARGO_TARGET_DIR="$agent_context_cargo_target" cargo test -p engine p058_escalation_retry_uses_durable_current_backend_profile_tier --lib -- --nocapture
+    )
+    log "Agent context and skills gate passed"
     ;;
   proposal-094|p094)
     log "Proposal 094 gate: workflow-owned blocker-boundary contract/readback"

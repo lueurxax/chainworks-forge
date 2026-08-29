@@ -209,6 +209,16 @@ BUNDLED_SHA_RESOURCE_DIR="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PAT
 mkdir -p "${BUNDLED_SHA_RESOURCE_DIR}"
 printf '%s\n' "${GIT_SHA}" > "${BUNDLED_SHA_RESOURCE_DIR}/bundled-daemon-build-sha.txt"
 
+# The packaged daemon resolves its agent catalog from the app bundle. Keep the
+# catalog beside the build stamp so debug and archive products have the same
+# launch-time inputs as the source-tree daemon.
+BUNDLED_AGENT_CATALOG="${SRCROOT}/examples/agents/agents.yaml"
+if [ ! -f "${BUNDLED_AGENT_CATALOG}" ]; then
+    echo "error: packaged daemon agent catalog missing at ${BUNDLED_AGENT_CATALOG}" >&2
+    exit 65
+fi
+cp "${BUNDLED_AGENT_CATALOG}" "${BUNDLED_SHA_RESOURCE_DIR}/agents.yaml"
+
 # `SMAppService.agent` starts from the embedded LaunchAgent plist, not
 # from the current shell. Stamp the same SHA into that plist so a
 # daemon launched from the app reports the bundled build identity even

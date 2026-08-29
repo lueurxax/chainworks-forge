@@ -1,4 +1,7 @@
-use anyhow::{bail, Result};
+use std::fs::{self, OpenOptions};
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use tracing::info;
 
@@ -10,6 +13,80 @@ use crate::transport::AcpSessionConfig;
 use crate::ExecutionRequest;
 
 const BINARY_ENV_VAR: &str = "CHAINWORKS_CLAUDE_ACP_BINARY";
+
+const CLAUDE_RAW_SDK_MESSAGE_FILTERS: &[(&str, Option<&str>)] = &[
+    ("stream_event", None),
+    ("assistant", None),
+    ("result", None),
+    ("system", Some("session_state_changed")),
+];
+
+pub(crate) fn claude_sdk_debug_file_path(req: &ExecutionRequest) -> Option<PathBuf> {
+    let meta_root = req.chainworks_meta_root.as_deref()?.trim();
+    let agent_execution_id = req.agent_execution_id.as_ref()?;
+    if meta_root.is_empty() {
+        return None;
+    }
+    Some(
+        Path::new(meta_root)
+            .join("runtime/claude-sdk-debug")
+            .join(format!("{agent_execution_id}.log")),
+    )
+}
+
+fn prepare_private_debug_file(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("Claude SDK debug file has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "ClaudeAgentAdapter: create SDK debug directory {}",
+            parent.display()
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!(
+                "ClaudeAgentAdapter: secure SDK debug directory {}",
+                parent.display()
+            )
+        })?;
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| {
+                format!(
+                    "ClaudeAgentAdapter: prepare SDK debug file {}",
+                    path.display()
+                )
+            })?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| {
+            format!(
+                "ClaudeAgentAdapter: secure SDK debug file {}",
+                path.display()
+            )
+        })?;
+    }
+
+    #[cfg(not(unix))]
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "ClaudeAgentAdapter: prepare SDK debug file {}",
+                path.display()
+            )
+        })?;
+
+    Ok(())
+}
 
 /// Adapter for the Claude Agent provider (`claude-agent-acp`).
 ///
@@ -108,6 +185,55 @@ impl AcpAdapter for ClaudeAgentAdapter {
             .unwrap_or(default_config.model)
             .to_string();
         let mut extra = default_config.extra.clone();
+        if let Some(extra_obj) = extra.as_mut().and_then(serde_json::Value::as_object_mut) {
+            let meta = extra_obj
+                .entry("_meta")
+                .or_insert_with(|| serde_json::json!({}));
+            let claude_code = meta
+                .as_object_mut()
+                .context("ClaudeAgentAdapter: _meta must be an object")?
+                .entry("claudeCode")
+                .or_insert_with(|| serde_json::json!({}));
+            let claude_code = claude_code
+                .as_object_mut()
+                .context("ClaudeAgentAdapter: _meta.claudeCode must be an object")?;
+            claude_code.insert(
+                "emitRawSDKMessages".to_string(),
+                serde_json::Value::Array(
+                    CLAUDE_RAW_SDK_MESSAGE_FILTERS
+                        .iter()
+                        .map(|(message_type, subtype)| {
+                            let mut filter = serde_json::Map::new();
+                            filter.insert(
+                                "type".to_string(),
+                                serde_json::Value::String((*message_type).to_string()),
+                            );
+                            if let Some(subtype) = subtype {
+                                filter.insert(
+                                    "subtype".to_string(),
+                                    serde_json::Value::String((*subtype).to_string()),
+                                );
+                            }
+                            serde_json::Value::Object(filter)
+                        })
+                        .collect(),
+                ),
+            );
+
+            if let Some(debug_file) = claude_sdk_debug_file_path(req) {
+                prepare_private_debug_file(&debug_file)?;
+                let options = claude_code
+                    .entry("options")
+                    .or_insert_with(|| serde_json::json!({}));
+                options
+                    .as_object_mut()
+                    .context("ClaudeAgentAdapter: _meta.claudeCode.options must be an object")?
+                    .insert(
+                        "debugFile".to_string(),
+                        serde_json::Value::String(debug_file.to_string_lossy().into_owned()),
+                    );
+            }
+        }
         if let Some(provider_session_id) = req
             .provider_session_id
             .as_deref()
@@ -146,7 +272,7 @@ impl AcpAdapter for ClaudeAgentAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain::ids::RunId;
+    use domain::ids::{AgentExecutionId, RunId};
 
     fn request(provider_session_id: Option<&str>) -> ExecutionRequest {
         ExecutionRequest {
@@ -222,5 +348,49 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("provider-session-123")
         );
+    }
+
+    #[test]
+    fn claude_session_enables_bounded_sdk_diagnostics_for_execution() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let agent_execution_id = AgentExecutionId::new();
+        let mut req = request(None);
+        req.agent_execution_id = Some(agent_execution_id);
+        req.chainworks_meta_root = Some(tempdir.path().to_string_lossy().into_owned());
+
+        let adapter = ClaudeAgentAdapter::new_with_binary("/bin/echo");
+        let spec = adapter
+            .prepare_session_new_spec(&req)
+            .expect("session spec");
+        let claude_code = &spec.extra.as_ref().expect("extra")["_meta"]["claudeCode"];
+
+        assert_eq!(
+            claude_code["emitRawSDKMessages"],
+            serde_json::json!([
+                {"type": "stream_event"},
+                {"type": "assistant"},
+                {"type": "result"},
+                {"type": "system", "subtype": "session_state_changed"}
+            ])
+        );
+
+        let debug_file = claude_code["options"]["debugFile"]
+            .as_str()
+            .expect("execution-specific debugFile");
+        assert!(debug_file.ends_with(&format!(
+            "/runtime/claude-sdk-debug/{agent_execution_id}.log"
+        )));
+        assert!(std::path::Path::new(debug_file).is_file());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(debug_file)
+                .expect("debug file metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }

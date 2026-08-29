@@ -12,8 +12,9 @@ use domain::commands::{
     MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision, MainSyncRepairStateCmd,
     MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd, MainSyncTriggerReason,
     MarkProviderSessionProcessAbsentCmd, P083LifecycleDenialCode, P083RollbackExecutionCmd,
-    P083SetEnforcementModeCmd, ProposalGateSettlementAction, RetrofitCatalogSnapshotCmd,
-    RetryRunCmd, SettleProposalGateCmd, ShutdownProviderSessionCmd, StartRunCmd,
+    P083SetEnforcementModeCmd, ProposalGateSettlementAction, ResumeEscalationChainCmd,
+    ResumeEscalationDeadlineCmd, RetrofitCatalogSnapshotCmd, RetryRunCmd, SettleProposalGateCmd,
+    ShutdownProviderSessionCmd, StartRunCmd,
 };
 use domain::ids::{IdeaId, RunId};
 use domain::risk_lineage::RiskAcceptanceLineage;
@@ -156,6 +157,131 @@ pub fn tool_specs() -> Vec<McpTool> {
                 }
             }),
             output_schema: Some(p083_lifecycle_output_schema()),
+        },
+        McpTool {
+            name: "runs.resume_escalation_deadline".to_string(),
+            description: "P058: Operator-only recovery for a paused escalation whose exact pause reason is escalation_deadline_elapsed. Opens a new linked deadline window for the frozen current backend-profile tier and queues that tier without rewriting prior ledger, policy, or attempt history."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["run_id", "escalation_ledger_id", "reason", "idempotency_key"],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "escalation_ledger_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256
+                    },
+                    "reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1024
+                    },
+                    "idempotency_key": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "description": "UUIDv7 replay key for this exact recovery request"
+                    }
+                }
+            }),
+            output_schema: Some(serde_json::json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "schema_version", "status", "run_id", "escalation_ledger_id",
+                    "deadline_window_id", "retry_stage_execution_id", "work_item_id",
+                    "tier_id", "backend_profile_id", "provider", "starts_at",
+                    "expires_at", "journal_id"
+                ],
+                "properties": {
+                    "schema_version": { "const": "p058_deadline_resume_v1" },
+                    "status": { "type": "string", "enum": ["accepted", "replayed"] },
+                    "run_id": { "type": "string" },
+                    "escalation_ledger_id": { "type": "string" },
+                    "deadline_window_id": { "type": "string" },
+                    "retry_stage_execution_id": { "type": "string" },
+                    "work_item_id": { "type": "string" },
+                    "tier_id": { "type": "string" },
+                    "backend_profile_id": { "type": "string" },
+                    "provider": { "type": "string" },
+                    "starts_at": { "type": "string", "format": "date-time" },
+                    "expires_at": { "type": "string", "format": "date-time" },
+                    "journal_id": { "type": "string" }
+                }
+            })),
+        },
+        McpTool {
+            name: "runs.resume_escalation_chain".to_string(),
+            description: "P058: Operator-only one-shot recovery for a frozen escalation ledger in terminal human_pause with pause reason escalation_chain_exhausted. Atomically opens a linked bounded window, creates retry authority, queues an explicit frozen backend-profile tier, and preserves prior attempt history."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "run_id", "escalation_ledger_id", "target_tier_id", "reason",
+                    "idempotency_key"
+                ],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "escalation_ledger_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256
+                    },
+                    "target_tier_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256,
+                        "description": "Explicit backend_profile tier from the run's frozen escalation policy"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1024
+                    },
+                    "operator_instruction": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000,
+                        "description": "Optional audited one-shot instruction for the recovery-created invocation"
+                    },
+                    "idempotency_key": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "description": "UUIDv7 replay key for this exact one-shot recovery"
+                    }
+                }
+            }),
+            output_schema: Some(serde_json::json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "schema_version", "status", "run_id", "escalation_ledger_id",
+                    "deadline_window_id", "retry_stage_execution_id", "work_item_id",
+                    "tier_id", "backend_profile_id", "provider", "starts_at",
+                    "expires_at", "journal_id"
+                ],
+                "properties": {
+                    "schema_version": { "const": "p058_chain_resume_v1" },
+                    "status": { "type": "string", "enum": ["accepted", "replayed"] },
+                    "run_id": { "type": "string" },
+                    "escalation_ledger_id": { "type": "string" },
+                    "deadline_window_id": { "type": "string" },
+                    "retry_stage_execution_id": { "type": "string" },
+                    "work_item_id": { "type": "string" },
+                    "tier_id": { "type": "string" },
+                    "backend_profile_id": { "type": "string" },
+                    "provider": { "type": "string" },
+                    "starts_at": { "type": "string", "format": "date-time" },
+                    "expires_at": { "type": "string", "format": "date-time" },
+                    "journal_id": { "type": "string" }
+                }
+            })),
         },
         McpTool {
             name: "runs.main_sync.request".to_string(),
@@ -806,6 +932,151 @@ pub async fn execute(
                 );
             }
             Ok(response)
+        }
+
+        "runs.resume_escalation_deadline" => {
+            if !matches!(principal.class, auth::PrincipalClass::Operator) {
+                anyhow::bail!(
+                    "forbidden: runs.resume_escalation_deadline requires operator principal"
+                );
+            }
+            let run_id = parse_run_id(&params)?;
+            let escalation_ledger_id = params["escalation_ledger_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'escalation_ledger_id'"))?
+                .to_string();
+            let reason = params["reason"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
+                .to_string();
+            let idempotency_key = params["idempotency_key"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
+                .to_string();
+            let caller = mcp_caller(&principal, "runs.resume_escalation_deadline");
+            let commanded = cmd_handler
+                .handle(
+                    Command::ResumeEscalationDeadline(ResumeEscalationDeadlineCmd {
+                        run_id,
+                        escalation_ledger_id,
+                        reason,
+                        idempotency_key,
+                    }),
+                    caller,
+                )
+                .await?;
+            match commanded.result {
+                engine::command_handler::CommandResult::EscalationDeadlineResumed {
+                    run_id,
+                    escalation_ledger_id,
+                    deadline_window_id,
+                    retry_stage_execution_id,
+                    work_item_id,
+                    tier_id,
+                    backend_profile_id,
+                    provider,
+                    starts_at,
+                    expires_at,
+                    replayed,
+                } => Ok(serde_json::json!({
+                    "schema_version": "p058_deadline_resume_v1",
+                    "status": if replayed { "replayed" } else { "accepted" },
+                    "run_id": run_id.to_string(),
+                    "escalation_ledger_id": escalation_ledger_id,
+                    "deadline_window_id": deadline_window_id,
+                    "retry_stage_execution_id": retry_stage_execution_id.to_string(),
+                    "work_item_id": work_item_id,
+                    "tier_id": tier_id,
+                    "backend_profile_id": backend_profile_id,
+                    "provider": provider,
+                    "starts_at": starts_at.to_rfc3339(),
+                    "expires_at": expires_at.to_rfc3339(),
+                    "journal_id": commanded.journal_id,
+                })),
+                _ => Err(anyhow::anyhow!(
+                    "unexpected result from ResumeEscalationDeadline command"
+                )),
+            }
+        }
+
+        "runs.resume_escalation_chain" => {
+            if !matches!(principal.class, auth::PrincipalClass::Operator) {
+                anyhow::bail!(
+                    "forbidden: runs.resume_escalation_chain requires operator principal"
+                );
+            }
+            let run_id = parse_run_id(&params)?;
+            let escalation_ledger_id = params["escalation_ledger_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'escalation_ledger_id'"))?
+                .to_string();
+            let target_tier_id = params["target_tier_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'target_tier_id'"))?
+                .to_string();
+            let reason = params["reason"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
+                .to_string();
+            let operator_instruction = params
+                .get("operator_instruction")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("'operator_instruction' must be a string"))
+                        .map(str::to_string)
+                })
+                .transpose()?;
+            let idempotency_key = params["idempotency_key"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
+                .to_string();
+            let caller = mcp_caller(&principal, "runs.resume_escalation_chain");
+            let commanded = cmd_handler
+                .handle(
+                    Command::ResumeEscalationChain(ResumeEscalationChainCmd {
+                        run_id,
+                        escalation_ledger_id,
+                        target_tier_id,
+                        reason,
+                        operator_instruction,
+                        idempotency_key,
+                    }),
+                    caller,
+                )
+                .await?;
+            match commanded.result {
+                engine::command_handler::CommandResult::EscalationChainResumed {
+                    run_id,
+                    escalation_ledger_id,
+                    deadline_window_id,
+                    retry_stage_execution_id,
+                    work_item_id,
+                    tier_id,
+                    backend_profile_id,
+                    provider,
+                    starts_at,
+                    expires_at,
+                    replayed,
+                } => Ok(serde_json::json!({
+                    "schema_version": "p058_chain_resume_v1",
+                    "status": if replayed { "replayed" } else { "accepted" },
+                    "run_id": run_id.to_string(),
+                    "escalation_ledger_id": escalation_ledger_id,
+                    "deadline_window_id": deadline_window_id,
+                    "retry_stage_execution_id": retry_stage_execution_id.to_string(),
+                    "work_item_id": work_item_id,
+                    "tier_id": tier_id,
+                    "backend_profile_id": backend_profile_id,
+                    "provider": provider,
+                    "starts_at": starts_at.to_rfc3339(),
+                    "expires_at": expires_at.to_rfc3339(),
+                    "journal_id": commanded.journal_id,
+                })),
+                _ => Err(anyhow::anyhow!(
+                    "unexpected result from ResumeEscalationChain command"
+                )),
+            }
         }
 
         "runs.main_sync.request" => {
@@ -2786,6 +3057,31 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn resume_escalation_chain_schema_exposes_optional_operator_instruction() {
+        let schema = tool_specs()
+            .into_iter()
+            .find(|tool| tool.name == "runs.resume_escalation_chain")
+            .expect("runs.resume_escalation_chain tool spec")
+            .input_schema;
+
+        assert_eq!(
+            schema["properties"]["operator_instruction"]["type"],
+            "string"
+        );
+        assert_eq!(
+            schema["properties"]["operator_instruction"]["maxLength"],
+            2000
+        );
+        assert_eq!(
+            schema["required"]
+                .as_array()
+                .map(|fields| fields.iter().any(|field| field == "operator_instruction")),
+            Some(false),
+            "operator_instruction must remain optional"
+        );
     }
 
     #[tokio::test]

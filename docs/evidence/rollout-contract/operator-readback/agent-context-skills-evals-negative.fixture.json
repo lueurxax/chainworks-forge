@@ -1,0 +1,335 @@
+{
+  "schema_version": "agent_context_rollout_projection_negative_fixture_set_v1",
+  "base_fixture": "docs/evidence/rollout-contract/operator-readback/agent-context-skills-evals-full-surface.fixture.json",
+  "base_fixture_sha256": "sha256:9189260a804811c3a0b0f7109f25ded5b1fd08f2712e7649760313d26dad3007",
+  "validator_contract": "agent_context_rollout_projection_validator_v1",
+  "mutation_manifest_schema_version": "agent_context_rollout_projection_mutation_manifest_v1",
+  "mutation_manifest_sha256": "sha256:f9816a29261d2305a193be73c6a12147569123482867ce1635e5d810a241b211",
+  "preflight_validator_contract": "agent_context_mandatory_preflight_validator_v1",
+  "preflight_manifest_schema_version": "agent_context_mandatory_preflight_manifest_v1",
+  "preflight_manifest_sha256": "sha256:13207340d8e65e653f0f63643cd9048308a90fb1d1ccb6a3f36a7ad08f3760d9",
+  "required_gate_aliases": [
+    "proposal-agent-context-skills-evals",
+    "agent-context-skills-evals"
+  ],
+  "expected_exit": "nonzero",
+  "cases": [
+    {
+      "case_id": "parity_lanes_array_rejected",
+      "mutation": {
+        "operation": "replace",
+        "json_pointer": "/parity_lanes",
+        "value": [
+          "run_report",
+          "mcp",
+          "release_receipt",
+          "graphql"
+        ]
+      },
+      "expected_reason": "invalid_parity_lanes_shape"
+    },
+    {
+      "case_id": "missing_release_receipt_lane_rejected",
+      "mutation": {
+        "operation": "remove",
+        "json_pointer": "/parity_lanes/release_receipt"
+      },
+      "expected_reason": "missing_parity_lane"
+    },
+    {
+      "case_id": "extra_lane_rejected",
+      "mutation": {
+        "operation": "copy",
+        "from_json_pointer": "/parity_lanes/mcp",
+        "json_pointer": "/parity_lanes/observer"
+      },
+      "expected_reason": "extra_parity_lane"
+    },
+    {
+      "case_id": "missing_canonical_operator_readback_rejected",
+      "mutation": {
+        "operation": "remove",
+        "json_pointer": "/parity_lanes/mcp/operator_readback"
+      },
+      "expected_reason": "missing_projection_field"
+    },
+    {
+      "case_id": "extra_projection_field_rejected",
+      "mutation": {
+        "operation": "add",
+        "json_pointer": "/parity_lanes/mcp/unexpected_field",
+        "value": true
+      },
+      "expected_reason": "extra_projection_field"
+    },
+    {
+      "case_id": "wrong_graphql_casing_rejected",
+      "mutation": {
+        "operation": "rename",
+        "from_json_pointer": "/parity_lanes/graphql/operatorReadback",
+        "json_pointer": "/parity_lanes/graphql/operator_readback"
+      },
+      "expected_reason": "projection_field_casing_invalid"
+    },
+    {
+      "case_id": "invalid_redaction_enum_rejected",
+      "mutation": {
+        "operation": "replace",
+        "json_pointer": "/parity_lanes/mcp/operator_readback/diagnostic_redaction",
+        "value": "bounded_non_secret"
+      },
+      "expected_reason": "invalid_diagnostic_redaction"
+    },
+    {
+      "case_id": "duplicate_normalized_key_rejected",
+      "mutation": {
+        "operation": "add",
+        "json_pointer": "/parity_lanes/graphql/schema_version",
+        "value": "agent_context_rollout_projection_v1"
+      },
+      "expected_reason": "duplicate_normalized_projection_key"
+    },
+    {
+      "case_id": "semantic_lane_divergence_rejected",
+      "mutation": {
+        "operation": "replace",
+        "json_pointer": "/parity_lanes/graphql/operatorReadback/backendDecision",
+        "value": "hold"
+      },
+      "expected_reason": "operator_readback_semantic_divergence"
+    },
+    {
+      "case_id": "missing_producer_rollback_schema_rejected",
+      "mutation": {
+        "operation": "remove",
+        "json_pointer": "/parity_lanes/run_report/operator_readback/rollback_disposition/schema_version"
+      },
+      "expected_reason": "operator_readback_producer_drift"
+    },
+    {
+      "case_id": "sidecar_rollback_steps_drift_rejected",
+      "mutation": {
+        "operation": "replace",
+        "json_pointer": "/parity_lanes/mcp/operator_readback/rollback_disposition/steps",
+        "value": [
+          "Require the complete retained gate and fresh release evidence before reopening admission."
+        ]
+      },
+      "expected_reason": "rollout_sidecar_drift"
+    },
+    {
+      "case_id": "producer_operator_message_drift_rejected",
+      "mutation": {
+        "operation": "replace",
+        "json_pointer": "/parity_lanes/release_receipt/operator_readback/operator_message",
+        "value": "Agent mission context, skill brokerage, and quality evaluation are mandatory after open."
+      },
+      "expected_reason": "operator_readback_producer_drift"
+    },
+    {
+      "case_id": "wrong_graphql_nested_rollback_schema_casing_rejected",
+      "mutation": {
+        "operation": "rename",
+        "from_json_pointer": "/parity_lanes/graphql/operatorReadback/rollbackDisposition/schema_version",
+        "json_pointer": "/parity_lanes/graphql/operatorReadback/rollbackDisposition/schemaVersion"
+      },
+      "expected_reason": "projection_field_casing_invalid"
+    },
+    {
+      "case_id": "graphql_p083_rollback_ttl_recasing_rejected",
+      "mutation": {
+        "operation": "rename",
+        "from_json_pointer": "/parity_lanes/graphql/operatorReadback/p083_rollback_ttl_expires_at",
+        "json_pointer": "/parity_lanes/graphql/operatorReadback/p083RollbackTtlExpiresAt"
+      },
+      "expected_reason": "projection_field_casing_invalid"
+    },
+    {
+      "case_id": "graphql_p083_last_preflight_hash_omission_rejected",
+      "mutation": {
+        "operation": "remove",
+        "json_pointer": "/parity_lanes/graphql/operatorReadback/p083_last_preflight_hash"
+      },
+      "expected_reason": "missing_projection_field"
+    },
+    {
+      "case_id": "graphql_p083_rollback_ttl_duplicate_normalized_key_rejected",
+      "mutation": {
+        "operation": "add",
+        "json_pointer": "/parity_lanes/graphql/operatorReadback/p083RollbackTtlExpiresAt",
+        "value": null
+      },
+      "expected_reason": "duplicate_normalized_projection_key"
+    }
+  ],
+  "preflight_cases": [
+    {
+      "case_id": "missing_gate_alias_holds",
+      "input": {
+        "gate_alias_state": "missing",
+        "gate_adapter_state": "installed",
+        "status": "pass",
+        "decision": "release",
+        "lifecycle_state": "terminal",
+        "enforcement_mode": "enforce",
+        "projection_integrity": "valid",
+        "failure_reasons": [],
+        "waiver_state": "none",
+        "enabled_state": "enabled"
+      },
+      "expected": {
+        "decision": "hold",
+        "reason": "missing_contract",
+        "implementation_work_rows": 0
+      },
+      "expected_readback": {
+        "schema_version": "agent_context_mandatory_hold_readback_expectation_v1",
+        "materialization": "complete_lane_native_payloads",
+        "required_parity_lanes": ["run_report", "mcp", "release_receipt", "graphql"],
+        "next_steps": ["repair_rollout_contract"],
+        "forbidden_next_steps": ["apply_privileged_waiver", "disable_rollout_contract", "use_permissive_mode", "bypass_rollout_contract"],
+        "legacy_producer_bytes_preserved": true
+      }
+    },
+    {
+      "case_id": "missing_gate_adapter_holds",
+      "input": {
+        "gate_alias_state": "installed",
+        "gate_adapter_state": "missing",
+        "status": "pass",
+        "decision": "release",
+        "lifecycle_state": "terminal",
+        "enforcement_mode": "enforce",
+        "projection_integrity": "valid",
+        "failure_reasons": [],
+        "waiver_state": "none",
+        "enabled_state": "enabled"
+      },
+      "expected": {
+        "decision": "hold",
+        "reason": "missing_contract",
+        "implementation_work_rows": 0
+      },
+      "expected_readback": {
+        "schema_version": "agent_context_mandatory_hold_readback_expectation_v1",
+        "materialization": "complete_lane_native_payloads",
+        "required_parity_lanes": ["run_report", "mcp", "release_receipt", "graphql"],
+        "next_steps": ["repair_rollout_contract"],
+        "forbidden_next_steps": ["apply_privileged_waiver", "disable_rollout_contract", "use_permissive_mode", "bypass_rollout_contract"],
+        "legacy_producer_bytes_preserved": true
+      }
+    },
+    {
+      "case_id": "waived_state_holds",
+      "input": {
+        "gate_alias_state": "installed",
+        "gate_adapter_state": "installed",
+        "status": "waived",
+        "decision": "waive",
+        "lifecycle_state": "terminal",
+        "enforcement_mode": "enforce",
+        "projection_integrity": "valid",
+        "failure_reasons": [],
+        "waiver_state": "active",
+        "enabled_state": "enabled"
+      },
+      "expected": {
+        "decision": "hold",
+        "reason": "agent_context_mandatory_rollout_policy_violation",
+        "implementation_work_rows": 0
+      },
+      "expected_readback": {
+        "schema_version": "agent_context_mandatory_hold_readback_expectation_v1",
+        "materialization": "complete_lane_native_payloads",
+        "required_parity_lanes": ["run_report", "mcp", "release_receipt", "graphql"],
+        "next_steps": ["repair_rollout_contract"],
+        "forbidden_next_steps": ["apply_privileged_waiver", "disable_rollout_contract", "use_permissive_mode", "bypass_rollout_contract"],
+        "legacy_producer_bytes_preserved": true
+      }
+    },
+    {
+      "case_id": "not_applicable_state_holds",
+      "input": {
+        "gate_alias_state": "installed",
+        "gate_adapter_state": "installed",
+        "status": "not_applicable",
+        "decision": "not_applicable",
+        "lifecycle_state": "terminal",
+        "enforcement_mode": "enforce",
+        "projection_integrity": "valid",
+        "failure_reasons": [],
+        "waiver_state": "none",
+        "enabled_state": "enabled"
+      },
+      "expected": {
+        "decision": "hold",
+        "reason": "agent_context_mandatory_rollout_policy_violation",
+        "implementation_work_rows": 0
+      },
+      "expected_readback": {
+        "schema_version": "agent_context_mandatory_hold_readback_expectation_v1",
+        "materialization": "complete_lane_native_payloads",
+        "required_parity_lanes": ["run_report", "mcp", "release_receipt", "graphql"],
+        "next_steps": ["repair_rollout_contract"],
+        "forbidden_next_steps": ["apply_privileged_waiver", "disable_rollout_contract", "use_permissive_mode", "bypass_rollout_contract"],
+        "legacy_producer_bytes_preserved": true
+      }
+    },
+    {
+      "case_id": "permissive_state_holds",
+      "input": {
+        "gate_alias_state": "installed",
+        "gate_adapter_state": "installed",
+        "status": "pass",
+        "decision": "release",
+        "lifecycle_state": "terminal",
+        "enforcement_mode": "permissive",
+        "projection_integrity": "valid",
+        "failure_reasons": [],
+        "waiver_state": "none",
+        "enabled_state": "enabled"
+      },
+      "expected": {
+        "decision": "hold",
+        "reason": "agent_context_mandatory_rollout_policy_violation",
+        "implementation_work_rows": 0
+      },
+      "expected_readback": {
+        "schema_version": "agent_context_mandatory_hold_readback_expectation_v1",
+        "materialization": "complete_lane_native_payloads",
+        "required_parity_lanes": ["run_report", "mcp", "release_receipt", "graphql"],
+        "next_steps": ["repair_rollout_contract"],
+        "forbidden_next_steps": ["apply_privileged_waiver", "disable_rollout_contract", "use_permissive_mode", "bypass_rollout_contract"],
+        "legacy_producer_bytes_preserved": true
+      }
+    },
+    {
+      "case_id": "disabled_state_holds",
+      "input": {
+        "gate_alias_state": "installed",
+        "gate_adapter_state": "installed",
+        "status": "not_applicable",
+        "decision": "not_applicable",
+        "lifecycle_state": "terminal",
+        "enforcement_mode": "disabled",
+        "projection_integrity": "valid",
+        "failure_reasons": [],
+        "waiver_state": "none",
+        "enabled_state": "disabled"
+      },
+      "expected": {
+        "decision": "hold",
+        "reason": "agent_context_mandatory_rollout_policy_violation",
+        "implementation_work_rows": 0
+      },
+      "expected_readback": {
+        "schema_version": "agent_context_mandatory_hold_readback_expectation_v1",
+        "materialization": "complete_lane_native_payloads",
+        "required_parity_lanes": ["run_report", "mcp", "release_receipt", "graphql"],
+        "next_steps": ["repair_rollout_contract"],
+        "forbidden_next_steps": ["apply_privileged_waiver", "disable_rollout_contract", "use_permissive_mode", "bypass_rollout_contract"],
+        "legacy_producer_bytes_preserved": true
+      }
+    }
+  ]
+}

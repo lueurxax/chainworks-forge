@@ -70,13 +70,12 @@ pub fn evaluate_quality_gate_boundary_assessment_with_context(
     context: BoundaryEvaluationContext,
     assessment: &serde_json::Value,
 ) -> Result<BoundaryEvaluation> {
-    let blockers = parse_blockers(assessment)?;
+    let (blockers, mut validation_errors) = parse_blockers(assessment)?;
     let server_verified_no_progress_signatures = context
         .server_verified_no_progress_signatures
         .iter()
         .cloned()
         .collect::<HashSet<_>>();
-    let mut validation_errors: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
     if assessment
@@ -243,7 +242,8 @@ pub fn evaluate_quality_gate_boundary_assessment_with_context(
         .map(blocker_json)
         .collect();
     let blocker_payloads: Vec<_> = blockers.iter().map(blocker_json).collect();
-    let local_work_complete = !local_code_tail && lower_layer_status.is_none();
+    let local_work_complete =
+        !local_code_tail && lower_layer_status.is_none() && validation_errors.is_empty();
     let projection_integrity = if validation_errors.is_empty() {
         "valid"
     } else {
@@ -293,8 +293,9 @@ pub fn evaluate_quality_gate_boundary_assessment_with_context(
     })
 }
 
-fn parse_blockers(assessment: &serde_json::Value) -> Result<Vec<BoundaryBlocker>> {
+fn parse_blockers(assessment: &serde_json::Value) -> Result<(Vec<BoundaryBlocker>, Vec<String>)> {
     let mut raw = Vec::new();
+    let mut validation_errors = Vec::new();
     for field_name in [
         "blockers",
         "candidate_blockers",
@@ -302,14 +303,17 @@ fn parse_blockers(assessment: &serde_json::Value) -> Result<Vec<BoundaryBlocker>
         "followup_code_tail",
         "local_code_tail",
     ] {
-        if let Some(items) = assessment
-            .get(field_name)
-            .and_then(|value| value.as_array())
-        {
-            raw.extend(items.iter().cloned());
+        match assessment.get(field_name) {
+            Some(serde_json::Value::Array(items)) => raw.extend(items.iter().cloned()),
+            Some(_) => validation_errors.push(format!("assessment.{field_name} must be an array")),
+            None if field_name == "blockers" => {
+                validation_errors.push("assessment.blockers is required".to_string());
+            }
+            None => {}
         }
     }
-    raw.iter()
+    let blockers = raw
+        .iter()
         .enumerate()
         .map(|(idx, value)| {
             let object = value
@@ -499,7 +503,8 @@ fn parse_blockers(assessment: &serde_json::Value) -> Result<Vec<BoundaryBlocker>
                 validation_errors,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok((blockers, validation_errors))
 }
 
 fn valid_owner_class(owner_class: &str) -> bool {
@@ -1088,5 +1093,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(evaluated.status, "invalid_claim");
+    }
+
+    #[test]
+    fn p094_non_array_blockers_from_live_run_fail_closed() {
+        let evaluated = evaluate_quality_gate_boundary_assessment(
+            "assessment-live-regression",
+            &serde_json::json!({
+                "schema_version": "quality_gate_blocker_assessment_v1",
+                "blockers": "DISPOSITION: BLOCKED; return to delegated implementation/code-fix work"
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(evaluated.status, "invalid_claim");
+        assert_eq!(
+            evaluated.workflow_route_hint,
+            "implementation_review_refresh"
+        );
+        assert_eq!(evaluated.payload["projection_integrity"], "tamper_detected");
+        assert_eq!(evaluated.payload["local_work_complete"], false);
+        assert!(evaluated.payload["validation_errors"]
+            .as_array()
+            .expect("validation errors should be present")
+            .iter()
+            .any(|error| error
+                .as_str()
+                .is_some_and(|error| error == "assessment.blockers must be an array")));
     }
 }

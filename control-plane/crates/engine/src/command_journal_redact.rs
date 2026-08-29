@@ -140,6 +140,19 @@ pub fn redact_for_journal(cmd: &Command, payload_json: &str) -> String {
         Command::RetrofitCatalogSnapshot(_) => {
             // Preserve typed repair fields. The free-form reason is operator audit material.
         }
+        Command::ResumeEscalationDeadline(_) => {
+            // P058: preserve immutable identifiers and redact free-form operator rationale.
+            if let Some(obj) = inner {
+                redact_field_if_present(obj, "reason");
+            }
+        }
+        Command::ResumeEscalationChain(_) => {
+            // P058: preserve ledger and explicit frozen tier; redact free-form operator text.
+            if let Some(obj) = inner {
+                redact_field_if_present(obj, "reason");
+                redact_field_if_present(obj, "operator_instruction");
+            }
+        }
         Command::CancelRun(_) => {
             // §8.1: preserve all fields.
         }
@@ -247,7 +260,8 @@ mod tests {
         MainSyncRepairStateCmd, MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd,
         MainSyncTriggerReason, OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd, ResetSessionCmd,
         ResolveApprovalCmd, ResolveLeadMediationConfirmationCmd,
-        ResolveWorkflowConflictTransitionCmd, RetrofitCatalogSnapshotCmd, RetryStageCmd,
+        ResolveWorkflowConflictTransitionCmd, ResumeEscalationChainCmd,
+        ResumeEscalationDeadlineCmd, RetrofitCatalogSnapshotCmd, RetryStageCmd,
         RunStewardAnalysisCmd, StartRunCmd, WorkflowLoopBudgetExtensionCmd,
     };
     use domain::discovery::LegacyBroadDiscoveryPolicy;
@@ -466,6 +480,53 @@ mod tests {
             original, redacted,
             "RetrofitCatalogSnapshot audit payload must preserve hash guard and reason"
         );
+    }
+
+    #[test]
+    fn test_redact_resume_escalation_deadline_redacts_reason_and_preserves_identity() {
+        let run_id = RunId::new();
+        let idempotency_key = uuid::Uuid::now_v7().to_string();
+        let cmd = Command::ResumeEscalationDeadline(ResumeEscalationDeadlineCmd {
+            run_id,
+            escalation_ledger_id: "ledger-p058".into(),
+            reason: "contains operator-only incident context".into(),
+            idempotency_key: idempotency_key.clone(),
+        });
+        let value = round_trip(&cmd);
+        let payload = inner(&value);
+
+        assert_eq!(payload["run_id"], serde_json::json!(run_id));
+        assert_eq!(payload["escalation_ledger_id"], "ledger-p058");
+        assert_eq!(payload["idempotency_key"], idempotency_key);
+        assert_eq!(payload["reason"], REDACTED);
+        assert!(!value.to_string().contains("incident context"));
+    }
+
+    #[test]
+    fn test_redact_resume_escalation_chain_redacts_reason_and_preserves_tier() {
+        let run_id = RunId::new();
+        let idempotency_key = uuid::Uuid::now_v7().to_string();
+        let cmd = Command::ResumeEscalationChain(ResumeEscalationChainCmd {
+            run_id,
+            escalation_ledger_id: "ledger-p058".into(),
+            target_tier_id: "claude_writer_fallback".into(),
+            reason: "contains operator-only incident context".into(),
+            operator_instruction: Some("repair only the rejected rollout contract fields".into()),
+            idempotency_key: idempotency_key.clone(),
+        });
+        let value = round_trip(&cmd);
+        let payload = inner(&value);
+
+        assert_eq!(payload["run_id"], serde_json::json!(run_id));
+        assert_eq!(payload["escalation_ledger_id"], "ledger-p058");
+        assert_eq!(payload["target_tier_id"], "claude_writer_fallback");
+        assert_eq!(payload["idempotency_key"], idempotency_key);
+        assert_eq!(payload["reason"], REDACTED);
+        assert_eq!(payload["operator_instruction"], REDACTED);
+        assert!(!value.to_string().contains("incident context"));
+        assert!(!value
+            .to_string()
+            .contains("rejected rollout contract fields"));
     }
 
     #[test]
@@ -740,6 +801,8 @@ mod tests {
                 Command::MainSyncRecordRecoveryDecision(_) => {}
                 Command::KnowledgeCapsuleIgnore(_) => {}
                 Command::RetrofitCatalogSnapshot(_) => {}
+                Command::ResumeEscalationDeadline(_) => {}
+                Command::ResumeEscalationChain(_) => {}
                 Command::CancelRun(_) => {}
                 Command::ResetSession(_) => {}
                 Command::RunStewardAnalysis(_) => {}

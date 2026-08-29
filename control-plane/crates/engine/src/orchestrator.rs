@@ -49,6 +49,7 @@ use crate::synthesizers::closeout_readiness::{
 use crate::work_queue::WorkQueue;
 use db::write_class::WriteLane;
 use db::writer::{class_a_operation, DbWriter};
+use std::path::{Component, Path};
 use std::sync::Arc;
 
 const P058_LAUNCH_RECYCLE_STORM_WINDOW_SECONDS: i64 = 300;
@@ -494,33 +495,12 @@ impl Orchestrator {
         run: &domain::run::Run,
         target_stage_execution_id: Option<StageExecutionId>,
     ) -> Result<()> {
-        let workflow_path = run.workflow_yaml_path.as_deref().unwrap();
-        let catalog_path = run.agent_catalog_yaml_path.as_deref().unwrap();
-        let plan = match (
-            run.workflow_snapshot_json.as_deref(),
-            run.catalog_snapshot_json.as_deref(),
-        ) {
-            (Some(workflow_snapshot), Some(catalog_snapshot))
-                if !workflow_snapshot.trim().is_empty() && !catalog_snapshot.trim().is_empty() =>
-            {
-                match workflow::compiler::compile_from_snapshot_json(
-                    workflow_snapshot,
-                    catalog_snapshot,
-                    catalog_path,
-                ) {
-                    Ok(plan) => plan,
-                    Err(snapshot_error) => {
-                        warn!(
-                            run_id = %run_id,
-                            error = %snapshot_error,
-                            "Failed to compile workflow from frozen snapshots; falling back to workflow files"
-                        );
-                        workflow::compiler::compile(workflow_path, catalog_path)?
-                    }
-                }
-            }
-            _ => workflow::compiler::compile(workflow_path, catalog_path)?,
-        };
+        let plan = crate::command_handler::compile_run_plan_for_run(run)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Run {} has neither frozen snapshots nor live workflow paths",
+                run_id
+            )
+        })?;
 
         let targeted_stage = if let Some(target_id) = target_stage_execution_id {
             let stage = stages::find_by_id(&self.pool, target_id)
@@ -776,10 +756,16 @@ impl Orchestrator {
                                         run.artifact_root.trim_end_matches('/')
                                     );
                                     if std::path::Path::new(&artifact_path).exists() {
-                                        let idea_opt = ideas::find_by_id(&self.pool, run.idea_id)
-                                            .await
-                                            .ok()
-                                            .flatten();
+                                        let idea_opt = Some(
+                                            ideas::find_by_id(&self.pool, run.idea_id)
+                                                .await?
+                                                .ok_or_else(|| {
+                                                    anyhow::anyhow!(
+                                                        "mission_context_source_missing: Idea {}",
+                                                        run.idea_id
+                                                    )
+                                                })?,
+                                        );
                                         self.materialize_dynamic_parallel(
                                             run_id,
                                             run,
@@ -794,10 +780,16 @@ impl Orchestrator {
                                 }
                             }
 
-                            let idea_opt = ideas::find_by_id(&self.pool, run.idea_id)
-                                .await
-                                .ok()
-                                .flatten();
+                            let idea_opt = Some(
+                                ideas::find_by_id(&self.pool, run.idea_id)
+                                    .await?
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "mission_context_source_missing: Idea {}",
+                                            run.idea_id
+                                        )
+                                    })?,
+                            );
                             let effective_total = effective.len();
                             if effective_total == 0 {
                                 let prompt = build_task_prompt_for_owner(
@@ -805,7 +797,7 @@ impl Orchestrator {
                                     &plan,
                                     run,
                                     idea_opt.as_ref(),
-                                );
+                                )?;
                                 self.enqueue_invoke_agent_for_owner(
                                     run_id,
                                     stage,
@@ -813,6 +805,7 @@ impl Orchestrator {
                                     &prompt,
                                     0,
                                     1,
+                                    &plan,
                                 )
                                 .await?;
                                 return Ok(());
@@ -845,7 +838,7 @@ impl Orchestrator {
                                     idea_opt.as_ref(),
                                     None,
                                     approval_rejection_context.as_deref(),
-                                );
+                                )?;
                                 self.enqueue_invoke_agent(
                                     run_id,
                                     stage,
@@ -946,10 +939,16 @@ impl Orchestrator {
                                             "Phase {} complete — enqueuing phase {} tasks",
                                             current_phase, np
                                         );
-                                        let idea_opt = ideas::find_by_id(&self.pool, run.idea_id)
-                                            .await
-                                            .ok()
-                                            .flatten();
+                                        let idea_opt = Some(
+                                            ideas::find_by_id(&self.pool, run.idea_id)
+                                                .await?
+                                                .ok_or_else(|| {
+                                                    anyhow::anyhow!(
+                                                        "mission_context_source_missing: Idea {}",
+                                                        run.idea_id
+                                                    )
+                                                })?,
+                                        );
                                         let effective_total = effective.len();
                                         let approval_rejection_context = self
                                             .approval_rejection_context_for_state(
@@ -981,7 +980,7 @@ impl Orchestrator {
                                                 idea_opt.as_ref(),
                                                 None,
                                                 approval_rejection_context.as_deref(),
-                                            );
+                                            )?;
                                             // P060: If the then-task declares selected_outputs_from,
                                             // resolve selected reviewer artifacts and inject paths.
                                             if task.selected_outputs_from.is_some() {
@@ -1467,14 +1466,12 @@ impl Orchestrator {
         }
 
         if needs_git_worktree && run.worktree_root.is_none() {
-            let idea_opt_for_slug = ideas::find_by_id(&self.pool, run.idea_id)
-                .await
-                .ok()
-                .flatten();
-            let idea_title = idea_opt_for_slug
-                .as_ref()
-                .map(|i| i.title.as_str())
-                .unwrap_or("untitled");
+            let idea_for_slug = ideas::find_by_id(&self.pool, run.idea_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("mission_context_source_missing: Idea {}", run.idea_id)
+                })?;
+            let idea_title = idea_for_slug.title.as_str();
 
             // Extract base_branch from the first agent with a worktree_policy in the catalog.
             let base_branch = self.resolve_base_branch_from_catalog(&run);
@@ -1558,10 +1555,13 @@ impl Orchestrator {
         // prompts that consume `input.idea`. Without this, the agent only
         // sees a placeholder line ("path not defined in catalog") and has no
         // access to what the user actually asked for.
-        let idea_opt = ideas::find_by_id(&self.pool, run.idea_id)
-            .await
-            .ok()
-            .flatten();
+        let idea_opt = Some(
+            ideas::find_by_id(&self.pool, run.idea_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("mission_context_source_missing: Idea {}", run.idea_id)
+                })?,
+        );
 
         // Proposal 007 §7.7: Validate worktree readiness before write-enabled execution.
         // Also validates for release agents that need worktree (strategy=dedicated,
@@ -1648,10 +1648,16 @@ impl Orchestrator {
                     run.artifact_root.trim_end_matches('/')
                 );
                 if std::path::Path::new(&artifact_path).exists() {
-                    let idea_opt = ideas::find_by_id(&self.pool, run.idea_id)
-                        .await
-                        .ok()
-                        .flatten();
+                    let idea_opt = Some(
+                        ideas::find_by_id(&self.pool, run.idea_id)
+                            .await?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "mission_context_source_missing: Idea {}",
+                                    run.idea_id
+                                )
+                            })?,
+                    );
                     let enqueued = self
                         .materialize_dynamic_parallel(
                             run_id,
@@ -1677,8 +1683,8 @@ impl Orchestrator {
 
         if state.tasks.is_empty() {
             // No tasks defined — run the owner agent as a single task
-            let prompt = build_task_prompt_for_owner(state, &plan, &run, idea_opt.as_ref());
-            self.enqueue_invoke_agent_for_owner(run_id, &stage, &state.owner, &prompt, 0, 1)
+            let prompt = build_task_prompt_for_owner(state, &plan, &run, idea_opt.as_ref())?;
+            self.enqueue_invoke_agent_for_owner(run_id, &stage, &state.owner, &prompt, 0, 1, &plan)
                 .await?;
         } else {
             // Phase-aware enqueuing: phase 0 tasks (parallel + initial sequence)
@@ -1716,7 +1722,7 @@ impl Orchestrator {
                     idea_opt.as_ref(),
                     source_ctx.as_ref(),
                     approval_rejection_context.as_deref(),
-                );
+                )?;
                 info!(
                     run_id = %run_id,
                     task = %task.task_name,
@@ -2760,6 +2766,7 @@ impl Orchestrator {
         {
             prompt.push_str(&context);
         }
+        crate::agent_mission_context::validate_persisted_v1_prompt(plan, &prompt)?;
         let declared_outputs = build_declared_outputs(task, plan, run);
         let mut agent = task.agent.clone();
         let provider_health_fallback = self
@@ -2988,6 +2995,7 @@ impl Orchestrator {
         run: &domain::run::Run,
         stage: &StageExecution,
     ) -> Result<bool> {
+        let frozen_plan = crate::command_handler::compile_run_plan_from_snapshot(run)?;
         let executions = agent_executions::find_by_stage(&self.pool, stage.id).await?;
         let runtime_facts = agent_execution_runtime_facts::list_by_run(&self.pool, run_id).await?;
         let facts_by_execution: std::collections::HashMap<_, _> = runtime_facts
@@ -3059,6 +3067,12 @@ impl Orchestrator {
                         continue;
                     }
                 };
+            if let Some(plan) = frozen_plan.as_ref() {
+                crate::agent_mission_context::validate_persisted_v1_payload_prompt(
+                    plan,
+                    &retry_payload,
+                )?;
+            }
             let source_provider = retry_payload
                 .get("provider")
                 .and_then(serde_json::Value::as_str)
@@ -3150,10 +3164,22 @@ impl Orchestrator {
                 .get("backend_profile_id")
                 .and_then(serde_json::Value::as_str)
                 .map(ToOwned::to_owned);
+            let inherited_p058_escalation =
+                retry_payload.pointer("/targeted_retry/escalation").cloned();
 
             let Some(object) = retry_payload.as_object_mut() else {
                 continue;
             };
+            for field in [
+                "p058_claimed",
+                "target_stage_execution_id",
+                "source_stage_execution_id",
+                "source_agent_execution_id",
+                "source_work_item_id",
+                "retry_authority_id",
+            ] {
+                object.remove(field);
+            }
             object.insert("run_id".into(), serde_json::json!(run_id.to_string()));
             object.insert("stage_id".into(), serde_json::json!(stage.stage_id));
             object.insert(
@@ -3161,10 +3187,13 @@ impl Orchestrator {
                 serde_json::json!(new_stage.id.to_string()),
             );
             object.insert(
+                "target_stage_execution_id".into(),
+                serde_json::json!(new_stage.id.to_string()),
+            );
+            object.insert(
                 "retry_authority_id".into(),
                 serde_json::json!(retry_authority_id),
             );
-            object.remove("p058_claimed");
             object.insert(
                 "provider".into(),
                 serde_json::json!(fallback_profile.provider.clone()),
@@ -3187,23 +3216,24 @@ impl Orchestrator {
             if let Some(max_turns) = fallback_profile.profile.get("max_turns").cloned() {
                 object.insert("max_turns".into(), max_turns);
             }
-            object.insert(
-                "targeted_retry".into(),
-                serde_json::json!({
-                    "source_stage_execution_id": stage.id.to_string(),
-                    "source_agent_execution_id": execution.id.to_string(),
-                    "source_work_item_id": source_item.id,
-                    "retry_authority_id": retry_authority_id,
-                    "reason": "auto_contract_output_retry",
-                    "provider_fallback": {
-                        "reason": "source_contract_outputs_missing",
-                        "from_backend_profile_id": from_backend_profile_id,
-                        "from_provider": source_provider.clone(),
-                        "to_backend_profile_id": fallback_profile.backend_profile_id,
-                        "to_provider": fallback_profile.provider,
-                    }
-                }),
-            );
+            let mut targeted_retry = serde_json::json!({
+                "source_stage_execution_id": stage.id.to_string(),
+                "source_agent_execution_id": execution.id.to_string(),
+                "source_work_item_id": source_item.id,
+                "retry_authority_id": retry_authority_id,
+                "reason": "auto_contract_output_retry",
+                "provider_fallback": {
+                    "reason": "source_contract_outputs_missing",
+                    "from_backend_profile_id": from_backend_profile_id,
+                    "from_provider": source_provider.clone(),
+                    "to_backend_profile_id": fallback_profile.backend_profile_id,
+                    "to_provider": fallback_profile.provider,
+                }
+            });
+            if let Some(escalation) = inherited_p058_escalation {
+                targeted_retry["escalation"] = escalation;
+            }
+            object.insert("targeted_retry".into(), targeted_retry);
 
             let tx_started = std::time::Instant::now();
             let mut tx = self
@@ -3392,11 +3422,26 @@ impl Orchestrator {
             }
 
             if policy.max_chain_wall_clock_seconds > 0 {
-                let elapsed = Utc::now()
-                    .signed_duration_since(ledger.created_at)
+                let now = Utc::now();
+                let latest_window =
+                    escalation::find_latest_deadline_window_by_ledger(&self.pool, &ledger.id)
+                        .await?;
+                let window_started_at = latest_window
+                    .as_ref()
+                    .map(|window| window.starts_at)
+                    .unwrap_or(ledger.created_at);
+                let deadline_at = latest_window
+                    .as_ref()
+                    .map(|window| window.expires_at)
+                    .unwrap_or_else(|| {
+                        ledger.created_at
+                            + chrono::Duration::seconds(policy.max_chain_wall_clock_seconds as i64)
+                    });
+                let elapsed = now
+                    .signed_duration_since(window_started_at)
                     .num_seconds()
                     .max(0) as u64;
-                if elapsed > policy.max_chain_wall_clock_seconds {
+                if now > deadline_at {
                     self.pause_p058_escalation_stage(
                         run_id,
                         stage,
@@ -3416,6 +3461,7 @@ impl Orchestrator {
                         stage_id = %stage.stage_id,
                         elapsed_seconds = elapsed,
                         max_seconds = policy.max_chain_wall_clock_seconds,
+                        deadline_window_id = ?latest_window.as_ref().map(|window| window.id.as_str()),
                         "P058 escalation chain deadline elapsed; suppressing retry"
                     );
                     return Ok(true);
@@ -3532,14 +3578,63 @@ impl Orchestrator {
                     }
                 };
 
-            let Some(fallback) =
+            crate::agent_mission_context::validate_persisted_v1_payload_prompt(
+                &plan,
+                &retry_payload,
+            )?;
+
+            let Some(mut fallback) =
                 p058_escalation_tier_provider_fallback(run, current_tier, &retry_payload)
             else {
                 continue;
             };
+            if fallback.reason == "p058_lead_mediation_tier"
+                && plan.mission_context_version.as_deref() == Some("agent_mission_context_v1")
+            {
+                let state = plan.states.get(&stage.stage_id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "frozen_snapshot_contract_incompatible: P058 state '{}' is absent from the frozen plan",
+                        stage.stage_id
+                    )
+                })?;
+                let lead_agent_id = fallback.agent_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "frozen_snapshot_contract_incompatible: P058 lead mediation has no lead agent"
+                    )
+                })?;
+                let lead = resolved_agent_from_plan(&plan, lead_agent_id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "frozen_snapshot_contract_incompatible: P058 lead agent '{lead_agent_id}' is absent from the frozen plan"
+                    )
+                })?;
+                let lead_resolution_contract = fallback.output_contract.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "frozen_snapshot_contract_incompatible: P058 lead mediation has no resolution contract"
+                    )
+                })?;
+                let body = fallback.prompt.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "frozen_snapshot_contract_incompatible: P058 lead mediation has no prompt body"
+                    )
+                })?;
+                let idea = ideas::find_by_id(&self.pool, run.idea_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("run Idea not found"))?;
+                fallback.prompt = Some(crate::agent_mission_context::finalize_mediation_prompt_v1(
+                    &plan,
+                    run,
+                    state,
+                    lead,
+                    &idea,
+                    "p058_lead_mediation",
+                    &ledger.id,
+                    lead_resolution_contract,
+                    body,
+                )?);
+            }
             let retry_reason = format!(
-                "p058_escalation_retry:{}:{}",
-                execution.agent_id, current_tier.tier_id
+                "p058_escalation_retry:{}:{}:{}",
+                execution.agent_id, current_tier.tier_id, ledger.id
             );
             if stage.retry_reason.as_deref() == Some(retry_reason.as_str())
                 || matching_stages.iter().any(|candidate| {
@@ -3586,10 +3681,24 @@ impl Orchestrator {
             let Some(object) = retry_payload.as_object_mut() else {
                 continue;
             };
+            for field in [
+                "p058_claimed",
+                "target_stage_execution_id",
+                "source_stage_execution_id",
+                "source_agent_execution_id",
+                "source_work_item_id",
+                "retry_authority_id",
+            ] {
+                object.remove(field);
+            }
             object.insert("run_id".into(), serde_json::json!(run_id.to_string()));
             object.insert("stage_id".into(), serde_json::json!(stage.stage_id));
             object.insert(
                 "stage_execution_id".into(),
+                serde_json::json!(new_stage.id.to_string()),
+            );
+            object.insert(
+                "target_stage_execution_id".into(),
                 serde_json::json!(new_stage.id.to_string()),
             );
             object.insert(
@@ -3629,7 +3738,6 @@ impl Orchestrator {
             if let Some(temperature) = fallback.temperature {
                 object.insert("temperature".into(), serde_json::json!(temperature));
             }
-            object.remove("p058_claimed");
             object.insert(
                 "targeted_retry".into(),
                 serde_json::json!({
@@ -3835,7 +3943,9 @@ impl Orchestrator {
         prompt: &str,
         task_index: usize,
         total_tasks: usize,
+        plan: &workflow::plan::RunPlan,
     ) -> Result<()> {
+        crate::agent_mission_context::validate_persisted_v1_prompt(plan, prompt)?;
         let work_item_id = format!("p058-invoke:{}:{}", stage.id, task_index);
         self.work_queue
             .enqueue_with_id(
@@ -5219,7 +5329,7 @@ impl Orchestrator {
                 .await?;
 
             // Build prompt for this reviewer.
-            let prompt = build_task_prompt(&task, plan, run, idea_opt, None, None);
+            let prompt = build_task_prompt(&task, plan, run, idea_opt, None, None)?;
 
             // Record materialization for idempotency.
             let work_item_id = format!(
@@ -5455,9 +5565,16 @@ impl Orchestrator {
         db::repos::artifact_contracts::expire_overrides_for_stage(&self.pool, run_id, state_id)
             .await?;
 
-        // Determine iteration: count how many stages for this state_id already exist.
+        // Retries keep the logical iteration and add another StageExecution row.
+        // Advance from the highest logical iteration so retries cannot create gaps.
         let all_stages = stages::list_by_run(&self.pool, run_id).await?;
-        let iteration = all_stages.iter().filter(|s| s.stage_id == state_id).count() as i64 + 1;
+        let iteration = all_stages
+            .iter()
+            .filter(|stage| stage.stage_id == state_id)
+            .map(|stage| stage.iteration)
+            .max()
+            .unwrap_or(0)
+            + 1;
 
         let stage = StageExecution {
             id: domain::ids::StageExecutionId::new(),
@@ -6154,67 +6271,52 @@ impl Orchestrator {
         conflict: &WorkflowConflictRecord,
         lead_agent_id: &str,
     ) -> Result<()> {
-        // Look up the lead agent's config from the catalog.
-        let catalog_path = run
-            .agent_catalog_yaml_path
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Run has no agent catalog path"))?;
-        let catalog = workflow::catalog::load(catalog_path)?;
-        let agents = catalog
-            .agents
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Agent catalog has no agents list"))?;
-        let lead_agent = agents
-            .iter()
-            .find(|a| a.id == lead_agent_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!("Lead agent '{}' not found in catalog", lead_agent_id)
-            })?;
-
-        // Resolve provider from backend profile or agent entry.
-        let provider = resolve_agent_provider(lead_agent, &catalog);
-        let model = resolve_agent_model(lead_agent, &catalog);
-        let effort = resolve_agent_effort(lead_agent, &catalog);
-        let lead_resolution_contract_id = lead_agent
-            .lead_resolution_contract
-            .as_deref()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Lead agent '{}' missing lead_resolution_contract",
-                    lead_agent_id
-                )
-            })?;
+        let plan = crate::command_handler::compile_run_plan_from_snapshot(run)?
+            .ok_or_else(|| anyhow::anyhow!("P017 mediation requires a frozen RunPlan"))?;
+        let lead = resolved_agent_from_plan(&plan, lead_agent_id).ok_or_else(|| {
+            anyhow::anyhow!("Lead agent '{}' not found in frozen RunPlan", lead_agent_id)
+        })?;
+        let catalog: serde_json::Value = serde_json::from_str(
+            run.catalog_snapshot_json
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Run has no frozen catalog snapshot"))?,
+        )?;
+        let lead_entry = catalog
+            .get("agents")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|agents| {
+                agents.iter().find(|agent| {
+                    agent.get("id").and_then(serde_json::Value::as_str) == Some(lead_agent_id)
+                })
+            })
+            .ok_or_else(|| anyhow::anyhow!("Lead agent missing from frozen catalog"))?;
+        let lead_resolution_contract_id = lead_entry
+            .get("lead_resolution_contract")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Frozen lead missing lead_resolution_contract"))?;
         let lead_resolution_contract = catalog
-            .contracts
-            .as_ref()
+            .get("contracts")
             .and_then(|contracts| contracts.get(lead_resolution_contract_id))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Lead agent '{}' references missing lead_resolution_contract '{}'",
-                    lead_agent_id,
-                    lead_resolution_contract_id
-                )
-            })?;
-        let lead_resolution_target_path = catalog
-            .artifacts
-            .as_ref()
-            .and_then(|artifacts| artifacts.get("lead_resolution"))
             .cloned()
-            .unwrap_or_else(|| {
-                "${CHAINWORKS_META_ROOT:-.chainworks}/mediation/lead-resolution.json".to_string()
-            });
+            .ok_or_else(|| anyhow::anyhow!("Frozen lead resolution contract missing"))?;
+        let lead_resolution_target_path = catalog
+            .get("artifacts")
+            .and_then(|artifacts| artifacts.get("lead_resolution"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("${CHAINWORKS_META_ROOT:-.chainworks}/mediation/lead-resolution.json")
+            .to_string();
         let lead_resolution_output_schema = serde_json::json!({
             "contract_id": lead_resolution_contract_id,
             "format": lead_resolution_contract
-                .format
-                .clone()
-                .unwrap_or_else(|| "json".to_string()),
-            "human_format": lead_resolution_contract.human_format.clone(),
-            "machine_format": lead_resolution_contract.machine_format.clone(),
-            "validation_mode": lead_resolution_contract.validation_mode.clone(),
-            "normalized_artifact_name": lead_resolution_contract.normalized_artifact_name.clone(),
-            "raw_artifact_name": lead_resolution_contract.raw_artifact_name.clone(),
-            "required_fields": lead_resolution_contract.required_fields.clone(),
+                .get("format")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("json"),
+            "human_format": lead_resolution_contract.get("human_format"),
+            "machine_format": lead_resolution_contract.get("machine_format"),
+            "validation_mode": lead_resolution_contract.get("validation_mode"),
+            "normalized_artifact_name": lead_resolution_contract.get("normalized_artifact_name"),
+            "raw_artifact_name": lead_resolution_contract.get("raw_artifact_name"),
+            "required_fields": lead_resolution_contract.get("required_fields").cloned().unwrap_or_else(|| serde_json::json!([])),
         });
         let declared_outputs = serde_json::json!([{
             "output_name": "lead_resolution",
@@ -6225,13 +6327,40 @@ impl Orchestrator {
             "companion_path": serde_json::Value::Null,
         }]);
 
-        let prompt = format!(
+        let body = format!(
             "You are the system lead agent mediating workflow conflict {}. \
              Conflict reason: {}. Current state: {}. \
              Analyze the conflict and propose a resolution. Return the required \
              LeadResolutionContract as CHAINWORKS_OUTPUT for lead_resolution.",
             conflict.conflict_id, conflict.reason, conflict.current_state_id,
         );
+        let prompt = if plan.mission_context_version.as_deref() == Some("agent_mission_context_v1")
+        {
+            let idea = ideas::find_by_id(&self.pool, run.idea_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("mission_context_source_missing: Idea {}", run.idea_id)
+                })?;
+            let state = plan.states.get(&conflict.current_state_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "mission_context_source_missing: state '{}'",
+                    conflict.current_state_id
+                )
+            })?;
+            crate::agent_mission_context::finalize_mediation_prompt_v1(
+                &plan,
+                run,
+                state,
+                lead,
+                &idea,
+                "p017_conflict",
+                &conflict.conflict_id,
+                lead_resolution_contract_id,
+                &body,
+            )?
+        } else {
+            body
+        };
 
         let work_item_id = format!("p017-mediation:{}:0", mediation_id);
         self.work_queue
@@ -6249,9 +6378,16 @@ impl Orchestrator {
                     "task_outputs": ["lead_resolution"],
                     "declared_outputs": declared_outputs,
                     "agent_id": lead_agent_id,
-                    "provider": provider,
-                    "model": model,
-                    "effort": effort,
+                    "backend_profile_id": lead.backend_profile_id,
+                    "provider": lead.provider,
+                    "model": lead.model,
+                    "effort": lead.effort,
+                    "max_turns": lead.max_turns,
+                    "temperature": lead.temperature,
+                    "permission_profile": lead.permission_profile,
+                    "skill_ref": lead.skill_ref,
+                    "skill_role": lead.skill_role,
+                    "skill_snapshot_hash": lead.skill_snapshot_hash,
                     "output_contract": lead_resolution_contract_id,
                     "prompt": prompt,
                     "task_index": 0,
@@ -7157,6 +7293,7 @@ impl Orchestrator {
 
                 if let Some(stage) = stage {
                     info!(run_id = %run_id, stage_id = %stage.stage_id, "Activating next stage");
+                    crate::agent_mission_context::validate_legacy_flat_invoke_agent(run)?;
                     stages::update_status(&self.pool, stage.id, StageStatus::Running).await?;
                     let _ = self.events.send(DomainEvent::StageStatusChanged {
                         run_id,
@@ -8386,7 +8523,7 @@ fn materialized_input_artifact_context(
 }
 
 fn is_control_plane_owned_output(output_name: &str) -> bool {
-    output_name == "changed_files_manifest"
+    crate::agent_mission_context::is_control_plane_owned_output(output_name)
 }
 
 fn build_declared_outputs(
@@ -8415,20 +8552,7 @@ fn build_declared_outputs(
                         &run.workspace_root,
                         run.chainworks_meta_root.as_deref(),
                     );
-                    let mr_abs = run.chainworks_meta_root.as_ref().map(|mr| {
-                        if mr.starts_with('/') {
-                            mr.clone()
-                        } else {
-                            format!("{}/{}", run.workspace_root, mr)
-                        }
-                    });
-                    normalize_path_for_worktree(
-                        &resolved,
-                        &run.workspace_root,
-                        run.worktree_root.as_deref(),
-                        task.agent.worktree_write_enabled,
-                        mr_abs.as_deref(),
-                    )
+                    normalize_resolved_artifact_path_for_task(&resolved, run, task)
                 });
 
             crate::contracts::DeclaredOutput {
@@ -8567,6 +8691,7 @@ fn normalize_resolved_artifact_path_for_task(
     run: &domain::run::Run,
     task: &workflow::plan::CompiledTask,
 ) -> String {
+    let resolved = rebase_safe_legacy_artifact_path_for_post_isolation_run(resolved, run);
     let meta_abs = run.chainworks_meta_root.as_ref().map(|mr| {
         if mr.starts_with('/') {
             mr.clone()
@@ -8583,6 +8708,36 @@ fn normalize_resolved_artifact_path_for_task(
     )
 }
 
+/// Rebase a frozen pre-P050 artifact path only when it is a safe descendant of
+/// the run's legacy artifact root. Hybrid runs can retain those absolute paths
+/// while also carrying `chainworks_meta_root`; their outputs must use the
+/// per-run root that SEC-001 authorizes.
+fn rebase_safe_legacy_artifact_path_for_post_isolation_run(
+    resolved: &str,
+    run: &domain::run::Run,
+) -> String {
+    let Some(meta_root) = run.chainworks_meta_root.as_deref() else {
+        return resolved.to_string();
+    };
+    let Ok(relative) = Path::new(resolved).strip_prefix(Path::new(&run.artifact_root)) else {
+        return resolved.to_string();
+    };
+    if relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return resolved.to_string();
+    }
+
+    let meta_root = if Path::new(meta_root).is_absolute() {
+        Path::new(meta_root).to_path_buf()
+    } else {
+        Path::new(&run.workspace_root).join(meta_root)
+    };
+    meta_root.join(relative).to_string_lossy().into_owned()
+}
+
 fn build_task_prompt(
     task: &workflow::plan::CompiledTask,
     plan: &workflow::plan::RunPlan,
@@ -8590,23 +8745,8 @@ fn build_task_prompt(
     idea: Option<&domain::idea::Idea>,
     source_ctx: Option<&crate::worktree::SourceContext>,
     approval_rejection_context: Option<&str>,
-) -> String {
+) -> Result<String> {
     let mut parts: Vec<String> = Vec::new();
-
-    let agent_prompt = task.agent.prompt.as_deref().unwrap_or("").trim();
-    if !agent_prompt.is_empty() {
-        parts.push(format!("## System Instructions\n{agent_prompt}"));
-        parts.push(String::from("---"));
-    }
-
-    // Inject resolved skill content (matches Swift RuntimeSessionBridge line 501-505).
-    // Position: after system instructions, before task heading.
-    if let Some(skill) = &task.agent.resolved_skill {
-        if !skill.injected_content.trim().is_empty() {
-            parts.push(String::new());
-            parts.push(skill.injected_content.clone());
-        }
-    }
 
     parts.push(format!("## Task: {}", task.task_name));
     // P050: make the per-run meta root explicit because read-only worktree
@@ -8740,7 +8880,10 @@ fn build_task_prompt(
              path and return only a small manifest in `CHAINWORKS_OUTPUT`: \
              `{ \"mode\": \"direct_file\", \"output_name\": \"<name>\", \
              \"path\": \"<canonical path>\", \"digest\": \"sha256:<digest>\", \
-             \"size_bytes\": <bytes> }`.",
+             \"size_bytes\": <bytes> }`. Here `<name>` means the exact logical \
+             output name shown before the arrow below, not the file name or \
+             basename. A manifest whose `output_name` conflicts with that logical \
+             name is rejected even when its path and digest are correct.",
         ));
         parts.push(String::from(
             "Tool stdout is not an output channel. Only the final assistant \
@@ -8757,6 +8900,11 @@ fn build_task_prompt(
                 task,
             );
             parts.push(format!("- `{output_name}` → `{normalized}`"));
+            parts.push(format!(
+                "  - Direct-file binding: use canonical key `{normalized}`, \
+                 `\"output_name\":\"{output_name}\"`, and `\"path\":\"{normalized}\"`; \
+                 do not substitute a basename."
+            ));
             if let Some(schema) = task.output_schemas.get(output_name) {
                 if crate::contracts::validation_mode(schema) == "structured_with_human_companion" {
                     if let Some(raw_name) = schema.raw_artifact_name.as_ref() {
@@ -8936,6 +9084,47 @@ fn build_task_prompt(
         source_ctx,
     );
 
+    let body = parts.join("\n");
+    finalize_task_prompt(plan, run, task, idea, &body)
+}
+
+fn finalize_task_prompt(
+    plan: &workflow::plan::RunPlan,
+    run: &domain::run::Run,
+    task: &workflow::plan::CompiledTask,
+    idea: Option<&domain::idea::Idea>,
+    body: &str,
+) -> Result<String> {
+    if plan.mission_context_version.as_deref() == Some("agent_mission_context_v1") {
+        let idea = idea.ok_or_else(|| anyhow::anyhow!("mission_context_source_missing: Idea"))?;
+        let state_id = run
+            .current_state
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("mission_context_source_missing: current state"))?;
+        let state = plan
+            .states
+            .get(state_id)
+            .ok_or_else(|| anyhow::anyhow!("mission_context_source_missing: state '{state_id}'"))?;
+        crate::agent_mission_context::finalize_task_prompt_v1(plan, run, state, task, idea, body)
+    } else {
+        Ok(finalize_legacy_prompt(&task.agent, body))
+    }
+}
+
+fn finalize_legacy_prompt(agent: &workflow::plan::ResolvedAgent, body: &str) -> String {
+    let mut parts = Vec::new();
+    let agent_prompt = agent.prompt.as_deref().unwrap_or("").trim();
+    if !agent_prompt.is_empty() {
+        parts.push(format!("## System Instructions\n{agent_prompt}"));
+        parts.push("---".to_string());
+    }
+    if let Some(skill) = &agent.resolved_skill {
+        if !skill.injected_content.trim().is_empty() {
+            parts.push(String::new());
+            parts.push(skill.injected_content.clone());
+        }
+    }
+    parts.push(body.to_string());
     parts.join("\n")
 }
 
@@ -8945,41 +9134,17 @@ fn effective_worktree_strategy_for_task(task: &workflow::plan::CompiledTask) -> 
     })
 }
 
-/// P017: Resolve the provider for an agent entry from its backend profile.
-fn resolve_agent_provider(
-    agent: &workflow::catalog::AgentEntry,
-    catalog: &workflow::catalog::AgentCatalogFile,
-) -> String {
-    catalog
-        .backend_profiles
-        .as_ref()
-        .and_then(|profiles| profiles.get(&agent.backend_profile))
-        .map(|bp| bp.provider.clone())
-        .unwrap_or_else(|| "claude".to_string())
-}
-
-/// P017: Resolve the model for an agent entry from its backend profile.
-fn resolve_agent_model(
-    agent: &workflow::catalog::AgentEntry,
-    catalog: &workflow::catalog::AgentCatalogFile,
-) -> Option<String> {
-    catalog
-        .backend_profiles
-        .as_ref()
-        .and_then(|profiles| profiles.get(&agent.backend_profile))
-        .and_then(|bp| bp.model.clone())
-}
-
-/// P017: Resolve the effort for an agent entry from its backend profile.
-fn resolve_agent_effort(
-    agent: &workflow::catalog::AgentEntry,
-    catalog: &workflow::catalog::AgentCatalogFile,
-) -> Option<String> {
-    catalog
-        .backend_profiles
-        .as_ref()
-        .and_then(|profiles| profiles.get(&agent.backend_profile))
-        .and_then(|bp| bp.effort.clone())
+/// Resolve one frozen agent binding without consulting the live catalog.
+fn resolved_agent_from_plan<'a>(
+    plan: &'a workflow::plan::RunPlan,
+    agent_id: &str,
+) -> Option<&'a workflow::plan::ResolvedAgent> {
+    plan.states.values().find_map(|state| {
+        std::iter::once(&state.owner)
+            .chain(state.tasks.iter().map(|task| &task.agent))
+            .chain(state.post_approval_tasks.iter().map(|task| &task.agent))
+            .find(|agent| agent.agent_id == agent_id)
+    })
 }
 
 fn task_reads_implementation_worktree(task: &workflow::plan::CompiledTask) -> bool {
@@ -8998,22 +9163,8 @@ fn build_task_prompt_for_owner(
     plan: &workflow::plan::RunPlan,
     run: &domain::run::Run,
     idea: Option<&domain::idea::Idea>,
-) -> String {
+) -> Result<String> {
     let mut parts: Vec<String> = Vec::new();
-
-    let agent_prompt = state.owner.prompt.as_deref().unwrap_or("").trim();
-    if !agent_prompt.is_empty() {
-        parts.push(format!("## System Instructions\n{agent_prompt}"));
-        parts.push(String::from("---"));
-    }
-
-    // Inject resolved skill content for the owner agent.
-    if let Some(skill) = &state.owner.resolved_skill {
-        if !skill.injected_content.trim().is_empty() {
-            parts.push(String::new());
-            parts.push(skill.injected_content.clone());
-        }
-    }
 
     parts.push(format!("## State: {} — {}", state.id, state.label));
     // Proposal 007: write-enabled owner agents see worktree root.
@@ -9080,7 +9231,13 @@ fn build_task_prompt_for_owner(
         }
     }
 
-    parts.join("\n")
+    let body = parts.join("\n");
+    if plan.mission_context_version.as_deref() == Some("agent_mission_context_v1") {
+        let idea = idea.ok_or_else(|| anyhow::anyhow!("mission_context_source_missing: Idea"))?;
+        crate::agent_mission_context::finalize_owner_prompt_v1(plan, run, state, idea, &body)
+    } else {
+        Ok(finalize_legacy_prompt(&state.owner, &body))
+    }
 }
 
 /// Normalize a resolved path for a write-enabled agent: replace workspace_root
@@ -9494,6 +9651,9 @@ mod tests {
     };
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{AgentExecutionId, IdeaId, RunId, StageExecutionId};
+    use domain::routing::{
+        AgentSelectionPlanV1, InputSnapshotHashes, ReviewRoutingMode, ScoreTerms, SelectedAgent,
+    };
     use domain::run::{Run, RunStatus};
     use domain::stage::StageStatus;
     use std::collections::HashMap;
@@ -9828,11 +9988,25 @@ mod tests {
             catalog_snapshot_hash: "catalog".into(),
             workflow_snapshot_json: "{}".into(),
             catalog_snapshot_json: "{}".into(),
+            mission_context_version: None,
             dynamic_candidate_bindings: Vec::new(),
             run_plan_snapshot_format_version: None,
             closeout_readiness_mode: None,
             escalation_policies: Vec::new(),
         }
+    }
+
+    fn set_snapshot_quartet(run: &mut domain::run::Run, workflow_json: &str, catalog_json: &str) {
+        run.workflow_snapshot_json = Some(workflow_json.to_string());
+        run.catalog_snapshot_json = Some(catalog_json.to_string());
+        run.workflow_snapshot_hash = Some(format!(
+            "{:x}",
+            sha2::Sha256::digest(workflow_json.as_bytes())
+        ));
+        run.catalog_snapshot_hash = Some(format!(
+            "{:x}",
+            sha2::Sha256::digest(catalog_json.as_bytes())
+        ));
     }
 
     #[tokio::test]
@@ -10643,25 +10817,56 @@ mod tests {
             Orchestrator::new(pool.clone(), events.clone(), WorkQueue::new(pool.clone()));
         let run_id = RunId::new();
         let mut run = test_run(run_id);
-        run.catalog_snapshot_json = Some(
-            serde_json::json!({
-                "backend_profiles": {
-                    "claude_product_high": {
-                        "provider": "claude_acp",
-                        "model": "sonnet",
-                        "effort": "medium",
-                        "max_turns": 12
-                    },
-                    "codex_architect_high": {
-                        "provider": "codex_acp",
-                        "model": "gpt-5.6",
-                        "effort": "xhigh",
-                        "max_turns": 16
-                    }
+        let workflow_json = serde_json::json!({
+            "workflow": {"id": "auto_contract_retry"},
+            "initial_state": "review",
+            "states": {
+                "review": {
+                    "label": "Review",
+                    "owner": "proposal_reviewer_product_owner",
+                    "type": "end"
                 }
-            })
-            .to_string(),
-        );
+            }
+        })
+        .to_string();
+        let catalog_json = serde_json::json!({
+            "backend_profiles": {
+                "claude_product_high": {
+                    "provider": "claude_acp",
+                    "model": "sonnet",
+                    "effort": "medium",
+                    "max_turns": 12
+                },
+                "codex_architect_high": {
+                    "provider": "codex_acp",
+                    "model": "gpt-5.6",
+                    "effort": "xhigh",
+                    "max_turns": 16
+                },
+                "lead_profile": {
+                    "provider": "claude_acp",
+                    "model": "sonnet"
+                }
+            },
+            "permission_profiles": {"lead_perm": {}},
+            "contracts": {"lead_contract": {"format": "json"}},
+            "agents": [
+                {
+                    "id": "proposal_reviewer_product_owner",
+                    "backend_profile": "claude_product_high",
+                    "output_contract": "proposal_review_v1"
+                },
+                {
+                    "id": "lead_orchestrator",
+                    "system_role": "lead",
+                    "backend_profile": "lead_profile",
+                    "permission_profile": "lead_perm",
+                    "lead_resolution_contract": "lead_contract"
+                }
+            ]
+        })
+        .to_string();
+        set_snapshot_quartet(&mut run, &workflow_json, &catalog_json);
         ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
         runs::insert(&pool, &run).await.unwrap();
 
@@ -10722,6 +10927,11 @@ mod tests {
                     "run_id": run_id.to_string(),
                     "stage_id": "review",
                     "stage_execution_id": stage_id.to_string(),
+                    "target_stage_execution_id": "stale-target-stage",
+                    "source_stage_execution_id": "stale-source-stage",
+                    "source_agent_execution_id": "stale-source-agent",
+                    "source_work_item_id": "stale-source-work-item",
+                    "retry_authority_id": "stale-retry-authority",
                     "agent_id": "proposal_reviewer_product_owner",
                     "provider": "claude_acp",
                     "backend_profile_id": "claude_product_high",
@@ -10732,6 +10942,12 @@ mod tests {
                     "task_outputs": ["proposal_review_po"],
                     "p058_claimed": {
                         "agent_execution_id": failed_exec_id.to_string()
+                    },
+                    "targeted_retry": {
+                        "escalation": {
+                            "ledger_id": "ledger-p058-auto",
+                            "tier_id": "claude_writer_fallback"
+                        }
                     }
                 })
                 .to_string(),
@@ -10790,6 +11006,15 @@ mod tests {
             payload.pointer("/targeted_retry/provider_fallback/reason"),
             Some(&serde_json::json!("source_contract_outputs_missing"))
         );
+        assert_eq!(
+            payload.pointer("/targeted_retry/escalation/ledger_id"),
+            Some(&serde_json::json!("ledger-p058-auto")),
+            "auto fallback must preserve an inherited P058 ledger"
+        );
+        assert_eq!(
+            payload.pointer("/targeted_retry/escalation/tier_id"),
+            Some(&serde_json::json!("claude_writer_fallback"))
+        );
         let authority = db::repos::retry_stage_execution_authorities::find_active_by_target(
             &pool,
             retry_stage.id,
@@ -10813,6 +11038,25 @@ mod tests {
             payload["retry_authority_id"],
             serde_json::json!(authority.id)
         );
+        assert_eq!(
+            payload["stage_execution_id"],
+            serde_json::json!(retry_stage.id.to_string())
+        );
+        assert_eq!(
+            payload["target_stage_execution_id"],
+            serde_json::json!(retry_stage.id.to_string())
+        );
+        for field in [
+            "source_stage_execution_id",
+            "source_agent_execution_id",
+            "source_work_item_id",
+            "p058_claimed",
+        ] {
+            assert!(
+                payload.get(field).is_none(),
+                "retry payload must not retain stale top-level {field}"
+            );
+        }
         assert_eq!(
             payload.pointer("/targeted_retry/retry_authority_id"),
             Some(&serde_json::json!(authority.id.clone()))
@@ -10843,9 +11087,36 @@ mod tests {
             .await
             .unwrap();
 
+        let claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
+            run_id,
+            owner_kind: domain::mediation::OwnerKind::StageExecution,
+            owner_id: retry_stage.id.to_string(),
+            stage_execution_id: Some(retry_stage.id),
+            agent_execution_id: retry_exec_id,
+            source_work_item_id: retry_invokes[0].id.clone(),
+        };
+        db::repos::artifact_contracts::insert_source_generation_claim(
+            &pool,
+            domain::artifact_contracts::ArtifactSourceGenerationClaim {
+                key: claim_key.clone(),
+                current_session_generation_id: None,
+                claim_state: domain::agent::ArtifactSourceClaimState::Active,
+                superseding_work_item_id: None,
+                superseded_by_agent_execution_id: None,
+                supersession_journal_id: None,
+                superseded_at: None,
+                closed_at: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
         let mut retry_payload = payload.clone();
         retry_payload["p058_claimed"] = serde_json::json!({
-            "agent_execution_id": retry_exec_id.to_string()
+            "agent_execution_id": retry_exec_id.to_string(),
+            "artifact_claim_key": claim_key,
         });
         sqlx::query(
             r#"UPDATE work_items
@@ -10950,10 +11221,34 @@ mod tests {
             ]
         }"#;
         let mut run = test_run(run_id);
-        run.workflow_snapshot_json = Some(workflow_json.into());
-        run.catalog_snapshot_json = Some(catalog_json.into());
+        set_snapshot_quartet(&mut run, workflow_json, catalog_json);
         ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
         runs::insert(&pool, &run).await.unwrap();
+
+        let prior_retry_stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "review".into(),
+            label: "review".into(),
+            status: StageStatus::Failed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: Some(StageSettlementKind::Failed),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: Some(
+                "p058_escalation_retry:proposal_reviewer_product_owner:codex_tier:ledger-prior"
+                    .into(),
+            ),
+        };
+        stages::insert(&pool, &prior_retry_stage).await.unwrap();
 
         let stage_id = StageExecutionId::new();
         let stage = StageExecution {
@@ -10963,7 +11258,7 @@ mod tests {
             label: "review".into(),
             status: StageStatus::Running,
             iteration: 1,
-            attempt_number: 1,
+            attempt_number: 2,
             settlement_kind: None,
             started_at: Utc::now(),
             completed_at: None,
@@ -11064,6 +11359,11 @@ mod tests {
                     "run_id": run_id.to_string(),
                     "stage_id": "review",
                     "stage_execution_id": stage_id.to_string(),
+                    "target_stage_execution_id": "stale-target-stage",
+                    "source_stage_execution_id": "stale-source-stage",
+                    "source_agent_execution_id": "stale-source-agent",
+                    "source_work_item_id": "stale-source-work-item",
+                    "retry_authority_id": "stale-retry-authority",
                     "agent_id": "proposal_reviewer_product_owner",
                     "provider": "claude_acp",
                     "backend_profile_id": "claude_product_high",
@@ -11100,7 +11400,8 @@ mod tests {
             .iter()
             .find(|candidate| {
                 candidate.retry_reason.as_deref().is_some_and(|reason| {
-                    reason == "p058_escalation_retry:proposal_reviewer_product_owner:codex_tier"
+                    reason
+                        == "p058_escalation_retry:proposal_reviewer_product_owner:codex_tier:ledger-p058-scheduler"
                 })
             })
             .expect("P058 escalation retry stage should be created");
@@ -11144,6 +11445,46 @@ mod tests {
             payload.pointer("/targeted_retry/provider_fallback/reason"),
             Some(&serde_json::json!("p058_backend_profile_tier"))
         );
+        assert_eq!(
+            payload["stage_execution_id"],
+            serde_json::json!(retry_stage.id.to_string())
+        );
+        assert_eq!(
+            payload["target_stage_execution_id"],
+            serde_json::json!(retry_stage.id.to_string())
+        );
+        for field in [
+            "source_stage_execution_id",
+            "source_agent_execution_id",
+            "source_work_item_id",
+            "p058_claimed",
+        ] {
+            assert!(
+                payload.get(field).is_none(),
+                "P058 retry payload must not retain stale top-level {field}"
+            );
+        }
+
+        let duplicate_scheduled = orchestrator
+            .schedule_p058_escalation_retry_for_stage(run_id, &run, &stage)
+            .await
+            .unwrap();
+        assert!(
+            !duplicate_scheduled,
+            "the same ledger and tier must remain idempotent"
+        );
+        let duplicate_retry_count = stages::list_by_run(&pool, run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|candidate| {
+                candidate.retry_reason.as_deref()
+                    == Some(
+                        "p058_escalation_retry:proposal_reviewer_product_owner:codex_tier:ledger-p058-scheduler",
+                    )
+            })
+            .count();
+        assert_eq!(duplicate_retry_count, 1);
     }
 
     #[tokio::test]
@@ -11205,8 +11546,7 @@ mod tests {
             ]
         }"#;
         let mut run = test_run(run_id);
-        run.workflow_snapshot_json = Some(workflow_json.into());
-        run.catalog_snapshot_json = Some(catalog_json.into());
+        set_snapshot_quartet(&mut run, workflow_json, catalog_json);
         ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
         runs::insert(&pool, &run).await.unwrap();
 
@@ -11422,8 +11762,7 @@ mod tests {
             ]
         }"#;
         let mut run = test_run(run_id);
-        run.workflow_snapshot_json = Some(workflow_json.into());
-        run.catalog_snapshot_json = Some(catalog_json.into());
+        set_snapshot_quartet(&mut run, workflow_json, catalog_json);
         ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
         runs::insert(&pool, &run).await.unwrap();
 
@@ -11640,8 +11979,7 @@ mod tests {
             ]
         }"#;
         let mut run = test_run(run_id);
-        run.workflow_snapshot_json = Some(workflow_json.into());
-        run.catalog_snapshot_json = Some(catalog_json.into());
+        set_snapshot_quartet(&mut run, workflow_json, catalog_json);
         ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
         runs::insert(&pool, &run).await.unwrap();
 
@@ -11942,8 +12280,7 @@ mod tests {
             ]
         }"#;
         let mut run = test_run(run_id);
-        run.workflow_snapshot_json = Some(workflow_json.into());
-        run.catalog_snapshot_json = Some(catalog_json.into());
+        set_snapshot_quartet(&mut run, workflow_json, catalog_json);
         ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
         runs::insert(&pool, &run).await.unwrap();
 
@@ -12199,6 +12536,234 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn agent_context_owner_validation_failure_enqueues_zero_provider_work() {
+        let pool = test_pool().await;
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            crate::event_bus::new_bus(16),
+            WorkQueue::new(pool.clone()),
+        );
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let plan = workflow::compiler::compile(
+            root.join("examples/workflows/full-mvp-live.yaml")
+                .to_str()
+                .unwrap(),
+            root.join("examples/agents/agents.yaml").to_str().unwrap(),
+        )
+        .unwrap();
+        let state = plan
+            .states
+            .values()
+            .find(|state| state.tasks.is_empty() && !state.is_end)
+            .unwrap();
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id: RunId::new(),
+            stage_id: state.id.clone(),
+            label: state.label.clone(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: Some(state.owner.agent_id.clone()),
+            provider: Some(state.owner.provider.clone()),
+            model: state.owner.model.clone(),
+            stage_type: state.state_type.clone(),
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+
+        let error = orchestrator
+            .enqueue_invoke_agent_for_owner(
+                stage.run_id,
+                &stage,
+                &state.owner,
+                "owner prompt without mission context",
+                0,
+                1,
+                &plan,
+            )
+            .await
+            .expect_err("V1 owner prompt without mission context must fail")
+            .to_string();
+        assert!(error.contains("exactly one mission block"));
+        let work_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_items")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(work_count, 0);
+    }
+
+    #[tokio::test]
+    async fn agent_context_corrupted_frozen_snapshot_enqueues_zero_provider_work() {
+        let pool = test_pool().await;
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            crate::event_bus::new_bus(16),
+            WorkQueue::new(pool.clone()),
+        );
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let plan = workflow::compiler::compile(
+            root.join("examples/workflows/full-mvp-live.yaml")
+                .to_str()
+                .unwrap(),
+            root.join("examples/agents/agents.yaml").to_str().unwrap(),
+        )
+        .unwrap();
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.workflow_yaml_path = Some("/must/not-be-read/workflow.yaml".into());
+        run.agent_catalog_yaml_path = Some("/must/not-be-read/catalog.yaml".into());
+        run.workflow_snapshot_json = Some(plan.workflow_snapshot_json.clone());
+        run.workflow_snapshot_hash = Some(plan.workflow_snapshot_hash.clone());
+        run.catalog_snapshot_json = Some(plan.catalog_snapshot_json.clone());
+        run.catalog_snapshot_hash = Some("0".repeat(64));
+        ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+
+        let error = orchestrator
+            .advance_run(run_id)
+            .await
+            .expect_err("corrupted frozen snapshot must fail before stage/provider work")
+            .to_string();
+        assert!(error.contains("stored snapshot digest mismatch"));
+        let work_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_items")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(work_count, 0);
+    }
+
+    #[tokio::test]
+    async fn agent_context_dynamic_finalizer_failure_enqueues_and_materializes_zero_work() {
+        let pool = test_pool().await;
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            crate::event_bus::new_bus(16),
+            WorkQueue::new(pool.clone()),
+        );
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let plan = workflow::compiler::compile(
+            root.join("examples/workflows/full-mvp-live.yaml")
+                .to_str()
+                .unwrap(),
+            root.join("examples/agents/agents.yaml").to_str().unwrap(),
+        )
+        .unwrap();
+        let state = plan
+            .states
+            .values()
+            .find(|state| state.dynamic_parallel.is_some())
+            .unwrap();
+        let dynamic_parallel = state.dynamic_parallel.as_ref().unwrap();
+        let binding = plan.dynamic_candidate_bindings.first().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let routing_dir = tmp.path().join("routing");
+        std::fs::create_dir_all(&routing_dir).unwrap();
+        let selection = AgentSelectionPlanV1 {
+            schema_version: "agent_selection_plan_v1".into(),
+            routing_rules_version: "fixture".into(),
+            proposal_md5: "fixture".into(),
+            plan_hash: "fixture-plan-hash".into(),
+            mode: ReviewRoutingMode::Dynamic,
+            fingerprint: vec!["fixture".into()],
+            selected_agents: vec![SelectedAgent {
+                agent_id: binding.agent_id.clone(),
+                routing_id: binding.routing_metadata.routing_id.clone(),
+                score: 1,
+                mandatory: true,
+                override_source: None,
+                score_terms: ScoreTerms::default(),
+                rationale: "fixture".into(),
+                evidence_refs: Vec::new(),
+                materialization_binding_id: binding.binding_id.clone(),
+            }],
+            rejected_alternatives: Vec::new(),
+            ineligible_candidates: Vec::new(),
+            warnings: Vec::new(),
+            input_snapshot_hashes: InputSnapshotHashes {
+                workflow_snapshot_hash: plan.workflow_snapshot_hash.clone(),
+                catalog_snapshot_hash: plan.catalog_snapshot_hash.clone(),
+                routing_metadata_hash: "fixture".into(),
+                candidate_binding_hash: "fixture".into(),
+                evidence_hash: "fixture".into(),
+                override_hash: None,
+            },
+        };
+        std::fs::write(
+            routing_dir.join("agent-selection-plan.v1.json"),
+            serde_json::to_vec(&selection).unwrap(),
+        )
+        .unwrap();
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.artifact_root = tmp.path().to_string_lossy().into_owned();
+        run.current_state = Some(state.id.clone());
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: state.id.clone(),
+            label: state.label.clone(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: Some(state.owner.agent_id.clone()),
+            provider: Some(state.owner.provider.clone()),
+            model: state.owner.model.clone(),
+            stage_type: state.state_type.clone(),
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        let oversized = Idea {
+            id: run.idea_id,
+            title: String::new(),
+            body: "x".repeat(crate::agent_mission_context::MAX_IDEA_CONTEXT_BYTES + 1),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        };
+
+        let error = orchestrator
+            .materialize_dynamic_parallel(
+                run_id,
+                &run,
+                &stage,
+                &plan,
+                dynamic_parallel,
+                Some(&oversized),
+            )
+            .await
+            .expect_err("oversized dynamic mission must fail before durable work")
+            .to_string();
+        assert!(
+            error.contains("mission_context_input_too_large"),
+            "unexpected dynamic finalizer error: {error}"
+        );
+        let work_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_items")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let materialization_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM dynamic_materialization_records")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(work_count, 0);
+        assert_eq!(materialization_count, 0);
+    }
+
     #[test]
     fn implementation_summary_orchestrator_does_not_switch_to_worktree() {
         let mut task = reviewer_task();
@@ -12235,7 +12800,8 @@ mod tests {
         );
         let task = implementation_security_task();
 
-        let prompt = build_task_prompt(&task, &plan, &run, None, None, None);
+        let prompt = build_task_prompt(&task, &plan, &run, None, None, None)
+            .expect("legacy prompt should build");
 
         assert!(prompt.contains(
             "Implementation worktree root: /workspace/.chainworks/worktrees/implementation"
@@ -12277,7 +12843,8 @@ mod tests {
         let mut task = reviewer_task();
         task.inputs = vec!["security_report".into()];
 
-        let prompt = build_task_prompt(&task, &plan, &run, None, None, None);
+        let prompt = build_task_prompt(&task, &plan, &run, None, None, None)
+            .expect("legacy prompt should build");
 
         assert!(prompt.contains("### Materialized Input Artifact"));
         assert!(prompt.contains("provider sandbox may not be allowed to read that path directly"));
@@ -12388,7 +12955,8 @@ mod tests {
             },
         );
 
-        let prompt = build_task_prompt(&task, &plan, &run, None, None, None);
+        let prompt = build_task_prompt(&task, &plan, &run, None, None, None)
+            .expect("legacy prompt should build");
         let declared_outputs = build_declared_outputs(&task, &plan, &run);
 
         assert!(
@@ -12399,6 +12967,9 @@ mod tests {
         assert!(prompt.contains("Only the final assistant message is settled"));
         assert!(prompt.contains("Do not call shell `echo`"));
         assert!(prompt.contains("direct-file manifest"));
+        assert!(prompt.contains("exact logical output name shown before the arrow"));
+        assert!(prompt.contains("`\"output_name\":\"implementation_progress\"`"));
+        assert!(prompt.contains("do not substitute a basename"));
         assert!(prompt.contains("implementation_complete"));
         assert!(prompt.contains("remaining_code_tasks"));
         assert!(prompt.contains("Control-Plane Generated Evidence"));
@@ -12463,7 +13034,8 @@ mod tests {
         ];
         task.output_schemas.clear();
 
-        let prompt = build_task_prompt(&task, &plan, &run, None, None, None);
+        let prompt = build_task_prompt(&task, &plan, &run, None, None, None)
+            .expect("legacy prompt should build");
 
         assert!(prompt.contains("### Authoritative Proposal Review Backlog"));
         assert!(prompt.contains("review_pass_id: `proposal-review-aggregate-run-state_4-r10`"));
@@ -12503,6 +13075,49 @@ mod tests {
         assert_eq!(
             declared.target_path,
             format!("/workspace/.chainworks/runs/{run_id}/reviews/proposal/product-owner.json")
+        );
+    }
+
+    #[test]
+    fn declared_output_rebases_safe_frozen_legacy_path_into_post_isolation_meta_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let run_id = RunId::new();
+        let legacy_root = workspace.path().join(".chainworks/legacy-artifacts");
+        let run_root = workspace
+            .path()
+            .join(".chainworks/runs")
+            .join(run_id.to_string());
+        let mut run = test_run(run_id);
+        run.workspace_root = workspace.path().to_string_lossy().into_owned();
+        run.artifact_root = legacy_root.to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(run_root.to_string_lossy().into_owned());
+
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "run_report".into(),
+            legacy_root
+                .join("run-report.json")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let mut task = reviewer_task();
+        task.outputs = vec!["run_report".into()];
+        task.output_schemas.clear();
+
+        let declared = build_declared_outputs(&task, &plan, &run);
+        assert_eq!(
+            declared[0].target_path,
+            run_root.join("run-report.json").to_string_lossy()
+        );
+
+        let escaped = legacy_root.join("../outside.json");
+        assert_eq!(
+            rebase_safe_legacy_artifact_path_for_post_isolation_run(
+                escaped.to_str().unwrap(),
+                &run,
+            ),
+            escaped.to_string_lossy(),
+            "non-normal legacy descendants must remain subject to SEC-001 rejection"
         );
     }
 
@@ -12547,7 +13162,8 @@ mod tests {
         );
 
         let declared_outputs = build_declared_outputs(&task, &plan, &run);
-        let prompt = build_task_prompt(&task, &plan, &run, None, None, None);
+        let prompt = build_task_prompt(&task, &plan, &run, None, None, None)
+            .expect("legacy prompt should build");
 
         assert_eq!(declared_outputs.len(), 1);
         let declared = &declared_outputs[0];
@@ -12718,7 +13334,8 @@ mod tests {
                 },
             );
 
-            let prompt = build_task_prompt(&task, &plan, &run, None, None, None);
+            let prompt = build_task_prompt(&task, &plan, &run, None, None, None)
+                .expect("legacy prompt should build");
             assert!(
                 prompt.contains("Allowed values for `status`:"),
                 "{agent_id} prompt should state allowed status values"
@@ -13188,6 +13805,67 @@ permission_profiles:
             state_9_stages.len(),
             2,
             "Should have created a new stage for state_9 because the old one is stale"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retry_rows_do_not_skip_the_next_logical_iteration() {
+        let pool = test_pool().await;
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        let idea = test_idea(run.idea_id);
+        ideas::insert(&pool, &idea).await.unwrap();
+        run.current_state = Some("refine".into());
+        runs::insert(&pool, &run).await.unwrap();
+
+        let skipped = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "refine".into(),
+            label: "Refine".into(),
+            status: StageStatus::Skipped,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now() - Duration::seconds(2),
+            completed_at: Some(Utc::now() - Duration::seconds(1)),
+            owner_agent: Some("code_writer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: Some("superseded_by_retry".into()),
+        };
+        let mut completed_retry = skipped.clone();
+        completed_retry.id = StageExecutionId::new();
+        completed_retry.status = StageStatus::Completed;
+        completed_retry.attempt_number = 2;
+        completed_retry.started_at = Utc::now();
+        completed_retry.completed_at = Some(Utc::now());
+        completed_retry.retry_reason = Some("operator_retry".into());
+        stages::insert(&pool, &skipped).await.unwrap();
+        stages::insert(&pool, &completed_retry).await.unwrap();
+
+        let next = orchestrator
+            .create_stage_for_state(
+                run_id,
+                "refine",
+                &compiled_state("refine", Vec::new(), false),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            next.iteration, 2,
+            "retry attempts within iteration 1 must not make the next logical cycle iteration 3"
         );
     }
 

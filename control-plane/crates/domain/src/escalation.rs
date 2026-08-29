@@ -193,6 +193,33 @@ pub struct EscalationLedger {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Append-only operator-opened wall-clock window for a paused P058 chain.
+/// The ledger's original timestamps and attempt history remain authoritative.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EscalationDeadlineWindow {
+    pub id: String,
+    pub escalation_ledger_id: String,
+    pub previous_window_id: Option<String>,
+    pub tier_id: String,
+    pub tier_kind_raw: String,
+    pub policy_hash: String,
+    pub source_pause_reason_raw: String,
+    pub source_deadline_at: DateTime<Utc>,
+    pub opened_by_principal_id: String,
+    pub command_journal_id: String,
+    pub resume_idempotency_key: String,
+    pub resume_request_hash: String,
+    pub source_stage_execution_id: String,
+    pub source_agent_execution_id: String,
+    pub retry_stage_execution_id: String,
+    pub work_item_id: String,
+    pub target_backend_profile_id: String,
+    pub target_provider: String,
+    pub starts_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Per-execution escalation attribution row.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EscalationExecutionMetadata {

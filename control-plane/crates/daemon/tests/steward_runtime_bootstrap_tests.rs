@@ -40,6 +40,8 @@ triggers:
     let effective = daemon::steward_runtime::load_effective_config(Some(&config_path));
     assert!(effective.used_default);
     assert_eq!(effective.config.windows.minimum_window_size, 5);
+    assert!(effective.config.triggers.post_run_hook.enabled);
+    assert_eq!(effective.config.triggers.post_run_hook.run_interval, 1);
     assert_eq!(effective.hash.len(), 64);
 }
 
@@ -82,6 +84,13 @@ backend_profiles:
     assert_eq!(
         pending.catalog_hash.as_deref(),
         Some(effective.agent_catalog_hash.as_str())
+    );
+    assert_eq!(
+        db::repos::steward::post_run_trigger_config(&pool)
+            .await
+            .unwrap(),
+        (true, 1),
+        "default bootstrap must persist every-run Steward analysis"
     );
     let queued = db::repos::work_items::claim_next(&pool).await.unwrap();
     assert!(

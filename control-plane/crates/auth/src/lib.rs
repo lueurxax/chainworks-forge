@@ -732,9 +732,11 @@ impl Default for PrincipalEntry {
 /// Returns 43-char base64url (without padding) encoding of 32 random bytes = 256 bits entropy.
 /// Satisfies P081 token format: 32..4096 visible ASCII, no CTL characters.
 fn generate_bootstrap_token() -> String {
-    use rand::RngCore;
+    use rand::{rngs::SysRng, TryRng};
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let mut rng = SysRng;
+    rng.try_fill_bytes(&mut bytes)
+        .expect("operating-system random source must be available for bootstrap tokens");
     base64_url_no_pad(&bytes)
 }
 
@@ -1292,7 +1294,7 @@ fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolI
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 55] {
+fn all_tool_capabilities() -> [CapabilityToolId; 57] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -1307,6 +1309,8 @@ fn all_tool_capabilities() -> [CapabilityToolId; 55] {
         CapabilityToolId::RunsKnowledgeCapsuleIgnore,
         CapabilityToolId::RunsRetrofitCatalogSnapshot,
         CapabilityToolId::RunsCancel,
+        CapabilityToolId::RunsResumeEscalationDeadline,
+        CapabilityToolId::RunsResumeEscalationChain,
         CapabilityToolId::ApprovalsList,
         CapabilityToolId::ApprovalsResolve,
         CapabilityToolId::StagesRetry,
@@ -1396,6 +1400,12 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         CapabilityToolId::RunsKnowledgeCapsuleIgnore => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::RunsRetrofitCatalogSnapshot => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::RunsCancel => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::RunsResumeEscalationDeadline => {
+            matches!(class, PrincipalClass::Operator)
+        }
+        CapabilityToolId::RunsResumeEscalationChain => {
+            matches!(class, PrincipalClass::Operator)
+        }
         CapabilityToolId::ApprovalsList => {
             matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
         }
@@ -1602,6 +1612,8 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
         "runs.knowledge_capsule.ignore" => Some(CapabilityToolId::RunsKnowledgeCapsuleIgnore),
         "runs.retrofit_catalog_snapshot" => Some(CapabilityToolId::RunsRetrofitCatalogSnapshot),
         "runs.cancel" => Some(CapabilityToolId::RunsCancel),
+        "runs.resume_escalation_deadline" => Some(CapabilityToolId::RunsResumeEscalationDeadline),
+        "runs.resume_escalation_chain" => Some(CapabilityToolId::RunsResumeEscalationChain),
         "approvals.list" => Some(CapabilityToolId::ApprovalsList),
         "approvals.resolve" => Some(CapabilityToolId::ApprovalsResolve),
         "stages.retry" => Some(CapabilityToolId::StagesRetry),
@@ -1677,6 +1689,18 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_token_is_base64url_and_256_bit() {
+        let first = generate_bootstrap_token();
+        let second = generate_bootstrap_token();
+
+        assert_eq!(first.len(), 43);
+        assert!(first
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'));
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn principal_carries_typed_capability_sets() {
         let p = Principal::new("op", PrincipalClass::Operator);
 
@@ -1741,6 +1765,8 @@ mod tests {
         assert!(is_tool_allowed(&p, "runs.main_sync.request"));
         assert!(is_tool_allowed(&p, "approvals.resolve"));
         assert!(is_tool_allowed(&p, "stages.retry"));
+        assert!(is_tool_allowed(&p, "runs.resume_escalation_deadline"));
+        assert!(is_tool_allowed(&p, "runs.resume_escalation_chain"));
     }
 
     #[test]
@@ -1752,6 +1778,8 @@ mod tests {
         assert!(!is_tool_allowed(&p, "stages.retry"));
         assert!(!is_tool_allowed(&p, "runs.main_sync.request"));
         assert!(!is_tool_allowed(&p, "runs.cancel"));
+        assert!(!is_tool_allowed(&p, "runs.resume_escalation_deadline"));
+        assert!(!is_tool_allowed(&p, "runs.resume_escalation_chain"));
     }
 
     #[test]
@@ -1762,6 +1790,8 @@ mod tests {
         assert!(!is_tool_allowed(&p, "reports.get"));
         assert!(!is_tool_allowed(&p, "ideas.create"));
         assert!(!is_tool_allowed(&p, "runs.start"));
+        assert!(!is_tool_allowed(&p, "runs.resume_escalation_deadline"));
+        assert!(!is_tool_allowed(&p, "runs.resume_escalation_chain"));
     }
 
     #[test]

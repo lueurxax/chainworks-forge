@@ -1,0 +1,117 @@
+{
+  "unrelated_skills_sha256": "bdb5ffb96a037b735ddf1737e35a2f6add2412670aae868314ac7733448dfb62",
+  "affected_agents": [
+    {
+      "agent_id": "code_writer",
+      "skill_ref": "code_writer_core",
+      "permission_profile": "CODE_WRITE",
+      "outputs": ["implementation_progress", "implementation_self_assessment", "tests_result"],
+      "output_contract": "implementation_self_assessment_v2",
+      "worktree_write_enabled": true
+    },
+    {
+      "agent_id": "proposal_review_router",
+      "skill_ref": "proposal_review_router_skill",
+      "permission_profile": "RO_REVIEW",
+      "outputs": ["agent_selection_plan_v1"],
+      "output_contract": "agent_selection_plan_v1",
+      "worktree_write_enabled": false
+    },
+    {
+      "agent_id": "proposal_reviewer_api_contract",
+      "skill_ref": "proposal_review_router_skill",
+      "permission_profile": "RO_REVIEW",
+      "outputs": ["proposal_review_architect"],
+      "output_contract": "proposal_review_v1",
+      "worktree_write_enabled": false
+    },
+    {
+      "agent_id": "proposal_reviewer_apple_architect",
+      "skill_ref": "proposal_review_router_skill",
+      "permission_profile": "RO_REVIEW",
+      "outputs": ["proposal_review_architect"],
+      "output_contract": "proposal_review_v1",
+      "worktree_write_enabled": false
+    },
+    {
+      "agent_id": "proposal_reviewer_architect",
+      "skill_ref": "proposal_review_router_skill",
+      "permission_profile": "RO_REVIEW",
+      "outputs": ["proposal_review_architect"],
+      "output_contract": "proposal_review_v1",
+      "worktree_write_enabled": false
+    },
+    {
+      "agent_id": "proposal_reviewer_macos",
+      "skill_ref": "proposal_review_router_skill",
+      "permission_profile": "RO_REVIEW",
+      "outputs": ["proposal_review_macos"],
+      "output_contract": "proposal_review_v1",
+      "worktree_write_enabled": false
+    },
+    {
+      "agent_id": "proposal_reviewer_observability_rollout",
+      "skill_ref": "proposal_review_router_skill",
+      "permission_profile": "RO_REVIEW",
+      "outputs": ["proposal_review_po"],
+      "output_contract": "proposal_review_v1",
+      "worktree_write_enabled": false
+    },
+    {
+      "agent_id": "proposal_reviewer_performance",
+      "skill_ref": "proposal_review_router_skill",
+      "permission_profile": "RO_REVIEW",
+      "outputs": ["proposal_review_architect"],
+      "output_contract": "proposal_review_v1",
+      "worktree_write_enabled": false
+    },
+    {
+      "agent_id": "proposal_reviewer_product_owner",
+      "skill_ref": "proposal_review_router_skill",
+      "permission_profile": "RO_REVIEW",
+      "outputs": ["proposal_review_po"],
+      "output_contract": "proposal_review_v1",
+      "worktree_write_enabled": false
+    },
+    {
+      "agent_id": "proposal_reviewer_reliability",
+      "skill_ref": "proposal_review_router_skill",
+      "permission_profile": "RO_REVIEW",
+      "outputs": ["proposal_review_architect"],
+      "output_contract": "proposal_review_v1",
+      "worktree_write_enabled": false
+    },
+    {
+      "agent_id": "proposal_reviewer_rust_architect",
+      "skill_ref": "proposal_review_router_skill",
+      "permission_profile": "RO_REVIEW",
+      "outputs": ["proposal_review_architect"],
+      "output_contract": "proposal_review_v1",
+      "worktree_write_enabled": false
+    },
+    {
+      "agent_id": "proposal_reviewer_security",
+      "skill_ref": "proposal_review_router_skill",
+      "permission_profile": "RO_REVIEW",
+      "outputs": ["proposal_review_architect"],
+      "output_contract": "proposal_review_v1",
+      "worktree_write_enabled": false
+    },
+    {
+      "agent_id": "proposal_reviewer_ui",
+      "skill_ref": "proposal_review_router_skill",
+      "permission_profile": "RO_REVIEW",
+      "outputs": ["proposal_review_ui"],
+      "output_contract": "proposal_review_v1",
+      "worktree_write_enabled": false
+    },
+    {
+      "agent_id": "proposal_reviewer_ux",
+      "skill_ref": "proposal_review_router_skill",
+      "permission_profile": "RO_REVIEW",
+      "outputs": ["proposal_review_ux"],
+      "output_contract": "proposal_review_v1",
+      "worktree_write_enabled": false
+    }
+  ]
+}

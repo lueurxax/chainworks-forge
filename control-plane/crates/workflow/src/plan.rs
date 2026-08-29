@@ -78,6 +78,9 @@ pub struct RunPlan {
     pub workflow_snapshot_json: String,
     /// Canonical parsed agent-catalog snapshot JSON.
     pub catalog_snapshot_json: String,
+    /// Compiler-owned prompt contract version. Absent for legacy frozen plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_context_version: Option<String>,
     /// P060: Dynamic candidate bindings for proposal review routing.
     /// Compiled from catalog entries with `routing` metadata.
     #[serde(default)]

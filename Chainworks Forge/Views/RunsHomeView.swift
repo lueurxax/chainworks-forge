@@ -1137,6 +1137,39 @@ struct P036RuntimeTimelineBuffer {
     }
 }
 
+@MainActor
+enum P031RuntimeTimelineSubscriptionLoop {
+    static func run(
+        runID: String,
+        reconnectDelayNanoseconds: UInt64,
+        shouldContinue: () -> Bool,
+        subscribe: (String) throws -> AsyncThrowingStream<P031RuntimeTimelineEventPresentation, Error>,
+        onEvent: (P031RuntimeTimelineEventPresentation) -> Void
+    ) async {
+        while !Task.isCancelled, shouldContinue() {
+            do {
+                let stream = try subscribe(runID)
+                for try await event in stream {
+                    try Task.checkCancellation()
+                    guard shouldContinue() else { return }
+                    onEvent(event)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                // A dropped daemon or WebSocket connection is recoverable for the selected run.
+            }
+
+            guard !Task.isCancelled, shouldContinue() else { return }
+            do {
+                try await Task.sleep(nanoseconds: reconnectDelayNanoseconds)
+            } catch {
+                return
+            }
+        }
+    }
+}
+
 enum P031RunDetailTab: String, CaseIterable, Identifiable {
     case overview
     case stages
@@ -1334,6 +1367,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
     private var runtimeTimelineBuffer = P036RuntimeTimelineBuffer()
     private var runtimeTimelineLastPublish = Date.distantPast
     private let runtimeTimelineFlushInterval: TimeInterval
+    private let runtimeTimelineReconnectDelayNanoseconds: UInt64 = 1_000_000_000
     private var escalationAttentionObserverID: UUID?
 
     var daemonSchemaMismatchMessage: String? {
@@ -2093,17 +2127,19 @@ final class P031ThinReadDashboardModel: ObservableObject {
         resetRuntimeTimelineBuffer()
         runtimeTimelineSubscriptionTask = Task { [weak self] in
             guard let self else { return }
-            do {
-                let stream = try self.subscribeRuntimeTimelineAction(runID)
-                for try await event in stream {
-                    try Task.checkCancellation()
-                    self.recordRuntimeTimelineEvent(event)
+            await P031RuntimeTimelineSubscriptionLoop.run(
+                runID: runID,
+                reconnectDelayNanoseconds: self.runtimeTimelineReconnectDelayNanoseconds,
+                shouldContinue: { [weak self] in
+                    guard let self else { return false }
+                    return self.selectedRunID == runID
+                        && self.subscribedRuntimeTimelineRunID == runID
+                },
+                subscribe: self.subscribeRuntimeTimelineAction,
+                onEvent: { [weak self] event in
+                    self?.recordRuntimeTimelineEvent(event)
                 }
-            } catch is CancellationError {
-                return
-            } catch {
-                return
-            }
+            )
         }
     }
 

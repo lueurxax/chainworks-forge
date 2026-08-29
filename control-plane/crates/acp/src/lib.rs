@@ -481,12 +481,58 @@ pub struct AcpRuntimeReceipt {
     pub first_events: Vec<AcpRuntimeReceiptEvent>,
     #[serde(default)]
     pub last_events: Vec<AcpRuntimeReceiptEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_diagnostics: Option<AcpClaudeRuntimeDiagnostics>,
     /// P079-SEC-HIGH-001: set when the repair turn was terminated because
     /// the transport denied a non-canonical permission request. Any outputs
     /// from this turn must be discarded and the repair settled as
     /// `rejected_invalid` with `initial_failure_subtype = unsafe_continuation`.
     #[serde(default)]
     pub p079_unsafe_continuation: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AcpClaudeRuntimeDiagnostics {
+    #[serde(default)]
+    pub raw_sdk_message_count: i64,
+    #[serde(default)]
+    pub stream_event_count: i64,
+    #[serde(default)]
+    pub assistant_count: i64,
+    #[serde(default)]
+    pub result_count: i64,
+    #[serde(default)]
+    pub session_state_changed_count: i64,
+    #[serde(default)]
+    pub result_seen: bool,
+    #[serde(default)]
+    pub idle_seen: bool,
+    #[serde(default)]
+    pub result_seen_before_cancel: bool,
+    #[serde(default)]
+    pub idle_seen_before_cancel: bool,
+    #[serde(default)]
+    pub last_sdk_message_type: Option<String>,
+    #[serde(default)]
+    pub last_sdk_message_subtype: Option<String>,
+    #[serde(default)]
+    pub last_stream_event_type: Option<String>,
+    #[serde(default)]
+    pub cancel_sent_on_watchdog: bool,
+    #[serde(default)]
+    pub cancel_send_succeeded: bool,
+    #[serde(default)]
+    pub cancel_flush_observed: bool,
+    #[serde(default)]
+    pub cancel_drain_message_count: i64,
+    #[serde(default)]
+    pub cancel_terminal_status: Option<String>,
+    #[serde(default)]
+    pub debug_file_path: Option<String>,
+    #[serde(default)]
+    pub sanitized_events: Vec<AcpRuntimeReceiptEvent>,
+    #[serde(default)]
+    pub sanitized_events_truncated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]

@@ -15,6 +15,13 @@ use crate::writer::begin_registered_immediate_transaction;
 
 use super::scheduler;
 
+// Older persisted timestamps use mixed RFC3339 precision. A whole-second
+// cutoff keeps comparisons on the scheduler index with at most one second of
+// additional queue latency.
+fn indexable_due_timestamp(now: DateTime<Utc>) -> String {
+    (now - chrono::Duration::seconds(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
 pub async fn enqueue(pool: &SqlitePool, item: &WorkItem) -> Result<()> {
     let tx_started = Instant::now();
     let mut tx = begin_registered_immediate_transaction(
@@ -85,7 +92,7 @@ async fn claim_next_where(pool: &SqlitePool, kind_predicate: &str) -> Result<Opt
     .await
     .context("begin claim_next transaction")?;
 
-    let now = Utc::now().to_rfc3339();
+    let now = indexable_due_timestamp(Utc::now());
     let pending_status = WorkItemStatus::Pending.to_string();
 
     // FIFO ordering with a deterministic tiebreaker. Without `rowid ASC`, two
@@ -97,7 +104,7 @@ async fn claim_next_where(pool: &SqlitePool, kind_predicate: &str) -> Result<Opt
     let query = format!(
         r#"SELECT id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, attempt_count, last_error
            FROM work_items
-           WHERE status = ?1 AND (scheduled_at <= ?2 OR datetime(scheduled_at) <= datetime(?2)) AND ({kind_predicate})
+           WHERE status = ?1 AND scheduled_at <= ?2 AND ({kind_predicate})
            ORDER BY scheduled_at ASC, rowid ASC
            LIMIT 1"#
     );
@@ -185,11 +192,11 @@ pub async fn select_pending_invoke_agents_for_start(
 ) -> Result<Vec<WorkItem>> {
     let pending_status = WorkItemStatus::Pending.to_string();
     let invoke_kind = WorkItemKind::InvokeAgent.to_string();
-    let now = now.to_rfc3339();
+    let now = indexable_due_timestamp(now);
     let rows = sqlx::query(
         r#"SELECT id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, attempt_count, last_error
            FROM work_items
-           WHERE status = ?1 AND (scheduled_at <= ?2 OR datetime(scheduled_at) <= datetime(?2)) AND kind = ?3
+           WHERE status = ?1 AND scheduled_at <= ?2 AND kind = ?3
            ORDER BY scheduled_at ASC, rowid ASC
            LIMIT ?4"#,
     )
@@ -226,11 +233,11 @@ pub async fn select_pending_invoke_agents_for_start_tx(
 ) -> Result<Vec<WorkItem>> {
     let pending_status = WorkItemStatus::Pending.to_string();
     let invoke_kind = WorkItemKind::InvokeAgent.to_string();
-    let now = now.to_rfc3339();
+    let now = indexable_due_timestamp(now);
     let rows = sqlx::query(
         r#"SELECT id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, attempt_count, last_error
            FROM work_items
-           WHERE status = ?1 AND (scheduled_at <= ?2 OR datetime(scheduled_at) <= datetime(?2)) AND kind = ?3
+           WHERE status = ?1 AND scheduled_at <= ?2 AND kind = ?3
            ORDER BY scheduled_at ASC, rowid ASC
            LIMIT ?4"#,
     )
@@ -552,6 +559,19 @@ pub async fn settle_terminal_preclaimed_invoke_agent_executions(
     pool: &SqlitePool,
     fallback_completed_at: DateTime<Utc>,
 ) -> Result<u64> {
+    // Settlement only changes preclaimed executions that are still marked
+    // running. Avoid scanning every historical terminal InvokeAgent item when
+    // there is no active execution to settle.
+    let has_running_agent_execution: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_executions WHERE status = ?1)")
+            .bind(AgentStatus::Running.to_string())
+            .fetch_one(pool)
+            .await
+            .context("check for running agent executions before terminal preclaim settlement")?;
+    if !has_running_agent_execution {
+        return Ok(0);
+    }
+
     let tx_started = Instant::now();
     let mut tx = begin_registered_immediate_transaction(
         pool,
@@ -1822,6 +1842,21 @@ pub async fn complete_running_invoke_agents_with_terminal_valid_outputs_on_start
     pool: &SqlitePool,
     _reason: &str,
 ) -> Result<u64> {
+    // This recovery only applies to already-claimed InvokeAgent items. Avoid
+    // the expensive artifact-claim join while the queue has no such work: the
+    // executor calls this sweep before every scheduling pass.
+    let has_running_invoke: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM work_items WHERE kind = ?1 AND status = ?2)",
+    )
+    .bind(WorkItemKind::InvokeAgent.to_string())
+    .bind(WorkItemStatus::Running.to_string())
+    .fetch_one(pool)
+    .await
+    .context("check for running InvokeAgent work items before terminal recovery")?;
+    if !has_running_invoke {
+        return Ok(0);
+    }
+
     let rows = sqlx::query(
         r#"
 	        SELECT wi.id
@@ -4189,6 +4224,37 @@ pub async fn list_by_run(pool: &SqlitePool, run_id: RunId) -> Result<Vec<WorkIte
         .collect()
 }
 
+pub async fn list_by_run_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+) -> Result<Vec<WorkItem>> {
+    let rows = sqlx::query(
+        r#"SELECT id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, attempt_count, last_error
+           FROM work_items WHERE run_id = ?1 ORDER BY created_at ASC"#,
+    )
+    .bind(run_id.to_string())
+    .fetch_all(&mut **tx)
+    .await
+    .context("list work items by run in transaction")?;
+
+    rows.into_iter()
+        .map(|row| {
+            parse_work_item_row(
+                row.get("id"),
+                row.get("kind"),
+                row.get("payload_json"),
+                row.get("status"),
+                row.get("run_id"),
+                row.get("stage_id"),
+                row.get("created_at"),
+                row.get("scheduled_at"),
+                row.get("attempt_count"),
+                row.get("last_error"),
+            )
+        })
+        .collect()
+}
+
 pub async fn list_by_status(pool: &SqlitePool, status: WorkItemStatus) -> Result<Vec<WorkItem>> {
     let rows = sqlx::query(
         r#"SELECT id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, attempt_count, last_error
@@ -4275,6 +4341,74 @@ mod tests {
         .await
         .expect("register shared writer");
         pool
+    }
+
+    #[tokio::test]
+    async fn terminal_invoke_recovery_short_circuits_without_running_invoke_items() {
+        let pool = test_pool().await;
+
+        let completed = complete_running_invoke_agents_with_terminal_valid_outputs_on_startup(
+            &pool,
+            "test_empty_running_invoke_recovery",
+        )
+        .await
+        .expect("empty running-invoke recovery should succeed");
+
+        assert_eq!(completed, 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_preclaim_settlement_short_circuits_without_running_agent_execution() {
+        let pool = test_pool().await;
+
+        let settled = settle_terminal_preclaimed_invoke_agent_executions(&pool, Utc::now())
+            .await
+            .expect("empty terminal preclaim settlement should succeed");
+
+        assert_eq!(settled, 0);
+    }
+
+    #[tokio::test]
+    async fn pending_invoke_selection_keeps_fractional_due_items_and_defers_future_items() {
+        let pool = test_pool().await;
+        let now = DateTime::parse_from_rfc3339("2026-08-10T06:30:10.500Z")
+            .expect("fixed timestamp")
+            .with_timezone(&Utc);
+        let items = [
+            ("due-fractional", now - Duration::milliseconds(1_100)),
+            ("future-fractional", now + Duration::milliseconds(500)),
+        ];
+
+        for (id, scheduled_at) in items {
+            enqueue(
+                &pool,
+                &WorkItem {
+                    id: id.to_string(),
+                    kind: WorkItemKind::InvokeAgent,
+                    payload_json: "{}".to_string(),
+                    status: WorkItemStatus::Pending,
+                    run_id: None,
+                    stage_id: None,
+                    created_at: now,
+                    scheduled_at,
+                    attempt_count: 0,
+                    last_error: None,
+                },
+            )
+            .await
+            .expect("enqueue pending invoke item");
+        }
+
+        let selected = select_pending_invoke_agents_for_start(&pool, now, 16)
+            .await
+            .expect("select due InvokeAgent work items");
+        assert_eq!(
+            selected
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["due-fractional"]
+        );
     }
 
     #[tokio::test]

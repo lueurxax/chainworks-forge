@@ -1631,6 +1631,23 @@ mod tests {
         .unwrap();
         assert_eq!(poisoned, 1);
     }
+
+    #[tokio::test]
+    async fn stage_summary_artifact_lookup_has_run_stage_index() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        let index_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_artifacts_run_stage_id'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            index_exists, 1,
+            "stage summary EXISTS(run_id, stage_id) must avoid a run-wide artifact scan"
+        );
+    }
 }
 
 async fn rebuild_all_for_run_on_current_thread(pool: &SqlitePool, run_id: RunId) -> Result<()> {

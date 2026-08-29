@@ -1717,6 +1717,40 @@ pub(crate) fn approved_proposal_rollout_contract_lint_failures(
     Ok(lint.failures)
 }
 
+pub(crate) fn proposal_current_freeze_readiness_prompt_example() -> serde_json::Value {
+    let required_readback_fields = REQUIRED_OPERATOR_READBACK_FIELDS.to_vec();
+    serde_json::json!({
+        "schema_version": ROLLOUT_CONTRACT_SCHEMA_VERSION,
+        "applicability": "required",
+        "gate_aliases": ["proposal-NNN", "pNNN"],
+        "commands": {
+            "allowlist": ["./scripts/test-gate.sh proposal-NNN"]
+        },
+        "migrations": {
+            "not_applicable": true,
+            "justification": "No schema migration is required for this proposal."
+        },
+        "metrics": {
+            "adoption_metric": "proposal_specific_adoption_metric",
+            "operational_metrics": ["proposal_specific_operational_metric_total{outcome}"]
+        },
+        "readback_lanes": ["run_report", "mcp", "release_receipt", "graphql"],
+        "readback_fields": required_readback_fields,
+        "readback_fixture": "docs/evidence/rollout-contract/operator-readback/pNNN-full-surface.fixture.json",
+        "operator_report_fields": REQUIRED_OPERATOR_READBACK_FIELDS.to_vec(),
+        "hold_conditions": [],
+        "rollback_disposition": {
+            "mode": "reviewed_code_revert",
+            "data_loss_risk": "none",
+            "steps": []
+        },
+        "decision_vocabulary": ["pass", "fail", "waived", "not_applicable", "timeout"],
+        "negative_fixtures": {
+            "invalid_contract": "docs/evidence/rollout-contract/negative/pNNN-invalid-contract.json"
+        }
+    })
+}
+
 pub(crate) fn proposal_current_freeze_readiness_failures(
     data: &[u8],
     proposal_path: &std::path::Path,
@@ -3810,6 +3844,30 @@ mod tests {
             .await
             .expect("test shared DbWriter registration failed");
         pool
+    }
+
+    #[test]
+    fn proposal_current_prompt_example_passes_freeze_readiness() {
+        let workspace = TempDir::new().unwrap();
+        std::fs::create_dir_all(workspace.path().join("docs/evidence/rollout-contract")).unwrap();
+        let proposal = serde_json::json!({
+            "schema_version": "proposal_document_v1",
+            "proposal_id": "NNN",
+            "proposal_revision_id": "pNNN-r1",
+            "rollout_contract_v1": proposal_current_freeze_readiness_prompt_example()
+        });
+        let proposal_path = workspace
+            .path()
+            .join(".chainworks/proposals/current/proposal.json");
+
+        let failures = proposal_current_freeze_readiness_failures(
+            &serde_json::to_vec(&proposal).unwrap(),
+            &proposal_path,
+            workspace.path().to_string_lossy().as_ref(),
+        )
+        .unwrap();
+
+        assert!(failures.is_empty(), "unexpected failures: {failures:?}");
     }
 
     #[tokio::test]

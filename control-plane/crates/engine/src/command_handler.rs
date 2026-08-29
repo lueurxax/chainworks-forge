@@ -7,7 +7,7 @@ use libc;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::future::Future;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
@@ -19,10 +19,11 @@ use tracing::{info, warn};
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger,
     approval_mutation_idempotency, approvals, artifact_contracts, audit_log, closeout,
-    code_writer_completion_receipts, command_idempotency, command_journal, ideas,
-    legacy_discovery_overrides, mcp_command_idempotency, projections, provider_sessions,
-    retry_operator_instructions, retry_stage_execution_authorities, runs, scheduler, sessions,
-    side_effects as side_effects_repo, stages, work_items, workflow_conflicts,
+    code_writer_completion_receipts, command_idempotency, command_journal,
+    escalation as escalation_repo, ideas, legacy_discovery_overrides, mcp_command_idempotency,
+    projections, provider_sessions, retry_operator_instructions, retry_stage_execution_authorities,
+    runs, scheduler, sessions, side_effects as side_effects_repo, stages, work_items,
+    workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use db::write_class::WriteLane;
@@ -411,6 +412,34 @@ pub enum CommandResult {
     },
     LegacyDiscoveryOverrideCreated {
         override_id: String,
+    },
+    /// P058: an operator opened a new bounded window for an elapsed escalation.
+    EscalationDeadlineResumed {
+        run_id: RunId,
+        escalation_ledger_id: String,
+        deadline_window_id: String,
+        retry_stage_execution_id: StageExecutionId,
+        work_item_id: String,
+        tier_id: String,
+        backend_profile_id: String,
+        provider: String,
+        starts_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        replayed: bool,
+    },
+    /// P058: an operator opened one bounded recovery window after chain exhaustion.
+    EscalationChainResumed {
+        run_id: RunId,
+        escalation_ledger_id: String,
+        deadline_window_id: String,
+        retry_stage_execution_id: StageExecutionId,
+        work_item_id: String,
+        tier_id: String,
+        backend_profile_id: String,
+        provider: String,
+        starts_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        replayed: bool,
     },
     RunCancelled {
         run_id: RunId,
@@ -1329,6 +1358,8 @@ impl CommandJournalEntry {
             Command::MainSyncRecordRecoveryDecision(_) => "MainSyncRecordRecoveryDecision",
             Command::KnowledgeCapsuleIgnore(_) => "KnowledgeCapsuleIgnore",
             Command::RetrofitCatalogSnapshot(_) => "RetrofitCatalogSnapshot",
+            Command::ResumeEscalationDeadline(_) => "ResumeEscalationDeadline",
+            Command::ResumeEscalationChain(_) => "ResumeEscalationChain",
             Command::CancelRun(_) => "CancelRun",
             Command::RetryRun(_) => "RetryRun",
             Command::ResetSession(_) => "ResetSession",
@@ -1362,6 +1393,8 @@ impl CommandJournalEntry {
             Command::MainSyncRecordRecoveryDecision(c) => Some(c.run_id.to_string()),
             Command::KnowledgeCapsuleIgnore(c) => Some(c.run_id.to_string()),
             Command::RetrofitCatalogSnapshot(c) => Some(c.run_id.to_string()),
+            Command::ResumeEscalationDeadline(c) => Some(c.run_id.to_string()),
+            Command::ResumeEscalationChain(c) => Some(c.run_id.to_string()),
             Command::CancelRun(c) => Some(c.run_id.to_string()),
             Command::RetryRun(c) => Some(c.run_id.to_string()),
             Command::ResetSession(c) => Some(c.run_id.to_string()),
@@ -1423,6 +1456,8 @@ impl CommandJournalEntry {
                 | "MainSyncRecordRecoveryDecision"
                 | "KnowledgeCapsuleIgnore"
                 | "RetrofitCatalogSnapshot"
+                | "ResumeEscalationDeadline"
+                | "ResumeEscalationChain"
                 | "ShutdownProviderSession"
                 | "MarkProviderSessionProcessAbsent"
                 | "P083RollbackExecution"
@@ -1685,26 +1720,8 @@ fn retry_requires_effect_reconciliation(
 }
 
 fn retry_state_has_release_post_approval_tasks(run: &Run, stage_id: &str) -> Result<bool> {
-    let plan = match (
-        run.workflow_snapshot_json.as_deref(),
-        run.catalog_snapshot_json.as_deref(),
-    ) {
-        (Some(workflow_snapshot_json), Some(catalog_snapshot_json)) => {
-            workflow::compiler::compile_from_snapshot_json(
-                workflow_snapshot_json,
-                catalog_snapshot_json,
-                run.agent_catalog_yaml_path.as_deref().unwrap_or("."),
-            )?
-        }
-        _ => match (
-            run.workflow_yaml_path.as_deref(),
-            run.agent_catalog_yaml_path.as_deref(),
-        ) {
-            (Some(workflow_path), Some(catalog_path)) => {
-                workflow::compiler::compile(workflow_path, catalog_path)?
-            }
-            _ => return Ok(false),
-        },
+    let Some(plan) = compile_run_plan_for_run(run)? else {
+        return Ok(false);
     };
 
     Ok(plan.states.get(stage_id).is_some_and(|state| {
@@ -1716,14 +1733,8 @@ fn retry_state_has_release_post_approval_tasks(run: &Run, stage_id: &str) -> Res
 }
 
 pub fn compile_run_plan_for_run(run: &Run) -> Result<Option<workflow::plan::RunPlan>> {
-    match (
-        run.workflow_snapshot_json.as_deref(),
-        run.catalog_snapshot_json.as_deref(),
-    ) {
-        (Some(workflow_snapshot_json), Some(catalog_snapshot_json))
-            if !workflow_snapshot_json.trim().is_empty()
-                && !catalog_snapshot_json.trim().is_empty() =>
-        {
+    match verified_run_snapshot_pair(run)? {
+        Some((workflow_snapshot_json, catalog_snapshot_json)) => {
             let catalog_path = run.agent_catalog_yaml_path.as_deref().unwrap_or(".");
             Ok(Some(workflow::compiler::compile_from_snapshot_json(
                 workflow_snapshot_json,
@@ -1731,7 +1742,7 @@ pub fn compile_run_plan_for_run(run: &Run) -> Result<Option<workflow::plan::RunP
                 catalog_path,
             )?))
         }
-        _ => match (
+        None => match (
             run.workflow_yaml_path.as_deref(),
             run.agent_catalog_yaml_path.as_deref(),
         ) {
@@ -1750,14 +1761,8 @@ pub fn compile_run_plan_for_run(run: &Run) -> Result<Option<workflow::plan::RunP
 /// Use this in contexts where YAML drift would violate the proposal contract
 /// (e.g., escalation policy resolution during live agent execution).
 pub fn compile_run_plan_from_snapshot(run: &Run) -> Result<Option<workflow::plan::RunPlan>> {
-    match (
-        run.workflow_snapshot_json.as_deref(),
-        run.catalog_snapshot_json.as_deref(),
-    ) {
-        (Some(workflow_snapshot_json), Some(catalog_snapshot_json))
-            if !workflow_snapshot_json.trim().is_empty()
-                && !catalog_snapshot_json.trim().is_empty() =>
-        {
+    match verified_run_snapshot_pair(run)? {
+        Some((workflow_snapshot_json, catalog_snapshot_json)) => {
             let catalog_path = run.agent_catalog_yaml_path.as_deref().unwrap_or(".");
             Ok(Some(workflow::compiler::compile_from_snapshot_json(
                 workflow_snapshot_json,
@@ -1765,7 +1770,36 @@ pub fn compile_run_plan_from_snapshot(run: &Run) -> Result<Option<workflow::plan
                 catalog_path,
             )?))
         }
-        _ => Ok(None),
+        None => Ok(None),
+    }
+}
+
+fn verified_run_snapshot_pair(run: &Run) -> Result<Option<(&str, &str)>> {
+    match (
+        run.workflow_snapshot_json.as_deref(),
+        run.catalog_snapshot_json.as_deref(),
+        run.workflow_snapshot_hash.as_deref(),
+        run.catalog_snapshot_hash.as_deref(),
+    ) {
+        (None, None, None, None) => Ok(None),
+        (Some(workflow_json), Some(catalog_json), Some(workflow_hash), Some(catalog_hash))
+            if !workflow_json.trim().is_empty()
+                && !catalog_json.trim().is_empty()
+                && !workflow_hash.trim().is_empty()
+                && !catalog_hash.trim().is_empty() =>
+        {
+            let actual_workflow_hash = format!("{:x}", Sha256::digest(workflow_json.as_bytes()));
+            let actual_catalog_hash = format!("{:x}", Sha256::digest(catalog_json.as_bytes()));
+            if actual_workflow_hash != workflow_hash || actual_catalog_hash != catalog_hash {
+                anyhow::bail!(
+                    "frozen_snapshot_contract_incompatible: stored snapshot digest mismatch"
+                );
+            }
+            Ok(Some((workflow_json, catalog_json)))
+        }
+        _ => anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: Run must store neither snapshot field nor the complete JSON/hash quartet"
+        ),
     }
 }
 
@@ -1830,6 +1864,55 @@ struct TargetedRetryProviderFallback {
     effort: Option<String>,
     max_turns: Option<i64>,
     temperature: Option<f64>,
+}
+
+async fn active_p058_escalation_context_for_targeted_retry(
+    pool: &SqlitePool,
+    run_id: RunId,
+    stage_id: &str,
+    source_stage_execution_id: StageExecutionId,
+    agent_id: &str,
+) -> Result<Option<serde_json::Value>> {
+    let mut matching = escalation_repo::find_ledgers_by_run(pool, run_id)
+        .await?
+        .into_iter()
+        .filter(|ledger| {
+            ledger.status_raw == "active"
+                && ledger.stage_id == stage_id
+                && ledger.stage_execution_id.as_deref()
+                    == Some(source_stage_execution_id.to_string().as_str())
+                && ledger.agent_id == agent_id
+        });
+    let Some(ledger) = matching.next() else {
+        return Ok(None);
+    };
+    if let Some(duplicate) = matching.next() {
+        anyhow::bail!(
+            "ambiguous active P058 ledgers for targeted retry: {} and {} both match run {} stage execution {} agent {}",
+            ledger.id,
+            duplicate.id,
+            run_id,
+            source_stage_execution_id,
+            agent_id,
+        );
+    }
+    let tier_id = ledger
+        .current_tier_id
+        .as_deref()
+        .context("active P058 targeted retry ledger is missing current_tier_id")?;
+    let tier_kind_raw = ledger
+        .current_tier_kind_raw
+        .as_deref()
+        .context("active P058 targeted retry ledger is missing current_tier_kind_raw")?;
+
+    Ok(Some(serde_json::json!({
+        "ledger_id": ledger.id,
+        "policy_id": ledger.policy_id,
+        "tier_id": tier_id,
+        "tier_kind_raw": tier_kind_raw,
+        "trigger_raw": ledger.trigger_raw,
+        "chain_attempt_index": ledger.chain_attempt_index,
+    })))
 }
 
 fn targeted_retry_catalog_profile_override(
@@ -2042,6 +2125,67 @@ fn attach_p088_operator_retry_completion_recovery_payload(
         "retry_reason".into(),
         serde_json::json!("operator_retry_completion_recovery"),
     );
+}
+
+/// Targeted retries copy a persisted InvokeAgent payload so they retain the
+/// frozen task contract. Hybrid pre-P050 runs can carry a legacy absolute
+/// artifact path in that payload while SEC-001 now authorizes only the
+/// per-run meta root. Rebase only safe descendants; all other paths remain
+/// unchanged and are still rejected by output-path validation.
+fn rebase_safe_legacy_declared_outputs_for_targeted_retry(
+    payload: &mut serde_json::Value,
+    run: &Run,
+) {
+    let Some(outputs) = payload
+        .get_mut("declared_outputs")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+
+    for output in outputs {
+        let Some(output) = output.as_object_mut() else {
+            continue;
+        };
+        for field in ["target_path", "companion_path"] {
+            let Some(path) = output
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+            else {
+                continue;
+            };
+            output.insert(
+                field.to_string(),
+                serde_json::Value::String(rebase_safe_legacy_artifact_path_for_targeted_retry(
+                    &path, run,
+                )),
+            );
+        }
+    }
+}
+
+fn rebase_safe_legacy_artifact_path_for_targeted_retry(path: &str, run: &Run) -> String {
+    let Some(meta_root) = run.chainworks_meta_root.as_deref() else {
+        return path.to_string();
+    };
+    let Ok(relative) = Path::new(path).strip_prefix(Path::new(&run.artifact_root)) else {
+        return path.to_string();
+    };
+    if relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return path.to_string();
+    }
+
+    let meta_root = if Path::new(meta_root).is_absolute() {
+        Path::new(meta_root).to_path_buf()
+    } else {
+        Path::new(&run.workspace_root).join(meta_root)
+    };
+    meta_root.join(relative).to_string_lossy().into_owned()
 }
 
 fn targeted_retry_fallback_profile_id<'a>(
@@ -2511,6 +2655,16 @@ impl CommandHandler {
         {
             anyhow::bail!("forbidden: RetrofitCatalogSnapshot requires operator principal");
         }
+        if matches!(&cmd, Command::ResumeEscalationDeadline(_))
+            && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: ResumeEscalationDeadline requires operator principal");
+        }
+        if matches!(&cmd, Command::ResumeEscalationChain(_))
+            && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: ResumeEscalationChain requires operator principal");
+        }
         if matches!(&cmd, Command::ResolveApproval(_))
             && caller.principal_class != PrincipalClass::Operator
         {
@@ -2868,6 +3022,42 @@ impl CommandHandler {
                     }
                 };
 
+                let mission_idea = match ideas::find_by_id(&self.pool, c.idea_id).await {
+                    Ok(Some(idea)) => idea,
+                    Ok(None) => {
+                        let error = anyhow!("Idea {} not found", c.idea_id);
+                        self.record_failed_command_transaction(
+                            journal,
+                            "command.StartRun",
+                            &error.to_string(),
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        self.record_failed_command_transaction(
+                            journal,
+                            "command.StartRun",
+                            &error.to_string(),
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = crate::agent_mission_context::preflight_run_mission_context(
+                    &plan,
+                    run_id,
+                    &mission_idea,
+                ) {
+                    self.record_failed_command_transaction(
+                        journal,
+                        "command.StartRun",
+                        &error.to_string(),
+                    )
+                    .await?;
+                    return Err(error);
+                }
+
                 let mut delivery_preflight_json =
                     if let Some(delivery_configuration_json) = &c.delivery_configuration_json {
                         let delivery_config: domain::run::DeliveryConfiguration =
@@ -3143,6 +3333,121 @@ impl CommandHandler {
                 )
                 .await?;
                 Ok(CommandResult::ArtifactContractOverrideCreated { override_id })
+            }
+
+            Command::ResumeEscalationDeadline(c) => {
+                let now = Utc::now();
+                let tx_started = Instant::now();
+                let mut tx = self
+                    .begin_command_transaction(
+                        "command.ResumeEscalationDeadline",
+                        journal.id.clone(),
+                    )
+                    .await?;
+                record_command_journal_tx(&mut tx, journal).await?;
+                let outcome = crate::p058_deadline_resume::resume_escalation_deadline_tx(
+                    &mut tx,
+                    &c,
+                    &caller.principal_id,
+                    journal_id,
+                    now,
+                )
+                .await?;
+                let scheduler_refresh = scheduler::refresh_queue_summaries_for_notification_tx(
+                    &mut tx,
+                    &self.capacity_config,
+                    now,
+                    "command.ResumeEscalationDeadline",
+                    0,
+                )
+                .await?;
+                command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ResumeEscalationDeadline", tx_started);
+                self.work_queue
+                    .publish_scheduler_notification(scheduler_refresh);
+
+                if !outcome.replayed {
+                    let _ = self.events.send(DomainEvent::StageStatusChanged {
+                        run_id: outcome.run_id,
+                        stage_execution_id: outcome.retry_stage_execution_id,
+                        status: StageStatus::Running,
+                    });
+                    let _ = self.events.send(DomainEvent::RunStatusChanged {
+                        run_id: outcome.run_id,
+                        status: RunStatus::Running,
+                    });
+                }
+
+                Ok(CommandResult::EscalationDeadlineResumed {
+                    run_id: outcome.run_id,
+                    escalation_ledger_id: outcome.escalation_ledger_id,
+                    deadline_window_id: outcome.deadline_window_id,
+                    retry_stage_execution_id: outcome.retry_stage_execution_id,
+                    work_item_id: outcome.work_item_id,
+                    tier_id: outcome.tier_id,
+                    backend_profile_id: outcome.backend_profile_id,
+                    provider: outcome.provider,
+                    starts_at: outcome.starts_at,
+                    expires_at: outcome.expires_at,
+                    replayed: outcome.replayed,
+                })
+            }
+
+            Command::ResumeEscalationChain(c) => {
+                let now = Utc::now();
+                let tx_started = Instant::now();
+                let mut tx = self
+                    .begin_command_transaction("command.ResumeEscalationChain", journal.id.clone())
+                    .await?;
+                record_command_journal_tx(&mut tx, journal).await?;
+                let outcome = crate::p058_deadline_resume::resume_escalation_chain_tx(
+                    &mut tx,
+                    &c,
+                    &caller.principal_id,
+                    journal_id,
+                    now,
+                )
+                .await?;
+                let scheduler_refresh = scheduler::refresh_queue_summaries_for_notification_tx(
+                    &mut tx,
+                    &self.capacity_config,
+                    now,
+                    "command.ResumeEscalationChain",
+                    0,
+                )
+                .await?;
+                command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ResumeEscalationChain", tx_started);
+                self.work_queue
+                    .publish_scheduler_notification(scheduler_refresh);
+
+                if !outcome.replayed {
+                    let _ = self.events.send(DomainEvent::StageStatusChanged {
+                        run_id: outcome.run_id,
+                        stage_execution_id: outcome.retry_stage_execution_id,
+                        status: StageStatus::Running,
+                    });
+                    let _ = self.events.send(DomainEvent::RunStatusChanged {
+                        run_id: outcome.run_id,
+                        status: RunStatus::Running,
+                    });
+                }
+
+                Ok(CommandResult::EscalationChainResumed {
+                    run_id: outcome.run_id,
+                    escalation_ledger_id: outcome.escalation_ledger_id,
+                    deadline_window_id: outcome.deadline_window_id,
+                    retry_stage_execution_id: outcome.retry_stage_execution_id,
+                    work_item_id: outcome.work_item_id,
+                    tier_id: outcome.tier_id,
+                    backend_profile_id: outcome.backend_profile_id,
+                    provider: outcome.provider,
+                    starts_at: outcome.starts_at,
+                    expires_at: outcome.expires_at,
+                    replayed: outcome.replayed,
+                })
             }
 
             Command::MainSyncRequest(_) => Err(anyhow!(
@@ -6733,6 +7038,7 @@ impl CommandHandler {
         let run = runs::find_by_id(&self.pool, run_id)
             .await?
             .ok_or_else(|| anyhow!("Run {} not found", run_id))?;
+        let frozen_plan = compile_run_plan_from_snapshot(&run)?;
         if run_forbids_retry(&run) {
             return Err(anyhow!(
                 "Run {} is {} and cannot be retried",
@@ -6989,9 +7295,23 @@ impl CommandHandler {
                     e
                 )
             })?;
+        if let Some(plan) = frozen_plan.as_ref() {
+            crate::agent_mission_context::validate_persisted_v1_payload_prompt(
+                plan,
+                &retry_payload,
+            )?;
+        }
         let runtime_facts =
             agent_execution_runtime_facts::find_by_execution_id(&self.pool, agent_execution_id)
                 .await?;
+        let active_p058_escalation = active_p058_escalation_context_for_targeted_retry(
+            &self.pool,
+            run_id,
+            stage_id,
+            old_stage.id,
+            &target_exec.agent_id,
+        )
+        .await?;
         let p088_completion_retry_evidence =
             code_writer_completion_receipts::find_by_execution_id(&self.pool, agent_execution_id)
                 .await?
@@ -7060,9 +7380,17 @@ impl CommandHandler {
                 },
             )
             .map_err(|error| anyhow!(error))?;
+            rebase_safe_legacy_declared_outputs_for_targeted_retry(&mut retry_payload, &run);
             let object = retry_payload
                 .as_object_mut()
                 .expect("sanitized targeted retry payload stays object");
+            if let Some(escalation) = active_p058_escalation {
+                object
+                    .get_mut("targeted_retry")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .expect("sanitized targeted retry metadata stays object")
+                    .insert("escalation".into(), escalation);
+            }
             if let Some(evidence_path) = p088_completion_retry_evidence.as_deref() {
                 attach_p088_operator_retry_completion_recovery_payload(
                     object,
@@ -7255,6 +7583,18 @@ impl CommandHandler {
             },
         )
         .await?;
+        // This compact scheduler projection is part of the retry transaction and
+        // wakes the worker after commit. Do not synchronously rebuild all
+        // read/export projections here: that work is best-effort and must not
+        // turn an already committed targeted retry into an MCP INTERNAL error.
+        let scheduler_refresh = scheduler::refresh_queue_summaries_for_notification_tx(
+            &mut retry_tx,
+            &self.capacity_config,
+            now,
+            "command.RetryAgentExecution",
+            0,
+        )
+        .await?;
         // P083: commit the narrow idempotency lease inside the same transaction.
         if let Some(ref idempotency) = narrow_idempotency {
             let outcome = serde_json::json!({
@@ -7282,6 +7622,8 @@ impl CommandHandler {
         command_journal::complete_entry_tx(&mut retry_tx, &journal.id, Utc::now()).await?;
         retry_tx.commit().await?;
         db::pool::log_write_transaction("command.RetryAgentExecution", retry_tx_started);
+        self.work_queue
+            .publish_scheduler_notification(scheduler_refresh);
 
         let _ = self.events.send(DomainEvent::StageStatusChanged {
             run_id,
@@ -7297,8 +7639,6 @@ impl CommandHandler {
             run_id,
             status: RunStatus::Running,
         });
-
-        projections::rebuild_all_for_run(&self.pool, run_id).await?;
 
         Ok(CommandResult::StageRetryScheduled {
             run_id,
@@ -10885,6 +11225,79 @@ reviewer_override:
                 .get("retry_reason")
                 .and_then(serde_json::Value::as_str),
             Some("operator_retry_completion_recovery")
+        );
+    }
+
+    #[test]
+    fn targeted_retry_rebases_safe_legacy_declared_output_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let legacy_root = workspace.path().join(".chainworks/legacy-artifacts");
+        let meta_root = workspace.path().join(".chainworks/runs/run-1");
+        let run = Run {
+            id: RunId::new(),
+            idea_id: IdeaId::new(),
+            status: RunStatus::Blocked,
+            workflow_id: "workflow".into(),
+            workflow_title: "Workflow".into(),
+            workspace_root: workspace.path().to_string_lossy().into_owned(),
+            artifact_root: legacy_root.to_string_lossy().into_owned(),
+            started_at: Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: Some("finalize".into()),
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
+            chainworks_meta_root: Some(meta_root.to_string_lossy().into_owned()),
+            review_routing_json: None,
+            closeout_readiness_mode: None,
+        };
+        let escaped = legacy_root.join("../outside.json");
+        let mut payload = serde_json::json!({
+            "declared_outputs": [
+                {
+                    "output_name": "run_report",
+                    "target_path": legacy_root.join("run-report.json"),
+                    "companion_path": legacy_root.join("run-report.md")
+                },
+                {
+                    "output_name": "must_remain_rejected",
+                    "target_path": escaped
+                }
+            ]
+        });
+
+        rebase_safe_legacy_declared_outputs_for_targeted_retry(&mut payload, &run);
+
+        assert_eq!(
+            payload.pointer("/declared_outputs/0/target_path"),
+            Some(&serde_json::json!(meta_root.join("run-report.json")))
+        );
+        assert_eq!(
+            payload.pointer("/declared_outputs/0/companion_path"),
+            Some(&serde_json::json!(meta_root.join("run-report.md")))
+        );
+        assert_eq!(
+            payload.pointer("/declared_outputs/1/target_path"),
+            Some(&serde_json::json!(escaped)),
+            "unsafe paths must remain subject to SEC-001 validation"
         );
     }
 

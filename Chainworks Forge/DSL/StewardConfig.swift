@@ -149,7 +149,7 @@ extension StewardConfig {
             "stability": ThresholdEntry(method: "ratio", trigger: 2.0),
         ],
         triggers: TriggerConfig(
-            postRunHook: PostRunHookConfig(enabled: false, runInterval: 5),
+            postRunHook: PostRunHookConfig(enabled: true, runInterval: 1),
             onConfigChange: OnConfigChangeConfig(enabled: true),
             schedule: ScheduleConfig(enabled: false, cron: "0 8 * * 1")
         ),

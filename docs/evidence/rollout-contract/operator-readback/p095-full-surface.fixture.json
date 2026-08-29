@@ -1,0 +1,122 @@
+{
+  "schema_version": "operator_readback_v1",
+  "fixture_purpose": "P095 mandatory two-phase code_writer execution. Proves all 18 operator_readback_v1 decision fields are present on every lane with identical values, and that the three prohibited-control fields are pinned to constants: waiver_state=none, waiver_expires_at=null, enforcement_mode=enforce, enabled_state=enabled. P095 has no waiver path, no permissive mode, and no disable control, so these values are compile-time constants with no setter.",
+  "proposal_id": "proposal-095",
+  "proposal_revision_id": "p095-implementation-ready-v9",
+  "gate": "proposal-095|p095",
+  "rollout_contract_status": "pass",
+  "rollout_contract_decision": "release",
+  "rollout_contract_failure_reasons": [],
+  "rollout_contract_waiver_state": "none",
+  "rollout_contract_waiver_expires_at": null,
+  "rollout_contract_enforcement_mode": "enforce",
+  "rollout_contract_enforcement_mode_reason": "mandatory_no_waiver_no_permissive_mode_available",
+  "rollout_contract_hold_conditions": [],
+  "rollout_contract_rollback_disposition": {
+    "mode": "reviewed_code_revert_forward_only",
+    "data_loss_risk": "none"
+  },
+  "rollout_contract_source_lane": "run_report",
+  "rollout_contract_enabled_state": "enabled",
+  "rollout_contract_disabled_reason_code": null,
+  "rollout_contract_action_id": "p095-action-00000000-0000-0000-0000-000000000001",
+  "rollout_contract_operator_message": null,
+  "rollout_contract_projection_integrity": "valid",
+  "rollout_contract_cutover_policy_revision": "p095-cutover-v1",
+  "rollout_contract_diagnostic_redaction": "none",
+  "rollout_contract_next_steps": [],
+  "parity_lanes": {
+    "run_report": {
+      "rollout_contract_status": "pass",
+      "rollout_contract_decision": "release",
+      "rollout_contract_failure_reasons": [],
+      "rollout_contract_waiver_state": "none",
+      "rollout_contract_waiver_expires_at": null,
+      "rollout_contract_enforcement_mode": "enforce",
+      "rollout_contract_enforcement_mode_reason": "mandatory_no_waiver_no_permissive_mode_available",
+      "rollout_contract_hold_conditions": [],
+      "rollout_contract_rollback_disposition": {
+        "mode": "reviewed_code_revert_forward_only",
+        "data_loss_risk": "none"
+      },
+      "rollout_contract_source_lane": "run_report",
+      "rollout_contract_enabled_state": "enabled",
+      "rollout_contract_disabled_reason_code": null,
+      "rollout_contract_action_id": "p095-action-00000000-0000-0000-0000-000000000001",
+      "rollout_contract_operator_message": null,
+      "rollout_contract_projection_integrity": "valid",
+      "rollout_contract_cutover_policy_revision": "p095-cutover-v1",
+      "rollout_contract_diagnostic_redaction": "none",
+      "rollout_contract_next_steps": []
+    },
+    "mcp": {
+      "rollout_contract_status": "pass",
+      "rollout_contract_decision": "release",
+      "rollout_contract_failure_reasons": [],
+      "rollout_contract_waiver_state": "none",
+      "rollout_contract_waiver_expires_at": null,
+      "rollout_contract_enforcement_mode": "enforce",
+      "rollout_contract_enforcement_mode_reason": "mandatory_no_waiver_no_permissive_mode_available",
+      "rollout_contract_hold_conditions": [],
+      "rollout_contract_rollback_disposition": {
+        "mode": "reviewed_code_revert_forward_only",
+        "data_loss_risk": "none"
+      },
+      "rollout_contract_source_lane": "mcp",
+      "rollout_contract_enabled_state": "enabled",
+      "rollout_contract_disabled_reason_code": null,
+      "rollout_contract_action_id": "p095-action-00000000-0000-0000-0000-000000000001",
+      "rollout_contract_operator_message": null,
+      "rollout_contract_projection_integrity": "valid",
+      "rollout_contract_cutover_policy_revision": "p095-cutover-v1",
+      "rollout_contract_diagnostic_redaction": "none",
+      "rollout_contract_next_steps": []
+    },
+    "release_receipt": {
+      "rollout_contract_status": "pass",
+      "rollout_contract_decision": "release",
+      "rollout_contract_failure_reasons": [],
+      "rollout_contract_waiver_state": "none",
+      "rollout_contract_waiver_expires_at": null,
+      "rollout_contract_enforcement_mode": "enforce",
+      "rollout_contract_enforcement_mode_reason": "mandatory_no_waiver_no_permissive_mode_available",
+      "rollout_contract_hold_conditions": [],
+      "rollout_contract_rollback_disposition": {
+        "mode": "reviewed_code_revert_forward_only",
+        "data_loss_risk": "none"
+      },
+      "rollout_contract_source_lane": "release_receipt",
+      "rollout_contract_enabled_state": "enabled",
+      "rollout_contract_disabled_reason_code": null,
+      "rollout_contract_action_id": "p095-action-00000000-0000-0000-0000-000000000001",
+      "rollout_contract_operator_message": null,
+      "rollout_contract_projection_integrity": "valid",
+      "rollout_contract_cutover_policy_revision": "p095-cutover-v1",
+      "rollout_contract_diagnostic_redaction": "none",
+      "rollout_contract_next_steps": []
+    },
+    "graphql": {
+      "rolloutContractStatus": "pass",
+      "rolloutContractDecision": "release",
+      "rolloutContractFailureReasons": [],
+      "rolloutContractWaiverState": "none",
+      "rolloutContractWaiverExpiresAt": null,
+      "rolloutContractEnforcementMode": "enforce",
+      "rolloutContractEnforcementModeReason": "mandatory_no_waiver_no_permissive_mode_available",
+      "rolloutContractHoldConditions": [],
+      "rolloutContractRollbackDisposition": {
+        "mode": "reviewed_code_revert_forward_only",
+        "dataLossRisk": "none"
+      },
+      "rolloutContractSourceLane": "graphql",
+      "rolloutContractEnabledState": "enabled",
+      "rolloutContractDisabledReasonCode": null,
+      "rolloutContractActionId": "p095-action-00000000-0000-0000-0000-000000000001",
+      "rolloutContractOperatorMessage": null,
+      "rolloutContractProjectionIntegrity": "valid",
+      "rolloutContractCutoverPolicyRevision": "p095-cutover-v1",
+      "rolloutContractDiagnosticRedaction": "none",
+      "rolloutContractNextSteps": []
+    }
+  }
+}

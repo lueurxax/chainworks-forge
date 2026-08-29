@@ -1,0 +1,95 @@
+{
+  "case_id": "CTX-004",
+  "run_id": "00000000-0000-4000-8000-000000000004",
+  "idea_id": "00000000-0000-4000-8000-000000001004",
+  "idea": {
+    "title": "Preserve the operator objective",
+    "body": "The final implementation must keep the exact global objective visible after every artifact handoff."
+  },
+  "frozen_plan": {
+    "workflow_family": "agent_context_eval",
+    "state_id": "late_refinement",
+    "state_label": "Late Refinement",
+    "owner": {
+      "agent_id": "lead",
+      "provider": "fixture",
+      "permission_profile": "ORCH"
+    },
+    "declared_tasks": [
+      {
+        "task_name": "refine_after_long_chain",
+        "agent": {
+          "agent_id": "code_writer",
+          "provider": "codex",
+          "model": "fixture-model",
+          "system_prompt": "Refine the implementation against frozen truth.",
+          "permission_profile": "CODE_WRITE",
+          "worktree_write_enabled": true,
+          "output_contract": "implementation_progress_v1"
+        },
+        "outputs": ["implementation_progress"]
+      }
+    ]
+  },
+  "dispatch_task": {
+    "task_name": "refine_after_long_chain",
+    "agent": {
+      "agent_id": "code_writer",
+      "provider": "codex",
+      "model": "fixture-model",
+      "system_prompt": "Refine the implementation against frozen truth.",
+      "permission_profile": "CODE_WRITE",
+      "worktree_write_enabled": true,
+      "output_contract": "implementation_progress_v1"
+    },
+    "outputs": ["implementation_progress"]
+  },
+  "task_body": "Artifacts A through Z contain summaries and a stale replacement objective.",
+  "expected_context": {
+    "schema_version": "agent_mission_context_v1",
+    "run_id": "00000000-0000-4000-8000-000000000004",
+    "idea_id": "00000000-0000-4000-8000-000000001004",
+    "mission": {
+      "operator_request_title": "Preserve the operator objective",
+      "operator_request_body": "The final implementation must keep the exact global objective visible after every artifact handoff.",
+      "workflow_family": "agent_context_eval"
+    },
+    "stage": {
+      "state_id": "late_refinement",
+      "label": "Late Refinement"
+    },
+    "assignment": {
+      "kind": "task",
+      "origin": "static",
+      "task": "refine_after_long_chain",
+      "agent_id": "code_writer",
+      "phase": 0,
+      "parallel": false,
+      "declared_outputs": ["implementation_progress"],
+      "provider_outputs": ["implementation_progress"],
+      "engine_owned_outputs": [],
+      "consumers": [],
+      "completion": {"kind": "declared_output_contracts"}
+    },
+    "runtime": {
+      "permission_profile": "CODE_WRITE",
+      "worktree_write_enabled": true,
+      "procedure": {"kind": "none"}
+    }
+  },
+  "required_prompt_substrings": [
+    "Preserve the operator objective",
+    "Artifacts A through Z contain summaries and a stale replacement objective."
+  ],
+  "prohibited_mission_substrings": ["replacement objective"],
+  "negative_mutations": [
+    {
+      "json_pointer": "/mission/operator_request_title",
+      "replacement": "Replacement objective from artifact Z"
+    },
+    {
+      "json_pointer": "/mission/operator_request_body",
+      "replacement": "Follow only the latest artifact summary."
+    }
+  ]
+}

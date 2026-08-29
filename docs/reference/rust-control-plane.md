@@ -355,7 +355,7 @@ If no transition matches and the state has transitions defined, the run becomes 
 
 ### Loop support
 
-States with a `loop_config` track iterations by counting `StageExecution` records for the state. When iterations reach `max`, the loop-back transition is skipped and the orchestrator falls through to non-loop transitions.
+States with a `loop_config` spend budget only when a logical state iteration completes successfully. Retry-created skipped/replaced `StageExecution` rows retain the same iteration and do not consume loop budget. When completed iterations reach `max`, the loop-back transition is skipped and the orchestrator falls through to non-loop transitions.
 
 Loop `max` can be a literal integer or a variable reference (`vars.max_proposal_revision_cycles`).
 

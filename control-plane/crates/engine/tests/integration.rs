@@ -7,9 +7,10 @@ use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, approvals,
-    artifact_contracts, artifacts, code_writer_completion_receipts, ideas, projections,
+    artifact_contracts, artifacts, code_writer_completion_receipts, escalation, ideas, projections,
     retry_operator_instructions, retry_payload_recovery_events, retry_stage_execution_authorities,
-    runs, sessions, side_effects, stages, startup_repairs, work_items, workflow_conflicts,
+    runs, scheduler, sessions, side_effects, stages, startup_repairs, work_items,
+    workflow_conflicts,
 };
 use db::work_item::{WorkItemKind, WorkItemStatus};
 use domain::agent::{
@@ -253,6 +254,38 @@ fn sha256_hex(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn initialize_git_repo_with_main(path: &std::path::Path) {
+    let initialized = std::process::Command::new("git")
+        .args(["init", "--initial-branch", "main"])
+        .current_dir(path)
+        .output()
+        .expect("git init should run");
+    assert!(
+        initialized.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    let committed = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=Chainworks Test",
+            "-c",
+            "user.email=chainworks-test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Initial test commit",
+        ])
+        .current_dir(path)
+        .output()
+        .expect("git commit should run");
+    assert!(
+        committed.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&committed.stderr)
+    );
 }
 
 fn test_workflow_yaml_path() -> String {
@@ -5655,6 +5688,31 @@ async fn test_retry_stage_with_agent_execution_id_schedules_single_invoke_attemp
     agent_executions::insert(&pool, &failed_lead).await.unwrap();
 
     let source_work_item_id = format!("p058-invoke:{old_stage_exec_id}:4");
+    let now = Utc::now();
+    escalation::insert_ledger(
+        &pool,
+        &domain::escalation::EscalationLedger {
+            id: "ledger-targeted-retry".into(),
+            run_id,
+            stage_id: "review".into(),
+            stage_execution_id: Some(old_stage_exec_id.to_string()),
+            agent_id: "lead_orchestrator".into(),
+            policy_id: "proposal-review-escalation".into(),
+            policy_hash: "policy-hash".into(),
+            status_raw: "active".into(),
+            current_tier_id: Some("claude_fallback".into()),
+            current_tier_kind_raw: Some("backend_profile".into()),
+            chain_attempt_index: 1,
+            trigger_raw: Some("stale_no_output".into()),
+            pause_reason_raw: None,
+            operator_action_hint: None,
+            runbook_anchor: None,
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
     work_items::enqueue(
         &pool,
         &db::work_item::WorkItem {
@@ -5745,6 +5803,16 @@ async fn test_retry_stage_with_agent_execution_id_schedules_single_invoke_attemp
         })
         .collect();
     assert_eq!(retry_invokes.len(), 1);
+    let queue_summaries = scheduler::list_queue_summaries_by_run(&pool, &run_id.to_string())
+        .await
+        .expect("targeted retry must refresh its scheduler read model atomically");
+    assert!(
+        queue_summaries.iter().any(|summary| {
+            summary.queued_count == 1
+                && summary.stage_execution_id.as_deref() == Some(&retry_stage.id.to_string())
+        }),
+        "targeted retry must publish a schedulable pending InvokeAgent item"
+    );
     let payload: serde_json::Value = serde_json::from_str(&retry_invokes[0].payload_json).unwrap();
     assert_eq!(
         payload["stage_execution_id"],
@@ -5769,6 +5837,18 @@ async fn test_retry_stage_with_agent_execution_id_schedules_single_invoke_attemp
     assert_eq!(
         payload.pointer("/targeted_retry/source_work_item_id"),
         Some(&serde_json::json!(source_work_item_id))
+    );
+    assert_eq!(
+        payload.pointer("/targeted_retry/escalation/ledger_id"),
+        Some(&serde_json::json!("ledger-targeted-retry"))
+    );
+    assert_eq!(
+        payload.pointer("/targeted_retry/escalation/tier_id"),
+        Some(&serde_json::json!("claude_fallback"))
+    );
+    assert_eq!(
+        payload.pointer("/targeted_retry/escalation/trigger_raw"),
+        Some(&serde_json::json!("stale_no_output"))
     );
 }
 
@@ -9277,11 +9357,7 @@ async fn test_start_run_persists_delivery_configuration_json() {
     let handler = make_command_handler(pool.clone());
     let workspace = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
-    std::process::Command::new("git")
-        .args(["init", "--initial-branch", "main"])
-        .current_dir(repo.path())
-        .output()
-        .expect("git init should run");
+    initialize_git_repo_with_main(repo.path());
     let worktrees = tempfile::tempdir().unwrap();
     let delivery_configuration_json = Some(format!(
         r#"{{
@@ -9318,6 +9394,12 @@ async fn test_start_run_persists_delivery_configuration_json() {
 
     let run_id = match commanded.result {
         engine::command_handler::CommandResult::RunStarted { run_id } => run_id,
+        engine::command_handler::CommandResult::StartRunBlockedByDeliveryPreflight(blocked) => {
+            panic!(
+                "delivery preflight unexpectedly blocked test run: {:?}",
+                blocked.delivery_preflight.checks
+            )
+        }
         _ => panic!("unexpected command result"),
     };
 
@@ -9931,7 +10013,8 @@ async fn steward_executor_tests_work_item_runs_active_catalog_agents_through_acp
     }
 
     let temp = tempfile::tempdir().unwrap();
-    let script = temp.path().join("steward_acp_fixture.py");
+    let temp_root = std::fs::canonicalize(temp.path()).unwrap();
+    let script = temp_root.join("steward_acp_fixture.py");
     std::fs::write(
         &script,
         r#"#!/usr/bin/env python3
@@ -9972,7 +10055,7 @@ recv()
     permissions.set_mode(0o755);
     std::fs::set_permissions(&script, permissions).unwrap();
 
-    let catalog_path = temp.path().join("agents.yaml");
+    let catalog_path = temp_root.join("agents.yaml");
     std::fs::write(
         &catalog_path,
         r#"
@@ -10035,7 +10118,7 @@ agents:
         Arc::new(runtime_inputs),
     );
 
-    let artifact_base = temp.path().join("artifacts");
+    let artifact_base = temp_root.join("artifacts");
     work_queue
         .enqueue(
             db::work_item::WorkItemKind::StewardAnalysis,
@@ -10054,9 +10137,24 @@ agents:
         .await
         .unwrap();
     assert_eq!(analyses.len(), 1);
-    assert!(analyses[0].health_report_artifact_id.is_some());
-    assert!(analyses[0].audit_report_artifact_id.is_some());
-    assert!(analyses[0].agent_tuning_artifact_id.is_some());
+    assert!(
+        analyses[0].health_report_artifact_id.is_some(),
+        "Steward ACP analysis status={} error={:?}",
+        analyses[0].status,
+        analyses[0].error_summary
+    );
+    assert!(
+        analyses[0].audit_report_artifact_id.is_some(),
+        "Steward ACP analysis status={} error={:?}",
+        analyses[0].status,
+        analyses[0].error_summary
+    );
+    assert!(
+        analyses[0].agent_tuning_artifact_id.is_some(),
+        "Steward ACP analysis status={} error={:?}",
+        analyses[0].status,
+        analyses[0].error_summary
+    );
 }
 
 #[tokio::test]
@@ -10266,11 +10364,7 @@ async fn delivery_preflight_success_persists_run_owned_result() {
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
 
     let repo = tempfile::tempdir().unwrap();
-    std::process::Command::new("git")
-        .args(["init", "--initial-branch", "main"])
-        .current_dir(repo.path())
-        .output()
-        .expect("git init should run");
+    initialize_git_repo_with_main(repo.path());
     let worktrees = tempfile::tempdir().unwrap();
     let delivery_configuration_json = Some(format!(
         r#"{{
@@ -14527,6 +14621,7 @@ impl acp::adapters::AcpAdapter for P088StaleImplementationActiveAdapter {
                     detail: Some("com.agentclientprotocol.rpc.JsonRpcNotification,diff".into()),
                 },
             ],
+            claude_diagnostics: None,
             p079_unsafe_continuation: false,
         };
 

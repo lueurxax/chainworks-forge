@@ -1,3 +1,4 @@
+pub mod agent_mission_context;
 pub mod cancellation;
 pub mod capacity;
 pub mod closeout_fingerprint;
@@ -18,6 +19,7 @@ pub mod main_sync_fixtures;
 pub mod mcp;
 pub mod mediation;
 pub mod orchestrator;
+pub mod p058_deadline_resume;
 pub mod parity_control;
 pub mod preflight;
 pub mod proposal_review_router;

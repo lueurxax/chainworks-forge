@@ -135,8 +135,8 @@ impl StewardConfig {
             context_strategy_profiles: BTreeMap::new(),
             triggers: StewardTriggers {
                 post_run_hook: StewardPostRunHook {
-                    enabled: false,
-                    run_interval: 5,
+                    enabled: true,
+                    run_interval: 1,
                 },
                 on_config_change: StewardToggle { enabled: true },
                 schedule: StewardSchedule {
@@ -276,4 +276,20 @@ fn first_existing_path(candidates: &[&str]) -> PathBuf {
         .map(PathBuf::from)
         .find(|path| path.exists())
         .unwrap_or_else(|| PathBuf::from(candidates[0]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StewardConfig;
+
+    #[test]
+    fn canonical_config_enables_every_run_analysis() {
+        let config: StewardConfig = serde_yaml::from_str(include_str!(
+            "../../../../../examples/steward/steward_config.yaml"
+        ))
+        .expect("canonical Steward config must decode");
+
+        assert!(config.triggers.post_run_hook.enabled);
+        assert_eq!(config.triggers.post_run_hook.run_interval, 1);
+    }
 }

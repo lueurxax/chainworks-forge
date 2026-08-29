@@ -257,6 +257,12 @@ fn p092_recovery_batch_limit() -> usize {
         .unwrap_or(20)
 }
 
+fn is_terminal_human_pause_ledger(ledger: &domain::escalation::EscalationLedger) -> bool {
+    ledger.status_raw == "paused"
+        && ledger.current_tier_kind_raw.as_deref() == Some("pause")
+        && ledger.pause_reason_raw.as_deref() == Some("escalation_chain_exhausted")
+}
+
 fn p092_stale_payload_fields(
     payload_target_stage_execution_id: Option<&str>,
     current_target_stage_execution_id: &str,
@@ -302,6 +308,13 @@ fn p088_startup_receipt_recovery_max_files() -> usize {
         .unwrap_or(0)
 }
 
+fn terminal_human_pause_suppresses_targeted_retry(payload: &serde_json::Value) -> bool {
+    payload
+        .pointer("/targeted_retry/reason")
+        .and_then(serde_json::Value::as_str)
+        != Some("operator_targeted_retry")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +330,58 @@ mod tests {
             .await
             .expect("background projection task must not hold startup")
             .unwrap();
+    }
+
+    #[test]
+    fn terminal_human_pause_match_excludes_resumable_deadline_pause() {
+        let run_id = domain::ids::RunId::new();
+        let now = Utc::now();
+        let mut ledger = domain::escalation::EscalationLedger {
+            id: "ledger-p058-pause".into(),
+            run_id,
+            stage_id: "proposal".into(),
+            stage_execution_id: None,
+            agent_id: "proposal_writer".into(),
+            policy_id: "policy".into(),
+            policy_hash: "sha256:test".into(),
+            status_raw: "paused".into(),
+            current_tier_id: Some("human_pause".into()),
+            current_tier_kind_raw: Some("pause".into()),
+            chain_attempt_index: 2,
+            trigger_raw: Some("transport_closed".into()),
+            pause_reason_raw: Some("escalation_chain_exhausted".into()),
+            operator_action_hint: None,
+            runbook_anchor: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        assert!(is_terminal_human_pause_ledger(&ledger));
+
+        ledger.current_tier_kind_raw = Some("backend_profile".into());
+        ledger.pause_reason_raw = Some("escalation_deadline_elapsed".into());
+        assert!(!is_terminal_human_pause_ledger(&ledger));
+    }
+
+    #[test]
+    fn operator_targeted_retry_survives_terminal_human_pause_startup_recovery() {
+        let operator_retry = serde_json::json!({
+            "targeted_retry": {
+                "reason": "operator_targeted_retry"
+            }
+        });
+        assert!(!terminal_human_pause_suppresses_targeted_retry(
+            &operator_retry
+        ));
+
+        let automatic_retry = serde_json::json!({
+            "targeted_retry": {
+                "reason": "provider_escalation_retry"
+            }
+        });
+        assert!(terminal_human_pause_suppresses_targeted_retry(
+            &automatic_retry
+        ));
     }
 
     #[test]
@@ -777,6 +842,27 @@ impl RecoveryService {
                         run_id = %run.id,
                         error = %e,
                         "Failed to recover P058 shutdown-drain force-detach state during startup"
+                    );
+                }
+            }
+        }
+        for run in &active_runs {
+            match self.repair_p058_paused_targeted_retries_for_run(run).await {
+                Ok(repaired) => {
+                    if repaired > 0 {
+                        runs_repaired += repaired;
+                        warn!(
+                            run_id = %run.id,
+                            repaired,
+                            "Startup recovery terminalized targeted retries blocked by a durable P058 human pause"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        run_id = %run.id,
+                        error = %e,
+                        "Failed to repair targeted retries blocked by a durable P058 human pause"
                     );
                 }
             }
@@ -2400,6 +2486,156 @@ impl RecoveryService {
             projections::rebuild_all_for_run(&self.pool, run.id).await?;
         }
         Ok(recovered)
+    }
+
+    async fn repair_p058_paused_targeted_retries_for_run(&self, run: &Run) -> Result<usize> {
+        let paused_ledgers = escalation::find_ledgers_by_run(&self.pool, run.id)
+            .await?
+            .into_iter()
+            .filter(is_terminal_human_pause_ledger)
+            .collect::<Vec<_>>();
+        if paused_ledgers.is_empty() {
+            return Ok(0);
+        }
+
+        let authorities =
+            retry_stage_execution_authorities::list_by_run(&self.pool, run.id).await?;
+        let stages_by_id = stages::list_by_run(&self.pool, run.id)
+            .await?
+            .into_iter()
+            .map(|stage| (stage.id.to_string(), stage))
+            .collect::<std::collections::HashMap<_, _>>();
+        let pending_invokes = work_items::list_by_run(&self.pool, run.id)
+            .await?
+            .into_iter()
+            .filter(|item| {
+                item.kind == WorkItemKind::InvokeAgent && item.status == WorkItemStatus::Pending
+            })
+            .collect::<Vec<_>>();
+        let now = Utc::now();
+        let mut repaired = 0;
+
+        for item in pending_invokes {
+            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&item.payload_json) else {
+                continue;
+            };
+            if payload.get("targeted_retry").is_none() {
+                continue;
+            }
+            if !terminal_human_pause_suppresses_targeted_retry(&payload) {
+                continue;
+            }
+            let Some(stage_execution_id) = payload
+                .get("stage_execution_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let Some(stage) = stages_by_id.get(stage_execution_id) else {
+                continue;
+            };
+            if stage.status != StageStatus::Running {
+                continue;
+            }
+            let agent_id = payload
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(stage.stage_id.as_str());
+            let Some(ledger) = paused_ledgers
+                .iter()
+                .find(|ledger| ledger.stage_id == stage.stage_id && ledger.agent_id == agent_id)
+            else {
+                continue;
+            };
+            let Some(authority_id) = payload
+                .get("retry_authority_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let Some(authority) = authorities.iter().find(|authority| {
+                authority.id == authority_id
+                    && authority.authority_state == RetryAuthorityState::Active
+                    && authority.target_stage_execution_id == stage.id
+            }) else {
+                continue;
+            };
+            if !agent_executions::find_by_stage(&self.pool, stage.id)
+                .await?
+                .is_empty()
+            {
+                continue;
+            }
+
+            let tx_started = std::time::Instant::now();
+            let mut tx = self
+                .begin_transaction(
+                    "recovery.p058_paused_targeted_retry",
+                    format!("recovery.p058_paused_targeted_retry:{}", item.id),
+                )
+                .await?;
+            work_items::cancel_pending_or_running_invoke_by_stage_execution_tx(
+                &mut tx,
+                run.id,
+                stage_execution_id,
+                now,
+                "p058_human_pause_suppressed_targeted_retry",
+            )
+            .await?;
+            retry_stage_execution_authorities::mark_terminalized_tx(
+                &mut tx,
+                &authority.id,
+                now,
+                "p058_human_pause_suppressed_targeted_retry",
+            )
+            .await?;
+            stages::settle_tx(&mut tx, stage.id, StageSettlementKind::Failed, now).await?;
+            runs::update_status_tx(&mut tx, run.id, RunStatus::Blocked).await?;
+            escalation::insert_event_tx(
+                &mut tx,
+                &EscalationEvent {
+                    id: format!("p058-paused-targeted-retry-suppressed:{}", item.id),
+                    escalation_ledger_id: ledger.id.clone(),
+                    event_kind_raw: "escalation.targeted_retry_suppressed".to_string(),
+                    tier_id: ledger.current_tier_id.clone(),
+                    tier_kind_raw: ledger.current_tier_kind_raw.clone(),
+                    trigger_raw: ledger.trigger_raw.clone(),
+                    pause_reason_raw: ledger.pause_reason_raw.clone(),
+                    payload_json: Some(
+                        serde_json::json!({
+                            "event_kind_raw": "escalation.targeted_retry_suppressed",
+                            "tier_id": ledger.current_tier_id,
+                            "tier_kind_raw": ledger.current_tier_kind_raw,
+                            "trigger_raw": ledger.trigger_raw,
+                            "pause_reason_raw": ledger.pause_reason_raw,
+                            "digest_inputs": {
+                                "failure_kind": "operator_retry_suppressed",
+                                "output_settlement_state": "none",
+                                "validation_evidence_kind": "p058_human_pause",
+                                "redacted_message_fragment_hash": format!(
+                                    "sha256:{:x}",
+                                    Sha256::digest(item.id.as_bytes())
+                                ),
+                            },
+                            "redacted_evidence_ref": format!(
+                                "sha256:{:x}",
+                                Sha256::digest(authority.id.as_bytes())
+                            ),
+                        })
+                        .to_string(),
+                    ),
+                    redaction_version: Some("redaction_v1".to_string()),
+                    created_at: now,
+                },
+            )
+            .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("recovery.p058_paused_targeted_retry", tx_started);
+            self.work_queue.refresh_scheduler_projection().await?;
+            repaired += 1;
+        }
+
+        Ok(repaired)
     }
 
     async fn recover_p090_output_settlement_rows(&self, run: &Run) -> Result<usize> {

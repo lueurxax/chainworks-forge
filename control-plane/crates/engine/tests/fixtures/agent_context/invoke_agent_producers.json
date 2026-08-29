@@ -1,0 +1,58 @@
+[
+  {
+    "producer_id": "command_handler.targeted_retry",
+    "source_file": "command_handler.rs",
+    "function": "retry_agent_execution",
+    "classification": "copy_validated",
+    "guard": "validate_persisted_v1_payload_prompt"
+  },
+  {
+    "producer_id": "orchestrator.auto_contract_retry",
+    "source_file": "orchestrator.rs",
+    "function": "schedule_auto_contract_output_retry_for_stage",
+    "classification": "copy_validated",
+    "guard": "validate_persisted_v1_payload_prompt"
+  },
+  {
+    "producer_id": "orchestrator.dynamic_parallel",
+    "source_file": "orchestrator.rs",
+    "function": "materialize_dynamic_parallel",
+    "classification": "fresh_finalized",
+    "guard": "build_task_prompt("
+  },
+  {
+    "producer_id": "orchestrator.legacy_flat",
+    "source_file": "orchestrator.rs",
+    "function": "advance_run_flat",
+    "classification": "legacy_non_v1",
+    "guard": "validate_legacy_flat_invoke_agent"
+  },
+  {
+    "producer_id": "orchestrator.owner_only",
+    "source_file": "orchestrator.rs",
+    "function": "enqueue_invoke_agent_for_owner",
+    "classification": "fresh_finalized",
+    "guard": "validate_persisted_v1_prompt"
+  },
+  {
+    "producer_id": "orchestrator.p017_mediation",
+    "source_file": "orchestrator.rs",
+    "function": "enqueue_mediation_invoke_agent",
+    "classification": "fresh_finalized",
+    "guard": "finalize_mediation_prompt_v1"
+  },
+  {
+    "producer_id": "orchestrator.p058_escalation_retry",
+    "source_file": "orchestrator.rs",
+    "function": "schedule_p058_escalation_retry_for_stage",
+    "classification": "copy_validated",
+    "guard": "validate_persisted_v1_payload_prompt"
+  },
+  {
+    "producer_id": "orchestrator.standard_task",
+    "source_file": "orchestrator.rs",
+    "function": "enqueue_invoke_agent",
+    "classification": "fresh_finalized",
+    "guard": "validate_persisted_v1_prompt"
+  }
+]

@@ -103,7 +103,7 @@ thresholds:
   cost:     { method: median_percentage, trigger: 0.25 }
   stability:{ method: ratio,             trigger: 2.0  }
 triggers:
-  post_run_hook: { enabled: false, run_interval: 5 }
+  post_run_hook: { enabled: true, run_interval: 1 }
   on_config_change: { enabled: true }
   schedule: { enabled: false, cron: "0 8 * * 1" }
 ```
@@ -114,6 +114,9 @@ Validation rules (enforced by `YAMLValidator.validateStewardConfig`):
 - All five threshold families (`timing`, `rework`, `quality`, `cost`, `stability`) are required.
 - Threshold methods must be one of `median_percentage`, `mean_percentage`, `ratio`.
 - `post_run_hook.run_interval >= 1` when enabled.
+- The shipped default enables the post-run hook with `run_interval: 1`, so every
+  newly completed run queues Steward analysis. An explicit valid operator config
+  may still disable the hook or select a larger interval.
 
 ## Persistence Model
 

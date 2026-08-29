@@ -1077,6 +1077,17 @@ fn test_compile_full_mvp_live_plan() {
     assert_eq!(plan.initial_state, "state_1_idea_received");
     assert_eq!(plan.states.len(), 22);
 
+    for terminal_output in ["delivery_receipt", "run_report", "run_state"] {
+        let path = plan
+            .artifact_paths
+            .get(terminal_output)
+            .unwrap_or_else(|| panic!("{terminal_output} must have a canonical artifact path"));
+        assert!(
+            path.starts_with("${CHAINWORKS_META_ROOT:-.chainworks}/"),
+            "{terminal_output} must remain below the per-run trusted meta root: {path}"
+        );
+    }
+
     // Verify provider resolution
     let s1 = &plan.states["state_1_idea_received"];
     assert_eq!(s1.owner.agent_id, "lead_orchestrator");
@@ -1086,6 +1097,13 @@ fn test_compile_full_mvp_live_plan() {
     );
     assert_eq!(s1.owner.model.as_deref(), Some("gpt-5.6"));
     assert_eq!(s1.owner.effort.as_deref(), Some("high"));
+    assert!(
+        s1.owner
+            .prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains("make blockers a JSON array, never prose")),
+        "the frozen lead prompt must preserve the quality-gate blocker collection shape"
+    );
 
     let s4 = &plan.states["state_4_proposal_reviewed"];
     assert_eq!(
@@ -1856,7 +1874,6 @@ states:
 "#;
     let catalog = catalog_with_default_system_lead(
         r#"
-catalog_snapshot_format_version: 1
 backend_profiles:
   steward_profile:
     provider: claude

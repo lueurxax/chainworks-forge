@@ -1,0 +1,112 @@
+{
+  "case_id": "CTX-003",
+  "run_id": "00000000-0000-4000-8000-000000000003",
+  "idea_id": "00000000-0000-4000-8000-000000001003",
+  "idea": {
+    "title": "Review without implementation authority",
+    "body": "Inspect the implementation and report findings; do not edit source files."
+  },
+  "frozen_plan": {
+    "workflow_family": "agent_context_eval",
+    "state_id": "implementation_review",
+    "state_label": "Implementation Review",
+    "owner": {
+      "agent_id": "lead",
+      "provider": "fixture",
+      "permission_profile": "ORCH"
+    },
+    "declared_tasks": [
+      {
+        "task_name": "review_implementation",
+        "agent": {
+          "agent_id": "implementation_auditor",
+          "provider": "claude",
+          "model": "fixture-model",
+          "system_prompt": "Report evidence-backed findings only.",
+          "permission_profile": "RO_REVIEW",
+          "worktree_write_enabled": false,
+          "output_contract": "implementation_audit_v1",
+          "procedure": {
+            "id": "proposal_implementation_audit",
+            "source_kind": "inline",
+            "hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "content": "## Skill: proposal_implementation_audit\nInspect code and report findings without editing it."
+          }
+        },
+        "outputs": ["implementation_audit"]
+      }
+    ]
+  },
+  "dispatch_task": {
+    "task_name": "review_implementation",
+    "agent": {
+      "agent_id": "implementation_auditor",
+      "provider": "claude",
+      "model": "fixture-model",
+      "system_prompt": "Report evidence-backed findings only.",
+      "permission_profile": "RO_REVIEW",
+      "worktree_write_enabled": false,
+      "output_contract": "implementation_audit_v1",
+      "procedure": {
+        "id": "proposal_implementation_audit",
+        "source_kind": "inline",
+        "hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "content": "## Skill: proposal_implementation_audit\nInspect code and report findings without editing it."
+      }
+    },
+    "outputs": ["implementation_audit"]
+  },
+  "task_body": "Read the frozen evidence and produce the audit report.",
+  "expected_context": {
+    "schema_version": "agent_mission_context_v1",
+    "run_id": "00000000-0000-4000-8000-000000000003",
+    "idea_id": "00000000-0000-4000-8000-000000001003",
+    "mission": {
+      "operator_request_title": "Review without implementation authority",
+      "operator_request_body": "Inspect the implementation and report findings; do not edit source files.",
+      "workflow_family": "agent_context_eval"
+    },
+    "stage": {
+      "state_id": "implementation_review",
+      "label": "Implementation Review"
+    },
+    "assignment": {
+      "kind": "task",
+      "origin": "static",
+      "task": "review_implementation",
+      "agent_id": "implementation_auditor",
+      "phase": 0,
+      "parallel": false,
+      "declared_outputs": ["implementation_audit"],
+      "provider_outputs": ["implementation_audit"],
+      "engine_owned_outputs": [],
+      "consumers": [],
+      "completion": {"kind": "declared_output_contracts"}
+    },
+    "runtime": {
+      "permission_profile": "RO_REVIEW",
+      "worktree_write_enabled": false,
+      "procedure": {
+        "kind": "resolved",
+        "id": "proposal_implementation_audit",
+        "source_kind": "inline",
+        "skill_snapshot_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    }
+  },
+  "required_prompt_substrings": [
+    "Report evidence-backed findings only.",
+    "Inspect code and report findings without editing it."
+  ],
+  "prohibited_mission_substrings": ["CODE_WRITE"],
+  "negative_mutations": [
+    {
+      "json_pointer": "/runtime/worktree_write_enabled",
+      "replacement": true
+    },
+    {
+      "json_pointer": "/runtime/permission_profile",
+      "replacement": "CODE_WRITE"
+    }
+  ]
+}

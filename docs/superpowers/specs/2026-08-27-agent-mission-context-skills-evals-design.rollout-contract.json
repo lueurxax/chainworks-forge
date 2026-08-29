@@ -1,0 +1,128 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "applicability": "required",
+  "gate_aliases": [
+    "proposal-agent-context-skills-evals",
+    "agent-context-skills-evals"
+  ],
+  "commands": {
+    "allowlist": [
+      "./scripts/lint-rollout-contract docs/superpowers/specs/2026-08-27-agent-mission-context-skills-evals-design.rollout-contract.json",
+      "./scripts/test-gate.sh proposal-agent-context-skills-evals",
+      "./scripts/test-gate.sh agent-context-skills-evals"
+    ],
+    "commentary": "Proposal-readiness executes only the existing linter. A separately reviewed precursor change lands and attests the protected-base bootstrap controller under pre-existing repository gates. That predecessor-owned controller later consumes the linked manifest outside the candidate branch, verifies the four artifact SHA-256 values, reconstructs the domain-separated sixteen-case projection and six-case preflight submanifests, and exhaustively classifies every changed path/action under the Phase 0 policy. Its atomic authority receipt activates a distinct full manifest before later phases. Six producer-faithful vectors separately reject missing alias, missing adapter, waived, not-applicable, permissive, and disabled outcomes with zero ordinary implementation work."
+  },
+  "migrations": {
+    "not_applicable": false,
+    "description": "Forward-only authority-store, control-plane projection, PrincipalTable, execution ownership, skill registry, and evaluation evidence migrations with signed exhaustive inventories and fail-closed seal gates."
+  },
+  "metrics": {
+    "adoption_metric": "production_agent_executions_with_verified_mission_context_and_skill_contract_percent",
+    "operational_metrics": [
+      "agent_context_admission_denied_total{reason}",
+      "agent_quality_target_declaration_invalid_total{reason}",
+      "agent_skill_broker_reconciliation_required_total{effect_class}",
+      "agent_context_rollout_hold_active{reason}"
+    ]
+  },
+  "readback_lanes": [
+    "run_report",
+    "mcp",
+    "release_receipt",
+    "graphql"
+  ],
+  "readback_fields": [
+    "schema_version",
+    "operator_readback_mapping_version",
+    "operator_readback",
+    "rollout_contract_status",
+    "rollout_contract_decision",
+    "rollout_contract_failure_reasons",
+    "rollout_contract_waiver_state",
+    "rollout_contract_waiver_expires_at",
+    "rollout_contract_enforcement_mode",
+    "rollout_contract_enforcement_mode_reason",
+    "rollout_contract_hold_conditions",
+    "rollout_contract_rollback_disposition",
+    "rollout_contract_source_lane",
+    "rollout_contract_enabled_state",
+    "rollout_contract_disabled_reason_code",
+    "rollout_contract_action_id",
+    "rollout_contract_operator_message",
+    "rollout_contract_projection_integrity",
+    "rollout_contract_cutover_policy_revision",
+    "rollout_contract_diagnostic_redaction",
+    "rollout_contract_next_steps"
+  ],
+  "readback_fixture": "docs/evidence/rollout-contract/operator-readback/agent-context-skills-evals-full-surface.fixture.json",
+  "operator_report_fields": [
+    "schema_version",
+    "operator_readback_mapping_version",
+    "operator_readback",
+    "rollout_contract_status",
+    "rollout_contract_decision",
+    "rollout_contract_failure_reasons",
+    "rollout_contract_waiver_state",
+    "rollout_contract_waiver_expires_at",
+    "rollout_contract_enforcement_mode",
+    "rollout_contract_enforcement_mode_reason",
+    "rollout_contract_hold_conditions",
+    "rollout_contract_rollback_disposition",
+    "rollout_contract_source_lane",
+    "rollout_contract_enabled_state",
+    "rollout_contract_disabled_reason_code",
+    "rollout_contract_action_id",
+    "rollout_contract_operator_message",
+    "rollout_contract_projection_integrity",
+    "rollout_contract_cutover_policy_revision",
+    "rollout_contract_diagnostic_redaction",
+    "rollout_contract_next_steps"
+  ],
+  "hold_conditions": [
+    "Any migration inventory is incomplete, ambiguous, unknown, or mixed-revision",
+    "Any required authority, broker, provider, PrincipalTable, eval, or readback gate is not passing",
+    "Any release evidence expires, loses projection integrity, or observes an unresolved rollout incident",
+    "Any required CI check or branch-protection CAS is not verified active"
+  ],
+  "hold_conditions_detail": {
+    "migration": "Seal and open remain blocked until every legacy and generation-owned row has one signed disposition.",
+    "security": "Credential, provider, proxy, workspace, and principal scope boundaries fail closed on missing proof.",
+    "quality": "Evaluation targets are frozen before sample zero and every declared retained case and metric target must pass.",
+    "release": "The functionality is mandatory at open; there is no feature flag, permissive mode, waiver, or disabled state."
+  },
+  "rollback_disposition": {
+    "mode": "forward_fix_or_pre_adoption_exact_preimage_restore",
+    "data_loss_risk": "medium",
+    "steps": [
+      "Before any candidate or release-evidence issuance or selection depends on a staged external ruleset mutation, restore its authenticated exact preimage with an ETag compare-and-swap.",
+      "After candidate or release-evidence adoption or authority migration, keep admission held and ship a reviewed forward repair; do not disable or waive the functionality.",
+      "Preserve authority, migration, attempt, effect, incident, and evaluation history during repair.",
+      "Require the complete retained gate and fresh release evidence before reopening admission."
+    ]
+  },
+  "decision_vocabulary": [
+    "pass",
+    "fail",
+    "timeout",
+    "cancelled",
+    "missing_contract",
+    "tamper_detected",
+    "stale",
+    "release",
+    "hold"
+  ],
+  "negative_fixtures": {
+    "mandatory_preflight_fail_closed": "docs/evidence/rollout-contract/operator-readback/agent-context-skills-evals-negative.fixture.json",
+    "unsafe_path_or_command": "docs/evidence/rollout-contract/negative/unsafe-path-and-command.json",
+    "missing_operator_decision_fields": "docs/evidence/rollout-contract/negative/missing-operator-decision-fields.json",
+    "operator_readback_parity_failures": "docs/evidence/rollout-contract/operator-readback/agent-context-skills-evals-negative.fixture.json"
+  },
+  "cutover_policy": {
+    "revision": "agent-context-skills-evals-cutover-v1",
+    "enforcement_mode_at_cutover": "enforce",
+    "applicable_to": "post_ready_implementation_starts",
+    "grandfathered_rendering": "not_applicable"
+  },
+  "operator_message": "Agent mission context, skill brokerage, and quality evaluation are mandatory after open. Holds require forward repair; no disable or waiver path exists."
+}

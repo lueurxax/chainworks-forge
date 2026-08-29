@@ -3160,7 +3160,7 @@ enum P031GraphQLDocuments {
 
   nonisolated static let runsHome = """
     query P031RunsHome {
-      runs {
+      runs(includeTerminal: true) {
         id
         status
         ideaId

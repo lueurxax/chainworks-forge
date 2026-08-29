@@ -1,0 +1,98 @@
+{
+  "schema_version": "agent_context_skills_proof_manifest_v1",
+  "clauses": [
+    {
+      "clause": 1,
+      "proofs": [
+        {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "frozen_catalog_version_extension_matrix_is_exhaustive"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "persisted_snapshot_quartet_exhausts_all_presence_states_and_never_falls_back"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "legacy_prompt_validation_preserves_pre_v1_bytes_exactly"}
+      ]
+    },
+    {
+      "clause": 2,
+      "proofs": [
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "v1_task_prompt_orders_mission_before_skill_and_projects_authoritative_outputs"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "owner_prompt_uses_state_owner_assignment_and_copy_validation_rejects_duplicates"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "dynamic_post_approval_and_mediation_assignments_use_the_common_finalizer"}
+      ]
+    },
+    {
+      "clause": 3,
+      "proofs": [
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "run_preflight_enforces_exact_idea_bound_without_writes"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "production_start_run_rejects_missing_or_oversized_idea_before_run_and_work_insert"},
+        {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "agent_context_owner_validation_failure_enqueues_zero_provider_work"},
+        {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "agent_context_dynamic_finalizer_failure_enqueues_and_materializes_zero_work"}
+      ]
+    },
+    {
+      "clause": 4,
+      "proofs": [
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "v1_task_prompt_orders_mission_before_skill_and_projects_authoritative_outputs"},
+        {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "active_catalog_preserves_affected_contracts_and_unrelated_skill_bytes"}
+      ]
+    },
+    {
+      "clause": 5,
+      "proofs": [
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "mission_consumers_cover_next_phase_and_transitions"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "consumer_grammar_covers_multi_transition_owner_and_terminal_shapes"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "ctx_001_through_ctx_006_have_exact_positive_and_mutation_negative_scores"}
+      ]
+    },
+    {
+      "clause": 6,
+      "proofs": [
+        {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "strict_bundle_rejects_auxiliary_entry_and_allowed_tools"},
+        {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "strict_bundle_rejects_oversized_malformed_and_non_utf8_documents"},
+        {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "strict_bundle_rejects_symlinked_skill_file_and_parent_escape"},
+        {"source": "control-plane/crates/workflow/src/skill_bundle.rs", "test": "final_entry_rename_swap_fails_closed"},
+        {"source": "control-plane/crates/workflow/src/skill_bundle.rs", "test": "intermediate_directory_symlink_swap_fails_closed"}
+      ]
+    },
+    {
+      "clause": 7,
+      "proofs": [
+        {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "initial_compile_embeds_valid_external_skill_in_catalog_v2"},
+        {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "declared_unknown_skill_fails_compilation"},
+        {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "bundle_and_role_specialization_mutations_change_declared_hashes"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "active_catalog_preserves_procedure_kinds_and_does_not_duplicate_bundle_body_in_prompts"}
+      ]
+    },
+    {
+      "clause": 8,
+      "proofs": [
+        {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "frozen_v2_recompile_uses_embedded_skill_after_source_is_removed"},
+        {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "frozen_v2_rejects_corrupted_bundle_digest"},
+        {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "agent_context_corrupted_frozen_snapshot_enqueues_zero_provider_work"}
+      ]
+    },
+    {
+      "clause": 9,
+      "proofs": [
+        {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "active_catalog_preserves_affected_contracts_and_unrelated_skill_bytes"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "active_catalog_preserves_procedure_kinds_and_does_not_duplicate_bundle_body_in_prompts"}
+      ]
+    },
+    {
+      "clause": 10,
+      "proofs": [
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "ctx_001_through_ctx_006_have_exact_positive_and_mutation_negative_scores"}
+      ]
+    },
+    {
+      "clause": 11,
+      "proofs": [
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "invoke_agent_producer_manifest_is_closed_and_each_guard_is_mutation_sensitive"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "legacy_flat_producer_rejects_workflow_or_snapshot_backed_runs"}
+      ]
+    },
+    {
+      "clause": 12,
+      "proofs": [
+        {"source": "scripts/test-gate.sh", "test": "agent_context_skills_provider_free_command_allowlist"}
+      ]
+    }
+  ]
+}

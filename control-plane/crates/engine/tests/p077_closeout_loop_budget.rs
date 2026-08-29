@@ -87,6 +87,7 @@ fn test_plan(loop_max: Option<u64>) -> RunPlan {
         run_plan_snapshot_format_version: None,
         closeout_readiness_mode: None,
         escalation_policies: Vec::new(),
+        mission_context_version: None,
     }
 }
 
@@ -113,6 +114,12 @@ fn stage(stage_id: &str, iteration: i64) -> StageExecution {
     }
 }
 
+fn stage_with_status(stage_id: &str, iteration: i64, status: StageStatus) -> StageExecution {
+    let mut stage = stage(stage_id, iteration);
+    stage.status = status;
+    stage
+}
+
 #[test]
 fn closeout_loop_budget_remaining_is_false_when_refine_loop_is_exhausted() {
     let plan = test_plan(Some(2));
@@ -122,6 +129,37 @@ fn closeout_loop_budget_remaining_is_false_when_refine_loop_is_exhausted() {
     ];
 
     assert!(!closeout_loop_budget_remaining(
+        &plan,
+        &stages,
+        "state_10_implementation_refined"
+    ));
+}
+
+#[test]
+fn closeout_loop_budget_ignores_skipped_retry_rows() {
+    let plan = test_plan(Some(2));
+    let stages = vec![
+        stage("state_10_implementation_refined", 1),
+        stage_with_status("state_10_implementation_refined", 2, StageStatus::Skipped),
+        stage_with_status("state_10_implementation_refined", 3, StageStatus::Skipped),
+    ];
+
+    assert!(closeout_loop_budget_remaining(
+        &plan,
+        &stages,
+        "state_10_implementation_refined"
+    ));
+}
+
+#[test]
+fn closeout_loop_budget_counts_completed_logical_iteration_once() {
+    let plan = test_plan(Some(2));
+    let stages = vec![
+        stage("state_10_implementation_refined", 1),
+        stage("state_10_implementation_refined", 1),
+    ];
+
+    assert!(closeout_loop_budget_remaining(
         &plan,
         &stages,
         "state_10_implementation_refined"

@@ -228,6 +228,48 @@ pub fn validate_output(
                 };
             }
         }
+        if schema.contract_id == "quality_gate_blocker_assessment_v1" {
+            let assessment = serde_json::Value::Object(obj.clone());
+            match crate::quality_gate_boundary::evaluate_quality_gate_boundary_assessment(
+                "pre-settlement-validation",
+                &assessment,
+            ) {
+                Ok(evaluation)
+                    if evaluation.payload["projection_integrity"] != serde_json::json!("valid") =>
+                {
+                    let validation_error = evaluation.payload["validation_errors"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|error| error.as_str())
+                        .take(4)
+                        .map(|error| error.chars().take(256).collect::<String>())
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return OutputValidationResult {
+                        output_name: output_name.to_string(),
+                        contract_id: Some(schema.contract_id.clone()),
+                        status: ValidationStatus::Failed,
+                        missing_fields: Vec::new(),
+                        validation_error: Some(validation_error),
+                        raw_payload_size: content.len(),
+                    };
+                }
+                Err(error) => {
+                    return OutputValidationResult {
+                        output_name: output_name.to_string(),
+                        contract_id: Some(schema.contract_id.clone()),
+                        status: ValidationStatus::Failed,
+                        missing_fields: Vec::new(),
+                        validation_error: Some(
+                            error.to_string().chars().take(256).collect::<String>(),
+                        ),
+                        raw_payload_size: content.len(),
+                    };
+                }
+                Ok(_) => {}
+            }
+        }
 
         let missing_fields: Vec<String> = schema
             .required_fields
@@ -780,6 +822,33 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("allowed values for status"));
+    }
+
+    #[test]
+    fn p094_quality_gate_boundary_contract_rejects_non_array_blockers_before_settlement() {
+        let mut schema = structured_schema();
+        schema.contract_id = "quality_gate_blocker_assessment_v1".to_string();
+        schema.human_format = None;
+        schema.validation_mode = Some("strict_structured".to_string());
+        schema.normalized_artifact_name = Some("quality_gate_blocker_assessment".to_string());
+        schema.raw_artifact_name = None;
+        schema.required_fields = vec!["schema_version".to_string(), "blockers".to_string()];
+
+        let result = validate_output(
+            "quality_gate_blocker_assessment",
+            br#"{
+                "schema_version": "quality_gate_blocker_assessment_v1",
+                "blockers": "DISPOSITION: BLOCKED; return to code fixes"
+            }"#,
+            Some(&schema),
+        );
+
+        assert_eq!(result.status, ValidationStatus::Failed);
+        assert!(result
+            .validation_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("assessment.blockers must be an array"));
     }
 
     #[test]

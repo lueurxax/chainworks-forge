@@ -328,6 +328,7 @@ mod tests {
     use domain::ids::{IdeaId, RunId, StageExecutionId};
     use domain::run::{Run, RunStatus};
     use domain::stage::{StageExecution, StageStatus};
+    use sha2::{Digest, Sha256};
     use std::sync::Arc;
     use workflow::plan::EscalationTierSnapshot;
 
@@ -571,8 +572,14 @@ mod tests {
                 project_key: None,
                 risk_class: None,
                 stack: None,
-                workflow_snapshot_hash: None,
-                catalog_snapshot_hash: None,
+                workflow_snapshot_hash: Some(format!(
+                    "{:x}",
+                    Sha256::digest(workflow_json.as_bytes())
+                )),
+                catalog_snapshot_hash: Some(format!(
+                    "{:x}",
+                    Sha256::digest(catalog_json.as_bytes())
+                )),
                 workflow_snapshot_json: Some(workflow_json.into()),
                 catalog_snapshot_json: Some(catalog_json.into()),
                 drift_detected_at: None,

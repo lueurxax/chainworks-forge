@@ -1561,6 +1561,7 @@ mod tests {
             permission_roundtrips: Vec::new(),
             first_events: Vec::new(),
             last_events: Vec::new(),
+            claude_diagnostics: None,
             p079_unsafe_continuation: false,
         }
     }

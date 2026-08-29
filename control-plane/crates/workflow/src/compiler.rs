@@ -10,7 +10,7 @@
 
 use anyhow::{Context, Result};
 use domain::provider::ProviderFamily;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::thread;
 use tracing::{info, warn};
@@ -44,8 +44,20 @@ fn compile_on_current_thread(workflow_path: &str, catalog_path: &str) -> Result<
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
+    let (catalog_snapshot_json, embedded_skill_bundles) =
+        prepare_initial_catalog_snapshot(&cat, &catalog_raw, &catalog_base)?;
 
-    compile_loaded(wf, cat, workflow_raw, catalog_raw, &catalog_base, None)
+    compile_loaded(
+        wf,
+        cat,
+        workflow_raw,
+        catalog_raw,
+        &catalog_base,
+        None,
+        Some(catalog_snapshot_json),
+        Some(embedded_skill_bundles),
+        Some("agent_mission_context_v1".to_string()),
+    )
 }
 
 /// Compile a run plan from the immutable workflow/catalog snapshots captured
@@ -72,10 +84,13 @@ fn compile_from_snapshot_json_on_current_thread(
     catalog_snapshot_json: &str,
     catalog_path: &str,
 ) -> Result<RunPlan> {
+    let catalog_value: serde_json::Value =
+        serde_json::from_str(catalog_snapshot_json).context("parsing catalog snapshot JSON")?;
     let wf: definition::WorkflowFile =
         serde_json::from_str(workflow_snapshot_json).context("parsing workflow snapshot JSON")?;
     let cat: catalog::AgentCatalogFile =
         serde_json::from_str(catalog_snapshot_json).context("parsing catalog snapshot JSON")?;
+    let snapshot_contract = validate_frozen_catalog_contract(&cat, &catalog_value)?;
     let workflow_raw =
         serde_yaml::to_value(&wf).context("building workflow snapshot value for P051 lint")?;
     let catalog_raw =
@@ -96,6 +111,9 @@ fn compile_from_snapshot_json_on_current_thread(
         catalog_raw,
         &catalog_base,
         Some(snapshots),
+        None,
+        snapshot_contract.skill_bundles,
+        snapshot_contract.mission_context_version,
     )
 }
 
@@ -125,6 +143,173 @@ struct SnapshotJson {
     catalog_json: String,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChainworksCompiledSnapshot {
+    schema_version: u32,
+    mission_context_version: String,
+    skill_bundles: BTreeMap<String, crate::skill_bundle::EmbeddedSkillBundle>,
+}
+
+struct CatalogSnapshotContract {
+    skill_bundles: Option<BTreeMap<String, crate::skill_bundle::EmbeddedSkillBundle>>,
+    mission_context_version: Option<String>,
+}
+
+fn prepare_initial_catalog_snapshot(
+    catalog: &catalog::AgentCatalogFile,
+    catalog_raw: &serde_yaml::Value,
+    catalog_base: &Path,
+) -> Result<(
+    String,
+    BTreeMap<String, crate::skill_bundle::EmbeddedSkillBundle>,
+)> {
+    let raw_mapping = catalog_raw
+        .as_mapping()
+        .ok_or_else(|| anyhow::anyhow!("agent catalog root must be a mapping"))?;
+    for compiler_owned_key in ["catalog_snapshot_format_version", "chainworks_compiled"] {
+        if raw_mapping.contains_key(serde_yaml::Value::String(compiler_owned_key.to_string())) {
+            anyhow::bail!(
+                "author agent catalog must not provide compiler-owned field '{compiler_owned_key}'"
+            );
+        }
+    }
+
+    let referenced = referenced_external_skills(catalog)?;
+    let mut skill_bundles = BTreeMap::new();
+    for (skill_id, skill_def) in referenced {
+        let relative_path = skill_def
+            .path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("external_skill '{skill_id}' missing 'path'"))?;
+        let loaded = crate::skill_bundle::load_skill_bundle(catalog_base, relative_path)
+            .with_context(|| format!("loading external skill '{skill_id}'"))?;
+        let _ = loaded.body;
+        skill_bundles.insert(skill_id, loaded.embedded);
+    }
+
+    let extension = ChainworksCompiledSnapshot {
+        schema_version: 1,
+        mission_context_version: "agent_mission_context_v1".to_string(),
+        skill_bundles: skill_bundles.clone(),
+    };
+    let mut enriched = serde_json::to_value(catalog)
+        .context("converting agent catalog to compiler-owned snapshot value")?;
+    let object = enriched
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("agent catalog snapshot must be an object"))?;
+    object.insert(
+        "catalog_snapshot_format_version".to_string(),
+        serde_json::json!(2),
+    );
+    object.insert(
+        "chainworks_compiled".to_string(),
+        serde_json::to_value(extension).context("serializing chainworks_compiled")?,
+    );
+    let snapshot =
+        canonical_json_string(&enriched).context("serializing enriched agent catalog snapshot")?;
+    Ok((snapshot, skill_bundles))
+}
+
+fn validate_frozen_catalog_contract(
+    catalog: &catalog::AgentCatalogFile,
+    catalog_value: &serde_json::Value,
+) -> Result<CatalogSnapshotContract> {
+    let object = catalog_value.as_object().ok_or_else(|| {
+        anyhow::anyhow!("frozen_snapshot_contract_incompatible: catalog snapshot is not an object")
+    })?;
+    let extension_value = object.get("chainworks_compiled");
+
+    match catalog.catalog_snapshot_format_version {
+        None | Some(1) => {
+            if extension_value.is_some() {
+                anyhow::bail!(
+                    "frozen_snapshot_contract_incompatible: legacy catalog snapshot may not contain chainworks_compiled"
+                );
+            }
+            catalog::validate_catalog_snapshot_format_version(catalog)?;
+            Ok(CatalogSnapshotContract {
+                skill_bundles: None,
+                mission_context_version: None,
+            })
+        }
+        Some(2) => {
+            let extension_value = extension_value.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "frozen_snapshot_contract_incompatible: catalog format 2 requires chainworks_compiled"
+                )
+            })?;
+            let extension: ChainworksCompiledSnapshot =
+                serde_json::from_value(extension_value.clone()).map_err(|error| {
+                    anyhow::anyhow!(
+                        "frozen_snapshot_contract_incompatible: invalid chainworks_compiled: {error}"
+                    )
+                })?;
+            if extension.schema_version != 1
+                || extension.mission_context_version != "agent_mission_context_v1"
+            {
+                anyhow::bail!(
+                    "frozen_snapshot_contract_incompatible: unsupported chainworks_compiled contract"
+                );
+            }
+
+            let referenced = referenced_external_skills(catalog)?;
+            let expected: Vec<_> = referenced.keys().cloned().collect();
+            let actual: Vec<_> = extension.skill_bundles.keys().cloned().collect();
+            if actual != expected {
+                anyhow::bail!(
+                    "frozen_snapshot_contract_incompatible: embedded skill cardinality mismatch; expected {expected:?}, got {actual:?}"
+                );
+            }
+            for (skill_id, skill_def) in referenced {
+                let relative_path = skill_def.path.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "frozen_snapshot_contract_incompatible: external_skill '{skill_id}' missing path"
+                    )
+                })?;
+                let bundle = extension.skill_bundles.get(&skill_id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "frozen_snapshot_contract_incompatible: embedded skill '{skill_id}' missing"
+                    )
+                })?;
+                crate::skill_bundle::validate_embedded_skill_bundle(bundle, relative_path)
+                    .with_context(|| {
+                        format!(
+                            "frozen_snapshot_contract_incompatible: validating embedded skill '{skill_id}'"
+                        )
+                    })?;
+            }
+
+            Ok(CatalogSnapshotContract {
+                skill_bundles: Some(extension.skill_bundles),
+                mission_context_version: Some(extension.mission_context_version),
+            })
+        }
+        Some(version) => anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: unsupported catalog snapshot format version {version}"
+        ),
+    }
+}
+
+fn referenced_external_skills(
+    catalog: &catalog::AgentCatalogFile,
+) -> Result<BTreeMap<String, catalog::SkillDef>> {
+    let skills = catalog.skills.as_ref();
+    let mut referenced = BTreeMap::new();
+    for agent in catalog.agents.as_deref().unwrap_or_default() {
+        let Some(skill_ref) = agent.skill_ref.as_ref() else {
+            continue;
+        };
+        let skill = skills
+            .and_then(|skills| skills.get(skill_ref))
+            .ok_or_else(|| anyhow::anyhow!("skill_ref '{skill_ref}' not found in catalog"))?;
+        if skill.skill_type == "external_skill" {
+            referenced.insert(skill_ref.clone(), skill.clone());
+        }
+    }
+    Ok(referenced)
+}
+
 fn compile_loaded(
     wf: definition::WorkflowFile,
     cat: catalog::AgentCatalogFile,
@@ -132,11 +317,11 @@ fn compile_loaded(
     catalog_raw: serde_yaml::Value,
     catalog_base: &Path,
     snapshots: Option<SnapshotJson>,
+    catalog_snapshot_override: Option<String>,
+    embedded_skill_bundles: Option<BTreeMap<String, crate::skill_bundle::EmbeddedSkillBundle>>,
+    mission_context_version: Option<String>,
 ) -> Result<RunPlan> {
     catalog::validate_catalog_has_exactly_one_system_lead(&cat)?;
-    if snapshots.is_some() {
-        catalog::validate_catalog_snapshot_format_version(&cat)?;
-    }
     catalog::validate_toolchain_cache_policies(&cat)?;
     let direct_command_scan =
         crate::direct_command::scan_catalog(&cat, &wf, &workflow_raw, &catalog_raw);
@@ -182,14 +367,19 @@ fn compile_loaded(
     };
     let catalog_snapshot_json = match snapshots.as_ref() {
         Some(snapshot) => snapshot.catalog_json.clone(),
-        None => {
-            canonical_json_string(&cat).context("serializing canonical agent catalog snapshot")?
-        }
+        None => catalog_snapshot_override.unwrap_or(
+            canonical_json_string(&cat).context("serializing canonical agent catalog snapshot")?,
+        ),
     };
     let workflow_snapshot_hash = sha256_string(&workflow_snapshot_json);
     let catalog_snapshot_hash = sha256_string(&catalog_snapshot_json);
 
-    let agent_lookup = build_agent_lookup(&cat, catalog_base, &direct_command_scan)?;
+    let agent_lookup = build_agent_lookup(
+        &cat,
+        catalog_base,
+        &direct_command_scan,
+        embedded_skill_bundles.as_ref(),
+    )?;
     let contract_lookup = build_contract_lookup(&cat);
 
     // Convert variables from serde_yaml::Value to serde_json::Value.
@@ -217,8 +407,11 @@ fn compile_loaded(
 
     // P060: Compile dynamic candidate bindings from routing metadata.
     // Must happen before consuming cat.artifacts.
-    let dynamic_candidate_bindings =
-        compile_dynamic_candidate_bindings(&cat, &catalog_snapshot_hash);
+    let dynamic_candidate_bindings = compile_dynamic_candidate_bindings_with_resolved_agents(
+        &cat,
+        &catalog_snapshot_hash,
+        &agent_lookup,
+    )?;
 
     // P058: Compile escalation policies before any partial moves on `cat`.
     // Build the set of unsafe stage IDs for compile validation (SEC-P058-001).
@@ -311,6 +504,7 @@ fn compile_loaded(
         catalog_snapshot_hash,
         workflow_snapshot_json,
         catalog_snapshot_json,
+        mission_context_version,
         dynamic_candidate_bindings,
         run_plan_snapshot_format_version,
         closeout_readiness_mode,
@@ -504,6 +698,7 @@ fn build_agent_lookup(
     cat: &catalog::AgentCatalogFile,
     catalog_base: &Path,
     direct_command_scan: &DirectCommandScan,
+    embedded_skill_bundles: Option<&BTreeMap<String, crate::skill_bundle::EmbeddedSkillBundle>>,
 ) -> Result<HashMap<String, AgentBinding>> {
     let empty_profiles = HashMap::new();
     let profiles = cat.backend_profiles.as_ref().unwrap_or(&empty_profiles);
@@ -550,44 +745,35 @@ fn build_agent_lookup(
 
         // Resolve skill if referenced.
         let resolved_skill = if let Some(skill_ref) = &agent.skill_ref {
-            match skills.get(skill_ref) {
-                Some(skill_def) => {
-                    match resolve_skill(
-                        skill_ref,
-                        skill_def,
-                        agent.skill_role.as_deref(),
-                        catalog_base,
-                    ) {
-                        Ok(rs) => {
-                            info!(
-                                agent_id = %agent.id,
-                                skill_id = %rs.id,
-                                skill_type = %rs.skill_type,
-                                role = ?rs.role,
-                                content_len = rs.injected_content.len(),
-                                "Skill resolved"
-                            );
-                            Some(rs)
-                        }
-                        Err(e) => {
-                            warn!(
-                                agent_id = %agent.id,
-                                skill_ref = %skill_ref,
-                                "Failed to resolve skill: {e:#}"
-                            );
-                            None
-                        }
-                    }
-                }
-                None => {
-                    warn!(
-                        agent_id = %agent.id,
-                        skill_ref = %skill_ref,
-                        "skill_ref not found in catalog skills section"
-                    );
-                    None
-                }
-            }
+            let skill_def = skills.get(skill_ref).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Agent '{}' skill_ref '{}' not found in catalog skills section",
+                    agent.id,
+                    skill_ref
+                )
+            })?;
+            let resolved = resolve_skill(
+                skill_ref,
+                skill_def,
+                agent.skill_role.as_deref(),
+                catalog_base,
+                embedded_skill_bundles,
+            )
+            .with_context(|| {
+                format!(
+                    "Agent '{}' failed to resolve skill_ref '{}'",
+                    agent.id, skill_ref
+                )
+            })?;
+            info!(
+                agent_id = %agent.id,
+                skill_id = %resolved.id,
+                skill_type = %resolved.skill_type,
+                role = ?resolved.role,
+                content_len = resolved.injected_content.len(),
+                "Skill resolved"
+            );
+            Some(resolved)
         } else {
             None
         };
@@ -1085,6 +1271,7 @@ fn resolve_skill(
     skill_def: &catalog::SkillDef,
     skill_role: Option<&str>,
     catalog_base: &Path,
+    embedded_skill_bundles: Option<&BTreeMap<String, crate::skill_bundle::EmbeddedSkillBundle>>,
 ) -> Result<ResolvedSkill> {
     let skill_type_str = &skill_def.skill_type;
 
@@ -1100,34 +1287,22 @@ fn resolve_skill(
                 .path
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("external_skill '{skill_id}' missing 'path'"))?;
-            // SEC-002: Reject traversal and absolute paths before joining with catalog_base.
             validate_skill_relative_path(skill_id, "path", raw_path)?;
-            let bundle_dir = catalog_base.join(raw_path);
-            // SEC-002: After joining, verify the resolved path stays within the catalog base
-            // to block symlink-based escapes that component-level checks cannot catch.
-            if let (Ok(canon_base), Ok(canon_bundle)) = (
-                std::fs::canonicalize(catalog_base),
-                std::fs::canonicalize(&bundle_dir),
-            ) {
-                if !canon_bundle.starts_with(&canon_base) {
-                    anyhow::bail!("skill '{skill_id}': path escapes catalog root via symlink");
-                }
-            }
-            let skill_md = bundle_dir.join("SKILL.md");
-            // Reject symlinks within the bundle to prevent escape via indirection.
-            #[cfg(unix)]
-            if std::fs::symlink_metadata(&skill_md)
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false)
-            {
-                anyhow::bail!("SKILL.md for external skill '{skill_id}' must not be a symlink");
-            }
-            let content = std::fs::read_to_string(&skill_md).with_context(|| {
-                format!(
-                    "reading SKILL.md for external skill '{skill_id}' at {}",
-                    skill_md.display()
-                )
-            })?;
+            let content = if let Some(bundles) = embedded_skill_bundles {
+                let bundle = bundles.get(skill_id).ok_or_else(|| {
+                    anyhow::anyhow!("embedded bundle missing for external skill '{skill_id}'")
+                })?;
+                crate::skill_bundle::validate_embedded_skill_bundle(bundle, raw_path)?
+            } else {
+                // Legacy frozen snapshots preserve their historical path-based prompt bytes.
+                let skill_md = catalog_base.join(raw_path).join("SKILL.md");
+                std::fs::read_to_string(&skill_md).with_context(|| {
+                    format!(
+                        "reading legacy SKILL.md for external skill '{skill_id}' at {}",
+                        skill_md.display()
+                    )
+                })?
+            };
             if content.trim().is_empty() {
                 anyhow::bail!("SKILL.md is empty for external skill '{skill_id}'");
             }
@@ -1155,8 +1330,14 @@ fn resolve_skill(
     };
 
     // Step 2: Apply role specialization
-    let specialized =
-        apply_role_specialization(skill_id, &base_content, skill_role, skill_def, catalog_base);
+    let specialized = apply_role_specialization(
+        skill_id,
+        &base_content,
+        skill_role,
+        skill_def,
+        catalog_base,
+        embedded_skill_bundles.is_none(),
+    );
 
     // Step 3: Wrap with injection header (matches Swift SkillInjector)
     let injected_content = format!("## Skill: {skill_id}\nType: {type_label}\n\n{specialized}");
@@ -1177,6 +1358,7 @@ fn apply_role_specialization(
     skill_role: Option<&str>,
     skill_def: &catalog::SkillDef,
     catalog_base: &Path,
+    allow_legacy_role_files: bool,
 ) -> String {
     let Some(role) = skill_role else {
         return base_content.to_string();
@@ -1192,7 +1374,7 @@ fn apply_role_specialization(
     }
 
     // Try loading roles/{role}.md from external bundle.
-    if skill_def.skill_type == "external_skill" {
+    if allow_legacy_role_files && skill_def.skill_type == "external_skill" {
         if let Some(raw_path) = &skill_def.path {
             let role_file = catalog_base
                 .join(raw_path)
@@ -1365,6 +1547,25 @@ pub fn compile_dynamic_candidate_bindings(
     }
 
     bindings
+}
+
+fn compile_dynamic_candidate_bindings_with_resolved_agents(
+    cat: &catalog::AgentCatalogFile,
+    catalog_snapshot_hash: &str,
+    agents: &HashMap<String, AgentBinding>,
+) -> Result<Vec<domain::routing::CompiledDynamicAgentBinding>> {
+    let mut bindings = compile_dynamic_candidate_bindings(cat, catalog_snapshot_hash);
+    for binding in &mut bindings {
+        let resolved = resolve_agent(&binding.agent_id, agents)?;
+        binding.resolved_agent_snapshot_json =
+            serde_json::to_string(&resolved).with_context(|| {
+                format!(
+                    "serializing frozen dynamic agent binding for '{}'",
+                    binding.agent_id
+                )
+            })?;
+    }
+    Ok(bindings)
 }
 
 /// P060: Compile dynamic candidate bindings from already-parsed YAML paths.

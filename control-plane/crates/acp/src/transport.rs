@@ -35,14 +35,15 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
+use crate::adapters::claude::claude_sdk_debug_file_path;
 use crate::{
-    AcpCloseDiagnostic, AcpCompletionAbsenceReason, AcpCompletionCaptureSource,
-    AcpCompletionCaptureStatus, AcpCompletionTextCaptureMetadata, AcpMcpServerPayload,
-    AcpPromptProgressKind, AcpPromptProgressSink, AcpPromptProgressUpdate, AcpRuntimeReceipt,
-    AcpRuntimeReceiptCounters, AcpRuntimeReceiptEvent, AcpRuntimeReceiptHandshake,
-    AcpRuntimeReceiptPermissionRoundtrip, DiscoveredArtifact, DiscoveredArtifactSourceKind,
-    ExecutionRequest, McpActualObservation, NoopAcpPromptProgressSink, ResolvedMcpServerTransport,
-    UsageSnapshot,
+    AcpClaudeRuntimeDiagnostics, AcpCloseDiagnostic, AcpCompletionAbsenceReason,
+    AcpCompletionCaptureSource, AcpCompletionCaptureStatus, AcpCompletionTextCaptureMetadata,
+    AcpMcpServerPayload, AcpPromptProgressKind, AcpPromptProgressSink, AcpPromptProgressUpdate,
+    AcpRuntimeReceipt, AcpRuntimeReceiptCounters, AcpRuntimeReceiptEvent,
+    AcpRuntimeReceiptHandshake, AcpRuntimeReceiptPermissionRoundtrip, DiscoveredArtifact,
+    DiscoveredArtifactSourceKind, ExecutionRequest, McpActualObservation,
+    NoopAcpPromptProgressSink, ResolvedMcpServerTransport, UsageSnapshot,
 };
 
 /// Strip ANSI escape sequences from a string for clean log output.
@@ -364,6 +365,7 @@ const CLAUDE_LOCAL_ACTIVITY_MAX_READ_BYTES: u64 = 1024 * 1024;
 const PROVIDER_SESSION_STORE_LINE_CAP_BYTES: usize = 16 * 1024 * 1024;
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const LATE_RESPONSE_DIAGNOSTIC_WINDOW: Duration = Duration::from_secs(2);
+const CLAUDE_WATCHDOG_CANCEL_DRAIN_WINDOW: Duration = Duration::from_secs(5);
 
 enum AcpPromptReadOutcome {
     Read(Result<usize>),
@@ -387,6 +389,7 @@ const STREAMED_TRANSCRIPT_TRUNCATION_MARKER: &str =
     "\n[chainworks transcript truncated at 10485760 bytes]\n";
 const COMPLETION_CAPTURE_RAW_BYTE_LIMIT: usize = 1024 * 1024;
 const RUNTIME_RECEIPT_EVENT_SAMPLE_LIMIT: usize = 8;
+const CLAUDE_SDK_DIAGNOSTIC_EVENT_LIMIT: usize = 64;
 
 #[derive(Clone, Debug, Default)]
 struct ClaudeLocalActivitySummary {
@@ -1565,6 +1568,7 @@ fn max_instant_option(base: Instant, candidate: Option<Instant>) -> Instant {
 }
 
 pub(crate) fn handshake_timeout_for_provider(provider: &str) -> Duration {
+    let provider = provider.strip_suffix("_acp").unwrap_or(provider);
     if provider.eq_ignore_ascii_case("gemini") {
         GEMINI_HANDSHAKE_TIMEOUT
     } else {
@@ -3528,6 +3532,7 @@ pub struct AcpTransportSession {
     permission_grant_debounce: Duration,
     xcode_shim_injected: bool,
     requires_xcode_host_execution: bool,
+    claude_sdk_debug_file_path: Option<String>,
     last_runtime_receipt: Option<AcpRuntimeReceipt>,
 }
 
@@ -3542,6 +3547,7 @@ struct RuntimeReceiptTracker {
     last_events: Vec<AcpRuntimeReceiptEvent>,
     last_event_kind: Option<String>,
     last_event_at_ms: Option<u64>,
+    claude_diagnostics: Option<AcpClaudeRuntimeDiagnostics>,
     /// P079-SEC-HIGH-001: true when the repair turn was terminated by a posture
     /// denial. Propagated to AcpRuntimeReceipt.p079_unsafe_continuation.
     p079_unsafe_continuation: bool,
@@ -3581,6 +3587,7 @@ impl RuntimeReceiptTracker {
             last_events: Vec::new(),
             last_event_kind: None,
             last_event_at_ms: None,
+            claude_diagnostics: None,
             p079_unsafe_continuation: false,
         }
     }
@@ -3638,6 +3645,87 @@ impl RuntimeReceiptTracker {
     fn note_terminal_response(&mut self, status: &str) {
         self.handshake.terminal_response_at_ms = Some(self.elapsed_ms());
         self.push_event("terminal_response", Some(format!("status={status}")));
+    }
+
+    fn configure_claude_diagnostics(&mut self, debug_file_path: Option<String>) {
+        self.claude_diagnostics = Some(AcpClaudeRuntimeDiagnostics {
+            debug_file_path,
+            ..AcpClaudeRuntimeDiagnostics::default()
+        });
+    }
+
+    fn note_claude_sdk_message(&mut self, parsed: &Value) -> bool {
+        let Some(observation) = claude_sdk_message_observation(parsed) else {
+            return false;
+        };
+        let at_ms = self.elapsed_ms();
+        let diagnostics = self
+            .claude_diagnostics
+            .get_or_insert_with(AcpClaudeRuntimeDiagnostics::default);
+        diagnostics.raw_sdk_message_count += 1;
+        diagnostics.last_sdk_message_type = Some(observation.message_type.clone());
+        diagnostics.last_sdk_message_subtype = observation.subtype.clone();
+        match observation.message_type.as_str() {
+            "stream_event" => {
+                diagnostics.stream_event_count += 1;
+                diagnostics.last_stream_event_type = observation.stream_event_type.clone();
+            }
+            "assistant" => diagnostics.assistant_count += 1,
+            "result" => {
+                diagnostics.result_count += 1;
+                diagnostics.result_seen = true;
+            }
+            "system" if observation.subtype.as_deref() == Some("session_state_changed") => {
+                diagnostics.session_state_changed_count += 1;
+                if observation.session_state.as_deref() == Some("idle") {
+                    diagnostics.idle_seen = true;
+                }
+            }
+            _ => {}
+        }
+        diagnostics.sanitized_events.push(AcpRuntimeReceiptEvent {
+            at_ms,
+            kind: format!("claude_sdk:{}", observation.message_type),
+            detail: Some(observation.detail),
+        });
+        if diagnostics.sanitized_events.len() > CLAUDE_SDK_DIAGNOSTIC_EVENT_LIMIT {
+            diagnostics.sanitized_events.remove(0);
+            diagnostics.sanitized_events_truncated = true;
+        }
+        true
+    }
+
+    fn note_claude_watchdog_cancel_sent(&mut self, send_succeeded: bool) {
+        let diagnostics = self
+            .claude_diagnostics
+            .get_or_insert_with(AcpClaudeRuntimeDiagnostics::default);
+        diagnostics.cancel_sent_on_watchdog = true;
+        diagnostics.cancel_send_succeeded = send_succeeded;
+        diagnostics.result_seen_before_cancel = diagnostics.result_seen;
+        diagnostics.idle_seen_before_cancel = diagnostics.idle_seen;
+        self.push_event(
+            "claude_watchdog_cancel_sent",
+            Some(format!("send_succeeded={send_succeeded}")),
+        );
+    }
+
+    fn note_claude_cancel_drain_message(&mut self) {
+        let diagnostics = self
+            .claude_diagnostics
+            .get_or_insert_with(AcpClaudeRuntimeDiagnostics::default);
+        diagnostics.cancel_drain_message_count += 1;
+    }
+
+    fn note_claude_cancel_flush_observed(&mut self, status: &str) {
+        let diagnostics = self
+            .claude_diagnostics
+            .get_or_insert_with(AcpClaudeRuntimeDiagnostics::default);
+        diagnostics.cancel_flush_observed = true;
+        diagnostics.cancel_terminal_status = Some(status.to_string());
+        self.push_event(
+            "claude_watchdog_cancel_flush_observed",
+            Some(format!("status={status}")),
+        );
     }
 
     fn note_incoming_message(&mut self, detail: Option<String>) {
@@ -3853,9 +3941,239 @@ impl RuntimeReceiptTracker {
                 .collect(),
             first_events: self.first_events.clone(),
             last_events: self.last_events.clone(),
+            claude_diagnostics: self.claude_diagnostics.clone(),
             p079_unsafe_continuation: self.p079_unsafe_continuation,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct ClaudeSdkMessageObservation {
+    message_type: String,
+    subtype: Option<String>,
+    stream_event_type: Option<String>,
+    session_state: Option<String>,
+    detail: String,
+}
+
+fn bounded_claude_diagnostic_scalar(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(|text| text.chars().take(96).collect::<String>())
+        .filter(|text| !text.is_empty())
+}
+
+fn claude_sdk_message_observation(parsed: &Value) -> Option<ClaudeSdkMessageObservation> {
+    if parsed.get("method").and_then(Value::as_str) != Some("_claude/sdkMessage") {
+        return None;
+    }
+    let message = parsed.pointer("/params/message")?;
+    let message_type = bounded_claude_diagnostic_scalar(message.get("type")?)?;
+    let subtype = message
+        .get("subtype")
+        .and_then(bounded_claude_diagnostic_scalar);
+    let accepted = matches!(
+        message_type.as_str(),
+        "stream_event" | "assistant" | "result"
+    ) || (message_type == "system"
+        && subtype.as_deref() == Some("session_state_changed"));
+    if !accepted {
+        return None;
+    }
+
+    let stream_event_type = message
+        .pointer("/event/type")
+        .and_then(bounded_claude_diagnostic_scalar);
+    let session_state = message
+        .get("state")
+        .and_then(bounded_claude_diagnostic_scalar);
+    let mut detail = vec![format!("type={message_type}")];
+    if let Some(subtype) = &subtype {
+        detail.push(format!("subtype={subtype}"));
+    }
+    if let Some(uuid) = message
+        .get("uuid")
+        .and_then(bounded_claude_diagnostic_scalar)
+    {
+        detail.push(format!("uuid={uuid}"));
+    }
+    if let Some(message_id) = message
+        .pointer("/message/id")
+        .and_then(bounded_claude_diagnostic_scalar)
+    {
+        detail.push(format!("message_id={message_id}"));
+    }
+    if let Some(stop_reason) = message
+        .pointer("/message/stop_reason")
+        .and_then(bounded_claude_diagnostic_scalar)
+    {
+        detail.push(format!("stop_reason={stop_reason}"));
+    }
+    if let Some(event_type) = &stream_event_type {
+        detail.push(format!("stream_event={event_type}"));
+    }
+    if let Some(index) = message.pointer("/event/index").and_then(Value::as_u64) {
+        detail.push(format!("index={index}"));
+    }
+    if let Some(state) = &session_state {
+        detail.push(format!("state={state}"));
+    }
+
+    let content_blocks: Vec<&Value> = message
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .map(|blocks| blocks.iter().collect())
+        .or_else(|| {
+            message
+                .pointer("/event/content_block")
+                .map(|block| vec![block])
+        })
+        .unwrap_or_default();
+    let content_types: Vec<String> = content_blocks
+        .iter()
+        .filter_map(|block| block.get("type").and_then(bounded_claude_diagnostic_scalar))
+        .collect();
+    if !content_types.is_empty() {
+        detail.push(format!("content_types={}", content_types.join(",")));
+    }
+    for block in content_blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+    {
+        if let Some(name) = block.get("name").and_then(bounded_claude_diagnostic_scalar) {
+            detail.push(format!("tool_name={name}"));
+        }
+        if let Some(tool_use_id) = block.get("id").and_then(bounded_claude_diagnostic_scalar) {
+            detail.push(format!("tool_use_id={tool_use_id}"));
+        }
+    }
+
+    Some(ClaudeSdkMessageObservation {
+        message_type,
+        subtype,
+        stream_event_type,
+        session_state,
+        detail: detail.join(";"),
+    })
+}
+
+fn claude_sdk_message_extends_watchdog(parsed: &Value) -> bool {
+    let Some(observation) = claude_sdk_message_observation(parsed) else {
+        return false;
+    };
+
+    matches!(
+        (
+            observation.message_type.as_str(),
+            observation.stream_event_type.as_deref()
+        ),
+        ("assistant", _)
+            | (
+                "stream_event",
+                Some("content_block_start" | "content_block_delta" | "content_block_stop")
+            )
+    )
+}
+
+fn session_cancel_notification(session_id: &str) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": session_id}
+    })
+}
+
+fn is_claude_provider(provider: &str) -> bool {
+    provider
+        .strip_suffix("_acp")
+        .unwrap_or(provider)
+        .eq_ignore_ascii_case("claude")
+}
+
+async fn cancel_and_drain_claude_watchdog<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    session_id: &str,
+    prompt_id: &str,
+    max_line_bytes: usize,
+    drain_window: Duration,
+    runtime_receipt: &mut RuntimeReceiptTracker,
+) -> Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let cancel = session_cancel_notification(session_id);
+    let mut payload = serde_json::to_vec(&cancel).context("serialize ACP session/cancel")?;
+    payload.push(b'\n');
+    if let Err(error) = writer.write_all(&payload).await {
+        runtime_receipt.note_claude_watchdog_cancel_sent(false);
+        return Err(error).context("write ACP session/cancel");
+    }
+    writer.flush().await.context("flush ACP session/cancel")?;
+    runtime_receipt.note_claude_watchdog_cancel_sent(true);
+
+    let drain_started = Instant::now();
+    let mut line = String::new();
+    loop {
+        let remaining = drain_window.saturating_sub(drain_started.elapsed());
+        if remaining.is_zero() {
+            runtime_receipt.push_event(
+                "claude_watchdog_cancel_drain_finished",
+                Some("reason=timeout".to_string()),
+            );
+            break;
+        }
+        let n = match timeout(
+            remaining,
+            read_capped_ndjson_line(
+                reader,
+                &mut line,
+                max_line_bytes,
+                "Claude watchdog cancel drain",
+            ),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                runtime_receipt.push_event(
+                    "claude_watchdog_cancel_drain_finished",
+                    Some("reason=timeout".to_string()),
+                );
+                break;
+            }
+        };
+        if n == 0 {
+            runtime_receipt.push_event(
+                "claude_watchdog_cancel_drain_finished",
+                Some("reason=stdout_closed".to_string()),
+            );
+            break;
+        }
+        let Ok(parsed) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        runtime_receipt.note_claude_cancel_drain_message();
+        runtime_receipt.note_incoming_message(summarize_runtime_receipt_message(&parsed));
+        runtime_receipt.note_claude_sdk_message(&parsed);
+
+        if parsed.get("id").and_then(normalize_jsonrpc_id).as_deref() == Some(prompt_id) {
+            let status = if parsed.get("error").is_some() {
+                "failed".to_string()
+            } else {
+                parsed
+                    .pointer("/result/stopReason")
+                    .or_else(|| parsed.pointer("/result/stop_reason"))
+                    .and_then(bounded_claude_diagnostic_scalar)
+                    .unwrap_or_else(|| "terminal".to_string())
+            };
+            runtime_receipt.note_claude_cancel_flush_observed(&status);
+            runtime_receipt.note_terminal_response(&status);
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn truncate_runtime_receipt_detail(detail: &str) -> String {
@@ -4378,6 +4696,44 @@ impl AcpTransportSession {
         receipt
     }
 
+    async fn diagnose_claude_watchdog_timeout(
+        &mut self,
+        req: &ExecutionRequest,
+        prompt_id: &str,
+        phase: &str,
+        runtime_receipt: &mut RuntimeReceiptTracker,
+    ) {
+        if !is_claude_provider(&self.provider) {
+            return;
+        }
+        runtime_receipt.push_event(
+            "claude_watchdog_cancel_requested",
+            Some(format!("phase={phase}")),
+        );
+        if let Err(error) = cancel_and_drain_claude_watchdog(
+            &mut self.reader,
+            &mut self.stdin,
+            &self.session_id,
+            prompt_id,
+            ndjson_line_cap_bytes(&req.expected_outputs),
+            CLAUDE_WATCHDOG_CANCEL_DRAIN_WINDOW,
+            runtime_receipt,
+        )
+        .await
+        {
+            runtime_receipt.push_event(
+                "claude_watchdog_cancel_drain_failed",
+                Some(error.to_string()),
+            );
+            warn!(
+                session_id = %self.session_id,
+                phase = phase,
+                error = %error,
+                "Claude watchdog cancel-drain failed"
+            );
+        }
+    }
+
     pub async fn start(
         child: Child,
         req: &ExecutionRequest,
@@ -4509,7 +4865,7 @@ impl AcpTransportSession {
             &mut reader,
             &mut child,
             &init_id,
-            HANDSHAKE_TIMEOUT,
+            handshake_timeout_for_provider(&req.provider),
             "initialize handshake",
         )
         .await
@@ -4722,6 +5078,8 @@ impl AcpTransportSession {
             permission_grant_debounce: config.permission_grant_debounce,
             xcode_shim_injected: req.xcode_shim_injection_signal,
             requires_xcode_host_execution: req.requires_xcode_host_execution,
+            claude_sdk_debug_file_path: claude_sdk_debug_file_path(req)
+                .map(|path| path.to_string_lossy().into_owned()),
             last_runtime_receipt,
         })
     }
@@ -4936,6 +5294,9 @@ impl AcpTransportSession {
             chrono::Utc::now() - chrono::Duration::milliseconds(startup_offset_ms as i64);
         let mut runtime_receipt =
             RuntimeReceiptTracker::new(runtime_started_wall, runtime_started_mono);
+        if is_claude_provider(&self.provider) {
+            runtime_receipt.configure_claude_diagnostics(self.claude_sdk_debug_file_path.clone());
+        }
         if req.reuse_existing_session {
             runtime_receipt.push_event(
                 "session_reused",
@@ -5195,6 +5556,13 @@ impl AcpTransportSession {
                             claude_local_activity.as_ref(),
                             codex_local_activity.as_ref(),
                         );
+                        self.diagnose_claude_watchdog_timeout(
+                            req,
+                            &prompt_id,
+                            "idle_timeout",
+                            &mut runtime_receipt,
+                        )
+                        .await;
                         self.last_runtime_receipt = Some(runtime_receipt.build(
                             &self.provider,
                             self.model.as_ref(),
@@ -5289,6 +5657,13 @@ impl AcpTransportSession {
                         claude_local_activity.as_ref(),
                         codex_local_activity.as_ref(),
                     );
+                    self.diagnose_claude_watchdog_timeout(
+                        req,
+                        &prompt_id,
+                        "progress_timeout",
+                        &mut runtime_receipt,
+                    )
+                    .await;
                     self.last_runtime_receipt = Some(runtime_receipt.build(
                         &self.provider,
                         self.model.as_ref(),
@@ -5602,6 +5977,18 @@ impl AcpTransportSession {
                             Some(receipt),
                         )));
                     } else {
+                        if matches!(
+                            failure_phase.as_deref(),
+                            Some("idle_timeout" | "progress_timeout")
+                        ) {
+                            self.diagnose_claude_watchdog_timeout(
+                                req,
+                                &prompt_id,
+                                failure_phase.as_deref().unwrap_or("prompt_stream_failed"),
+                                &mut runtime_receipt,
+                            )
+                            .await;
+                        }
                         self.last_runtime_receipt = Some(
                             runtime_receipt.build(
                                 &self.provider,
@@ -5680,6 +6067,35 @@ impl AcpTransportSession {
 
             if let Some(method) = parsed["method"].as_str() {
                 match method {
+                    "_claude/sdkMessage" => {
+                        // Claude delivers model output on this raw SDK channel rather than as a
+                        // session/update. Count only content-bearing events as progress so a
+                        // live stream cannot be cancelled by the ACP watchdog.
+                        let extends_watchdog = claude_sdk_message_extends_watchdog(&parsed);
+                        runtime_receipt.note_claude_sdk_message(&parsed);
+                        if extends_watchdog {
+                            last_acp_progress = Instant::now();
+                            if last_prompt_progress_reported
+                                .map(|reported_at| {
+                                    reported_at.elapsed() >= PROMPT_PROGRESS_REPORT_INTERVAL
+                                })
+                                .unwrap_or(true)
+                            {
+                                record_prompt_progress_detail_for_session(
+                                    req,
+                                    &progress_sink,
+                                    &self.session_id,
+                                    AcpPromptProgressKind::MeaningfulProgress,
+                                    Some("Claude SDK content streamed".to_string()),
+                                    Some("source=claude_sdk".to_string()),
+                                    Some("claude_sdk_stream".to_string()),
+                                )
+                                .await;
+                                last_prompt_progress_reported = Some(Instant::now());
+                            }
+                        }
+                        continue;
+                    }
                     "session/request_permission" => {
                         if let Some(req_id) = parsed.get("id") {
                             let params = parsed.get("params").cloned().unwrap_or(Value::Null);
@@ -6606,6 +7022,10 @@ mod tests {
             handshake_timeout_for_provider("Gemini"),
             Duration::from_secs(120)
         );
+        assert_eq!(
+            handshake_timeout_for_provider("gemini_acp"),
+            Duration::from_secs(120)
+        );
     }
 
     #[test]
@@ -6851,6 +7271,246 @@ mod tests {
                     .as_deref()
                     .is_some_and(|detail| detail.contains("open_background_tasks=1"))
         }));
+    }
+
+    #[test]
+    fn runtime_receipt_persists_sanitized_claude_sdk_boundary_events() {
+        let started_wall = chrono::Utc::now();
+        let started_mono = Instant::now();
+        let mut tracker = RuntimeReceiptTracker::new(started_wall, started_mono);
+        tracker
+            .configure_claude_diagnostics(Some("/tmp/claude-sdk-debug/agent-exec.log".to_string()));
+
+        for message in [
+            serde_json::json!({
+                "method": "_claude/sdkMessage",
+                "params": {"message": {
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_start",
+                        "index": 3,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": "toolu_14",
+                            "name": "Write",
+                            "input": {"file_path": "/secret/path", "content": "secret-body"}
+                        }
+                    }
+                }}
+            }),
+            serde_json::json!({
+                "method": "_claude/sdkMessage",
+                "params": {"message": {
+                    "type": "assistant",
+                    "uuid": "assistant-uuid",
+                    "message": {
+                        "id": "msg_14",
+                        "stop_reason": "tool_use",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "toolu_14",
+                            "name": "Write",
+                            "input": {"content": "secret-body"}
+                        }]
+                    }
+                }}
+            }),
+            serde_json::json!({
+                "method": "_claude/sdkMessage",
+                "params": {"message": {"type": "result", "subtype": "success"}}
+            }),
+            serde_json::json!({
+                "method": "_claude/sdkMessage",
+                "params": {"message": {
+                    "type": "system",
+                    "subtype": "session_state_changed",
+                    "state": "idle"
+                }}
+            }),
+        ] {
+            assert!(tracker.note_claude_sdk_message(&message));
+        }
+
+        let receipt = tracker.build(
+            "claude",
+            None,
+            "provider-session-1",
+            None,
+            false,
+            false,
+            "failed",
+            Some("progress_timeout".to_string()),
+        );
+        let diagnostics = receipt.claude_diagnostics.expect("Claude diagnostics");
+
+        assert_eq!(diagnostics.raw_sdk_message_count, 4);
+        assert_eq!(diagnostics.stream_event_count, 1);
+        assert_eq!(diagnostics.assistant_count, 1);
+        assert_eq!(diagnostics.result_count, 1);
+        assert_eq!(diagnostics.session_state_changed_count, 1);
+        assert!(diagnostics.result_seen);
+        assert!(diagnostics.idle_seen);
+        assert_eq!(
+            diagnostics.last_stream_event_type.as_deref(),
+            Some("content_block_start")
+        );
+        assert_eq!(
+            diagnostics.debug_file_path.as_deref(),
+            Some("/tmp/claude-sdk-debug/agent-exec.log")
+        );
+        let serialized = serde_json::to_string(&diagnostics).expect("serialize diagnostics");
+        assert!(serialized.contains("tool_name=Write"));
+        assert!(serialized.contains("tool_use_id=toolu_14"));
+        assert!(!serialized.contains("secret-body"));
+        assert!(!serialized.contains("/secret/path"));
+    }
+
+    #[test]
+    fn claude_sdk_content_stream_extends_watchdog_but_usage_does_not() {
+        let content_delta = serde_json::json!({
+            "method": "_claude/sdkMessage",
+            "params": {"message": {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "private output"}
+                }
+            }}
+        });
+        let usage_update = serde_json::json!({
+            "method": "_claude/sdkMessage",
+            "params": {"message": {
+                "type": "stream_event",
+                "event": {"type": "message_delta", "usage": {"output_tokens": 1}}
+            }}
+        });
+        let assistant_message = serde_json::json!({
+            "method": "_claude/sdkMessage",
+            "params": {"message": {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "private output"}]}
+            }}
+        });
+
+        assert!(claude_sdk_message_extends_watchdog(&content_delta));
+        assert!(claude_sdk_message_extends_watchdog(&assistant_message));
+        assert!(!claude_sdk_message_extends_watchdog(&usage_update));
+    }
+
+    #[test]
+    fn claude_watchdog_cancel_receipt_distinguishes_terminal_flush() {
+        assert_eq!(
+            session_cancel_notification("provider-session-1"),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": {"sessionId": "provider-session-1"}
+            })
+        );
+
+        let started_wall = chrono::Utc::now();
+        let started_mono = Instant::now();
+        let mut tracker = RuntimeReceiptTracker::new(started_wall, started_mono);
+        tracker.configure_claude_diagnostics(None);
+        tracker.note_claude_watchdog_cancel_sent(true);
+        tracker.note_claude_cancel_drain_message();
+        tracker.note_claude_cancel_flush_observed("cancelled");
+
+        let receipt = tracker.build(
+            "claude",
+            None,
+            "provider-session-1",
+            None,
+            false,
+            false,
+            "failed",
+            Some("progress_timeout".to_string()),
+        );
+        let diagnostics = receipt.claude_diagnostics.expect("Claude diagnostics");
+        assert!(diagnostics.cancel_sent_on_watchdog);
+        assert!(diagnostics.cancel_send_succeeded);
+        assert!(diagnostics.cancel_flush_observed);
+        assert_eq!(diagnostics.cancel_drain_message_count, 1);
+        assert_eq!(
+            diagnostics.cancel_terminal_status.as_deref(),
+            Some("cancelled")
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_watchdog_cancel_drains_raw_boundary_and_terminal_response() {
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let (server_read, mut server_write) = tokio::io::split(server);
+        let mut reader = BufReader::new(client_read);
+        let mut server_reader = BufReader::new(server_read);
+
+        let server_task = tokio::spawn(async move {
+            let mut cancel_line = String::new();
+            server_reader
+                .read_line(&mut cancel_line)
+                .await
+                .expect("read cancel");
+            assert_eq!(
+                serde_json::from_str::<Value>(cancel_line.trim()).expect("cancel json"),
+                session_cancel_notification("provider-session-1")
+            );
+            for message in [
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "_claude/sdkMessage",
+                    "params": {"message": {"type": "result", "subtype": "success"}}
+                }),
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "_claude/sdkMessage",
+                    "params": {"message": {
+                        "type": "system",
+                        "subtype": "session_state_changed",
+                        "state": "idle"
+                    }}
+                }),
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "chainworks-session-prompt-7",
+                    "result": {"stopReason": "cancelled"}
+                }),
+            ] {
+                server_write
+                    .write_all(format!("{}\n", message).as_bytes())
+                    .await
+                    .expect("write diagnostic response");
+            }
+        });
+
+        let mut tracker = RuntimeReceiptTracker::new(chrono::Utc::now(), Instant::now());
+        tracker.configure_claude_diagnostics(None);
+        cancel_and_drain_claude_watchdog(
+            &mut reader,
+            &mut client_write,
+            "provider-session-1",
+            "chainworks-session-prompt-7",
+            16 * 1024,
+            Duration::from_secs(1),
+            &mut tracker,
+        )
+        .await
+        .expect("cancel drain");
+        server_task.await.expect("server task");
+
+        let diagnostics = tracker
+            .claude_diagnostics
+            .expect("Claude diagnostics after cancel drain");
+        assert!(diagnostics.cancel_send_succeeded);
+        assert!(diagnostics.result_seen);
+        assert!(diagnostics.idle_seen);
+        assert!(diagnostics.cancel_flush_observed);
+        assert_eq!(diagnostics.cancel_drain_message_count, 3);
+        assert_eq!(
+            diagnostics.cancel_terminal_status.as_deref(),
+            Some("cancelled")
+        );
     }
 
     #[test]

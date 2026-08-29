@@ -1,0 +1,356 @@
+{
+  "schema_version": "agent_context_rollout_projection_fixture_v1",
+  "fixture_purpose": "Golden contract for lossless projection of canonical operator_readback_v1 producer output across run report, MCP, release receipt, and GraphQL after agent-context open.",
+  "proposal_id": "agent-context-skills-evals",
+  "proposal_revision_id": "design-ready-v1",
+  "gate": "proposal-agent-context-skills-evals|agent-context-skills-evals",
+  "canonical_producer": "control_plane_db_rollout_contract_check_operator_readback_json_for_lane_v1",
+  "parity_lanes": {
+    "run_report": {
+      "schema_version": "agent_context_rollout_projection_v1",
+      "operator_readback_mapping_version": "operator_readback_v1_to_agent_context_rollout_projection_v1",
+      "operator_readback": {
+        "schema_version": "operator_readback_v1",
+        "authoritative_record_id": "00000000-0000-0000-0000-000000000001",
+        "run_id": "00000000-0000-0000-0000-000000000002",
+        "proposal_id": "agent-context-skills-evals",
+        "proposal_revision_id": "design-ready-v1",
+        "status": "pass",
+        "backend_decision": "release",
+        "failure_reasons": [],
+        "waiver_state": "none",
+        "waiver_expires_at": null,
+        "waiver": null,
+        "enforcement_mode": "enforce",
+        "enforcement_mode_reason": null,
+        "hold_conditions": [],
+        "rollback_disposition": {
+          "schema_version": "rollback_disposition_v1",
+          "mode": "forward_fix_or_pre_adoption_exact_preimage_restore",
+          "data_loss_risk": "medium",
+          "steps": [
+            "Before any candidate or release-evidence issuance or selection depends on a staged external ruleset mutation, restore its authenticated exact preimage with an ETag compare-and-swap.",
+            "After candidate or release-evidence adoption or authority migration, keep admission held and ship a reviewed forward repair; do not disable or waive the functionality.",
+            "Preserve authority, migration, attempt, effect, incident, and evaluation history during repair.",
+            "Require the complete retained gate and fresh release evidence before reopening admission."
+          ]
+        },
+        "enabled_state": "enabled",
+        "disabled_reason_code": null,
+        "action_id": "rollout_contract_check:00000000-0000-0000-0000-000000000001",
+        "operator_message": "Rollout contract preflight passed; implementation scheduling may continue.",
+        "source_lane": "run_report",
+        "projection_integrity": "valid",
+        "cutover_policy_revision": "agent-context-skills-evals-cutover-v1",
+        "diagnostic_redaction": "partial",
+        "next_steps": [
+          "continue_implementation_scheduling"
+        ],
+        "adoption_metric": {
+          "name": "new_applicable_proposals_with_passing_rollout_contract_percent",
+          "applicable_proposals": 1,
+          "passing_rollout_contracts": 1,
+          "percent": 100.0,
+          "status": "pass"
+        },
+        "updated_at": "2026-08-27T00:00:00+00:00",
+        "rollout_contract_shutdown_deadline_config_state": "not_configured",
+        "rollout_contract_command_lease_ttl_config_state": "not_configured",
+        "p083_rollback_ttl_expires_at": null,
+        "p083_last_preflight_hash": null
+      },
+      "rollout_contract_status": "pass",
+      "rollout_contract_decision": "release",
+      "rollout_contract_failure_reasons": [],
+      "rollout_contract_waiver_state": "none",
+      "rollout_contract_waiver_expires_at": null,
+      "rollout_contract_enforcement_mode": "enforce",
+      "rollout_contract_enforcement_mode_reason": null,
+      "rollout_contract_hold_conditions": [],
+      "rollout_contract_rollback_disposition": {
+        "schema_version": "rollback_disposition_v1",
+        "mode": "forward_fix_or_pre_adoption_exact_preimage_restore",
+        "data_loss_risk": "medium",
+        "steps": [
+          "Before any candidate or release-evidence issuance or selection depends on a staged external ruleset mutation, restore its authenticated exact preimage with an ETag compare-and-swap.",
+          "After candidate or release-evidence adoption or authority migration, keep admission held and ship a reviewed forward repair; do not disable or waive the functionality.",
+          "Preserve authority, migration, attempt, effect, incident, and evaluation history during repair.",
+          "Require the complete retained gate and fresh release evidence before reopening admission."
+        ]
+      },
+      "rollout_contract_source_lane": "run_report",
+      "rollout_contract_enabled_state": "enabled",
+      "rollout_contract_disabled_reason_code": null,
+      "rollout_contract_action_id": "rollout_contract_check:00000000-0000-0000-0000-000000000001",
+      "rollout_contract_operator_message": "Rollout contract preflight passed; implementation scheduling may continue.",
+      "rollout_contract_projection_integrity": "valid",
+      "rollout_contract_cutover_policy_revision": "agent-context-skills-evals-cutover-v1",
+      "rollout_contract_diagnostic_redaction": "partial",
+      "rollout_contract_next_steps": [
+        "continue_implementation_scheduling"
+      ]
+    },
+    "mcp": {
+      "schema_version": "agent_context_rollout_projection_v1",
+      "operator_readback_mapping_version": "operator_readback_v1_to_agent_context_rollout_projection_v1",
+      "operator_readback": {
+        "schema_version": "operator_readback_v1",
+        "authoritative_record_id": "00000000-0000-0000-0000-000000000001",
+        "run_id": "00000000-0000-0000-0000-000000000002",
+        "proposal_id": "agent-context-skills-evals",
+        "proposal_revision_id": "design-ready-v1",
+        "status": "pass",
+        "backend_decision": "release",
+        "failure_reasons": [],
+        "waiver_state": "none",
+        "waiver_expires_at": null,
+        "waiver": null,
+        "enforcement_mode": "enforce",
+        "enforcement_mode_reason": null,
+        "hold_conditions": [],
+        "rollback_disposition": {
+          "schema_version": "rollback_disposition_v1",
+          "mode": "forward_fix_or_pre_adoption_exact_preimage_restore",
+          "data_loss_risk": "medium",
+          "steps": [
+            "Before any candidate or release-evidence issuance or selection depends on a staged external ruleset mutation, restore its authenticated exact preimage with an ETag compare-and-swap.",
+            "After candidate or release-evidence adoption or authority migration, keep admission held and ship a reviewed forward repair; do not disable or waive the functionality.",
+            "Preserve authority, migration, attempt, effect, incident, and evaluation history during repair.",
+            "Require the complete retained gate and fresh release evidence before reopening admission."
+          ]
+        },
+        "enabled_state": "enabled",
+        "disabled_reason_code": null,
+        "action_id": "rollout_contract_check:00000000-0000-0000-0000-000000000001",
+        "operator_message": "Rollout contract preflight passed; implementation scheduling may continue.",
+        "source_lane": "mcp",
+        "projection_integrity": "valid",
+        "cutover_policy_revision": "agent-context-skills-evals-cutover-v1",
+        "diagnostic_redaction": "partial",
+        "next_steps": [
+          "continue_implementation_scheduling"
+        ],
+        "adoption_metric": {
+          "name": "new_applicable_proposals_with_passing_rollout_contract_percent",
+          "applicable_proposals": 1,
+          "passing_rollout_contracts": 1,
+          "percent": 100.0,
+          "status": "pass"
+        },
+        "updated_at": "2026-08-27T00:00:00+00:00",
+        "rollout_contract_shutdown_deadline_config_state": "not_configured",
+        "rollout_contract_command_lease_ttl_config_state": "not_configured",
+        "p083_rollback_ttl_expires_at": null,
+        "p083_last_preflight_hash": null
+      },
+      "rollout_contract_status": "pass",
+      "rollout_contract_decision": "release",
+      "rollout_contract_failure_reasons": [],
+      "rollout_contract_waiver_state": "none",
+      "rollout_contract_waiver_expires_at": null,
+      "rollout_contract_enforcement_mode": "enforce",
+      "rollout_contract_enforcement_mode_reason": null,
+      "rollout_contract_hold_conditions": [],
+      "rollout_contract_rollback_disposition": {
+        "schema_version": "rollback_disposition_v1",
+        "mode": "forward_fix_or_pre_adoption_exact_preimage_restore",
+        "data_loss_risk": "medium",
+        "steps": [
+          "Before any candidate or release-evidence issuance or selection depends on a staged external ruleset mutation, restore its authenticated exact preimage with an ETag compare-and-swap.",
+          "After candidate or release-evidence adoption or authority migration, keep admission held and ship a reviewed forward repair; do not disable or waive the functionality.",
+          "Preserve authority, migration, attempt, effect, incident, and evaluation history during repair.",
+          "Require the complete retained gate and fresh release evidence before reopening admission."
+        ]
+      },
+      "rollout_contract_source_lane": "mcp",
+      "rollout_contract_enabled_state": "enabled",
+      "rollout_contract_disabled_reason_code": null,
+      "rollout_contract_action_id": "rollout_contract_check:00000000-0000-0000-0000-000000000001",
+      "rollout_contract_operator_message": "Rollout contract preflight passed; implementation scheduling may continue.",
+      "rollout_contract_projection_integrity": "valid",
+      "rollout_contract_cutover_policy_revision": "agent-context-skills-evals-cutover-v1",
+      "rollout_contract_diagnostic_redaction": "partial",
+      "rollout_contract_next_steps": [
+        "continue_implementation_scheduling"
+      ]
+    },
+    "release_receipt": {
+      "schema_version": "agent_context_rollout_projection_v1",
+      "operator_readback_mapping_version": "operator_readback_v1_to_agent_context_rollout_projection_v1",
+      "operator_readback": {
+        "schema_version": "operator_readback_v1",
+        "authoritative_record_id": "00000000-0000-0000-0000-000000000001",
+        "run_id": "00000000-0000-0000-0000-000000000002",
+        "proposal_id": "agent-context-skills-evals",
+        "proposal_revision_id": "design-ready-v1",
+        "status": "pass",
+        "backend_decision": "release",
+        "failure_reasons": [],
+        "waiver_state": "none",
+        "waiver_expires_at": null,
+        "waiver": null,
+        "enforcement_mode": "enforce",
+        "enforcement_mode_reason": null,
+        "hold_conditions": [],
+        "rollback_disposition": {
+          "schema_version": "rollback_disposition_v1",
+          "mode": "forward_fix_or_pre_adoption_exact_preimage_restore",
+          "data_loss_risk": "medium",
+          "steps": [
+            "Before any candidate or release-evidence issuance or selection depends on a staged external ruleset mutation, restore its authenticated exact preimage with an ETag compare-and-swap.",
+            "After candidate or release-evidence adoption or authority migration, keep admission held and ship a reviewed forward repair; do not disable or waive the functionality.",
+            "Preserve authority, migration, attempt, effect, incident, and evaluation history during repair.",
+            "Require the complete retained gate and fresh release evidence before reopening admission."
+          ]
+        },
+        "enabled_state": "enabled",
+        "disabled_reason_code": null,
+        "action_id": "rollout_contract_check:00000000-0000-0000-0000-000000000001",
+        "operator_message": "Rollout contract preflight passed; implementation scheduling may continue.",
+        "source_lane": "release_receipt",
+        "projection_integrity": "valid",
+        "cutover_policy_revision": "agent-context-skills-evals-cutover-v1",
+        "diagnostic_redaction": "partial",
+        "next_steps": [
+          "continue_implementation_scheduling"
+        ],
+        "adoption_metric": {
+          "name": "new_applicable_proposals_with_passing_rollout_contract_percent",
+          "applicable_proposals": 1,
+          "passing_rollout_contracts": 1,
+          "percent": 100.0,
+          "status": "pass"
+        },
+        "updated_at": "2026-08-27T00:00:00+00:00",
+        "rollout_contract_shutdown_deadline_config_state": "not_configured",
+        "rollout_contract_command_lease_ttl_config_state": "not_configured",
+        "p083_rollback_ttl_expires_at": null,
+        "p083_last_preflight_hash": null
+      },
+      "rollout_contract_status": "pass",
+      "rollout_contract_decision": "release",
+      "rollout_contract_failure_reasons": [],
+      "rollout_contract_waiver_state": "none",
+      "rollout_contract_waiver_expires_at": null,
+      "rollout_contract_enforcement_mode": "enforce",
+      "rollout_contract_enforcement_mode_reason": null,
+      "rollout_contract_hold_conditions": [],
+      "rollout_contract_rollback_disposition": {
+        "schema_version": "rollback_disposition_v1",
+        "mode": "forward_fix_or_pre_adoption_exact_preimage_restore",
+        "data_loss_risk": "medium",
+        "steps": [
+          "Before any candidate or release-evidence issuance or selection depends on a staged external ruleset mutation, restore its authenticated exact preimage with an ETag compare-and-swap.",
+          "After candidate or release-evidence adoption or authority migration, keep admission held and ship a reviewed forward repair; do not disable or waive the functionality.",
+          "Preserve authority, migration, attempt, effect, incident, and evaluation history during repair.",
+          "Require the complete retained gate and fresh release evidence before reopening admission."
+        ]
+      },
+      "rollout_contract_source_lane": "release_receipt",
+      "rollout_contract_enabled_state": "enabled",
+      "rollout_contract_disabled_reason_code": null,
+      "rollout_contract_action_id": "rollout_contract_check:00000000-0000-0000-0000-000000000001",
+      "rollout_contract_operator_message": "Rollout contract preflight passed; implementation scheduling may continue.",
+      "rollout_contract_projection_integrity": "valid",
+      "rollout_contract_cutover_policy_revision": "agent-context-skills-evals-cutover-v1",
+      "rollout_contract_diagnostic_redaction": "partial",
+      "rollout_contract_next_steps": [
+        "continue_implementation_scheduling"
+      ]
+    },
+    "graphql": {
+      "schemaVersion": "agent_context_rollout_projection_v1",
+      "operatorReadbackMappingVersion": "operator_readback_v1_to_agent_context_rollout_projection_v1",
+      "operatorReadback": {
+        "schemaVersion": "operator_readback_v1",
+        "authoritativeRecordId": "00000000-0000-0000-0000-000000000001",
+        "runId": "00000000-0000-0000-0000-000000000002",
+        "proposalId": "agent-context-skills-evals",
+        "proposalRevisionId": "design-ready-v1",
+        "status": "pass",
+        "backendDecision": "release",
+        "failureReasons": [],
+        "waiverState": "none",
+        "waiverExpiresAt": null,
+        "waiver": null,
+        "enforcementMode": "enforce",
+        "enforcementModeReason": null,
+        "holdConditions": [],
+        "rollbackDisposition": {
+          "schema_version": "rollback_disposition_v1",
+          "mode": "forward_fix_or_pre_adoption_exact_preimage_restore",
+          "dataLossRisk": "medium",
+          "steps": [
+            "Before any candidate or release-evidence issuance or selection depends on a staged external ruleset mutation, restore its authenticated exact preimage with an ETag compare-and-swap.",
+            "After candidate or release-evidence adoption or authority migration, keep admission held and ship a reviewed forward repair; do not disable or waive the functionality.",
+            "Preserve authority, migration, attempt, effect, incident, and evaluation history during repair.",
+            "Require the complete retained gate and fresh release evidence before reopening admission."
+          ]
+        },
+        "enabledState": "enabled",
+        "disabledReasonCode": null,
+        "actionId": "rollout_contract_check:00000000-0000-0000-0000-000000000001",
+        "operatorMessage": "Rollout contract preflight passed; implementation scheduling may continue.",
+        "sourceLane": "graphql",
+        "projectionIntegrity": "valid",
+        "cutoverPolicyRevision": "agent-context-skills-evals-cutover-v1",
+        "diagnosticRedaction": "partial",
+        "nextSteps": [
+          "continue_implementation_scheduling"
+        ],
+        "adoptionMetric": {
+          "name": "new_applicable_proposals_with_passing_rollout_contract_percent",
+          "applicableProposals": 1,
+          "passingRolloutContracts": 1,
+          "percent": 100.0,
+          "status": "pass"
+        },
+        "updatedAt": "2026-08-27T00:00:00+00:00",
+        "rollout_contract_shutdown_deadline_config_state": "not_configured",
+        "rollout_contract_command_lease_ttl_config_state": "not_configured",
+        "p083_rollback_ttl_expires_at": null,
+        "p083_last_preflight_hash": null
+      },
+      "rolloutContractStatus": "pass",
+      "rolloutContractDecision": "release",
+      "rolloutContractFailureReasons": [],
+      "rolloutContractWaiverState": "none",
+      "rolloutContractWaiverExpiresAt": null,
+      "rolloutContractEnforcementMode": "enforce",
+      "rolloutContractEnforcementModeReason": null,
+      "rolloutContractHoldConditions": [],
+      "rolloutContractRollbackDisposition": {
+        "schema_version": "rollback_disposition_v1",
+        "mode": "forward_fix_or_pre_adoption_exact_preimage_restore",
+        "dataLossRisk": "medium",
+        "steps": [
+          "Before any candidate or release-evidence issuance or selection depends on a staged external ruleset mutation, restore its authenticated exact preimage with an ETag compare-and-swap.",
+          "After candidate or release-evidence adoption or authority migration, keep admission held and ship a reviewed forward repair; do not disable or waive the functionality.",
+          "Preserve authority, migration, attempt, effect, incident, and evaluation history during repair.",
+          "Require the complete retained gate and fresh release evidence before reopening admission."
+        ]
+      },
+      "rolloutContractSourceLane": "graphql",
+      "rolloutContractEnabledState": "enabled",
+      "rolloutContractDisabledReasonCode": null,
+      "rolloutContractActionId": "rollout_contract_check:00000000-0000-0000-0000-000000000001",
+      "rolloutContractOperatorMessage": "Rollout contract preflight passed; implementation scheduling may continue.",
+      "rolloutContractProjectionIntegrity": "valid",
+      "rolloutContractCutoverPolicyRevision": "agent-context-skills-evals-cutover-v1",
+      "rolloutContractDiagnosticRedaction": "partial",
+      "rolloutContractNextSteps": [
+        "continue_implementation_scheduling"
+      ]
+    }
+  },
+  "invariants": {
+    "canonical_operator_readback_present": true,
+    "compatibility_aliases_derived_only": true,
+    "enabled_state": "enabled",
+    "enforcement_mode": "enforce",
+    "waiver_state": "none",
+    "disable_control_present": false,
+    "waiver_control_present": false,
+    "permissive_mode_present": false
+  }
+}

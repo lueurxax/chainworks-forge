@@ -1564,9 +1564,10 @@ Scope:
 - ledger/agent-execution/metadata commit inside the engine-owned start transaction (`proposal_058_claim_start`), including insert-or-ignore idempotency for the chain row
 - tier selection writes (`agent_execution_runtime_facts.would_select_*`) populated from the frozen `RunPlan` policy at agent-execution completion (`engine/src/shadow_escalation.rs`)
 - durable scheduler readback fields derived from redacted `escalation_events` (`waiting_retry_after_until`, `escalation_trace_json_redacted`, `external_acknowledgement_ref`, `feature_flag_state`, and per-attempt `digest_inputs`)
-- governed macOS read-surface components compile and are covered by focused Swift tests (`EscalationStatusCapsule`, `EscalationBannerStack`, `EscalationLineageView`, `EscalationPauseCard`, `EscalationTraceTimeline`, `DriftReviewSheet`, MenuBarExtra overflow routing, retained shared adapters, command disabled-state parity, actual drift sheet tier/trigger/max-attempt inputs, compact banner co-occurrence summarization, non-collapsed lineage disclosures, pause-card ultra-narrow fallback, SF Symbol availability, drift diff presentation, and read-only trace pasteboard copy)
+- governed macOS readback types compile and focused Swift tests prove elapsed-deadline DTO decoding, passive paused-state preservation, adapter publication, frozen fallback-tier presentation, and pause-reason vocabulary coverage
 - full P058 metric inventory declaration plus production emission from ledger/event writes for the metrics backed by durable escalation state
 - idempotency-key uniqueness enforced by migration `078_p058_escalation_idempotency.sql` (one chain per `run_id`/`stage_id`/`agent_id`/`policy_id`; one execution-metadata row per `ledger_id`/`tier_id`/`tier_attempt_index`)
+- operator-only elapsed-deadline recovery: a paused `escalation_deadline_elapsed` ledger can open one append-only, linked deadline window and queue its frozen current backend-profile tier; replay is idempotent, prior ledger timestamps/policy/attempt history remain unchanged, and every other pause reason fails closed
 
 Use when:
 
@@ -1576,6 +1577,7 @@ Use when:
 - changing artifact active-index source provenance
 - changing GraphQL or MCP execution truth readback
 - changing escalation domain types, repository layer, or GraphQL escalation readback
+- changing operator recovery for elapsed P058 escalation deadlines
 - changing escalation_policy_v1 YAML parsing, compile validation, or RunPlan policy snapshot
 
 Host policy:
@@ -1601,6 +1603,7 @@ Important:
 - runtime facts are durable typed execution truth, not log parsing
 - `InvokeAgent` provider startup must use the pre-created execution identity from the claim/start DTO; creating a second execution row after the claim boundary is a gate failure
 - P058 claim/start tests must run; compiling them with `--no-run` is not sufficient proof
+- P058 deadline-resume tests must prove that elapsed ledgers do not restart implicitly, explicit operator recovery queues the frozen tier, and command replay creates no duplicate window or work item
 - DB claim-start and MCP parity are executed single-job in gate-owned target directories so stale shared `target/` artifacts cannot satisfy or block the proof
 - `ignored_late_outputs` is output settlement truth, not an `AgentFailureKind`
 - stale output from `closed`, `superseded`, or `superseded_pending_retry` claims must never update active artifact truth
@@ -2524,6 +2527,34 @@ Important:
 - `p082` is accepted as an alias
 - this gate is behavioral, not only a static test-name inventory; a zero-test cargo filter is a gate failure
 - live-auth coverage must include MCP HTTP, MCP stdio, GraphQL HTTP bearer, and failed-serve paths
+
+### `proposal-094|p094`
+
+Retained historical alias proof gate for the workflow-owned quality-gate
+blocker boundary. The proposal is retired; durable behavior is documented in
+[`workflow-execution-engine.md`](workflow-execution-engine.md) and
+[`output-contracts-failure-evidence-and-recovery.md`](output-contracts-failure-evidence-and-recovery.md).
+
+Scope:
+
+- compiles the boundary evaluator, manual approval, and release routes from the stable workflow and catalog examples
+- proves malformed blocker payloads fail closed to implementation review refresh instead of release
+- proves lower-layer recovery, stale review, fresh local code, external blockers, and server-owned no-progress use distinct routes
+- verifies canonical DB, GraphQL, MCP, runtime-health, metric, and operator-report readback
+- verifies quality-gate and terminal artifact templates remain below the per-run `${CHAINWORKS_META_ROOT:-.chainworks}`
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-094
+./scripts/test-gate.sh p094
+```
+
+Important:
+
+- `p094` is accepted as an alias
+- static contract checks run before the focused Rust tests
+- a missing required route field, unknown enum, or non-array blocker collection must never normalize to `pass`
 
 ### `proposal-080|p080`
 

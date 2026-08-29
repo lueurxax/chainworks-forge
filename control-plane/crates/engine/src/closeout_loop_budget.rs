@@ -1,4 +1,6 @@
-use domain::stage::StageExecution;
+use std::collections::BTreeSet;
+
+use domain::stage::{StageExecution, StageStatus};
 
 pub fn closeout_loop_budget_remaining(
     plan: &workflow::plan::RunPlan,
@@ -32,8 +34,8 @@ pub(crate) fn closeout_loop_budget_exhaustion(
 fn loop_iterations_for_state(stages: &[StageExecution], state_id: &str) -> u64 {
     stages
         .iter()
-        .filter(|stage| stage.stage_id == state_id)
+        .filter(|stage| stage.stage_id == state_id && stage.status == StageStatus::Completed)
         .filter_map(|stage| u64::try_from(stage.iteration).ok())
-        .max()
-        .unwrap_or(0)
+        .collect::<BTreeSet<_>>()
+        .len() as u64
 }

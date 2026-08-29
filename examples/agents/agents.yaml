@@ -72,6 +72,7 @@ artifacts:
   release_bundle_manifest: ${CHAINWORKS_META_ROOT:-.chainworks}/release/bundle.json
   connect_upload_receipt: ${CHAINWORKS_META_ROOT:-.chainworks}/release/connect-upload.json
   delivery_receipt: ${CHAINWORKS_META_ROOT:-.chainworks}/release/delivery-receipt.json
+  run_report: ${CHAINWORKS_META_ROOT:-.chainworks}/reports/run-report.json
   final_feature_report: ${CHAINWORKS_META_ROOT:-.chainworks}/summaries/final-feature-report.json
   metrics_window: ${CHAINWORKS_META_ROOT:-.chainworks}/steward/metrics-window.json
   baseline_window: ${CHAINWORKS_META_ROOT:-.chainworks}/steward/baseline-window.json
@@ -99,16 +100,8 @@ skills:
       proposal reviewer agents. Run proposal-first, evidence-backed review through
       the requested role lens and output only the proposal_review_v1 contract.
   proposal_review_router_skill:
-    type: inline_skill
-    description: >-
-      Proposal-first review router and specialist reviewer skill. In routing mode,
-      build evidence-backed stack, surface, and risk tags, then select the smallest
-      sufficient reviewer set. In specialist role mode, review the proposal through
-      the requested lens only, using local proposal/docs/reference evidence first,
-      and output only the declared structured review contract. Do not require
-      build, daemon startup, UI smoke, benchmarks, fuzzing, or live runtime proof
-      in proposal-readiness review unless the user explicitly asks for runtime
-      validation.
+    type: external_skill
+    path: skills/proposal-review-router
   proposal_implementation_audit:
     type: inline_skill
     description: >-
@@ -127,8 +120,8 @@ skills:
     type: inline_skill
     description: Draft and refine product/technical proposals from idea + review feedback.
   code_writer_core:
-    type: inline_skill
-    description: Implement approved proposal incrementally in a dedicated worktree.
+    type: external_skill
+    path: skills/code-implementation
   security_checker_core:
     type: inline_skill
     description: Threat-model and review the implementation for security, privacy, secrets, auth, and unsafe defaults.
@@ -1597,6 +1590,8 @@ agents:
       Delegate all authoring, review, implementation, audit, docs, and release work to specialized agents.
 
       Aggregate only structured outputs, track loop counters, enforce gates, and stop on contradictions.
+
+      For assess_quality_gate_blockers, emit schema_version quality_gate_blocker_assessment_v1 and make blockers a JSON array, never prose. Each blocker object must include id, summary, blocker_signature_id, evidence_fingerprint, source_artifact_generation_id, observed_after_stage_execution_id, observed_after_agent_execution_id, owner_class, blocker_class, evidence_freshness, severity, release_blocking, allowed_workflow_routes, forbidden_routes, gate_command, and evidence_refs. Use an empty blockers array only when all canonical implementation review artifacts are release-ready.
 
       Never edit product code, never commit, never push, and never publish artifacts yourself.
 

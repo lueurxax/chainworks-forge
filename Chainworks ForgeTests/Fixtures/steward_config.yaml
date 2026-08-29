@@ -87,8 +87,8 @@ context_strategy_profiles:
 
 triggers:
   post_run_hook:
-    enabled: false
-    run_interval: 5
+    enabled: true
+    run_interval: 1
   on_config_change:
     enabled: true
   schedule:

@@ -541,28 +541,39 @@ private struct P031DaemonIdeaDetail: View {
 
                     Divider()
 
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Run Status")
-                    .font(.headline)
-                
-                // P036: use the canonical projected lane. .deferred surfaces unknown server
-                // statuses as an explicit projection-lag row rather than silently miscounting.
-                let waitingCount = runs.filter { $0.lane == .waiting }.count
-                let blockedCount = runs.filter { $0.lane == .blocked }.count
-                let runningCount = runs.filter { $0.lane == .running }.count
-                let completedCount = runs.filter { $0.lane == .completed }.count
-                let deferredCount = runs.filter { $0.lane == .deferred }.count
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Run Status")
+                            .font(.headline)
 
-                VStack(alignment: .leading, spacing: 8) {
-                    compactStatusStrip(label: "Waiting Approval", count: waitingCount, color: .orange)
-                    compactStatusStrip(label: "Blocked or Failed", count: blockedCount, color: .red)
-                    compactStatusStrip(label: "Running", count: runningCount, color: .blue)
-                    compactStatusStrip(label: "Completed", count: completedCount, color: .green)
-                    if deferredCount > 0 {
-                        compactStatusStrip(label: "Status Unknown", count: deferredCount, color: .gray)
+                        if runs.isEmpty {
+                            ContentUnavailableView(
+                                "No runs yet",
+                                systemImage: "play.slash",
+                                description: Text("Run status will appear after a daemon-backed run starts for this idea.")
+                            )
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 20)
+                            .accessibilityIdentifier("idea-run-status-empty")
+                        } else {
+                            // P036: use the canonical projected lane. .deferred surfaces unknown server
+                            // statuses as an explicit projection-lag row rather than silently miscounting.
+                            let waitingCount = runs.filter { $0.lane == .waiting }.count
+                            let blockedCount = runs.filter { $0.lane == .blocked }.count
+                            let runningCount = runs.filter { $0.lane == .running }.count
+                            let completedCount = runs.filter { $0.lane == .completed }.count
+                            let deferredCount = runs.filter { $0.lane == .deferred }.count
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                compactStatusStrip(label: "Waiting Approval", count: waitingCount, color: .orange)
+                                compactStatusStrip(label: "Blocked or Failed", count: blockedCount, color: .red)
+                                compactStatusStrip(label: "Running", count: runningCount, color: .blue)
+                                compactStatusStrip(label: "Completed", count: completedCount, color: .green)
+                                if deferredCount > 0 {
+                                    compactStatusStrip(label: "Status Unknown", count: deferredCount, color: .gray)
+                                }
+                            }
+                        }
                     }
-                }
-            }
         } else if isLoading {
                     ProgressView("Loading ideas")
                 } else {

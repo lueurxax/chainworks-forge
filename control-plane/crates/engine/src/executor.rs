@@ -27,8 +27,8 @@ use db::repos::{
     agent_execution_runtime_receipts, agent_executions, agent_retry_budget_ledger,
     artifact_contracts, artifacts, code_writer_completion_receipts, escalation as escalation_repo,
     evidence_spool_refs, ideas, legacy_discovery_overrides, output_contract_repair as ocr_repo,
-    p080, projections, provider_sessions, rollout_contract_checks, runs, scheduler, sessions,
-    stages, storage_health, validation, work_items, workflow_conflicts,
+    p080, projections, provider_sessions, retry_operator_instructions, rollout_contract_checks,
+    runs, scheduler, sessions, stages, storage_health, validation, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use db::write_class::{WriteLane, WriteResult};
@@ -68,6 +68,156 @@ use workflow::catalog::{AgentCatalogFile, AgentEntry};
 const MAX_P086_OUTPUT_ONLY_SOURCE_SNAPSHOT_BYTES: u64 = 2 * 1024 * 1024;
 const TERMINAL_INVOKE_RECOVERY_SWEEP_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(10);
+
+async fn append_retry_operator_instruction_for_invocation(
+    pool: &SqlitePool,
+    payload: &serde_json::Value,
+    work_item_id: &str,
+    run_id: RunId,
+    stage_id: &str,
+    stage_execution_id: Option<domain::ids::StageExecutionId>,
+    agent_execution_id: domain::ids::AgentExecutionId,
+    prompt: &mut String,
+) -> Result<bool> {
+    let payload_instruction = payload
+        .get("operator_retry_instruction")
+        .cloned()
+        .map(serde_json::from_value::<domain::retry_instruction::OperatorRetryInstructionPayload>)
+        .transpose()
+        .context("parse operator_retry_instruction payload")?;
+
+    let mut tx = pool.begin().await?;
+    let delivery =
+        retry_operator_instructions::find_delivery_for_work_item_tx(&mut tx, work_item_id).await?;
+    let Some(delivery) = delivery else {
+        if payload_instruction.is_some() {
+            anyhow::bail!(
+                "P065 retry instruction payload for work item {work_item_id} has no durable delivery"
+            );
+        }
+        return Ok(false);
+    };
+    let Some(payload_instruction) = payload_instruction else {
+        if delivery.status == domain::retry_instruction::RetryInstructionDeliveryStatus::Pending {
+            retry_operator_instructions::mark_failed_tx(
+                &mut tx,
+                &delivery.delivery_id,
+                "missing_operator_retry_instruction_payload",
+            )
+            .await?;
+            tx.commit().await?;
+        }
+        anyhow::bail!(
+            "P065 durable delivery {} has no operator_retry_instruction payload",
+            delivery.delivery_id
+        );
+    };
+    let binding = retry_operator_instructions::find_binding_by_id_tx(&mut tx, &delivery.binding_id)
+        .await?
+        .with_context(|| {
+            format!(
+                "P065 retry instruction binding {} is missing",
+                delivery.binding_id
+            )
+        })?;
+    let retry_stage_execution_id = stage_execution_id.context(
+        "P065 retry instruction cannot be delivered to an invocation without stage execution identity",
+    )?;
+    let canonical_instruction =
+        domain::retry_instruction::validate_operator_instruction(&binding.instruction_text)
+            .map_err(|error| {
+                anyhow::anyhow!("invalid durable P065 operator instruction: {error}")
+            })?;
+    let canonical_sha256 = domain::retry_instruction::instruction_sha256(&canonical_instruction);
+
+    let mismatch = if binding.run_id != run_id {
+        Some("run_id")
+    } else if binding.stage_id != stage_id {
+        Some("stage_id")
+    } else if binding.retry_stage_execution_id != retry_stage_execution_id {
+        Some("retry_stage_execution_id")
+    } else if payload_instruction.binding_id != binding.binding_id {
+        Some("binding_id")
+    } else if payload_instruction.journal_id != binding.journal_id {
+        Some("journal_id")
+    } else if payload_instruction.scope_kind != binding.scope_kind {
+        Some("scope_kind")
+    } else if payload_instruction.instruction != canonical_instruction {
+        Some("instruction")
+    } else if payload_instruction.instruction_sha256 != binding.instruction_sha256
+        || binding.instruction_sha256 != canonical_sha256
+    {
+        Some("instruction_sha256")
+    } else if delivery.binding_id != binding.binding_id {
+        Some("delivery_binding_id")
+    } else if delivery.work_item_id.as_deref() != Some(work_item_id) {
+        Some("delivery_work_item_id")
+    } else {
+        None
+    };
+    if let Some(field) = mismatch {
+        if delivery.status == domain::retry_instruction::RetryInstructionDeliveryStatus::Pending {
+            retry_operator_instructions::mark_failed_tx(
+                &mut tx,
+                &delivery.delivery_id,
+                &format!("operator_retry_instruction_{field}_mismatch"),
+            )
+            .await?;
+            tx.commit().await?;
+        }
+        anyhow::bail!(
+            "P065 retry instruction delivery {} failed closed: {field} mismatch",
+            delivery.delivery_id
+        );
+    }
+    if delivery.status == domain::retry_instruction::RetryInstructionDeliveryStatus::Failed {
+        anyhow::bail!(
+            "P065 retry instruction delivery {} is already failed: {}",
+            delivery.delivery_id,
+            delivery.failure_reason.as_deref().unwrap_or("unspecified")
+        );
+    }
+    if delivery.status == domain::retry_instruction::RetryInstructionDeliveryStatus::Delivered
+        && delivery.agent_execution_id != Some(agent_execution_id)
+    {
+        anyhow::bail!(
+            "P065 retry instruction delivery {} is already bound to a different agent execution",
+            delivery.delivery_id
+        );
+    }
+
+    append_operator_retry_instruction_prompt(
+        prompt,
+        &canonical_instruction,
+        &binding.instruction_sha256,
+    );
+    if delivery.status == domain::retry_instruction::RetryInstructionDeliveryStatus::Pending {
+        retry_operator_instructions::mark_delivered_for_agent_tx(
+            &mut tx,
+            &delivery.delivery_id,
+            agent_execution_id,
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+fn append_operator_retry_instruction_prompt(
+    prompt: &mut String,
+    instruction: &str,
+    instruction_sha256: &str,
+) {
+    prompt.push_str(
+        "\n\n### One-shot Operator Retry Instruction\n\
+         Apply this instruction only to this retry-created invocation and only within the frozen workflow and proposal boundaries. If it conflicts with frozen truth, report the conflict instead of broadening scope.\n",
+    );
+    prompt.push_str(&format!(
+        "Instruction SHA-256: `{instruction_sha256}`\n<operator_retry_instruction>\n"
+    ));
+    prompt.push_str(instruction);
+    prompt.push_str("\n</operator_retry_instruction>\n");
+}
 
 async fn close_invalidated_acp_sessions<F, Fut>(
     invalidated_generation_ids: &[String],
@@ -535,6 +685,120 @@ async fn resolve_escalation_chain_candidate(
         resolved_tier_kind_raw,
         None,
     )))
+}
+
+/// Targeted P058 retries keep a single durable escalation ledger across new
+/// stage executions. The fallback profile may not match the policy's original
+/// `applies_to` profile, so resolving only from the current payload would start
+/// an unrelated chain and lose the next-tier transition after a retry failure.
+async fn resolve_targeted_p058_retry_candidate(
+    pool: &SqlitePool,
+    payload: &serde_json::Value,
+    run_id: RunId,
+    stage_id: &str,
+    agent_id: &str,
+) -> Result<Option<EscalationChainCandidate>> {
+    let is_operator_targeted_retry = payload
+        .pointer("/targeted_retry/reason")
+        .and_then(serde_json::Value::as_str)
+        == Some("operator_targeted_retry");
+    let Some(escalation) = targeted_p058_escalation_context(pool, payload).await? else {
+        return Ok(None);
+    };
+    let ledger_id = escalation
+        .get("ledger_id")
+        .and_then(serde_json::Value::as_str)
+        .context("targeted P058 retry escalation is missing ledger_id")?;
+    let payload_tier_id = escalation
+        .get("tier_id")
+        .and_then(serde_json::Value::as_str)
+        .context("targeted P058 retry escalation is missing tier_id")?;
+
+    let ledger = escalation_repo::find_ledger_by_id(pool, ledger_id)
+        .await?
+        .with_context(|| format!("targeted P058 retry ledger {ledger_id} is missing"))?;
+    if ledger.run_id != run_id || ledger.stage_id != stage_id || ledger.agent_id != agent_id {
+        anyhow::bail!(
+            "targeted P058 retry ledger identity mismatch: ledger {} belongs to run {} stage {} agent {}, not run {} stage {} agent {}",
+            ledger.id,
+            ledger.run_id,
+            ledger.stage_id,
+            ledger.agent_id,
+            run_id,
+            stage_id,
+            agent_id,
+        );
+    }
+    if ledger.status_raw != "active" {
+        if is_operator_targeted_retry
+            && matches!(ledger.status_raw.as_str(), "paused" | "exhausted")
+        {
+            // An explicit operator retry is a new attempt after the prior escalation
+            // chain reached a terminal pause. Preserve that ledger for audit, but do
+            // not inherit it into the new execution. Returning None lets the normal
+            // resolver create a fresh active chain from the retry payload's current
+            // catalog binding. Automatic retries remain fail-closed below.
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "targeted P058 retry ledger {} is not active ({})",
+            ledger.id,
+            ledger.status_raw
+        );
+    }
+    let tier_id = ledger
+        .current_tier_id
+        .as_deref()
+        .context("targeted P058 retry ledger is missing current_tier_id")?
+        .to_string();
+    let tier_kind_raw = ledger
+        .current_tier_kind_raw
+        .as_deref()
+        .context("targeted P058 retry ledger is missing current_tier_kind_raw")?
+        .to_string();
+    if tier_id != payload_tier_id {
+        anyhow::bail!(
+            "targeted P058 retry tier mismatch: payload requests {}, active ledger {} is at {}",
+            payload_tier_id,
+            ledger.id,
+            tier_id
+        );
+    }
+
+    Ok(Some((ledger, tier_id, tier_kind_raw, None)))
+}
+
+/// Recover the P058 ledger reference from the targeted retry payload or its
+/// bounded source-work-item ancestry. Older auto-contract retries rebuilt
+/// `targeted_retry` and dropped `escalation`; an operator retry adds one more
+/// source hop, so two durable references are sufficient for recovery.
+async fn targeted_p058_escalation_context(
+    pool: &SqlitePool,
+    payload: &serde_json::Value,
+) -> Result<Option<serde_json::Value>> {
+    let mut current = payload.clone();
+    for _ in 0..=2 {
+        if let Some(escalation) = current.pointer("/targeted_retry/escalation") {
+            return Ok(Some(escalation.clone()));
+        }
+        let Some(source_work_item_id) = current
+            .pointer("/targeted_retry/source_work_item_id")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Ok(None);
+        };
+        let Some(source_item) = work_items::find_by_id(pool, source_work_item_id).await? else {
+            return Ok(None);
+        };
+        let Ok(source_payload) =
+            serde_json::from_str::<serde_json::Value>(&source_item.payload_json)
+        else {
+            return Ok(None);
+        };
+        current = source_payload;
+    }
+
+    Ok(None)
 }
 
 type EscalationChainCandidate = (
@@ -1389,6 +1653,10 @@ async fn claim_invoke_agent_work_item_with_start(
 
     let esc_candidate = if pre_resolved_escalation_candidate.is_some() {
         pre_resolved_escalation_candidate
+    } else if let Some(candidate) =
+        resolve_targeted_p058_retry_candidate(pool, &payload, run_id, &stage_id, &agent_id).await?
+    {
+        Some(candidate)
     } else {
         resolve_escalation_chain_candidate(
             pool,
@@ -11162,6 +11430,17 @@ impl BackgroundExecutor {
                     .as_ref()
                     .map(|claimed| claimed.agent_execution_id)
                     .unwrap_or_else(domain::ids::AgentExecutionId::new);
+                append_retry_operator_instruction_for_invocation(
+                    &self.pool,
+                    &payload,
+                    &item.id,
+                    run_id,
+                    &stage_id,
+                    stage_execution_id,
+                    agent_exec_id,
+                    &mut prompt,
+                )
+                .await?;
                 if preclaimed_start.is_some() {
                     agent_executions::update_mcp_provenance(
                         &self.pool,
@@ -19221,6 +19500,7 @@ fn prompt_with_runtime_invocation_contract(
         );
     }
     append_chainworks_output_contract_example(&mut prompt, input.declared_outputs);
+    append_proposal_current_freeze_readiness_guidance(&mut prompt, input.declared_outputs);
     append_docs_noop_contract_guidance(&mut prompt, input.declared_outputs);
     prompt
 }
@@ -19288,6 +19568,38 @@ fn append_docs_noop_contract_guidance(prompt: &mut String, declared_outputs: &[D
         );
     }
     let example = serde_json::json!({ "CHAINWORKS_OUTPUT": outputs });
+    if let Ok(example) = serde_json::to_string(&example) {
+        prompt.push_str(&example);
+        prompt.push('\n');
+    }
+}
+
+fn append_proposal_current_freeze_readiness_guidance(
+    prompt: &mut String,
+    declared_outputs: &[DeclaredOutput],
+) {
+    if !declared_outputs
+        .iter()
+        .any(|output| output.output_name == "proposal_current")
+    {
+        return;
+    }
+
+    prompt.push_str(
+        "\n`proposal_current` is also subject to implementation-freeze readiness validation. \
+         Keep the complete proposal document, and include a top-level `rollout_contract_v1` \
+         object with every required field in the contract-complete example below. Replace \
+         placeholders with proposal-specific truthful values. Optional fields may be added only \
+         when allowed by `docs/reference/executable-rollout-gate-template.md`. Inside `metrics`, \
+         only `adoption_metric` and `operational_metrics` are allowed; keep narrative such as \
+         implementation details or release-criteria computation outside `rollout_contract_v1.metrics`. \
+         In particular, do not emit `metrics.implementation` or \
+         `metrics.release_criteria_computation`.\n",
+    );
+    let example = serde_json::json!({
+        "rollout_contract_v1":
+            crate::rollout_contract_preflight::proposal_current_freeze_readiness_prompt_example()
+    });
     if let Ok(example) = serde_json::to_string(&example) {
         prompt.push_str(&example);
         prompt.push('\n');
@@ -22774,6 +23086,7 @@ fn output_contract_repair_prompt(
         prompt.push_str(&example);
         prompt.push('\n');
     }
+    append_proposal_current_freeze_readiness_guidance(&mut prompt, &outputs_for_example);
     append_docs_noop_contract_guidance(&mut prompt, declared_outputs);
     prompt
 }
@@ -22923,6 +23236,378 @@ fn merge_contract_repair_result(initial: &mut acp::ExecutionResult, repair: acp:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn proposal_065_operator_retry_instruction_reaches_prompt_and_delivery_readback() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let run_id = RunId::new();
+        let source_stage_execution_id = domain::ids::StageExecutionId::new();
+        let retry_stage_execution_id = domain::ids::StageExecutionId::new();
+        let agent_execution_id = domain::ids::AgentExecutionId::new();
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO ideas (id,title,body,status,created_at) VALUES ('idea-p065-executor','idea','body','active',?)",
+        )
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id,idea_id,status,workflow_id,workflow_title,workspace_root,artifact_root,started_at,chainworks_meta_root) VALUES (?,'idea-p065-executor','running','wf','Workflow','/tmp/ws','/tmp/art',?,'/tmp/cw-run')",
+        )
+        .bind(run_id.to_string())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (id, status, attempt) in [
+            (source_stage_execution_id, "failed", 1_i64),
+            (retry_stage_execution_id, "running", 2_i64),
+        ] {
+            sqlx::query(
+                "INSERT INTO stage_executions (id,run_id,stage_id,label,status,iteration,attempt_number,started_at) VALUES (?,?,'proposal_refined','Proposal refined',?,1,?,?)",
+            )
+            .bind(id.to_string())
+            .bind(run_id.to_string())
+            .bind(status)
+            .bind(attempt)
+            .bind(now.to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let journal_id = uuid::Uuid::new_v4().to_string();
+        db::repos::command_journal::record(
+            &pool,
+            &journal_id,
+            "RetryStage",
+            "{}",
+            Some(&run_id.to_string()),
+            now,
+            Some("mcp"),
+            Some("operator"),
+            Some("operator"),
+            Some("stages.retry"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let instruction = "Remove the forbidden migration keys and keep each negative fixture as one string path.";
+        let work_item_id = "p065-executor-delivery";
+        let mut tx = pool.begin().await.unwrap();
+        let binding = retry_operator_instructions::create_for_retry_attempt_tx(
+            &mut tx,
+            &domain::retry_instruction::RetryInstructionBindingInput {
+                journal_id,
+                run_id,
+                stage_id: "proposal_refined".into(),
+                source_stage_execution_id,
+                retry_stage_execution_id,
+                retry_attempt_number: 2,
+                target_agent_execution_id: None,
+                scope_kind: domain::retry_instruction::RetryInstructionScopeKind::TargetedRetry,
+                instruction_text: instruction.into(),
+                created_by_principal_id: "operator".into(),
+                created_by_principal_class: "operator".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let delivery = retry_operator_instructions::create_for_work_item_tx(
+            &mut tx,
+            &binding.binding_id,
+            Some(work_item_id),
+            None,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let payload = serde_json::json!({
+            "operator_retry_instruction": {
+                "binding_id": binding.binding_id.clone(),
+                "journal_id": binding.journal_id.clone(),
+                "scope_kind": binding.scope_kind.clone(),
+                "instruction": binding.instruction_text.clone(),
+                "instruction_sha256": binding.instruction_sha256.clone(),
+            }
+        });
+        let mut prompt = "base prompt".to_string();
+        assert!(append_retry_operator_instruction_for_invocation(
+            &pool,
+            &payload,
+            work_item_id,
+            run_id,
+            "proposal_refined",
+            Some(retry_stage_execution_id),
+            agent_execution_id,
+            &mut prompt,
+        )
+        .await
+        .unwrap());
+        assert!(prompt.contains("### One-shot Operator Retry Instruction"));
+        assert!(prompt.contains(instruction));
+        assert!(prompt.contains(&binding.instruction_sha256));
+
+        let deliveries =
+            retry_operator_instructions::list_deliveries_by_binding(&pool, &delivery.binding_id)
+                .await
+                .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(
+            deliveries[0].status,
+            domain::retry_instruction::RetryInstructionDeliveryStatus::Delivered
+        );
+        assert_eq!(deliveries[0].agent_execution_id, Some(agent_execution_id));
+        assert!(deliveries[0].delivered_at.is_some());
+
+        let mut replay_prompt = "base prompt".to_string();
+        assert!(append_retry_operator_instruction_for_invocation(
+            &pool,
+            &payload,
+            work_item_id,
+            run_id,
+            "proposal_refined",
+            Some(retry_stage_execution_id),
+            agent_execution_id,
+            &mut replay_prompt,
+        )
+        .await
+        .unwrap());
+        assert_eq!(replay_prompt.matches(instruction).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn targeted_p058_retry_reuses_the_durable_ledger_for_the_fallback_execution() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let run_id = RunId::new();
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO ideas (id,title,body,status,created_at) VALUES ('idea-p058','idea','body','active',?)",
+        )
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id,idea_id,status,workflow_id,workflow_title,workspace_root,artifact_root,started_at,chainworks_meta_root) VALUES (?,'idea-p058','running','wf','Workflow','/tmp/ws','/tmp/art',?,'/tmp/cw-run')",
+        )
+        .bind(run_id.to_string())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ledger = domain::escalation::EscalationLedger {
+            id: "ledger-p058-fallback".into(),
+            run_id,
+            stage_id: "state_5_proposal_refined".into(),
+            stage_execution_id: Some("original-stage".into()),
+            agent_id: "proposal_writer".into(),
+            policy_id: "proposal_writer_quota_escalation".into(),
+            policy_hash: "sha256:p058-test".into(),
+            status_raw: "active".into(),
+            current_tier_id: Some("claude_writer_fallback".into()),
+            current_tier_kind_raw: Some("backend_profile".into()),
+            chain_attempt_index: 1,
+            trigger_raw: Some("stale_no_output".into()),
+            pause_reason_raw: None,
+            operator_action_hint: None,
+            runbook_anchor: None,
+            created_at: now,
+            updated_at: now,
+        };
+        escalation_repo::insert_ledger(&pool, &ledger)
+            .await
+            .unwrap();
+
+        let payload = serde_json::json!({
+            "targeted_retry": {
+                "escalation": {
+                    "ledger_id": ledger.id,
+                    "tier_id": "claude_writer_fallback"
+                }
+            }
+        });
+        let candidate = resolve_targeted_p058_retry_candidate(
+            &pool,
+            &payload,
+            run_id,
+            "state_5_proposal_refined",
+            "proposal_writer",
+        )
+        .await
+        .unwrap()
+        .expect("P058 retry must retain its existing ledger");
+
+        assert_eq!(candidate.0.id, ledger.id);
+        assert_eq!(candidate.1, "claude_writer_fallback");
+        assert_eq!(candidate.2, "backend_profile");
+
+        let source_item = WorkItem {
+            id: "p058-source-item".into(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "targeted_retry": {
+                    "escalation": {
+                        "ledger_id": ledger.id,
+                        "tier_id": "claude_writer_fallback"
+                    }
+                }
+            })
+            .to_string(),
+            status: WorkItemStatus::Failed,
+            run_id: Some(run_id),
+            stage_id: Some("state_5_proposal_refined".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 1,
+            last_error: None,
+        };
+        work_items::enqueue(&pool, &source_item).await.unwrap();
+        let bridge_item = WorkItem {
+            id: "auto-contract-source-item".into(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "targeted_retry": {
+                    "source_work_item_id": source_item.id
+                }
+            })
+            .to_string(),
+            status: WorkItemStatus::Failed,
+            run_id: Some(run_id),
+            stage_id: Some("state_5_proposal_refined".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 1,
+            last_error: None,
+        };
+        work_items::enqueue(&pool, &bridge_item).await.unwrap();
+        let recovered_payload = serde_json::json!({
+            "targeted_retry": {
+                "reason": "operator_targeted_retry",
+                "source_work_item_id": bridge_item.id
+            }
+        });
+        let recovered = resolve_targeted_p058_retry_candidate(
+            &pool,
+            &recovered_payload,
+            run_id,
+            "state_5_proposal_refined",
+            "proposal_writer",
+        )
+        .await
+        .unwrap()
+        .expect("operator retry should recover bounded P058 provenance");
+        assert_eq!(recovered.0.id, ledger.id);
+    }
+
+    #[tokio::test]
+    async fn operator_targeted_retry_starts_fresh_chain_after_terminal_p058_pause() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let run_id = RunId::new();
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO ideas (id,title,body,status,created_at) VALUES ('idea-p058-terminal','idea','body','active',?)",
+        )
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id,idea_id,status,workflow_id,workflow_title,workspace_root,artifact_root,started_at,chainworks_meta_root) VALUES (?,'idea-p058-terminal','running','wf','Workflow','/tmp/ws','/tmp/art',?,'/tmp/cw-run')",
+        )
+        .bind(run_id.to_string())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ledger = domain::escalation::EscalationLedger {
+            id: "ledger-p058-terminal".into(),
+            run_id,
+            stage_id: "state_5_proposal_refined".into(),
+            stage_execution_id: Some("original-stage".into()),
+            agent_id: "proposal_writer".into(),
+            policy_id: "proposal_writer_quota_escalation".into(),
+            policy_hash: "sha256:p058-terminal-test".into(),
+            status_raw: "paused".into(),
+            current_tier_id: Some("human_pause".into()),
+            current_tier_kind_raw: Some("pause".into()),
+            chain_attempt_index: 3,
+            trigger_raw: Some("contract_output_failure".into()),
+            pause_reason_raw: Some("escalation_chain_exhausted".into()),
+            operator_action_hint: Some("Retry after remediation".into()),
+            runbook_anchor: Some("escalation/chain-exhausted".into()),
+            created_at: now,
+            updated_at: now,
+        };
+        escalation_repo::insert_ledger(&pool, &ledger)
+            .await
+            .unwrap();
+
+        let source_item = WorkItem {
+            id: "p058-terminal-source-item".into(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "targeted_retry": {
+                    "escalation": {
+                        "ledger_id": ledger.id,
+                        "tier_id": "human_pause"
+                    }
+                }
+            })
+            .to_string(),
+            status: WorkItemStatus::Completed,
+            run_id: Some(run_id),
+            stage_id: Some("state_5_proposal_refined".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 1,
+            last_error: None,
+        };
+        work_items::enqueue(&pool, &source_item).await.unwrap();
+
+        let operator_payload = serde_json::json!({
+            "targeted_retry": {
+                "reason": "operator_targeted_retry",
+                "source_work_item_id": source_item.id
+            }
+        });
+        let candidate = resolve_targeted_p058_retry_candidate(
+            &pool,
+            &operator_payload,
+            run_id,
+            "state_5_proposal_refined",
+            "proposal_writer",
+        )
+        .await
+        .unwrap();
+        assert!(
+            candidate.is_none(),
+            "operator retry must preserve the terminal ledger and let normal resolution create a fresh chain"
+        );
+
+        let automatic_payload = serde_json::json!({
+            "targeted_retry": {
+                "source_work_item_id": source_item.id
+            }
+        });
+        let error = resolve_targeted_p058_retry_candidate(
+            &pool,
+            &automatic_payload,
+            run_id,
+            "state_5_proposal_refined",
+            "proposal_writer",
+        )
+        .await
+        .expect_err("automatic retry must not bypass a terminal escalation ledger");
+        assert!(error.to_string().contains("is not active (paused)"));
+    }
 
     #[test]
     fn command_failed_control_plane_manifest_marks_evidence_incomplete() {
@@ -23830,6 +24515,16 @@ plain progress line without gate evidence";
         assert!(prompt.contains(
             "\"/workspace/.chainworks/runs/run-1/proposals/current.md\":\"<proposal_current content>\""
         ));
+        assert!(prompt.contains("implementation-freeze readiness validation"));
+        assert!(prompt.contains("\"rollout_contract_v1\""));
+        assert!(prompt.contains("\"commands\":{\"allowlist\""));
+        assert!(prompt.contains(
+            "\"readback_lanes\":[\"run_report\",\"mcp\",\"release_receipt\",\"graphql\"]"
+        ));
+        assert!(prompt.contains("\"operator_report_fields\""));
+        assert!(prompt.contains("\"negative_fixtures\""));
+        assert!(prompt.contains("do not emit `metrics.implementation`"));
+        assert!(prompt.contains("`metrics.release_criteria_computation`"));
         assert!(!prompt.contains("{\"status\":\"complete\"}"));
     }
 
@@ -25957,6 +26652,7 @@ plain progress line without gate evidence";
                 kind: "session_update:tool_call_update".into(),
                 detail: Some("tool_call_update".into()),
             }],
+            claude_diagnostics: None,
             p079_unsafe_continuation: false,
         }
     }

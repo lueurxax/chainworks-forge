@@ -11,6 +11,7 @@ serde_yaml = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 sha2 = "0.10"
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -2,7 +2,9 @@ use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
-use domain::escalation::{EscalationEvent, EscalationExecutionMetadata, EscalationLedger};
+use domain::escalation::{
+    EscalationDeadlineWindow, EscalationEvent, EscalationExecutionMetadata, EscalationLedger,
+};
 use domain::ids::RunId;
 
 /// SEC-004: Detect duplicate object keys at any depth using a custom serde Visitor.
@@ -214,6 +216,7 @@ fn canonicalize_and_validate_payload_json(json_str: &str) -> Result<String> {
         "digest_version",
         "waiting_retry_after_until",
         "external_acknowledgement_ref",
+        "deadline_window_id",
         "metric_sample_ms",
         "metric_numerator",
         "metric_denominator",
@@ -766,6 +769,242 @@ pub async fn update_ledger_tx(
     Ok(())
 }
 
+pub async fn insert_deadline_window_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    window: &EscalationDeadlineWindow,
+) -> Result<()> {
+    check_identifier_field("deadline_window.id", &window.id)?;
+    check_identifier_field(
+        "deadline_window.escalation_ledger_id",
+        &window.escalation_ledger_id,
+    )?;
+    check_opt_identifier_field(
+        "deadline_window.previous_window_id",
+        &window.previous_window_id,
+    )?;
+    check_identifier_field("deadline_window.tier_id", &window.tier_id)?;
+    check_identifier_field("deadline_window.tier_kind_raw", &window.tier_kind_raw)?;
+    check_identifier_field(
+        "deadline_window.source_pause_reason_raw",
+        &window.source_pause_reason_raw,
+    )?;
+    check_identifier_field(
+        "deadline_window.opened_by_principal_id",
+        &window.opened_by_principal_id,
+    )?;
+    check_identifier_field(
+        "deadline_window.command_journal_id",
+        &window.command_journal_id,
+    )?;
+    check_identifier_field(
+        "deadline_window.resume_idempotency_key",
+        &window.resume_idempotency_key,
+    )?;
+    check_field_len(
+        "deadline_window.resume_request_hash",
+        &window.resume_request_hash,
+        FIELD_ID_MAX,
+    )?;
+    check_identifier_field(
+        "deadline_window.source_stage_execution_id",
+        &window.source_stage_execution_id,
+    )?;
+    check_identifier_field(
+        "deadline_window.source_agent_execution_id",
+        &window.source_agent_execution_id,
+    )?;
+    check_identifier_field(
+        "deadline_window.retry_stage_execution_id",
+        &window.retry_stage_execution_id,
+    )?;
+    check_identifier_field("deadline_window.work_item_id", &window.work_item_id)?;
+    check_identifier_field(
+        "deadline_window.target_backend_profile_id",
+        &window.target_backend_profile_id,
+    )?;
+    check_identifier_field("deadline_window.target_provider", &window.target_provider)?;
+    check_field_len(
+        "deadline_window.policy_hash",
+        &window.policy_hash,
+        FIELD_ID_MAX,
+    )?;
+    if !matches!(
+        window.source_pause_reason_raw.as_str(),
+        "escalation_deadline_elapsed" | "escalation_chain_exhausted"
+    ) {
+        bail!(
+            "P058_RESUME_REASON_NOT_ALLOWED: recovery windows may only resume escalation_deadline_elapsed or escalation_chain_exhausted"
+        );
+    }
+    if window.expires_at <= window.starts_at {
+        bail!("P058_INVALID_DEADLINE_WINDOW: expires_at must be later than starts_at");
+    }
+
+    sqlx::query(
+        r#"INSERT INTO escalation_deadline_windows
+           (id, escalation_ledger_id, previous_window_id, tier_id, tier_kind_raw,
+            policy_hash, source_pause_reason_raw, source_deadline_at,
+            opened_by_principal_id, command_journal_id, resume_idempotency_key,
+            resume_request_hash,
+            source_stage_execution_id, source_agent_execution_id,
+            retry_stage_execution_id, work_item_id, target_backend_profile_id,
+            target_provider, starts_at, expires_at, created_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"#,
+    )
+    .bind(&window.id)
+    .bind(&window.escalation_ledger_id)
+    .bind(&window.previous_window_id)
+    .bind(&window.tier_id)
+    .bind(&window.tier_kind_raw)
+    .bind(&window.policy_hash)
+    .bind(&window.source_pause_reason_raw)
+    .bind(window.source_deadline_at.to_rfc3339())
+    .bind(&window.opened_by_principal_id)
+    .bind(&window.command_journal_id)
+    .bind(&window.resume_idempotency_key)
+    .bind(&window.resume_request_hash)
+    .bind(&window.source_stage_execution_id)
+    .bind(&window.source_agent_execution_id)
+    .bind(&window.retry_stage_execution_id)
+    .bind(&window.work_item_id)
+    .bind(&window.target_backend_profile_id)
+    .bind(&window.target_provider)
+    .bind(window.starts_at.to_rfc3339())
+    .bind(window.expires_at.to_rfc3339())
+    .bind(window.created_at.to_rfc3339())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+pub async fn find_deadline_window_by_idempotency_key_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    idempotency_key: &str,
+) -> Result<Option<EscalationDeadlineWindow>> {
+    let row = sqlx::query(
+        r#"SELECT id, escalation_ledger_id, previous_window_id, tier_id, tier_kind_raw,
+                  policy_hash, source_pause_reason_raw, source_deadline_at,
+                  opened_by_principal_id, command_journal_id, resume_idempotency_key,
+                  resume_request_hash,
+                  source_stage_execution_id, source_agent_execution_id,
+                  retry_stage_execution_id, work_item_id, target_backend_profile_id,
+                  target_provider, starts_at, expires_at, created_at
+           FROM escalation_deadline_windows
+           WHERE resume_idempotency_key = ?1"#,
+    )
+    .bind(idempotency_key)
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(parse_deadline_window_row).transpose()
+}
+
+pub async fn find_latest_deadline_window_by_ledger(
+    pool: &SqlitePool,
+    escalation_ledger_id: &str,
+) -> Result<Option<EscalationDeadlineWindow>> {
+    let row = sqlx::query(
+        r#"SELECT id, escalation_ledger_id, previous_window_id, tier_id, tier_kind_raw,
+                  policy_hash, source_pause_reason_raw, source_deadline_at,
+                  opened_by_principal_id, command_journal_id, resume_idempotency_key,
+                  resume_request_hash,
+                  source_stage_execution_id, source_agent_execution_id,
+                  retry_stage_execution_id, work_item_id, target_backend_profile_id,
+                  target_provider, starts_at, expires_at, created_at
+           FROM escalation_deadline_windows
+           WHERE escalation_ledger_id = ?1
+           ORDER BY created_at DESC, id DESC
+           LIMIT 1"#,
+    )
+    .bind(escalation_ledger_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(parse_deadline_window_row).transpose()
+}
+
+pub async fn find_latest_deadline_window_by_ledger_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    escalation_ledger_id: &str,
+) -> Result<Option<EscalationDeadlineWindow>> {
+    let row = sqlx::query(
+        r#"SELECT id, escalation_ledger_id, previous_window_id, tier_id, tier_kind_raw,
+                  policy_hash, source_pause_reason_raw, source_deadline_at,
+                  opened_by_principal_id, command_journal_id, resume_idempotency_key,
+                  resume_request_hash,
+                  source_stage_execution_id, source_agent_execution_id,
+                  retry_stage_execution_id, work_item_id, target_backend_profile_id,
+                  target_provider, starts_at, expires_at, created_at
+           FROM escalation_deadline_windows
+           WHERE escalation_ledger_id = ?1
+           ORDER BY created_at DESC, id DESC
+           LIMIT 1"#,
+    )
+    .bind(escalation_ledger_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(parse_deadline_window_row).transpose()
+}
+
+pub async fn find_deadline_windows_by_ledger(
+    pool: &SqlitePool,
+    escalation_ledger_id: &str,
+) -> Result<Vec<EscalationDeadlineWindow>> {
+    let rows = sqlx::query(
+        r#"SELECT id, escalation_ledger_id, previous_window_id, tier_id, tier_kind_raw,
+                  policy_hash, source_pause_reason_raw, source_deadline_at,
+                  opened_by_principal_id, command_journal_id, resume_idempotency_key,
+                  resume_request_hash,
+                  source_stage_execution_id, source_agent_execution_id,
+                  retry_stage_execution_id, work_item_id, target_backend_profile_id,
+                  target_provider, starts_at, expires_at, created_at
+           FROM escalation_deadline_windows
+           WHERE escalation_ledger_id = ?1
+           ORDER BY created_at ASC, id ASC
+           LIMIT 101"#,
+    )
+    .bind(escalation_ledger_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(parse_deadline_window_row).collect()
+}
+
+fn parse_deadline_window_row(row: sqlx::sqlite::SqliteRow) -> Result<EscalationDeadlineWindow> {
+    let source_deadline_at: String = row.try_get("source_deadline_at")?;
+    let starts_at: String = row.try_get("starts_at")?;
+    let expires_at: String = row.try_get("expires_at")?;
+    let created_at: String = row.try_get("created_at")?;
+    Ok(EscalationDeadlineWindow {
+        id: row.try_get("id")?,
+        escalation_ledger_id: row.try_get("escalation_ledger_id")?,
+        previous_window_id: row.try_get("previous_window_id")?,
+        tier_id: row.try_get("tier_id")?,
+        tier_kind_raw: row.try_get("tier_kind_raw")?,
+        policy_hash: row.try_get("policy_hash")?,
+        source_pause_reason_raw: row.try_get("source_pause_reason_raw")?,
+        source_deadline_at: source_deadline_at
+            .parse()
+            .map_err(|e| anyhow!("bad source_deadline_at: {e}"))?,
+        opened_by_principal_id: row.try_get("opened_by_principal_id")?,
+        command_journal_id: row.try_get("command_journal_id")?,
+        resume_idempotency_key: row.try_get("resume_idempotency_key")?,
+        resume_request_hash: row.try_get("resume_request_hash")?,
+        source_stage_execution_id: row.try_get("source_stage_execution_id")?,
+        source_agent_execution_id: row.try_get("source_agent_execution_id")?,
+        retry_stage_execution_id: row.try_get("retry_stage_execution_id")?,
+        work_item_id: row.try_get("work_item_id")?,
+        target_backend_profile_id: row.try_get("target_backend_profile_id")?,
+        target_provider: row.try_get("target_provider")?,
+        starts_at: starts_at
+            .parse()
+            .map_err(|e| anyhow!("bad starts_at: {e}"))?,
+        expires_at: expires_at
+            .parse()
+            .map_err(|e| anyhow!("bad expires_at: {e}"))?,
+        created_at: created_at
+            .parse()
+            .map_err(|e| anyhow!("bad created_at: {e}"))?,
+    })
+}
+
 pub async fn find_ledgers_by_run(
     pool: &SqlitePool,
     run_id: RunId,
@@ -999,6 +1238,53 @@ pub async fn find_ledger_by_id(
                 .parse()
                 .map_err(|e| anyhow!("bad created_at: {e}"))?,
             updated_at: updated_at_str
+                .parse()
+                .map_err(|e| anyhow!("bad updated_at: {e}"))?,
+        })
+    })
+    .transpose()
+}
+
+pub async fn find_ledger_by_id_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    ledger_id: &str,
+) -> Result<Option<EscalationLedger>> {
+    let row = sqlx::query(
+        r#"SELECT id, run_id, stage_id, stage_execution_id, agent_id, policy_id, policy_hash,
+                  status_raw, current_tier_id, current_tier_kind_raw,
+                  chain_attempt_index, trigger_raw, pause_reason_raw,
+                  operator_action_hint, runbook_anchor, created_at, updated_at
+           FROM escalation_ledger
+           WHERE id = ?1"#,
+    )
+    .bind(ledger_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    row.map(|row| {
+        let run_id: String = row.try_get("run_id")?;
+        let created_at: String = row.try_get("created_at")?;
+        let updated_at: String = row.try_get("updated_at")?;
+        Ok(EscalationLedger {
+            id: row.try_get("id")?,
+            run_id: run_id.parse().map_err(|e| anyhow!("bad run_id: {e}"))?,
+            stage_id: row.try_get("stage_id")?,
+            stage_execution_id: row.try_get("stage_execution_id")?,
+            agent_id: row.try_get("agent_id")?,
+            policy_id: row.try_get("policy_id")?,
+            policy_hash: row.try_get("policy_hash")?,
+            status_raw: row.try_get("status_raw")?,
+            current_tier_id: row.try_get("current_tier_id")?,
+            current_tier_kind_raw: row.try_get("current_tier_kind_raw")?,
+            chain_attempt_index: row.try_get("chain_attempt_index")?,
+            trigger_raw: row.try_get("trigger_raw")?,
+            pause_reason_raw: row.try_get("pause_reason_raw")?,
+            operator_action_hint: row.try_get("operator_action_hint")?,
+            runbook_anchor: row.try_get("runbook_anchor")?,
+            created_at: created_at
+                .parse()
+                .map_err(|e| anyhow!("bad created_at: {e}"))?,
+            updated_at: updated_at
                 .parse()
                 .map_err(|e| anyhow!("bad updated_at: {e}"))?,
         })

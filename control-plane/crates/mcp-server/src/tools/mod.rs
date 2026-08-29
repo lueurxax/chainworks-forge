@@ -17,7 +17,7 @@ pub mod temp_artifacts;
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
 
-pub fn all_capability_tool_ids() -> [CapabilityToolId; 55] {
+pub fn all_capability_tool_ids() -> [CapabilityToolId; 57] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -32,6 +32,8 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 55] {
         CapabilityToolId::RunsKnowledgeCapsuleIgnore,
         CapabilityToolId::RunsRetrofitCatalogSnapshot,
         CapabilityToolId::RunsCancel,
+        CapabilityToolId::RunsResumeEscalationDeadline,
+        CapabilityToolId::RunsResumeEscalationChain,
         CapabilityToolId::ApprovalsList,
         CapabilityToolId::ApprovalsResolve,
         CapabilityToolId::StagesRetry,
@@ -108,6 +110,8 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "runs.knowledge_capsule.ignore" => Some(CapabilityToolId::RunsKnowledgeCapsuleIgnore),
         "runs.retrofit_catalog_snapshot" => Some(CapabilityToolId::RunsRetrofitCatalogSnapshot),
         "runs.cancel" => Some(CapabilityToolId::RunsCancel),
+        "runs.resume_escalation_deadline" => Some(CapabilityToolId::RunsResumeEscalationDeadline),
+        "runs.resume_escalation_chain" => Some(CapabilityToolId::RunsResumeEscalationChain),
         "approvals.list" => Some(CapabilityToolId::ApprovalsList),
         "approvals.resolve" => Some(CapabilityToolId::ApprovalsResolve),
         "stages.retry" => Some(CapabilityToolId::StagesRetry),
@@ -180,6 +184,8 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "runs_knowledge_capsule_ignore" => "runs.knowledge_capsule.ignore",
         "runs_retrofit_catalog_snapshot" => "runs.retrofit_catalog_snapshot",
         "runs_cancel" => "runs.cancel",
+        "runs_resume_escalation_deadline" => "runs.resume_escalation_deadline",
+        "runs_resume_escalation_chain" => "runs.resume_escalation_chain",
         "approvals_list" => "approvals.list",
         "approvals_resolve" => "approvals.resolve",
         "stages_retry" => "stages.retry",
@@ -260,6 +266,12 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
             tool_spec_by_name(runs::tool_specs(), "runs.retrofit_catalog_snapshot")
         }
         CapabilityToolId::RunsCancel => tool_spec_by_name(runs::tool_specs(), "runs.cancel"),
+        CapabilityToolId::RunsResumeEscalationDeadline => {
+            tool_spec_by_name(runs::tool_specs(), "runs.resume_escalation_deadline")
+        }
+        CapabilityToolId::RunsResumeEscalationChain => {
+            tool_spec_by_name(runs::tool_specs(), "runs.resume_escalation_chain")
+        }
         CapabilityToolId::ApprovalsList => {
             tool_spec_by_name(approvals::tool_specs(), "approvals.list")
         }
@@ -431,6 +443,25 @@ mod tests {
             super::mcp_tool_for(CapabilityToolId::RunsKnowledgeCapsuleIgnore).name,
             "runs.knowledge_capsule.ignore"
         );
+        assert_eq!(
+            super::capability_id_for("runs_resume_escalation_deadline"),
+            Some(CapabilityToolId::RunsResumeEscalationDeadline)
+        );
+        let resume_tool = super::mcp_tool_for(CapabilityToolId::RunsResumeEscalationDeadline);
+        assert_eq!(resume_tool.name, "runs.resume_escalation_deadline");
+        assert_eq!(resume_tool.input_schema["additionalProperties"], false);
+        assert!(resume_tool.output_schema.is_some());
+        assert_eq!(
+            super::capability_id_for("runs_resume_escalation_chain"),
+            Some(CapabilityToolId::RunsResumeEscalationChain)
+        );
+        let chain_resume_tool = super::mcp_tool_for(CapabilityToolId::RunsResumeEscalationChain);
+        assert_eq!(chain_resume_tool.name, "runs.resume_escalation_chain");
+        assert_eq!(
+            chain_resume_tool.input_schema["additionalProperties"],
+            false
+        );
+        assert!(chain_resume_tool.output_schema.is_some());
         assert_eq!(
             super::capability_id_for("legacy_discovery_override_create"),
             Some(CapabilityToolId::LegacyDiscoveryOverrideCreate)

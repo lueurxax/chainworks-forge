@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use async_graphql::futures_util::{stream, StreamExt};
 use async_graphql::*;
 use sha2::{Digest, Sha256};
-use sqlx::{Row, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tracing::{debug, info, warn};
 
@@ -1926,11 +1926,19 @@ impl QueryRoot {
         Ok(item.map(GqlIdea::from))
     }
 
-    async fn runs(&self, ctx: &Context<'_>, idea_id: Option<ID>) -> Result<Vec<GqlRun>> {
+    async fn runs(
+        &self,
+        ctx: &Context<'_>,
+        idea_id: Option<ID>,
+        include_terminal: Option<bool>,
+    ) -> Result<Vec<GqlRun>> {
         require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let mut runs: Vec<GqlRun> = if let Some(id) = idea_id {
             let items = projections::list_by_idea_projection(pool, id.as_str()).await?;
+            items.into_iter().map(GqlRun::from).collect()
+        } else if include_terminal.unwrap_or(false) {
+            let items = projections::list_all_projection(pool).await?;
             items.into_iter().map(GqlRun::from).collect()
         } else {
             let items = projections::list_active_projection(pool).await?;
@@ -4896,22 +4904,27 @@ async fn proposal_064_command_readback(
     run_id: RunId,
     command_types: &[&str],
 ) -> Result<serde_json::Value> {
-    let placeholders = command_types
-        .iter()
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT id, command_type, result_status, created_at, completed_at, caller_surface, caller_principal_id, caller_tool \
-         FROM command_journal \
-         WHERE run_id = ? AND command_type IN ({placeholders}) \
-         ORDER BY created_at DESC LIMIT 8"
-    );
-    let mut query = sqlx::query(&sql).bind(run_id.to_string());
-    for command_type in command_types {
-        query = query.bind(*command_type);
+    if command_types.is_empty() {
+        return Ok(serde_json::json!({
+            "latest_commands": [],
+            "pending_commands": [],
+        }));
     }
-    let rows = query.fetch_all(pool).await?;
+
+    let mut builder = QueryBuilder::<Sqlite>::new(
+        "SELECT id, command_type, result_status, created_at, completed_at, caller_surface, caller_principal_id, caller_tool \
+         FROM command_journal WHERE run_id = ",
+    );
+    builder.push_bind(run_id.to_string());
+    builder.push(" AND command_type IN (");
+    {
+        let mut separated = builder.separated(", ");
+        for command_type in command_types {
+            separated.push_bind(*command_type);
+        }
+    }
+    builder.push(") ORDER BY created_at DESC LIMIT 8");
+    let rows = builder.build().fetch_all(pool).await?;
     let commands = rows
         .iter()
         .map(|row| {
@@ -8114,7 +8127,7 @@ async fn p093_persist_live_timeline_raw_detail(
     raw_detail: &str,
     raw_detail_digest: &str,
 ) -> Result<Option<String>> {
-    let mut query = String::from(
+    let row = sqlx::query(
         r#"
         SELECT ae.id
         FROM agent_executions ae
@@ -8123,25 +8136,18 @@ async fn p093_persist_live_timeline_raw_detail(
           AND se.stage_id = ?2
           AND ae.agent_id = ?3
           AND ae.provider = ?4
+          AND (?5 IS NULL OR ae.session_generation_id = ?5)
+        ORDER BY ae.started_at DESC LIMIT 1
         "#,
-    );
-    if session_generation_id.is_some() {
-        query.push_str(" AND ae.session_generation_id = ?5");
-    }
-    query.push_str(" ORDER BY ae.started_at DESC LIMIT 1");
-
-    let mut sql = sqlx::query(&query)
-        .bind(run_id.to_string())
-        .bind(stage_id)
-        .bind(agent_id)
-        .bind(provider);
-    if let Some(session_generation_id) = session_generation_id {
-        sql = sql.bind(session_generation_id);
-    }
-    let row = sql
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| Error::new(e.to_string()))?;
+    )
+    .bind(run_id.to_string())
+    .bind(stage_id)
+    .bind(agent_id)
+    .bind(provider)
+    .bind(session_generation_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| Error::new(e.to_string()))?;
     let Some(row) = row else {
         return Ok(None);
     };
@@ -11235,6 +11241,48 @@ mod tests {
                 .iter()
                 .any(|error| error.message.contains("forbidden")),
             "P043 V1 reads must reject non-operator principals: {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn runs_include_terminal_returns_completed_history_without_changing_default() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+        let mut run = make_run(run_id, idea_id);
+        run.status = domain::run::RunStatus::Completed;
+        run.completed_at = Some(Utc::now());
+        runs::insert(&pool, &run).await.unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+
+        let default_response = schema
+            .execute(Request::new("{ runs { id } }").data(test_principal()))
+            .await;
+        assert!(default_response.errors.is_empty());
+        assert_eq!(
+            default_response.data.into_json().unwrap()["runs"],
+            serde_json::json!([])
+        );
+
+        let history_response = schema
+            .execute(
+                Request::new("{ runs(includeTerminal: true) { id status } }")
+                    .data(test_principal()),
+            )
+            .await;
+        assert!(history_response.errors.is_empty());
+        assert_eq!(
+            history_response.data.into_json().unwrap()["runs"][0]["id"],
+            serde_json::json!(run_id.to_string())
         );
     }
 

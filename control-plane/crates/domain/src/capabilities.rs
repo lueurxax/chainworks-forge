@@ -15,6 +15,10 @@ pub enum CapabilityToolId {
     RunsKnowledgeCapsuleIgnore,
     RunsRetrofitCatalogSnapshot,
     RunsCancel,
+    /// P058: operator-only resume of an elapsed escalation deadline window.
+    RunsResumeEscalationDeadline,
+    /// P058: operator-only one-shot recovery from a terminal exhausted chain.
+    RunsResumeEscalationChain,
     ApprovalsList,
     ApprovalsResolve,
     StagesRetry,
