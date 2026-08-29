@@ -1,5 +1,5 @@
 {
-  "unrelated_skills_sha256": "9c4b83207653627dab9fe05c1e06b9b39cd8ee13e29ba0600552a3a22410093c",
+  "unrelated_skills_sha256": "695a0d0f89c74d4f4ae54653f71087f661312fe113773de6c62ff4080346407c",
   "affected_agents": [
     {
       "agent_id": "code_writer",
@@ -15,6 +15,22 @@
       "permission_profile": "RO_VERIFY",
       "outputs": ["audit_report"],
       "output_contract": "audit_report_v1",
+      "worktree_write_enabled": false
+    },
+    {
+      "agent_id": "security_checker",
+      "skill_ref": "security_checker_core",
+      "permission_profile": "RO_VERIFY",
+      "outputs": ["security_report"],
+      "output_contract": "security_report_v1",
+      "worktree_write_enabled": false
+    },
+    {
+      "agent_id": "prepush_code_reviewer",
+      "skill_ref": "prepush_review_core",
+      "permission_profile": "RO_PREPUSH_VERIFY",
+      "outputs": ["prepush_review_report"],
+      "output_contract": "prepush_review_v1",
       "worktree_write_enabled": false
     },
     {

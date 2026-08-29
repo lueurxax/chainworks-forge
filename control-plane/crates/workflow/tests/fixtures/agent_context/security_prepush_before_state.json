@@ -1,0 +1,238 @@
+{
+  "inline_skill_definitions": {
+    "security_checker_core": {
+      "type": "inline_skill",
+      "description": "Threat-model and review the implementation for security, privacy, secrets, auth, and unsafe defaults."
+    },
+    "prepush_review_core": {
+      "type": "inline_skill",
+      "description": "Final code review barrier before commit/push; looks for correctness, readability, regressions, and missing tests."
+    }
+  },
+  "agents": {
+    "security_checker": {
+      "id": "security_checker",
+      "title": "Security Checker",
+      "mode": "security",
+      "backend_profile": "claude_security_high",
+      "permission_profile": "RO_VERIFY",
+      "skill_ref": "security_checker_core",
+      "required_tools": [
+        "scanner.readonly",
+        "dependency_scan.readonly",
+        "secrets_scan.readonly"
+      ],
+      "inputs": [
+        "approved_proposal",
+        "implementation_progress",
+        "changed_files_manifest",
+        "tests_result"
+      ],
+      "outputs": ["security_report"],
+      "output_contract": "security_report_v1",
+      "requires_human_approval": false,
+      "prompt": "Review the current implementation for security and privacy risks.\nFocus on auth/authz, secrets handling, unsafe defaults, injection, serialization, filesystem access, network boundaries, data leakage, and dependency risk.\nUse readonly scanners when available, but do not rely on scanners alone.\nUse changed_files_manifest as the canonical control-plane-generated Git evidence. Do not run `git status`, `git diff`, or `git rev-parse`, and do not read `.git`.\nOutput only the structured security report and mark status as pass only when no blocking issue remains."
+    },
+    "prepush_code_reviewer": {
+      "id": "prepush_code_reviewer",
+      "title": "Pre-push Code Reviewer",
+      "mode": "prepush_review",
+      "backend_profile": "claude_prepush_medium",
+      "permission_profile": "RO_PREPUSH_VERIFY",
+      "skill_ref": "prepush_review_core",
+      "required_tools": [
+        "go test ./...",
+        "cargo test",
+        "swift test"
+      ],
+      "inputs": [
+        "approved_proposal",
+        "implementation_progress",
+        "changed_files_manifest",
+        "tests_result",
+        "audit_report",
+        "security_report"
+      ],
+      "outputs": ["prepush_review_report"],
+      "output_contract": "prepush_review_v1",
+      "requires_human_approval": false,
+      "prompt": "Perform the last human-like code review before commit and push.\nFocus on correctness, readability, maintainability, surprising side effects, regression risk, and missing tests.\nDo not propose gold-plating; prioritize issues that would make the release unsafe or expensive to maintain.\nUse changed_files_manifest as the canonical control-plane-generated Git evidence. Do not run `git status`, `git diff`, or `git rev-parse`, and do not read `.git`.\nKeep discovery bounded: inspect changed files and implicated paths first; do not run broad rg/find over repo or worktree roots unless generated/build roots are excluded and output is capped.\nOutput only the structured pre-push review contract."
+    }
+  },
+  "backend_profiles": {
+    "claude_security_high": {
+      "provider": "claude_acp",
+      "model": "opus",
+      "effort": "high",
+      "temperature": 0.0,
+      "max_turns": 16,
+      "structured_output": "required",
+      "mcp": ["context7"],
+      "runtime_profile": "claude_agent_acp"
+    },
+    "claude_prepush_medium": {
+      "provider": "claude_acp",
+      "model": "opus",
+      "effort": "medium",
+      "temperature": 0.1,
+      "max_turns": 12,
+      "structured_output": "required",
+      "mcp": [],
+      "runtime_profile": "claude_agent_acp"
+    }
+  },
+  "permission_profiles": {
+    "RO_VERIFY": {
+      "filesystem": {
+        "read": [
+          "${CHAINWORKS_REPO_ROOT:-.}/**",
+          "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**",
+          "${CHAINWORKS_META_ROOT:-.chainworks}/**"
+        ],
+        "write": [
+          "${CHAINWORKS_META_ROOT:-.chainworks}/audit/**",
+          "${CHAINWORKS_META_ROOT:-.chainworks}/security/**",
+          "${CHAINWORKS_META_ROOT:-.chainworks}/review/**"
+        ],
+        "deny": [
+          "${CHAINWORKS_REPO_ROOT:-.}/.git",
+          "${CHAINWORKS_REPO_ROOT:-.}/.git/**",
+          "${CHAINWORKS_REPO_ROOT:-.}/**/.env*",
+          "${CHAINWORKS_REPO_ROOT:-.}/**/secrets/**"
+        ]
+      },
+      "git": {
+        "status": false,
+        "diff": false,
+        "checkout": false,
+        "commit": false,
+        "push": false
+      },
+      "shell": {
+        "allow": [
+          "rg",
+          "fd",
+          "find",
+          "ls",
+          "cat",
+          "go test ./...",
+          "cargo test",
+          "cargo clippy",
+          "swift build",
+          "swift test",
+          "xcodebuild -project \"Chainworks Forge.xcodeproj\" -scheme \"Chainworks Forge\" -destination \"platform=macOS\" build",
+          "xcodebuild -project \"Chainworks Forge.xcodeproj\" -scheme \"Chainworks Forge\" -destination \"platform=macOS\" test",
+          "npm test",
+          "pnpm test",
+          "yarn test",
+          "make test",
+          "just test"
+        ],
+        "deny": ["git commit*", "git push*", "rm -rf *"]
+      },
+      "network": {"allow": []},
+      "mcp": {"legacy_allow": [], "runtime_authority": false}
+    },
+    "RO_PREPUSH_VERIFY": {
+      "filesystem": {
+        "read": [
+          "${CHAINWORKS_REPO_ROOT:-.}/**",
+          "${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**",
+          "${CHAINWORKS_META_ROOT:-.chainworks}/**"
+        ],
+        "write": ["${CHAINWORKS_META_ROOT:-.chainworks}/review/**"],
+        "deny": [
+          "${CHAINWORKS_REPO_ROOT:-.}/.git",
+          "${CHAINWORKS_REPO_ROOT:-.}/.git/**",
+          "${CHAINWORKS_REPO_ROOT:-.}/**/.env*",
+          "${CHAINWORKS_REPO_ROOT:-.}/**/secrets/**"
+        ]
+      },
+      "git": {
+        "status": false,
+        "diff": false,
+        "checkout": false,
+        "commit": false,
+        "push": false
+      },
+      "shell": {
+        "allow": [
+          "rg",
+          "fd",
+          "find",
+          "ls",
+          "cat",
+          "go test ./...",
+          "cargo test",
+          "cargo clippy",
+          "swift build",
+          "swift test",
+          "npm test",
+          "pnpm test",
+          "yarn test",
+          "make test",
+          "just test"
+        ],
+        "deny": ["git commit*", "git push*", "rm -rf *"]
+      },
+      "network": {"allow": []},
+      "mcp": {"legacy_allow": [], "runtime_authority": false}
+    }
+  },
+  "workflow_tasks": {
+    "full-mvp-live.yaml:state_9_implementation_reviewed:check_implementation_security": {
+      "agent": "security_checker",
+      "task": "check_implementation_security",
+      "inputs": ["approved_proposal", "changed_files_manifest"],
+      "outputs": ["security_report"],
+      "compiled_phase": 0,
+      "compiled_parallel": true
+    },
+    "full-mvp-live.yaml:state_9_implementation_reviewed:prepush_review": {
+      "agent": "prepush_code_reviewer",
+      "task": "prepush_review",
+      "inputs": [
+        "approved_proposal",
+        "changed_files_manifest",
+        "audit_report",
+        "security_report"
+      ],
+      "outputs": ["prepush_review_report"],
+      "compiled_phase": 2,
+      "compiled_parallel": false
+    },
+    "workflow.yaml:state_9_implementation_reviewed:review_security": {
+      "agent": "security_checker",
+      "task": "review_security",
+      "inputs": [
+        "approved_proposal",
+        "implementation_progress",
+        "changed_files_manifest",
+        "tests_result"
+      ],
+      "outputs": ["security_report"],
+      "compiled_phase": 0,
+      "compiled_parallel": true
+    },
+    "workflow.yaml:state_9_implementation_reviewed:review_before_push": {
+      "agent": "prepush_code_reviewer",
+      "task": "review_before_push",
+      "inputs": [
+        "approved_proposal",
+        "implementation_progress",
+        "changed_files_manifest",
+        "tests_result",
+        "audit_report",
+        "security_report"
+      ],
+      "outputs": ["prepush_review_report"],
+      "compiled_phase": 2,
+      "compiled_parallel": false
+    }
+  },
+  "existing_bundle_sha256": {
+    "proposal-review-router": "7f13a84b65fe13c1a5fab2dd0f49d3e2c5038df076a74a9bd8365fe6915fbbcd",
+    "code-implementation": "6b50320cbac48626b2f836ece4299f59ce7f9397252404ebd74bb724fed2a9a4",
+    "implementation-audit": "19d192036f063963948e7dba6b0f08ed1f4214fc39d35fdaeada9c04e8336547"
+  }
+}

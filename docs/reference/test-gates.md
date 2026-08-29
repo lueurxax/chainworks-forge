@@ -154,19 +154,26 @@ Agent Skills bundles.
 
 Scope:
 
-- validates the closed `CTX-001..006` corpus and the twelve-clause proof manifest
-- verifies `proposal_review_router_skill`, `code_writer_core`, and
-  `proposal_implementation_audit` resolve from single-file external bundles
-- proves the implementation auditor keeps `RO_VERIFY`, `audit_report`, and
-  `audit_report_v1` while injecting its procedure exactly once after mission
-  context and before the task body
+- validates the closed `CTX-001..008` corpus and the twelve-clause proof manifest
+- verifies `proposal_review_router_skill`, `code_writer_core`,
+  `proposal_implementation_audit`, `security_checker_core`, and
+  `prepush_review_core` resolve from single-file external bundles
+- proves complete catalog/profile/permission/workflow-task parity for the
+  security and pre-push migration, including byte pins for the three earlier
+  bundles
+- finalizes all four security/pre-push tasks in `full-mvp-live.yaml` and
+  `workflow.yaml`, proving both declared and undeclared direct-`tests_result`
+  branches with prompt-regenerating mutation negatives
+- proves the audit, security, and pre-push procedures inject exactly once after
+  mission context and before the task body
 - verifies frozen bundle reuse, catalog parity, prompt finalization, producer
-  inventory, mutation-negative cases, and zero-provider-work failure paths
+  inventory, pre-migration inline prompt compatibility, mutation-negative
+  cases, and zero-provider-work failure paths
 
 Use when:
 
 - changing mission context assembly, skill bundle compilation, active skill
-  bindings, or the proposal implementation auditor procedure
+  bindings, or the audit, security, and pre-push review procedures
 
 Host policy:
 
@@ -183,8 +190,9 @@ Important:
 
 - the gate rejects missing or auxiliary bundle files and any `allowed-tools`
   declaration in these procedure-only skills
-- frozen runs retain their catalog snapshot; the third bundle applies only to
-  newly compiled runs
+- frozen runs retain their catalog snapshot: pre-migration V2 runs keep their
+  inline security/pre-push bytes, while newly compiled runs freeze both external
+  bundles
 
 ### `ui-smoke`
 
