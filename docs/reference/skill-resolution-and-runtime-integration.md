@@ -1,10 +1,12 @@
-# Skill Resolution and Runtime Integration
+# Mission Context, Skill Resolution, and Runtime Integration
 
-Stable reference for how Chainworks Forge resolves agent skills, injects them into runtime execution, freezes skill truth into runs, and exposes that truth back to operator surfaces.
+Stable reference for how Chainworks Forge gives every Rust-owned provider
+invocation a bounded mission, resolves agent procedures, freezes both contracts
+into a run, and exposes skill truth back to operator surfaces.
 
 ## Purpose
 
-Skills are part of the execution contract, not prompt decoration.
+Mission context and skills are execution contracts, not prompt decoration.
 
 The system must be able to answer, for any agent execution:
 
@@ -12,12 +14,16 @@ The system must be able to answer, for any agent execution:
 - which concrete content was resolved at run start,
 - how role-specific specialization changed that content,
 - what exact injected snapshot was sent to the runtime,
+- which durable mission, stage, assignment, and completion contract authorized
+  the invocation,
 - and where the operator can inspect that frozen truth later.
 
 ## Scope
 
 This reference covers:
 
+- the default-on Rust `AgentMissionContextV1` contract,
+- prompt finalization and persisted-copy validation,
 - catalog-owned `skill_ref` and `skill_role`,
 - builtin, inline, and external skill resolution,
 - role-aware specialization,
@@ -39,6 +45,110 @@ It does not define:
 - [operator-experience.md](operator-experience.md)
 - [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md)
 - [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md)
+
+## Default-on Rust invocation contract
+
+New Rust-compiled runs use catalog snapshot format `2`. The compiler owns the
+`chainworks_compiled` extension and freezes:
+
+- extension schema version `1`,
+- `mission_context_version = agent_mission_context_v1`,
+- every referenced external `SKILL.md` bundle,
+- bundle and injected-content hashes,
+- and the resolved agent authority already present in `RunPlan`.
+
+Authors cannot supply or override the compiler-owned extension. There is no
+feature flag, cohort, disable switch, or fresh-run fallback that removes
+mission context.
+
+Legacy frozen catalog snapshots with absent or format `1` metadata remain
+readable when they contain only legacy builtin/inline skills. They fail closed
+if they reference external skills without authenticated embedded bytes. Format
+`2` snapshots validate the complete extension and embedded bundle cardinality
+before reuse; resume never reloads changed live bundle bytes.
+
+### Input bounds
+
+The control plane rejects oversized context before provider work is created:
+
+- Idea title plus body: at most `16 KiB`;
+- serialized mission JSON inside a persisted prompt: at most `24 KiB`, checked
+  before JSON deserialization;
+- external `SKILL.md`: at most `65,536` bytes and `500` body lines.
+
+Preflight failure leaves no durable Run or provider work. Dynamic fan-out is
+prepared completely before its materialization and work rows are committed in
+one transaction. A finalizer failure settles its typed blocked evidence, Stage,
+and Run atomically.
+
+### `AgentMissionContextV1`
+
+Every fresh V1 `InvokeAgent` prompt contains exactly one canonical JSON object
+with these closed sections:
+
+- `schema_version`, `run_id`, and `idea_id`;
+- `mission`: operator request title/body and frozen workflow family;
+- `stage`: frozen state ID and label;
+- `assignment`: exactly one of `task`, `state_owner`, or `mediation`;
+- `runtime`: permission profile, worktree-write disposition, and total
+  procedure identity (`resolved` or `none`).
+
+Task assignments include static/dynamic origin, task name, phase, parallel
+shape, declared outputs, provider-owned outputs, engine-owned outputs, direct
+consumers, and completion contract. State-owner assignments name transition
+consumers. Mediation assignments name the P017/P058 origin, frozen system lead,
+durable conflict or escalation ID, lead-resolution contract, transition
+consumers, and completion contract.
+
+Task inputs remain task-body/materialization data. They are intentionally not a
+field in the closed mission object and cannot broaden the frozen assignment.
+
+### Prompt order
+
+The common finalizer emits sections in this order:
+
+1. frozen agent system instructions, when present;
+2. one `## Mission Context` block with canonical JSON;
+3. frozen precedence rules;
+4. resolved external procedure content, when present;
+5. the task-specific body and materialized input guidance.
+
+Procedure prose is injected once. Active external-skill agents do not retain a
+second copy of the same reusable procedure in their catalog prompt.
+
+### Output ownership
+
+The mission projects existing output authority; it does not create new write
+permission. Declared outputs are partitioned into provider-owned and
+control-plane-owned outputs. `changed_files_manifest` is control-plane-owned:
+provider agents do not need direct Git metadata access to produce it.
+
+Runtime permission profiles, worktree strategy, provider/model binding, MCP
+requirements, output contracts, and side-effect policy remain the enforcing
+authorities. Mission text cannot override them.
+
+### Persisted copy and retry validation
+
+Retry and resume preserve the original prompt bytes. The control plane parses
+and validates them without regenerating the prompt:
+
+- exactly one bounded mission block must exist;
+- Run and Idea IDs/title/body must match durable truth;
+- stage, task/owner, phase, parallel shape, consumers, output partition, agent
+  authority, permission, and procedure hashes must match the frozen plan;
+- dynamic copies must retain a frozen binding identity;
+- P017 mediation copies must match the unique frozen system lead and
+  `lead_resolution_contract`, durable workflow conflict, mediation record, and
+  execution owner relation;
+- P058 mediation copies must match the unique frozen system lead and contract,
+  durable escalation ledger, frozen policy hash, current `lead_mediation` tier,
+  and stage.
+
+A mediation copy without an unambiguous durable authority anchor fails closed.
+All four current copy/retry paths perform this validation before payload
+mutation or retry/work/state writes. P058 lead-tier construction performs a
+second validation after replacing agent authority and before opening its write
+transaction.
 
 ## Skill truth model
 
@@ -112,17 +222,38 @@ They are useful for small agent-local directives that should stay in the YAML so
 
 External skills resolve from explicit external bundles.
 
-Current rules:
+The Swift app keeps its existing canonicalized bundle-loader contract. The Rust
+control plane uses a narrower production format for newly compiled runs:
 
-- external resolution is rooted in explicit catalog base context,
-- relative paths are resolved against the catalog source,
-- the bundle path is validated before any filesystem join: empty strings, null bytes, backslash separators, URI scheme prefixes (`://`), absolute paths, and `..` traversal components are rejected,
-- role names used in `roles/{role}.md` joins must be simple identifiers (no `/`, `\`, null byte, `.`, or `..`),
-- after joining, the resolved bundle path is canonicalized and must remain inside the canonicalized catalog root, blocking symlink-based escapes that component-level checks cannot catch,
-- the loader reads bundle content plus companion metadata,
-- resolution fails closed when the bundle cannot be read or the skill contract is malformed.
+- paths are descriptor-relative and confined to the canonical catalog root;
+- path components and final files are opened without following symlinks;
+- a production bundle contains exactly one regular `SKILL.md` and no auxiliary
+  files;
+- frontmatter is validated and `allowed-tools` is rejected because tools remain
+  catalog/runtime authority;
+- malformed UTF-8, oversized content, path escape, symlink/rename races, and
+  unexpected entries fail compilation;
+- the validated file bytes are embedded into the frozen format `2` snapshot.
 
 The app does not silently substitute a different skill when external resolution fails.
+
+### Active production bundles
+
+The current catalog resolves these five procedures from strict local bundles:
+
+| Catalog skill ID | Bundle |
+|---|---|
+| `proposal_review_router_skill` | `examples/agents/skills/proposal-review-router/SKILL.md` |
+| `proposal_implementation_audit` | `examples/agents/skills/implementation-audit/SKILL.md` |
+| `code_writer_core` | `examples/agents/skills/code-implementation/SKILL.md` |
+| `security_checker_core` | `examples/agents/skills/security-review/SKILL.md` |
+| `prepush_review_core` | `examples/agents/skills/prepush-review/SKILL.md` |
+
+`docs_quality_guardian` remains builtin. `orchestrator_core`,
+`proposal_writer_core`, `github_commit_push`, `connect_publisher`, and
+`steward_core` remain inline. Moving those procedures, adding skill resources
+or scripts, and introducing provider evaluation are future roadmap work and
+require separately reviewed bounded proposals.
 
 ### Role specialization
 
@@ -150,7 +281,7 @@ Operator surfaces should prefer frozen execution-time truth over re-resolving cu
 
 ## Frozen run behavior
 
-Skill resolution happens before the run becomes durable execution.
+Skill and mission resolution happen before the run becomes durable execution.
 
 At run start the app freezes:
 
@@ -215,6 +346,20 @@ That means skill functionality is not a sidecar feature. It is part of:
 
 ## Current implementation owners
 
+Rust execution owners:
+
+- `control-plane/crates/workflow/src/compiler.rs`
+- `control-plane/crates/workflow/src/skill_bundle.rs`
+- `control-plane/crates/workflow/src/plan.rs`
+- `control-plane/crates/engine/src/agent_mission_context.rs`
+- `control-plane/crates/engine/src/orchestrator.rs`
+- `control-plane/crates/engine/src/command_handler.rs`
+- `control-plane/crates/engine/src/p058_deadline_resume.rs`
+- `control-plane/crates/engine/tests/agent_context_skills.rs`
+- `control-plane/crates/engine/tests/fixtures/agent_context/`
+
+Swift resolution and operator-readback owners:
+
 - `Chainworks Forge/Engine/Skills/ResolvedSkill.swift`
 - `Chainworks Forge/Engine/Skills/SkillResolver.swift`
 - `Chainworks Forge/Engine/Skills/ExternalSkillLoader.swift`
@@ -230,10 +375,15 @@ That means skill functionality is not a sidecar feature. It is part of:
 
 ## Verification baseline
 
-Current stable verification for this slice is:
+Current stable verification is the provider-free canonical gate:
 
-- dedicated skill-resolution capability regression coverage on the current tree
-- approved-host non-UI verification summary `15/15` passed
-- canonical app-proof export on the approved host
-- same-tree approved-host `full` green basis:
-  - `full-20260408-101540.xcresult`
+```bash
+./scripts/test-gate.sh agent-context-skills
+```
+
+The gate executes the closed `CTX-001..008` corpus and twelve-clause proof
+manifest, strict bundle and frozen-snapshot compatibility tests, recursive
+InvokeAgent producer inventory, exact prompt/copy mutation negatives, dynamic
+atomicity and zero-work failure proofs, P017/P058 durable mediation authority,
+and P058 deadline/resume regressions. It requires no daemon, network, UI host,
+or live provider.

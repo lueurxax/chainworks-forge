@@ -18,6 +18,7 @@ If you are new to the repo, read these in order:
 - [ROADMAP.md](ROADMAP.md) — short active sequencing index
 - [roadmap/](roadmap) — dated roadmap updates and planning context
 - [roadmap/2026-05-06-main-roadmap-update.md](roadmap/2026-05-06-main-roadmap-update.md) — current sequencing update after the latest `main` stabilization work
+- [roadmap/2026-08-30-agent-mission-context-and-skills-hardening-program.md](roadmap/2026-08-30-agent-mission-context-and-skills-hardening-program.md) — bounded proposal sequence for deferred Agent Skills and eval hardening
 
 ## Features
 
@@ -40,7 +41,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 ### Agents, skills, and MCP
 
-- [reference/skill-resolution-and-runtime-integration.md](reference/skill-resolution-and-runtime-integration.md) — Skill resolution, specialization, runtime injection
+- [reference/skill-resolution-and-runtime-integration.md](reference/skill-resolution-and-runtime-integration.md) — Default-on mission context, frozen Agent Skills, copy validation, and runtime injection
 - [reference/per-agent-mcp-policy-and-runtime-validation.md](reference/per-agent-mcp-policy-and-runtime-validation.md) — Per-agent MCP intent, runtime validation, persisted MCP truth
 - [reference/failed-stage-evidence-delivery-preflight-and-mcp-resolution.md](reference/failed-stage-evidence-delivery-preflight-and-mcp-resolution.md) — Failed-stage evidence, delivery preflight, MCP resolution
 - [reference/agent-work-continuation.md](reference/agent-work-continuation.md) — Agent work continuation API contracts: `agents.continue_work` / `agents.continuation_status` / `agents.continuation_candidates` MCP commands, GraphQL read-only continuation status/candidate/history/metrics surfaces, and materialized request/response and artifact JSON Schemas

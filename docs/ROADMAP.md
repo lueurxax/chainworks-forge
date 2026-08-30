@@ -4,6 +4,7 @@ Small planning index for active sequencing. This is not a proposal and does not 
 
 Detailed context:
 - [2026-05-06 main roadmap update](roadmap/2026-05-06-main-roadmap-update.md)
+- [Agent mission context and skills hardening program](roadmap/2026-08-30-agent-mission-context-and-skills-hardening-program.md)
 - Current stabilization direction: keep the UI boundary closed, preserve local storage liveness, prove retry/recovery behavior, and improve operator usability without reopening client-owned orchestration.
 
 ## Operating mode
@@ -62,6 +63,11 @@ These are not active workstreams:
   - Post-implementation expansion and soak evidence lives in P093.
 - **P036/P085** macOS operator navigation and thin-client affordance baseline.
   - Treat as implemented UI/read-model baseline unless a new delta proposal explicitly says otherwise.
+- **Default-on mission context and frozen Agent Skills baseline**.
+  - Every new Rust-owned invocation receives bounded compiler-owned mission context, and persisted copy/retry paths validate exact task, owner, P017, and P058 authority before mutation.
+  - Proposal review, implementation audit, code implementation, security review, and pre-push review use strict frozen external bundles.
+  - Stable truth lives in [skill-resolution-and-runtime-integration.md](reference/skill-resolution-and-runtime-integration.md); the retained provider-free gate is `agent-context-skills`.
+  - Remaining procedure migration, authority overlays, resource brokerage, and eval infrastructure are new bounded work, not incomplete baseline acceptance.
 
 ## Now
 
@@ -95,6 +101,11 @@ After the current recovery/output/ownership block stabilizes:
 - **P070** typed-boundary consolidation.
   - Refactor only after P082/P083/P088 stop moving the core contracts.
   - Do not use P070 to add product features.
+- **Agent mission context and skills hardening program**.
+  - Schedule only bounded slices from the [program note](roadmap/2026-08-30-agent-mission-context-and-skills-hardening-program.md), each behind a fresh reviewed proposal.
+  - Start with remaining low-authority procedure migration after current stabilization; defer mutable authority overlays until P083/P070 boundaries are stable.
+  - Keep deterministic evals in PR gates and repeated live-provider evals in Steward/nightly operation.
+  - `orchestrator_core`, `github_commit_push`, and `connect_publisher` require separate high-authority proposals and side-effect proof.
 - **P089** managed temporary artifact inventory (read-only smoke slice implemented).
   - Advisory read-only, dry-run-only managed temporary artifact inventory slice, `disabled` by default.
   - Keeps active worktrees and failure evidence safe by design with no cleanup mutations.
@@ -118,6 +129,7 @@ After the current recovery/output/ownership block stabilizes:
 - Additional ACP runtime/provider expansion only after the stabilization window.
 - Additional UI polish only after P032/P036/P093 remain stable under dogfood.
 - Additional storage migration work only if storage/read-path exit criteria fail under real runs.
+- Deferred Agent Skills and eval hardening only through the bounded [program sequence](roadmap/2026-08-30-agent-mission-context-and-skills-hardening-program.md); the preserved full design is source inventory, not one implementation proposal.
 
 ## Current critical path
 
@@ -130,6 +142,10 @@ P073 freeze mode
 → P088 code-writer completion/freshness
 → P095 work/output turn separation
 → P070 typed-boundary consolidation
+→ bounded low-authority skill migration
+→ skill resource broker and provider-free eval registry
+→ Steward-owned nightly live evals
+→ promotion/readback only after measured evidence
 ```
 
 Parallel throughput lane:

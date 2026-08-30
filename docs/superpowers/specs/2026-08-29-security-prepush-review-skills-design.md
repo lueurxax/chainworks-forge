@@ -1,7 +1,7 @@
 # Security and Pre-Push Review Skills: Default-On Slice
 
 Date: 2026-08-29
-Status: Revised after proposal-readiness review; implementation prohibited until Ready
+Status: Implementation merged; deterministic verification complete; natural-run observation pending
 
 ## Summary
 
@@ -21,8 +21,9 @@ their stored catalog and prompt bytes. No feature flag, fallback path, cohort,
 or disable switch is added.
 
 Two provider-free cases, `CTX-007` and `CTX-008`, extend the existing mission
-context gate. After implementation is merged and the local runtime is refreshed,
-one new Chainworks run will provide the first live end-to-end observation.
+context gate and pass in the canonical `agent-context-skills` suite. The next
+ordinary newly compiled Chainworks run may provide a natural observation; no
+dedicated validation run or provider budget is required for closeout.
 
 ## Scope Boundary
 

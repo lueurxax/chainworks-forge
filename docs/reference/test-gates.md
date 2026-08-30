@@ -155,6 +155,8 @@ Agent Skills bundles.
 Scope:
 
 - validates the closed `CTX-001..008` corpus and the twelve-clause proof manifest
+- enforces the `16 KiB` Idea and pre-deserialization `24 KiB` persisted mission
+  bounds
 - verifies `proposal_review_router_skill`, `code_writer_core`,
   `proposal_implementation_audit`, `security_checker_core`, and
   `prepush_review_core` resolve from single-file external bundles
@@ -169,6 +171,10 @@ Scope:
 - verifies frozen bundle reuse, catalog parity, prompt finalization, producer
   inventory, pre-migration inline prompt compatibility, mutation-negative
   cases, and zero-provider-work failure paths
+- proves exact byte-preserving copy validation against durable Run/Idea truth
+  and exact P017 conflict/mediation plus P058 ledger/policy/lead-tier authority
+- proves dynamic fan-out preparation and blocked settlement are atomic before
+  provider work becomes visible
 
 Use when:
 
@@ -190,6 +196,8 @@ Important:
 
 - the gate rejects missing or auxiliary bundle files and any `allowed-tools`
   declaration in these procedure-only skills
+- copied mediation prompts without an unambiguous durable authority anchor fail
+  closed before retry payload mutation or retry/work/state writes
 - frozen runs retain their catalog snapshot: pre-migration V2 runs keep their
   inline security/pre-push bytes, while newly compiled runs freeze both external
   bundles

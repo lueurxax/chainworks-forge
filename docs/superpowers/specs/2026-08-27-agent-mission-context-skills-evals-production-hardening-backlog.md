@@ -1,14 +1,16 @@
 # Deferred Production Hardening Backlog: Agent Mission Context, Skills, and Evals
 
-Status: Deferred, non-normative, and out of scope for the hypothesis-validation
-proposal.
+Status: Deferred, non-normative source inventory. Not an implementation
+contract.
 
 This file preserves the previously reviewed full-production design so that its
-research and review history are not lost. It is not an implementation contract,
-acceptance gate, release requirement, or prerequisite for the experiment in
-`2026-08-27-agent-mission-context-skills-evals-design.md`. Items in this file
-must be promoted into separately scoped proposals and reviewed independently
-before implementation. No claim in this file expands the active proposal.
+research and review history are not lost. The implemented baseline now lives in
+[Mission Context, Skill Resolution, and Runtime Integration](../../reference/skill-resolution-and-runtime-integration.md).
+Scheduling and slice ownership live in the
+[agent mission context and skills hardening program](../../roadmap/2026-08-30-agent-mission-context-and-skills-hardening-program.md).
+This file is not an acceptance gate or release requirement. Items must be
+promoted into separately scoped proposals and reviewed independently before
+implementation; text below cannot expand any roadmap slice.
 
 The preserved text begins below and is intentionally not being refined as part
 of the scope-reduction change.
