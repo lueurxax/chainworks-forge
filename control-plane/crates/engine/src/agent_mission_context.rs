@@ -1,8 +1,15 @@
 use anyhow::{Context, Result};
+use db::repos::{escalation, lead_conflict_mediations, workflow_conflicts};
+use domain::agent::AgentExecution;
+use domain::escalation::EscalationLedger;
 use domain::idea::Idea;
 use domain::ids::RunId;
+use domain::mediation::LeadConflictMediationRecord;
 use domain::run::Run;
+use domain::workflow_conflict::WorkflowConflictRecord;
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
+use workflow::catalog::{validate_catalog_has_exactly_one_system_lead, AgentCatalogFile};
 use workflow::plan::{CompiledState, CompiledTask, ResolvedAgent, RunPlan};
 
 pub const MAX_IDEA_CONTEXT_BYTES: usize = 16 * 1024;
@@ -198,6 +205,227 @@ enum PersistedProcedureIdentity {
     None,
 }
 
+#[derive(Clone, Debug)]
+pub struct PersistedMediationCopyTruth {
+    origin: String,
+    stage_id: String,
+    conflict_or_escalation_id: String,
+    mediation_record_id: Option<String>,
+    lead_agent_id: String,
+    lead_resolution_contract: String,
+}
+
+pub fn p017_mediation_copy_truth(
+    plan: &RunPlan,
+    run: &Run,
+    conflict: &WorkflowConflictRecord,
+    mediation: &LeadConflictMediationRecord,
+) -> Result<PersistedMediationCopyTruth> {
+    let (lead, lead_resolution_contract) = frozen_system_lead_authority(plan)?;
+    let expected_run_id = run.id.to_string();
+    if conflict.run_id != expected_run_id
+        || mediation.run_id != expected_run_id
+        || mediation.conflict_id != conflict.conflict_id
+        || mediation.conflict_fingerprint != conflict.conflict_fingerprint
+        || conflict.mediation_record_id.as_deref() != Some(mediation.id.as_str())
+        || conflict.lead_agent_id.as_deref() != Some(lead.agent_id.as_str())
+        || mediation.lead_agent_id != lead.agent_id
+        || !plan.states.contains_key(&conflict.current_state_id)
+    {
+        anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: P017 mediation relation differs from durable conflict truth"
+        );
+    }
+    Ok(PersistedMediationCopyTruth {
+        origin: "p017_conflict".into(),
+        stage_id: conflict.current_state_id.clone(),
+        conflict_or_escalation_id: conflict.conflict_id.clone(),
+        mediation_record_id: Some(mediation.id.clone()),
+        lead_agent_id: lead.agent_id,
+        lead_resolution_contract,
+    })
+}
+
+pub fn p058_mediation_copy_truth(
+    plan: &RunPlan,
+    run: &Run,
+    ledger: &EscalationLedger,
+) -> Result<PersistedMediationCopyTruth> {
+    let (lead, lead_resolution_contract) = frozen_system_lead_authority(plan)?;
+    let policy = plan
+        .escalation_policies
+        .iter()
+        .find(|policy| {
+            policy.policy_id == ledger.policy_id && policy.policy_hash == ledger.policy_hash
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "frozen_snapshot_contract_incompatible: P058 ledger policy differs from frozen plan"
+            )
+        })?;
+    let current_tier_id = ledger.current_tier_id.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "frozen_snapshot_contract_incompatible: P058 mediation ledger has no current tier"
+        )
+    })?;
+    let tier = policy
+        .tiers
+        .iter()
+        .find(|tier| tier.tier_id == current_tier_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "frozen_snapshot_contract_incompatible: P058 ledger tier is absent from frozen plan"
+            )
+        })?;
+    if ledger.run_id != run.id
+        || !plan.states.contains_key(&ledger.stage_id)
+        || tier.kind != "lead_mediation"
+        || ledger.current_tier_kind_raw.as_deref() != Some("lead_mediation")
+    {
+        anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: P058 mediation relation differs from durable ledger truth"
+        );
+    }
+    Ok(PersistedMediationCopyTruth {
+        origin: "p058_lead_mediation".into(),
+        stage_id: ledger.stage_id.clone(),
+        conflict_or_escalation_id: ledger.id.clone(),
+        mediation_record_id: None,
+        lead_agent_id: lead.agent_id,
+        lead_resolution_contract,
+    })
+}
+
+pub async fn load_mediation_copy_truth_for_execution(
+    pool: &SqlitePool,
+    plan: &RunPlan,
+    run: &Run,
+    execution: &AgentExecution,
+    payload: &serde_json::Value,
+) -> Result<Option<PersistedMediationCopyTruth>> {
+    if plan.mission_context_version.as_deref() != Some(MISSION_CONTEXT_VERSION) {
+        return Ok(None);
+    }
+    let claimed_origin = payload
+        .get("mediation_origin")
+        .and_then(serde_json::Value::as_str);
+    let p017_owned = execution.owner_kind.as_deref() == Some("lead_conflict_mediation")
+        || execution.lead_mediation_record_id.is_some();
+    let p058_owned = execution.escalation_tier_kind_raw.as_deref() == Some("lead_mediation");
+    if p017_owned && p058_owned {
+        anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: execution has ambiguous mediation ownership"
+        );
+    }
+    if p017_owned {
+        if claimed_origin != Some("p017_conflict") {
+            anyhow::bail!(
+                "frozen_snapshot_contract_incompatible: P017 execution payload lost its mediation origin"
+            );
+        }
+        let owner_id = execution.owner_id.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "frozen_snapshot_contract_incompatible: P017 execution has no mediation owner"
+            )
+        })?;
+        let mediation_id = execution
+            .lead_mediation_record_id
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "frozen_snapshot_contract_incompatible: P017 execution has no mediation relation"
+                )
+            })?;
+        if owner_id != mediation_id {
+            anyhow::bail!(
+                "frozen_snapshot_contract_incompatible: P017 execution owner and mediation relation differ"
+            );
+        }
+        let mediation = lead_conflict_mediations::find_by_id(pool, mediation_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "frozen_snapshot_contract_incompatible: P017 durable mediation is missing"
+                )
+            })?;
+        let conflict = workflow_conflicts::list_conflict_history_for_run(pool, run.id)
+            .await?
+            .into_iter()
+            .find(|conflict| conflict.conflict_id == mediation.conflict_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "frozen_snapshot_contract_incompatible: P017 durable conflict is missing"
+                )
+            })?;
+        let truth = p017_mediation_copy_truth(plan, run, &conflict, &mediation)?;
+        if execution.agent_id != truth.lead_agent_id {
+            anyhow::bail!(
+                "frozen_snapshot_contract_incompatible: P017 execution agent differs from frozen system lead"
+            );
+        }
+        return Ok(Some(truth));
+    }
+    if p058_owned {
+        let ledger_id = execution.escalation_ledger_id.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "frozen_snapshot_contract_incompatible: P058 lead execution has no escalation ledger"
+            )
+        })?;
+        let ledger = escalation::find_ledger_by_id(pool, ledger_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "frozen_snapshot_contract_incompatible: P058 durable ledger is missing"
+                )
+            })?;
+        return p058_mediation_copy_truth_for_execution(plan, run, &ledger, execution, payload);
+    }
+    if claimed_origin.is_some() {
+        anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: mediation payload has no durable execution ownership"
+        );
+    }
+    Ok(None)
+}
+
+pub fn p058_mediation_copy_truth_for_execution(
+    plan: &RunPlan,
+    run: &Run,
+    ledger: &EscalationLedger,
+    execution: &AgentExecution,
+    payload: &serde_json::Value,
+) -> Result<Option<PersistedMediationCopyTruth>> {
+    let claimed_origin = payload
+        .get("mediation_origin")
+        .and_then(serde_json::Value::as_str);
+    let p058_owned = execution.escalation_tier_kind_raw.as_deref() == Some("lead_mediation");
+    if !p058_owned {
+        if claimed_origin == Some("p058_lead_mediation") {
+            anyhow::bail!(
+                "frozen_snapshot_contract_incompatible: P058 mediation payload has no lead-tier execution authority"
+            );
+        }
+        return Ok(None);
+    }
+    if claimed_origin != Some("p058_lead_mediation") {
+        anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: P058 execution payload lost its mediation origin"
+        );
+    }
+    let truth = p058_mediation_copy_truth(plan, run, ledger)?;
+    if execution.agent_id != truth.lead_agent_id
+        || execution.escalation_ledger_id.as_deref() != Some(ledger.id.as_str())
+        || execution.escalation_policy_id.as_deref() != Some(ledger.policy_id.as_str())
+        || execution.escalation_policy_hash.as_deref() != Some(ledger.policy_hash.as_str())
+        || execution.escalation_tier_id.as_deref() != ledger.current_tier_id.as_deref()
+    {
+        anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: P058 execution differs from durable escalation authority"
+        );
+    }
+    Ok(Some(truth))
+}
+
 pub fn is_control_plane_owned_output(output_name: &str) -> bool {
     output_name == "changed_files_manifest"
 }
@@ -317,6 +545,16 @@ pub fn validate_persisted_v1_payload_prompt_with_truth(
     idea: &Idea,
     payload: &serde_json::Value,
 ) -> Result<()> {
+    validate_persisted_v1_payload_prompt_with_copy_truth(plan, run, idea, payload, None)
+}
+
+pub fn validate_persisted_v1_payload_prompt_with_copy_truth(
+    plan: &RunPlan,
+    run: &Run,
+    idea: &Idea,
+    payload: &serde_json::Value,
+    mediation_truth: Option<&PersistedMediationCopyTruth>,
+) -> Result<()> {
     if plan.mission_context_version.as_deref() != Some(MISSION_CONTEXT_VERSION) {
         return Ok(());
     }
@@ -331,7 +569,8 @@ pub fn validate_persisted_v1_payload_prompt_with_truth(
     let context = parse_persisted_v1_prompt(prompt)?;
     validate_persisted_context_shape(plan, &context)?;
     validate_persisted_payload_authority(plan, payload, &context)?;
-    validate_persisted_durable_truth(run, idea, &context)
+    validate_persisted_durable_truth(run, idea, &context)?;
+    validate_persisted_mediation_copy_truth(payload, &context, mediation_truth)
 }
 
 fn parse_persisted_v1_prompt(prompt: &str) -> Result<PersistedAgentMissionContextV1> {
@@ -538,6 +777,59 @@ fn validate_persisted_durable_truth(
     Ok(())
 }
 
+fn validate_persisted_mediation_copy_truth(
+    payload: &serde_json::Value,
+    context: &PersistedAgentMissionContextV1,
+    expected: Option<&PersistedMediationCopyTruth>,
+) -> Result<()> {
+    let PersistedAssignment::Mediation {
+        origin,
+        lead_agent_id,
+        conflict_or_escalation_id,
+        lead_resolution,
+        ..
+    } = &context.assignment
+    else {
+        if expected.is_some() {
+            anyhow::bail!(
+                "frozen_snapshot_contract_incompatible: durable mediation owner points to a non-mediation mission"
+            );
+        }
+        return Ok(());
+    };
+    let expected = expected.ok_or_else(|| {
+        anyhow::anyhow!(
+            "frozen_snapshot_contract_incompatible: copied mediation mission has no durable authority anchor"
+        )
+    })?;
+    if origin != &expected.origin
+        || context.stage.state_id != expected.stage_id
+        || conflict_or_escalation_id != &expected.conflict_or_escalation_id
+        || lead_agent_id != &expected.lead_agent_id
+        || lead_resolution != &expected.lead_resolution_contract
+    {
+        anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: copied mediation mission differs from frozen or durable authority"
+        );
+    }
+    if expected.origin == "p017_conflict" {
+        let mediation_record_id = expected.mediation_record_id.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "frozen_snapshot_contract_incompatible: P017 durable mediation relation is missing"
+            )
+        })?;
+        let object = payload.as_object().ok_or_else(|| {
+            anyhow::anyhow!(
+                "frozen_snapshot_contract_incompatible: V1 retry payload must be an object"
+            )
+        })?;
+        require_payload_string(object, "owner_kind", "lead_conflict_mediation")?;
+        require_payload_string(object, "owner_id", mediation_record_id)?;
+        require_payload_string(object, "mediation_record_id", mediation_record_id)?;
+    }
+    Ok(())
+}
+
 fn validate_persisted_payload_authority(
     plan: &RunPlan,
     payload: &serde_json::Value,
@@ -718,6 +1010,31 @@ fn frozen_agent(plan: &RunPlan, agent_id: &str) -> Result<ResolvedAgent> {
                 "frozen_snapshot_contract_incompatible: payload agent '{agent_id}' is absent from frozen plan"
             )
         })
+}
+
+fn frozen_system_lead_authority(plan: &RunPlan) -> Result<(ResolvedAgent, String)> {
+    let catalog: AgentCatalogFile =
+        serde_json::from_str(&plan.catalog_snapshot_json).map_err(|error| {
+            anyhow::anyhow!(
+                "frozen_snapshot_contract_incompatible: frozen agent catalog is malformed: {error}"
+            )
+        })?;
+    let lead_entry = validate_catalog_has_exactly_one_system_lead(&catalog).map_err(|error| {
+        anyhow::anyhow!(
+            "frozen_snapshot_contract_incompatible: frozen system lead authority is invalid: {error}"
+        )
+    })?;
+    let lead_resolution_contract = lead_entry
+        .lead_resolution_contract
+        .as_deref()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "frozen_snapshot_contract_incompatible: frozen system lead has no resolution contract"
+            )
+        })?
+        .to_string();
+    let lead = frozen_agent(plan, &lead_entry.id)?;
+    Ok((lead, lead_resolution_contract))
 }
 
 fn persisted_procedure_matches_agent(

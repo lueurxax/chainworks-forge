@@ -29,7 +29,8 @@
         {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "agent_context_late_dynamic_finalizer_failure_rolls_back_the_entire_fanout"},
         {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "agent_context_dynamic_blocked_settlement_is_atomic_under_write_failure"},
         {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "agent_context_advance_run_missing_idea_settles_dynamic_stage_atomically"},
-        {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "agent_context_p017_finalizer_failure_preserves_unresolved_conflict_and_zero_work"}
+        {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "agent_context_p017_finalizer_failure_preserves_unresolved_conflict_and_zero_work"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "persisted_mediation_copy_validation_rejects_coordinated_frozen_authority_substitution"}
       ]
     },
     {
@@ -107,6 +108,7 @@
         {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "invoke_agent_producer_manifest_is_closed_and_each_guard_is_mutation_sensitive"},
         {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "legacy_flat_producer_rejects_workflow_or_snapshot_backed_runs"},
         {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "persisted_v1_validation_rejects_structural_and_authority_mutations_without_rewriting"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "persisted_mediation_copy_validation_rejects_coordinated_frozen_authority_substitution"},
         {"source": "control-plane/crates/engine/tests/proposal_058_deadline_resume.rs", "test": "p058_operator_resume_rejects_malformed_v1_source_prompt_without_mutation"},
         {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "proposal_058_lead_mediation_replaces_complete_source_agent_authority"}
       ]

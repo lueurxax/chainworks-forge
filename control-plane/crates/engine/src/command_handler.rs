@@ -7310,11 +7310,21 @@ impl CommandHandler {
             })?;
         if let Some(plan) = frozen_plan.as_ref() {
             if let Some(idea) = frozen_idea.as_ref() {
-                crate::agent_mission_context::validate_persisted_v1_payload_prompt_with_truth(
+                let mediation_truth =
+                    crate::agent_mission_context::load_mediation_copy_truth_for_execution(
+                        &self.pool,
+                        plan,
+                        &run,
+                        &target_exec,
+                        &retry_payload,
+                    )
+                    .await?;
+                crate::agent_mission_context::validate_persisted_v1_payload_prompt_with_copy_truth(
                     plan,
                     &run,
                     idea,
                     &retry_payload,
+                    mediation_truth.as_ref(),
                 )?;
             }
         }

@@ -124,6 +124,19 @@ pub async fn find_by_id(pool: &SqlitePool, id: AgentExecutionId) -> Result<Optio
     row.map(|row| parse_agent_execution_row(&row)).transpose()
 }
 
+pub async fn find_by_id_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: AgentExecutionId,
+) -> Result<Option<AgentExecution>> {
+    let query = format!("SELECT {SELECT_COLS} FROM agent_executions WHERE id = ?");
+    let row = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
+        .bind(id.to_string())
+        .fetch_optional(&mut **tx)
+        .await?;
+
+    row.map(|row| parse_agent_execution_row(&row)).transpose()
+}
+
 pub async fn update_completed(
     pool: &SqlitePool,
     id: AgentExecutionId,

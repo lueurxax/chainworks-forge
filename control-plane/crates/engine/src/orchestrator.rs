@@ -3073,11 +3073,21 @@ impl Orchestrator {
                         .ok_or_else(|| {
                             anyhow::anyhow!("mission_context_source_missing: Idea {}", run.idea_id)
                         })?;
-                    crate::agent_mission_context::validate_persisted_v1_payload_prompt_with_truth(
+                    let mediation_truth =
+                        crate::agent_mission_context::load_mediation_copy_truth_for_execution(
+                            &self.pool,
+                            plan,
+                            run,
+                            execution,
+                            &retry_payload,
+                        )
+                        .await?;
+                    crate::agent_mission_context::validate_persisted_v1_payload_prompt_with_copy_truth(
                         plan,
                         run,
                         &idea,
                         &retry_payload,
+                        mediation_truth.as_ref(),
                     )?;
                 }
             }
@@ -3592,11 +3602,21 @@ impl Orchestrator {
                     .ok_or_else(|| {
                         anyhow::anyhow!("mission_context_source_missing: Idea {}", run.idea_id)
                     })?;
-                crate::agent_mission_context::validate_persisted_v1_payload_prompt_with_truth(
+                let mediation_truth =
+                    crate::agent_mission_context::load_mediation_copy_truth_for_execution(
+                        &self.pool,
+                        &plan,
+                        run,
+                        execution,
+                        &retry_payload,
+                    )
+                    .await?;
+                crate::agent_mission_context::validate_persisted_v1_payload_prompt_with_copy_truth(
                     &plan,
                     run,
                     &idea,
                     &retry_payload,
+                    mediation_truth.as_ref(),
                 )?;
             }
 
@@ -3786,7 +3806,10 @@ impl Orchestrator {
                 }),
             );
             if lead_authority.is_some() {
-                validate_p058_lead_retry_payload(&plan, &retry_payload)?;
+                let idea = ideas::find_by_id(&self.pool, run.idea_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("run Idea not found"))?;
+                validate_p058_lead_retry_payload(&plan, run, &idea, &ledger, &retry_payload)?;
             }
 
             let tx_started = std::time::Instant::now();
@@ -8139,9 +8162,20 @@ fn replace_p058_lead_invoke_payload_authority(
 
 fn validate_p058_lead_retry_payload(
     plan: &workflow::plan::RunPlan,
+    run: &domain::run::Run,
+    idea: &domain::idea::Idea,
+    ledger: &domain::escalation::EscalationLedger,
     payload: &serde_json::Value,
 ) -> Result<()> {
-    crate::agent_mission_context::validate_persisted_v1_payload_prompt(plan, payload)
+    let mediation_truth =
+        crate::agent_mission_context::p058_mediation_copy_truth(plan, run, ledger)?;
+    crate::agent_mission_context::validate_persisted_v1_payload_prompt_with_copy_truth(
+        plan,
+        run,
+        idea,
+        payload,
+        Some(&mediation_truth),
+    )
 }
 
 fn p058_escalation_tier_provider_fallback(

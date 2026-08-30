@@ -1,8 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use db::repos::{
-    escalation, ideas, retry_operator_instructions, retry_stage_execution_authorities, runs,
-    stages, work_items,
+    agent_executions, escalation, ideas, retry_operator_instructions,
+    retry_stage_execution_authorities, runs, stages, work_items,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::commands::{ResumeEscalationChainCmd, ResumeEscalationDeadlineCmd};
@@ -349,11 +349,22 @@ async fn resume_escalation_tx(
     let idea = ideas::find_by_id_tx(tx, run.idea_id)
         .await?
         .context("P058_RESUME_SOURCE_WORK_INVALID: durable Idea is missing")?;
-    crate::agent_mission_context::validate_persisted_v1_payload_prompt_with_truth(
+    let source_execution = agent_executions::find_by_id_tx(tx, source_agent_execution_id)
+        .await?
+        .context("P058_RESUME_SOURCE_WORK_INVALID: durable source execution is missing")?;
+    let mediation_truth = crate::agent_mission_context::p058_mediation_copy_truth_for_execution(
+        &plan,
+        &run,
+        &ledger,
+        &source_execution,
+        &retry_payload,
+    )?;
+    crate::agent_mission_context::validate_persisted_v1_payload_prompt_with_copy_truth(
         &plan,
         &run,
         &idea,
         &retry_payload,
+        mediation_truth.as_ref(),
     )
     .context("P058_RESUME_SOURCE_WORK_INVALID: source V1 prompt validation failed")?;
     let source_provider = retry_payload

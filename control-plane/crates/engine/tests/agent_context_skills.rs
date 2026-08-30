@@ -2,14 +2,21 @@ use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{ideas, runs};
 use domain::commands::{CallerContext, Command, PrincipalClass, StartRunCmd};
+use domain::escalation::EscalationLedger;
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{IdeaId, RunId};
+use domain::mediation::{LeadConflictMediationRecord, LeadMediationStatus};
 use domain::run::{Run, RunStatus};
+use domain::workflow_conflict::{
+    WorkflowConflictReason, WorkflowConflictRecord, WorkflowConflictStatus,
+};
 use engine::agent_mission_context::{
     finalize_mediation_prompt_v1, finalize_owner_prompt_v1, finalize_task_prompt_v1,
-    preflight_run_mission_context, validate_legacy_flat_invoke_agent,
-    validate_persisted_v1_payload_prompt, validate_persisted_v1_payload_prompt_with_truth,
-    validate_persisted_v1_prompt, MAX_IDEA_CONTEXT_BYTES, MAX_MISSION_CONTEXT_BYTES,
+    p017_mediation_copy_truth, p058_mediation_copy_truth, preflight_run_mission_context,
+    validate_legacy_flat_invoke_agent, validate_persisted_v1_payload_prompt,
+    validate_persisted_v1_payload_prompt_with_copy_truth,
+    validate_persisted_v1_payload_prompt_with_truth, validate_persisted_v1_prompt,
+    MAX_IDEA_CONTEXT_BYTES, MAX_MISSION_CONTEXT_BYTES,
 };
 use engine::command_handler::{compile_run_plan_for_run, CommandHandler};
 use engine::event_bus;
@@ -19,8 +26,8 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use std::collections::{BTreeSet, HashMap};
 use workflow::plan::{
-    CompiledState, CompiledTask, CompiledTransition, DegradedOutputPolicy, ResolvedAgent,
-    ResolvedSkill, RunPlan,
+    CompiledState, CompiledTask, CompiledTransition, DegradedOutputPolicy,
+    EscalationPolicySnapshot, EscalationTierSnapshot, ResolvedAgent, ResolvedSkill, RunPlan,
 };
 
 fn repository_root() -> std::path::PathBuf {
@@ -130,6 +137,52 @@ fn task_for_agent<'a>(plan: &'a RunPlan, agent_id: &str) -> (&'a CompiledState, 
                 .map(|task| (state, task))
         })
         .expect("agent task should exist")
+}
+
+fn mediation_payload(
+    run: &Run,
+    state: &CompiledState,
+    agent: &ResolvedAgent,
+    origin: &str,
+    durable_id: &str,
+    resolution_contract: &str,
+    prompt: String,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "run_id": run.id.to_string(),
+        "stage_id": state.id,
+        "task_name": format!("mediation_{durable_id}"),
+        "task_outputs": ["lead_resolution"],
+        "agent_id": agent.agent_id,
+        "backend_profile_id": agent.backend_profile_id,
+        "provider": agent.provider,
+        "model": agent.model,
+        "effort": agent.effort,
+        "max_turns": agent.max_turns,
+        "temperature": agent.temperature,
+        "permission_profile": agent.permission_profile,
+        "skill_ref": agent.skill_ref,
+        "skill_role": agent.skill_role,
+        "skill_snapshot_hash": agent.skill_snapshot_hash,
+        "requested_mcp_server_ids": agent.requested_mcp_server_ids,
+        "worktree_write_enabled": agent.worktree_write_enabled,
+        "worktree_strategy": agent.worktree_strategy,
+        "session_reuse_scope": agent.session_reuse_scope,
+        "session_family_id": agent.session_family_id,
+        "xcode_broker_required": agent.xcode_broker_required,
+        "xcode_shim_injection_signal": agent.xcode_shim_injection_signal,
+        "requires_xcode_host_execution": agent.requires_xcode_host_execution,
+        "output_contract": resolution_contract,
+        "mediation_origin": origin,
+        "conflict_or_escalation_id": durable_id,
+        "prompt": prompt,
+    });
+    if origin == "p017_conflict" {
+        payload["owner_kind"] = serde_json::json!("lead_conflict_mediation");
+        payload["owner_id"] = serde_json::json!(format!("mediation-{durable_id}"));
+        payload["mediation_record_id"] = serde_json::json!(format!("mediation-{durable_id}"));
+    }
+    payload
 }
 
 #[derive(Debug, Deserialize)]
@@ -1973,6 +2026,192 @@ fn persisted_v1_validation_rejects_structural_and_authority_mutations_without_re
         &consumer_mutation,
     )
     .is_err());
+}
+
+#[test]
+fn persisted_mediation_copy_validation_rejects_coordinated_frozen_authority_substitution() {
+    let mut plan = compile_plan();
+    plan.escalation_policies.push(EscalationPolicySnapshot {
+        policy_id: "mission_context_test_policy".into(),
+        schema_version: "p058_escalation_policy_v1".into(),
+        enabled_default: true,
+        applies_to_agent_id: Some("code_writer".into()),
+        applies_to_backend_profile_id: None,
+        applies_to_stage_id: None,
+        max_chain_attempts: 2,
+        max_chain_wall_clock_seconds: 300,
+        triggers: vec!["contract_output_failure".into()],
+        tiers: vec![EscalationTierSnapshot {
+            tier_id: "lead_mediation".into(),
+            kind: "lead_mediation".into(),
+            backend_profile_id: None,
+            max_attempts: Some(1),
+        }],
+        policy_hash: "sha256:mission-context-test-policy".into(),
+        digest_version: Some("escalation_blocker_digest_v1".into()),
+        rollout_override_state: None,
+    });
+    let lead_state = plan
+        .states
+        .values()
+        .find(|state| state.owner.agent_id == "lead_orchestrator")
+        .expect("system lead should own a frozen state");
+    let (_, alternate_task) = task_for_agent(&plan, "code_writer");
+    let idea = idea(
+        "Mediation copy authority".into(),
+        "Copied mediation must remain bound to durable truth.".into(),
+    );
+    let run = run(&plan, &idea, &lead_state.id);
+    let now = Utc::now();
+    let conflict = WorkflowConflictRecord {
+        conflict_id: "conflict-canonical".into(),
+        conflict_fingerprint: "sha256:mission-context-conflict".into(),
+        run_id: run.id.to_string(),
+        stage_execution_id: None,
+        lineage_id: None,
+        current_state_id: lead_state.id.clone(),
+        reason: WorkflowConflictReason::NoDeclarativeTransitionMatched,
+        operator_label: "No declarative transition matched".into(),
+        status: WorkflowConflictStatus::LeadMediationPending,
+        candidate_transitions: Vec::new(),
+        candidate_transition_hash: "sha256:empty".into(),
+        advisory_evidence_refs: Vec::new(),
+        lead_agent_id: Some(lead_state.owner.agent_id.clone()),
+        mediation_record_id: Some("mediation-conflict-canonical".into()),
+        created_at: now,
+        updated_at: now,
+        resolved_at: None,
+        superseded_by_conflict_id: None,
+        resolution_record_json: None,
+        terminal_failure_reason: None,
+        diagnostic_redaction_tier: "operator_safe".into(),
+    };
+    let mediation = LeadConflictMediationRecord {
+        id: "mediation-conflict-canonical".into(),
+        run_id: run.id.to_string(),
+        conflict_id: conflict.conflict_id.clone(),
+        conflict_fingerprint: conflict.conflict_fingerprint.clone(),
+        lead_agent_id: lead_state.owner.agent_id.clone(),
+        status: LeadMediationStatus::Queued,
+        settlement_result: None,
+        recovery_action: None,
+        chosen_action: None,
+        chosen_next_state_id: None,
+        chosen_next_state_label: None,
+        operator_rationale: None,
+        sanitized_progress: None,
+        validation_errors_json: None,
+        cost_summary_json: None,
+        metric_event_id: None,
+        superseded_by_event_ref: None,
+        agent_execution_id: None,
+        confirmation_subject_id: None,
+        created_at: now,
+        updated_at: now,
+        settled_at: None,
+    };
+    let p017_truth = p017_mediation_copy_truth(&plan, &run, &conflict, &mediation).unwrap();
+    let (policy, lead_tier) = plan
+        .escalation_policies
+        .iter()
+        .find_map(|policy| {
+            policy
+                .tiers
+                .iter()
+                .find(|tier| tier.kind == "lead_mediation")
+                .map(|tier| (policy, tier))
+        })
+        .expect("active frozen plan should contain a P058 lead tier");
+    let ledger = EscalationLedger {
+        id: "ledger-canonical".into(),
+        run_id: run.id,
+        stage_id: lead_state.id.clone(),
+        stage_execution_id: None,
+        agent_id: "code_writer".into(),
+        policy_id: policy.policy_id.clone(),
+        policy_hash: policy.policy_hash.clone(),
+        status_raw: "active".into(),
+        current_tier_id: Some(lead_tier.tier_id.clone()),
+        current_tier_kind_raw: Some(lead_tier.kind.clone()),
+        chain_attempt_index: 1,
+        trigger_raw: Some("contract_output_failure".into()),
+        pause_reason_raw: None,
+        operator_action_hint: None,
+        runbook_anchor: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let p058_truth = p058_mediation_copy_truth(&plan, &run, &ledger).unwrap();
+
+    for (origin, durable_id, durable_truth) in [
+        ("p017_conflict", "conflict-canonical", p017_truth),
+        ("p058_lead_mediation", "ledger-canonical", p058_truth),
+    ] {
+        let canonical_prompt = finalize_mediation_prompt_v1(
+            &plan,
+            &run,
+            lead_state,
+            &lead_state.owner,
+            &idea,
+            origin,
+            durable_id,
+            "LeadResolutionContract",
+            "mediate the frozen evidence",
+        )
+        .unwrap();
+        let canonical_payload = mediation_payload(
+            &run,
+            lead_state,
+            &lead_state.owner,
+            origin,
+            durable_id,
+            "LeadResolutionContract",
+            canonical_prompt.clone(),
+        );
+        validate_persisted_v1_payload_prompt_with_copy_truth(
+            &plan,
+            &run,
+            &idea,
+            &canonical_payload,
+            Some(&durable_truth),
+        )
+        .expect("unchanged mediation payload should validate");
+        assert_eq!(canonical_payload["prompt"], canonical_prompt);
+
+        let substituted_id = format!("{durable_id}-substituted");
+        let substituted_prompt = finalize_mediation_prompt_v1(
+            &plan,
+            &run,
+            lead_state,
+            &alternate_task.agent,
+            &idea,
+            origin,
+            &substituted_id,
+            "AlternateLeadResolutionContract",
+            "mediate the frozen evidence",
+        )
+        .unwrap();
+        let substituted_payload = mediation_payload(
+            &run,
+            lead_state,
+            &alternate_task.agent,
+            origin,
+            &substituted_id,
+            "AlternateLeadResolutionContract",
+            substituted_prompt,
+        );
+        assert!(
+            validate_persisted_v1_payload_prompt_with_copy_truth(
+                &plan,
+                &run,
+                &idea,
+                &substituted_payload,
+                Some(&durable_truth),
+            )
+            .is_err(),
+            "{origin} coordinated frozen-agent/contract/durable-id substitution must fail"
+        );
+    }
 }
 
 #[test]
