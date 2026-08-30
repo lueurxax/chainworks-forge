@@ -4,14 +4,14 @@
     "source_file": "command_handler.rs",
     "function": "retry_agent_execution",
     "classification": "copy_validated",
-    "guard": "validate_persisted_v1_payload_prompt"
+    "guard": "validate_persisted_v1_payload_prompt_with_truth"
   },
   {
     "producer_id": "orchestrator.auto_contract_retry",
     "source_file": "orchestrator.rs",
     "function": "schedule_auto_contract_output_retry_for_stage",
     "classification": "copy_validated",
-    "guard": "validate_persisted_v1_payload_prompt"
+    "guard": "validate_persisted_v1_payload_prompt_with_truth"
   },
   {
     "producer_id": "orchestrator.dynamic_parallel",
@@ -46,7 +46,7 @@
     "source_file": "orchestrator.rs",
     "function": "schedule_p058_escalation_retry_for_stage",
     "classification": "copy_validated",
-    "guard": "validate_persisted_v1_payload_prompt"
+    "guard": "validate_persisted_v1_payload_prompt_with_truth"
   },
   {
     "producer_id": "orchestrator.standard_task",
@@ -60,6 +60,6 @@
     "source_file": "p058_deadline_resume.rs",
     "function": "resume_escalation_tx",
     "classification": "copy_validated",
-    "guard": "validate_persisted_v1_payload_prompt"
+    "guard": "validate_persisted_v1_payload_prompt_with_truth"
   }
 ]

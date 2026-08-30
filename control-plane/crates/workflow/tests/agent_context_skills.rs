@@ -8,6 +8,20 @@ use workflow::compiler;
 
 static FIXTURE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+fn repository_root() -> PathBuf {
+    let current = std::env::current_dir().expect("test process should have a working directory");
+    current
+        .ancestors()
+        .find(|candidate| {
+            candidate
+                .join("examples/workflows/full-mvp-live.yaml")
+                .is_file()
+                && candidate.join("control-plane/Cargo.toml").is_file()
+        })
+        .map(Path::to_path_buf)
+        .expect("test working directory should be inside the Chainworks repository")
+}
+
 struct FixtureDir(PathBuf);
 
 impl FixtureDir {
@@ -137,7 +151,7 @@ struct CatalogParityExpectedAgent {
 
 #[test]
 fn active_catalog_preserves_affected_contracts_and_unrelated_skill_bytes() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let root = repository_root();
     let source: CatalogParitySource =
         serde_yaml::from_slice(&fs::read(root.join("examples/agents/agents.yaml")).unwrap())
             .unwrap();
@@ -391,7 +405,7 @@ fn assert_review_surface_matches(
 
 #[test]
 fn security_and_prepush_migration_preserves_complete_before_state() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let root = repository_root();
     let before: serde_json::Value = serde_json::from_slice(
         &fs::read(root.join(
             "control-plane/crates/workflow/tests/fixtures/agent_context/\
@@ -493,7 +507,7 @@ fn security_and_prepush_migration_preserves_complete_before_state() {
 
 #[test]
 fn active_security_and_prepush_bundles_are_strict_single_file_documents() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let root = repository_root();
     for (relative, expected_name) in [
         ("examples/agents/skills/security-review", "security-review"),
         ("examples/agents/skills/prepush-review", "prepush-review"),
@@ -525,7 +539,7 @@ fn active_security_and_prepush_bundles_are_strict_single_file_documents() {
 
 #[test]
 fn security_and_prepush_frozen_bundles_ignore_live_source_drift() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let root = repository_root();
     let workflow_path = root.join("examples/workflows/full-mvp-live.yaml");
     let catalog_path = root.join("examples/agents/agents.yaml");
     let initial = compiler::compile(path_string(&workflow_path), path_string(&catalog_path))

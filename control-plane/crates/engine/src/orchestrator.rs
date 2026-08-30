@@ -730,6 +730,18 @@ impl Orchestrator {
                             );
 
                             if state.dynamic_parallel.is_some() {
+                                let Some(dynamic_idea) = self
+                                    .load_idea_for_provider_prompt(
+                                        run_id,
+                                        run,
+                                        stage,
+                                        &plan,
+                                        "dynamic_parallel",
+                                    )
+                                    .await?
+                                else {
+                                    return Ok(());
+                                };
                                 if self
                                     .execute_system_routing_if_applicable(run_id, run, stage, &plan)
                                     .await?
@@ -756,23 +768,13 @@ impl Orchestrator {
                                         run.artifact_root.trim_end_matches('/')
                                     );
                                     if std::path::Path::new(&artifact_path).exists() {
-                                        let idea_opt = Some(
-                                            ideas::find_by_id(&self.pool, run.idea_id)
-                                                .await?
-                                                .ok_or_else(|| {
-                                                    anyhow::anyhow!(
-                                                        "mission_context_source_missing: Idea {}",
-                                                        run.idea_id
-                                                    )
-                                                })?,
-                                        );
                                         self.materialize_dynamic_parallel(
                                             run_id,
                                             run,
                                             stage,
                                             &plan,
                                             dp,
-                                            idea_opt.as_ref(),
+                                            Some(&dynamic_idea),
                                         )
                                         .await?;
                                         return Ok(());
@@ -780,16 +782,19 @@ impl Orchestrator {
                                 }
                             }
 
-                            let idea_opt = Some(
-                                ideas::find_by_id(&self.pool, run.idea_id)
-                                    .await?
-                                    .ok_or_else(|| {
-                                        anyhow::anyhow!(
-                                            "mission_context_source_missing: Idea {}",
-                                            run.idea_id
-                                        )
-                                    })?,
-                            );
+                            let Some(idea) = self
+                                .load_idea_for_provider_prompt(
+                                    run_id,
+                                    run,
+                                    stage,
+                                    &plan,
+                                    "provider_enqueue",
+                                )
+                                .await?
+                            else {
+                                return Ok(());
+                            };
+                            let idea_opt = Some(idea);
                             let effective_total = effective.len();
                             if effective_total == 0 {
                                 let prompt = build_task_prompt_for_owner(
@@ -939,16 +944,19 @@ impl Orchestrator {
                                             "Phase {} complete — enqueuing phase {} tasks",
                                             current_phase, np
                                         );
-                                        let idea_opt = Some(
-                                            ideas::find_by_id(&self.pool, run.idea_id)
-                                                .await?
-                                                .ok_or_else(|| {
-                                                    anyhow::anyhow!(
-                                                        "mission_context_source_missing: Idea {}",
-                                                        run.idea_id
-                                                    )
-                                                })?,
-                                        );
+                                        let Some(idea) = self
+                                            .load_idea_for_provider_prompt(
+                                                run_id,
+                                                run,
+                                                stage,
+                                                &plan,
+                                                "next_phase",
+                                            )
+                                            .await?
+                                        else {
+                                            return Ok(());
+                                        };
+                                        let idea_opt = Some(idea);
                                         let effective_total = effective.len();
                                         let approval_rejection_context = self
                                             .approval_rejection_context_for_state(
@@ -1466,11 +1474,12 @@ impl Orchestrator {
         }
 
         if needs_git_worktree && run.worktree_root.is_none() {
-            let idea_for_slug = ideas::find_by_id(&self.pool, run.idea_id)
+            let Some(idea_for_slug) = self
+                .load_idea_for_provider_prompt(run_id, &run, &stage, &plan, "worktree_provisioning")
                 .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("mission_context_source_missing: Idea {}", run.idea_id)
-                })?;
+            else {
+                return Ok(());
+            };
             let idea_title = idea_for_slug.title.as_str();
 
             // Extract base_branch from the first agent with a worktree_policy in the catalog.
@@ -1555,13 +1564,13 @@ impl Orchestrator {
         // prompts that consume `input.idea`. Without this, the agent only
         // sees a placeholder line ("path not defined in catalog") and has no
         // access to what the user actually asked for.
-        let idea_opt = Some(
-            ideas::find_by_id(&self.pool, run.idea_id)
-                .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("mission_context_source_missing: Idea {}", run.idea_id)
-                })?,
-        );
+        let Some(idea) = self
+            .load_idea_for_provider_prompt(run_id, &run, &stage, &plan, "provider_enqueue")
+            .await?
+        else {
+            return Ok(());
+        };
+        let idea_opt = Some(idea);
 
         // Proposal 007 §7.7: Validate worktree readiness before write-enabled execution.
         // Also validates for release agents that need worktree (strategy=dedicated,
@@ -1648,16 +1657,6 @@ impl Orchestrator {
                     run.artifact_root.trim_end_matches('/')
                 );
                 if std::path::Path::new(&artifact_path).exists() {
-                    let idea_opt = Some(
-                        ideas::find_by_id(&self.pool, run.idea_id)
-                            .await?
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "mission_context_source_missing: Idea {}",
-                                    run.idea_id
-                                )
-                            })?,
-                    );
                     let enqueued = self
                         .materialize_dynamic_parallel(
                             run_id,
@@ -3068,10 +3067,19 @@ impl Orchestrator {
                     }
                 };
             if let Some(plan) = frozen_plan.as_ref() {
-                crate::agent_mission_context::validate_persisted_v1_payload_prompt(
-                    plan,
-                    &retry_payload,
-                )?;
+                if plan.mission_context_version.as_deref() == Some("agent_mission_context_v1") {
+                    let idea = ideas::find_by_id(&self.pool, run.idea_id)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("mission_context_source_missing: Idea {}", run.idea_id)
+                        })?;
+                    crate::agent_mission_context::validate_persisted_v1_payload_prompt_with_truth(
+                        plan,
+                        run,
+                        &idea,
+                        &retry_payload,
+                    )?;
+                }
             }
             let source_provider = retry_payload
                 .get("provider")
@@ -3578,10 +3586,19 @@ impl Orchestrator {
                     }
                 };
 
-            crate::agent_mission_context::validate_persisted_v1_payload_prompt(
-                &plan,
-                &retry_payload,
-            )?;
+            if plan.mission_context_version.as_deref() == Some("agent_mission_context_v1") {
+                let idea = ideas::find_by_id(&self.pool, run.idea_id)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("mission_context_source_missing: Idea {}", run.idea_id)
+                    })?;
+                crate::agent_mission_context::validate_persisted_v1_payload_prompt_with_truth(
+                    &plan,
+                    run,
+                    &idea,
+                    &retry_payload,
+                )?;
+            }
 
             let Some(mut fallback) =
                 p058_escalation_tier_provider_fallback(run, current_tier, &retry_payload)
@@ -5264,7 +5281,7 @@ impl Orchestrator {
             .map(|s| s.tasks.iter().filter(|t| t.phase > 0).count())
             .unwrap_or(0);
         let total_tasks = total_selected + then_task_count;
-        let mut enqueued = 0;
+        let mut prepared = Vec::new();
 
         for (idx, selected_agent) in selection_plan.selected_agents.iter().enumerate() {
             let binding = match binding_map.get(selected_agent.agent_id.as_str()) {
@@ -5346,7 +5363,8 @@ impl Orchestrator {
                 }
             };
 
-            // Record materialization for idempotency.
+            // Prepare the complete fan-out before any durable write. A later
+            // reviewer finalization failure must leave no partial dispatch.
             let work_item_id = format!(
                 "p060-dynamic:{}:{}:{}",
                 stage.id, selection_plan.plan_hash, idx
@@ -5371,70 +5389,98 @@ impl Orchestrator {
                 ),
                 created_at: Utc::now(),
             };
-            db::repos::dynamic_materialization::insert_idempotent(&self.pool, &mat_record).await?;
+            let declared_outputs = build_declared_outputs(&task, plan, run);
+            let now = Utc::now();
+            let payload = serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": stage.stage_id,
+                "stage_execution_id": stage.id.to_string(),
+                "task_name": task.task_name,
+                "task_inputs": task.inputs,
+                "task_outputs": task.outputs,
+                "agent_id": task.agent.agent_id,
+                "backend_profile_id": task.agent.backend_profile_id,
+                "provider": task.agent.provider,
+                "model": task.agent.model,
+                "effort": task.agent.effort,
+                "max_turns": task.agent.max_turns,
+                "temperature": task.agent.temperature,
+                "permission_profile": task.agent.permission_profile,
+                "skill_ref": task.agent.skill_ref,
+                "skill_role": task.agent.skill_role,
+                "skill_snapshot_hash": task.agent.skill_snapshot_hash,
+                "requested_mcp_server_ids": task.agent.requested_mcp_server_ids,
+                "xcode_broker_required": task.agent.xcode_broker_required,
+                "xcode_shim_injection_signal": task.agent.xcode_shim_injection_signal,
+                "requires_xcode_host_execution": task.agent.requires_xcode_host_execution,
+                "output_contract": task.agent.output_contract,
+                "prompt": prompt,
+                "task_index": idx,
+                "total_tasks": total_tasks,
+                "worktree_write_enabled": task.agent.worktree_write_enabled,
+                "worktree_strategy": task.agent.worktree_strategy,
+                "legacy_broad_discovery_policy": plan.legacy_broad_discovery_policy,
+                "session_reuse_scope": task.agent.session_reuse_scope,
+                "session_family_id": task.agent.session_family_id,
+                "declared_outputs": declared_outputs,
+                "provider_health_fallback": provider_health_fallback,
+                "p060_dynamic_phase": 0,
+                "p060_dispatch_mode": selection_plan.mode.to_string(),
+                "p060_plan_hash": selection_plan.plan_hash,
+                "p060_binding_id": binding.binding_id,
+            });
+            let item = WorkItem {
+                id: work_item_id,
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: serde_json::to_string(&payload)?,
+                status: WorkItemStatus::Pending,
+                run_id: Some(run_id),
+                stage_id: Some(stage.stage_id.clone()),
+                created_at: now,
+                scheduled_at: now,
+                attempt_count: 0,
+                last_error: None,
+            };
+            prepared.push((
+                mat_record,
+                item,
+                selected_agent.agent_id.clone(),
+                task.agent.provider.clone(),
+                selected_agent.score,
+                selected_agent.mandatory,
+                idx,
+            ));
+        }
 
+        let tx_started = std::time::Instant::now();
+        let mut tx = self
+            .begin_orchestrator_transaction(
+                "orchestrator.DynamicParallelMaterialization",
+                format!("orchestrator.DynamicParallelMaterialization:{}", stage.id),
+            )
+            .await?;
+        let mut enqueued = 0;
+        let mut materialized_logs = Vec::new();
+        for (record, item, agent_id, provider, score, mandatory, index) in prepared {
+            if db::repos::dynamic_materialization::insert_idempotent_tx(&mut tx, &record).await? {
+                work_items::enqueue_tx(&mut tx, &item).await?;
+                enqueued += 1;
+                materialized_logs.push((agent_id, provider, score, mandatory, index));
+            }
+        }
+        tx.commit().await?;
+        db::pool::log_write_transaction("orchestrator.DynamicParallelMaterialization", tx_started);
+        for (agent_id, provider, score, mandatory, index) in materialized_logs {
             info!(
                 run_id = %run_id,
-                agent_id = %selected_agent.agent_id,
-                provider = %task.agent.provider,
-                score = selected_agent.score,
-                mandatory = selected_agent.mandatory,
-                index = idx,
+                agent_id = %agent_id,
+                provider = %provider,
+                score = score,
+                mandatory = mandatory,
+                index = index,
                 total = total_selected,
-                "P060: Materializing dynamic reviewer (phase 0)"
+                "P060: Materialized dynamic reviewer (phase 0)"
             );
-
-            // Enqueue via the standard InvokeAgent path, with a p060_dynamic_phase
-            // marker in the payload so phase advancement logic recognizes these.
-            let declared_outputs = build_declared_outputs(&task, plan, run);
-            self.work_queue
-                .enqueue_with_id(
-                    work_item_id,
-                    WorkItemKind::InvokeAgent,
-                    Some(run_id),
-                    Some(stage.stage_id.clone()),
-                    serde_json::json!({
-                        "run_id": run_id.to_string(),
-                        "stage_id": stage.stage_id,
-                        "stage_execution_id": stage.id.to_string(),
-                        "task_name": task.task_name,
-                        "task_inputs": task.inputs,
-                        "task_outputs": task.outputs,
-                        "agent_id": task.agent.agent_id,
-                        "backend_profile_id": task.agent.backend_profile_id,
-                        "provider": task.agent.provider,
-                        "model": task.agent.model,
-                        "effort": task.agent.effort,
-                        "max_turns": task.agent.max_turns,
-                        "temperature": task.agent.temperature,
-                        "permission_profile": task.agent.permission_profile,
-                        "skill_ref": task.agent.skill_ref,
-                        "skill_role": task.agent.skill_role,
-                        "skill_snapshot_hash": task.agent.skill_snapshot_hash,
-                        "requested_mcp_server_ids": task.agent.requested_mcp_server_ids,
-                        "xcode_broker_required": task.agent.xcode_broker_required,
-                        "xcode_shim_injection_signal": task.agent.xcode_shim_injection_signal,
-                        "requires_xcode_host_execution": task.agent.requires_xcode_host_execution,
-                        "output_contract": task.agent.output_contract,
-                        "prompt": prompt,
-                        "task_index": idx,
-                        "total_tasks": total_tasks,
-                        "worktree_write_enabled": task.agent.worktree_write_enabled,
-                        "worktree_strategy": task.agent.worktree_strategy,
-                        "legacy_broad_discovery_policy": plan.legacy_broad_discovery_policy,
-                        "session_reuse_scope": task.agent.session_reuse_scope,
-                        "session_family_id": task.agent.session_family_id,
-                        "declared_outputs": declared_outputs,
-                        "provider_health_fallback": provider_health_fallback,
-                        "p060_dynamic_phase": 0,
-                        "p060_dispatch_mode": selection_plan.mode.to_string(),
-                        "p060_plan_hash": selection_plan.plan_hash,
-                        "p060_binding_id": binding.binding_id,
-                    }),
-                )
-                .await?;
-
-            enqueued += 1;
         }
 
         info!(
@@ -5454,18 +5500,41 @@ impl Orchestrator {
         stage: &StageExecution,
         error: &anyhow::Error,
     ) -> Result<()> {
+        self.block_prompt_finalization_failure(run_id, stage, "dynamic_parallel", error)
+            .await
+    }
+
+    async fn block_prompt_finalization_failure(
+        &self,
+        run_id: RunId,
+        stage: &StageExecution,
+        dispatch_shape: &str,
+        error: &anyhow::Error,
+    ) -> Result<()> {
         let failure = serde_json::json!({
             "schema_version": "agent_mission_context_failure_v1",
             "failure_kind": "prompt_finalization_failed",
-            "dispatch_shape": "dynamic_parallel",
+            "dispatch_shape": dispatch_shape,
             "stage_id": stage.stage_id,
             "stage_execution_id": stage.id.to_string(),
             "error": format!("{error:#}"),
             "retryable": false,
         });
-        stages::update_validation_failure_json(&self.pool, stage.id, &failure.to_string()).await?;
-        stages::update_status(&self.pool, stage.id, StageStatus::Blocked).await?;
-        runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
+        let tx_started = std::time::Instant::now();
+        let mut tx = self
+            .begin_orchestrator_transaction(
+                "orchestrator.DynamicPromptFinalizationFailure",
+                format!("orchestrator.DynamicPromptFinalizationFailure:{}", stage.id),
+            )
+            .await?;
+        stages::update_validation_failure_json_tx(&mut tx, stage.id, &failure.to_string()).await?;
+        stages::update_status_tx(&mut tx, stage.id, StageStatus::Blocked).await?;
+        runs::update_status_tx(&mut tx, run_id, RunStatus::Blocked).await?;
+        tx.commit().await?;
+        db::pool::log_write_transaction(
+            "orchestrator.DynamicPromptFinalizationFailure",
+            tx_started,
+        );
         let _ = self.events.send(DomainEvent::StageStatusChanged {
             run_id,
             stage_execution_id: stage.id,
@@ -5476,6 +5545,26 @@ impl Orchestrator {
             status: RunStatus::Blocked,
         });
         Ok(())
+    }
+
+    async fn load_idea_for_provider_prompt(
+        &self,
+        run_id: RunId,
+        run: &domain::run::Run,
+        stage: &StageExecution,
+        plan: &workflow::plan::RunPlan,
+        dispatch_shape: &str,
+    ) -> Result<Option<domain::idea::Idea>> {
+        match ideas::find_by_id(&self.pool, run.idea_id).await? {
+            Some(idea) => Ok(Some(idea)),
+            None if plan.mission_context_version.as_deref() == Some("agent_mission_context_v1") => {
+                let error = anyhow::anyhow!("mission_context_source_missing: Idea {}", run.idea_id);
+                self.block_prompt_finalization_failure(run_id, stage, dispatch_shape, &error)
+                    .await?;
+                Ok(None)
+            }
+            None => anyhow::bail!("mission_context_source_missing: Idea {}", run.idea_id),
+        }
     }
 
     /// P060: Resolve selected reviewer outputs for a then-task that declares
@@ -9150,6 +9239,7 @@ fn build_task_prompt(
                 parts.push(String::from(
                     "Required nested shapes and invariants for `proposal_review_summary_v2`:\n\
                      - `blocking_issues`, `blocking_required_changes`, `advisory_follow_ups`, and `recurring_themes` must be arrays.\n\
+                     - `decision` must be a string, never an object, array, boolean, or null. Keep routing details out of `decision`; use the separate `run_state` output when it is declared.\n\
                      - Put refinement-blocking work only in `blocking_required_changes`.\n\
                      - Put implementation notes, cautions, and non-blocking suggestions only in `advisory_follow_ups`.\n\
                      - If `pass` is `true`, then `blocker_count` must be `0`, `blocking_issues` must be empty, and `blocking_required_changes` must be empty.\n\
@@ -12987,6 +13077,7 @@ mod tests {
         assert_eq!(work_count, 0);
         assert_eq!(materialization_count, 0);
         let persisted_stage = stages::find_by_id(&pool, stage.id).await.unwrap().unwrap();
+        let persisted_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
         assert_eq!(persisted_stage.status, StageStatus::Blocked);
         let failure: serde_json::Value = serde_json::from_str(
             persisted_stage
@@ -13006,14 +13097,7 @@ mod tests {
         assert!(failure["error"]
             .as_str()
             .is_some_and(|error| error.contains("mission_context_input_too_large")));
-        assert_eq!(
-            runs::find_by_id(&pool, run_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            RunStatus::Blocked
-        );
+        assert_eq!(persisted_run.status, RunStatus::Blocked);
 
         let missing_idea_stage = StageExecution {
             id: StageExecutionId::new(),
@@ -13055,6 +13139,460 @@ mod tests {
                 .unwrap();
         assert_eq!(work_count, 0);
         assert_eq!(materialization_count, 0);
+    }
+
+    #[tokio::test]
+    async fn agent_context_advance_run_missing_idea_settles_dynamic_stage_atomically() {
+        let pool = test_pool().await;
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            crate::event_bus::new_bus(16),
+            WorkQueue::new(pool.clone()),
+        );
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let plan = workflow::compiler::compile(
+            root.join("examples/workflows/full-mvp-live.yaml")
+                .to_str()
+                .unwrap(),
+            root.join("examples/agents/agents.yaml").to_str().unwrap(),
+        )
+        .unwrap();
+        let state = plan
+            .states
+            .values()
+            .find(|state| state.dynamic_parallel.is_some())
+            .unwrap();
+        let binding = plan.dynamic_candidate_bindings.first().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let routing_dir = tmp.path().join("routing");
+        std::fs::create_dir_all(&routing_dir).unwrap();
+        let selection = AgentSelectionPlanV1 {
+            schema_version: "agent_selection_plan_v1".into(),
+            routing_rules_version: "fixture".into(),
+            proposal_md5: "fixture".into(),
+            plan_hash: "fixture-plan-hash".into(),
+            mode: ReviewRoutingMode::Dynamic,
+            fingerprint: vec!["fixture".into()],
+            selected_agents: vec![SelectedAgent {
+                agent_id: binding.agent_id.clone(),
+                routing_id: binding.routing_metadata.routing_id.clone(),
+                score: 1,
+                mandatory: true,
+                override_source: None,
+                score_terms: ScoreTerms::default(),
+                rationale: "fixture".into(),
+                evidence_refs: Vec::new(),
+                materialization_binding_id: binding.binding_id.clone(),
+            }],
+            rejected_alternatives: Vec::new(),
+            ineligible_candidates: Vec::new(),
+            warnings: Vec::new(),
+            input_snapshot_hashes: InputSnapshotHashes {
+                workflow_snapshot_hash: plan.workflow_snapshot_hash.clone(),
+                catalog_snapshot_hash: plan.catalog_snapshot_hash.clone(),
+                routing_metadata_hash: "fixture".into(),
+                candidate_binding_hash: "fixture".into(),
+                evidence_hash: "fixture".into(),
+                override_hash: None,
+            },
+        };
+        std::fs::write(
+            routing_dir.join("agent-selection-plan.v1.json"),
+            serde_json::to_vec(&selection).unwrap(),
+        )
+        .unwrap();
+
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.artifact_root = tmp.path().to_string_lossy().into_owned();
+        run.current_state = Some(state.id.clone());
+        run.workflow_yaml_path = Some("frozen-workflow.yaml".into());
+        run.agent_catalog_yaml_path = Some("frozen-agents.yaml".into());
+        let mut workflow_snapshot: serde_json::Value =
+            serde_json::from_str(&plan.workflow_snapshot_json).unwrap();
+        workflow_snapshot["states"][&state.id]["run"]["system_task"] = serde_json::Value::Null;
+        let workflow_snapshot_json = serde_json::to_string(&workflow_snapshot).unwrap();
+        set_snapshot_quartet(
+            &mut run,
+            &workflow_snapshot_json,
+            &plan.catalog_snapshot_json,
+        );
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: state.id.clone(),
+            label: state.label.clone(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: Some(state.owner.agent_id.clone()),
+            provider: Some(state.owner.provider.clone()),
+            model: state.owner.model.clone(),
+            stage_type: state.state_type.clone(),
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+        stages::insert(&pool, &stage).await.unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM ideas WHERE id = ?1")
+            .bind(run.idea_id.to_string())
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        drop(connection);
+
+        orchestrator
+            .advance_run(run_id)
+            .await
+            .expect("missing dynamic Idea must become typed Blocked state");
+        let persisted_stage = stages::find_by_id(&pool, stage.id).await.unwrap().unwrap();
+        let persisted_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+        assert_eq!(persisted_stage.status, StageStatus::Blocked);
+        assert!(persisted_stage
+            .validation_failure_json
+            .as_deref()
+            .is_some_and(|failure| failure.contains("mission_context_source_missing")));
+        assert_eq!(persisted_run.status, RunStatus::Blocked);
+        let work_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_items")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(work_count, 0);
+    }
+
+    #[tokio::test]
+    async fn agent_context_late_dynamic_finalizer_failure_rolls_back_the_entire_fanout() {
+        let pool = test_pool().await;
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            crate::event_bus::new_bus(16),
+            WorkQueue::new(pool.clone()),
+        );
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let mut plan = workflow::compiler::compile(
+            root.join("examples/workflows/full-mvp-live.yaml")
+                .to_str()
+                .unwrap(),
+            root.join("examples/agents/agents.yaml").to_str().unwrap(),
+        )
+        .unwrap();
+        let state = plan
+            .states
+            .values()
+            .find(|state| state.dynamic_parallel.is_some())
+            .unwrap()
+            .clone();
+        let dynamic_parallel = state.dynamic_parallel.clone().unwrap();
+        let bindings = plan
+            .dynamic_candidate_bindings
+            .iter()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(bindings.len(), 2);
+        let second = plan
+            .dynamic_candidate_bindings
+            .iter_mut()
+            .find(|binding| binding.binding_id == bindings[1].binding_id)
+            .unwrap();
+        let mut invalid_agent: workflow::plan::ResolvedAgent =
+            serde_json::from_str(&second.resolved_agent_snapshot_json).unwrap();
+        invalid_agent.skill_snapshot_hash = Some("not-a-valid-sha256".into());
+        second.resolved_agent_snapshot_json = serde_json::to_string(&invalid_agent).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let routing_dir = tmp.path().join("routing");
+        std::fs::create_dir_all(&routing_dir).unwrap();
+        let selected_agents = bindings
+            .iter()
+            .map(|binding| SelectedAgent {
+                agent_id: binding.agent_id.clone(),
+                routing_id: binding.routing_metadata.routing_id.clone(),
+                score: 1,
+                mandatory: true,
+                override_source: None,
+                score_terms: ScoreTerms::default(),
+                rationale: "fixture".into(),
+                evidence_refs: Vec::new(),
+                materialization_binding_id: binding.binding_id.clone(),
+            })
+            .collect();
+        let selection = AgentSelectionPlanV1 {
+            schema_version: "agent_selection_plan_v1".into(),
+            routing_rules_version: "fixture".into(),
+            proposal_md5: "fixture".into(),
+            plan_hash: "fixture-plan-hash".into(),
+            mode: ReviewRoutingMode::Dynamic,
+            fingerprint: vec!["fixture".into()],
+            selected_agents,
+            rejected_alternatives: Vec::new(),
+            ineligible_candidates: Vec::new(),
+            warnings: Vec::new(),
+            input_snapshot_hashes: InputSnapshotHashes {
+                workflow_snapshot_hash: plan.workflow_snapshot_hash.clone(),
+                catalog_snapshot_hash: plan.catalog_snapshot_hash.clone(),
+                routing_metadata_hash: "fixture".into(),
+                candidate_binding_hash: "fixture".into(),
+                evidence_hash: "fixture".into(),
+                override_hash: None,
+            },
+        };
+        std::fs::write(
+            routing_dir.join("agent-selection-plan.v1.json"),
+            serde_json::to_vec(&selection).unwrap(),
+        )
+        .unwrap();
+
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.artifact_root = tmp.path().to_string_lossy().into_owned();
+        run.current_state = Some(state.id.clone());
+        let idea = test_idea(run.idea_id);
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: state.id.clone(),
+            label: state.label.clone(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: Some(state.owner.agent_id.clone()),
+            provider: Some(state.owner.provider.clone()),
+            model: state.owner.model.clone(),
+            stage_type: state.state_type.clone(),
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        ideas::insert(&pool, &idea).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+        stages::insert(&pool, &stage).await.unwrap();
+
+        let enqueued = orchestrator
+            .materialize_dynamic_parallel(
+                run_id,
+                &run,
+                &stage,
+                &plan,
+                &dynamic_parallel,
+                Some(&idea),
+            )
+            .await
+            .expect("late finalizer failure must settle the complete fan-out");
+        assert_eq!(enqueued, 0);
+        let work_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_items")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let materialization_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM dynamic_materialization_records")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(work_count, 0, "no earlier reviewer may escape");
+        assert_eq!(materialization_count, 0, "no partial marker may escape");
+        assert_eq!(
+            stages::find_by_id(&pool, stage.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            StageStatus::Blocked
+        );
+        assert_eq!(
+            runs::find_by_id(&pool, run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RunStatus::Blocked
+        );
+
+        plan.dynamic_candidate_bindings
+            .iter_mut()
+            .find(|binding| binding.binding_id == bindings[1].binding_id)
+            .unwrap()
+            .resolved_agent_snapshot_json = bindings[1].resolved_agent_snapshot_json.clone();
+        let retry_run_id = RunId::new();
+        let mut retry_run = test_run(retry_run_id);
+        retry_run.artifact_root = tmp.path().to_string_lossy().into_owned();
+        retry_run.current_state = Some(state.id.clone());
+        let retry_idea = test_idea(retry_run.idea_id);
+        let retry_stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id: retry_run_id,
+            attempt_number: 2,
+            status: StageStatus::Running,
+            validation_failure_json: None,
+            ..stage.clone()
+        };
+        ideas::insert(&pool, &retry_idea).await.unwrap();
+        runs::insert(&pool, &retry_run).await.unwrap();
+        stages::insert(&pool, &retry_stage).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_second_dynamic_work BEFORE INSERT ON work_items \
+             WHEN NEW.id LIKE '%:1' BEGIN SELECT RAISE(ABORT, 'dynamic work failpoint'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = orchestrator
+            .materialize_dynamic_parallel(
+                retry_run_id,
+                &retry_run,
+                &retry_stage,
+                &plan,
+                &dynamic_parallel,
+                Some(&retry_idea),
+            )
+            .await
+            .expect_err("a second-work write failure must roll back the complete fan-out");
+        assert!(format!("{error:#}").contains("dynamic work failpoint"));
+        let retry_work_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM work_items WHERE run_id = ?1")
+                .bind(retry_run_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let retry_materialization_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dynamic_materialization_records WHERE run_id = ?1",
+        )
+        .bind(retry_run_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retry_work_count, 0);
+        assert_eq!(retry_materialization_count, 0);
+        assert_eq!(
+            stages::find_by_id(&pool, retry_stage.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            StageStatus::Running
+        );
+
+        sqlx::query("DROP TRIGGER fail_second_dynamic_work")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            orchestrator
+                .materialize_dynamic_parallel(
+                    retry_run_id,
+                    &retry_run,
+                    &retry_stage,
+                    &plan,
+                    &dynamic_parallel,
+                    Some(&retry_idea),
+                )
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_context_dynamic_blocked_settlement_is_atomic_under_write_failure() {
+        let pool = test_pool().await;
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            crate::event_bus::new_bus(16),
+            WorkQueue::new(pool.clone()),
+        );
+        let run_id = RunId::new();
+        let run = test_run(run_id);
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "dynamic_review".into(),
+            label: "Dynamic review".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+        stages::insert(&pool, &stage).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_dynamic_run_block BEFORE UPDATE OF status ON runs \
+             WHEN NEW.status = 'blocked' BEGIN SELECT RAISE(ABORT, 'settlement failpoint'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = orchestrator
+            .block_dynamic_prompt_finalization_failure(
+                run_id,
+                &stage,
+                &anyhow::anyhow!("fixture finalizer failure"),
+            )
+            .await
+            .expect_err("the failpoint must abort the settlement");
+        assert!(format!("{error:#}").contains("settlement failpoint"));
+        let persisted_stage = stages::find_by_id(&pool, stage.id).await.unwrap().unwrap();
+        assert_eq!(persisted_stage.status, StageStatus::Running);
+        assert!(persisted_stage.validation_failure_json.is_none());
+        assert_eq!(
+            runs::find_by_id(&pool, run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RunStatus::Running
+        );
+
+        sqlx::query("DROP TRIGGER fail_dynamic_run_block")
+            .execute(&pool)
+            .await
+            .unwrap();
+        orchestrator
+            .block_dynamic_prompt_finalization_failure(
+                run_id,
+                &stage,
+                &anyhow::anyhow!("fixture finalizer failure"),
+            )
+            .await
+            .unwrap();
+        let persisted_stage = stages::find_by_id(&pool, stage.id).await.unwrap().unwrap();
+        assert_eq!(persisted_stage.status, StageStatus::Blocked);
+        assert!(persisted_stage.validation_failure_json.is_some());
+        assert_eq!(
+            runs::find_by_id(&pool, run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RunStatus::Blocked
+        );
     }
 
     #[tokio::test]
@@ -13364,6 +13902,55 @@ mod tests {
         assert!(declared_outputs
             .iter()
             .any(|output| output.output_name == "changed_files_manifest"));
+    }
+
+    #[test]
+    fn proposal_review_summary_prompt_requires_scalar_decision() {
+        let run_id = RunId::new();
+        let run = test_run(run_id);
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "proposal_review_summary".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/summary.json".into(),
+        );
+        let mut task = reviewer_task();
+        task.agent.agent_id = "lead_orchestrator".into();
+        task.agent.output_contract = Some("proposal_review_summary_v2".into());
+        task.task_name = "aggregate_proposal_reviews".into();
+        task.outputs = vec!["proposal_review_summary".into(), "run_state".into()];
+        task.output_schemas.clear();
+        task.output_schemas.insert(
+            "proposal_review_summary".into(),
+            OutputSchema {
+                contract_id: "proposal_review_summary_v2".into(),
+                format: "json".into(),
+                human_format: None,
+                machine_format: Some("json".into()),
+                validation_mode: Some("strict_structured".into()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec![
+                    "pass".into(),
+                    "average_score".into(),
+                    "aggregate_score".into(),
+                    "min_individual_score".into(),
+                    "blocker_count".into(),
+                    "blocking_issues".into(),
+                    "summary".into(),
+                    "blocking_required_changes".into(),
+                    "advisory_follow_ups".into(),
+                    "recurring_themes".into(),
+                    "decision".into(),
+                ],
+            },
+        );
+
+        let prompt = build_task_prompt(&task, &plan, &run, None, None, None)
+            .expect("proposal review prompt should build");
+
+        assert!(prompt.contains("`decision` must be a string, never an object"));
+        assert!(prompt.contains("Keep routing details out of `decision`"));
+        assert!(prompt.contains("use the separate `run_state` output when it is declared"));
     }
 
     #[test]

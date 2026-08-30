@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 use domain::ids::{DynamicMaterializationId, RunId};
 use domain::routing::DynamicMaterializationRecord;
@@ -37,6 +37,35 @@ pub async fn insert_idempotent(
         .bind(record.created_at.to_rfc3339())
     )
     .context("insert dynamic_materialization_record")?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn insert_idempotent_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    record: &DynamicMaterializationRecord,
+) -> Result<bool> {
+    let result = sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO dynamic_materialization_records
+            (id, run_id, stage_id, attempt_id, phase_id, plan_hash,
+             binding_id, agent_execution_id, idempotency_key, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#,
+    )
+    .bind(record.id.to_string())
+    .bind(record.run_id.to_string())
+    .bind(&record.stage_id)
+    .bind(record.attempt_id)
+    .bind(&record.phase_id)
+    .bind(&record.plan_hash)
+    .bind(&record.binding_id)
+    .bind(&record.agent_execution_id)
+    .bind(&record.idempotency_key)
+    .bind(record.created_at.to_rfc3339())
+    .execute(&mut **tx)
+    .await
+    .context("insert dynamic_materialization_record (tx)")?;
 
     Ok(result.rows_affected() > 0)
 }

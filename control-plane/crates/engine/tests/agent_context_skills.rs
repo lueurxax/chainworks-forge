@@ -8,7 +8,8 @@ use domain::run::{Run, RunStatus};
 use engine::agent_mission_context::{
     finalize_mediation_prompt_v1, finalize_owner_prompt_v1, finalize_task_prompt_v1,
     preflight_run_mission_context, validate_legacy_flat_invoke_agent,
-    validate_persisted_v1_payload_prompt, validate_persisted_v1_prompt, MAX_IDEA_CONTEXT_BYTES,
+    validate_persisted_v1_payload_prompt, validate_persisted_v1_payload_prompt_with_truth,
+    validate_persisted_v1_prompt, MAX_IDEA_CONTEXT_BYTES, MAX_MISSION_CONTEXT_BYTES,
 };
 use engine::command_handler::{compile_run_plan_for_run, CommandHandler};
 use engine::event_bus;
@@ -22,12 +23,26 @@ use workflow::plan::{
     ResolvedSkill, RunPlan,
 };
 
+fn repository_root() -> std::path::PathBuf {
+    let current = std::env::current_dir().expect("test process should have a working directory");
+    current
+        .ancestors()
+        .find(|candidate| {
+            candidate
+                .join("examples/workflows/full-mvp-live.yaml")
+                .is_file()
+                && candidate.join("control-plane/Cargo.toml").is_file()
+        })
+        .map(std::path::Path::to_path_buf)
+        .expect("test working directory should be inside the Chainworks repository")
+}
+
 fn compile_plan() -> RunPlan {
     compile_workflow("full-mvp-live.yaml")
 }
 
 fn compile_workflow(workflow_file: &str) -> RunPlan {
-    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let root = repository_root();
     workflow::compiler::compile(
         root.join("examples/workflows")
             .join(workflow_file)
@@ -864,7 +879,7 @@ fn score_active_review_case(
 #[test]
 fn ctx_007_and_008_compile_active_tasks_and_reject_each_prompt_mutation() {
     let fixture_dir =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent_context");
+        repository_root().join("control-plane/crates/engine/tests/fixtures/agent_context");
     for case_id in ["CTX-007", "CTX-008"] {
         let path = fixture_dir.join(format!("{case_id}.json"));
         let fixture: ActiveReviewContextCase =
@@ -1118,7 +1133,7 @@ fn security_prepush_compatibility_prompts(plan: &RunPlan) -> (String, String) {
 
 #[test]
 fn pre_migration_v2_inline_snapshot_survives_external_bundle_migration() {
-    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let root = repository_root();
     let fixture: SecurityPrepushSnapshotFixture = serde_json::from_slice(
         &std::fs::read(root.join(
             "control-plane/crates/workflow/tests/fixtures/agent_context/\
@@ -1193,7 +1208,7 @@ fn regenerate_security_prepush_compatibility_fixtures() {
     let plan = workflow::compiler::compile(&workflow_path, &catalog_path)
         .expect("historical workflow and catalog should compile");
     let (security_prompt, prepush_prompt) = security_prepush_compatibility_prompts(&plan);
-    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let root = repository_root();
     let fixture_dir = root.join("control-plane/crates/workflow/tests/fixtures/agent_context");
     let snapshot = serde_json::json!({
         "schema_version": "security_prepush_catalog_v2_fixture_v1",
@@ -1221,7 +1236,7 @@ fn regenerate_security_prepush_compatibility_fixtures() {
 #[test]
 fn ctx_001_through_ctx_006_have_exact_positive_and_mutation_negative_scores() {
     let fixture_dir =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent_context");
+        repository_root().join("control-plane/crates/engine/tests/fixtures/agent_context");
     let paths = (1..=6)
         .map(|index| fixture_dir.join(format!("CTX-{index:03}.json")))
         .collect::<Vec<_>>();
@@ -1381,9 +1396,38 @@ fn validate_producer_inventory(
     Ok(())
 }
 
+fn production_engine_sources(root: &std::path::Path) -> HashMap<String, String> {
+    fn visit(base: &std::path::Path, dir: &std::path::Path, sources: &mut HashMap<String, String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                visit(base, &path, sources);
+            } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+                let relative = path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                let source = std::fs::read_to_string(&path).unwrap();
+                sources.insert(
+                    relative,
+                    source.split("#[cfg(test)]").next().unwrap().to_string(),
+                );
+            }
+        }
+    }
+
+    let source_root = root.join("control-plane/crates/engine/src");
+    let mut sources = HashMap::new();
+    visit(&source_root, &source_root, &mut sources);
+    sources
+}
+
 #[test]
 fn invoke_agent_producer_manifest_is_closed_and_each_guard_is_mutation_sensitive() {
-    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let root = repository_root();
     let manifest_path = root.join(
         "control-plane/crates/engine/tests/fixtures/agent_context/invoke_agent_producers.json",
     );
@@ -1408,22 +1452,7 @@ fn invoke_agent_producer_manifest_is_closed_and_each_guard_is_mutation_sensitive
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(actual_ids, expected_ids.into_iter().collect());
 
-    let mut sources = HashMap::new();
-    for source_file in [
-        "orchestrator.rs",
-        "command_handler.rs",
-        "p058_deadline_resume.rs",
-    ] {
-        let source = std::fs::read_to_string(
-            root.join("control-plane/crates/engine/src")
-                .join(source_file),
-        )
-        .unwrap();
-        sources.insert(
-            source_file.to_string(),
-            source.split("#[cfg(test)]").next().unwrap().to_string(),
-        );
-    }
+    let sources = production_engine_sources(&root);
     validate_producer_inventory(&manifest, &sources).unwrap();
 
     for entry in &manifest {
@@ -1452,6 +1481,26 @@ fn invoke_agent_producer_manifest_is_closed_and_each_guard_is_mutation_sensitive
     let error = validate_producer_inventory(&manifest, &unclassified)
         .expect_err("an unknown InvokeAgent producer must fail inventory");
     assert!(error.contains("unclassified InvokeAgent producer"));
+
+    let mut different_existing_module = sources.clone();
+    different_existing_module
+        .get_mut("work_queue.rs")
+        .unwrap()
+        .push_str("\nfn mutation_only_unknown_producer() { WorkItemKind::InvokeAgent, }\n");
+    assert!(
+        validate_producer_inventory(&manifest, &different_existing_module)
+            .expect_err("a producer in any existing engine module must fail inventory")
+            .contains("unclassified InvokeAgent producer in work_queue.rs")
+    );
+
+    let mut newly_added_module = sources.clone();
+    newly_added_module.insert(
+        "future/new_producer.rs".into(),
+        "fn mutation_only_unknown_producer() { WorkItemKind::InvokeAgent, }".into(),
+    );
+    assert!(validate_producer_inventory(&manifest, &newly_added_module)
+        .expect_err("a producer in a newly added engine module must fail inventory")
+        .contains("unclassified InvokeAgent producer in future/new_producer.rs"));
 }
 
 #[test]
@@ -1693,9 +1742,20 @@ fn consumer_grammar_covers_multi_transition_owner_and_terminal_shapes() {
         .expect("active workflow should contain a terminal state")
         .clone();
     terminal.transitions.clear();
-    let terminal_run = run(&plan, &idea, &terminal.id);
+    let mut terminal_plan = plan.clone();
+    terminal_plan
+        .states
+        .insert(terminal.id.clone(), terminal.clone());
+    let terminal_run = run(&terminal_plan, &idea, &terminal.id);
     let terminal_context = extract_mission_context(
-        &finalize_owner_prompt_v1(&plan, &terminal_run, &terminal, &idea, "terminal body").unwrap(),
+        &finalize_owner_prompt_v1(
+            &terminal_plan,
+            &terminal_run,
+            &terminal,
+            &idea,
+            "terminal body",
+        )
+        .unwrap(),
     );
     assert_eq!(terminal_context["assignment"]["kind"], "state_owner");
     assert_eq!(
@@ -1733,6 +1793,40 @@ fn owner_prompt_uses_state_owner_assignment_and_copy_validation_rejects_duplicat
         .expect_err("V1 copied payload without prompt must fail")
         .to_string();
     assert!(error.contains("no persisted prompt"));
+}
+
+#[test]
+fn persisted_v1_parser_enforces_the_mission_bound_before_deserialization() {
+    let plan = compile_plan();
+    let (state, task) = task_for_agent(&plan, "code_writer");
+    let idea = idea(
+        "Bounded parser".into(),
+        "Validate persisted bytes first.".into(),
+    );
+    let run = run(&plan, &idea, &state.id);
+    let prompt = finalize_task_prompt_v1(&plan, &run, state, task, &idea, "body").unwrap();
+    let header = "## Mission Context\n";
+    let delimiter = "\n\nFrozen precedence rules:";
+    let block_start = prompt.find(header).unwrap() + header.len();
+    let delimiter_offset = prompt[block_start..].find(delimiter).unwrap() + block_start;
+    let block_len = delimiter_offset - block_start;
+    assert!(block_len < MAX_MISSION_CONTEXT_BYTES);
+
+    let mut exact_limit = prompt.clone();
+    exact_limit.insert_str(
+        delimiter_offset,
+        &" ".repeat(MAX_MISSION_CONTEXT_BYTES - block_len),
+    );
+    validate_persisted_v1_prompt(&plan, &exact_limit)
+        .expect("an exact-limit valid JSON block must pass");
+
+    let mut plus_one = exact_limit;
+    let plus_one_offset = plus_one.find(delimiter).unwrap();
+    plus_one.insert(plus_one_offset, ' ');
+    let error = validate_persisted_v1_prompt(&plan, &plus_one)
+        .expect_err("a plus-one mission block must fail before JSON parsing")
+        .to_string();
+    assert!(error.contains("mission_context_input_too_large"));
 }
 
 #[test]
@@ -1783,6 +1877,8 @@ fn persisted_v1_validation_rejects_structural_and_authority_mutations_without_re
     let exact_prompt = payload["prompt"].as_str().unwrap().to_string();
     validate_persisted_v1_payload_prompt(&plan, &payload)
         .expect("complete copied V1 payload should validate");
+    validate_persisted_v1_payload_prompt_with_truth(&plan, &run, &idea, &payload)
+        .expect("complete copied V1 payload should match durable Run and Idea truth");
     assert_eq!(payload["prompt"], exact_prompt);
 
     let narrative_header = format!(
@@ -1821,6 +1917,62 @@ fn persisted_v1_validation_rejects_structural_and_authority_mutations_without_re
             "payload authority mutation {field} must fail"
         );
     }
+
+    let mut coordinated_run_mutation = payload.clone();
+    let different_run_id = RunId::new().to_string();
+    coordinated_run_mutation["run_id"] = serde_json::json!(different_run_id);
+    let mut coordinated_context = extract_mission_context(&exact_prompt);
+    coordinated_context["run_id"] = coordinated_run_mutation["run_id"].clone();
+    coordinated_run_mutation["prompt"] =
+        serde_json::json!(replace_mission_context(&exact_prompt, &coordinated_context));
+    assert!(validate_persisted_v1_payload_prompt(&plan, &coordinated_run_mutation).is_ok());
+    assert!(validate_persisted_v1_payload_prompt_with_truth(
+        &plan,
+        &run,
+        &idea,
+        &coordinated_run_mutation,
+    )
+    .is_err());
+
+    let mut idea_mutation = payload.clone();
+    let mut idea_context = extract_mission_context(&exact_prompt);
+    idea_context["idea_id"] = serde_json::json!(IdeaId::new().to_string());
+    idea_context["mission"]["operator_request_title"] = serde_json::json!("Different request");
+    idea_context["mission"]["operator_request_body"] = serde_json::json!("Different scope");
+    idea_mutation["prompt"] =
+        serde_json::json!(replace_mission_context(&exact_prompt, &idea_context));
+    assert!(
+        validate_persisted_v1_payload_prompt_with_truth(&plan, &run, &idea, &idea_mutation,)
+            .is_err()
+    );
+
+    let mut consumer_mutation = payload.clone();
+    let mut consumer_context = extract_mission_context(&exact_prompt);
+    let consumers = consumer_context["assignment"]["consumers"]
+        .as_array_mut()
+        .unwrap();
+    if let Some(consumer) = consumers.first_mut() {
+        if consumer["kind"] == "transition" {
+            consumer["when"] = serde_json::json!("true");
+        } else {
+            consumer["task"] = serde_json::json!("different_consumer");
+        }
+    } else {
+        consumers.push(serde_json::json!({
+            "kind": "task",
+            "task": "injected_consumer",
+            "agent_id": task.agent.agent_id,
+        }));
+    }
+    consumer_mutation["prompt"] =
+        serde_json::json!(replace_mission_context(&exact_prompt, &consumer_context));
+    assert!(validate_persisted_v1_payload_prompt_with_truth(
+        &plan,
+        &run,
+        &idea,
+        &consumer_mutation,
+    )
+    .is_err());
 }
 
 #[test]

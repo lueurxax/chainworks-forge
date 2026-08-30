@@ -7039,6 +7039,19 @@ impl CommandHandler {
             .await?
             .ok_or_else(|| anyhow!("Run {} not found", run_id))?;
         let frozen_plan = compile_run_plan_from_snapshot(&run)?;
+        let frozen_idea = if frozen_plan.as_ref().is_some_and(|plan| {
+            plan.mission_context_version.as_deref() == Some("agent_mission_context_v1")
+        }) {
+            Some(
+                ideas::find_by_id(&self.pool, run.idea_id)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!("mission_context_source_missing: Idea {}", run.idea_id)
+                    })?,
+            )
+        } else {
+            None
+        };
         if run_forbids_retry(&run) {
             return Err(anyhow!(
                 "Run {} is {} and cannot be retried",
@@ -7296,10 +7309,14 @@ impl CommandHandler {
                 )
             })?;
         if let Some(plan) = frozen_plan.as_ref() {
-            crate::agent_mission_context::validate_persisted_v1_payload_prompt(
-                plan,
-                &retry_payload,
-            )?;
+            if let Some(idea) = frozen_idea.as_ref() {
+                crate::agent_mission_context::validate_persisted_v1_payload_prompt_with_truth(
+                    plan,
+                    &run,
+                    idea,
+                    &retry_payload,
+                )?;
+            }
         }
         let runtime_facts =
             agent_execution_runtime_facts::find_by_execution_id(&self.pool, agent_execution_id)

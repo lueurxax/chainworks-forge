@@ -23,8 +23,12 @@
       "proofs": [
         {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "run_preflight_enforces_exact_idea_bound_without_writes"},
         {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "production_start_run_rejects_missing_or_oversized_idea_before_run_and_work_insert"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "persisted_v1_parser_enforces_the_mission_bound_before_deserialization"},
         {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "agent_context_owner_validation_failure_enqueues_zero_provider_work"},
         {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "agent_context_dynamic_finalizer_failure_enqueues_and_materializes_zero_work"},
+        {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "agent_context_late_dynamic_finalizer_failure_rolls_back_the_entire_fanout"},
+        {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "agent_context_dynamic_blocked_settlement_is_atomic_under_write_failure"},
+        {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "agent_context_advance_run_missing_idea_settles_dynamic_stage_atomically"},
         {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "agent_context_p017_finalizer_failure_preserves_unresolved_conflict_and_zero_work"}
       ]
     },

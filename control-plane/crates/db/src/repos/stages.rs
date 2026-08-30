@@ -239,6 +239,20 @@ pub async fn update_validation_failure_json(
     Ok(())
 }
 
+pub async fn update_validation_failure_json_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: StageExecutionId,
+    validation_failure_json: &str,
+) -> Result<()> {
+    sqlx::query(r#"UPDATE stage_executions SET validation_failure_json = ?1 WHERE id = ?2"#)
+        .bind(validation_failure_json)
+        .bind(id.to_string())
+        .execute(&mut **tx)
+        .await
+        .context("update stage validation failure json (tx)")?;
+    Ok(())
+}
+
 pub async fn update_recovery_snapshot_json(
     pool: &SqlitePool,
     id: StageExecutionId,

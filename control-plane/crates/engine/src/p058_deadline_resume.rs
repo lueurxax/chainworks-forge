@@ -1,8 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use db::repos::{
-    escalation, retry_operator_instructions, retry_stage_execution_authorities, runs, stages,
-    work_items,
+    escalation, ideas, retry_operator_instructions, retry_stage_execution_authorities, runs,
+    stages, work_items,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::commands::{ResumeEscalationChainCmd, ResumeEscalationDeadlineCmd};
@@ -346,8 +346,16 @@ async fn resume_escalation_tx(
     .context("P058_RESUME_SOURCE_WORK_MISSING: source InvokeAgent work item is absent")?;
     let mut retry_payload: serde_json::Value = serde_json::from_str(&source_item.payload_json)
         .context("P058_RESUME_SOURCE_WORK_INVALID: source payload is not valid JSON")?;
-    crate::agent_mission_context::validate_persisted_v1_payload_prompt(&plan, &retry_payload)
-        .context("P058_RESUME_SOURCE_WORK_INVALID: source V1 prompt validation failed")?;
+    let idea = ideas::find_by_id_tx(tx, run.idea_id)
+        .await?
+        .context("P058_RESUME_SOURCE_WORK_INVALID: durable Idea is missing")?;
+    crate::agent_mission_context::validate_persisted_v1_payload_prompt_with_truth(
+        &plan,
+        &run,
+        &idea,
+        &retry_payload,
+    )
+    .context("P058_RESUME_SOURCE_WORK_INVALID: source V1 prompt validation failed")?;
     let source_provider = retry_payload
         .get("provider")
         .and_then(serde_json::Value::as_str)

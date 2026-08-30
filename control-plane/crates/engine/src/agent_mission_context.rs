@@ -102,7 +102,7 @@ enum ProcedureIdentity<'a> {
     None,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedAgentMissionContextV1 {
     schema_version: String,
@@ -114,7 +114,7 @@ struct PersistedAgentMissionContextV1 {
     runtime: PersistedRuntimeContext,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedMission {
     operator_request_title: String,
@@ -122,14 +122,14 @@ struct PersistedMission {
     workflow_family: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedStage {
     state_id: String,
     label: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum PersistedAssignment {
     Task {
@@ -159,7 +159,7 @@ enum PersistedAssignment {
     },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum PersistedConsumer {
     Task {
@@ -173,13 +173,13 @@ enum PersistedConsumer {
     },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedCompletion {
     kind: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedRuntimeContext {
     permission_profile: Option<String>,
@@ -187,7 +187,7 @@ struct PersistedRuntimeContext {
     procedure: PersistedProcedureIdentity,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum PersistedProcedureIdentity {
     Resolved {
@@ -311,6 +311,29 @@ pub fn validate_persisted_v1_payload_prompt(
     validate_persisted_payload_authority(plan, payload, &context)
 }
 
+pub fn validate_persisted_v1_payload_prompt_with_truth(
+    plan: &RunPlan,
+    run: &Run,
+    idea: &Idea,
+    payload: &serde_json::Value,
+) -> Result<()> {
+    if plan.mission_context_version.as_deref() != Some(MISSION_CONTEXT_VERSION) {
+        return Ok(());
+    }
+    let prompt = payload
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "frozen_snapshot_contract_incompatible: V1 retry payload has no persisted prompt"
+            )
+        })?;
+    let context = parse_persisted_v1_prompt(prompt)?;
+    validate_persisted_context_shape(plan, &context)?;
+    validate_persisted_payload_authority(plan, payload, &context)?;
+    validate_persisted_durable_truth(run, idea, &context)
+}
+
 fn parse_persisted_v1_prompt(prompt: &str) -> Result<PersistedAgentMissionContextV1> {
     let header = format!("{MISSION_HEADER}\n");
     let delimiter = format!("\n\n{PRECEDENCE_HEADER}");
@@ -330,6 +353,13 @@ fn parse_persisted_v1_prompt(prompt: &str) -> Result<PersistedAgentMissionContex
             blocks.len()
         );
     }
+    if blocks[0].len() > MAX_MISSION_CONTEXT_BYTES {
+        anyhow::bail!(
+            "mission_context_input_too_large: persisted mission context is {} bytes; maximum is {}",
+            blocks[0].len(),
+            MAX_MISSION_CONTEXT_BYTES
+        );
+    }
     serde_json::from_str(blocks[0]).map_err(|error| {
         anyhow::anyhow!(
             "frozen_snapshot_contract_incompatible: persisted V1 mission block is malformed: {error}"
@@ -344,11 +374,6 @@ fn validate_persisted_context_shape(
     if context.schema_version != MISSION_CONTEXT_VERSION {
         anyhow::bail!("frozen_snapshot_contract_incompatible: persisted mission version mismatch");
     }
-    let _ = (
-        &context.idea_id,
-        &context.mission.operator_request_title,
-        &context.mission.operator_request_body,
-    );
     if context.mission.workflow_family != plan.workflow_family.as_deref().unwrap_or("unknown") {
         anyhow::bail!(
             "frozen_snapshot_contract_incompatible: persisted workflow family differs from frozen plan"
@@ -365,7 +390,7 @@ fn validate_persisted_context_shape(
             "frozen_snapshot_contract_incompatible: persisted stage label differs from frozen plan"
         );
     }
-    let consumers = match &context.assignment {
+    let expected_consumers = match &context.assignment {
         PersistedAssignment::Task {
             origin,
             task,
@@ -373,7 +398,7 @@ fn validate_persisted_context_shape(
             declared_outputs,
             provider_outputs,
             engine_owned_outputs,
-            consumers,
+            consumers: _,
             completion,
             phase,
             parallel,
@@ -407,6 +432,16 @@ fn validate_persisted_context_shape(
                         "frozen_snapshot_contract_incompatible: persisted static task differs from frozen plan"
                     );
                 }
+                let expected_agent = &frozen_task.agent.agent_id;
+                if expected_agent != agent_id {
+                    anyhow::bail!(
+                        "frozen_snapshot_contract_incompatible: persisted static task agent differs from frozen plan"
+                    );
+                }
+            } else if *phase != 0 || !*parallel {
+                anyhow::bail!(
+                    "frozen_snapshot_contract_incompatible: persisted dynamic task phase/parallel differs from frozen contract"
+                );
             }
             let expected_provider = declared_outputs
                 .iter()
@@ -423,12 +458,23 @@ fn validate_persisted_context_shape(
                     "frozen_snapshot_contract_incompatible: persisted output ownership projection is invalid"
                 );
             }
-            let _ = (phase, parallel);
-            consumers
+            if origin == "static" {
+                let frozen_task = state
+                    .tasks
+                    .iter()
+                    .chain(&state.post_approval_tasks)
+                    .find(|candidate| {
+                        candidate.task_name == *task && candidate.agent.agent_id == *agent_id
+                    })
+                    .expect("static task existence was checked above");
+                task_consumers(plan, state, frozen_task)
+            } else {
+                dynamic_task_consumers(plan, state, *phase)
+            }
         }
         PersistedAssignment::StateOwner {
             agent_id,
-            consumers,
+            consumers: _,
             completion,
         } => {
             if completion.kind != "state_owner_transition" || *agent_id != state.owner.agent_id {
@@ -436,14 +482,14 @@ fn validate_persisted_context_shape(
                     "frozen_snapshot_contract_incompatible: persisted owner completion contract is invalid"
                 );
             }
-            consumers
+            transition_consumers(plan, state)
         }
         PersistedAssignment::Mediation {
             origin,
             lead_agent_id,
             conflict_or_escalation_id,
             lead_resolution,
-            consumers,
+            consumers: _,
             completion,
             ..
         } => {
@@ -457,37 +503,38 @@ fn validate_persisted_context_shape(
                 );
             }
             frozen_agent(plan, lead_agent_id)?;
-            consumers
+            transition_consumers(plan, state)
         }
     };
-    for consumer in consumers {
-        match consumer {
-            PersistedConsumer::Task { task, agent_id } => {
-                if task.trim().is_empty() || agent_id.trim().is_empty() {
-                    anyhow::bail!(
-                        "frozen_snapshot_contract_incompatible: persisted task consumer is incomplete"
-                    );
-                }
-            }
-            PersistedConsumer::Transition {
-                target_state_id,
-                owner_id,
-                when,
-            } => {
-                let target = plan.states.get(target_state_id).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "frozen_snapshot_contract_incompatible: persisted transition target '{target_state_id}' is absent"
-                    )
-                })?;
-                if target.owner.agent_id != *owner_id || when.trim().is_empty() {
-                    anyhow::bail!(
-                        "frozen_snapshot_contract_incompatible: persisted transition consumer differs from frozen truth"
-                    );
-                }
-            }
-        }
+    let actual_consumers = match &context.assignment {
+        PersistedAssignment::Task { consumers, .. }
+        | PersistedAssignment::StateOwner { consumers, .. }
+        | PersistedAssignment::Mediation { consumers, .. } => consumers,
+    };
+    if serde_json::to_value(actual_consumers)? != serde_json::to_value(expected_consumers)? {
+        anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: persisted consumers differ from frozen plan"
+        );
     }
-    let _ = state;
+    Ok(())
+}
+
+fn validate_persisted_durable_truth(
+    run: &Run,
+    idea: &Idea,
+    context: &PersistedAgentMissionContextV1,
+) -> Result<()> {
+    validate_idea_size(idea)?;
+    if run.idea_id != idea.id
+        || context.run_id != run.id.to_string()
+        || context.idea_id != idea.id.to_string()
+        || context.mission.operator_request_title != idea.title
+        || context.mission.operator_request_body != idea.body
+    {
+        anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: persisted mission differs from durable Run/Idea truth"
+        );
+    }
     Ok(())
 }
 
@@ -503,13 +550,47 @@ fn validate_persisted_payload_authority(
     require_payload_string(object, "stage_id", &context.stage.state_id)?;
     let assignment_agent_id = match &context.assignment {
         PersistedAssignment::Task {
+            origin,
             task,
             agent_id,
+            phase,
+            parallel,
             declared_outputs,
             ..
         } => {
             require_payload_string(object, "task_name", task)?;
             require_payload_value(object, "task_outputs", &serde_json::json!(declared_outputs))?;
+            if origin == "dynamic_parallel" {
+                let binding_id = object
+                    .get("p060_binding_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "frozen_snapshot_contract_incompatible: dynamic retry payload has no binding identity"
+                        )
+                    })?;
+                let binding = plan
+                    .dynamic_candidate_bindings
+                    .iter()
+                    .find(|binding| binding.binding_id == binding_id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "frozen_snapshot_contract_incompatible: dynamic retry binding is absent from frozen plan"
+                        )
+                    })?;
+                let expected_outputs = vec![dynamic_review_output_name(&binding.agent_id)];
+                if binding.agent_id != *agent_id
+                    || task != &format!("dynamic_review_{}", binding.agent_id)
+                    || *phase != 0
+                    || !*parallel
+                    || declared_outputs != &expected_outputs
+                {
+                    anyhow::bail!(
+                        "frozen_snapshot_contract_incompatible: dynamic assignment differs from frozen binding"
+                    );
+                }
+                require_payload_value(object, "p060_dynamic_phase", &serde_json::json!(0))?;
+            }
             agent_id
         }
         PersistedAssignment::StateOwner { agent_id, .. } => agent_id,
@@ -609,6 +690,14 @@ fn validate_persisted_payload_authority(
         )?;
     }
     Ok(())
+}
+
+fn dynamic_review_output_name(agent_id: &str) -> String {
+    let suffix = agent_id
+        .strip_prefix("proposal_reviewer_")
+        .unwrap_or(agent_id)
+        .replace('-', "_");
+    format!("proposal_review_{suffix}")
 }
 
 fn frozen_agent(plan: &RunPlan, agent_id: &str) -> Result<ResolvedAgent> {
@@ -888,6 +977,27 @@ fn task_consumers(plan: &RunPlan, state: &CompiledState, task: &CompiledTask) ->
         .min();
     if let Some(next_phase) = next_phase {
         return declared_tasks
+            .iter()
+            .filter(|candidate| candidate.phase == next_phase)
+            .map(|candidate| Consumer::Task {
+                task: candidate.task_name.clone(),
+                agent_id: candidate.agent.agent_id.clone(),
+            })
+            .collect();
+    }
+    transition_consumers(plan, state)
+}
+
+fn dynamic_task_consumers(plan: &RunPlan, state: &CompiledState, phase: u32) -> Vec<Consumer> {
+    let next_phase = state
+        .tasks
+        .iter()
+        .map(|candidate| candidate.phase)
+        .filter(|candidate_phase| *candidate_phase > phase)
+        .min();
+    if let Some(next_phase) = next_phase {
+        return state
+            .tasks
             .iter()
             .filter(|candidate| candidate.phase == next_phase)
             .map(|candidate| Consumer::Task {
