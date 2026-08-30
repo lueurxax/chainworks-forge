@@ -8719,6 +8719,14 @@ fn rebase_safe_legacy_artifact_path_for_post_isolation_run(
     let Some(meta_root) = run.chainworks_meta_root.as_deref() else {
         return resolved.to_string();
     };
+    let meta_root = if Path::new(meta_root).is_absolute() {
+        Path::new(meta_root).to_path_buf()
+    } else {
+        Path::new(&run.workspace_root).join(meta_root)
+    };
+    if Path::new(resolved).strip_prefix(&meta_root).is_ok() {
+        return resolved.to_string();
+    }
     let Ok(relative) = Path::new(resolved).strip_prefix(Path::new(&run.artifact_root)) else {
         return resolved.to_string();
     };
@@ -8730,11 +8738,6 @@ fn rebase_safe_legacy_artifact_path_for_post_isolation_run(
         return resolved.to_string();
     }
 
-    let meta_root = if Path::new(meta_root).is_absolute() {
-        Path::new(meta_root).to_path_buf()
-    } else {
-        Path::new(&run.workspace_root).join(meta_root)
-    };
     meta_root.join(relative).to_string_lossy().into_owned()
 }
 
@@ -13118,6 +13121,34 @@ mod tests {
             ),
             escaped.to_string_lossy(),
             "non-normal legacy descendants must remain subject to SEC-001 rejection"
+        );
+    }
+
+    #[test]
+    fn declared_output_keeps_path_already_resolved_under_post_isolation_meta_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let run_id = RunId::new();
+        let artifact_root = workspace.path().join(".chainworks");
+        let run_root = artifact_root.join("runs").join(run_id.to_string());
+        let mut run = test_run(run_id);
+        run.workspace_root = workspace.path().to_string_lossy().into_owned();
+        run.artifact_root = artifact_root.to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(run_root.to_string_lossy().into_owned());
+
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "idea_brief".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/context/idea.md".into(),
+        );
+        let mut task = reviewer_task();
+        task.outputs = vec!["idea_brief".into()];
+        task.output_schemas.clear();
+
+        let declared = build_declared_outputs(&task, &plan, &run);
+        assert_eq!(
+            declared[0].target_path,
+            run_root.join("context/idea.md").to_string_lossy(),
+            "a current meta-root template must not be rebased beneath the run root twice"
         );
     }
 

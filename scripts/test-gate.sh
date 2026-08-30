@@ -5132,6 +5132,8 @@ PY
       cargo test -p engine --test integration test_stale_workspace_artifacts_not_visible_to_new_run -- --exact --nocapture &&
       cargo test -p engine --test integration test_prompt_input_paths_point_to_per_run_meta_root -- --exact --nocapture &&
       cargo test -p engine --test integration test_run_serde_includes_chainworks_meta_root -- --exact --nocapture &&
+      cargo test -p engine --lib orchestrator::tests::declared_output_keeps_path_already_resolved_under_post_isolation_meta_root -- --exact --nocapture &&
+      cargo test -p engine --lib orchestrator::tests::declared_output_rebases_safe_frozen_legacy_path_into_post_isolation_meta_root -- --exact --nocapture &&
       # GraphQL readback proof (P050 §2f AC-12)
       cargo test -p graphql-server test_graphql_run_exposes_chainworks_meta_root -- --nocapture &&
       # Full workspace regression
