@@ -450,6 +450,15 @@ fn extract_mission_context(prompt: &str) -> serde_json::Value {
     serde_json::from_str(raw).expect("mission context must be JSON")
 }
 
+fn replace_mission_context(prompt: &str, context: &serde_json::Value) -> String {
+    let (prefix, rest) = prompt.split_once("## Mission Context\n").unwrap();
+    let (_, suffix) = rest.split_once("\n\nFrozen precedence rules:").unwrap();
+    format!(
+        "{prefix}## Mission Context\n{}\n\nFrozen precedence rules:{suffix}",
+        serde_json::to_string(context).unwrap()
+    )
+}
+
 fn score_context_case(
     fixture: &ContextEvalCase,
     prompt: &str,
@@ -548,7 +557,24 @@ fn apply_mission_source_mutation(
             *task
                 .outputs
                 .first_mut()
-                .expect("review task should declare one output") = replacement;
+                .expect("review task should declare one output") = replacement.clone();
+            let state = plan
+                .states
+                .get_mut(&fixture.state_id)
+                .expect("review state should exist");
+            let frozen_task = state
+                .tasks
+                .iter_mut()
+                .chain(state.post_approval_tasks.iter_mut())
+                .find(|candidate| {
+                    candidate.task_name == task.task_name
+                        && candidate.agent.agent_id == task.agent.agent_id
+                })
+                .expect("mutated review task should remain in frozen plan");
+            *frozen_task
+                .outputs
+                .first_mut()
+                .expect("frozen review task should declare one output") = replacement;
         }
         "/assignment/consumers/0/task" => {
             let state = plan
@@ -1246,34 +1272,46 @@ fn ctx_001_through_ctx_006_have_exact_positive_and_mutation_negative_scores() {
 
 fn producer_function_span(source: &str, function: &str) -> Result<(usize, usize), String> {
     let signatures = [
-        format!("    async fn {function}"),
-        format!("    pub async fn {function}"),
-        format!("    fn {function}"),
-        format!("    pub fn {function}"),
+        format!("async fn {function}("),
+        format!("pub async fn {function}("),
+        format!("fn {function}("),
+        format!("pub fn {function}("),
     ];
-    let starts = signatures
-        .iter()
-        .filter_map(|signature| source.find(signature))
-        .collect::<Vec<_>>();
+    let mut starts = Vec::new();
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if signatures
+            .iter()
+            .any(|signature| trimmed.starts_with(signature))
+        {
+            starts.push((offset, line.len() - trimmed.len()));
+        }
+        offset += line.len();
+    }
     if starts.len() != 1 {
         return Err(format!(
             "function {function} must have one production definition; found {}",
             starts.len()
         ));
     }
-    let start = starts[0];
-    let tail = &source[start + 1..];
-    let end = [
-        "\n    async fn ",
-        "\n    pub async fn ",
-        "\n    fn ",
-        "\n    pub fn ",
-    ]
-    .iter()
-    .filter_map(|marker| tail.find(marker))
-    .min()
-    .map(|offset| start + 1 + offset)
-    .unwrap_or(source.len());
+    let (start, indentation) = starts[0];
+    let mut end = source.len();
+    let mut relative_offset = 0;
+    for (line_index, line) in source[start..].split_inclusive('\n').enumerate() {
+        if line_index > 0 {
+            let trimmed = line.trim_start();
+            let candidate_indentation = line.len() - trimmed.len();
+            let is_function = ["async fn ", "pub async fn ", "fn ", "pub fn "]
+                .iter()
+                .any(|signature| trimmed.starts_with(signature));
+            if candidate_indentation == indentation && is_function {
+                end = start + relative_offset;
+                break;
+            }
+        }
+        relative_offset += line.len();
+    }
     Ok((start, end))
 }
 
@@ -1362,6 +1400,7 @@ fn invoke_agent_producer_manifest_is_closed_and_each_guard_is_mutation_sensitive
         "orchestrator.p017_mediation",
         "orchestrator.p058_escalation_retry",
         "orchestrator.standard_task",
+        "p058_deadline_resume.operator_resume",
     ];
     let actual_ids = manifest
         .iter()
@@ -1370,7 +1409,11 @@ fn invoke_agent_producer_manifest_is_closed_and_each_guard_is_mutation_sensitive
     assert_eq!(actual_ids, expected_ids.into_iter().collect());
 
     let mut sources = HashMap::new();
-    for source_file in ["orchestrator.rs", "command_handler.rs"] {
+    for source_file in [
+        "orchestrator.rs",
+        "command_handler.rs",
+        "p058_deadline_resume.rs",
+    ] {
         let source = std::fs::read_to_string(
             root.join("control-plane/crates/engine/src")
                 .join(source_file),
@@ -1693,6 +1736,94 @@ fn owner_prompt_uses_state_owner_assignment_and_copy_validation_rejects_duplicat
 }
 
 #[test]
+fn persisted_v1_validation_rejects_structural_and_authority_mutations_without_rewriting() {
+    let plan = compile_plan();
+    let (state, task) = task_for_agent(&plan, "code_writer");
+    let idea = idea(
+        "Validate copied context".into(),
+        "Persisted bytes must remain authoritative.".into(),
+    );
+    let run = run(&plan, &idea, &state.id);
+    let prompt = finalize_task_prompt_v1(
+        &plan,
+        &run,
+        state,
+        task,
+        &idea,
+        "Implement the bounded assignment.",
+    )
+    .unwrap();
+    let payload = serde_json::json!({
+        "run_id": run.id.to_string(),
+        "stage_id": state.id,
+        "task_name": task.task_name,
+        "task_outputs": task.outputs,
+        "agent_id": task.agent.agent_id,
+        "backend_profile_id": task.agent.backend_profile_id,
+        "provider": task.agent.provider,
+        "model": task.agent.model,
+        "effort": task.agent.effort,
+        "max_turns": task.agent.max_turns,
+        "temperature": task.agent.temperature,
+        "permission_profile": task.agent.permission_profile,
+        "skill_ref": task.agent.skill_ref,
+        "skill_role": task.agent.skill_role,
+        "skill_snapshot_hash": task.agent.skill_snapshot_hash,
+        "requested_mcp_server_ids": task.agent.requested_mcp_server_ids,
+        "worktree_write_enabled": task.agent.worktree_write_enabled,
+        "worktree_strategy": task.agent.worktree_strategy,
+        "session_reuse_scope": task.agent.session_reuse_scope,
+        "session_family_id": task.agent.session_family_id,
+        "xcode_broker_required": task.agent.xcode_broker_required,
+        "xcode_shim_injection_signal": task.agent.xcode_shim_injection_signal,
+        "requires_xcode_host_execution": task.agent.requires_xcode_host_execution,
+        "output_contract": task.agent.output_contract,
+        "prompt": prompt,
+    });
+    let exact_prompt = payload["prompt"].as_str().unwrap().to_string();
+    validate_persisted_v1_payload_prompt(&plan, &payload)
+        .expect("complete copied V1 payload should validate");
+    assert_eq!(payload["prompt"], exact_prompt);
+
+    let narrative_header = format!(
+        "{}\n\n## Mission Context\nThis is narrative text, not a canonical mission block.",
+        exact_prompt
+    );
+    validate_persisted_v1_prompt(&plan, &narrative_header)
+        .expect("non-canonical header text must not change block cardinality");
+
+    let mut missing = extract_mission_context(&exact_prompt);
+    missing.as_object_mut().unwrap().remove("mission");
+    let missing_prompt = replace_mission_context(&exact_prompt, &missing);
+    assert!(validate_persisted_v1_prompt(&plan, &missing_prompt).is_err());
+
+    let mut extra = extract_mission_context(&exact_prompt);
+    extra["unexpected"] = serde_json::json!(true);
+    let extra_prompt = replace_mission_context(&exact_prompt, &extra);
+    assert!(validate_persisted_v1_prompt(&plan, &extra_prompt).is_err());
+
+    let discriminator_only = replace_mission_context(
+        &exact_prompt,
+        &serde_json::json!({"schema_version": "agent_mission_context_v1"}),
+    );
+    assert!(validate_persisted_v1_prompt(&plan, &discriminator_only).is_err());
+
+    for (field, replacement) in [
+        ("run_id", serde_json::json!(RunId::new().to_string())),
+        ("stage_id", serde_json::json!("different_state")),
+        ("agent_id", serde_json::json!("different_agent")),
+        ("permission_profile", serde_json::json!("BROADER_PROFILE")),
+    ] {
+        let mut mutated = payload.clone();
+        mutated[field] = replacement;
+        assert!(
+            validate_persisted_v1_payload_prompt(&plan, &mutated).is_err(),
+            "payload authority mutation {field} must fail"
+        );
+    }
+}
+
+#[test]
 fn dynamic_post_approval_and_mediation_assignments_use_the_common_finalizer() {
     let plan = compile_plan();
     let idea = idea(
@@ -1783,7 +1914,7 @@ fn dynamic_post_approval_and_mediation_assignments_use_the_common_finalizer() {
         .find(|state| state.owner.agent_id == "lead_orchestrator")
         .expect("system lead should own a state");
     let mediation_run = run(&plan, &idea, &lead_state.id);
-    for origin in ["p017_conflict_mediation", "p058_lead_mediation"] {
+    for origin in ["p017_conflict", "p058_lead_mediation"] {
         let prompt = finalize_mediation_prompt_v1(
             &plan,
             &mediation_run,

@@ -5,6 +5,7 @@
       "clause": 1,
       "proofs": [
         {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "frozen_catalog_version_extension_matrix_is_exhaustive"},
+        {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "frozen_catalog_preserves_inline_legacy_and_rejects_external_without_embedded_bytes"},
         {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "persisted_snapshot_quartet_exhausts_all_presence_states_and_never_falls_back"},
         {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "legacy_prompt_validation_preserves_pre_v1_bytes_exactly"}
       ]
@@ -23,7 +24,8 @@
         {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "run_preflight_enforces_exact_idea_bound_without_writes"},
         {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "production_start_run_rejects_missing_or_oversized_idea_before_run_and_work_insert"},
         {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "agent_context_owner_validation_failure_enqueues_zero_provider_work"},
-        {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "agent_context_dynamic_finalizer_failure_enqueues_and_materializes_zero_work"}
+        {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "agent_context_dynamic_finalizer_failure_enqueues_and_materializes_zero_work"},
+        {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "agent_context_p017_finalizer_failure_preserves_unresolved_conflict_and_zero_work"}
       ]
     },
     {
@@ -52,7 +54,8 @@
         {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "strict_bundle_rejects_symlinked_skill_file_and_parent_escape"},
         {"source": "control-plane/crates/workflow/tests/agent_context_skills.rs", "test": "active_security_and_prepush_bundles_are_strict_single_file_documents"},
         {"source": "control-plane/crates/workflow/src/skill_bundle.rs", "test": "final_entry_rename_swap_fails_closed"},
-        {"source": "control-plane/crates/workflow/src/skill_bundle.rs", "test": "intermediate_directory_symlink_swap_fails_closed"}
+        {"source": "control-plane/crates/workflow/src/skill_bundle.rs", "test": "intermediate_directory_symlink_swap_fails_closed"},
+        {"source": "control-plane/crates/workflow/src/skill_bundle.rs", "test": "catalog_parent_symlink_is_rejected_without_following"}
       ]
     },
     {
@@ -98,7 +101,10 @@
       "clause": 11,
       "proofs": [
         {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "invoke_agent_producer_manifest_is_closed_and_each_guard_is_mutation_sensitive"},
-        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "legacy_flat_producer_rejects_workflow_or_snapshot_backed_runs"}
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "legacy_flat_producer_rejects_workflow_or_snapshot_backed_runs"},
+        {"source": "control-plane/crates/engine/tests/agent_context_skills.rs", "test": "persisted_v1_validation_rejects_structural_and_authority_mutations_without_rewriting"},
+        {"source": "control-plane/crates/engine/tests/proposal_058_deadline_resume.rs", "test": "p058_operator_resume_rejects_malformed_v1_source_prompt_without_mutation"},
+        {"source": "control-plane/crates/engine/src/orchestrator.rs", "test": "proposal_058_lead_mediation_replaces_complete_source_agent_authority"}
       ]
     },
     {

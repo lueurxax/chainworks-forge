@@ -37,9 +37,9 @@
   {
     "producer_id": "orchestrator.p017_mediation",
     "source_file": "orchestrator.rs",
-    "function": "enqueue_mediation_invoke_agent",
+    "function": "build_mediation_invoke_agent_work_item",
     "classification": "fresh_finalized",
-    "guard": "finalize_mediation_prompt_v1"
+    "guard": "validate_persisted_v1_payload_prompt"
   },
   {
     "producer_id": "orchestrator.p058_escalation_retry",
@@ -54,5 +54,12 @@
     "function": "enqueue_invoke_agent",
     "classification": "fresh_finalized",
     "guard": "validate_persisted_v1_prompt"
+  },
+  {
+    "producer_id": "p058_deadline_resume.operator_resume",
+    "source_file": "p058_deadline_resume.rs",
+    "function": "resume_escalation_tx",
+    "classification": "copy_validated",
+    "guard": "validate_persisted_v1_payload_prompt"
   }
 ]

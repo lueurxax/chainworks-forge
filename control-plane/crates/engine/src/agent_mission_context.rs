@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use domain::idea::Idea;
 use domain::ids::RunId;
 use domain::run::Run;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use workflow::plan::{CompiledState, CompiledTask, ResolvedAgent, RunPlan};
 
 pub const MAX_IDEA_CONTEXT_BYTES: usize = 16 * 1024;
@@ -102,6 +102,102 @@ enum ProcedureIdentity<'a> {
     None,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedAgentMissionContextV1 {
+    schema_version: String,
+    run_id: String,
+    idea_id: String,
+    mission: PersistedMission,
+    stage: PersistedStage,
+    assignment: PersistedAssignment,
+    runtime: PersistedRuntimeContext,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedMission {
+    operator_request_title: String,
+    operator_request_body: String,
+    workflow_family: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedStage {
+    state_id: String,
+    label: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum PersistedAssignment {
+    Task {
+        origin: String,
+        task: String,
+        agent_id: String,
+        phase: u32,
+        parallel: bool,
+        declared_outputs: Vec<String>,
+        provider_outputs: Vec<String>,
+        engine_owned_outputs: Vec<String>,
+        consumers: Vec<PersistedConsumer>,
+        completion: PersistedCompletion,
+    },
+    StateOwner {
+        agent_id: String,
+        consumers: Vec<PersistedConsumer>,
+        completion: PersistedCompletion,
+    },
+    Mediation {
+        origin: String,
+        lead_agent_id: String,
+        conflict_or_escalation_id: String,
+        lead_resolution: String,
+        consumers: Vec<PersistedConsumer>,
+        completion: PersistedCompletion,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum PersistedConsumer {
+    Task {
+        task: String,
+        agent_id: String,
+    },
+    Transition {
+        target_state_id: String,
+        owner_id: String,
+        when: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedCompletion {
+    kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedRuntimeContext {
+    permission_profile: Option<String>,
+    worktree_write_enabled: bool,
+    procedure: PersistedProcedureIdentity,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum PersistedProcedureIdentity {
+    Resolved {
+        id: String,
+        source_kind: String,
+        skill_snapshot_hash: String,
+    },
+    None,
+}
+
 pub fn is_control_plane_owned_output(output_name: &str) -> bool {
     output_name == "changed_files_manifest"
 }
@@ -190,27 +286,8 @@ pub fn validate_persisted_v1_prompt(plan: &RunPlan, prompt: &str) -> Result<()> 
     if plan.mission_context_version.as_deref() != Some(MISSION_CONTEXT_VERSION) {
         return Ok(());
     }
-    let count = prompt.matches(MISSION_HEADER).count();
-    if count != 1 {
-        anyhow::bail!(
-            "frozen_snapshot_contract_incompatible: persisted V1 prompt must contain exactly one mission block; found {count}"
-        );
-    }
-    let mission = prompt
-        .split_once(&format!("{MISSION_HEADER}\n"))
-        .and_then(|(_, rest)| rest.split_once(&format!("\n\n{PRECEDENCE_HEADER}")))
-        .map(|(json, _)| json)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "frozen_snapshot_contract_incompatible: persisted V1 mission block is malformed"
-            )
-        })?;
-    let value: serde_json::Value =
-        serde_json::from_str(mission).context("parsing persisted V1 mission JSON")?;
-    if value.get("schema_version").and_then(|value| value.as_str()) != Some(MISSION_CONTEXT_VERSION)
-    {
-        anyhow::bail!("frozen_snapshot_contract_incompatible: persisted mission version mismatch");
-    }
+    let context = parse_persisted_v1_prompt(prompt)?;
+    validate_persisted_context_shape(plan, &context)?;
     Ok(())
 }
 
@@ -229,7 +306,384 @@ pub fn validate_persisted_v1_payload_prompt(
                 "frozen_snapshot_contract_incompatible: V1 retry payload has no persisted prompt"
             )
         })?;
-    validate_persisted_v1_prompt(plan, prompt)
+    let context = parse_persisted_v1_prompt(prompt)?;
+    validate_persisted_context_shape(plan, &context)?;
+    validate_persisted_payload_authority(plan, payload, &context)
+}
+
+fn parse_persisted_v1_prompt(prompt: &str) -> Result<PersistedAgentMissionContextV1> {
+    let header = format!("{MISSION_HEADER}\n");
+    let delimiter = format!("\n\n{PRECEDENCE_HEADER}");
+    let mut blocks = Vec::new();
+    for (offset, _) in prompt.match_indices(&header) {
+        if offset != 0 && !prompt[..offset].ends_with("\n\n") {
+            continue;
+        }
+        let tail = &prompt[offset + header.len()..];
+        if let Some((json, _)) = tail.split_once(&delimiter) {
+            blocks.push(json);
+        }
+    }
+    if blocks.len() != 1 {
+        anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: persisted V1 prompt must contain exactly one canonical mission block; found {}",
+            blocks.len()
+        );
+    }
+    serde_json::from_str(blocks[0]).map_err(|error| {
+        anyhow::anyhow!(
+            "frozen_snapshot_contract_incompatible: persisted V1 mission block is malformed: {error}"
+        )
+    })
+}
+
+fn validate_persisted_context_shape(
+    plan: &RunPlan,
+    context: &PersistedAgentMissionContextV1,
+) -> Result<()> {
+    if context.schema_version != MISSION_CONTEXT_VERSION {
+        anyhow::bail!("frozen_snapshot_contract_incompatible: persisted mission version mismatch");
+    }
+    let _ = (
+        &context.idea_id,
+        &context.mission.operator_request_title,
+        &context.mission.operator_request_body,
+    );
+    if context.mission.workflow_family != plan.workflow_family.as_deref().unwrap_or("unknown") {
+        anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: persisted workflow family differs from frozen plan"
+        );
+    }
+    let state = plan.states.get(&context.stage.state_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "frozen_snapshot_contract_incompatible: persisted mission state '{}' is absent from the frozen plan",
+            context.stage.state_id
+        )
+    })?;
+    if context.stage.label != state.label {
+        anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: persisted stage label differs from frozen plan"
+        );
+    }
+    let consumers = match &context.assignment {
+        PersistedAssignment::Task {
+            origin,
+            task,
+            agent_id,
+            declared_outputs,
+            provider_outputs,
+            engine_owned_outputs,
+            consumers,
+            completion,
+            phase,
+            parallel,
+            ..
+        } => {
+            if !matches!(origin.as_str(), "static" | "dynamic_parallel")
+                || completion.kind != "declared_output_contracts"
+            {
+                anyhow::bail!(
+                    "frozen_snapshot_contract_incompatible: persisted task assignment contract is invalid"
+                );
+            }
+            if origin == "static" {
+                let frozen_task = state
+                    .tasks
+                    .iter()
+                    .chain(&state.post_approval_tasks)
+                    .find(|candidate| {
+                        candidate.task_name == *task && candidate.agent.agent_id == *agent_id
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "frozen_snapshot_contract_incompatible: persisted static task is absent from frozen state"
+                        )
+                    })?;
+                if frozen_task.phase != *phase
+                    || frozen_task.parallel != *parallel
+                    || frozen_task.outputs != *declared_outputs
+                {
+                    anyhow::bail!(
+                        "frozen_snapshot_contract_incompatible: persisted static task differs from frozen plan"
+                    );
+                }
+            }
+            let expected_provider = declared_outputs
+                .iter()
+                .filter(|output| !is_control_plane_owned_output(output))
+                .cloned()
+                .collect::<Vec<_>>();
+            let expected_engine = declared_outputs
+                .iter()
+                .filter(|output| is_control_plane_owned_output(output))
+                .cloned()
+                .collect::<Vec<_>>();
+            if provider_outputs != &expected_provider || engine_owned_outputs != &expected_engine {
+                anyhow::bail!(
+                    "frozen_snapshot_contract_incompatible: persisted output ownership projection is invalid"
+                );
+            }
+            let _ = (phase, parallel);
+            consumers
+        }
+        PersistedAssignment::StateOwner {
+            agent_id,
+            consumers,
+            completion,
+        } => {
+            if completion.kind != "state_owner_transition" || *agent_id != state.owner.agent_id {
+                anyhow::bail!(
+                    "frozen_snapshot_contract_incompatible: persisted owner completion contract is invalid"
+                );
+            }
+            consumers
+        }
+        PersistedAssignment::Mediation {
+            origin,
+            lead_agent_id,
+            conflict_or_escalation_id,
+            lead_resolution,
+            consumers,
+            completion,
+            ..
+        } => {
+            if !matches!(origin.as_str(), "p017_conflict" | "p058_lead_mediation")
+                || conflict_or_escalation_id.trim().is_empty()
+                || lead_resolution.trim().is_empty()
+                || completion.kind != "lead_resolution_contract"
+            {
+                anyhow::bail!(
+                    "frozen_snapshot_contract_incompatible: persisted mediation assignment contract is invalid"
+                );
+            }
+            frozen_agent(plan, lead_agent_id)?;
+            consumers
+        }
+    };
+    for consumer in consumers {
+        match consumer {
+            PersistedConsumer::Task { task, agent_id } => {
+                if task.trim().is_empty() || agent_id.trim().is_empty() {
+                    anyhow::bail!(
+                        "frozen_snapshot_contract_incompatible: persisted task consumer is incomplete"
+                    );
+                }
+            }
+            PersistedConsumer::Transition {
+                target_state_id,
+                owner_id,
+                when,
+            } => {
+                let target = plan.states.get(target_state_id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "frozen_snapshot_contract_incompatible: persisted transition target '{target_state_id}' is absent"
+                    )
+                })?;
+                if target.owner.agent_id != *owner_id || when.trim().is_empty() {
+                    anyhow::bail!(
+                        "frozen_snapshot_contract_incompatible: persisted transition consumer differs from frozen truth"
+                    );
+                }
+            }
+        }
+    }
+    let _ = state;
+    Ok(())
+}
+
+fn validate_persisted_payload_authority(
+    plan: &RunPlan,
+    payload: &serde_json::Value,
+    context: &PersistedAgentMissionContextV1,
+) -> Result<()> {
+    let object = payload.as_object().ok_or_else(|| {
+        anyhow::anyhow!("frozen_snapshot_contract_incompatible: V1 retry payload must be an object")
+    })?;
+    require_payload_string(object, "run_id", &context.run_id)?;
+    require_payload_string(object, "stage_id", &context.stage.state_id)?;
+    let assignment_agent_id = match &context.assignment {
+        PersistedAssignment::Task {
+            task,
+            agent_id,
+            declared_outputs,
+            ..
+        } => {
+            require_payload_string(object, "task_name", task)?;
+            require_payload_value(object, "task_outputs", &serde_json::json!(declared_outputs))?;
+            agent_id
+        }
+        PersistedAssignment::StateOwner { agent_id, .. } => agent_id,
+        PersistedAssignment::Mediation {
+            origin,
+            lead_agent_id,
+            conflict_or_escalation_id,
+            lead_resolution,
+            ..
+        } => {
+            require_payload_string(object, "output_contract", lead_resolution)?;
+            require_payload_string(object, "mediation_origin", origin)?;
+            require_payload_string(
+                object,
+                "conflict_or_escalation_id",
+                conflict_or_escalation_id,
+            )?;
+            require_payload_value(
+                object,
+                "task_outputs",
+                &serde_json::json!(["lead_resolution"]),
+            )?;
+            lead_agent_id
+        }
+    };
+    require_payload_string(object, "agent_id", assignment_agent_id)?;
+    let agent = frozen_agent(plan, assignment_agent_id)?;
+
+    if context.runtime.permission_profile != agent.permission_profile
+        || context.runtime.worktree_write_enabled != agent.worktree_write_enabled
+        || !persisted_procedure_matches_agent(&context.runtime.procedure, &agent)
+    {
+        anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: persisted mission runtime differs from frozen agent authority"
+        );
+    }
+    for (field, expected) in [
+        (
+            "backend_profile_id",
+            serde_json::json!(agent.backend_profile_id),
+        ),
+        ("provider", serde_json::json!(agent.provider)),
+        ("model", serde_json::json!(agent.model)),
+        ("effort", serde_json::json!(agent.effort)),
+        ("max_turns", serde_json::json!(agent.max_turns)),
+        ("temperature", serde_json::json!(agent.temperature)),
+        (
+            "permission_profile",
+            serde_json::json!(agent.permission_profile),
+        ),
+        ("skill_ref", serde_json::json!(agent.skill_ref)),
+        ("skill_role", serde_json::json!(agent.skill_role)),
+        (
+            "skill_snapshot_hash",
+            serde_json::json!(agent.skill_snapshot_hash),
+        ),
+        (
+            "requested_mcp_server_ids",
+            serde_json::json!(agent.requested_mcp_server_ids),
+        ),
+        (
+            "worktree_write_enabled",
+            serde_json::json!(agent.worktree_write_enabled),
+        ),
+        (
+            "worktree_strategy",
+            serde_json::json!(agent.worktree_strategy),
+        ),
+        (
+            "session_reuse_scope",
+            serde_json::json!(agent.session_reuse_scope),
+        ),
+        (
+            "session_family_id",
+            serde_json::json!(agent.session_family_id),
+        ),
+        (
+            "xcode_broker_required",
+            serde_json::json!(agent.xcode_broker_required),
+        ),
+        (
+            "xcode_shim_injection_signal",
+            serde_json::json!(agent.xcode_shim_injection_signal),
+        ),
+        (
+            "requires_xcode_host_execution",
+            serde_json::json!(agent.requires_xcode_host_execution),
+        ),
+    ] {
+        require_payload_value(object, field, &expected)?;
+    }
+    if !matches!(&context.assignment, PersistedAssignment::Mediation { .. }) {
+        require_payload_value(
+            object,
+            "output_contract",
+            &serde_json::json!(agent.output_contract),
+        )?;
+    }
+    Ok(())
+}
+
+fn frozen_agent(plan: &RunPlan, agent_id: &str) -> Result<ResolvedAgent> {
+    if let Some(agent) = plan.states.values().find_map(|state| {
+        std::iter::once(&state.owner)
+            .chain(state.tasks.iter().map(|task| &task.agent))
+            .chain(state.post_approval_tasks.iter().map(|task| &task.agent))
+            .find(|agent| agent.agent_id == agent_id)
+    }) {
+        return Ok(agent.clone());
+    }
+    plan.dynamic_candidate_bindings
+        .iter()
+        .filter(|binding| binding.agent_id == agent_id)
+        .find_map(|binding| serde_json::from_str(&binding.resolved_agent_snapshot_json).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "frozen_snapshot_contract_incompatible: payload agent '{agent_id}' is absent from frozen plan"
+            )
+        })
+}
+
+fn persisted_procedure_matches_agent(
+    procedure: &PersistedProcedureIdentity,
+    agent: &ResolvedAgent,
+) -> bool {
+    match (
+        procedure,
+        &agent.skill_ref,
+        &agent.resolved_skill,
+        &agent.skill_snapshot_hash,
+    ) {
+        (PersistedProcedureIdentity::None, None, None, None) => true,
+        (
+            PersistedProcedureIdentity::Resolved {
+                id,
+                source_kind,
+                skill_snapshot_hash,
+            },
+            Some(expected_id),
+            Some(skill),
+            Some(expected_hash),
+        ) => {
+            id == expected_id
+                && source_kind == &skill.skill_type
+                && skill_snapshot_hash == expected_hash
+        }
+        _ => false,
+    }
+}
+
+fn require_payload_string(
+    payload: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    expected: &str,
+) -> Result<()> {
+    if payload.get(field).and_then(serde_json::Value::as_str) != Some(expected) {
+        anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: V1 retry payload field '{field}' differs from persisted mission"
+        );
+    }
+    Ok(())
+}
+
+fn require_payload_value(
+    payload: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    expected: &serde_json::Value,
+) -> Result<()> {
+    if payload.get(field).unwrap_or(&serde_json::Value::Null) != expected {
+        anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: V1 retry payload field '{field}' differs from frozen authority"
+        );
+    }
+    Ok(())
 }
 
 pub fn validate_legacy_flat_invoke_agent(run: &Run) -> Result<()> {

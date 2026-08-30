@@ -13,6 +13,7 @@ use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use engine::command_handler::{CommandHandler, CommandResult};
 use engine::event_bus;
 use engine::work_queue::WorkQueue;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 const LEDGER_ID: &str = "ledger-p058-deadline-resume";
@@ -26,6 +27,10 @@ struct Fixture {
     source_stage_execution_id: StageExecutionId,
     source_agent_execution_id: AgentExecutionId,
     ledger_created_at: chrono::DateTime<Utc>,
+}
+
+fn snapshot_hash(snapshot: &str) -> String {
+    format!("{:x}", Sha256::digest(snapshot.as_bytes()))
 }
 
 async fn setup_fixture(pause_reason: &str) -> Fixture {
@@ -114,6 +119,8 @@ async fn setup_fixture(pause_reason: &str) -> Fixture {
         }]
     })
     .to_string();
+    let workflow_snapshot_hash = snapshot_hash(&workflow_snapshot);
+    let catalog_snapshot_hash = snapshot_hash(&catalog_snapshot);
 
     ideas::insert(
         &pool,
@@ -157,8 +164,8 @@ async fn setup_fixture(pause_reason: &str) -> Fixture {
         project_key: None,
         risk_class: None,
         stack: None,
-        workflow_snapshot_hash: None,
-        catalog_snapshot_hash: None,
+        workflow_snapshot_hash: Some(workflow_snapshot_hash),
+        catalog_snapshot_hash: Some(catalog_snapshot_hash),
         workflow_snapshot_json: Some(workflow_snapshot),
         catalog_snapshot_json: Some(catalog_snapshot),
         drift_detected_at: None,
@@ -314,6 +321,43 @@ async fn setup_fixture(pause_reason: &str) -> Fixture {
     }
 }
 
+async fn enable_v1_catalog_snapshot(fixture: &Fixture) {
+    let run = runs::find_by_id(&fixture.pool, fixture.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut catalog: serde_json::Value = serde_json::from_str(
+        run.catalog_snapshot_json
+            .as_deref()
+            .expect("fixture catalog snapshot"),
+    )
+    .unwrap();
+    let object = catalog.as_object_mut().unwrap();
+    object.insert(
+        "catalog_snapshot_format_version".into(),
+        serde_json::json!(2),
+    );
+    object.insert(
+        "chainworks_compiled".into(),
+        serde_json::json!({
+            "schema_version": 1,
+            "mission_context_version": "agent_mission_context_v1",
+            "skill_bundles": {}
+        }),
+    );
+    let catalog_snapshot = serde_json::to_string(&catalog).unwrap();
+    let catalog_snapshot_hash = snapshot_hash(&catalog_snapshot);
+    sqlx::query(
+        "UPDATE runs SET catalog_snapshot_json = ?1, catalog_snapshot_hash = ?2 WHERE id = ?3",
+    )
+    .bind(catalog_snapshot)
+    .bind(catalog_snapshot_hash)
+    .bind(fixture.run_id.to_string())
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+}
+
 fn operator_caller() -> CallerContext {
     CallerContext::mcp(
         "operator-p058",
@@ -328,6 +372,71 @@ fn chain_operator_caller() -> CallerContext {
         &PrincipalClass::Operator,
         "runs.resume_escalation_chain",
     )
+}
+
+#[tokio::test]
+async fn p058_operator_resume_rejects_malformed_v1_source_prompt_without_mutation() {
+    let fixture = setup_fixture("escalation_deadline_elapsed").await;
+    enable_v1_catalog_snapshot(&fixture).await;
+    let stage_count_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM stage_executions WHERE run_id = ?1")
+            .bind(fixture.run_id.to_string())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+
+    let result = fixture
+        .handler
+        .handle(
+            Command::ResumeEscalationDeadline(ResumeEscalationDeadlineCmd {
+                run_id: fixture.run_id,
+                escalation_ledger_id: LEDGER_ID.into(),
+                reason: "Malformed V1 source prompt must remain paused".into(),
+                idempotency_key: uuid::Uuid::now_v7().to_string(),
+            }),
+            operator_caller(),
+        )
+        .await;
+    let error = match result {
+        Ok(_) => panic!("V1 resume must reject a copied prompt without mission context"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("P058_RESUME_SOURCE_WORK_INVALID"));
+
+    assert!(
+        escalation_repo::find_deadline_windows_by_ledger(&fixture.pool, LEDGER_ID)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let stage_count_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM stage_executions WHERE run_id = ?1")
+            .bind(fixture.run_id.to_string())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(stage_count_after, stage_count_before);
+    assert_eq!(
+        work_items::list_by_run(&fixture.pool, fixture.run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.kind == WorkItemKind::InvokeAgent
+                && item.status == WorkItemStatus::Pending)
+            .count(),
+        0
+    );
+    let ledger = escalation_repo::find_ledger_by_id(&fixture.pool, LEDGER_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.status_raw, "paused");
+    assert_eq!(
+        ledger.pause_reason_raw.as_deref(),
+        Some("escalation_deadline_elapsed")
+    );
 }
 
 async fn setup_exhausted_chain_fixture() -> Fixture {

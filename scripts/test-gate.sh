@@ -12670,7 +12670,9 @@ PY
       CARGO_TARGET_DIR="$agent_context_cargo_target" cargo test -p workflow skill_bundle::tests:: --lib -- --nocapture
       CARGO_TARGET_DIR="$agent_context_cargo_target" cargo test -p workflow --test agent_context_skills -- --nocapture
       CARGO_TARGET_DIR="$agent_context_cargo_target" cargo test -p engine --test agent_context_skills -- --nocapture
+      CARGO_TARGET_DIR="$agent_context_cargo_target" cargo test -p engine --test proposal_058_deadline_resume -- --test-threads=1 --nocapture
       CARGO_TARGET_DIR="$agent_context_cargo_target" cargo test -p engine agent_context_ --lib -- --nocapture
+      CARGO_TARGET_DIR="$agent_context_cargo_target" cargo test -p engine proposal_058_lead_mediation_replaces_complete_source_agent_authority --lib -- --nocapture
       CARGO_TARGET_DIR="$agent_context_cargo_target" cargo test -p engine p058_escalation_retry_uses_durable_current_backend_profile_tier --lib -- --nocapture
     )
     log "Agent context and skills gate passed"

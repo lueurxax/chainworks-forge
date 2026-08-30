@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::CString;
-use std::fs::{self, File, Metadata};
+use std::fs::{File, Metadata};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -59,9 +59,7 @@ where
         .and_then(|name| name.to_str())
         .ok_or_else(|| anyhow::anyhow!("external skill path must end in a UTF-8 directory name"))?;
 
-    let canonical_base = fs::canonicalize(catalog_base)
-        .with_context(|| format!("resolving agent catalog parent {}", catalog_base.display()))?;
-    let dir = open_bundle_directory(&canonical_base, relative_path)?;
+    let dir = open_bundle_directory(catalog_base, relative_path)?;
 
     let before_entries = enumerate_directory(dir.as_raw_fd())?;
     if before_entries != [b"SKILL.md".to_vec()] {
@@ -93,7 +91,7 @@ where
     if enumerate_directory(dir.as_raw_fd())? != before_entries {
         anyhow::bail!("external skill bundle entries changed while SKILL.md was read");
     }
-    let rebound_dir = open_bundle_directory(&canonical_base, relative_path)
+    let rebound_dir = open_bundle_directory(catalog_base, relative_path)
         .context("revalidating external skill bundle path")?;
     if descriptor_identity(dir.as_raw_fd())? != descriptor_identity(rebound_dir.as_raw_fd())? {
         anyhow::bail!("external skill bundle path changed while SKILL.md was read");
@@ -247,14 +245,42 @@ fn open_directory(path: &Path) -> io::Result<OwnedFd> {
     })
 }
 
-fn open_bundle_directory(canonical_base: &Path, relative_path: &str) -> Result<OwnedFd> {
-    let mut dir = open_directory(canonical_base)?;
+fn open_bundle_directory(catalog_base: &Path, relative_path: &str) -> Result<OwnedFd> {
+    let mut dir = open_directory_tree(catalog_base)?;
     for component in Path::new(relative_path).components() {
         let Component::Normal(name) = component else {
             anyhow::bail!("external skill path contains an invalid component");
         };
         dir = open_child_directory(dir.as_raw_fd(), name.as_bytes())
             .with_context(|| format!("opening external skill path component {:?}", name))?;
+    }
+    Ok(dir)
+}
+
+fn open_directory_tree(path: &Path) -> Result<OwnedFd> {
+    let mut dir = if path.is_absolute() {
+        open_directory(Path::new("/"))?
+    } else {
+        open_directory(Path::new("."))?
+    };
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                dir =
+                    open_child_directory(dir.as_raw_fd(), name.as_bytes()).with_context(|| {
+                        format!("opening agent catalog parent component {:?}", name)
+                    })?;
+            }
+            Component::ParentDir => {
+                dir = open_child_directory(dir.as_raw_fd(), b"..").context(
+                    "opening agent catalog parent component '..' without following symlinks",
+                )?;
+            }
+            Component::Prefix(_) => {
+                anyhow::bail!("agent catalog parent must not contain platform-prefix components");
+            }
+        }
     }
     Ok(dir)
 }
@@ -372,6 +398,7 @@ fn descriptor_identity(fd: RawFd) -> io::Result<(u64, u64, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -386,7 +413,7 @@ mod tests {
                 TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir_all(&path).unwrap();
-            Self(path)
+            Self(fs::canonicalize(path).unwrap())
         }
 
         fn write_skill(&self, root: &str, body: &str) {
@@ -446,5 +473,19 @@ mod tests {
             result.is_err(),
             "swapped intermediate directory must fail closed"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_parent_symlink_is_rejected_without_following() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDir::new();
+        root.write_skill("real-catalog/skills", "original bytes");
+        let alias = root.0.join("catalog-alias");
+        symlink(root.0.join("real-catalog"), &alias).unwrap();
+
+        let result = load_skill_bundle(&alias, "skills/test-skill");
+        assert!(result.is_err(), "catalog parent symlink must fail closed");
     }
 }

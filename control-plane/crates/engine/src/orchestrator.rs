@@ -3588,6 +3588,7 @@ impl Orchestrator {
             else {
                 continue;
             };
+            let mut lead_authority = None;
             if fallback.reason == "p058_lead_mediation_tier"
                 && plan.mission_context_version.as_deref() == Some("agent_mission_context_v1")
             {
@@ -3631,6 +3632,7 @@ impl Orchestrator {
                     lead_resolution_contract,
                     body,
                 )?);
+                lead_authority = Some(lead.clone());
             }
             let retry_reason = format!(
                 "p058_escalation_retry:{}:{}:{}",
@@ -3738,6 +3740,9 @@ impl Orchestrator {
             if let Some(temperature) = fallback.temperature {
                 object.insert("temperature".into(), serde_json::json!(temperature));
             }
+            if let Some(lead) = lead_authority.as_ref() {
+                replace_p058_lead_invoke_payload_authority(object, lead, &ledger.id);
+            }
             object.insert(
                 "targeted_retry".into(),
                 serde_json::json!({
@@ -3763,6 +3768,9 @@ impl Orchestrator {
                     }
                 }),
             );
+            if lead_authority.is_some() {
+                validate_p058_lead_retry_payload(&plan, &retry_payload)?;
+            }
 
             let tx_started = std::time::Instant::now();
             let mut tx = self
@@ -5329,7 +5337,14 @@ impl Orchestrator {
                 .await?;
 
             // Build prompt for this reviewer.
-            let prompt = build_task_prompt(&task, plan, run, idea_opt, None, None)?;
+            let prompt = match build_task_prompt(&task, plan, run, idea_opt, None, None) {
+                Ok(prompt) => prompt,
+                Err(error) => {
+                    self.block_dynamic_prompt_finalization_failure(run_id, stage, &error)
+                        .await?;
+                    return Ok(0);
+                }
+            };
 
             // Record materialization for idempotency.
             let work_item_id = format!(
@@ -5431,6 +5446,36 @@ impl Orchestrator {
         );
 
         Ok(enqueued)
+    }
+
+    async fn block_dynamic_prompt_finalization_failure(
+        &self,
+        run_id: RunId,
+        stage: &StageExecution,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        let failure = serde_json::json!({
+            "schema_version": "agent_mission_context_failure_v1",
+            "failure_kind": "prompt_finalization_failed",
+            "dispatch_shape": "dynamic_parallel",
+            "stage_id": stage.stage_id,
+            "stage_execution_id": stage.id.to_string(),
+            "error": format!("{error:#}"),
+            "retryable": false,
+        });
+        stages::update_validation_failure_json(&self.pool, stage.id, &failure.to_string()).await?;
+        stages::update_status(&self.pool, stage.id, StageStatus::Blocked).await?;
+        runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
+        let _ = self.events.send(DomainEvent::StageStatusChanged {
+            run_id,
+            stage_execution_id: stage.id,
+            status: StageStatus::Blocked,
+        });
+        let _ = self.events.send(DomainEvent::RunStatusChanged {
+            run_id,
+            status: RunStatus::Blocked,
+        });
+        Ok(())
     }
 
     /// P060: Resolve selected reviewer outputs for a then-task that declares
@@ -6101,57 +6146,17 @@ impl Orchestrator {
         _current_state_id: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<Option<String>> {
-        use crate::mediation::lead_resolver::{LeadResolution, PhaseBLeadResolver};
-
-        // MF-PRE-ENABLE-002: Wrap find-active, insert, and update-pointer in a
-        // single IMMEDIATE transaction to prevent orphaned mediation records.
-        // Lead resolution (file I/O) happens outside the tx since it's read-only.
-
-        // Attempt Phase B lead resolution from the versioned compatibility map.
-        // If the map file doesn't exist or no match is found, resolution fails closed.
-        let resolver_path =
-            "docs/reference/workflow-conflict-evidence/phase-0-phase-b-lead-resolver.json";
-        let resolver = match PhaseBLeadResolver::load_from_file(resolver_path) {
-            Ok(r) => r,
-            Err(e) => {
-                debug!(
-                    run_id = %run_id,
-                    error = %e,
-                    "Phase B lead resolver map not available; mediation cannot start"
-                );
-                return Ok(None);
-            }
-        };
-
-        // Resolve using the run's workflow and catalog paths.
-        let run = runs::find_by_id(&self.pool, run_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Run not found: {}", run_id))?;
-        let workflow_path = run.workflow_yaml_path.as_deref().unwrap_or("");
-        let catalog_path = run.agent_catalog_yaml_path.as_deref().unwrap_or("");
-
-        let lead_agent_id = match resolver.resolve(workflow_path, catalog_path) {
-            LeadResolution::Resolved { lead_agent_id, .. } => lead_agent_id,
-            LeadResolution::FailedClosed { reason } => {
-                debug!(
-                    run_id = %run_id,
-                    conflict_id = %conflict.conflict_id,
-                    reason = %reason,
-                    "Phase B lead resolution failed closed"
-                );
-                return Ok(None);
-            }
-        };
-
-        // Begin IMMEDIATE transaction for the idempotency check + insert + pointer update.
+        // A fast idempotency check avoids rebuilding a prompt for an already-active
+        // mediation. The creation transaction repeats the check to close the race.
         let mut tx = self
             .begin_orchestrator_transaction(
-                "mediation.try_initiate",
-                format!("mediation.try_initiate:{run_id}:{}", conflict.conflict_id),
+                "mediation.try_initiate_precheck",
+                format!(
+                    "mediation.try_initiate_precheck:{run_id}:{}",
+                    conflict.conflict_id
+                ),
             )
             .await?;
-
-        // Check for existing active mediation for this conflict fingerprint (idempotent).
         if let Some(existing) = lead_conflict_mediations::find_active_for_conflict_tx(
             &mut tx,
             &run_id.to_string(),
@@ -6178,16 +6183,68 @@ impl Orchestrator {
             tx.commit().await.ok();
             return Ok(Some(existing.id));
         }
+        tx.commit().await?;
 
-        // Create the mediation record inside the transaction.
+        let run = runs::find_by_id(&self.pool, run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Run not found: {}", run_id))?;
+        let plan = crate::command_handler::compile_run_plan_from_snapshot(&run)?
+            .ok_or_else(|| anyhow::anyhow!("P017 mediation requires a frozen RunPlan"))?;
+        let catalog: serde_json::Value = serde_json::from_str(
+            run.catalog_snapshot_json
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Run has no frozen catalog snapshot"))?,
+        )?;
+        let lead_entries = catalog
+            .get("agents")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|agent| {
+                agent.get("system_role").and_then(serde_json::Value::as_str) == Some("lead")
+            })
+            .collect::<Vec<_>>();
+        let [lead_entry] = lead_entries.as_slice() else {
+            debug!(
+                run_id = %run_id,
+                conflict_id = %conflict.conflict_id,
+                lead_count = lead_entries.len(),
+                "Frozen catalog must contain exactly one system lead for mediation"
+            );
+            return Ok(None);
+        };
+        let lead_agent_id = lead_entry
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Frozen system lead has no agent id"))?
+            .to_string();
+        let lead = resolved_agent_from_plan(&plan, &lead_agent_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Frozen system lead '{}' is absent from the frozen RunPlan",
+                lead_agent_id
+            )
+        })?;
+
         let mediation_id = uuid::Uuid::new_v4().to_string();
+        let work_item = self
+            .build_mediation_invoke_agent_work_item(
+                run_id,
+                &run,
+                &plan,
+                &mediation_id,
+                conflict,
+                lead,
+                now,
+            )
+            .await?;
+
         let mediation = domain::mediation::LeadConflictMediationRecord {
             id: mediation_id.clone(),
             run_id: run_id.to_string(),
             conflict_id: conflict.conflict_id.clone(),
             conflict_fingerprint: conflict.conflict_fingerprint.clone(),
             lead_agent_id: lead_agent_id.clone(),
-            status: domain::mediation::LeadMediationStatus::Pending,
+            status: domain::mediation::LeadMediationStatus::Queued,
             settlement_result: None,
             recovery_action: None,
             chosen_action: None,
@@ -6205,9 +6262,33 @@ impl Orchestrator {
             updated_at: now,
             settled_at: None,
         };
-        lead_conflict_mediations::insert_tx(&mut tx, &mediation).await?;
 
-        // Update conflict record with mediation pointer and lead_mediation_pending status.
+        let mut tx = self
+            .begin_orchestrator_transaction(
+                "mediation.try_initiate",
+                format!("mediation.try_initiate:{run_id}:{}", conflict.conflict_id),
+            )
+            .await?;
+        if let Some(existing) = lead_conflict_mediations::find_active_for_conflict_tx(
+            &mut tx,
+            &run_id.to_string(),
+            &conflict.conflict_fingerprint,
+        )
+        .await?
+        {
+            let _ = db::repos::workflow_conflicts::record_duplicate_mediation_session_tx(
+                &mut tx,
+                &run_id.to_string(),
+                &conflict.conflict_id,
+                &existing.id,
+                "try_initiate_race",
+                Utc::now(),
+            )
+            .await;
+            tx.commit().await?;
+            return Ok(Some(existing.id));
+        }
+        lead_conflict_mediations::insert_tx(&mut tx, &mediation).await?;
         workflow_conflicts::update_mediation_pointer_tx(
             &mut tx,
             &conflict.conflict_id,
@@ -6217,65 +6298,29 @@ impl Orchestrator {
             now,
         )
         .await?;
-
-        // Commit the atomic find+insert+pointer-update.
+        work_items::enqueue_tx(&mut tx, &work_item).await?;
         tx.commit().await?;
 
-        // Enqueue InvokeAgent work item for the lead agent with owner-aware payload.
-        // MC-002: If enqueue fails after the mediation record was committed,
-        // transition the orphaned Pending mediation to terminal_unverifiable
-        // so it doesn't permanently block new mediation for the same fingerprint.
-        if let Err(enqueue_err) = self
-            .enqueue_mediation_invoke_agent(run_id, &run, &mediation_id, conflict, &lead_agent_id)
-            .await
-        {
-            tracing::error!(
-                run_id = %run_id,
-                mediation_id = %mediation_id,
-                error = %enqueue_err,
-                "Failed to enqueue mediation work item; transitioning orphaned mediation to terminal"
-            );
-            // Best-effort recovery: mark the orphaned mediation as terminal.
-            let recovery_now = chrono::Utc::now();
-            if let Ok(mut recovery_tx) = self
-                .begin_orchestrator_transaction(
-                    "mediation.orphan_recovery",
-                    format!("mediation.orphan_recovery:{mediation_id}"),
-                )
-                .await
-            {
-                let _ = db::repos::lead_conflict_mediations::update_status_tx(
-                    &mut recovery_tx,
-                    &mediation_id,
-                    "terminal_unverifiable",
-                    Some("enqueue_failure"),
-                    Some("clone_or_manual_fallback"),
-                    recovery_now,
-                )
-                .await;
-                let _ = recovery_tx.commit().await;
-            }
-            return Err(enqueue_err);
-        }
+        info!(
+            run_id = %run_id,
+            mediation_id = %mediation_id,
+            lead_agent_id = %lead_agent_id,
+            "Atomically queued lead agent invocation for mediation"
+        );
 
         Ok(Some(mediation_id))
     }
 
-    /// P017 Phase B: Enqueue an InvokeAgent work item for the resolved lead agent,
-    /// with owner_kind=lead_conflict_mediation and the mediation record as owner_id.
-    async fn enqueue_mediation_invoke_agent(
+    async fn build_mediation_invoke_agent_work_item(
         &self,
         run_id: RunId,
         run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
         mediation_id: &str,
         conflict: &WorkflowConflictRecord,
-        lead_agent_id: &str,
-    ) -> Result<()> {
-        let plan = crate::command_handler::compile_run_plan_from_snapshot(run)?
-            .ok_or_else(|| anyhow::anyhow!("P017 mediation requires a frozen RunPlan"))?;
-        let lead = resolved_agent_from_plan(&plan, lead_agent_id).ok_or_else(|| {
-            anyhow::anyhow!("Lead agent '{}' not found in frozen RunPlan", lead_agent_id)
-        })?;
+        lead: &workflow::plan::ResolvedAgent,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<WorkItem> {
         let catalog: serde_json::Value = serde_json::from_str(
             run.catalog_snapshot_json
                 .as_deref()
@@ -6286,7 +6331,8 @@ impl Orchestrator {
             .and_then(serde_json::Value::as_array)
             .and_then(|agents| {
                 agents.iter().find(|agent| {
-                    agent.get("id").and_then(serde_json::Value::as_str) == Some(lead_agent_id)
+                    agent.get("id").and_then(serde_json::Value::as_str)
+                        == Some(lead.agent_id.as_str())
                 })
             })
             .ok_or_else(|| anyhow::anyhow!("Lead agent missing from frozen catalog"))?;
@@ -6363,72 +6409,60 @@ impl Orchestrator {
         };
 
         let work_item_id = format!("p017-mediation:{}:0", mediation_id);
-        self.work_queue
-            .enqueue_with_id(
-                work_item_id,
-                WorkItemKind::InvokeAgent,
-                Some(run_id),
-                Some(conflict.current_state_id.clone()),
-                serde_json::json!({
-                    "run_id": run_id.to_string(),
-                    "stage_id": conflict.current_state_id,
-                    "stage_execution_id": serde_json::Value::Null,
-                    "task_name": format!("mediation_{}", mediation_id),
-                    "task_inputs": Vec::<String>::new(),
-                    "task_outputs": ["lead_resolution"],
-                    "declared_outputs": declared_outputs,
-                    "agent_id": lead_agent_id,
-                    "backend_profile_id": lead.backend_profile_id,
-                    "provider": lead.provider,
-                    "model": lead.model,
-                    "effort": lead.effort,
-                    "max_turns": lead.max_turns,
-                    "temperature": lead.temperature,
-                    "permission_profile": lead.permission_profile,
-                    "skill_ref": lead.skill_ref,
-                    "skill_role": lead.skill_role,
-                    "skill_snapshot_hash": lead.skill_snapshot_hash,
-                    "output_contract": lead_resolution_contract_id,
-                    "prompt": prompt,
-                    "task_index": 0,
-                    "total_tasks": 1,
-                    // P017: Owner-aware execution identity fields.
-                    "owner_kind": "lead_conflict_mediation",
-                    "owner_id": mediation_id,
-                    "origin_stage_id": conflict.current_state_id,
-                    "origin_stage_execution_id": conflict.stage_execution_id,
-                    "mediation_record_id": mediation_id,
-                    "conflict_fingerprint": conflict.conflict_fingerprint,
-                }),
-            )
-            .await?;
-
-        // Update mediation status to queued.
-        let now = chrono::Utc::now();
-        let mut tx = self
-            .begin_orchestrator_transaction(
-                "mediation.update_status_queued",
-                format!("mediation.update_status_queued:{mediation_id}"),
-            )
-            .await?;
-        db::repos::lead_conflict_mediations::update_status_tx(
-            &mut tx,
-            mediation_id,
-            "queued",
-            None,
-            None,
-            now,
-        )
-        .await?;
-        tx.commit().await?;
-
-        info!(
-            run_id = %run_id,
-            mediation_id = %mediation_id,
-            lead_agent_id = %lead_agent_id,
-            "Enqueued lead agent invocation for mediation"
-        );
-        Ok(())
+        let payload = serde_json::json!({
+            "run_id": run_id.to_string(),
+            "stage_id": conflict.current_state_id,
+            "stage_execution_id": serde_json::Value::Null,
+            "task_name": format!("mediation_{}", mediation_id),
+            "task_inputs": Vec::<String>::new(),
+            "task_outputs": ["lead_resolution"],
+            "declared_outputs": declared_outputs,
+            "agent_id": lead.agent_id,
+            "backend_profile_id": lead.backend_profile_id,
+            "provider": lead.provider,
+            "model": lead.model,
+            "effort": lead.effort,
+            "max_turns": lead.max_turns,
+            "temperature": lead.temperature,
+            "permission_profile": lead.permission_profile,
+            "skill_ref": lead.skill_ref,
+            "skill_role": lead.skill_role,
+            "skill_snapshot_hash": lead.skill_snapshot_hash,
+            "requested_mcp_server_ids": lead.requested_mcp_server_ids,
+            "xcode_broker_required": lead.xcode_broker_required,
+            "xcode_shim_injection_signal": lead.xcode_shim_injection_signal,
+            "requires_xcode_host_execution": lead.requires_xcode_host_execution,
+            "output_contract": lead_resolution_contract_id,
+            "mediation_origin": "p017_conflict",
+            "conflict_or_escalation_id": conflict.conflict_id,
+            "prompt": prompt,
+            "task_index": 0,
+            "total_tasks": 1,
+            "worktree_write_enabled": lead.worktree_write_enabled,
+            "worktree_strategy": lead.worktree_strategy,
+            "legacy_broad_discovery_policy": plan.legacy_broad_discovery_policy,
+            "session_reuse_scope": lead.session_reuse_scope,
+            "session_family_id": lead.session_family_id,
+            "owner_kind": "lead_conflict_mediation",
+            "owner_id": mediation_id,
+            "origin_stage_id": conflict.current_state_id,
+            "origin_stage_execution_id": conflict.stage_execution_id,
+            "mediation_record_id": mediation_id,
+            "conflict_fingerprint": conflict.conflict_fingerprint,
+        });
+        crate::agent_mission_context::validate_persisted_v1_payload_prompt(plan, &payload)?;
+        Ok(WorkItem {
+            id: work_item_id,
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::to_string(&payload)?,
+            status: WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some(conflict.current_state_id.clone()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 0,
+            last_error: None,
+        })
     }
 
     async fn record_workflow_transition_cursor(
@@ -7931,6 +7965,94 @@ async fn select_run_local_health_fallback_profile(
         );
     }
     Ok(None)
+}
+
+fn replace_invoke_payload_agent_authority(
+    payload: &mut serde_json::Map<String, serde_json::Value>,
+    agent: &workflow::plan::ResolvedAgent,
+) {
+    for (field, value) in [
+        ("agent_id", serde_json::json!(agent.agent_id)),
+        (
+            "backend_profile_id",
+            serde_json::json!(agent.backend_profile_id),
+        ),
+        ("provider", serde_json::json!(agent.provider)),
+        ("model", serde_json::json!(agent.model)),
+        ("effort", serde_json::json!(agent.effort)),
+        ("max_turns", serde_json::json!(agent.max_turns)),
+        ("temperature", serde_json::json!(agent.temperature)),
+        (
+            "permission_profile",
+            serde_json::json!(agent.permission_profile),
+        ),
+        ("skill_ref", serde_json::json!(agent.skill_ref)),
+        ("skill_role", serde_json::json!(agent.skill_role)),
+        (
+            "skill_snapshot_hash",
+            serde_json::json!(agent.skill_snapshot_hash),
+        ),
+        (
+            "requested_mcp_server_ids",
+            serde_json::json!(agent.requested_mcp_server_ids),
+        ),
+        (
+            "xcode_broker_required",
+            serde_json::json!(agent.xcode_broker_required),
+        ),
+        (
+            "xcode_shim_injection_signal",
+            serde_json::json!(agent.xcode_shim_injection_signal),
+        ),
+        (
+            "requires_xcode_host_execution",
+            serde_json::json!(agent.requires_xcode_host_execution),
+        ),
+        (
+            "worktree_write_enabled",
+            serde_json::json!(agent.worktree_write_enabled),
+        ),
+        (
+            "worktree_strategy",
+            serde_json::json!(agent.worktree_strategy),
+        ),
+        (
+            "session_reuse_scope",
+            serde_json::json!(agent.session_reuse_scope),
+        ),
+        (
+            "session_family_id",
+            serde_json::json!(agent.session_family_id),
+        ),
+    ] {
+        payload.insert(field.into(), value);
+    }
+}
+
+fn replace_p058_lead_invoke_payload_authority(
+    payload: &mut serde_json::Map<String, serde_json::Value>,
+    agent: &workflow::plan::ResolvedAgent,
+    ledger_id: &str,
+) {
+    replace_invoke_payload_agent_authority(payload, agent);
+    payload.insert("task_name".into(), serde_json::json!("p058_lead_mediation"));
+    payload.insert("task_inputs".into(), serde_json::json!([]));
+    payload.insert(
+        "mediation_origin".into(),
+        serde_json::json!("p058_lead_mediation"),
+    );
+    payload.insert(
+        "conflict_or_escalation_id".into(),
+        serde_json::json!(ledger_id),
+    );
+    payload.remove("provider_health_fallback");
+}
+
+fn validate_p058_lead_retry_payload(
+    plan: &workflow::plan::RunPlan,
+    payload: &serde_json::Value,
+) -> Result<()> {
+    crate::agent_mission_context::validate_persisted_v1_payload_prompt(plan, payload)
 }
 
 fn p058_escalation_tier_provider_fallback(
@@ -12227,6 +12349,106 @@ mod tests {
             .is_some_and(|prompt| prompt.contains("P058 escalation tier")));
     }
 
+    #[test]
+    fn proposal_058_lead_mediation_replaces_complete_source_agent_authority() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let plan = workflow::compiler::compile(
+            root.join("examples/workflows/full-mvp-live.yaml")
+                .to_str()
+                .unwrap(),
+            root.join("examples/agents/agents.yaml").to_str().unwrap(),
+        )
+        .unwrap();
+        let lead = resolved_agent_from_plan(&plan, "lead_orchestrator")
+            .expect("frozen plan must contain the system lead");
+        let state = plan.states.get(&plan.initial_state).unwrap();
+        let idea = test_idea(IdeaId::new());
+        let run = test_run(RunId::new());
+        let prompt = crate::agent_mission_context::finalize_mediation_prompt_v1(
+            &plan,
+            &run,
+            state,
+            lead,
+            &idea,
+            "p058_lead_mediation",
+            "ledger-authority-test",
+            "LeadResolutionContract",
+            "Resolve the escalation.",
+        )
+        .unwrap();
+        let mut payload = serde_json::json!({
+            "run_id": run.id.to_string(),
+            "stage_id": state.id,
+            "agent_id": "source_agent",
+            "backend_profile_id": "source_profile",
+            "provider": "source_provider",
+            "model": "source_model",
+            "effort": "source_effort",
+            "max_turns": 999,
+            "temperature": 1.0,
+            "permission_profile": "SOURCE_BROAD_AUTHORITY",
+            "skill_ref": "source_skill",
+            "skill_role": "source_role",
+            "skill_snapshot_hash": "source_hash",
+            "requested_mcp_server_ids": ["source-mcp"],
+            "xcode_broker_required": true,
+            "xcode_shim_injection_signal": true,
+            "requires_xcode_host_execution": true,
+            "worktree_write_enabled": true,
+            "worktree_strategy": "source_strategy",
+            "session_reuse_scope": "source_scope",
+            "session_family_id": "source_family",
+            "output_contract": "LeadResolutionContract",
+            "mediation_origin": "p058_lead_mediation",
+            "conflict_or_escalation_id": "ledger-authority-test",
+            "task_outputs": ["lead_resolution"],
+            "prompt": prompt,
+        });
+
+        replace_p058_lead_invoke_payload_authority(
+            payload.as_object_mut().unwrap(),
+            lead,
+            "ledger-authority-test",
+        );
+        crate::agent_mission_context::validate_persisted_v1_payload_prompt(&plan, &payload)
+            .expect("rebuilt P058 lead payload must match frozen lead authority");
+
+        assert_eq!(payload["agent_id"], serde_json::json!(lead.agent_id));
+        assert_eq!(
+            payload["backend_profile_id"],
+            serde_json::json!(lead.backend_profile_id)
+        );
+        assert_eq!(
+            payload["permission_profile"],
+            serde_json::json!(lead.permission_profile)
+        );
+        assert_eq!(
+            payload["requested_mcp_server_ids"],
+            serde_json::json!(lead.requested_mcp_server_ids)
+        );
+        assert_eq!(
+            payload["worktree_write_enabled"],
+            serde_json::json!(lead.worktree_write_enabled)
+        );
+        assert_eq!(
+            payload["session_family_id"],
+            serde_json::json!(lead.session_family_id)
+        );
+        assert_eq!(payload["provider"], serde_json::json!(lead.provider));
+        assert_eq!(
+            payload["output_contract"],
+            serde_json::json!("LeadResolutionContract")
+        );
+        assert_eq!(
+            payload["task_name"],
+            serde_json::json!("p058_lead_mediation")
+        );
+        assert_eq!(
+            payload["conflict_or_escalation_id"],
+            serde_json::json!("ledger-authority-test")
+        );
+    }
+
     #[tokio::test]
     async fn proposal_058_pause_tier_blocks_run_and_suppresses_legacy_retry() {
         let pool = test_pool().await;
@@ -12594,7 +12816,7 @@ mod tests {
             .await
             .expect_err("V1 owner prompt without mission context must fail")
             .to_string();
-        assert!(error.contains("exactly one mission block"));
+        assert!(error.contains("exactly one"));
         let work_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_items")
             .fetch_one(&pool)
             .await
@@ -12737,8 +12959,11 @@ mod tests {
             created_at: Utc::now(),
             archived_at: None,
         };
+        ideas::insert(&pool, &oversized).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+        stages::insert(&pool, &stage).await.unwrap();
 
-        let error = orchestrator
+        let enqueued = orchestrator
             .materialize_dynamic_parallel(
                 run_id,
                 &run,
@@ -12748,12 +12973,8 @@ mod tests {
                 Some(&oversized),
             )
             .await
-            .expect_err("oversized dynamic mission must fail before durable work")
-            .to_string();
-        assert!(
-            error.contains("mission_context_input_too_large"),
-            "unexpected dynamic finalizer error: {error}"
-        );
+            .expect("dynamic finalizer failure must settle durably");
+        assert_eq!(enqueued, 0);
         let work_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_items")
             .fetch_one(&pool)
             .await
@@ -12765,6 +12986,160 @@ mod tests {
                 .unwrap();
         assert_eq!(work_count, 0);
         assert_eq!(materialization_count, 0);
+        let persisted_stage = stages::find_by_id(&pool, stage.id).await.unwrap().unwrap();
+        assert_eq!(persisted_stage.status, StageStatus::Blocked);
+        let failure: serde_json::Value = serde_json::from_str(
+            persisted_stage
+                .validation_failure_json
+                .as_deref()
+                .expect("typed mission-context failure evidence"),
+        )
+        .unwrap();
+        assert_eq!(
+            failure["schema_version"],
+            serde_json::json!("agent_mission_context_failure_v1")
+        );
+        assert_eq!(
+            failure["failure_kind"],
+            serde_json::json!("prompt_finalization_failed")
+        );
+        assert!(failure["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("mission_context_input_too_large")));
+        assert_eq!(
+            runs::find_by_id(&pool, run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RunStatus::Blocked
+        );
+
+        let missing_idea_stage = StageExecution {
+            id: StageExecutionId::new(),
+            status: StageStatus::Running,
+            attempt_number: 2,
+            validation_failure_json: None,
+            ..stage.clone()
+        };
+        stages::insert(&pool, &missing_idea_stage).await.unwrap();
+        let enqueued = orchestrator
+            .materialize_dynamic_parallel(
+                run_id,
+                &run,
+                &missing_idea_stage,
+                &plan,
+                dynamic_parallel,
+                None,
+            )
+            .await
+            .expect("missing Idea must settle the dynamic stage durably");
+        assert_eq!(enqueued, 0);
+        let persisted_stage = stages::find_by_id(&pool, missing_idea_stage.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted_stage.status, StageStatus::Blocked);
+        assert!(persisted_stage
+            .validation_failure_json
+            .as_deref()
+            .is_some_and(|failure| failure.contains("mission_context_source_missing")));
+        let work_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_items")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let materialization_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM dynamic_materialization_records")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(work_count, 0);
+        assert_eq!(materialization_count, 0);
+    }
+
+    #[tokio::test]
+    async fn agent_context_p017_finalizer_failure_preserves_unresolved_conflict_and_zero_work() {
+        let pool = test_pool().await;
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            crate::event_bus::new_bus(16),
+            WorkQueue::new(pool.clone()),
+        );
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let plan = workflow::compiler::compile(
+            root.join("examples/workflows/full-mvp-live.yaml")
+                .to_str()
+                .unwrap(),
+            root.join("examples/agents/agents.yaml").to_str().unwrap(),
+        )
+        .unwrap();
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.workflow_yaml_path = Some("examples/workflows/full-mvp-live.yaml".into());
+        run.agent_catalog_yaml_path = Some("examples/agents/agents.yaml".into());
+        run.workflow_snapshot_json = Some(plan.workflow_snapshot_json.clone());
+        run.workflow_snapshot_hash = Some(plan.workflow_snapshot_hash.clone());
+        run.catalog_snapshot_json = Some(plan.catalog_snapshot_json.clone());
+        run.catalog_snapshot_hash = Some(plan.catalog_snapshot_hash.clone());
+        let mut oversized = test_idea(run.idea_id);
+        oversized.body = "x".repeat(crate::agent_mission_context::MAX_IDEA_CONTEXT_BYTES + 1);
+        ideas::insert(&pool, &oversized).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+
+        let now = Utc::now();
+        let conflict = WorkflowConflictRecord {
+            conflict_id: uuid::Uuid::new_v4().to_string(),
+            conflict_fingerprint: "p017-agent-context-finalizer-failure".into(),
+            run_id: run_id.to_string(),
+            stage_execution_id: None,
+            lineage_id: None,
+            current_state_id: plan.initial_state.clone(),
+            operator_label: "No declarative transition matched".into(),
+            reason: WorkflowConflictReason::NoDeclarativeTransitionMatched,
+            status: WorkflowConflictStatus::Unresolved,
+            candidate_transitions: Vec::new(),
+            candidate_transition_hash: "sha256:empty".into(),
+            advisory_evidence_refs: Vec::new(),
+            lead_agent_id: None,
+            mediation_record_id: None,
+            created_at: now,
+            updated_at: now,
+            resolved_at: None,
+            superseded_by_conflict_id: None,
+            resolution_record_json: None,
+            terminal_failure_reason: None,
+            diagnostic_redaction_tier: "operator_safe".into(),
+        };
+        workflow_conflicts::upsert_conflict_by_fingerprint(&pool, &conflict)
+            .await
+            .unwrap();
+
+        let error = orchestrator
+            .try_initiate_mediation(&conflict, run_id, &plan.initial_state, now)
+            .await
+            .expect_err("P017 prompt finalizer failure must fail before durable mediation")
+            .to_string();
+        assert!(error.contains("mission_context_input_too_large"));
+        let mediation_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM lead_conflict_mediations")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let work_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_items")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let (status, mediation_record_id): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, mediation_record_id FROM workflow_conflicts WHERE conflict_id = ?1",
+        )
+        .bind(&conflict.conflict_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(mediation_count, 0);
+        assert_eq!(work_count, 0);
+        assert_eq!(status, "unresolved");
+        assert_eq!(mediation_record_id, None);
     }
 
     #[test]

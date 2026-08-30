@@ -19,7 +19,7 @@ impl FixtureDir {
             unique
         ));
         fs::create_dir_all(&path).expect("fixture directory should be created");
-        Self(path)
+        Self(fs::canonicalize(path).expect("fixture directory should have a physical path"))
     }
 
     fn write(&self, relative: &str, content: &str) -> PathBuf {
@@ -875,7 +875,7 @@ fn frozen_v2_rejects_corrupted_bundle_digest() {
 }
 
 #[test]
-fn frozen_catalog_accepts_legacy_absent_and_v1_without_extension() {
+fn frozen_catalog_preserves_inline_legacy_and_rejects_external_without_embedded_bytes() {
     let root = FixtureDir::new();
     root.write(
         "skills/test-skill/SKILL.md",
@@ -898,20 +898,36 @@ fn frozen_catalog_accepts_legacy_absent_and_v1_without_extension() {
                 object.remove("catalog_snapshot_format_version");
             }
         }
-        let compiled = compiler::compile_from_snapshot_json(
+        let external_error = compiler::compile_from_snapshot_json(
             &plan.workflow_snapshot_json,
             &serde_json::to_string(&legacy).expect("legacy snapshot should serialize"),
             path_string(&root.0.join("catalog.yaml")),
         )
-        .expect("supported legacy snapshot should compile");
+        .expect_err("legacy frozen snapshot must not resolve an external skill from live disk");
+        assert!(
+            format!("{external_error:#}")
+                .contains("legacy frozen catalog cannot reference external skill"),
+            "unexpected legacy external error: {external_error:#}"
+        );
+
+        legacy["skills"]["test_skill"] = serde_json::json!({
+            "type": "inline_skill",
+            "description": "Historical inline procedure bytes."
+        });
+        let compiled = compiler::compile_from_snapshot_json(
+            &plan.workflow_snapshot_json,
+            &serde_json::to_string(&legacy).expect("legacy inline snapshot should serialize"),
+            "/must/not/read/catalog.yaml",
+        )
+        .expect("supported inline legacy snapshot should compile without live files");
         assert_eq!(compiled.mission_context_version, None);
         assert!(compiled.states["only_state"]
             .owner
             .resolved_skill
             .as_ref()
-            .expect("legacy external skill should resolve")
+            .expect("legacy inline skill should resolve")
             .injected_content
-            .contains("description: Legacy procedure source."));
+            .contains("Historical inline procedure bytes."));
     }
 }
 
@@ -987,10 +1003,9 @@ fn frozen_catalog_version_extension_matrix_is_exhaustive() {
                 &serde_json::to_string(&candidate).unwrap(),
                 path_string(&root.0.join("catalog.yaml")),
             );
-            let should_pass = matches!(
-                (version, has_extension),
-                (None, false) | (Some(1), false) | (Some(2), true)
-            );
+            // This matrix starts from an external-skill catalog. Legacy inline/builtin
+            // compatibility is covered separately; external bytes require authenticated V2.
+            let should_pass = matches!((version, has_extension), (Some(2), true));
             assert_eq!(
                 result.is_ok(),
                 should_pass,

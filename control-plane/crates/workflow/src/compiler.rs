@@ -228,6 +228,11 @@ fn validate_frozen_catalog_contract(
                 );
             }
             catalog::validate_catalog_snapshot_format_version(catalog)?;
+            if let Some(skill_id) = referenced_external_skills(catalog)?.keys().next() {
+                anyhow::bail!(
+                    "frozen_snapshot_contract_incompatible: legacy frozen catalog cannot reference external skill '{skill_id}' without authenticated embedded bytes"
+                );
+            }
             Ok(CatalogSnapshotContract {
                 skill_bundles: None,
                 mission_context_version: None,
