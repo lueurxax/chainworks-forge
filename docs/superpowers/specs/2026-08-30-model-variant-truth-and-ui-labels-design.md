@@ -626,14 +626,14 @@ first `AgentExecution`. The generation stores:
 
 - provider-configuration contract version;
 - accepted model and effort;
-- provider-session ID and binding fingerprint;
+- opaque provider-session ref ID and binding fingerprint;
 - accepted-at timestamp;
 - bounded `ProviderConfigurationAcceptanceV1` and its SHA-256 digest.
 
 Before a reused prompt, the engine submits
 `provider_configuration.reserve_existing_generation`. Its atomic transaction
 loads the active generation and requires all of these values to match the live
-handle and current request: generation ID, provider-session ID, provider,
+handle and current request: generation ID, opaque provider-session ref ID, provider,
 binding fingerprint, contract version, requested model, requested effort, and a
 still-valid `GenerationOptionSnapshotV1` revision/digest. It also requires the
 configuration owner's active attempt/generation fields to be null, reads
@@ -681,7 +681,7 @@ daemon generation into a newly attached generation. The only supported attach
 seam in this slice is the installed `@agentclientprotocol/codex-acp` 1.1.7 ACP
 contract. Before the source generation can become resumable, the adapter
 persists secret-safe `ProviderSessionResumeContextV1` with schema version,
-context ID, source generation ID, an internal provider-session-row reference,
+context ID, source generation ID, an opaque `provider_session_ref_id`,
 provider/adapter contract version, target binding fingerprint, canonical
 absolute `cwd`, ordered canonical `additionalDirectories`, and an immutable MCP
 descriptor-set reference plus RFC 8785 digest. The descriptor set contains
@@ -720,10 +720,11 @@ option update that cannot be ordered is
 `ACP_P086_RESUME_CONFIGURATION_UNAVAILABLE` and closes the attached generation
 with zero prompt bytes.
 
-Only after this catalog source is established does the manager reserve the
-continuation owner's single active configuration attempt and run the normal
-model-first set/readback sequence against the resumed session, without
-`session/new`. Response-verified equality may create the new generation
+After this catalog source is established, the manager loads the continuation's
+already-reserved active configuration attempt/generation/process intent and
+runs the normal model-first set/readback sequence against the resumed session,
+without `session/new`. It never allocates or substitutes an owner tuple after
+launch. Response-verified equality may create the new generation
 acceptance and owner receipt with
 `acceptance_source = attached_session_reverification`. The attach receipt,
 active attempt, new generation, process binding, acceptance, option snapshot,
@@ -832,12 +833,13 @@ state is closed to `reserved`, `configuring`, `configured`, `prompt_pending`,
 retry reducer below; the last seven values are terminal.
 
 At claim, `run_steward_analysis_with_executor` computes all deterministic
-analysis inputs and, in one transaction, inserts the `steward_analyses` row as
-`running`, inserts both lane rows as `reserved`, and binds the already claimed
-StewardAnalysis work item. That transaction also allocates the system lane's
-turn `0`; the auditor lane remains turnless until a validated system health
-report permits its own Class A initial claim, which allocates auditor turn `0`.
-Provider calls happen only after the corresponding turn commit. Final
+analysis inputs and calls the sealed Class A `steward_analysis.claim`. Its one
+transaction inserts the `steward_analyses` row as `running`, inserts both lane
+rows as `reserved`, binds the already claimed StewardAnalysis work item, and
+allocates only the system lane's turn `0`. The auditor lane remains turnless
+until a validated system health report permits the sealed Class A
+`steward_auditor_lane.activate`, which allocates only auditor turn `0`.
+Provider calls happen only after the corresponding operation commit. Final
 settlement updates that analysis row instead of inserting it late. Therefore
 `analysis_id` and lane ownership survive a crash before either provider call.
 
@@ -874,8 +876,9 @@ skipped lane is eligible for startup requeue. Cancellation, system failure,
 auditor failure, missing output, and crash after either lane settlement each
 have an executable row fixture.
 
-The only automatic Steward replay is a zero-send infrastructure retry. Initial
-claim allocates turn index `0`; its permit requires
+The only automatic Steward replay is a zero-send infrastructure retry. The two
+sealed initial operations above allocate their respective turn index `0`; each
+permit requires
 `zero_send_retries_consumed = 0`, exactly that active turn, and no earlier turn.
 An eligible typed infrastructure failure leaves turn `0` permanently
 `not_started` with its non-null failure code, appends matching
@@ -883,7 +886,7 @@ An eligible typed infrastructure failure leaves turn `0` permanently
 or never launched, and moves the lane to `zero_send_retry_pending`. It does not
 return a terminal lane directly to `reserved`.
 
-One Class A `steward_lane.claim_or_retry` transaction may then CAS
+One Class A `steward_lane.retry_zero_send` transaction may then CAS
 `zero_send_retries_consumed: 0 -> 1`, allocate only turn index `1`, and move the
 lane to `reserved`. After that commit, the common
 `provider_configuration.reserve_new_generation` operation separately allocates
@@ -1078,8 +1081,11 @@ minimum operation registry is normative:
 | `provider_generation_owner.settle` | `critical_barrier`; generation + owner + turn | admit terminal settlement |
 | `p079_repair.admit_or_retry` | `critical_barrier`; operation ID + attempt index | deny new admission |
 | `p079_repair.settle_validation` | `critical_barrier`; operation ID + attempt index + validation-evidence digest | admit terminal settlement |
+| `p079_repair.complete_artifact_settlement` | `critical_barrier`; artifact-settlement intent ID + candidate digest | admit terminal settlement |
 | `p086_continuation.admit` | `operator_command` for operator requests, otherwise `critical_barrier`; command journal ID | deny new admission |
-| `steward_lane.claim_or_retry` | `critical_barrier`; analysis/lane + retry index | deny new admission |
+| `steward_analysis.claim` | `critical_barrier`; analysis ID + claimed work-item ID | deny new admission |
+| `steward_auditor_lane.activate` | `critical_barrier`; analysis/auditor lane + health-report digest | deny new admission |
+| `steward_lane.retry_zero_send` | `critical_barrier`; analysis/lane + retry index 1 | deny new admission |
 | `steward_lane.settle` | `critical_barrier`; analysis/lane + terminal digest | admit terminal settlement |
 | `runtime_mutation_fence.persist_fatal` | `safety_fence`; next epoch + fatal reason digest | admit safety settlement only |
 
@@ -1096,8 +1102,24 @@ CREATE TABLE class_a_operation_results_v1 (
   result_schema_version TEXT NOT NULL,
   result_json TEXT NOT NULL CHECK (length(result_json) <= 16384),
   result_sha256 TEXT NOT NULL CHECK (length(result_sha256) = 64),
+  membership_count INTEGER NOT NULL CHECK (membership_count >= 0),
+  membership_sha256 TEXT NOT NULL CHECK (length(membership_sha256) = 64),
   committed_at TEXT NOT NULL,
   PRIMARY KEY (operation_name, journal_key)
+);
+
+CREATE TABLE class_a_operation_result_members_v1 (
+  operation_name TEXT NOT NULL,
+  journal_key TEXT NOT NULL,
+  member_ordinal INTEGER NOT NULL CHECK (member_ordinal >= 0),
+  member_kind TEXT NOT NULL,
+  natural_owner_id TEXT NOT NULL CHECK (length(natural_owner_id) <= 512),
+  member_sha256 TEXT NOT NULL CHECK (length(member_sha256) = 64),
+  PRIMARY KEY (operation_name, journal_key, member_ordinal),
+  UNIQUE (operation_name, journal_key, member_kind, natural_owner_id),
+  FOREIGN KEY (operation_name, journal_key)
+    REFERENCES class_a_operation_results_v1(operation_name, journal_key)
+    DEFERRABLE INITIALLY DEFERRED
 );
 ```
 
@@ -1113,6 +1135,21 @@ returns `Conflict`, and absence permits the mutation. It inserts the result row
 in the same transaction as all natural rows. Decode, schema, digest, or
 natural-row mismatch is fatal evidence corruption, never `AlreadyMatching`.
 
+Result JSON contains only fixed-size outcome fields and a membership summary;
+it never embeds an unbounded collateral-owner array. For any operation with a
+variable owner set, the transaction canonical-sorts `(member_kind,
+natural_owner_id)`, inserts one child membership row per owner, and stores count
+plus SHA-256 over the common-codec ordered member tuples in the parent result.
+The registered deterministic SQLite aggregate
+`chainworks_membership_sha256(kind, id, ordinal)` is available on every writer
+connection; the parent insert trigger requires exact contiguous ordinals,
+count, and aggregate digest before commit. Empty membership uses count zero and
+the frozen empty-list digest. Replay streams child rows in ordinal order,
+recomputes count/digest, and then verifies every natural owner row. A missing,
+duplicate, reordered, truncated, or extra member is fatal evidence corruption.
+The 16 KiB bound therefore applies only to the fixed parent result, not owner
+cardinality; a 512-owner settlement and restart replay are retained fixtures.
+
 The exhaustive natural-result mapping is:
 
 | Registered operation | Result codec | Natural rows cross-checked on replay |
@@ -1121,13 +1158,16 @@ The exhaustive natural-result mapping is:
 | configuration success/failure | `ProviderConfigurationSettlementResultV1` | owner active pair/state/pointer, generation, receipt or failure row |
 | configuration invalidation | `ProviderConfigurationInvalidationResultV1` | generation snapshot state, append-only invalidation, affected owner projections |
 | prompt prepare/sent/unknown | `PromptTurnCasResultV1` | prompt turn plus exact owner mirror/quarantine rows |
-| generation-owner settle | `GenerationOwnerSettlementResultV1` | generation binding, terminal receipt link, active owner and every collateral owner row |
+| generation-owner settle | `GenerationOwnerSettlementResultV1` plus membership count/digest | generation binding, terminal receipt link, active owner and every collateral owner child row |
 | P079 admit/retry | `P079AttemptAdmissionResultV1` | operation, guarded slot, lease, work item, turn, attempt-link, and fallback child/parent link when applicable |
-| P079 post-validation settle | `P079PostValidationSettlementResultV1` | repair item, lease, operation, repair event, parent execution, validated/rejected artifact evidence, and transition hold/release |
-| P086 admit | `P086ContinuationAdmissionResultV1` | existing command journal, continuation, work item, turn, and provider-send side effect |
-| Steward claim/retry | `StewardLaneClaimResultV1` | analysis, lane/retry counter, work item, and turn; no generation/configuration attempt |
+| P079 validation prepare | `P079PostValidationSettlementResultV1` | repair item, lease, operation pending state, repair event, blocked parent/transition, and prepared artifact intent |
+| P079 artifact completion | `P079ArtifactCompletionResultV1` | file-committed/completed intent, settled operation/event, parent result, and transition hold/release |
+| P086 admit | `P086ContinuationAdmissionResultV1` | command journal, continuation/deadline/context, work item, turn, provider-send side effect, active attempt, pre-session generation, process intent, and generation-owner binding |
+| Steward analysis claim | `StewardAnalysisClaimResultV1` | analysis, both lane rows, claimed work item, and system turn 0; no generation/configuration attempt |
+| Steward auditor activation | `StewardAuditorActivationResultV1` | validated health-report prerequisite, auditor lane, and auditor turn 0 |
+| Steward zero-send retry | `StewardLaneRetryResultV1` | lane retry counter, terminal turn 0 evidence, and new turn 1; no generation/configuration attempt |
 | Steward settle | `StewardLaneSettlementResultV1` | both lane states, analysis reduction, work-item terminal state, and terminal artifacts |
-| fatal mutation fence | `RuntimeMutationFenceResultV1` | singleton durable epoch/state/reason row and in-memory commit-barrier epoch |
+| fatal mutation fence | `RuntimeMutationFenceResultV1` | append-only fatal-cycle row plus singleton current epoch/state/cycle pointer |
 
 Every codec contains its natural IDs and closed outcome; no generic string
 result is accepted. The registry generator requires exactly one mapping row and
@@ -1199,20 +1239,37 @@ prompt.
 All runtime mutations, not only newly added operations, move behind one
 DB-owned `RuntimeMutationFenceV1` and `DbWriter`. Migration 100 creates singleton
 `runtime_mutation_fence(singleton_id = 1, epoch, state, fatal_reason_sha256,
-updated_at)`, where state is `open|fatal`. The db crate owns the matching
-in-memory epoch plus one commit-barrier mutex. Each queued mutation captures an
-open epoch, verifies it before `BEGIN IMMEDIATE`, and acquires the commit barrier
-before its final epoch check and `COMMIT`.
+current_fatal_cycle_id, updated_at)`, where state is `open|fatal`, plus immutable
+`runtime_fatal_cycles_v1(cycle_id, process_boot_id, open_epoch, fatal_epoch,
+fatal_reason_sha256, persisted_at)` and append-only
+`runtime_fatal_cycle_reconciliations_v1(cycle_id, reopened_epoch,
+reconciled_at)`. Cycle ID is common-codec identity over process boot ID and
+fatal epoch; cycle rows reject update/delete and one cycle has at most one
+reconciliation row. The db crate owns the matching in-memory epoch plus one
+commit-barrier mutex.
+
+The global runtime writer order is exactly `commit barrier -> BEGIN IMMEDIATE ->
+domain/result writes -> COMMIT/ROLLBACK -> release barrier`. Each queued mutation
+captures an open epoch before waiting, acquires the barrier before any SQLite
+write transaction or write lock, rechecks that epoch and open state, and retains
+the barrier through commit or rollback. No runtime path may acquire a SQLite
+write lock and then wait for the barrier. Read-only preparation happens before
+the barrier and is revalidated inside the transaction. Startup/preflight writes
+run before runtime publication under `PreflightLockGuard` and never race this
+order.
 
 Daemon owns exactly one `FirstFatalCoordinator`; no crate receives separate
 mutation-fence or prompt-fence close authority. Its sole mutation method
 `close_first_fatal(FatalServeReasonV1)` acquires the commit barrier and a
 first-reason latch, ignores a later reason, increments the in-memory epoch,
 closes both `RuntimeMutationFenceV1` and `PromptAdmissionFence`, and invokes the
-private shutdown-proof `runtime_mutation_fence.persist_fatal` transaction while
-still owning fatal linearization. That transaction CAS-persists the exact next
-epoch/reason and is the sole write admitted after closure. Only after the durable
-row is readable does the coordinator disable the ordinary writer queue and
+private shutdown-proof `runtime_mutation_fence.persist_fatal` transaction on a
+dedicated connection while still owning fatal linearization. Because every
+ordinary writer releases its SQLite transaction before the coordinator can own
+the barrier, this fatal-only transaction cannot invert lock order. It inserts
+the immutable cycle/result rows and CAS-persists the singleton's exact next
+epoch/reason/cycle pointer; it is the sole write admitted after closure. Only
+after both rows and the Class A result are readable does the coordinator disable the ordinary writer queue and
 publish the failed-serve watch notification. Therefore a commit holding the
 barrier linearizes before fatal; `close_first_fatal` holding it first forces
 every old-epoch transaction to roll back, and prompt admission closes at the
@@ -1221,11 +1278,16 @@ same point. There is no second compare-exchange linearization point.
 If fatal persistence fails, both in-memory fences and the first-reason latch
 remain closed/frozen, no watch success is claimed, and daemon exits with the
 fatal bootstrap code; startup derives fatal state from unresolved authority
-before opening any consumer. Clean startup reconciliation increments the
-durable epoch and reopens both fences before producing
-`PreflightCompleteToken`; no running process reopens them. Concurrency fixtures
-race every fatal source and paused-before-commit writer, require one immutable
-reason/epoch, and prove persist-before-notify ordering.
+before opening any consumer. Clean startup reconciliation verifies the exact
+fatal-cycle result by immutable cycle ID rather than expecting the singleton to
+remain at that old epoch, inserts its one reconciliation row, advances the
+singleton to a new open epoch with null cycle/reason, and only then produces
+`PreflightCompleteToken`; no running process reopens it. A later process may
+therefore create a distinct fatal cycle without invalidating replay of the
+first. Concurrency fixtures race every fatal source and a writer paused before
+barrier/BEGIN/commit, require one immutable reason per cycle, prove
+persist-before-notify ordering, and run two complete fatal/restart/reopen cycles
+without result mismatch or deadlock.
 
 A `syn` plus SQL-call-site inventory classifies every production mutation
 producer: GraphQL and MCP commands, scheduler/work-queue claim/requeue,
@@ -1377,7 +1439,8 @@ prompt_owner_kind <> 'steward_agent_lane' OR (
 )
 ```
 
-`PromptTurnAllocator::reserve_tx` is the only constructor. Claim/start inserts
+`PromptTurnAllocator::reserve_tx` is the only low-level constructor, is
+crate-private, and accepts a sealed owner-specific allocation permit. Claim/start inserts
 `original/0`, sets `next_prompt_turn_index = 1`, and creates the execution in one
 transaction for ordinary, P017 mediation-owned, and P058 escalation-owned
 AgentExecutions. It copy-validates and copies the already-enqueued occurrence
@@ -1386,7 +1449,14 @@ escalation ledger. Every later run-bound prompt atomically reads/increments that
 counter, so P079 and P086 cannot both claim index 1. A Steward invocation uses
 the durable `steward_agent_lanes.id`, reads/increments that lane's
 `next_prompt_turn_index`, inserts `steward_analysis/<allocated index>`, and never
-allocates from an `AgentExecution`. Exact prompt
+allocates from an `AgentExecution`. The exact Steward call sites are closed:
+`steward_analysis.claim` alone constructs the system lane and its turn `0`;
+`steward_auditor_lane.activate` alone constructs auditor turn `0` after the
+validated prerequisite; and `steward_lane.retry_zero_send` alone constructs turn
+`1` after its durable zero-send retry CAS. The executor receives and loads an
+existing turn ID and has no allocation permit. Generic work claim, startup
+requeue, configuration reservation, and prompt execution cannot create a turn.
+Exact prompt
 kinds are `original`, `code_writer_completion_repair`,
 `output_contract_repair`, `work_continuation_live_handle`,
 `work_continuation_resurrection`, `work_continuation_output_only`, and
@@ -1461,6 +1531,17 @@ together. Creating the operation consumes exactly one selected budget; a repair
 sets only `repair_budget_consumed`, a fallback only
 `fallback_budget_consumed`, and the opposite flag remains false.
 
+Logical admission identity is `(repair_event_id, selected_kind)`, not the
+caller-pre-generated operation ID. `p079_repair.admit_or_retry` computes
+`admission_sha256` over the complete immutable parent/kind/policy intent and
+uses one immediate transaction to insert-or-load the unique tuple before
+changing either compatibility budget flag. A concurrent insert with another
+operation ID loses the unique constraint, loads the winner, and returns that
+same operation/attempt only when the admission digest matches; another digest
+is `Conflict`. Budget consumption, operation insert, attempt-0 slot, and the
+compatibility event flag commit once. Direct-SQL and two-writer fixtures prove
+one surviving operation and one budget transition for 100 conflicting IDs.
+
 Migration 100 renames the lease and fallback-link tables created by immutable
 migration 095 to private `*_v1_source` names, creates the following canonical
 tables, copies and verifies every source row, then drops the source tables only
@@ -1479,6 +1560,7 @@ CREATE TABLE output_contract_repair_operations_v1 (
   parent_agent_execution_id TEXT NOT NULL REFERENCES agent_executions(id),
   parent_task_occurrence_id TEXT,
   selected_kind TEXT NOT NULL CHECK (selected_kind IN ('repair','fallback')),
+  admission_sha256 TEXT NOT NULL CHECK (length(admission_sha256) = 64),
   repair_budget_consumed INTEGER NOT NULL CHECK (repair_budget_consumed IN (0,1)),
   fallback_budget_consumed INTEGER NOT NULL CHECK (fallback_budget_consumed IN (0,1)),
   budget_provenance TEXT NOT NULL CHECK (budget_provenance IN (
@@ -1495,7 +1577,9 @@ CREATE TABLE output_contract_repair_operations_v1 (
     CHECK (next_attempt_index >= 0 AND
            next_attempt_index <= max_infrastructure_attempts),
   operation_state TEXT NOT NULL
-    CHECK (operation_state IN ('active','settled','legacy_unverified')),
+    CHECK (operation_state IN (
+      'active','artifact_settlement_pending','settled','legacy_unverified'
+    )),
   terminal_result TEXT CHECK (terminal_result IN (
     'accepted','rejected_invalid','skipped_ineligible','unavailable',
     'failed_transport','deadline_exceeded','cancelled','superseded_ignored',
@@ -1504,6 +1588,7 @@ CREATE TABLE output_contract_repair_operations_v1 (
   )),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  UNIQUE (repair_event_id, selected_kind),
   CHECK ((selected_kind = 'repair' AND fallback_budget_consumed = 0 AND
           (repair_budget_consumed = 1 OR
            (operation_state = 'legacy_unverified' AND
@@ -1527,6 +1612,10 @@ CREATE TABLE output_contract_repair_operations_v1 (
   CHECK ((budget_provenance = 'legacy_unverified') =
          (operation_state = 'legacy_unverified')),
   CHECK ((operation_state = 'active' AND terminal_result IS NULL) OR
+         (operation_state = 'artifact_settlement_pending' AND
+          terminal_result IS NOT NULL AND terminal_result IN (
+            'accepted','rejected_invalid','cancelled','superseded_ignored'
+          )) OR
          (operation_state = 'settled' AND terminal_result IS NOT NULL AND
           terminal_result <> 'legacy_unverified') OR
          (operation_state = 'legacy_unverified' AND
@@ -1666,7 +1755,33 @@ CREATE TABLE output_contract_repair_fallback_parent_links (
   FOREIGN KEY (operation_id, attempt_index, lease_key)
     REFERENCES output_contract_repair_leases(
       operation_id, attempt_index, lease_key
-    )
+  )
+);
+
+CREATE TABLE p079_artifact_settlement_intents_v1 (
+  intent_id TEXT PRIMARY KEY,
+  operation_id TEXT NOT NULL UNIQUE
+    REFERENCES output_contract_repair_operations_v1(operation_id),
+  attempt_index INTEGER NOT NULL,
+  lease_key TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (outcome IN (
+    'accepted','rejected_invalid','cancelled','superseded_ignored'
+  )),
+  candidate_sha256 TEXT NOT NULL CHECK (length(candidate_sha256) = 64),
+  candidate_byte_count INTEGER NOT NULL CHECK (candidate_byte_count >= 0),
+  staging_relative_path TEXT NOT NULL,
+  destination_relative_path TEXT NOT NULL,
+  destination_kind TEXT NOT NULL CHECK (destination_kind IN ('published','quarantine')),
+  state TEXT NOT NULL CHECK (state IN ('prepared','file_committed','completed')),
+  prepared_at TEXT NOT NULL,
+  file_committed_at TEXT,
+  completed_at TEXT,
+  UNIQUE (operation_id, attempt_index, lease_key),
+  FOREIGN KEY (operation_id, attempt_index, lease_key)
+    REFERENCES output_contract_repair_leases(operation_id, attempt_index, lease_key),
+  CHECK ((state = 'prepared' AND file_committed_at IS NULL AND completed_at IS NULL) OR
+         (state = 'file_committed' AND file_committed_at IS NOT NULL AND completed_at IS NULL) OR
+         (state = 'completed' AND file_committed_at IS NOT NULL AND completed_at IS NOT NULL))
 );
 
 CREATE TRIGGER p079_attempt_slot_before_insert
@@ -1706,12 +1821,18 @@ BEGIN
   ) THEN RAISE(ABORT, 'p079_active_lease_requires_active_operation') END;
 END;
 
-CREATE TRIGGER p079_lease_cannot_reactivate
-BEFORE UPDATE OF lease_state ON output_contract_repair_leases
+CREATE TRIGGER p079_terminal_lease_is_immutable
+BEFORE UPDATE ON output_contract_repair_leases
 WHEN OLD.lease_state IN ('dispatch_unknown','settled','legacy_unverified')
- AND NEW.lease_state IN ('reserved','dispatch_pending','prompt_sent')
 BEGIN
   SELECT RAISE(ABORT, 'p079_terminal_lease_is_immutable');
+END;
+
+CREATE TRIGGER p079_terminal_operation_is_immutable
+BEFORE UPDATE ON output_contract_repair_operations_v1
+WHEN OLD.operation_state IN ('settled','legacy_unverified')
+BEGIN
+  SELECT RAISE(ABORT, 'p079_terminal_operation_is_immutable');
 END;
 
 CREATE TRIGGER p079_operation_terminal_guard
@@ -1744,6 +1865,31 @@ BEGIN
        AND a.link_state = 'linked_v2'
        AND w.status NOT IN ('completed','failed','cancelled')
   ) THEN RAISE(ABORT, 'p079_operation_has_active_work_item') END;
+  SELECT CASE WHEN NEW.terminal_result IN (
+    'accepted','rejected_invalid','cancelled','superseded_ignored'
+  ) AND NEW.operation_state <> 'artifact_settlement_pending'
+    THEN RAISE(ABORT, 'p079_artifact_outcome_requires_pending_intent') END;
+  SELECT CASE WHEN NEW.operation_state = 'artifact_settlement_pending'
+    AND NOT EXISTS (
+      SELECT 1 FROM p079_artifact_settlement_intents_v1 i
+       WHERE i.operation_id = NEW.operation_id
+         AND i.outcome = NEW.terminal_result
+         AND i.state = 'prepared'
+    ) THEN RAISE(ABORT, 'p079_artifact_intent_missing') END;
+END;
+
+CREATE TRIGGER p079_artifact_pending_finalize_guard
+BEFORE UPDATE OF operation_state ON output_contract_repair_operations_v1
+WHEN OLD.operation_state = 'artifact_settlement_pending'
+BEGIN
+  SELECT CASE WHEN NEW.operation_state <> 'settled'
+    OR NEW.terminal_result <> OLD.terminal_result
+    OR NOT EXISTS (
+      SELECT 1 FROM p079_artifact_settlement_intents_v1 i
+       WHERE i.operation_id = NEW.operation_id
+         AND i.outcome = OLD.terminal_result
+         AND i.state = 'file_committed'
+    ) THEN RAISE(ABORT, 'p079_artifact_settlement_not_committed') END;
 END;
 ```
 
@@ -1768,10 +1914,12 @@ or `dispatch_unknown` leases. These generated clauses are byte-compared to the
 checked-in migration so the abbreviated SQL above cannot drift from the final
 trigger body.
 
-The operation update guard rejects changes to identity, selected kind, either
-budget flag, provenance, source schema/key, or attempt limit. It allows exactly
-two update shapes: active-to-terminal with unchanged `next_attempt_index`, or
-same-state `next_attempt_index = old + 1` with all other semantic fields
+The operation update guard rejects changes to identity, admission digest,
+selected kind, either budget flag, provenance, source schema/key, or attempt
+limit. It allows exactly four update shapes: active-to-terminal/non-artifact
+settlement; active-to-`artifact_settlement_pending` with a matching prepared
+intent; pending-to-settled with matching file-committed intent and unchanged
+result; or same-state active `next_attempt_index = old + 1` with all other semantic fields
 unchanged and an attempt-slot row at `(operation_id, old index)`. The latter is
 performed only by `p079_attempt_slot_advance`; a direct increment without that
 slot fails. Slot insert checks the old index and attempt cap before its guarded
@@ -1813,32 +1961,58 @@ delivery moves both to `dispatch_unknown` and immediately runs the typed unknown
 settlement; no active item survives that terminal lease.
 
 Provider output itself is never allowed to close only the lease. After bounded
-artifact validation, the registered Class A
-`p079_repair.settle_validation` operation is the sole terminal reducer. Its
-request carries operation/attempt/lease/item/turn IDs, the closed validation
-outcome, candidate-artifact digest, validator-version digest, and canonical
-result digest. In one transaction it verifies the turn is `prompt_sent`, writes
-the immutable validation evidence, terminalizes the `OutputContractRepair` work
-item, moves the lease to `settled`, updates the repair event, settles or holds
-the parent execution and transition, commits or quarantines the candidate
-artifact, and only then moves the logical operation to `settled`. The exact
-matrix is:
+artifact validation, runtime first writes the bounded candidate to a
+runtime-owned staging directory using dirfd-relative no-symlink traversal,
+enforces the output byte cap, computes its digest while writing, fsyncs the file,
+and fsyncs the staging directory. No database row yet claims publication.
 
-| Validation outcome | Item / lease / operation | Parent and artifact |
+The registered Class A `p079_repair.settle_validation` operation is the sole
+validation prepare reducer. Its request carries operation/attempt/lease/item/
+turn IDs, closed validation outcome, candidate digest/byte count/staging name,
+validator-version digest, and canonical result digest. For an artifact-bearing
+outcome, one transaction verifies the `prompt_sent` turn and staged descriptor,
+writes immutable validation evidence, terminalizes the item and lease, retains
+the parent/transition hold, inserts one `prepared` artifact intent, and moves
+the operation to `artifact_settlement_pending` with its terminal result. It does
+not claim the file published/quarantined and does not release the parent.
+`unavailable` or `failed_transport` without a candidate uses the ordinary
+direct DB terminal settlement and keeps the parent blocked.
+
+A single daemon-owned `P079ArtifactSettlementReconciler` owns prepared intents.
+It opens the already-validated staging and destination roots by directory FD,
+rejects symlinks/path traversal, rechecks bounded byte count and SHA-256, then
+uses an atomic same-filesystem rename to the unique digest-addressed publish or
+quarantine destination and fsyncs the destination directory. If the staging
+file is absent but the destination exists with the exact digest/size, rename is
+already complete; a different destination digest is fatal evidence corruption.
+Only after durable rename does registered Class A
+`p079_repair.complete_artifact_settlement` atomically move the intent through
+`file_committed` to `completed`, move the operation to `settled`, finalize the
+repair event/parent result, and release the matching transition only for
+`accepted`. The completed DB intent is the durable completion marker.
+
+The exact reduction is:
+
+| Validation outcome | Prepare transaction | File/reconciliation + completion |
 |---|---|---|
-| `accepted` | `completed` / `settled(accepted)` / `settled(accepted)` | atomically publish the validated artifact, mark parent output contract repaired, release only the matching transition hold |
-| `rejected_invalid` | `failed` / `settled(rejected_invalid)` / `settled(rejected_invalid)` | retain parent failure, quarantine candidate by digest, keep stage/run blocked |
-| `unavailable` or `failed_transport` after a sent prompt | `failed` / matching settled result / matching settled result | retain parent failure and candidate evidence, keep blocked; no infrastructure retry |
-| cancellation or supersession after validation starts | `cancelled` / matching settled result / matching settled result | preserve terminal parent truth, quarantine any candidate, apply only the existing scoped cancellation/supersession reducer |
+| `accepted` | item `completed`; lease `settled(accepted)`; operation `artifact_settlement_pending(accepted)`; parent remains held; publish intent prepared | rename/fsync to canonical artifact path, complete intent/operation/event, mark parent repaired, release only matching transition |
+| `rejected_invalid` | item `failed`; lease `settled(rejected_invalid)`; operation pending; parent failure/hold retained; quarantine intent prepared | rename/fsync to digest quarantine, complete intent/operation/event, keep stage/run blocked |
+| `cancelled` or `superseded_ignored` with candidate | item cancelled; matching terminal lease; operation pending; parent terminal truth retained; quarantine intent prepared | rename/fsync to digest quarantine, complete intent/operation/event, never release transition |
+| `unavailable` or `failed_transport` without candidate | item/lease/operation settle in one DB transaction | no filesystem action; parent remains blocked and evidence is retained |
 
-Fallback-child terminal output uses the same operation-level terminality rules
-through its existing P079 fallback result reducer; it must close the child
-InvokeAgent item and lease before operation settlement. Idempotent replay with
-the same validation digest returns the complete stored settlement; another
-digest is `Conflict`. Fault injection pauses before/after every row mutation and
-commit/ack, then proves same-process and restart convergence with one artifact
-publication/quarantine and no active item, lease, or operation. Database
-terminal guards reject every partial direct-SQL ordering.
+Fallback-child terminal output uses the same operation-level terminality and
+artifact-intent protocol through its existing P079 fallback result reducer; it
+must close the child InvokeAgent item and lease before pending settlement.
+Idempotent replay with the same validation digest returns the complete stored
+prepare/completion state; another digest is `Conflict`. Startup scans every
+`prepared|file_committed` intent before consumers and executes the same
+idempotent reconciliation. Kill injection covers candidate write, file fsync,
+staging-dir fsync, prepare DB commit/ack, pre/post rename, destination-dir fsync,
+completion DB commit/ack, and restart. Every case converges to one accepted or
+quarantined digest, one completed marker, no active item/lease/operation, and no
+premature parent release. Orphan staged files with no intent are never published
+and are removed only by bounded age/digest cleanup. Database terminal guards
+reject every partial direct-SQL ordering.
 
 Budget consumption is never refunded. A TTL-expired `reserved` attempt with
 turn still `not_started` terminalizes its linked item and settles that attempt
@@ -1876,7 +2050,13 @@ source rows does not mean forcing them through new foreign keys. Migration 100
 creates append-only `p079_migration_quarantine_v1` with primary key
 `(upgrade_id, source_table, source_primary_key)`, source row count/ordinal,
 duplicate-key-rejected `sqlite_typed_row_v1` JSON, its SHA-256, closed reason
-`dangling_run|dangling_stage|dangling_parent_execution|dangling_repair_event|dangling_lease|ambiguous_owner|contradictory_budget`, nullable parsed correlation IDs, active/terminal source classification, and timestamp. The typed envelope records every source column in declaration order as
+`dangling_run`, `dangling_stage`, `dangling_parent_execution`,
+`dangling_fallback_child`, `dangling_repair_event`, `dangling_lease`,
+`ambiguous_owner`, or `contradictory_budget`,
+nullable parsed correlation IDs, active/terminal source classification, and
+timestamp. `dangling_fallback_child` is used when a migration-095 fallback row's
+child execution is absent or does not match its lease/parent tuple; it is never
+collapsed into parent ambiguity. The typed envelope records every source column in declaration order as
 `{name, sqlite_type, value}`; text bytes are UTF-8, integers use canonical
 decimal, null is tagged, and blobs are base64. The quarantine table has no FK to
 any potentially dangling source identity. It is writeable only by
@@ -1886,7 +2066,8 @@ Only rows whose mandatory run, stage, event, parent execution, lease, and
 fallback-child relationships all validate may create canonical operation,
 slot, lease, link, or fallback-parent rows. Every other source row is copied to
 quarantine and digest-verified before the source table can be dropped. Final
-accounting requires, per source table,
+accounting requires, independently for the lease source and fallback-parent
+source tables,
 `source_count = canonical_source_count + quarantine_count`, disjoint source
 keys, and byte-equal source-envelope digests. An active quarantined row keeps
 bootstrap failed with its sanitized reason; a terminal quarantined row is
@@ -1982,10 +2163,25 @@ receipt evidence, and assert the table above byte-for-byte.
 
 ### P086 atomic owner reservation
 
+Migration 100 rebuilds `provider_sessions` around an opaque immutable
+`provider_session_ref_id` primary key and moves the provider's raw wire session
+ID into private one-to-one `provider_session_private_ids`. Fresh refs are random
+UUIDv4 values with `psref_` prefix; legacy migration checkpoints one random ref
+per old raw-PK row before rebuilding every FK, so restart reuses the stored ref
+instead of deriving it from secret bytes. The private table stores the raw wire
+ID only for ACP resume, is reachable solely through a crate-private
+`ProviderSessionSecretResolver` capability, and is excluded from generic repos,
+read models, debug derives, tracing, artifacts, JSON codecs, and northbound
+schemas. The resolver returns a zeroizing buffer scoped to one
+`session/resume` serialization. New acceptance/receipt authority JSON uses
+`provider_session_ref_id`; the compatibility `provider_session_id` key in new
+runtime-receipt-v1 rows also carries only the opaque ref. Historical frozen
+runtime-receipt bytes remain unchanged.
+
 Migration 100 creates append-only `provider_session_resume_contexts` with
 primary key `context_id`, literal schema version
 `provider_session_resume_context_v1`, unique source-generation FK, internal
-provider-session-row FK, provider, adapter-contract version, target-binding
+opaque provider-session-ref FK, provider, adapter-contract version, target-binding
 fingerprint, canonical cwd, duplicate-free ordered additional-directories JSON,
 immutable MCP descriptor-set reference/digest, canonical context JSON/digest,
 and creation time. Context JSON contains the provider-session row reference but
@@ -1996,27 +2192,45 @@ are rejected. `agent_work_continuations` adds nullable
 both non-null and matching; live-handle mode requires both null; output-only
 requires null until its one-way resurrection conversion atomically installs the
 pair. Cross-generation, cross-provider, changed-root, changed-MCP, and
-current-workspace recomputation attempts fail before launch.
+current-workspace recomputation attempts fail before launch. Sentinel fixtures
+place a distinctive raw session ID in the private map and prove it is absent
+from context/acceptance/receipt digests, GraphQL/MCP/report payloads, logs,
+errors, artifacts, snapshots, and generated test diagnostics.
 
-P086 admission pre-generates the continuation and ProcessContinuation work-item
-IDs. One registered Class A `p086_continuation.admit` DbWriter operation performs
-command idempotency and policy checks and inserts the command-journal row,
-continuation, Pending work item, allocated `not_started` turn, and
-`provider_send` side-effect row in `reserved`. The work item stores non-null
-run/stage owner fields. A transaction-body error rolls back all five records;
-an acknowledged accepted response therefore always names a claimable work item
-and turn. A timeout after transaction start returns `Unknown` and reconciles by
-the command-journal ID before any response or claim. Identical command replay
-returns the committed IDs and cannot enqueue a second item.
+P086 admission pre-generates the continuation, ProcessContinuation work-item,
+prompt-turn, attached-generation, process-intent, and owner-binding IDs and
+computes immutable `attachment_deadline_at = admitted_at + 30 seconds`. One
+registered Class A `p086_continuation.admit` DbWriter operation performs command
+idempotency and policy checks and, for resurrection, atomically inserts the
+command-journal row, continuation with deadline/context tuple, Pending work
+item, allocated `not_started` turn, `provider_send` side-effect row in
+`reserved`, active configuration attempt `0`, pre-session generation, process
+binding in `spawn_pending` with launch nonce but no PID, and generation-owner
+binding in `admitted`. The owner next-attempt allocator advances to `1`; current
+receipt remains null and evidence is `pending`. The work item stores non-null
+run/stage owner fields. A transaction-body error rolls back the entire tuple;
+an acknowledged accepted response therefore always names one claimable item,
+turn, generation, process intent, and absolute deadline. A timeout after
+transaction start returns `Unknown` and reconciles by command-journal ID before
+any response, claim, broker call, or spawn. Identical replay returns every
+stored ID/deadline and cannot enqueue or allocate again.
 
-The inserted continuation initializes its own configuration allocator to zero,
-active attempt/generation and current receipt to null, and evidence to `pending`
-for exact Codex resurrection or `not_applicable` for a provider without this
-contract. Live-handle continuation may project its already validated active
-generation only after an owner-matching receipt is copied into a new
-continuation-owned attempt; it never points directly at the target execution's
-receipt. These columns and their FKs are part of the same five-record admission
-transaction and idempotent replay comparison.
+Broker/toolchain acquisition, process spawn/barrier, `initialize`,
+`session/resume`, configuration reverification, receipt persistence, and
+zero-send failure settlement all consume the remaining duration of that same
+absolute deadline; no phase resets or starts it. Expiry before launch settles
+the intent as never-launched. Expiry after launch performs identity-safe reap
+and writes the binding's configuration-failure ref. Startup selects every
+nonterminal admitted tuple by deadline/phase and reaches the same result.
+
+Live-handle continuation uses the same admission operation but binds its
+validated existing generation and derives a continuation-owned attempt/receipt
+without allocating a process intent. Output-only begins in that branch; its
+one-way conversion to resurrection is a separate Class A CAS that, before any
+broker I/O, installs the context ID/digest, a fresh absolute deadline, active
+attempt/pre-session generation, spawn-pending process intent, and admitted
+binding atomically. Neither path points at the target execution's receipt or
+allocates after provider launch.
 
 The same migration fully rebuilds `agent_external_side_effect_ledger`. It adds
 nullable `prompt_turn_id REFERENCES provider_prompt_turns(id)` and replaces the
@@ -2123,22 +2337,32 @@ fresh-session fallback rejection.
 ### Upgrade and startup ordering
 
 `ProviderTruthUpgradeCoordinator` is part of the DB-owned bootstrap session,
-not a post-serve task. Production daemon startup calls exactly
-`db::bootstrap::open_runtime_database(database_url)`. That lower-layer API
-derives/acquires the database singleton lock and returns the closed
-`RuntimeDatabaseBootstrapOutcomeV1` union:
+not a post-serve task. Production daemon startup first calls exactly
+`db::bootstrap::acquire_runtime_database_lock(database_url)`, whose closed outer
+result is:
+
+| Lock outcome | Meaning / action |
+|---|---|
+| `acquired(PreflightLockGuard)` | This process owns bootstrap and may bind its listener in `starting` mode |
+| `duplicate_healthy(ExistingOwnerEvidenceV1)` | PID/start identity and authenticated health identify the already-serving owner; this process never binds or opens DB and exits with typed duplicate-owner status |
+| `anomalous_holder(ExistingOwnerEvidenceV1)` | Lock holder exists but identity/health is stale, mismatched, or unverifiable; no signal, takeover, listener, or DB open occurs; operator recovery is required |
+| `lock_failure(SanitizedLockFailureV1)` | No ownership proof; process exits without serving or mutating |
+
+Only `acquired` enters
+`db::bootstrap::open_runtime_database_with_guard(database_url, guard)`. That
+inner API returns the closed `RuntimeDatabaseBootstrapOutcomeV1` union:
 
 | Outcome | Owned value | Serve transition |
 |---|---|---|
 | `ready` | `RuntimeDatabase { pool, preflight_lock_guard }` | `starting -> normal` only after every preflight proof succeeds |
-| `failed` | `FailedBootstrapOwner { preflight_lock_guard, sanitized_failure, failure_code }` | `starting -> failed`; no writable/readable runtime pool exists |
+| `preflight_failed` | `FailedBootstrapOwner { preflight_lock_guard, sanitized_failure, failure_code }` | `starting -> failed`; no writable/readable runtime pool exists |
 
-Both owner values are non-`Clone` and non-serializable. In particular,
+Both inner owner values are non-`Clone` and non-serializable. In particular,
 `FailedBootstrapOwner` retains the live `PreflightLockGuard` until process exit,
 so a failed serve process cannot accidentally release singleton ownership and
-race another local opener. Daemon `supervisor` never acquires a second database
-lock and never retries bootstrap in-process. Recovery requires a clean process
-restart.
+race another local opener. No outer duplicate/anomalous/failure result pretends
+to own a guard. Daemon `supervisor` never acquires a second database lock and
+never retries bootstrap in-process. Recovery requires a clean process restart.
 
 Inside that API, `run_preflight_with_guard(&mut PreflightLockGuard)` returns a
 private `PreflightCompleteToken` only after migration, Rust finalization, and
@@ -2147,17 +2371,33 @@ consumes that token and opens the runtime pool without calling preflight or
 reacquiring the lock. The ordinary `create_pool` remains only for in-memory
 tests and explicitly feature-gated maintenance binaries; a retained production
 call-site scan rejects it in daemon startup. One-shot admin commands use the
-same `open_runtime_database` path and keep the returned ready or failed owner
-until exit.
+same outer acquisition and inner bootstrap path and keep the returned ready or
+preflight-failed owner until exit.
 
-The registered SQLx migration is deliberately a staging
-migration: it creates `provider_truth_upgrade_state`, shadow/final-target tables
-with nullable backfill columns, and compatibility read views, but installs no
-constraint that requires Rust-derived data. Guarded preflight invokes the
-coordinator after `Migrator::run` both when migrations were just applied and
-when SQLx already reports the binary version as current. A tracked-equal DB with
-phase other than `complete` must resume/fail the coordinator; the ordinary
-equal-version return cannot bypass the Rust finalizer.
+The registered SQLx migration 100 is deliberately a staging migration: it
+creates `provider_truth_upgrade_state`, shadow/final-target tables with nullable
+backfill columns, and compatibility read views, but installs no constraint that
+requires Rust-derived data. `ProviderTruthPhasedMigratorV1` runs under the guard
+in three ordered phases:
+
+1. A duplicate-version/checksum ledger preflight rejects any applied migration
+   above the binary maximum and specifically rejects an applied post-100
+   migration while provider-truth phase is not `complete`. A filtered SQLx
+   `MigrationSource` containing exactly versions `<= 100` is passed to a first
+   `Migrator`; migration 100 becomes ledger-visible but no 101+ SQL executes.
+2. The Rust coordinator resumes or starts migration-100 finalization whenever
+   the staging migration is applied and phase is not `complete`. It verifies the
+   final schema and durably marks phase `complete` while still holding the guard.
+3. Only after a fresh read proves `phase = complete`, the ordinary full embedded
+   `Migrator` runs. Applied `<= 100` entries are checksum-verified/skipped and
+   pending `> 100` migrations execute in order.
+
+The filtered source is constructed from the same embedded migration bytes and
+checksums as the full source, not copied SQL. A tracked-equal DB with migration
+100 applied but incomplete phase cannot bypass phase 2. A synthetic migration
+101 fixture records that its SQL side effect and `_sqlx_migrations` row are both
+absent at every migration-100 crash point, then appear exactly once after final
+phase completion.
 
 Before bounded work, guarded preflight proves its live lock token and opens
 `BEGIN EXCLUSIVE`. It records target version, stable upgrade ID, and phase; copies every
@@ -2300,7 +2540,7 @@ JSON keys:
   "schema_version": "provider_configuration_acceptance_v1",
   "provider_configuration_contract_version": "codex_exact_pair_v1",
   "session_generation_id": "...",
-  "provider_session_id": "...",
+  "provider_session_ref_id": "psref_...",
   "provider": "codex",
   "binding_fingerprint_sha256": "...",
   "requested_model": "gpt-5.6-terra",
@@ -2331,7 +2571,7 @@ keys: `schema_version` with literal value
 `configuration_owner_id`, `configuration_attempt_index`, `prompt_turn_id`,
 nullable `agent_execution_id`, nullable `task_occurrence_id`, nullable
 `continuation_id`, `work_item_id`, non-null `session_generation_id`, non-null
-`provider_session_id`, `provider`, non-null `binding_fingerprint_sha256`,
+`provider_session_ref_id`, `provider`, non-null `binding_fingerprint_sha256`,
 `requested_model`, `requested_effort`, non-null `accepted_model`, non-null
 `accepted_effort`, non-null `accepted_model_wire_value`, non-null
 `accepted_effort_wire_value`, non-null `option_snapshot_revision`, non-null
@@ -2570,16 +2810,19 @@ pre-write permit check reads the coordinator-owned fence. The failed-state watch
 is published only after `close_first_fatal` durably stores the first reason as
 defined above.
 
-Before database bootstrap begins, daemon loads the live reloadable principal
-table, constructs one Axum router, binds one listener, and starts it with
-`RuntimeServeLifecycleV1 = starting`. The lifecycle is the closed one-way state
+Daemon first loads the live reloadable principal table and obtains the outer
+database-lock outcome above. `duplicate_healthy`, `anomalous_holder`, and
+`lock_failure` never construct a router or bind a listener. Only after
+`acquired(PreflightLockGuard)` does daemon construct one Axum router, bind one
+listener, and start it with `RuntimeServeLifecycleV1 = starting` before running
+inner preflight. The lifecycle is the closed one-way state
 machine `starting -> normal | failed` and `normal -> failed`; `failed` is
 terminal for the process. In `starting`, the outer middleware bypasses all
 normal resolvers and permits only unauthenticated `/health` and `/ready`
 returning 503, the exact authenticated GraphQL `daemonStatus` operation, typed
 MCP refusal, and sanitized 503 for every other route. On
 `RuntimeDatabaseBootstrapOutcomeV1::ready`, daemon installs the runtime owner
-and atomically publishes `normal`. On `failed`, it stores the entire
+and atomically publishes `normal`. On `preflight_failed`, it stores the entire
 `FailedBootstrapOwner` beside the server task and publishes the sanitized
 failure without opening any consumer.
 
@@ -2597,17 +2840,18 @@ without a clean restart.
 
 The `starting`/`failed` GraphQL exception is an AST whitelist, never a lexical
 `contains("daemonStatus")` filter. The duplicate-key-rejected HTTP JSON object
-must contain exactly `query` and `operationName`, with
-`operationName = "DaemonStatus"`. The document must contain exactly one named
-query operation `DaemonStatus`, no variables, extensions, fragments, aliases,
+must contain exactly `query`, `operationName`, and `variables`, with
+`operationName = "P031DaemonStatus"` and `variables = {}`. These are the exact
+bytes structurally emitted by production `P031URLSessionGraphQLReadTransport`.
+The document must contain exactly one named query operation
+`P031DaemonStatus`, no GraphQL variable definitions, extensions, fragments, aliases,
 arguments, directives, inline fragments, mutation, or subscription, and this
 exact root selection:
 
 ```graphql
-query DaemonStatus {
+query P031DaemonStatus {
   daemonStatus {
-    state schemaVersion binarySchemaVersion buildSha startedAt
-    lastStateChangeAt restartCountSinceBoot pid json
+    json
   }
 }
 ```
@@ -2615,7 +2859,8 @@ query DaemonStatus {
 The minimal handler parses JSON and GraphQL with the same parser/version as the
 normal server, canonicalizes only insignificant whitespace/comma placement,
 and compares operation kind, name, field names, and tree shape to this AST.
-Malformed bodies, another operation name, missing/extra/duplicate field, mixed
+Malformed bodies, non-empty/non-object/missing `variables`, another operation
+name, missing/extra/duplicate field, mixed
 `daemonStatus` plus any other root field, alias, fragment, directive, variable,
 or batch are the typed failed-serve refusal. A live Operator principal is
 required; Agent/Observer and revoked/disabled/re-scoped principals receive the
@@ -2750,7 +2995,9 @@ settlement before returning, under one additional absolute 10-second cleanup
 deadline. An identity-ambiguous child is
 quarantined rather than signalled. No broker request, authority call, settlement
 await, transport task, or cleanup task may detach or outlive its owning
-deadline. Configuration settlement uses a CAS over captured owner truth. Prompt
+deadline. For P086 resurrection, this `ConfigurationDeadline` is reconstructed from the
+persisted admission-time `attachment_deadline_at`; launch/attach never creates a
+new 30-second window. Configuration settlement uses a CAS over captured owner truth. Prompt
 dispatch then holds the gate from permit through its separate fixed 10-second
 transport write/flush deadline and final CAS. A committed `prompt_sent` turn
 does not release the gate: the generation-owner binding moves to
@@ -3440,13 +3687,30 @@ not copied onto execution/event rows where it could become stale. After decode,
 `P031RunDetailReadModel` constructs mandatory
 `OccurrencePresentationJoinV1(runID, presentationRowID, taskOccurrenceID,
 stageID, occurrencePosition, humanSourceOrdinal)` entries from topology rows.
-Every v2 execution, matched-occurrence timeline event, raw-detail result, and
-active-agent row joins by exact `(runID, presentationRowID)` and, when present,
-must match the same task-occurrence ID. Missing, duplicate, cross-run, or
-position/source-mismatched joins are typed schema failures; an explicit
-`unassociated_run_event` is the only event shape that bypasses the join and it
-must target the run-events lane. Position changes are published by replacing
-this join snapshot, never by rewriting historical events.
+Every v2 execution, active-agent row, and `matched_occurrence_v2` timeline event
+joins by exact `(runID, presentationRowID)` and, when present, must match the
+same task-occurrence ID. Missing, duplicate, cross-run, or
+position/source-mismatched joins are typed schema failures. An explicitly
+authorized `unassociated_run_event` bypasses the join and must target the
+run-events lane. Position changes are published by replacing this join snapshot,
+never by rewriting historical events.
+
+Raw-detail decode is deliberately conditional rather than treating all six
+statuses as occurrence-shaped. The decoder first validates the complete
+status/raw/error/identity nullability row, then applies exactly one branch:
+
+| Raw-detail row | Occurrence-presentation action |
+|---|---|
+| `available`, `stale`, `unavailable`, or `digest_mismatch` with non-null identity tuple and `matched_occurrence_v2` | Require the exact join and reject any tuple mismatch |
+| Authorized `unassociated_run_event` with a non-null run-events lane | Bypass occurrence join and preserve the run-events lane |
+| `missing` or `unauthorized` | Require execution, occurrence, presentation-row, event, and lane identity fields all null; do not construct or attempt a join |
+
+No missing or unauthorized response may recover identity from the request
+handle, cached row, selected occurrence, or prior response. Conversely, a
+status that legally carries matched identity may not silently degrade to a null
+join. Production-document/decoder fixtures execute all six rows and both legal
+identity branches; mutation negatives swap each status, identity state, lane,
+and nullable identity field.
 
 Every DTO declares every `CodingKey` and uses a custom decoder that distinguishes
 `container.contains(key) == false` (typed schema mismatch) from explicit null
@@ -3597,17 +3861,30 @@ status copy.
 | Retry/fallback | Latest execution for the same task occurrence | Codex uses that execution's accepted pair and dispatch state |
 
 If `configured` lacks either accepted field, the Codex readback is internally
-inconsistent. It renders `Runtime identity unavailable`, exposes diagnostic
-Help text, and must be caught by the gate. It must not fall back to planned
-truth.
+inconsistent. It renders exactly `Runtime identity unavailable`; its Help and
+copy text are exactly
+`Runtime identity unavailable - Configured execution is missing accepted model or effort.`
+and it must be caught by the gate. It must not fall back to planned truth.
 
 `legacy_ambiguous` is a legal formatter input, not a schema failure. It renders
-`Runtime identity unavailable - Multiple legacy executions`, Help text with the
-bounded candidate count, and no accepted/requested runtime pair. Planned task
-identity may remain on its separate planned line. It never selects one legacy
-execution. A configured execution that fails before permit is likewise the
-legal `Start failed after configuration` row above rather than an impossible
-tuple.
+exactly `Runtime identity unavailable - Multiple legacy executions`; its Help
+and copy text are exactly
+`Runtime identity unavailable - Multiple legacy executions: <count>.`, where
+`<count>` is the bounded candidate count in canonical non-negative ASCII
+decimal. It has no accepted/requested runtime pair. Planned task identity may
+remain on its separate planned line. It never selects one legacy execution. A
+configured execution that fails before permit is likewise the legal `Start
+failed after configuration` row above rather than an impossible tuple.
+
+For every other legal row in the Codex, legacy, and provider-neutral matrices,
+`helpText` and `copyText` are byte-equal to that row's exact `Operator copy`.
+For every illegal tuple not covered by the configured-missing-acceptance case,
+the visual text is exactly `Runtime identity unavailable` and Help/copy are
+exactly
+`Runtime identity unavailable - Provider execution truth is inconsistent.`
+There is no caller-supplied diagnostic suffix. The formatter's accessibility
+identity value is byte-equal to `helpText`; occurrence and control labels wrap
+that value using the exact templates below.
 
 Legacy generic Codex status is also closed rather than assembled from an
 unspecified prefix:
@@ -3742,6 +4019,9 @@ and effort, unknown non-empty values, and missing optional non-Codex segments.
 For every legal tuple it freezes status prefix, `fullIdentity`,
 `compactIdentity`, Help, copy, and accessibility strings; every illegal tuple
 must return typed `identity_contract_invalid` rather than a best-effort label.
+The oracle implements the exact Help/copy rules above, including configured
+missing acceptance, bounded legacy ambiguity count, and generic illegal truth;
+it does not accept free-form diagnostics from the fixture.
 The gate proves each enum value appears in at least one legal golden and one
 applicable mutation-negative. Visual, Help, copy, and accessibility outputs are
 then byte-compared to the same formatter result.
@@ -3931,18 +4211,39 @@ legal formatter state exactly to `Planned`, `Configuring`, `Configured`,
 ASCII integer codec as the ordinals. Unknown state, negative count, or a status
 not selected by the legal-state table is `identity_contract_invalid`; there is
 no locale-aware or description-based fallback.
-The info control label is
-`Show full runtime identity for <task name>, <occurrenceDiscriminator>`, the copy
-control is `Copy full runtime identity for <task name>, <occurrenceDiscriminator>`,
-and the close control is `Close runtime identity details`. Unknown delivery adds
-the exact hint `Automatic retry is blocked.` to the row value; legacy ambiguity
-adds `Multiple legacy executions; runtime identity is unavailable.` Tests assert
-labels, values, hints, child order, and reducer actions byte-for-byte. Same-agent
-and repeated-task fixtures assert distinct labels and action targets. Machine
-uniqueness is separate: every accessibility identifier is the canonical
-`PresentationTargetV1` identifier below and may contain the full hashed row ID;
-it is never used as accessibility label, value, hint, Help text, or spoken
-custom-action name.
+Accessibility labels are a closed subject/control matrix:
+
+| Subject / control | Exact accessibility label |
+|---|---|
+| occurrence `row` | `<task name>. <occurrenceDiscriminator>. <fullIdentity>. Status: <status>. Attempts: <count>.` |
+| occurrence `info` | `Show full runtime identity for <task name>, <occurrenceDiscriminator>` |
+| occurrence `copy` | `Copy full runtime identity for <task name>, <occurrenceDiscriminator>` |
+| occurrence `popover` | `Runtime identity details for <task name>, <occurrenceDiscriminator>` |
+| occurrence `close` | `Close runtime identity details` |
+| timeline event `event_row` | `<event title>, <laneDiscriminator>` |
+| timeline event `event_expand` | `Expand <event title>, <laneDiscriminator>` |
+| timeline event `event_copy` | `Copy <event title>, <laneDiscriminator>` |
+| timeline event `event_raw_detail` | `Show raw detail for <event title>, <laneDiscriminator>` |
+| stage heading `stage_heading` | `<stage label> stage` |
+| run-events lane `run_events` | `Run events` |
+| empty summary `empty_summary` | `No run activity` |
+
+For an occurrence timeline lane, `<laneDiscriminator>` is its exact
+`OccurrenceDiscriminatorV1`; for the separate run-events lane it is exactly
+`Run events`. `<event title>`, `<task name>`, and `<stage label>` are the complete
+existing operator-visible strings after the same bounded-control validation as
+the visual control; they are not reconstructed from an agent ID. Only
+occurrence controls carry an occurrence discriminator. `close`, stage heading,
+run-events, and empty-summary controls intentionally do not invent one.
+Unknown delivery adds the exact hint `Automatic retry is blocked.` to the
+occurrence row value; legacy ambiguity adds `Multiple legacy executions;
+runtime identity is unavailable.` Tests assert labels, values, hints, child
+order, and reducer actions byte-for-byte for every legal matrix cell and reject
+every incompatible subject/control pair. Same-agent and repeated-task fixtures
+assert distinct labels and action targets. Machine uniqueness is separate:
+every accessibility identifier is the canonical `PresentationTargetV1`
+identifier below and may contain the full hashed row ID; it is never used as
+accessibility label, value, hint, Help text, or spoken custom-action name.
 `PresentationRowIdentity` is the sole encoder. It hashes domain-separated,
 length-prefixed UTF-8 components and emits lowercase
 `topology_row_v2:<sha256>` over exact components
@@ -3982,13 +4283,20 @@ with a nullable row ID. `PresentationSubjectV1` is the required tagged union:
 
 `PresentationTargetV1` is the exact tuple
 `(run_id, surface, subject, control_kind)`, where surface is closed to
-`overview | stages | timeline | run_inspector` and control kind is closed to
-`row`, `info`, `copy`, `popover`, `close`, `event`, `stage_heading`,
-`run_events`, or `empty_summary`. Subject/control compatibility is closed:
-row/info/copy/popover
-use `occurrence`, event uses `timeline_event`, stage heading uses
-`stage_heading`, run-events uses `run_events`, empty summary uses
-`empty_summary`, and close preserves the subject of the popover it closes. Its
+`overview | stages | timeline | run_inspector`. Subject/control compatibility
+is the following closed matrix; no generic `event` control exists:
+
+| Subject | Legal control kinds |
+|---|---|
+| `occurrence` | `row`, `info`, `copy`, `popover`, `close` |
+| `timeline_event` | `event_row`, `event_expand`, `event_copy`, `event_raw_detail` |
+| `stage_heading` | `stage_heading` |
+| `run_events` | `run_events` |
+| `empty_summary` | `empty_summary` |
+
+`close` preserves the occurrence subject of the popover it closes. Every event
+action therefore has a distinct target even when it acts on the same timeline
+event. Its
 machine identifier uses the common codec with domain
 `chainworks.presentation_target.v1` plus the union tag and exact payload; two
 timeline events in one lane, two stage headings, or a heading and empty summary
@@ -3996,28 +4304,45 @@ can never compare equal. A row ID remains the cross-surface semantic selection
 key, but it is never by itself a focus, popover, anchor,
 accessibility-action, event, heading, or copy target.
 
-`SelectedRowSnapshotV1` stores the last selected row's presentation-row ID,
-source stable ID, normalized index, occurrence position, and stage ID. The
-single `RunOccurrenceSelectionStateV1` contains nullable `selectedRunID`,
-`selectedPresentationRowID`, nullable `selectedRowSnapshot`, non-null
-`activeSurface`, nullable `popoverTarget: PresentationTargetV1`, and nullable
-`focusTarget: PresentationTargetV1`. There is no per-run dictionary and no
-view-local `selectedAgentID`.
+`RunSemanticSelectionV1` is the required tagged union
+`occurrence(presentationRowID) | run_events(timelineLaneID) | empty`.
+`SelectedRowSnapshotV1` stores the last selected occurrence row's
+presentation-row ID, source stable ID, normalized index, occurrence position,
+and stage ID. The single `RunOccurrenceSelectionStateV1` contains nullable
+`selectedRunID`, non-null `selection: RunSemanticSelectionV1`, nullable
+`selectedRowSnapshot`, non-null `activeSurface`, nullable
+`popoverTarget: PresentationTargetV1`, and nullable
+`focusTarget: PresentationTargetV1`. The snapshot is non-null only for
+`occurrence`; run-events selection never uses a synthetic row. `empty` is legal
+only when no selectable occurrence row or run-events lane exists, although its
+focus target may be a surviving stage heading. There is no per-run dictionary,
+nullable row-ID surrogate for a non-row selection, or view-local
+`selectedAgentID`.
 
 `P031RunsHomeViewModel` owns one `RunsWorkbenchPresentationModel`. Overview,
 Stages, Timeline, Run Inspector, popover, and focus events all call one pure
 `RunOccurrenceSelectionReducer.reduce(state:event:rows:)`; each user event
 carries its complete `PresentationTargetV1`, and views receive only reducer
 bindings/actions. `runChanged` clears selection, prior snapshot, popover, and
-focus before choosing the new run's default. `rowsChanged` uses the retained
-snapshot, not a lookup in the already-replaced row array: it first maps a
-removed planned row to the current row with the same source stable ID;
-otherwise it chooses the row now occupying the prior normalized index, then the
-last preceding row, then that stage's heading, then the empty-run summary. It
-rebuilds focus for `activeSurface` and closes a popover whose exact target no
-longer exists; it never transfers a `stages` anchor to `overview` merely because
-the row ID matches. Selection and every successful rows change refresh the
-snapshot from the chosen row before returning.
+focus before choosing the new run's first `current`, first `previous`, then
+first planned occurrence; if none exists it chooses the run-events lane, then
+`empty`. For occurrence selection, `rowsChanged` uses the retained snapshot,
+not a lookup in the already-replaced row array: it first maps a removed planned
+row to the current row with the same source stable ID; otherwise it chooses the
+row now occupying the prior normalized index, then the last preceding row, then
+the run-events lane when present, then `empty` with that stage's heading as the
+focus target when the heading survives. For `run_events`, occurrence row churn
+does not change selection while the exact lane exists; disappearance chooses
+the same occurrence default and then `empty`. For `empty`, newly available data
+chooses the same occurrence default and then run-events. A timeline event action
+under an occurrence lane selects that occurrence; one under the run-events lane
+selects `run_events`, while the event-specific target remains the independent
+focus/action target. Popover and focus transitions do not replace semantic
+selection. The reducer rebuilds focus for `activeSurface` and closes a popover
+whose exact target no longer exists; it never transfers a `stages` anchor to
+`overview` merely because the row ID matches. Every selected occurrence and
+successful occurrence fallback refreshes the row snapshot; every non-occurrence
+selection clears it.
 
 The view model also owns one `RunDetailPublicationOwner`. Beginning a run load
 atomically increments a monotonic `load_generation`, cancels the prior request
@@ -4032,14 +4357,15 @@ old-generation cancellation cannot clear the new subscription. Pure and hosted
 fixtures delay run A, select run B, publish B, then deliver A responses and
 updates in every order; B remains byte-identical and no A target can reappear.
 
-Run Inspector deletes `activeTimelineAgents.first`; it resolves the
-selected `RunStageTopologyOccurrenceV2`, then shows that occurrence's complete
-attempt list ordered by `started_at DESC, agent_execution_id DESC` and uses its
-latest attempt only for the summary identity. With no explicit selection it
-chooses the first `current` row in normalized presentation order, then the first
-`previous` row, then the first planned row. Popover and focus consume that exact
-reducer result rather than implementing a second fallback rule. An agent ID is
-never a selection key. Pure reducer tests cover all surface/control pairs,
+Run Inspector deletes `activeTimelineAgents.first`. For `occurrence` selection
+it resolves that exact `RunStageTopologyOccurrenceV2`, shows its complete
+attempt list ordered by `started_at DESC, agent_execution_id DESC`, and uses its
+latest attempt only for the summary identity. For `run_events` it shows the
+selected run-events lane and no occurrence summary or attempt fallback; for
+`empty` it shows the empty summary. Initial/default occurrence choice belongs
+only to the reducer rule above. Popover and focus consume that exact reducer
+result rather than implementing a second fallback rule. An agent ID is never a
+selection key. Pure reducer tests cover all surface/control pairs,
 same-row targets on two surfaces, removed-row snapshot fallback, planned to
 current replacement, popover invalidation, run switching, and run-events lane.
 Hosted tests cover two simultaneous same-agent occurrences, explicit attempt
@@ -4076,8 +4402,12 @@ the modifier is absent or attached to another target.
 | Original-owner reused generation evidence mismatch | close generation and negotiate fresh once | 0 on old session |
 | P079 repair/fallback or P086 generation evidence mismatch | fail typed owner; transparent fresh fallback forbidden | 0 |
 | P079 fallback provenance/operation/lease join mismatch | `ACP_PROMPT_OWNER_INVALID`; settle fallback attempt | 0 |
+| P079 candidate staging write/digest/fsync fails | no prepared intent; parent/transition remain held; typed validation-settlement failure | unchanged |
+| P079 artifact intent is `prepared` or `file_committed` after crash | startup reconciler publishes/quarantines by digest and completes the same intent; no validation/prompt replay | unchanged |
 | P086 continuation lacks execution/occurrence/turn/work-item binding | `ACP_PROMPT_OWNER_INVALID` | 0 |
 | P086 resume context missing/digest or target binding mismatch | admission rejected before launch | 0 |
+| P086 admission deadline expires before broker/spawn | settle reserved process intent as never launched and configuration failure against the pre-reserved generation | 0 |
+| P086 admission deadline expires after launch | identity-safe reap and configuration-failure settlement against the same admitted tuple | 0 |
 | P086 resume capability absent | `ACP_P086_RESUME_UNSUPPORTED` | 0 |
 | P086 pre-response option update or response/catalog/correlation invalid | `ACP_P086_RESUME_CONFIGURATION_UNAVAILABLE`; identity-safe reap | 0 |
 | P086 atomic admission insert fails | complete transaction rollback; no accepted response | 0 |
@@ -4097,6 +4427,8 @@ the modifier is absent or attached to another target.
 | Topology execution lacks unambiguous occurrence identity | omit execution association; expose legacy ambiguity | unchanged |
 | Schema v1 probe or selected-key contract fails | typed daemon schema mismatch; no reduced query | unchanged |
 | Legacy generic frozen run | allowed as planned/unverified | shared ledger for each new attempt |
+| Runtime lock is `duplicate_healthy`, `anomalous_holder`, or `lock_failure` | typed outer bootstrap exit; no router, listener, DB open, or mutation | 0 |
+| Migration 100 incomplete while migration 101 is present | finish/repair phase 100 before executing 101; failed finalization retains failed-serve owner | 0 |
 
 Configuration failures use `failure_phase = provider_configuration`, leave
 accepted fields `null`, and may render the requested pair plus
@@ -4136,11 +4468,11 @@ commits, or from an implementation file absent from the manifest, is invalid.
 | Owner | Required proof in `codex-model-truth` |
 |---|---|
 | `workflow` + `domain` | Exact seven-profile matrix; per-profile frozen capabilities and effective fallback contract; validated Steward catalog; fresh generic/invalid rejection; legacy replay; sealed provenance union including typed P079 fallback; exact ten-ID manifest; typed P058 owner; `OutputContractRepair` work-item kind; complete compiled-coordinate, condition, binding, dynamic-key, deterministic enqueue-time occurrence allocation, unique human-source ordinal, legacy ordering, sequence, and presentation vectors |
-| `acp` fake provider + `engine` dispatch | Response-closed negotiation plus generation-owned `config_option_update` snapshot; durable secret-safe P086 resume context, post-launch capability proof, exact `session/resume`, pre-response-update rejection, response catalog, ordered post-response updates, and identity-safe zero-send reap matrix; separate new/existing-generation reservations; many-to-one ownership with one prompt-through-terminal manager; acyclic typed authority/control ports and permit-only API; bounded broker/config/send/terminal-settlement/cleanup; complete P017/P058/P079/P086/Steward reducers and collateral matrix; owner-scoped versus generation cancellation; launch barrier/process identity; bidirectional fallback; Claude aliases unchanged |
-| `db` + `engine` recovery | Lower-layer lock-guarded staged/tracked-equal preflight; complete registered Class A operation/result-codec/natural-row set with uncancellable late-commit supervisor; separate acknowledgement certainty and operation-specific domain outcomes; exact generation-binding receipt/failure matrix; active owner attempts/receipts/invalidations/failures; exact Steward turn-0/one-retry turn-1 allocation and three-phase cancellation reducer; prompt authority/quarantine; immutable migration-095 checksum plus complete migration-100 P079 DDL, strict canonical/quarantine accounting, terminal guards, and atomic validation settlement; immutable P058 execution/ledger/tier authority; deterministic occurrence enqueue/copy-validation, unique human ordinal, and legacy backfill/seed/restart; exhaustive old P086 classifier; sealed legacy envelopes; closure-owned replay authorization; paused-before-commit mutation-fence fixtures for every writer |
-| `daemon` composition | One `open_runtime_database` guard and no lock reacquisition; ready/failed bootstrap owner union with failed owner retaining `PreflightLockGuard`; production construction of upgrade coordinator, durable authority, ACP manager, invocation/invalidation coordinators, process-control port, `DbWriter`, and the sole `FirstFatalCoordinator`; one prebound tri-state `starting|normal|failed` router; durable first-fatal persist-before-notify; exact Operator-only `DaemonStatus` AST whitelist and zero-DB minimal routes |
-| `graphql-server` | Byte-equal complete `AppSchema::sdl()` with explicit lowercase snake-case enum literals, uppercase/unknown negatives, probe matrix, and exact schema-version literals; one non-null execution-level truth object plus turn-owned configuration truth; complete latest-specialized-turn reducer; simultaneous P079 receipt A/B on physical generation A and P086 physical generation A/B readback; exact occurrence attempt list and mandatory occurrence-presentation join; old `rte_` compatibility vectors; non-null occurrence/run-events lanes; all six raw-detail status/nullability rows; mediation/topology mapping; structural proof that this slice does not change MCP/report/resource schemas |
-| Swift focused and hosted-view tests | Complete production `P031GraphQLDocumentSet.runDetail`/`runtimeStatusChanged`/`timelineRawDetail` snapshots for operations `P031RunDetail`/`P031RuntimeStatusChanged`/`P031TimelineRawDetail` and presence-aware DTO decoding; lockstep restart; complete state/ambiguity/start-failure/invalidation matrices with byte-distinct pre/post-acceptance cancellation; one exact formatter plus independent stdlib oracle across shipped surfaces and host locales; mandatory occurrence-presentation join; generation-qualified run publication; tagged injective targets; unique human occurrence accessibility with opaque IDs only in machine identifiers; exact topology rules; real `NSHostingView`/`.focused` first-responder proof, without claiming remote keyboard/VoiceOver event delivery |
+| `acp` fake provider + `engine` dispatch | Response-closed negotiation plus generation-owned `config_option_update` snapshot; P086 admission-time opaque session ref, immutable context, pre-reserved generation/process/binding, one absolute attachment deadline across broker through reap, post-launch capability proof, exact `session/resume`, pre-response-update rejection, response catalog, ordered post-response updates, and identity-safe zero-send reap matrix; sentinel raw session ID absent from every public/diagnostic surface; separate new/existing-generation reservations; many-to-one ownership with one prompt-through-terminal manager; acyclic typed authority/control ports and permit-only API; bounded broker/config/send/terminal-settlement/cleanup; complete P017/P058/P079/P086/Steward reducers and collateral matrix; owner-scoped versus generation cancellation; launch barrier/process identity; bidirectional fallback; Claude aliases unchanged |
+| `db` + `engine` recovery | Outer lock outcome plus guarded phased migration `<=100 -> Rust finalizer -> >100`, including synthetic 101 crash proof; complete registered Class A operation/result-codec/natural-row set with fixed parent result, ordered membership child rows, 512-owner restart replay, and uncancellable late-commit supervisor; barrier-before-SQLite global writer order and two immutable fatal-cycle/reopen rounds; separate acknowledgement certainty and operation-specific domain outcomes; exact generation-binding receipt/failure matrix; active owner attempts/receipts/invalidations/failures; sealed Steward analysis/activation/retry turn allocators and cancellation reducer; prompt authority/quarantine; immutable migration-095 checksum plus complete migration-100 P079 DDL, independent lease/fallback quarantine accounting, immutable terminal rows, unique logical admission, and staged-file/artifact-intent reconciliation; immutable P058 execution/ledger/tier authority; opaque provider-session surrogate migration/private resolver; deterministic occurrence enqueue/copy-validation, unique human ordinal, and legacy backfill/seed/restart; exhaustive old P086 classifier; sealed legacy envelopes; closure-owned replay authorization |
+| `daemon` composition | Closed outer `acquired|duplicate_healthy|anomalous_holder|lock_failure` result; only acquired binds one starting router and enters guarded `ready|preflight_failed` bootstrap; failed owner retains `PreflightLockGuard`; production construction of upgrade coordinator, durable authority, ACP manager, invocation/invalidation coordinators, process-control port, `DbWriter`, artifact reconciler, and sole `FirstFatalCoordinator`; global barrier-before-SQLite order, immutable first-fatal cycle persist-before-notify, restart reconciliation, and no deadlock; exact Operator-only shipped `P031DaemonStatus { daemonStatus { json } }` AST/body whitelist and zero-DB minimal routes |
+| `graphql-server` | Byte-equal complete `AppSchema::sdl()` with explicit lowercase snake-case enum literals, uppercase/unknown negatives, probe matrix, and exact schema-version literals; one non-null execution-level truth object plus turn-owned configuration truth; complete latest-specialized-turn reducer; simultaneous P079 receipt A/B on physical generation A and P086 physical generation A/B readback; exact occurrence attempt list and occurrence-presentation join for only identity-bearing rows; old `rte_` compatibility vectors; non-null occurrence/run-events lanes; all six raw-detail status/nullability rows including null-identity missing/unauthorized and authorized unassociated-run-event branches; mediation/topology mapping; structural proof that this slice does not change MCP/report/resource schemas |
+| Swift focused and hosted-view tests | Complete production `P031GraphQLDocumentSet.runDetail`/`runtimeStatusChanged`/`timelineRawDetail` snapshots for operations `P031RunDetail`/`P031RuntimeStatusChanged`/`P031TimelineRawDetail` and presence-aware DTO decoding; conditional raw-detail join after six-row nullability validation; lockstep restart; complete state/ambiguity/start-failure/invalidation matrices with byte-distinct pre/post-acceptance cancellation; exact visual/Help/copy/accessibility strings from one formatter plus independent stdlib oracle; generation-qualified run publication; tagged semantic occurrence/run-events/empty selection; injective event action targets; exhaustive subject/control accessibility matrix with occurrence discriminator only where legal; unique human occurrence accessibility with opaque IDs only in machine identifiers; exact topology rules; real `NSHostingView`/`.focused` first-responder proof, without claiming remote keyboard/VoiceOver event delivery |
 
 Swift proof is two independent invocations and result bundles:
 
@@ -4188,13 +4520,17 @@ The retained executable scenario matrix must include:
     changing the physical generation allocator, while consuming exactly one
     owner receipt-attempt; missing/mismatched evidence closes the old handle and
     permits only the owner-kind policy's explicit next action;
-9. P086 admission binds the immutable secret-safe resume-context ID/digest;
-   attachment launches/binds identity before proving advertised resume
-   capability, sends exact stored cwd/roots/MCP inputs, rejects every
-   pre-response authority update without reordering, seeds only from the
-   correlated non-empty response catalog, orders later updates, reverifies the
-   pair, identity-safely reaps every post-launch failure, and never sends
-   `session/new`, `session/load`, or a prompt for any negative permutation;
+9. P086 admission binds the immutable secret-safe resume-context ID/digest,
+   opaque provider-session ref, pre-session generation, spawn-pending process
+   intent, owner binding, and one absolute attachment deadline before broker
+   I/O; attachment consumes that deadline, launches/binds identity before
+   proving advertised resume capability, sends exact stored cwd/roots/MCP
+   inputs, rejects every pre-response authority update without reordering,
+   seeds only from the correlated non-empty response catalog, orders later
+   updates, reverifies the pair, identity-safely reaps every post-launch
+   failure, and never sends `session/new`, `session/load`, or a prompt for any
+   negative permutation; a sentinel raw session ID appears only in the private
+   resolver buffer and nowhere in public evidence;
 10. original success followed by both P079 repair kinds proves independent turns,
     distinct receipt attempts on the same parent physical generation, immutable
     original terminal-turn truth under repair-time invalidation, the closed
@@ -4205,18 +4541,23 @@ The retained executable scenario matrix must include:
     operation/attempt/lease authority, source occurrence, target binding digest,
     and initial one-generation permit; collateral loss allows zero transparent
     fresh sessions, attaches, or replays;
-12. P086 admission atomically creates command journal, continuation, work item,
-    turn, and reserved side effect; every insert fault rolls back all and
-    idempotent replay returns the same IDs;
+12. P086 admission atomically creates command journal, continuation/context/
+    deadline, work item, turn, reserved side effect, active attempt, pre-session
+    generation, process intent, and owner binding; every insert fault rolls back
+    the whole tuple, timeout reconciliation occurs before launch, expiry before
+    and after launch settles the same tuple, and idempotent replay returns the
+    same IDs/deadline without allocation;
 13. all P086 modes bind target execution/occurrence, use their own configuration
     reservation/receipt, mirror side effects only after prompt CAS, reject fresh
     fallback, and reproduce every old migration phase with an independent
     oracle;
-14. Steward claim persists analysis, both internal lane owners, and initial
-    turn before provider I/O; its sole retry preserves terminal zero-send turn
-    `0`, atomically allocates turn `1`, and rejects a second retry, while
-    cancellation before dispatch, during `dispatch_pending`, and after
-    `prompt_sent` produce three distinct immutable turn/lane outcomes;
+14. sealed `steward_analysis.claim` alone creates system turn `0`, sealed
+    `steward_auditor_lane.activate` alone creates auditor turn `0`, and sealed
+    `steward_lane.retry_zero_send` alone preserves a terminal zero-send turn `0`
+    while allocating turn `1`; the generic allocator requires an unforgeable
+    permit, a second retry is rejected, and cancellation before dispatch,
+    during `dispatch_pending`, and after `prompt_sent` produces three distinct
+    immutable turn/lane outcomes;
 15. every prompt CAS committed result
     `Applied|AlreadyMatching|Conflict|Missing` crosses every
     `DbWriterAcknowledgementV1` case; known `Missing` is never confused with
@@ -4224,8 +4565,10 @@ The retained executable scenario matrix must include:
 16. every registered Class A operation crosses committed, busy/shutdown rejected,
     failed-before-start, uncertain-after-start, commit-before-ack, reconciliation,
     delayed commit after an empty immediate read, caller cancellation, supervisor
-    takeover, writer crash, and restart for every owner kind; no request-scoped
-    task owns final reconciliation and no mutation is resubmitted;
+    takeover, writer crash, and restart for every owner kind; fixed parent JSON
+    plus ordered membership rows replay a 512-owner settlement and reject
+    missing/extra/reordered membership; no request-scoped task owns final
+    reconciliation and no mutation is resubmitted;
 17. a manager task retains the non-cloneable generation guard through terminal
     response, receipt, active-owner/collateral settlement, and cleanup; compile
     and call-graph tests prove no coordinator second-settlement or callback cycle;
@@ -4243,11 +4586,14 @@ The retained executable scenario matrix must include:
     identity-matched processes are reaped;
 22. run-wide and scoped invalidation races prove epoch/token fencing and that the
     active manager, not the invalidation caller, performs terminal settlement;
-23. real two-process file-DB startup proves one lower-layer lock acquisition,
-    immutable source snapshot/fence, deterministic takeover, full legacy matrix,
-    process reconciliation, and consumer closure until preflight completes;
-    failed preflight returns a `FailedBootstrapOwner` retaining the lock with no
-    pool, stays in `failed` without in-process retry, and only restart may recover;
+23. real two-process file-DB startup proves the four outer lock outcomes without
+    false guard ownership, only `acquired` binds the starting listener, and the
+    inner ready/preflight-failed owner retains the one guard; a synthetic 101
+    side effect remains absent through every migration-100 Rust-finalizer crash
+    and executes exactly once after phase completion, while immutable source
+    snapshot/fence, full legacy mapping, process reconciliation, and consumer
+    closure hold; failed preflight has no pool/in-process retry and only restart
+    may recover;
 24. the generated replay manifest covers every enqueue/claim/requeue/prompt site
     and rejects unresolved, quarantined, stale, absent, or migration-pending
     authority;
@@ -4268,16 +4614,18 @@ The retained executable scenario matrix must include:
     `receipt_json` plus existing report/MCP projection before/after migration;
 29. migration 095 remains byte-identical and checksum-equal; migration 100
     survives every staged interruption, maps every 095 lease/fallback row
-    exactly, routes dangling mandatory identities only to typed quarantine,
-    proves canonical-plus-quarantine count/digest equality and disjoint keys,
-    and never drops or merges history;
+    exactly, assigns `dangling_fallback_child` independently of lease/parent
+    failures, proves separate per-source canonical-plus-quarantine count/digest
+    equality and disjoint keys, and never drops or merges history;
 30. direct-SQL P079 negatives reject active zero selected budget, contradictory
-    flags/provenance/source schema, budget mutation, wrong work-item kind, and
-    cross-operation turn/lease references; direct-SQL negatives also include
-    dispatch-unknown without start, terminal operation with active lease/item,
-    incomplete slot/link, and mismatched greatest-attempt result, while accepted,
-    rejected, unavailable, cancelled, and superseded validation settlement
-    atomically close item/lease/operation/event/parent/artifact truth;
+    flags/provenance/source schema, budget mutation, duplicate/conflicting
+    `(repair_event_id, selected_kind)` admission, wrong work-item kind,
+    cross-operation turn/lease references, and every terminal lease/operation
+    rewrite; each validation outcome first commits one prepared artifact intent
+    with parent held, then crash injection around staging fsync, DB prepare,
+    same-filesystem rename, destination fsync, `file_committed`, and completion
+    proves deterministic publish/quarantine recovery, no duplicate artifact,
+    and parent release only after accepted completion;
 31. direct-SQL P058 negatives reject every cross-ledger/run/stage/agent/tier/
     attempt/policy tuple plus all update/delete attempts against immutable prompt
     authority;
@@ -4292,13 +4640,16 @@ The retained executable scenario matrix must include:
     resolvers and decoders;
 33. same-agent interleaved execution events preserve execution, occurrence,
     sequence, presentation-row, event, and lane identity through DB, GraphQL,
-    Swift, the mandatory occurrence-presentation join, filtering, expansion,
-    copy, and swapped-handle rejection; missing/duplicate/cross-run join rows fail,
-    while null-row stage/legacy events remain only in deterministic `Run events`;
+    Swift, filtering, expansion, copy, and swapped-handle rejection; v2
+    execution/active-agent/matched-event and identity-bearing raw-detail rows
+    require the occurrence join, authorized unassociated events use only the
+    run-events lane, and missing/unauthorized raw detail carries null identity
+    without attempting a join;
 34. historical and v2 event fixtures preserve the old `runtime_event_id`
     output for identical old inputs, while every `available`, `missing`,
     `stale`, `unauthorized`, `unavailable`, and `digest_mismatch` raw-detail
-    result obeys the exact raw/error/identity nullability matrix;
+    result obeys the exact raw/error/identity nullability matrix before its
+    conditional occurrence/run-events/no-identity branch;
 35. topology association and layout fixtures cover all source kinds, legacy
     unique/ambiguous, complete occurrence-scoped attempt lists, transition
     identity, SCC/median/track/virtual/self-loop rules, shuffled input, stress,
@@ -4308,28 +4659,31 @@ The retained executable scenario matrix must include:
     byte-distinct cancellation before acceptance versus after verified
     acceptance, every exact failure/repair/continuation/historical string,
     canonical ASCII ordinals under multiple host locales, compact bounds,
-    Help/copy/accessibility values, and illegal tuple rejection;
+    byte-exact legal Help/copy, configured-missing, legacy-ambiguity-count, and
+    generic-illegal outputs, plus mutation-negative tuple rejection;
 37. the single `RunOccurrenceSelectionReducer` covers run change, planned-to-
     current replacement, retained previous-row metadata, next/preceding/heading
-    fallback, exact tagged surface/control-qualified occurrence/event/heading/
-    run-events/empty targets, retries, and same-agent occurrences; the
+    fallback, tagged semantic occurrence/run-events/empty selection, persistent
+    run-events selection across occurrence churn, and injective event-row/
+    expand/copy/raw-detail targets across surfaces; the
     generation-qualified publication owner drops delayed run-A responses after
     run B without any state mutation; no view-local agent-ID selection or
     `activeTimelineAgents.first` remains;
-38. accessibility fixtures include the exact human planned, sequenced, and
-    legacy occurrence discriminator in row/control labels, contain no digest or
-    UUID in spoken strings, and keep static/dynamic/repeated tasks byte-distinct
-    through unique human-source and occurrence ordinals; hosted `NSHostingView`
-    tests assert the actual `.focused` binding and first responder, not only
-    reducer state and not physical keyboard or VoiceOver event delivery;
-39. one prebound tri-state router owns the listener once; bootstrap transitions
-    `starting -> normal|failed`, one `FirstFatalCoordinator` closes both fences,
-    persists one immutable reason under the commit barrier before notification,
-    and moves `normal -> failed`; later reasons cannot replace it, normal routes/
-    consumers close, every paused writer rolls back, and persistence failure
-    exits without reopening; the minimal GraphQL handler accepts only the exact
-    Operator `DaemonStatus` AST, rejects mixed/aliased/fragmented/variable/batch
-    forms, and performs zero DB accesses in starting and failed states;
+38. accessibility fixtures exhaust every legal subject/control matrix cell,
+    include the exact human planned/sequenced/legacy discriminator only on
+    occurrence controls, use exact event/lane, stage-heading, run-events, empty,
+    popover, and close labels, reject incompatible pairs, contain no digest or
+    UUID in spoken strings, and keep repeated tasks byte-distinct; hosted
+    `NSHostingView` tests assert actual `.focused` binding/first responder, not
+    only reducer state and not physical keyboard or VoiceOver event delivery;
+39. one prebound tri-state router owns the listener once after outer lock
+    acquisition; two fatal/restart cycles prove global barrier-before-SQLite
+    order without deadlock, one immutable fatal-cycle result per cycle, paused
+    writer rollback, persisted-before-notify failure, and append-only reopen
+    reconciliation; the zero-DB minimal GraphQL handler accepts only the exact
+    production body/AST `P031DaemonStatus { daemonStatus { json } }` with empty
+    variables and rejects every extra/missing key, selection, alias, fragment,
+    directive, variable definition, batch, or unauthorized principal;
 40. `codex-model-truth` executes the exact shared function/test-array content of
     `proposal-027`, `proposal-058`, `proposal-075`, `proposal-079`, and
     `proposal-086` without recursive shell invocation; the composed gate and
@@ -4404,15 +4758,20 @@ tree and includes their common `HEAD`.
 - [ ] Every new runtime mutation is registered in the P075 operation registry,
       uses a natural idempotency key/result digest, reconciles commit-before-ack,
       obeys shutdown admission/terminal allowlists, and converges after writer
-      crash/restart.
+      crash/restart. Variable collateral sets use ordered child membership rows
+      plus fixed parent count/digest; a 512-owner replay cannot exceed the 16 KiB
+      parent result or omit/reorder an owner.
 - [ ] One `FirstFatalCoordinator` is the sole close authority. It closes prompt
-      and mutation admission under the shared commit barrier, durably persists
-      exactly one reason/epoch, and only then publishes failed state; no competing
-      CAS/watch owner exists. One prebound router transitions
-      `starting -> normal|failed` and `normal -> failed`; failed bootstrap retains
-      its `PreflightLockGuard` without a runtime pool or in-process retry. The
-      minimal Operator GraphQL path accepts only the exact `DaemonStatus` AST and
-      performs zero DB accesses. `persist_fatal` failure cannot reopen service.
+      and mutation admission under the global barrier-before-SQLite writer order,
+      durably persists exactly one immutable fatal-cycle result, and only then
+      publishes failed state; no competing CAS/watch owner or lock inversion
+      exists. Restart appends reconciliation and opens a new epoch/cycle without
+      rewriting old evidence. Only outer lock `acquired` binds one prebound
+      router; inner bootstrap transitions `starting -> normal|failed` and
+      `normal -> failed`, while failed bootstrap retains its guard without a pool
+      or in-process retry. The zero-DB Operator GraphQL exception accepts exactly
+      the shipped `P031DaemonStatus` body, empty variables, and
+      `daemonStatus { json }` AST. `persist_fatal` failure cannot reopen service.
 - [ ] Session lineage, generation, process binding, launch barrier, PID/start
       identity, and bounded cleanup support run-agent, P086-continuation, and
       Steward-lane owners without signalling an identity-ambiguous process.
@@ -4422,44 +4781,59 @@ tree and includes their common `HEAD`.
       repair/fallback, P086, and Steward prompts.
 - [ ] Migration 095 remains byte-identical. New migration 100 owns complete P079
       v2 DDL and exact 095-source mapping, stages/restarts without row loss or
-      merging, routes dangling mandatory identities only to typed quarantine
-      with canonical-plus-quarantine count/digest proof, and enforces selected
-      budget, provenance, source schema/key, work item, turn, operation, attempt,
-      active/terminal state, and timestamp constraints through direct-SQL negatives.
+      merging, routes dangling mandatory identities including fallback-child
+      mismatch to typed quarantine with independent per-source
+      canonical-plus-quarantine count/digest proof, and enforces unique logical
+      admission, selected budget, provenance, source schema/key, work item, turn,
+      operation, attempt, terminal immutability, active state, and timestamps
+      through direct-SQL negatives. A filtered embedded migrator runs `<=100`,
+      Rust finalization, then `>100`; synthetic migration 101 cannot run early.
 - [ ] P079 repair uses `OutputContractRepair`; its fallback child remains an
       `InvokeAgent` item but carries typed `production.p079_fallback`
       provenance and `p079_fallback_child` prompt ownership. Its initial permit
       joins operation/attempt/lease/parent/binding authority, and collateral loss
       permits zero transparent fresh session, attach, or replay. Original and
       repair turns use distinct receipt attempts on the same physical generation;
-      post-validation settlement atomically closes item, lease, operation, event,
-      parent/transition, and artifact publication or quarantine.
+      validation settlement closes item/lease and writes one prepared artifact
+      intent while parent/transition stay held. The daemon reconciler performs
+      bounded staged fsync plus same-filesystem publish/quarantine rename, then a
+      second Class A completion settles intent/operation/event/parent. Crash at
+      every boundary converges without duplicate publication or early release.
 - [ ] P058 prompt authority is an immutable complete
       execution/ledger/run/stage/agent/tier/kind/attempt/policy tuple. Composite
       FK plus insert/update/delete negatives prevent cross-ledger use or
       post-reservation tier mutation.
-- [ ] P086 admission atomically commits command, continuation, item, turn, and
-      side effect plus immutable resume-context ID/digest. Resurrection launches
-      and binds process identity before checking advertised ACP resume capability,
-      uses only exact frozen `session/resume` inputs, rejects pre-response option
-      updates without reordering, and requires a correlated complete response
-      option catalog before set/readback. Every post-launch failure reaps by
-      identity. Every mode owns configuration evidence,
-      preserves target execution/occurrence, rejects fresh fallback, and passes
-      the exhaustive old phase/release migration oracle.
+- [ ] P086 admission atomically commits command, continuation/context/deadline,
+      item, turn, side effect, active attempt, pre-session generation,
+      spawn-pending process intent, and owner binding before broker I/O. It uses
+      one persisted absolute deadline through acquisition, launch, initialize,
+      resume, reverify, receipt, and reap; restart/replay allocates nothing.
+      Provider session identity is an opaque random surrogate on every public
+      row/surface and raw wire identity is available only through the private
+      zeroizing resolver. Resurrection binds process identity before checking
+      advertised capability, uses only frozen `session/resume` inputs, rejects
+      pre-response option updates, and requires a correlated complete response
+      catalog. Every post-launch failure reaps by identity; every mode owns
+      configuration evidence, preserves target occurrence, rejects fresh
+      fallback, and passes the old phase/release oracle.
 - [ ] Steward persists analysis and both internal lane owners before provider
-      I/O, uses no synthetic run/execution, applies one total delivery reducer
-      including `steward_pending|steward_sent|unknown`, preserves failed turn `0`
-      before allocating retry turn `1`, and distinguishes cancellation before
-      dispatch, during dispatch, and after prompt sent. Both lanes settle with at
-      most one durable zero-send retry.
+      I/O, uses no synthetic run/execution, and exposes only sealed analysis-claim,
+      auditor-activation, and zero-send-retry constructors over the private turn
+      allocator. It applies one total delivery reducer including
+      `steward_pending|steward_sent|unknown`, preserves failed turn `0` before
+      allocating retry turn `1`, and distinguishes cancellation before dispatch,
+      during dispatch, and after prompt sent. Both lanes settle with at most one
+      durable zero-send retry.
 - [ ] The closed collateral matrix covers ordinary, P017, P058, P079 repair,
       P079 fallback, P086, and Steward. A sent collateral turn is never replayed;
-      only the explicit ordinary policy may allocate a fresh generation after
-      closure.
+      only the explicit ordinary policy or Steward's durable zero-send
+      turn-0-to-turn-1 retry CAS may allocate a fresh generation after closure;
+      P079/P086 never may.
 - [ ] Startup keeps consumers closed until migration, receipt/invalidation,
       process, turn, quarantine, and owner reconciliation complete. Generated
-      replay selectors reject every unresolved or unclassified path.
+      replay selectors reject every unresolved or unclassified path. Duplicate,
+      anomalous, and failed lock outcomes never bind/open; only the acquired
+      guard enters phased preflight and can publish a router.
 - [ ] The ten exact production producer IDs, including typed P079 fallback,
       delegate to sealed envelope enqueue/claim validation; legacy migration is
       separate, and compiled/occurrence identity survives retry/fallback without
@@ -4494,30 +4868,35 @@ tree and includes their common `HEAD`.
       states. One formatter owns visual, Help, copy, and accessibility values and
       never renders invalidated or planned values as actual. Cancellation before
       acceptance and after verified acceptance have byte-distinct copy and legal
-      tuple predicates.
+      tuple predicates. Every legal state, configured-missing acceptance,
+      bounded legacy ambiguity, and generic illegal tuple has exact normative
+      visual/Help/copy/accessibility bytes.
 - [ ] Timeline and raw-detail identity preserve exact event, execution,
       occurrence, sequence, presentation-row, and lane tuples through DB,
-      GraphQL, shipped Swift DTOs, the mandatory occurrence-presentation join,
-      filtering, expansion, and copy. Missing/duplicate/cross-run joins fail. The old
-      `rte_` algorithm/handles remain byte-compatible; all six raw-detail status
-      rows obey exact raw/error/identity nullability; null-row events remain in
-      the separate deterministic `Run events` lane.
+      GraphQL, shipped Swift DTOs, conditional occurrence-presentation join,
+      filtering, expansion, and copy. Identity-bearing rows require the join;
+      authorized unassociated events use run-events; `missing`/`unauthorized`
+      require null identity and never attempt a join. The old `rte_` algorithm/
+      handles remain byte-compatible and all six status rows obey exact
+      raw/error/identity nullability.
 - [ ] One `RunOccurrenceSelectionReducer` owned by
       `P031RunsHomeViewModel` governs Overview, Stages, Timeline, Run Inspector,
       popover, and focus. It retains prior selected-row metadata across row-array
-      replacement and uses exact tagged, injective surface/control-qualified
-      targets. A generation-qualified publication owner drops every stale run
+      replacement, represents semantic selection as occurrence/run-events/empty,
+      preserves run-events across row churn, and uses injective event-row/expand/
+      copy/raw-detail targets. A generation-qualified publication owner drops every stale run
       response/update without mutating the newer run. It has no per-run
       dictionary, view-local agent selection, or
       `activeTimelineAgents.first` fallback.
-- [ ] Every row/control accessibility value includes the exact planned,
-      sequenced, or legacy human occurrence discriminator and no digest, UUID, or
-      provider-session ID. Static, dynamic, and legacy source ordinals are unique
-      and rendered as locale-independent ASCII decimal. Opaque row identity
-      remains only in the machine accessibility identifier. Pure/hosted tests
-      prove exact formatter strings plus real `.focused`/first-responder targets;
-      this proposal does not claim local proof of physical
-      keyboard or VoiceOver event delivery.
+- [ ] Accessibility implements the exhaustive subject/control matrix. Only
+      occurrence controls include the exact planned, sequenced, or legacy human
+      discriminator; event controls use event plus occurrence/run-events lane,
+      while close, heading, run-events, and empty controls use their exact
+      discriminator-free strings. No spoken value contains a digest, UUID, or
+      provider-session ID. Source ordinals use locale-independent ASCII decimal;
+      opaque identity remains only in machine identifiers. Pure/hosted tests
+      prove every legal pair, reject illegal pairs, and assert real `.focused`/
+      first-responder targets without claiming physical keyboard/VoiceOver proof.
 - [ ] `./scripts/test-gate.sh codex-model-truth` runs nonzero Rust and
       independently nonzero pure/hosted Swift suites and the exact shared legs
       from P027/P058/P075/P079/P086. The composed gate and all five standalone
