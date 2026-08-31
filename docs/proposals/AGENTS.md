@@ -23,6 +23,9 @@ docs/proposals/NNN-title_IMPLEMENTATION_AUDIT_RN.md
 ## Proposal-readiness rules
 
 - Read the proposal first.
+- Measure the proposal with `wc -l` before refinement or review. At `>= 2,000` physical lines, report a scope blocker and require decomposition; do not request or add further substantive detail to the same file.
+- An over-limit parent may retain only the problem statement, shared invariants, dependency order, cheapest useful hypothesis test, minimal acceptance criteria, and links. Independently implementable contracts, proof obligations, migrations, UI slices, and rollout phases belong in child proposals with their own scope, acceptance criteria, proof gate, and lifecycle.
+- Existing over-limit proposals may receive only decomposition corrections. Generated evidence, implementation-audit output, and canonical reference documentation are outside this active-proposal line budget.
 - Reuse `.review-baselines/current-system-baseline.md` and `docs/reference/current-system-baseline.md` before source archaeology.
 - Prefer current `docs/reference/` docs over stale proposal dependencies.
 - Inspect only current code slices needed for the proposal's claimed seams.

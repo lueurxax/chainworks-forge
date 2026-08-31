@@ -888,7 +888,8 @@ execute `openat(O_WRONLY)`, rename, hard/symbolic link, clone, truncate, chmod,
 xattr, backend network, local socket, and descendant-helper variants against
 read-only, read-write, sibling, daemon-control, canonical, and source-workspace
 roots on every supported macOS release. The pinned backend outbound probe must
-succeed; inbound/listen, ambient local socket, undeclared endpoint, and all
+succeed only through the exact `ProviderEgressBrokerV1`; direct DNS/IP/backend,
+inbound/listen, ambient local socket, undeclared endpoint, proxy bypass, and all
 filesystem operations outside each declared mode must fail.
 
 The supervised child is then launched and bound to target process identity.
@@ -1329,11 +1330,14 @@ envelope and allowlisted environment, installs the final provider-specific
 Seatbelt profile, then performs the sole final `execve`. That profile denies
 filesystem access by default, grants only verified private launch/runtime/
 materialized-root paths with their frozen read/write modes, denies inbound
-network/listen and ambient local sockets, and grants outbound network only for
-adapter classes whose pinned backend contract requires it. Approved stdio MCP
-FDs are explicit; no HTTP/SSE/WebSocket MCP endpoint becomes reachable merely
-because provider backend egress is enabled. Profiles are generated from a
-closed adapter capability manifest and compiled/probed on every supported
+network/listen and ambient local sockets, and denies direct external DNS,
+TCP, UDP, QUIC, and Unix-socket opens. A provider that requires backend access
+receives only a generated `HTTPS_PROXY` endpoint for the one already-bound
+per-generation loopback `ProviderEgressBrokerV1`; Seatbelt permits outbound
+connect only to that exact loopback address/port and denies every other network
+destination. Approved stdio MCP FDs are explicit; no HTTP/SSE/WebSocket MCP
+endpoint becomes reachable through the backend broker. Profiles are generated
+from a closed adapter capability manifest and compiled/probed on every supported
 macOS release before that adapter is enabled. The PID and start identity remain
 stable across final `execve`. On any pre-exec or `execve` failure the helper
 writes one fixed-size errno/phase record and exits; successful `execve` writes
@@ -1349,6 +1353,28 @@ identity, code signature, private inode set, and manifest again before moving
 `provider_exec_released -> running` and before `initialize`. An empty or
 unverifiable identity is `identity_ambiguous`, closes prompt admission, and is
 never signalled by PID alone.
+
+`ProviderEgressAuthorityV1` is frozen before broker bind and included in the
+launch-release digest. It contains schema version, provider/adapter executable
+digest, exact lowercase HTTPS CONNECT host allowlist, port `443`, DNS resolver
+policy, forbidden IP classes, system-trust-only TLS policy, redirect target
+policy, maximum concurrent connections, request/connect/idle byte and time
+budgets, expiry, and broker endpoint/nonce. The broker alone resolves DNS and
+rejects loopback, link-local, multicast, private, documentation, unspecified,
+or changed-address results unless an exact checked-in backend exception names
+that address set. Each initial request or redirect creates a new CONNECT and is
+rechecked against the same host/port authority; cross-host redirects require an
+independently listed target. Custom CA/client certificates, ambient proxy
+chains, CONNECT to an IP literal, cleartext HTTP, UDP/QUIC, proxy authentication
+from provider data, and a destination outside the digest are denied. The
+provider retains end-to-end TLS and hostname validation through the tunnel; all
+custom trust environment variables are absent. An adapter that cannot be
+forced through this broker is unsupported and fails zero-send before launch.
+The broker logs only authority digest, bounded counters, and typed reason codes,
+never URL paths, headers, prompts, response bodies, credentials, or DNS payloads.
+Descendant, alternate resolver, direct IP, redirect, proxy-bypass, IPv4/IPv6,
+and connection-reuse fixtures prove the backend succeeds only through the
+authorized broker and all other network paths fail at the OS or broker boundary.
 
 `VerifiedProviderLaunchImageV1` is prepared completely before child creation or
 secret/environment materialization. The launcher resolves the adapter entrypoint
@@ -1395,8 +1421,11 @@ passed to the gate in the single `SCM_RIGHTS` release message as already-open
 descriptors; no pre-release path or file is created.
 
 The release envelope uses `env_clear` and one provider-version-pinned allowlist;
-unknown variables and all `DYLD_*`, shell startup, proxy, credential-helper, and
-ambient MCP variables are rejected. The launch gate receives resolved values
+unknown variables and all `DYLD_*`, shell startup, ambient proxy,
+credential-helper, custom TLS trust, and ambient MCP variables are rejected.
+For a brokered backend the launcher alone inserts exact `HTTPS_PROXY` from the
+frozen egress authority and an empty `NO_PROXY`; provider/workspace/catalog
+input cannot set or override either value. The launch gate receives resolved values
 only in the authenticated sequenced-packet release, zeroizes its buffer on every
 branch, closes the socket before `execve`, and cannot serialize or log it.
 Canary credentials cover
@@ -1405,6 +1434,22 @@ verification, private-image verification, release write, target `execve`, and
 post-exec identity verification. Every pre-release failure proves resolver call
 count zero and no auth file/header/environment materialization; every later
 failure proves bounded process cleanup and zeroized private state.
+
+The existing Claude SDK filesystem debug sink is not carried across this
+boundary. `ClaudeSessionDebugPolicyV1` requires `_meta.claudeCode.options` to
+omit `debugFile` for every ordinary, P079, and P086 launch; a source scan and
+serialized-session fixture reject any `claude-sdk-debug` path or other provider-
+writable diagnostic file. The existing filtered `emitRawSDKMessages` stream may
+remain only as bounded ACP transport input: it is subject to the same line/byte
+budget, secret sanitizer, authorization, retention, and terminal purge as other
+provider envelopes and is never mirrored to a raw file, tracing field, artifact,
+or northbound response. Startup performs a no-follow, exact-root cleanup of
+legacy `runtime/claude-sdk-debug` files after proving they are not referenced by
+durable authority; it deletes at most 128 files/16 MiB per pass, checkpoints the
+cursor, and keeps failed-serve on malformed, linked, oversized, or out-of-root
+entries. Raw diagnostic bytes are not evidence for attach, settlement, repair,
+or replay. Tests inject prompt, token, and provider-session sentinels and prove
+they appear in none of the retained files, logs, errors, artifacts, or readback.
 
 After gate release, `proc_pidpath`, PID/start identity, and the private entrypoint
 inode must match the precommitted launch image before `initialize`; mismatch is
@@ -1567,17 +1612,22 @@ loser performs zero launch/session/prompt I/O.
 All new non-startup writes obey the P075 gateway. They are registered in
 `control-plane/crates/db/write-operation-registry.toml`; direct pool
 transactions are forbidden outside the existing startup/migration bypass.
-`ClassARegistryManifestV1` is generated from every row in that complete
-registry, including all rows that predate this proposal. Each generated row is
-the exact tuple `(operation_name, lane, replay_key_schema, request_codec,
+`ClassARegistryManifestV1` is generated from every registry row whose declared
+write class is exactly `A`, including all Class A rows that predate this
+proposal. Class B/C/D rows are excluded from this journal manifest and retain
+their pre-proposal registry bytes, queue policy, retry policy, and shutdown
+behavior. Each generated Class A row is the exact tuple
+`(operation_name, lane, replay_key_schema, request_codec,
 result_codec, replay_rule, natural_owner_selector, completion_callback,
 proved_no_start_callback, shutdown_policy)`. None may be null, wildcard, or a
 generic fallback. The build compares the sorted generated manifest with the
-registry and the Rust codec/selector/callback inventories in both directions;
-any missing, extra, duplicate, or renamed operation is a compile/gate failure.
-Existing operations retain their existing result type and behavior through an
-explicit generated adapter row rather than being silently omitted from the V1
-journal. The following table is the normative proposal delta, not the complete
+Class A projection of the registry and the Rust codec/selector/callback
+inventories in both directions; any missing, extra, duplicate, misclassified,
+or renamed Class A operation is a compile/gate failure. A separate zero-diff
+guard proves this proposal changes no Class B/C/D row or policy. Existing Class
+A operations retain their existing result type and behavior through an explicit
+generated adapter row rather than being silently omitted from the V1 journal.
+The following table is the normative proposal delta, not the complete Class A
 registry:
 
 | Operation name | Lane / replay key | Shutdown policy |
@@ -1808,8 +1858,9 @@ cycle/open epoch only when the original immutable attempt/receipt/failure/turn/
 cycle witness still exists. There is no generic "current row equals result"
 fallback. The proposal-delta result/replay mapping is shown below. The
 generated `ClassARegistryManifestV1` is the exhaustive mapping for the complete
-registry; the gate proves every pre-existing and new operation has exactly one
-concrete row even when it is not repeated in this prose table:
+Class A registry subset; the gate proves every pre-existing and new Class A
+operation has exactly one concrete row even when it is not repeated in this
+prose table, while Class B/C/D operations have zero manifest rows:
 
 | Registered operation | Result codec | Effect rows and replay rule |
 |---|---|---|
@@ -1844,7 +1895,8 @@ concrete row even when it is not repeated in this prose table:
 Every codec contains its natural IDs and closed outcome; no generic string
 result is accepted. The registry generator requires exactly one manifest row,
 codec, replay rule, selector, completion callback, proved-no-start callback,
-and shutdown policy for every operation name. Commit-before-ack reconciliation
+and shutdown policy for every Class A operation name and exactly zero such rows
+for Class B/C/D operation names. Commit-before-ack reconciliation
 reads this journal, runs the listed replay verifier in one read transaction,
 and returns the stored result. Missing journal remains `Unknown` even if some
 natural rows appear suggestive; journal-with-missing/mismatched natural truth
@@ -1933,13 +1985,19 @@ permit release after known result, proven rollback, or process-exit transfer to
 startup.
 
 Migration 100 also creates durable `class_a_reconciliation_pending_v1` intents
-for every Class A operation and singleton
+for every Class A operation, append-only
+`class_a_reconciliation_pending_terminals_v1` outcomes, and singleton
 `class_a_reconciliation_checkpoint_v1(last_result_sequence,
 last_result_chain_sha256, updated_at)`, initialized to sequence `0` and the
 64-zero chain sentinel. A pending parent stores at most 16 KiB of fixed scalar
 request JSON, operation/key/full-request digest, owner selector, transfer boot
-ID/time, `request_member_count`, `request_membership_sha256`, and one-way
-`pending -> resolved_result | proved_rollback_or_no_start | fatal` state.
+ID/time, `request_member_count`, `request_membership_sha256`, and an immutable
+sealed-intent identity. It has no mutable state column. The terminal table is
+keyed by the same `(operation_name, journal_key)`, has exactly one closed
+`outcome = resolved_result | proved_rollback_or_no_start | fatal`, nullable
+`result_sequence` required only for `resolved_result`, the exact terminal-proof
+digest, and `terminalized_at`. Its foreign key requires the sealed parent;
+insert is the only terminal transition and update/delete are rejected.
 Variable request collections are never embedded in that JSON. They use sealed
 `class_a_reconciliation_pending_request_members_v1` child rows with exact key
 `(operation_name, journal_key, member_ordinal)`, bounded `member_kind`, at most
@@ -1954,20 +2012,25 @@ without a 16-KiB aggregate assumption.
 The intent transaction inserts all children first and the parent last. Parent
 insert validates contiguous ordinals, count, aggregate digest, and full request
 digest; parent presence seals the child set. Parent and children reject update
-or delete, and post-seal child insert is rejected. Same-key replay requires
-byte-identical scalar and child rows. The resulting maximum P079 pending object
+or delete, terminal rows reject update/delete, and post-seal child insert is
+rejected. Same-key replay requires byte-identical scalar and child rows. The
+resulting maximum P079 pending object
 is below 1.7 MiB and participates in the existing 4-MiB startup batch budget;
 the reader streams children in ordinal order rather than materializing all 200.
 The idempotent sealed-intent insert is acknowledged before the
 domain transaction can start and before any provider/process/prompt I/O; an
 uncertain intent acknowledgement is read back by exact key, and failure to prove
 it closes first fatal without starting the operation. The domain transaction
-that inserts effect/result rows also moves its intent to `resolved_result`.
-Process death rolls an uncommitted domain transaction back while leaving the
-intent, so startup can prove rollback/no-start from the absent result and absent
-registered natural witnesses before terminalizing the intent. Startup consumes
-both sources: unresolved pending intents first, then result rows strictly after
-the durable high-water sequence.
+that inserts effect/result rows also inserts the unique `resolved_result`
+terminal successor referencing that result sequence. Process death rolls an
+uncommitted domain transaction back while leaving the intent without a terminal
+successor, so startup can prove rollback/no-start from the absent result and
+absent registered natural witnesses before inserting the unique
+`proved_rollback_or_no_start` successor. An unprovable or corrupt intent receives
+the unique `fatal` successor only in the first-fatal transaction. Startup
+consumes both sources: sealed intents lacking a terminal successor first, then
+result rows strictly after the durable high-water sequence. No code updates a
+pending parent to represent progress.
 
 Fresh/restart fixtures use 0, 1, 2, 199, and 200 P079 descriptors, including a
 canonical request larger than 16 KiB, and crash before each child, before the
@@ -2888,6 +2951,97 @@ CREATE TABLE p079_artifact_settlement_members_v1 (
           destination_committed_at IS NOT NULL AND completed_at IS NOT NULL))
 );
 
+CREATE TABLE p079_artifact_reconciliation_chunks_v1 (
+  artifact_set_id TEXT NOT NULL,
+  member_ordinal INTEGER NOT NULL,
+  phase TEXT NOT NULL CHECK (phase IN (
+    'history_member','destination_member'
+  )),
+  chunk_ordinal INTEGER NOT NULL CHECK (chunk_ordinal >= 0),
+  byte_offset INTEGER NOT NULL CHECK (byte_offset >= 0),
+  byte_count INTEGER NOT NULL CHECK (
+    byte_count > 0 AND byte_count <= 1048576
+  ),
+  source_device INTEGER NOT NULL,
+  source_inode INTEGER NOT NULL,
+  source_generation TEXT NOT NULL,
+  source_size INTEGER NOT NULL CHECK (source_size >= 0),
+  source_content_sha256 TEXT NOT NULL
+    CHECK (length(source_content_sha256) = 64),
+  destination_temp_device INTEGER NOT NULL,
+  destination_temp_inode INTEGER NOT NULL,
+  destination_temp_generation TEXT NOT NULL,
+  chunk_sha256 TEXT NOT NULL CHECK (length(chunk_sha256) = 64),
+  sha256_resume_state_v1 BLOB NOT NULL
+    CHECK (length(sha256_resume_state_v1) BETWEEN 48 AND 192),
+  sha256_resume_state_sha256 TEXT NOT NULL
+    CHECK (length(sha256_resume_state_sha256) = 64),
+  previous_chunk_chain_sha256 TEXT NOT NULL
+    CHECK (length(previous_chunk_chain_sha256) = 64),
+  chunk_chain_sha256 TEXT NOT NULL
+    CHECK (length(chunk_chain_sha256) = 64),
+  completed_at TEXT NOT NULL,
+  PRIMARY KEY (artifact_set_id, member_ordinal, phase, chunk_ordinal),
+  UNIQUE (artifact_set_id, member_ordinal, phase, byte_offset),
+  FOREIGN KEY (artifact_set_id, member_ordinal)
+    REFERENCES p079_artifact_settlement_members_v1(
+      artifact_set_id, member_ordinal
+    ),
+  CHECK (byte_offset + byte_count <= source_size)
+);
+
+CREATE TRIGGER p079_chunk_append_guard
+BEFORE INSERT ON p079_artifact_reconciliation_chunks_v1
+BEGIN
+  SELECT CASE WHEN NEW.chunk_ordinal <> COALESCE((
+    SELECT MAX(chunk_ordinal) + 1
+      FROM p079_artifact_reconciliation_chunks_v1
+     WHERE artifact_set_id = NEW.artifact_set_id
+       AND member_ordinal = NEW.member_ordinal
+       AND phase = NEW.phase
+  ), 0) THEN RAISE(ABORT, 'p079_chunk_ordinal_non_successor') END;
+  SELECT CASE WHEN NEW.byte_offset <> COALESCE((
+    SELECT byte_offset + byte_count
+      FROM p079_artifact_reconciliation_chunks_v1
+     WHERE artifact_set_id = NEW.artifact_set_id
+       AND member_ordinal = NEW.member_ordinal
+       AND phase = NEW.phase
+     ORDER BY chunk_ordinal DESC LIMIT 1
+  ), 0) THEN RAISE(ABORT, 'p079_chunk_offset_non_contiguous') END;
+  SELECT CASE WHEN NEW.source_content_sha256 <> (
+    SELECT candidate_sha256 FROM p079_artifact_settlement_members_v1
+     WHERE artifact_set_id = NEW.artifact_set_id
+       AND member_ordinal = NEW.member_ordinal
+  ) OR NEW.source_size <> (
+    SELECT candidate_byte_count FROM p079_artifact_settlement_members_v1
+     WHERE artifact_set_id = NEW.artifact_set_id
+       AND member_ordinal = NEW.member_ordinal
+  ) THEN RAISE(ABORT, 'p079_chunk_source_truth_mismatch') END;
+  SELECT CASE WHEN NEW.previous_chunk_chain_sha256 <> COALESCE((
+    SELECT chunk_chain_sha256
+      FROM p079_artifact_reconciliation_chunks_v1
+     WHERE artifact_set_id = NEW.artifact_set_id
+       AND member_ordinal = NEW.member_ordinal
+       AND phase = NEW.phase
+     ORDER BY chunk_ordinal DESC LIMIT 1
+  ), '0000000000000000000000000000000000000000000000000000000000000000')
+  THEN RAISE(ABORT, 'p079_chunk_chain_predecessor_mismatch') END;
+  SELECT CASE WHEN NEW.chunk_chain_sha256 <>
+    chainworks_p079_chunk_chain_sha256(
+      NEW.previous_chunk_chain_sha256, NEW.artifact_set_id,
+      NEW.member_ordinal, NEW.phase, NEW.chunk_ordinal, NEW.byte_offset,
+      NEW.byte_count, NEW.chunk_sha256, NEW.sha256_resume_state_sha256
+    ) THEN RAISE(ABORT, 'p079_chunk_chain_digest_mismatch') END;
+END;
+
+CREATE TRIGGER p079_chunk_immutable_update
+BEFORE UPDATE ON p079_artifact_reconciliation_chunks_v1
+BEGIN SELECT RAISE(ABORT, 'p079_chunk_immutable'); END;
+
+CREATE TRIGGER p079_chunk_immutable_delete
+BEFORE DELETE ON p079_artifact_reconciliation_chunks_v1
+BEGIN SELECT RAISE(ABORT, 'p079_chunk_immutable'); END;
+
 CREATE TABLE p079_artifact_activation_history_v1 (
   run_id TEXT NOT NULL REFERENCES runs(id),
   canonical_relative_path TEXT NOT NULL,
@@ -3324,9 +3478,11 @@ the guarded Rust finalizer may replace staging relations and, after all copy,
 authority, trigger, and verification phases commit, produce the byte-equal
 final manifest containing operations, slots, leases, attempt links,
 fallback-parent links, validation evidence, no-candidate witnesses, settlement
-allocator, sets, members, activation history/current activation, activation
-conflicts, reconciliation checkpoint, migration quarantine, and active
-authority. No file or code path may call the staging manifest canonical/final.
+allocator, sets, members, reconciliation chunks plus all three chunk triggers
+and the chunk-chain function-version digest, activation history/current
+activation, activation conflicts, reconciliation checkpoint, migration
+quarantine, and active authority. No file or code path may call the staging
+manifest canonical/final.
 
 Startup selects exactly one expected manifest from the durable phase row before
 any P079 selector or reconciler can run; a staging database claiming final phase,
@@ -3615,14 +3771,29 @@ Member copy/hash work is crash-safe and chunked rather than indivisible.
 `p079_artifact_reconciliation_chunks_v1` is keyed by
 `(artifact_set_id, member_ordinal, phase, chunk_ordinal)` and stores exact source
 device/inode/generation, source size, byte offset/count (at most 1 MiB), chunk
-SHA-256, destination-temp identity, and completion time. A startup-only guarded
-writer appends one row only after that chunk is written and synced; rows reject
-update/delete and contiguous-offset triggers reject gaps or overlap. Resume
-reopens both identities without symlinks, verifies every retained chunk digest,
-and continues at the first absent offset. The final aggregate SHA-256 is over
-the ordered chunk digests plus exact total size and must equal the frozen member
-digest before the ordinary history/destination Class A operation may rename or
-commit state. A member larger than the remaining 8-MiB soft budget may continue
+SHA-256, destination-temp identity, the exact bounded
+`Sha256ResumeStateV1`, its digest, predecessor/chunk-chain digests, and
+completion time. `Sha256ResumeStateV1` freezes the SHA-256 implementation
+version, eight chaining words, total byte count, and 0...63-byte partial block;
+its encoder/decoder and continuation/finalization have independent known-answer
+vectors across every 1-MiB boundary. A startup-only guarded writer updates that
+content state from the exact buffer written, syncs the destination, and appends
+one row in that order. Rows reject update/delete; the shown trigger rejects
+ordinal/offset gaps, overlap, source size/content-digest drift, or chunk-chain
+forks. If a crash leaves bytes beyond the last committed row, resume reopens
+both identities without symlinks, verifies the durable size/identity, truncates
+only the private destination temp to the committed end, restores the last
+validated content state, and continues at the first absent offset.
+
+The two digests are deliberately different authorities.
+`chunk_chain_sha256` is a domain-separated hash over ordered chunk metadata and
+state digests and is used only for journal/restart integrity; it is never
+compared with a content hash. After the final byte, finalizing the restored
+content state yields SHA-256 over the exact concatenated file bytes and must
+equal `p079_artifact_settlement_members_v1.candidate_sha256` before the ordinary
+history/destination Class A operation may rename or commit state. Mutation
+fixtures prove that substituting a chunk-tree digest for content SHA fails.
+A member larger than the remaining 8-MiB soft budget may continue
 alone in at most 1-MiB chunks up to the frozen 10-MiB output limit plus 2 MiB of
 bounded authority/copy overhead; no second member starts after crossing soft
 budget, and 12 MiB is the single startup-attempt hard cap. A member above 10 MiB
@@ -3843,11 +4014,19 @@ instead of deriving it from secret bytes. The private table stores the raw wire
 ID only for ACP resume, is reachable solely through a crate-private
 `ProviderSessionSecretResolver` capability, and is excluded from generic repos,
 debug derives, tracing, artifacts, new authority JSON codecs, and all new
-northbound schemas. The capability has exactly two call purposes:
-`provider_wire`, which returns a zeroizing buffer scoped to one
-`session/resume` serialization, and `legacy_projection`, which may populate only
-an already-existing authorized raw-ID compatibility field. New private
-acceptance/receipt authority JSON uses `provider_session_ref_id`.
+northbound schemas. The capability has exactly two call purposes.
+`claude_session_new_resume_session_id_v1` requires a non-cloneable
+`ClaudeAttachSerializationPermitV1` bound to continuation, context, source and
+target generations, attach-protocol tag, exact ACP request ID, serializer
+version/digest, and one-use nonce; it returns a zeroizing buffer consumable only
+while serializing that exact `session/new.params.resumeSessionId` member.
+`legacy_projection` may populate only an already-existing authorized raw-ID
+compatibility field. There is no generic `provider_wire` purpose. Generic
+`session/resume`, `session/load`, another request ID, another serializer,
+untagged `session/new`, logging/debug formatting, or reuse after serialization
+cannot construct or consume the permit and therefore receives zero raw bytes
+and sends zero ACP request. New private acceptance/receipt authority JSON uses
+`provider_session_ref_id`.
 
 Frozen `AcpRuntimeReceipt` v1 and every existing authorized GraphQL/MCP/report
 `provider_session_id` field keep their historical nullable raw-provider-ID
@@ -4326,26 +4505,28 @@ advance without byte-equal source and destination manifests.
 1. A custom ledger preflight compares every applied version/checksum against the
    full embedded source, rejects an applied version above the binary maximum,
    and reads provider-truth phase without invoking SQLx's missing-version check.
-2. If phase is already `complete`, it skips the filtered migrator entirely and
-   runs only the ordinary full embedded `Migrator`; this is the clean-restart
-   path after 101+ has been applied.
+2. If phase is already `final_swap_committed`, it skips the filtered migrator
+   entirely and runs only the ordinary full embedded `Migrator`; this is the
+   clean-restart path after 101+ has been applied.
 3. Otherwise, preflight requires no applied version above 100, constructs a
    filtered SQLx `MigrationSource` containing exactly versions `<= 100`, and
    runs it. Migration 100 becomes ledger-visible but no 101+ SQL executes.
 4. The Rust coordinator resumes or starts migration-100 finalization, verifies
-   the final schema, and durably marks phase `complete` while holding the guard.
-5. Only after a fresh complete read does the full embedded `Migrator` run;
-   applied `<= 100` entries are checksum-verified/skipped and pending `> 100`
-   migrations execute in order.
+   the final schema, and durably marks phase `final_swap_committed` while
+   holding the guard.
+5. Only after a fresh `final_swap_committed` read does the full embedded
+   `Migrator` run; applied `<= 100` entries are checksum-verified/skipped and
+   pending `> 100` migrations execute in order.
 
 The filtered source is constructed from the same embedded migration bytes and
 checksums as the full source, not copied SQL. A tracked-equal DB with migration
-100 applied but incomplete phase cannot enter the complete-phase branch or
+100 applied but incomplete phase cannot enter the final-phase branch or
 bypass Rust finalization. A synthetic migration
 101 fixture records that its SQL side effect and `_sqlx_migrations` row are both
 absent at every migration-100 crash point, then appear exactly once after final
-phase completion. A second clean restart after 101 proves the complete-phase
-branch skips the filtered source and accepts the full ledger unchanged.
+phase completion. A second clean restart after 101 proves the
+`final_swap_committed` branch skips the filtered source and accepts the full
+ledger unchanged.
 An applied version above 100 while phase 100 is still incomplete is not repaired
 or adopted: it is typed operator-only corruption
 `provider_truth_future_migration_applied_before_phase_complete`, retains the
@@ -4372,7 +4553,8 @@ snapshot digest and original-table fence, runs
 `ProviderTruthSchemaFinalizer`, and rebuilds each
 target table with final NOT NULL/CHECK/FK/unique constraints, copies only
 validated rows, runs `foreign_key_check` plus invariant queries, switches the
-compatibility views, removes fence triggers, and marks phase `complete`. No later
+compatibility views, removes fence triggers, and marks phase
+`final_swap_committed`. No later
 numbered SQL migration is needed to add those constraints. Only then does
 preflight open the normal foreign-key-enforcing runtime pool. A failure in
 staging, snapshot/fence creation, any batch, final copy, or verification leaves
@@ -8271,7 +8453,7 @@ commits, or from an implementation file absent from the manifest, is invalid.
 |---|---|
 | `workflow` + `domain` | Exact seven-profile matrix; per-profile frozen capabilities and effective fallback contract; validated Steward catalog; fresh generic/invalid rejection; legacy replay; sealed provenance union including typed P079 fallback; exact ten-ID manifest with occurrence-free P017 identity branch and occurrence-bound other producers; typed P058 owner; `OutputContractRepair` work-item kind; complete compiled-coordinate, condition, binding, dynamic-key, deterministic enqueue-time occurrence allocation, unique human-source ordinal, legacy ordering, sequence, and presentation vectors |
 | `acp` fake provider + `engine` dispatch | Response-closed negotiation plus generation-owned `config_option_update` snapshot; class-tagged receipt/readiness permits and complete provider-class x owner-kind dispatch matrix; one private `GenerationReservationWriterV1` invoked only inside the five registered enclosing operation families, including contained P079 repair/fallback admission and output-only conversion; enforced Seatbelt staging containment with no external MCP, direct-write, syscall-mode, and descendant escape negatives; P086 admission-time opaque session ref, complete source/effective MCP inventories and required/optional transport matrix, source descriptor/inode/mount-bound authorities copied into verified daemon-private materialized roots enforced by Seatbelt, and context/window with boot-session plus continuous-time 30-second setup and 10-second pre-prompt cleanup authority, prompt deadline `min(setup, write+10s)`, ordinary 300/900-second post-send watchdog, sleep/wall-jump/reboot/legacy-clock reduction, bounded cursor-addressed post-expiry cleanup-only restart, configuration-journal-first cleanup, typed post-readiness outcome preservation, replacement-turn output-only conversion, post-launch capability proof, manifest-pinned exact Claude `session/new.params.resumeSessionId` attach and zero-send unsupported Codex branch, provider-neutral correlated readiness with optional diagnostic configOptions, ordered post-response updates, and parent-aware same-process/restart process cleanup with PID-reuse proof; verified signed helper/immutable private launch closure and trusted suspended launch gate remain inert until durable binding, release exact fixed-role FDs plus non-serializable secrets only through authenticated SOCK_SEQPACKET/SCM_RIGHTS after durable authority, and bind proc identity before initialize; raw-session sentinel absent from new authority/log/error evidence while existing authorized raw-ID projections and fixed-salt `SessionGeneration.providerSessionRef` remain byte-compatible and never contain `psref_*`; separate new/existing-generation reservations; many-to-one ownership with one prompt-through-terminal manager; acyclic typed authority/control ports and permit-only API; bounded broker/config/send/terminal-settlement/cleanup; complete stage-less P017/P058/P079/P086/Steward reducers and collateral matrix; executor loads the Steward claim-created turn and only the sealed turn-0 reservation permit may create its generation; owner-scoped versus generation cancellation; frozen deterministic fallback selection; Claude aliases unchanged |
-| `db` + `engine` recovery | Stable-inode outer lock acquired before any principal-table mutation plus guarded phased migration that skips the filtered source after phase completion, refuses an early 101 ledger as operator corruption, and accepts a full 101+ ledger on a second clean restart; complete generated zero-diff Class A registry manifest with operation/result codec/replay/natural-owner/callback/shutdown parity for every row, including separate receipt/readiness and P079 no-candidate settlement; immutable parent/member/absence witnesses, closed successor graphs, 0/1/512-member replay, fixed 512-permit reconciliation registry with terminal/fatal reserves, P086 cleanup-deadline-bounded late-commit handoff, global result sequence/hash chain, scalar-plus-child durable pending envelopes, 256-row/4-MiB/15-second startup batches, restart high-water continuation, and one-million-row no-rescan proof; barrier-before-SQLite global writer order and append-only fatal-cycle reconciliation before reopen; separate acknowledgement certainty and operation-specific domain outcomes; exact generation-binding receipt/readiness/failure/cancellation/post-outcome matrix plus append-only cleanup events; active owner attempts/receipts/invalidations/failures/cancellations; sealed Steward analysis/activation/retry generation constructors and cancellation reducer; prompt authority/quarantine; immutable migration-095 checksum plus disjoint exact `Migration100StagingSchemaManifestV1` and `Migration100FinalSchemaManifestV1`, validation/no-candidate evidence, settlement allocator/checkpoint/chunks, native-only logical and canonical-path uniqueness, deterministic one-winner migrated authority, independent lease/fallback quarantine accounting, immutable artifact history, per-member history/destination Class A operations, final DB-only completion, canonical activation CAS, and delete/update guards; immutable P058 execution/ledger/tier authority; exhaustive provider-session correlation manifest and purpose-limited private raw-ID resolver with no new public opaque ref; deterministic occurrence enqueue/copy-validation, unique human stage/task/event ordinals, run-local durable Timeline event journal/event-or-empty-anchor cursor, honest legacy-gap evidence, bounded backfill/checkpoint, and restart; exhaustive old P086 classifier; sealed legacy envelopes; closure-owned replay authorization |
+| `db` + `engine` recovery | Stable-inode outer lock acquired before any principal-table mutation plus guarded phased migration that skips the filtered source after phase completion, refuses an early 101 ledger as operator corruption, and accepts a full 101+ ledger on a second clean restart; complete generated zero-diff Class A registry manifest with operation/result codec/replay/natural-owner/callback/shutdown parity for every Class A row and zero B/C/D rows, including separate receipt/readiness and P079 no-candidate settlement; immutable pending parent/member rows plus append-only terminal successors, immutable effect/absence witnesses, closed successor graphs, 0/1/512-member replay, fixed 512-permit reconciliation registry with terminal/fatal reserves, P086 cleanup-deadline-bounded late-commit handoff, global result sequence/hash chain, scalar-plus-child durable pending envelopes, 256-row/4-MiB/15-second startup batches, restart high-water continuation, and one-million-row no-rescan proof; barrier-before-SQLite global writer order and append-only fatal-cycle reconciliation before reopen; separate acknowledgement certainty and operation-specific domain outcomes; exact generation-binding receipt/readiness/failure/cancellation/post-outcome matrix plus append-only cleanup events; active owner attempts/receipts/invalidations/failures/cancellations; sealed Steward analysis/activation/retry generation constructors and cancellation reducer; prompt authority/quarantine; immutable migration-095 checksum plus disjoint exact `Migration100StagingSchemaManifestV1` and `Migration100FinalSchemaManifestV1`, validation/no-candidate evidence, settlement allocator/checkpoint/chunk DDL with separate content-state and chunk-chain truth, native-only logical and canonical-path uniqueness, deterministic one-winner migrated authority, independent lease/fallback quarantine accounting, immutable artifact history, per-member history/destination Class A operations, final DB-only completion, canonical activation CAS, and delete/update guards; immutable P058 execution/ledger/tier authority; exhaustive provider-session correlation manifest and purpose-limited private raw-ID resolver with no new public opaque ref; deterministic occurrence enqueue/copy-validation, unique human stage/task/event ordinals, run-local durable Timeline event journal/event-or-empty-anchor cursor, honest legacy-gap evidence, bounded backfill/checkpoint, and restart; exhaustive old P086 classifier; sealed legacy envelopes; closure-owned replay authorization |
 | `daemon` composition | Closed outer `acquired|duplicate_healthy|anomalous_holder|lock_failure` result over one persistent mode-0600 lock inode; three-process contention and source scan prove no unlink/replace and only one guard; only acquired binds one starting router and enters guarded `ready|preflight_failed` bootstrap; failed owner retains `PreflightLockGuard`; production construction of upgrade coordinator, durable authority, ACP manager, invocation/invalidation coordinators, process-control port, `DbWriter`, artifact-set reconciler, and sole `FirstFatalCoordinator`; global barrier-before-SQLite order, immutable first-fatal cycle persist-before-notify, restart reconciliation, and no deadlock; exact Operator-only shipped `P031DaemonStatus { daemonStatus { json } }` AST/body whitelist and zero-DB minimal routes; production `DaemonLifecycleClient` uses the named `P031URLSessionGraphQLReadTransport` request for starting/failed polling and live-principal revocation tests |
 | `graphql-server` | Byte-equal complete `AppSchema::sdl()` with explicit lowercase snake-case enum literals, uppercase/unknown negatives, protocol/truth probe matrix, and exact schema-version literals; generated exact old/v2 P031 document inventory and pre-resolver capability handshake for both mixed-version directions; one non-null execution-level truth object plus turn-owned configuration truth; complete latest-specialized-turn reducer; simultaneous P079 source-generation-A/contained-generation-B and P086 target-generation-A/attached-generation-B readback; no new `providerSessionRefId` or public `psref_*` field, while retained P046 `SessionGeneration.providerSessionRef` keeps its exact nullability, authorization, fixed-salt, and restart-instability vectors; bounded snapshot-paged topology and presentation-row-addressed immutable occurrence-attempt documents plus typed legacy-over-limit rejection; pre-async-graphql exact-document/variable normalizer, strict Timeline run-ID parsing, and complete typed HTTP/WebSocket error matrix; authorized paged durable Timeline snapshot with Class A lease plus event/empty-anchor cursor handoff, run-local sequence, public wire digest, honest legacy gap, replay/refetch, and old `rte_` compatibility vectors; Operator-only bounded frozen snapshot readback and idempotent replacement mutation with non-Operator no-oracle proof; one zero-event lane per occurrence and a run-events lane only when unassociated events exist; all six raw-detail status/nullability rows including null-identity missing/unauthorized and authorized unassociated-run-event branches; mediation/topology mapping; structural proof that this slice does not change MCP/report/resource schemas |
 | Swift focused and hosted-view tests | Complete production `P031GraphQLDocumentSet.providerExecutionTruthSchemaProbe`/`runDetailProtocolProbe`/`runDetail`/`runStageTopologyPage`/`occurrenceExecutionAttemptPage`/`runtimeTimelineSnapshot`/`runtimeStatusChanged`/`timelineRawDetail`/`daemonStatus` snapshots for named operations and presence-aware DTO/error decoding; exact old/v2 document inventory plus mixed-version handshake rejection; immutable attempt-snapshot pagination addressable by presentation row; typed over-limit/limit-only recovery, field-level topology recovery, and strict non-topology decode; conditional raw-detail join after six-row nullability validation; first-page Timeline publication, immediate event-or-empty-anchor cursor handoff, honest legacy-gap row, explicit typed load-older/loading/retry controls, run-local dedupe/gap proof, Timeline-only gap refetch, and client caps; lockstep restart; complete planned-shell and typed state/ambiguity/start-failure/invalidation/post-outcome matrices with byte-distinct pre/post-acceptance cancellation; exact bounded diagnostic visual/Help/copy strings and separately safe accessibility identity from one formatter plus independent stdlib oracle; one random routing ID, focused-scene command router, and publication owner per window across ordinary/direct/deep-link flow; generation-qualified loading/loaded/failed/topology-unavailable publication and semantic selection; all seven navigation destinations, explicit unregistered primary tabs with deterministic existing-root focus entry, tagged primary/auxiliary focus intent, concurrent primary/Run Inspector slots, user-activation-only focus transfer, new-tuple epoch-0/tombstoned-successor/idempotent-replay mount rules, source-qualified focus gain/loss, and bidirectional MainActor focus bridge; exact `presentation_target_v1`, `presentation_surface_mount_v1`, and `presentation_mount_v1` known-answer codecs; distinct occurrence, attempt, event row/expand/collapse/copy targets, bounded human labels, visible/spoken legacy-order state, human stage/task/event ordinals, and clipboard bytes; separate window-owned all-destination run-load and topology restart/replacement/limit-only states; preserved Inspector approval/repair/recovery composition; exhaustive label/value/hint/role/enabled accessibility matrix and exact 32-case full outer-navigation/Runs-sidebar/Inspector layout matrix with occurrence/event discriminators only where legal; opaque generated identities only in machine identifiers and never spoken; exact topology rules; real `NSHostingView`/`.focused` first-responder proof, without claiming remote keyboard/VoiceOver event delivery |
@@ -8829,10 +9011,15 @@ tree and includes their common `HEAD`.
 - [ ] Every new runtime mutation is registered in the P075 operation registry,
       uses a natural idempotency key/result digest, reconciles commit-before-ack,
       obeys shutdown admission/terminal allowlists, and converges after writer
-      crash/restart. Variable collateral sets use ordered child membership rows
+      crash/restart. The generated manifest covers every and only Class A row;
+      Class B/C/D registry bytes and policies remain unchanged. Variable
+      collateral sets use ordered child membership rows
       plus fixed parent count/digest; a 512-owner replay cannot exceed the 16 KiB
       parent result or omit/reorder an owner. Parent/member update/delete and
-      post-seal insert are rejected for 0/1/512 members. The keyed reconciliation
+      post-seal insert are rejected for 0/1/512 members. Pending parents and
+      members are immutable; exactly one append-only terminal successor records
+      resolved result, proved rollback/no-start, or fatal, and crash tests prove
+      no pending-row state update. The keyed reconciliation
       registry has a fixed 512 permits split into admission, terminal/cleanup,
       and fatal reserves; coalesced overload tests prove admission cannot starve
       settlement. Replay verifies immutable witnesses
@@ -8903,8 +9090,9 @@ tree and includes their common `HEAD`.
       source schema/key, work item, turn,
       operation, attempt, terminal immutability, active state, and timestamps
       through direct-SQL negatives. An incomplete phase runs the filtered
-      embedded `<=100` source, Rust finalization, then the full source; a complete
-      phase skips the filtered source and validates the full ledger. Synthetic
+      embedded `<=100` source, Rust finalization, then the full source;
+      `final_swap_committed` skips the filtered source and validates the full
+      ledger. Synthetic
       migration 101 cannot run early; if already recorded before phase completion
       startup refuses as operator corruption on every restart, while a legitimate
       second clean restart after 101 is byte-stable. The sole generated P079 V1
@@ -8914,7 +9102,9 @@ tree and includes their common `HEAD`.
       `Migration100FinalSchemaManifestV1` byte-prove every legal
       phase-specific table/index/trigger, including
       validation evidence, no-candidate witness, settlement allocator,
-      reconciliation checkpoint, migration quarantine, and active authority,
+      reconciliation checkpoint, complete reconciliation-chunk table/triggers,
+      separate resumable content-SHA state and chunk-chain truth, migration
+      quarantine, and active authority,
       from empty and migration-095 databases; installed-schema drift fails before
       a P079 selector runs.
 - [ ] P079 repair uses `OutputContractRepair`; its fallback child remains an

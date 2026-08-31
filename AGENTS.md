@@ -147,6 +147,15 @@ Key entry points:
 - [`docs/reference/acp-runtime-transport.md`](docs/reference/acp-runtime-transport.md) — ACP adapter contract
 - [`docs/reference/test-gates.md`](docs/reference/test-gates.md) — gate-by-gate semantics
 
+### Specification scope budget
+
+- An active proposal or design specification must not reach 2,000 physical lines without decomposition. Measure the checked-in Markdown file with `wc -l`.
+- At `>= 2,000` lines, stop substantive refinement and implementation-readiness review of that file. Do not append more contracts, evidence, edge cases, or rollout detail until the scope is split.
+- Keep the parent document as a bounded index: problem statement, shared invariants, dependency order, the cheapest useful hypothesis test, minimal acceptance criteria, and links to child documents.
+- Move independently implementable contracts, proof obligations, migrations, UI slices, and rollout phases into separate child proposal/design documents. Each child owns its scope, acceptance criteria, proof gate, and lifecycle.
+- Existing over-limit documents may receive only corrections needed to perform the decomposition. They must not accumulate new implementation scope.
+- Proposal reviewers must treat an over-limit active document as a scope blocker and request decomposition instead of asking authors to expand the same file. Generated evidence, implementation-audit output, and canonical reference documentation are not counted as active proposal/design specifications.
+
 ## Conventions
 
 - **Frozen snapshots**: run state compiled at start is frozen in `RunPlanSnapshot`. Drift detected on resume against current YAML → run blocks until engineer chooses a `DriftDecision`.
