@@ -53,9 +53,8 @@ This revision therefore makes these choices explicit:
   `effort`, and backend profile.
 - `runStageTopology.occurrences` already exposes planned provider, model, and
   effort from the frozen Run.
-- `activeAgentExecutions` already exposes execution model and identity.
-- Overview already has the selected Run's topology map, so it can obtain the
-  frozen effort for an active execution without a new GraphQL field.
+- `activeAgentExecutions` already exposes execution identity and model; the
+  existing topology map supplies frozen stage/task assignments.
 - The Codex adapter already sends the requested model through its current
   Codex ACP compatibility path and sends effort separately through
   `session/set_config_option`.
@@ -121,6 +120,7 @@ content is the following JSON plus one final LF:
   "schema_version": 1,
   "policy_id": "codex_model_variant_matrix_v1",
   "provider": "codex_acp",
+  "canonical_provider": "codex",
   "variants": [
     {
       "model_id": "gpt-5.6-sol",
@@ -178,26 +178,38 @@ content is the following JSON plus one final LF:
 }
 ```
 
-The fixture is 1,446 bytes and has SHA-256
-`b9119b3e4375d46d8e9ad29b615ca3d8385357be8f7415869e4c51590bc31395`.
+The fixture is 1,479 bytes and has SHA-256
+`b6ad3f2047466a34da42241eae6b790f60bb835d9e6826cb77b51eb3fc558911`.
 Version 1 is append-only. A later vocabulary adds a new file and policy ID
 without replacing these bytes.
 
-`domain::codex_model_variant_policy` is the dependency-leaf parser and
-registry. It rejects duplicate JSON keys, unknown fields, duplicate model or
-profile IDs, an undeclared production model, an unsupported effort, malformed
-UTF-8, missing final LF, wrong byte length, or wrong digest. Workflow, ACP
-tests, and Swift formatter tests import generated/typed values from this single
-policy source rather than maintaining another matrix.
+`domain::codex_model_variant_policy` defines both provider tokens: authored
+catalog provider `codex_acp` and canonical resolved/request/readback provider
+`codex`. A non-Codex provider with the same model ID never receives a Codex
+label.
+
+Its duplicate-aware `parse_policy_json_v1` rejects unknown fields, duplicate
+keys or IDs, undeclared production models, unsupported efforts, and malformed
+UTF-8 with typed `policy_schema_invalid` errors. The separate
+`load_pinned_policy_v1` first enforces final LF, byte length, and literal digest
+with typed `policy_bytes_mismatch`, then calls the parser. Workflow, ACP tests,
+and Swift formatter tests consume this one policy source rather than
+maintaining another matrix.
 
 The Xcode bundle contains the same retained fixture for validation and
 presentation lookup. Rust remains the run-creation authority; Swift validation
 is feedback only.
 
-### 2. Fresh catalog validation
+### 2. New-Run admission
 
-The Rust workflow compiler validates every newly authored catalog before Run
-creation:
+Add typed workflow entrypoint `compile_for_new_run_v1`. It first performs the
+existing fresh YAML compilation, then validates the authored catalog and
+canonical resolved plan before returning `NewRunAdmissionV1`. `StartRun` is the
+only daemon caller and must receive this value before opening any Run/work
+insertion transaction. A validation failure writes zero Run, Stage, or work
+rows.
+
+Admission enforces:
 
 - every Codex profile uses a declared model and allowed effort;
 - each of the seven reserved production profile IDs, when present,
@@ -210,19 +222,21 @@ The focused source gate separately requires canonical
 and no additional Codex profile. Bounded test catalogs may use other profile
 IDs with supported pairs; they cannot impersonate or weaken a reserved row.
 
-The compiler then writes the unchanged authored provider, model, effort, and
-backend profile into the existing frozen catalog and resolved-agent fields.
-No new Run schema version, DB column, or execution contract is needed.
+The raw catalog snapshot retains authored provider `codex_acp`. Existing
+compiler canonicalization writes `codex` to `ResolvedAgent.provider`, work
+payloads, `ExecutionRequest`, and GraphQL readback; model, effort, and backend
+profile remain byte-identical to the admitted row. No new Run schema version,
+DB column, or execution contract is needed.
 
-The canonical production-catalog check applies only to new Run compilation.
-`compile_from_snapshot_json` continues to decode previously frozen catalogs
-without applying the current production matrix. Old generic or custom Runs
-therefore resume byte-for-byte with their existing behavior.
+The policy check exists only in `compile_for_new_run_v1`. Existing `compile`,
+`compile_from_snapshot_json`, snapshot-less legacy fallback, and catalog
+retrofit keep their current compatibility behavior and never acquire current
+matrix admission. Old generic or custom Runs therefore replay byte-for-byte.
 
 There is no YAML switch, environment override, app preference, rollout flag,
 or test-only production bypass. Non-production tests may construct a bounded
 fixture catalog explicitly through test helpers; those helpers are not linked
-into the daemon binary.
+into the daemon binary and are guarded by `#[cfg(test)]`.
 
 ### 3. Planned dispatch
 
@@ -230,11 +244,14 @@ For a new Run, every existing InvokeAgent producer continues through its
 current owner, queue, retry, fan-out, and recovery path. This proposal adds no
 producer branch.
 
-The existing execution request receives the full frozen model and effort as
-separate values. The Codex adapter must not collapse them into
-`model/effort`, replace a named variant with generic `gpt-5.6`, or apply
-case folding to a policy-known value. Adapter unit tests cover all seven
-production rows.
+The canonical production bridge is tested end to end for all seven rows:
+`compile_for_new_run_v1 -> standard InvokeAgent work payload encode/decode ->
+ExecutionRequest -> AcpSessionNewSpec`. It must retain canonical provider
+`codex`, the exact unsuffixed model, and exactly one separate best-effort
+`reasoning_effort` config option. It must not collapse values into
+`model/effort`, substitute generic `gpt-5.6`, or case-fold a policy-known
+value. The existing nonfatal behavior when that effort option is unsupported
+or rejected remains unchanged.
 
 The current Codex ACP compatibility envelope, permission mode, process
 lifetime, and error behavior remain unchanged. This proposal neither calls
@@ -255,12 +272,19 @@ No GraphQL schema changes are required:
 
 - Stages uses the existing `runStageTopology.occurrences` provider, model,
   and effort values.
-- Overview keeps using `activeAgentExecutions` for active execution identity
-  and the existing topology map for stage context. It obtains effort from the
-  matching frozen topology occurrence for the same stage and agent.
-- A frozen agent ID has one backend profile, so repeated tasks for that agent
-  share the same planned model/effort. If no matching occurrence is available,
-  Overview renders the execution model and `effort unavailable`.
+- `planned` is one provider/model/effort tuple from one frozen run-plan
+  occurrence. Overview uses the existing StageExecution-to-stage mapping plus
+  active agent ID to select candidates, then requires exactly one occurrence
+  whose canonical provider and model byte-match the active execution. All
+  three displayed planned fields come from that occurrence; the active row may
+  select and verify it but may not donate one field.
+- No candidate, multiple candidates, missing effort, provider/model mismatch,
+  owner-only work, or an unrepresented P017/dynamic occurrence renders
+  `Planned assignment unavailable`. The existing raw execution model may remain
+  separately visible without a friendly label, effort, or `planned` qualifier.
+- Health fallback and P058 that change the binding therefore cannot combine a
+  target execution model with source topology effort. A same-binding retry may
+  display planned identity only when the unique occurrence still matches.
 
 The change must not alter root queries, authorization, topology stacks,
 filtering, occurrence identity, focus, selection, pagination, or stale-response
@@ -277,12 +301,21 @@ Codex · Terra · gpt-5.6-terra · high · planned
 Codex · Luna · gpt-5.6-luna · high · planned
 ```
 
-Unknown or legacy values remain honest:
+Legacy and unavailable values remain honest:
 
 ```text
 Codex · gpt-5.6 · high · planned
-Codex · unknown-model · effort unavailable · planned
+Codex · Sol · gpt-5.6-sol · Planned effort not recorded
+Planned assignment unavailable
 ```
+
+| State | Planned line | Accessibility value |
+|---|---|---|
+| unique known tuple | friendly name, full ID, effort, `planned` | identical complete line |
+| unique generic/unknown tuple | bounded raw model, effort, `planned` | identical complete line |
+| unique tuple, effort absent | model plus `Planned effort not recorded` | identical complete line |
+| no/ambiguous/stale/mismatched tuple | `Planned assignment unavailable` | same phrase; no inferred pair |
+| non-Codex | existing provider copy | unchanged |
 
 Rules:
 
@@ -294,13 +327,21 @@ Rules:
 - existing help/accessibility text uses the same complete formatter output;
 - no new button, menu, shortcut, selection behavior, or topology ownership is
   introduced;
-- missing effort renders `effort unavailable`;
-- unknown nonempty values are trimmed and capped to 96 UTF-8 bytes with
-  `...[truncated]`; control characters render as escaped code points; and
+- missing effort and missing assignment use the two distinct normative phrases
+  in the table;
+- unknown nonempty values trim ASCII edge whitespace, escape C0/C1/DEL and line
+  breaks as uppercase `\u{HEX}`, then cap output at 96 UTF-8 bytes including
+  the ASCII suffix `...[truncated]`; the cut ends on an extended grapheme-cluster
+  or complete escape boundary; and
 - non-Codex providers retain current copy.
 
 Overview and Stages must call the same formatter. Source scans reject local
 Sol/Terra/Luna switch statements elsewhere in the app.
+
+At the existing 292-point card width, the metadata region reserves two wrapped
+lines and stable height. The longest known/unknown value, accessibility text
+size, and status refresh may not clip, overlap, resize the card, reorder the
+agent/status/planned accessibility value, or change row identity/focus.
 
 ## Failure behavior
 
@@ -309,7 +350,7 @@ Sol/Terra/Luna switch statements elsewhere in the app.
 | New production catalog differs from the policy | compilation fails before Run creation |
 | Policy fixture missing, malformed, or digest-mismatched | compilation fails; Xcode validation reports the same issue |
 | Old frozen Run contains generic or custom model | replay unchanged; raw planned value is shown |
-| Overview cannot correlate topology effort | model remains visible; `effort unavailable` |
+| Overview has no unique matching frozen occurrence | `Planned assignment unavailable`; raw execution model may remain separately unqualified |
 | Provider ignores or later changes the request | existing runtime behavior; planned UI remains planned |
 | Unknown model/effort reaches formatter | bounded escaped raw value, never a friendly false match |
 
@@ -321,25 +362,32 @@ quarantine behavior is introduced.
 Add focused gate `codex-planned-variant-slice`. It is provider-free and runs
 only the following:
 
-1. Policy tests recompute the exact 1,446-byte digest, parse strict JSON, and
-   reject duplicate keys, unknown fields, malformed rows, unsupported effort,
-   generic production model, Luna `ultra`, and in-place v1 mutation.
-2. Workflow tests compile the canonical seven rows and mutation-test every
-   model, effort, provider, duplicate, missing profile, and extra Codex profile.
-3. Frozen replay tests prove old generic/custom snapshots remain byte-identical
-   and do not receive current production validation.
-4. Adapter unit tests prove each production pair reaches the existing request
-   as separate full model and effort values, with no generic substitution or
-   combined `model/effort` encoding.
-5. Existing GraphQL tests prove topology still returns frozen provider, model,
-   and effort and active execution identity is unchanged. No new document or
+1. Parser tests exercise duplicate keys, unknown fields, duplicate IDs,
+   malformed rows, unsupported effort, generic production model, and Luna
+   `ultra` through `parse_policy_json_v1`. Loader tests independently exercise
+   LF/length/digest mutation and recompute the pinned bytes.
+2. New-Run admission tests mutation-test every model, effort, authored/canonical
+   provider, duplicate, missing profile, and extra Codex profile. `StartRun`
+   failures write zero Run/work rows; its test-only constructors are absent
+   from the daemon build.
+3. Frozen replay, snapshot-less legacy fallback, and catalog retrofit tests
+   prove old generic/custom behavior remains byte-identical and bypasses
+   current-policy admission.
+4. A provider-free table test carries all seven rows through canonical compile,
+   production work payload encode/decode, `ExecutionRequest`, and
+   `AcpSessionNewSpec`, asserting unsuffixed model, one separate effort, no
+   generic substitution, and unchanged nonfatal option rejection.
+5. Existing GraphQL tests prove topology still returns one frozen tuple. Swift
+   tests cover unique/no/multiple matches, repeated tasks, owner-only, dynamic,
+   health fallback, P058 same and changed binding, lead/P017 exclusion, stale
+   stage mapping, and provider/model mismatch. No new root, field, document, or
    schema snapshot is added.
-6. Swift unit tests prove one formatter produces the normative Sol, Terra,
-   Luna, generic, missing-effort, unknown, control-character, and truncation
-   outputs for both Overview and Stages.
-7. Swift presentation tests cover the current compact card width and
-   accessibility value, and prove existing Overview topology stacks, focus,
-   selection, and stage filtering remain present.
+6. Swift unit tests prove every visual/AX table row, Sol/Terra/Luna, generic,
+   unknown, every control class, exact 96-byte boundary, plus-one truncation,
+   combining grapheme, and complete escape handling in Overview and Stages.
+7. Swift presentation tests cover 292 points, the longest value,
+   accessibility size/order, and status refresh without clipping, height/focus/
+   identity loss; existing Overview stacks, selection, and filtering remain.
 8. Static scans prove there is no feature flag/disable path and no second
    variant lookup table.
 
@@ -361,15 +409,17 @@ is part of acceptance.
 ## Acceptance checklist
 
 - [ ] The policy fixture is byte-pinned, append-only, and parsed by one strict
-      Rust authority.
+      Rust authority with distinct schema and byte-integrity failures.
 - [ ] The production catalog contains exactly the seven approved pairs.
-- [ ] Fresh compilation rejects every matrix mutation before Run creation.
-- [ ] Old frozen Runs replay unchanged.
-- [ ] Adapter tests preserve full model and effort separately for all seven
-      profiles without claiming provider acceptance.
+- [ ] Typed new-Run admission rejects every matrix mutation with zero Run/work
+      writes; old snapshot, legacy fallback, and retrofit paths replay unchanged.
+- [ ] Authored `codex_acp` canonicalizes to `codex`; the provider-free production
+      bridge preserves full model and one separate effort for all seven rows
+      without claiming provider acceptance.
 - [ ] Overview and Stages use the same formatter and visibly show friendly
-      variant, full ID, effort, and `planned`.
-- [ ] Missing and unknown values remain bounded and honest.
+      variant, full ID, effort, and `planned` only from one frozen tuple.
+- [ ] No/ambiguous/mismatched assignments and missing effort use distinct
+      normative copy; unknown values remain bounded and honest.
 - [ ] Existing topology stacks, identities, focus, filtering, authorization,
       retries, fan-out, recovery, and provider lifecycle are unchanged.
 - [ ] No public surface says configured, accepted, actual, or exact.
