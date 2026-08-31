@@ -199,9 +199,14 @@ loader rejects duplicate object keys before typed decoding. The YAML loader
 likewise rejects duplicate `backend_profiles` mapping keys before catalog
 decoding; last-key-wins behavior is forbidden.
 
-Rust owns append-only `CodexModelVariantPolicyRegistryV1`. Its v1 entry pins
-the policy ID, fixture path, byte length, and literal digest above. The compiler
-embeds and resolves every retained registry entry, not only the newest one.
+The dependency-leaf module
+`domain::codex_model_variant_policy` owns append-only
+`CodexModelVariantPolicyRegistryV1`. It has no DB, ACP, workflow, or readback
+dependency. Its v1 entry pins the policy ID, fixture path, byte length, literal
+digest, supported pairs, and production-profile rows above. `workflow`, `acp`,
+engine, and GraphQL import this one module rather than copying registry tables.
+The compiler embeds and resolves every retained registry entry, not only the
+newest one.
 Neither the v1 entry nor its fixture may be replaced or removed. A vocabulary
 change adds a new fixture filename, policy ID, digest, and registry entry while
 retaining v1 for old snapshots. A test-only second policy proves both versions
@@ -274,21 +279,39 @@ ExactVariantV1 { policy_id, fixture_sha256, backend_profile_id }
 ```
 
 The engine loads the frozen plan by `run_id` and resolves the expected task
-occurrence using durable `stage_execution_id`, `agent_execution_id`, agent ID,
-and task identity. That occurrence supplies `backend_profile_id`; a persisted
-frozen escalation tier supplies it only when the invocation was already routed
-through that tier for some other failure. Queue payload values, including its
-profile ID, are comparison evidence only. A missing occurrence/profile or any
+through the durable `TaskOccurrenceKeyV1` defined below. A stage occurrence
+supplies `backend_profile_id`; a persisted frozen escalation tier supplies it
+only when the invocation was already routed through that tier for some other
+failure. Queue payload values, including agent and profile IDs, are comparison
+evidence only. A missing occurrence/profile or any
 payload/profile/provider/model/effort mismatch rejects before child launch; a
 second valid matrix pair cannot be substituted. `ExecutionRequest` carries the
-resolved `backend_profile_id` and typed mode, and the adapter rechecks the pair
-against the pinned policy entry before `session/new`.
+resolved `backend_profile_id`, occurrence key, and typed mode, and the adapter
+rechecks the pair against the pinned policy entry before `session/new`.
+
+Every newly enqueued exact Codex invocation has a durable
+`TaskOccurrenceKeyV1` before it is claimable:
+
+```text
+StageTask { stage_execution_id, task_index }
+LeadConflictMediation { mediation_record_id, task_index: 0 }
+```
+
+For a stage, `task_index` is the zero-based position in the frozen concatenated
+order `tasks` then `post_approval_tasks`; mediation always uses zero. The
+canonical encoded key, `task_index`, and `attempt_number` are persisted on both
+the work item and each AgentExecution attempt. They are not reconstructed from
+`agent_id`. Attempts for one occurrence are ordered by
+`attempt_number DESC`, then `started_at DESC`, then AgentExecution ID byte
+order. Legacy rows may keep a null key/index and retain existing best-effort
+readback; every exact-v1 row requires all three values.
 
 `ExecutionRequest` also carries typed `SessionLaunchIntentV1`:
 
 ```text
 LegacyUnspecified
-Fresh { lineage_generation_id }
+FreshStage { lineage_generation_id, stage_execution_id, task_index }
+FreshLeadConflictMediation { lineage_generation_id, mediation_record_id }
 Reuse { session_generation_id, provider_session_id }
 ```
 
@@ -297,13 +320,33 @@ Existing serialized requests without this field decode as
 requires an explicit fresh intent.
 
 The fresh lineage ID is durable audit/output ownership and is not a live
-transport handle. `ExactVariantV1` requires `Fresh`,
-`owner_kind == stage_execution`, `reuse_existing_session == false`, and
+transport handle. Every exact invocation allocates and persists its canonical
+generation before claim, even when `outputs` is missing or empty.
+`ExactVariantV1` accepts only `FreshStage` or
+`FreshLeadConflictMediation`, with `reuse_existing_session == false` and
 `keep_session_alive == false`; the transport always launches a process and
 executes `session/new`. It rejects `Reuse`, P079 repair paths, P086
-attach/resurrection, Steward ownership, and every non-stage combination before
-child launch. A normal stage with declared outputs retains its newly allocated
-lineage ID through `Fresh` and does not bypass startup.
+attach/resurrection, Steward ownership, and every other non-stage combination
+before child launch. Generation allocation is therefore independent of output
+materialization.
+
+`FreshStage` resolves the exact binding from the frozen task occurrence.
+`FreshLeadConflictMediation` resolves the existing P017 mediation record, its
+run, and that run's frozen `system_lead` binding; provider/model/effort in the
+current mediation payload are comparison evidence only. Missing or mismatched
+mediation identity rejects before launch. This preserves the existing P017
+route without authorizing other non-stage owners. A non-Codex system lead and
+a compiler-v1 mediation retain their existing provider/legacy path; the typed
+exact intent is required only for a compiler-v2 Codex system lead.
+
+Fresh v2 Codex work is enqueued in append-only execution admission state
+`pending_exact_v1`, never legacy `pending`. Only the new dedicated exact claim
+query can atomically move it to `running`; every old claim query continues to
+select only `pending`. This state is the downgrade fence: a pre-change daemon
+can neither claim nor launch an exact-v1 row even though it ignores nullable
+payload fields. A new daemon treats `pending_exact_v1` as normal schedulable
+work for capacity and queue summaries. Downgrade may expose a compatibility
+block, but must leave the row untouched and write no prompt bytes.
 
 A stage-scoped frozen fallback binding selected because of some other failure
 may use exact mode only when its own frozen profile names an approved pair.
@@ -351,9 +394,9 @@ It performs this sequence before writing any `session/prompt` bytes:
    "config_option_update", configOptions } }`; `sessionId` must match and the
    complete array again replaces the working snapshot.
 10. Reverify the current in-memory pair immediately before prompt delivery.
-    The same actor, with no concurrent writer, transitions to
-    `prompt_write_started` before the first write attempt and then sends the
-    prompt.
+    The same actor, with no concurrent writer, requests an engine-owned durable
+    prompt-write fence and waits for its commit acknowledgement before gaining
+    access to the writer. It then sends the prompt.
 
 The handshake accepts only responses with the exact request ID and only
 `ConfigOption` entries with bounded ACP v1 shapes. Every complete replacement
@@ -390,15 +433,57 @@ provider rejection, or a final mismatch before `prompt_write_started` closes
 the child and returns
 `ACP_CODEX_EXACT_CONFIGURATION_REJECTED`; prompt-write-start count remains zero.
 
-Once `prompt_write_started` is set, no later error is a configuration
-rejection and no zero-prompt claim is allowed. A complete write transitions to
-`prompt_dispatched`. Any short/partial write, EPIPE, close, timeout, or other
+The ACP crate exposes a narrow callback interface but has no DB dependency.
+The engine implementation persists `prompt_write_started` against the exact
+work item, AgentExecution, generation, and occurrence in one transaction and
+returns an opaque one-use fence token. The writer cannot be called without
+that token. A crash after this commit is conservatively delivery-unknown even
+when the process died before its first byte; startup recovery must settle it
+and must never requeue it. A crash before the commit cannot have written a
+prompt and retains existing safe recovery. Failure to commit the fence aborts
+and reaps the child before writer access and follows the existing bounded
+storage-failure path.
+
+Migration-owned table `exact_prompt_delivery_settlements` has one row per
+source work item, unique AgentExecution/generation/occurrence foreign keys, and
+state vocabulary `prompt_write_started`, `prompt_dispatched`, or
+`prompt_delivery_unknown`. Arm inserts `prompt_write_started`; a complete write
+CASes only that state to `prompt_dispatched`; unknown settlement CASes only that
+state to `prompt_delivery_unknown`. A committed dispatched row can never be
+rewritten as unknown. An already-armed row cannot issue another live fence
+token after process restart; recovery settles it unknown instead.
+
+Once durable `prompt_write_started` is set, no later error is a configuration
+rejection and no zero-prompt claim is allowed. A complete write durably
+transitions to `prompt_dispatched`; a crash before that second commit remains
+delivery-unknown. Any short/partial write, EPIPE, close, timeout, or other
 error from the first write attempt returns
 `ACP_PROMPT_DELIVERY_UNKNOWN`, failure kind `prompt_delivery_unknown`, and
 output settlement `none`; it closes the physical session and is ineligible for
 automatic retry, repair, resurrection, fallback, or escalation. This narrow
 settlement prevents duplicate work without claiming durable provider
 acceptance.
+
+Engine-owned `settle_prompt_delivery_unknown_v1` is the sole terminal writer.
+Using deterministic settlement key
+`prompt-delivery-unknown:{source_work_item_id}:{agent_execution_id}`, one
+immediate transaction:
+
+- inserts or reads the idempotent settlement record;
+- CASes the running work item to failed;
+- closes the AgentExecution with the typed runtime facts;
+- invalidates/closes the session generation and its live-session ownership;
+- closes the active artifact source-generation claim without activating
+  output; and
+- for a stage owner, places the StageExecution in terminal blocked state; for
+  P017, marks the mediation failed and leaves its workflow conflict unresolved
+  in operator hold; and
+- enqueues no AdvanceRun, repair, retry, or escalation work.
+
+Replay returns the same settlement. Late provider output is quarantined and
+cannot reopen any closed owner. Startup recovery invokes this same transaction
+for every exact row with durable `prompt_write_started` but no durable
+`prompt_dispatched` settlement.
 
 The in-memory option snapshot is invocation-local and discarded with the child;
 it is not a durable acceptance receipt. Updates received after prompt dispatch
@@ -409,10 +494,10 @@ behavior remains in force.
 
 ### 4. Session lifetime
 
-An exact-pair normal stage invocation owns one fresh physical Codex session. It
-is not eligible for cross-invocation live-session reuse or P086 resurrection in
-this slice. This slice does not authorize automatic retry of configuration or
-prompt-delivery failures.
+An exact-pair stage or P017 mediation invocation owns one fresh physical Codex
+session. It is not eligible for cross-invocation live-session reuse or P086
+resurrection in this slice. This slice does not authorize automatic retry of
+configuration or prompt-delivery failures.
 
 This deliberate performance tradeoff avoids treating process-local or
 historical evidence as durable acceptance. Efficient reuse is deferred to the
@@ -442,46 +527,80 @@ its current compile-failure behavior rather than fabricating a partial row.
 Bounded non-authorizing inspection of corrupt snapshots belongs to the deferred
 P031 readback proposal and is not required to test this fresh-valid hypothesis.
 
-`runStageTopology.occurrences` remains the Stages source. Its existing model
-and effort fields and new `configurationMode` are populated by that classifier.
-`P031RunStageTopologyOccurrenceReadModel` gains the same closed mode and does
-not infer it locally. Occurrences also expose nullable strings `failureKind`,
-`failurePhase`, and `operatorActionHint`. Failure kind uses the retained raw
+Existing `runStageTopology` and its types remain unchanged. Dedicated
+`runStageTopologyV2` is the Stages source after capability admission. Its
+occurrences carry non-null `taskOccurrenceKey`, planned model/effort and
+`configurationMode` from the shared classifier plus nullable strings
+`failureKind`, `failurePhase`, and `operatorActionHint`. The resolver joins an
+execution to a frozen task by its persisted occurrence key, never by
+`agent_id`, and selects attempts by the deterministic ordering above.
+`P031RunStageTopologyOccurrenceReadModel` gains the same fields and does not
+infer mode or task identity locally. Failure kind uses the retained raw
 runtime-fact value, phase is a pure mapping for the two new transport codes,
-and action uses the existing runtime-fact value; adding nullable fields does
-not alter old documents.
+and action uses the existing runtime-fact value.
 
 Existing `activeAgentExecutions: [GqlAgentExecution!]!` and its resolver remain
 unchanged for old applications, fragments, generated clients, and rollback.
 New field `activeAgentExecutionsV2` returns dedicated
 `GqlActiveAgentExecutionV2` with nullable planned `effort`, non-null
-`configurationMode`, and the same nullable failure strings. It otherwise
-preserves the old active field set and semantics. Model and effort are derived
-together from the execution's `backend_profile_id` in the run's frozen catalog.
-It does not read the current catalog or add/backfill a database column. Every
-producer of this dedicated type uses the same helper.
+`configurationMode`, and non-null `taskOccurrenceKey` for exact rows. It
+otherwise preserves the old active field set and running-only semantics. Model
+and effort are derived together from the execution's `backend_profile_id` and
+persisted occurrence key in the run's frozen catalog. It does not read the
+current catalog. Every producer of this dedicated type uses the same helper.
+Terminal failure presentation belongs to `runStageTopologyV2`; a terminal row
+is intentionally absent from running-only `activeAgentExecutionsV2`.
 
-GraphQL exposes `codexModelVariantReadbackV1: Boolean!`. An actor-owned
+GraphQL exposes:
+
+```graphql
+type CodexModelVariantCapabilityV1 {
+  compatible: Boolean!
+  generationToken: String!
+}
+
+codexModelVariantReadbackV1: CodexModelVariantCapabilityV1!
+activeAgentExecutionsV2(runId: ID!, generationToken: String!):
+  [GqlActiveAgentExecutionV2!]!
+runStageTopologyV2(runId: ID!, generationToken: String!):
+  [GqlRunStageTopologyNodeV2!]!
+```
+
+`generationToken` is a bounded opaque digest of the serving daemon generation
+`{ endpoint, pid, started_at, build_sha }`; it is not an authorization token.
+Both V2 resolvers compare it with their own current generation before loading
+run data and return typed GraphQL extension code
+`DAEMON_GENERATION_CHANGED` on mismatch. Therefore a daemon replacement
+between probe and readback cannot authorize a stale V2 document.
+
+An actor-owned
 `ModelVariantCapabilityCoordinator` keys state by exact daemon generation
 `{ endpoint, pid, started_at, build_sha }` from current status readback. Its
 closed states are `unknown`, `probing`, `compatible`, `incompatible`, and
 `failed`; one single-flight probe exists per generation. Only an error-free
-response with `data.codexModelVariantReadbackV1 == true` is compatible. `false`,
-missing data, unknown-field response, partial data with errors, timeout, and
-decode failure never authorize the versioned document. `false`, missing data,
-and unknown-field errors become `incompatible`; partial errors, timeout, and
-decode failure become `failed`. The server returns true only when both
-`activeAgentExecutionsV2` and topology identity/failure fields are installed.
-A generation-key change invalidates prior state.
+response with `compatible == true` and a valid bounded generation token is
+compatible. `false`, missing data, unknown-field response, partial data with
+errors, timeout, and decode failure never authorize a versioned document.
+`false`, missing data, and unknown-field errors become `incompatible`; partial
+errors, timeout, and decode failure become `failed`. The server returns true
+only when both dedicated V2 resolvers and occurrence/failure fields are
+installed. A generation-key change invalidates prior state and token.
 
-Before selecting `activeAgentExecutionsV2`, `effort`, or
-`configurationMode`, the app completes that probe. Compatible state permits
-the versioned run-detail document and updates
+Before selecting either V2 resolver, the app completes that probe. Compatible
+state permits the versioned run-detail document with the returned token and
+updates
 `P031ActiveAgentExecutionReadModel` with nullable effort plus the closed mode.
 Incompatible or failed state shows a blocking daemon-compatibility message and
 does not send the document. That message can invoke the existing explicit
 `Restart Daemon` operator command and warns that restart can interrupt active
 work; it never invokes the command itself.
+
+Run-detail loading is keyed by `{ run_id, generationToken, request_nonce }`.
+Changing the selected Run or daemon generation immediately clears prior V2
+rows, cancels the old task, and enters `unknown`/`probing`; a late response is
+discarded unless all three keys still match. `unknown`, `probing`, `failed`,
+and `incompatible` render distinct safe placeholders and never retain rows
+from the previously selected Run.
 
 Capability handling never restarts or replaces the daemon automatically. The
 existing explicit operator restart action remains the only restart authority.
@@ -525,11 +644,12 @@ Rules:
   truncation or overlap; wrapping is allowed at larger accessibility sizes.
 - The raw exact ID may wrap or truncate visually after those values, but the
   row's help text exposes the complete formatter output.
-- A focused-row `Copy Model Configuration` command in the app's Commands menu
-  (`Option-Command-C`), its context-menu alias, and the row's named
-  accessibility action invoke one copy handler. The command is disabled without
-  a focused agent row, preserves focus and selection, and copies the complete
-  untruncated formatter output.
+- Each row has a trailing icon-only `Copy Model Configuration` button, its
+  context-menu alias, and a named accessibility action backed by one copy
+  handler. The button is in normal keyboard traversal, has visible focus,
+  tooltip/help text, and copies the complete untruncated formatter output
+  without changing row selection. There is no app-level Commands-menu item or
+  window-global shortcut in this slice, so copy ownership cannot cross windows.
 - `planned` is mandatory. This slice never renders `accepted`, `configured`,
   `actual`, or equivalent claims.
 - Missing effort renders `effort unavailable`; unknown nonempty values render
@@ -540,11 +660,14 @@ Rules:
   its hint describes only an existing action. Parent cards must not combine or
   hide occurrence accessibility children. Formatting must not change focus or
   selection.
-- `provider_configuration_rejected` renders `Configuration rejected` plus
-  existing action `Inspect logs`; `prompt_delivery_unknown` renders
-  `Prompt delivery unknown` plus the same action. The complete failure kind,
-  phase, and action hint remain in the row's accessibility value. No generic
-  retry copy is shown for either terminal failure.
+- In Stages, `provider_configuration_rejected` renders `Configuration rejected`
+  and `prompt_delivery_unknown` renders `Prompt delivery unknown`. When the
+  retained raw action hint is `inspect_logs`, the row shows noninteractive text
+  `Inspect daemon logs`; this slice adds no button, navigation destination, or
+  accessibility action for it. The complete failure kind, phase, and raw action
+  hint remain in the row's accessibility value. No generic retry copy is shown
+  for either terminal failure. Overview remains running-only and does not claim
+  to present terminal failures.
 
 Unknown values pass through one cross-language `BoundedIdentityScalarV1`:
 
@@ -591,11 +714,11 @@ within the existing bounded cleanup policy.
 `ACP_PROMPT_DELIVERY_UNKNOWN` maps to new failure kind
 `prompt_delivery_unknown`, `failure_kind_version = 2`, failure phase
 `prompt_delivery`, output settlement `none`, existing hint `inspect_logs`, and
-`retryable = false`. Its distinct transport code proves that the write attempt
-started and never records a zero-prompt assertion. The execution enters the
-existing fresh-session quarantine/late-output isolation path and places the
-stage in terminal operator hold, so possible side effects or late outputs
-cannot be consumed by later automatic work.
+`retryable = false`. Its distinct transport code proves that the durable write
+fence was committed and never records a zero-prompt assertion. The execution
+enters the existing fresh-session quarantine/late-output isolation path and
+places its stage or mediation owner in terminal operator hold, so possible
+side effects or late outputs cannot be consumed by later automatic work.
 
 Both failure kinds are ineligible for automatic retry, P058 escalation tiers,
 P079 output repair, P086 resurrection, provider-health fallback, provider
@@ -618,7 +741,8 @@ Add focused gate `codex-model-variant-slice`. It is provider-free and runs:
 1. Strict fixture parsing, duplicate-key negatives, the exact v1 literal
    digest/length, rejection of in-place v1 mutation/removal, parity across
    checked-in/Rust-embedded/Xcode-bundled bytes, and coexistence of v1 with a
-   synthetic later policy.
+   synthetic later policy. A dependency scan proves all Rust consumers use
+   `domain::codex_model_variant_policy` and no second registry exists.
 2. Rust fresh compiler positives for every approved production row and bounded
    non-production fixture catalogs using supported exact pairs.
 3. Mutation negatives for every production profile, generic model, unknown
@@ -628,52 +752,66 @@ Add focused gate `codex-model-variant-slice`. It is provider-free and runs:
    every v1 snapshot remains byte-identical legacy even with an exact-looking
    pair; malformed/unknown-policy v2 fails strict compilation and emits no
    partial planned-identity row.
-5. Frozen-binding tests proving provider/model/effort are derived from
-   `backend_profile_id`, substitution of another valid pair rejects before
-   launch, and the adapter rechecks the same tuple.
-6. `SessionLaunchIntentV1` matrix proving a normal output-declaring stage keeps
-   fresh lineage and still executes `session/new`, while reuse, keep-alive,
-   repair, resurrection, live-session handles, and non-stage combinations
-   reject before launch; missing/`LegacyUnspecified` intent is accepted only on
-   legacy mode.
-7. Fake ACP success proving exact request IDs, full-state replacement,
+5. Frozen-binding and occurrence tests proving provider/model/effort are
+   derived from the persisted task occurrence and `backend_profile_id`,
+   substitution of another valid pair rejects before launch, duplicate agent
+   IDs cannot cross-bind, and attempt selection is deterministic.
+6. `SessionLaunchIntentV1` matrix proving stage tasks with absent, empty, and
+   nonempty outputs all allocate durable generations and execute `session/new`;
+   P017 mediation uses its typed owner and frozen `system_lead` binding; reuse,
+   keep-alive, repair, resurrection, live-session handles, Steward, and every
+   other non-stage owner reject before launch. Missing/`LegacyUnspecified`
+   intent is accepted only on legacy mode.
+7. Downgrade tests create `pending_exact_v1` with the new binary, run the old
+   claim paths against the same DB, and prove the row remains untouched with
+   zero child launches and zero prompt-write starts. New-claim tests cover
+   scheduling, capacity accounting, and starvation-free progress for both
+   pending states.
+8. Fake ACP success proving exact request IDs, full-state replacement,
    dependent effort appearing only after model selection, notification
    interleaving, ordered model then effort configuration, and exactly one
    prompt after both exact `currentValue` checks.
-8. Fake ACP negatives for alias-only, substring-only, duplicate, missing,
+9. Fake ACP negatives for alias-only, substring-only, duplicate, missing,
    malformed, empty-success, stale-snapshot, wrong-session, out-of-order,
    rejected, mismatched, and every numeric-limit overflow; each asserts zero
    prompt-write starts and bounded child cleanup.
-9. Short-write fixtures for every boundary from one byte through payload minus
-   one proving `prompt_delivery_unknown`, no zero-prompt fact, immutable
-   terminal settlement, and no automatic retry/repair/resurrection/fallback or
-   escalation for either new failure; possible late output remains quarantined.
-10. Old-reader/new-row compatibility across DB, GraphQL, MCP, and reports,
+10. Durable-fence tests prove no writer access before the committed
+    `prompt_write_started` marker. Short-write fixtures for every boundary from
+    one byte through payload minus one, plus fault injection before/after each
+    arm/write/settlement commit, prove conservative `prompt_delivery_unknown`,
+    idempotent closure of work item/execution/generation/source claim/owner,
+    startup non-requeue, no retry/repair/resurrection/fallback/escalation, and
+    quarantine of late output.
+11. Old-reader/new-row compatibility across DB, GraphQL, MCP, and reports,
     proving raw version-2 failure retention, old GraphQL enum value `UNKNOWN`,
     and existing `inspect_logs` hint.
-11. GraphQL compatibility tests proving the old field/type/document work
-    unchanged on the new daemon and the new app never sends
-    `activeAgentExecutionsV2` to an old daemon.
-12. Capability-coordinator tests for error-free true, false, missing, partial
-    errors, timeout, decode failure, concurrent callers, exact state mapping,
-    generation change, no automatic restart, and an operator restart followed
-    by a distinct ready generation within 30 seconds.
-13. GraphQL tests proving both new active and topology paths use the same classifier,
-    derive model/effort from the frozen profile rather than the current catalog,
-    and classify exact-looking v1, valid v2, and missing bindings.
-14. Swift decoding, bounded-scalar, and formatter goldens for Sol, Terra, Luna,
+12. GraphQL compatibility tests prove old active/topology fields and documents
+    work unchanged on the new daemon and the new app never sends either V2
+    document to an old daemon.
+13. Capability-coordinator tests cover error-free true/token, false, missing,
+    partial errors, timeout, decode failure, concurrent callers, every safe UI
+    state, no automatic restart, and explicit restart followed by a distinct
+    ready generation within 30 seconds. Daemon A/B tests prove an A token is
+    rejected by B before data access; Run A/B tests prove old rows are cleared
+    and late probe/readback responses cannot repopulate the selected Run.
+14. GraphQL tests prove both V2 paths use the same classifier and occurrence
+    join, derive model/effort from the frozen profile rather than the current
+    catalog, classify exact-looking v1 and valid v2, preserve deterministic
+    attempt order, and expose terminal failures only through Stages topology.
+15. Swift decoding, bounded-scalar, and formatter goldens for Sol, Terra, Luna,
     exact-looking legacy, generic legacy, missing effort, unknown bounded
     values, both terminal failure presentations, compact copy, full copy, and
     accessibility output.
-15. Hosted Overview and Stages tests at 292 points with `.large` and
+16. Hosted Overview and Stages tests at 292 points with `.large` and
     `.accessibility3` text proving friendly variant, effort, planned qualifier,
-    and status remain distinguishable; full accessibility/copy values are
-    available through keyboard command, context menu, and accessibility action;
-    focus and selection do not move; and parent accessibility does not hide
-    rows.
-16. Structural scans proving there is no feature flag, environment bypass,
+    and status remain distinguishable; the row-local button is keyboard and
+    pointer operable, and context-menu/accessibility aliases return the same
+    full value without moving selection. Two-window tests prove no cross-window
+    copy ownership, and parent accessibility does not hide rows.
+17. Structural scans prove there is no feature flag, environment bypass,
     current-catalog read in run readback, automatic capability-triggered daemon
-    restart, replacement of the old GraphQL field, or second formatter.
+    restart, replacement of either old GraphQL field, app-level copy command,
+    interactive inspect-logs affordance, or second formatter/registry.
 
 The gate fails when any selected Rust or Swift suite executes zero tests. It
 does not invoke a live provider, network, remote UI host, or another proposal
@@ -685,6 +823,8 @@ gate.
   newly compiled run after release.
 - There is no disable switch, experiment percentage, or operator opt-in.
 - Pre-change frozen runs continue unchanged and visibly say legacy/unverified.
+- Exact work uses the downgrade-fenced `pending_exact_v1` admission state; an
+  old daemon cannot claim or launch it.
 - Configuration rejection and prompt-delivery-unknown settle terminally and
   visibly; retry, repair, resurrection, fallback, provider switch, and
   escalation do not react.
@@ -708,33 +848,43 @@ gate.
       fabricated Sol/Terra/Luna label.
 - [ ] Exact mode derives and rechecks its pair from frozen
       `backend_profile_id`; another valid pair cannot be substituted.
-- [ ] Exact mode preserves fresh durable lineage for ordinary output stages but
-      rejects physical reuse, keep-alive, repair, resurrection, supplied live
-      sessions, and non-stage ownership before child launch.
+- [ ] Every exact task occurrence has a persisted stable key and deterministic
+      attempt order; repeated agent IDs cannot cross-bind readback or failure.
+- [ ] Exact mode allocates fresh durable lineage with absent, empty, or nonempty
+      outputs; typed P017 mediation resolves the frozen system-lead binding,
+      while physical reuse, keep-alive, repair, resurrection, supplied live
+      sessions, Steward, and every other non-stage owner reject before launch.
+- [ ] Exact-v1 work is admitted only as `pending_exact_v1`; a pre-change daemon
+      cannot claim it and writes zero prompt bytes.
 - [ ] Exact invocations verify model and effort in order before the first
       prompt, and every pre-prompt negative fixture proves zero prompt-write
       starts.
 - [ ] Exact invocations use a fresh physical session and neither new failure
       enters automatic retry or escalation.
 - [ ] Instrumented writer tests prove no write attempt for configuration
-      rejection; every partial-write error settles as prompt delivery unknown
-      without a zero-prompt claim.
+      rejection and no writer access before the durable fence; every crash or
+      partial-write after the fence reaches one idempotent terminal settlement
+      without a zero-prompt claim or startup requeue.
 - [ ] Overview and Stages show the same friendly variant, effort, and `planned`
       qualifier and expose the complete exact model ID through the shared full
       value, help, and copy affordance.
 - [ ] Active-agent effort is derived only from the frozen backend profile and
       remains nullable when unavailable.
-- [ ] The old GraphQL field/type remains unchanged; generation-bound,
-      single-flight capability negotiation prevents the V2 document from
-      reaching an old daemon, and both new readbacks expose the same typed mode.
+- [ ] The old GraphQL fields/types remain unchanged; generation-token-bound,
+      single-flight capability negotiation prevents V2 documents from reaching
+      an old or replaced daemon, and both V2 readbacks expose the same typed
+      mode and occurrence identity.
 - [ ] Capability failure never restarts a daemon automatically; only an
       operator action followed by a distinct ready generation permits re-probe.
 - [ ] Typed configuration rejection cannot enter repair, resurrection,
       fallback, provider switching, or escalation.
 - [ ] Old readers retain raw new failure values and decode the existing
       `inspect_logs` action; no new action-hint vocabulary is introduced.
-- [ ] Terminal configuration states and complete model configuration are
-      keyboard, pointer, and accessibility readable without moving selection.
+- [ ] Terminal configuration states are visible in Stages; complete model
+      configuration is keyboard, pointer, and accessibility readable through
+      row-local actions without moving selection or crossing windows.
+- [ ] `inspect_logs` is rendered only as noninteractive recommendation text;
+      this slice does not promise a destination it does not implement.
 - [ ] No public surface claims accepted/configured/actual provider identity.
 - [ ] No flag or bypass can disable the fresh-run behavior.
 - [ ] `./scripts/test-gate.sh codex-model-variant-slice` passes with nonzero
@@ -748,7 +898,7 @@ review, implementation, and closeout cycles before use:
 
 | Deferred child | Removed responsibility | Inherited review findings |
 |---|---|---|
-| [Provider accepted truth and prompt authority](2026-08-31-provider-accepted-truth-and-prompt-authority-design.md) | Durable accepted configuration, stable task occurrence, reuse, prompt permits, general post-dispatch delivery settlement, fallback ambiguity; excludes this slice's first-write terminal safety classification | P2-01 and accepted-truth portions of the checkpoint |
+| [Provider accepted truth and prompt authority](2026-08-31-provider-accepted-truth-and-prompt-authority-design.md) | Durable accepted configuration, general cross-owner occurrence authority beyond this slice's stage-index/P017 key, reuse, prompt permits, general post-dispatch delivery settlement, fallback ambiguity; excludes this slice's first-write terminal safety classification | P2-01 and accepted-truth portions of the checkpoint |
 | [Provider configuration migration and reconciliation](2026-08-31-provider-configuration-migration-and-reconciliation-design.md) | Class A registry, append-only reconciliation, bootstrap migration phases and manifests | P1-01, P1-05 |
 | [P079 repair output materialization](2026-08-31-p079-repair-output-materialization-design.md) | Staging, leases, chunk resume, history activation, crash recovery | P1-02 |
 | [P086 resurrection containment](2026-08-31-p086-resurrection-containment-design.md) | Claude attach protocol, secret resolver, root/MCP containment, output-only recovery | P1-03 |
