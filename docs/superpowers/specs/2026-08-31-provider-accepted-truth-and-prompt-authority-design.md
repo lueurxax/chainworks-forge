@@ -31,8 +31,8 @@ reviewed independently before implementation.
 
 - P083 execution ownership truth.
 - Typed P070/P081 boundary authorization.
-- The active exact-variant slice must already prevent prompts under an
-  unverified fresh pair.
+- The active planned-label slice supplies only frozen requested identity. This
+  child owns any future rule that prevents prompts without provider proof.
 - Provider configuration migration/reconciliation must define durable storage
   and restart ownership.
 
