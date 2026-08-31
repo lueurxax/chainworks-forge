@@ -71,7 +71,7 @@ verdict.
 - Reuse an exact-pair Codex physical session across separate invocations.
 - Change provider-session resurrection, output-only recovery, P079 repair
   materialization, or general provider-fallback/escalation policy beyond making
-  the new pre-prompt configuration failure explicitly ineligible.
+  the two new terminal failure outcomes explicitly ineligible.
 - Redesign Timeline, topology pagination, raw-detail readback, frozen-run
   replacement, migration bootstrap, or daemon failed-serve behavior.
 - Add runtime model selection or an operator setting.
@@ -114,6 +114,75 @@ variants[] = { model_id, display_name, allowed_efforts[] }
 production_profiles[] = { backend_profile_id, model_id, effort }
 ```
 
+The exact UTF-8 fixture is 1,446 bytes including its final LF and has SHA-256
+`b9119b3e4375d46d8e9ad29b615ca3d8385357be8f7415869e4c51590bc31395`.
+That digest is normative for policy v1, not derived at runtime from whichever
+fixture happens to be current.
+
+Its bytes are exactly this JSON followed by one LF:
+
+```json
+{
+  "schema_version": 1,
+  "policy_id": "codex_model_variant_matrix_v1",
+  "provider": "codex_acp",
+  "variants": [
+    {
+      "model_id": "gpt-5.6-sol",
+      "display_name": "Sol",
+      "allowed_efforts": ["low", "medium", "high", "xhigh", "max", "ultra"]
+    },
+    {
+      "model_id": "gpt-5.6-terra",
+      "display_name": "Terra",
+      "allowed_efforts": ["low", "medium", "high", "xhigh", "max", "ultra"]
+    },
+    {
+      "model_id": "gpt-5.6-luna",
+      "display_name": "Luna",
+      "allowed_efforts": ["low", "medium", "high", "xhigh", "max"]
+    }
+  ],
+  "production_profiles": [
+    {
+      "backend_profile_id": "codex_orchestrator_high",
+      "model_id": "gpt-5.6-sol",
+      "effort": "max"
+    },
+    {
+      "backend_profile_id": "codex_architect_high",
+      "model_id": "gpt-5.6-sol",
+      "effort": "xhigh"
+    },
+    {
+      "backend_profile_id": "codex_audit_high",
+      "model_id": "gpt-5.6-sol",
+      "effort": "ultra"
+    },
+    {
+      "backend_profile_id": "codex_writer_high",
+      "model_id": "gpt-5.6-terra",
+      "effort": "high"
+    },
+    {
+      "backend_profile_id": "codex_builder_high",
+      "model_id": "gpt-5.6-terra",
+      "effort": "high"
+    },
+    {
+      "backend_profile_id": "codex_orchestrator_acp",
+      "model_id": "gpt-5.6-terra",
+      "effort": "high"
+    },
+    {
+      "backend_profile_id": "codex_ops_low",
+      "model_id": "gpt-5.6-luna",
+      "effort": "high"
+    }
+  ]
+}
+```
+
 The complete supported vocabulary is:
 
 | Variant | Allowed efforts |
@@ -128,16 +197,24 @@ Each `variants[].model_id` and each
 must reference one declared variant. Unknown fields are rejected, and the JSON
 loader rejects duplicate object keys before typed decoding. The YAML loader
 likewise rejects duplicate `backend_profiles` mapping keys before catalog
-decoding; last-key-wins behavior is forbidden. Version 1 fixture bytes are
-immutable after release; a vocabulary change requires a new fixture version
-and policy ID.
+decoding; last-key-wins behavior is forbidden.
 
-The Rust workflow compiler embeds those exact fixture bytes and their SHA-256
-digest and is the sole run-creation authority. The Xcode target bundles the
-same file so `YAMLValidator` can provide preflight feedback, but Swift does not
-compile or authorize a run. Missing, malformed, or digest-mismatched bundled
-data is a visible validation error. The retained gate proves source bytes,
-bundled bytes, and Rust-embedded bytes have the same digest.
+Rust owns append-only `CodexModelVariantPolicyRegistryV1`. Its v1 entry pins
+the policy ID, fixture path, byte length, and literal digest above. The compiler
+embeds and resolves every retained registry entry, not only the newest one.
+Neither the v1 entry nor its fixture may be replaced or removed. A vocabulary
+change adds a new fixture filename, policy ID, digest, and registry entry while
+retaining v1 for old snapshots. A test-only second policy proves both versions
+can compile and dispatch in the same binary.
+
+The Rust workflow compiler verifies embedded bytes against the independent
+registry entry and is the sole run-creation authority. The Xcode target bundles
+all retained fixtures and the same read-only registry values so `YAMLValidator`
+can provide preflight feedback, but Swift does not compile or authorize a run.
+Missing, malformed, removed, or digest-mismatched bundled data is a visible
+validation error. The retained gate proves source bytes, bundled bytes, and
+Rust-embedded bytes match the pinned registry entry and rejects mutation of an
+existing policy in place.
 
 For every fresh catalog, a Codex profile must use an exact supported variant
 and a valid effort; when a profile uses one of the seven production IDs, its
@@ -167,7 +244,7 @@ frozen catalog and resolved-agent fields. It keeps outer
   "model_variant_policy": {
     "schema_version": 1,
     "policy_id": "codex_model_variant_matrix_v1",
-    "fixture_sha256": "<64 lowercase hex characters>"
+    "fixture_sha256": "b9119b3e4375d46d8e9ad29b615ca3d8385357be8f7415869e4c51590bc31395"
   }
 }
 ```
@@ -193,21 +270,46 @@ provenance, not from caller input:
 
 ```text
 LegacyBestEffortV0
-ExactVariantV1 { policy_id, fixture_sha256 }
+ExactVariantV1 { policy_id, fixture_sha256, backend_profile_id }
 ```
 
-It carries that mode through `ExecutionRequest`. `ExactVariantV1` requires a
-valid compiler schema v2 marker, a Codex frozen binding whose pair exists in
-the marked fixture, and `owner_kind == stage_execution`. It is valid for an
-ordinary initial attempt or same-binding retry. A stage-scoped frozen fallback
-binding may use it only when that fallback already names an approved exact
-Codex pair; configuration rejection itself never selects that fallback.
+The engine loads the frozen plan by `run_id` and resolves the expected task
+occurrence using durable `stage_execution_id`, `agent_execution_id`, agent ID,
+and task identity. That occurrence supplies `backend_profile_id`; a persisted
+frozen escalation tier supplies it only when the invocation was already routed
+through that tier for some other failure. Queue payload values, including its
+profile ID, are comparison evidence only. A missing occurrence/profile or any
+payload/profile/provider/model/effort mismatch rejects before child launch; a
+second valid matrix pair cannot be substituted. `ExecutionRequest` carries the
+resolved `backend_profile_id` and typed mode, and the adapter rechecks the pair
+against the pinned policy entry before `session/new`.
 
-Before launching a child, exact mode rejects `reuse_existing_session`,
-`keep_session_alive`, a supplied provider-session or session-generation ID,
-P079 repair paths, P086 attach/resurrection, Steward ownership, and every other
-non-stage or session-reuse combination. The caller cannot downgrade an exact
-v2 request to legacy mode. V1 snapshots retain their current legacy behavior.
+`ExecutionRequest` also carries typed `SessionLaunchIntentV1`:
+
+```text
+LegacyUnspecified
+Fresh { lineage_generation_id }
+Reuse { session_generation_id, provider_session_id }
+```
+
+Existing serialized requests without this field decode as
+`LegacyUnspecified`, which is legal only with `LegacyBestEffortV0`; exact mode
+requires an explicit fresh intent.
+
+The fresh lineage ID is durable audit/output ownership and is not a live
+transport handle. `ExactVariantV1` requires `Fresh`,
+`owner_kind == stage_execution`, `reuse_existing_session == false`, and
+`keep_session_alive == false`; the transport always launches a process and
+executes `session/new`. It rejects `Reuse`, P079 repair paths, P086
+attach/resurrection, Steward ownership, and every non-stage combination before
+child launch. A normal stage with declared outputs retains its newly allocated
+lineage ID through `Fresh` and does not bypass startup.
+
+A stage-scoped frozen fallback binding selected because of some other failure
+may use exact mode only when its own frozen profile names an approved pair.
+Configuration rejection itself is terminal and never schedules a retry,
+fallback, escalation tier, repair, or resurrection. The caller cannot downgrade
+an exact v2 request to legacy mode. V1 snapshots retain current legacy behavior.
 
 ### 3. Exact ACP configuration
 
@@ -218,6 +320,7 @@ prompt writer. Its closed state machine is:
 ```text
 awaiting_session_new -> setting_model -> setting_effort -> ready_to_prompt
 any validation or transport failure --------------------------> rejected
+ready_to_prompt -> prompt_write_started -> prompt_dispatched
 ```
 
 It performs this sequence before writing any `session/prompt` bytes:
@@ -247,8 +350,10 @@ It performs this sequence before writing any `session/prompt` bytes:
    `session/update.params = { sessionId, update: { sessionUpdate:
    "config_option_update", configOptions } }`; `sessionId` must match and the
    complete array again replaces the working snapshot.
-10. Reverify the current in-memory pair immediately before the prompt write.
-    The same actor, with no concurrent writer, then sends the first prompt.
+10. Reverify the current in-memory pair immediately before prompt delivery.
+    The same actor, with no concurrent writer, transitions to
+    `prompt_write_started` before the first write attempt and then sends the
+    prompt.
 
 The handshake accepts only responses with the exact request ID and only
 `ConfigOption` entries with bounded ACP v1 shapes. Every complete replacement
@@ -280,9 +385,20 @@ Handshake-specific bounds are lower than the general transport budget:
 Every response and notification is consumed in wire order. A success response
 without the required bounded complete state is not proof. Missing/duplicate
 options, wrong-session notifications, limit overflow, ambiguous values,
-malformed responses, send failure, provider rejection, or a final mismatch
-closes the child and returns
-`ACP_CODEX_EXACT_CONFIGURATION_REJECTED`; prompt-send count remains zero.
+configuration request send/read failure, malformed configuration responses,
+provider rejection, or a final mismatch before `prompt_write_started` closes
+the child and returns
+`ACP_CODEX_EXACT_CONFIGURATION_REJECTED`; prompt-write-start count remains zero.
+
+Once `prompt_write_started` is set, no later error is a configuration
+rejection and no zero-prompt claim is allowed. A complete write transitions to
+`prompt_dispatched`. Any short/partial write, EPIPE, close, timeout, or other
+error from the first write attempt returns
+`ACP_PROMPT_DELIVERY_UNKNOWN`, failure kind `prompt_delivery_unknown`, and
+output settlement `none`; it closes the physical session and is ineligible for
+automatic retry, repair, resurrection, fallback, or escalation. This narrow
+settlement prevents duplicate work without claiming durable provider
+acceptance.
 
 The in-memory option snapshot is invocation-local and discarded with the child;
 it is not a durable acceptance receipt. Updates received after prompt dispatch
@@ -295,8 +411,8 @@ behavior remains in force.
 
 An exact-pair normal stage invocation owns one fresh physical Codex session. It
 is not eligible for cross-invocation live-session reuse or P086 resurrection in
-this slice. Retry creates another fresh session and repeats the complete
-required configuration sequence.
+this slice. This slice does not authorize automatic retry of configuration or
+prompt-delivery failures.
 
 This deliberate performance tradeoff avoids treating process-local or
 historical evidence as durable acceptance. Efficient reuse is deferred to the
@@ -307,42 +423,76 @@ Legacy v1 frozen invocations retain their current reuse behavior.
 ### 5. Readback
 
 One server-side `PlannedProviderIdentityClassifierV1` derives planned identity
-from the frozen snapshot for both readback paths. Its closed mode vocabulary
-and precedence are:
+from an already compiled frozen plan for both readback paths. Its closed mode
+vocabulary and precedence are:
 
 1. non-Codex provider -> `not_applicable`;
-2. missing or unreadable snapshot/profile binding -> `unavailable`;
-3. valid compiler v2 marker, matching fixture digest, and supported exact pair
+2. missing execution-to-profile binding in an otherwise valid compiled plan ->
+   `unavailable`;
+3. valid compiler v2 marker, registry-resolved historical fixture, matching
+   digest, and supported exact pair
    -> `exact_variant_v1`;
 4. compiler v1 or absent marker -> `legacy_best_effort_v0`, even when its raw
-   model string happens to name an exact variant; and
-5. compiler v2 with a missing, blank, generic, or unknown pair ->
-   `unavailable` and fail-closed execution admission.
+   model string happens to name an exact variant.
+
+Malformed, unknown-policy, digest-mismatched, generic, or otherwise invalid v2
+snapshots fail in the existing authoritative compiler before this classifier
+runs. Execution is blocked, no exact/legacy mode is emitted, and topology keeps
+its current compile-failure behavior rather than fabricating a partial row.
+Bounded non-authorizing inspection of corrupt snapshots belongs to the deferred
+P031 readback proposal and is not required to test this fresh-valid hypothesis.
 
 `runStageTopology.occurrences` remains the Stages source. Its existing model
 and effort fields and new `configurationMode` are populated by that classifier.
 `P031RunStageTopologyOccurrenceReadModel` gains the same closed mode and does
-not infer it locally.
+not infer it locally. Occurrences also expose nullable strings `failureKind`,
+`failurePhase`, and `operatorActionHint`. Failure kind uses the retained raw
+runtime-fact value, phase is a pure mapping for the two new transport codes,
+and action uses the existing runtime-fact value; adding nullable fields does
+not alter old documents.
 
-`activeAgentExecutions` stops returning the shared `GqlAgentExecution` object
-and uses dedicated `GqlActiveAgentExecutionV1`. It adds nullable planned
-`effort` and non-null `configurationMode`; model and effort are derived
-together from the execution's `backend_profile_id` in the run's frozen
-catalog. It does not read the current catalog or add/backfill a database
-column. Every producer of this dedicated type uses the same helper.
+Existing `activeAgentExecutions: [GqlAgentExecution!]!` and its resolver remain
+unchanged for old applications, fragments, generated clients, and rollback.
+New field `activeAgentExecutionsV2` returns dedicated
+`GqlActiveAgentExecutionV2` with nullable planned `effort`, non-null
+`configurationMode`, and the same nullable failure strings. It otherwise
+preserves the old active field set and semantics. Model and effort are derived
+together from the execution's `backend_profile_id` in the run's frozen catalog.
+It does not read the current catalog or add/backfill a database column. Every
+producer of this dedicated type uses the same helper.
 
-GraphQL exposes `codexModelVariantReadbackV1: Boolean!`. Once per daemon
-process generation and before selecting
-`effort` or `configurationMode`, the app sends only this fixed capability
-probe. An old daemon's unknown-field schema error triggers one bundled-daemon
-replacement/restart and a second probe. If it is still absent, the app shows a
-daemon incompatibility state and never sends the new run-detail document.
-Capability success permits the versioned document and updates
+GraphQL exposes `codexModelVariantReadbackV1: Boolean!`. An actor-owned
+`ModelVariantCapabilityCoordinator` keys state by exact daemon generation
+`{ endpoint, pid, started_at, build_sha }` from current status readback. Its
+closed states are `unknown`, `probing`, `compatible`, `incompatible`, and
+`failed`; one single-flight probe exists per generation. Only an error-free
+response with `data.codexModelVariantReadbackV1 == true` is compatible. `false`,
+missing data, unknown-field response, partial data with errors, timeout, and
+decode failure never authorize the versioned document. `false`, missing data,
+and unknown-field errors become `incompatible`; partial errors, timeout, and
+decode failure become `failed`. The server returns true only when both
+`activeAgentExecutionsV2` and topology identity/failure fields are installed.
+A generation-key change invalidates prior state.
+
+Before selecting `activeAgentExecutionsV2`, `effort`, or
+`configurationMode`, the app completes that probe. Compatible state permits
+the versioned run-detail document and updates
 `P031ActiveAgentExecutionReadModel` with nullable effort plus the closed mode.
-This is lockstep compatibility, not silent nullable decoding.
+Incompatible or failed state shows a blocking daemon-compatibility message and
+does not send the document. That message can invoke the existing explicit
+`Restart Daemon` operator command and warns that restart can interrupt active
+work; it never invokes the command itself.
 
-No MCP, report, artifact, receipt, or runtime-health schema changes in this
-slice.
+Capability handling never restarts or replaces the daemon automatically. The
+existing explicit operator restart action remains the only restart authority.
+After that action, the coordinator waits at most 30 seconds for a distinct
+ready generation key, then probes it as new. It never transfers a
+capability result across PID/start-time/build generations or interrupts active
+work on its own. Old documents continue to work against the new daemon.
+
+MCP, reports, artifacts, receipts, and runtime health keep their existing
+shapes. The new failure kinds use their existing bounded string/raw-value lanes;
+no new `OperatorActionHint` vocabulary is introduced.
 
 ### 6. Shared presentation
 
@@ -374,18 +524,27 @@ Rules:
   current 292-point constrained width these values remain readable without
   truncation or overlap; wrapping is allowed at larger accessibility sizes.
 - The raw exact ID may wrap or truncate visually after those values, but the
-  row's help text and context-menu action `Copy model configuration` expose the
-  complete formatter output through standard macOS interaction.
+  row's help text exposes the complete formatter output.
+- A focused-row `Copy Model Configuration` command in the app's Commands menu
+  (`Option-Command-C`), its context-menu alias, and the row's named
+  accessibility action invoke one copy handler. The command is disabled without
+  a focused agent row, preserves focus and selection, and copies the complete
+  untruncated formatter output.
 - `planned` is mandatory. This slice never renders `accepted`, `configured`,
   `actual`, or equivalent claims.
 - Missing effort renders `effort unavailable`; unknown nonempty values render
   bounded escaped text and never map to a known effort.
 - Non-Codex providers retain their existing requested-identity copy.
-- Each rendered agent row owns one accessibility element. Its label contains agent
-  and task, its value contains status plus the complete formatter output, and
+- Each rendered agent row owns one accessibility element. Its label contains
+  agent and task, its value contains status plus the complete formatter output, and
   its hint describes only an existing action. Parent cards must not combine or
   hide occurrence accessibility children. Formatting must not change focus or
   selection.
+- `provider_configuration_rejected` renders `Configuration rejected` plus
+  existing action `Inspect logs`; `prompt_delivery_unknown` renders
+  `Prompt delivery unknown` plus the same action. The complete failure kind,
+  phase, and action hint remain in the row's accessibility value. No generic
+  retry copy is shown for either terminal failure.
 
 Unknown values pass through one cross-language `BoundedIdentityScalarV1`:
 
@@ -407,39 +566,59 @@ view tests reject independent string assembly for these two surfaces.
 
 ## Failure behavior
 
-| Failure | Result | Prompt bytes |
-|---|---|---:|
-| Fresh matrix mismatch | Compile error; no run created | 0 |
-| Exact model option absent/ambiguous | `ACP_CODEX_EXACT_CONFIGURATION_REJECTED` | 0 |
-| Model set response lacks exact current value | Same typed failure | 0 |
-| Effort option absent/ambiguous | Same typed failure | 0 |
-| Final pair mismatch | Same typed failure | 0 |
-| Required configuration transport failure | Same typed failure and bounded reap | 0 |
-| Invalid exact v2 provenance/request shape | Same typed failure before child launch | 0 |
-| Legacy generic frozen run | Existing legacy path; UI says unverified | Existing behavior |
-| Active readback cannot resolve frozen profile | `effort = null`; UI says unavailable | No mutation |
+| Failure | Result | Prompt delivery |
+|---|---|---|
+| Fresh matrix mismatch | Compile error; no run created | Write not started |
+| Frozen binding/payload mismatch | Typed rejection before child launch | Write not started |
+| Exact model option absent/ambiguous | `ACP_CODEX_EXACT_CONFIGURATION_REJECTED` | Write not started |
+| Model set response lacks exact current value | Same typed failure | Write not started |
+| Effort option absent/ambiguous | Same typed failure | Write not started |
+| Final pair mismatch | Same typed failure | Write not started |
+| Required configuration send/read failure | Same typed failure and bounded reap | Write not started |
+| Invalid exact v2 provenance/request shape | Strict compile failure before child launch | Write not started |
+| Prompt write fails after attempt begins | `ACP_PROMPT_DELIVERY_UNKNOWN` | Unknown; never reported as zero |
+| Legacy v1 frozen run | Existing legacy path; UI says unverified | Existing behavior |
+| Valid plan cannot resolve execution profile | `effort = null`; UI says unavailable | No mutation |
 
 `ACP_CODEX_EXACT_CONFIGURATION_REJECTED` maps to new domain failure kind
-`provider_configuration_rejected`, failure phase `provider_configuration`,
-output settlement `none`, and operator action hint `retry_same_binding` while
-the existing same-binding budget remains, otherwise
-`inspect_provider_configuration`. The failed AgentExecution and its zero-prompt
-fact are immutable. Cleanup terminates and reaps the child within the existing
-bounded cleanup policy.
+`provider_configuration_rejected`, `failure_kind_version = 2`, failure phase
+`provider_configuration`, output settlement `none`, existing operator action
+hint `inspect_logs`, and `retryable = false`. The failed AgentExecution and its
+transport code are immutable; the adapter invariant and instrumented writer
+prove that prompt write was not started. Cleanup terminates and reaps the child
+within the existing bounded cleanup policy.
 
-This failure is ineligible for P079 output repair, P086 resurrection,
-provider-health fallback, provider switching, and escalation to another
-binding. It is retryable only through the existing bounded same-binding retry
-budget; such a retry creates a new AgentExecution, process, and session and
-repeats the full handshake. No failure falls back to a generic model, provider
-default, weaker effort, or another provider.
+`ACP_PROMPT_DELIVERY_UNKNOWN` maps to new failure kind
+`prompt_delivery_unknown`, `failure_kind_version = 2`, failure phase
+`prompt_delivery`, output settlement `none`, existing hint `inspect_logs`, and
+`retryable = false`. Its distinct transport code proves that the write attempt
+started and never records a zero-prompt assertion. The execution enters the
+existing fresh-session quarantine/late-output isolation path and places the
+stage in terminal operator hold, so possible side effects or late outputs
+cannot be consumed by later automatic work.
+
+Both failure kinds are ineligible for automatic retry, P058 escalation tiers,
+P079 output repair, P086 resurrection, provider-health fallback, provider
+switching, and weaker/default model selection. No retry ledger or new action
+hint is introduced by this slice.
+
+Persistence retains the raw new failure string in the existing bounded
+`failure_kind_raw_debug` lane and maps it to `Unknown` for an old reader that
+does not know version 2. The existing GraphQL `AgentFailureKind` enum remains
+unchanged and likewise emits `UNKNOWN`; V2 readback carries the bounded raw
+string separately. MCP and reports continue to expose their existing
+nullable/string lanes. Because both rows use existing `inspect_logs`, old
+`OperatorActionHint` decoding remains valid. Compatibility tests cover
+old-reader/new-row readback on DB, GraphQL, MCP, and report projections.
 
 ## Verification gate
 
 Add focused gate `codex-model-variant-slice`. It is provider-free and runs:
 
-1. Strict fixture parsing, duplicate-key negatives, and SHA-256 parity across
-   checked-in, Rust-embedded, and Xcode-bundled bytes.
+1. Strict fixture parsing, duplicate-key negatives, the exact v1 literal
+   digest/length, rejection of in-place v1 mutation/removal, parity across
+   checked-in/Rust-embedded/Xcode-bundled bytes, and coexistence of v1 with a
+   synthetic later policy.
 2. Rust fresh compiler positives for every approved production row and bounded
    non-production fixture catalogs using supported exact pairs.
 3. Mutation negatives for every production profile, generic model, unknown
@@ -447,37 +626,54 @@ Add focused gate `codex-model-variant-slice`. It is provider-free and runs:
    profile, and undeclared extra production Codex profile.
 4. Separate fresh and frozen admission tests: fresh compilation writes v2;
    every v1 snapshot remains byte-identical legacy even with an exact-looking
-   pair; malformed v2 fails closed.
-5. `ExecutionRequest` matrix proving exact mode rejects every reuse, keep-alive,
-   repair, resurrection, supplied-session, and non-stage combination before
-   child launch.
-6. Fake ACP success proving exact request IDs, full-state replacement,
+   pair; malformed/unknown-policy v2 fails strict compilation and emits no
+   partial planned-identity row.
+5. Frozen-binding tests proving provider/model/effort are derived from
+   `backend_profile_id`, substitution of another valid pair rejects before
+   launch, and the adapter rechecks the same tuple.
+6. `SessionLaunchIntentV1` matrix proving a normal output-declaring stage keeps
+   fresh lineage and still executes `session/new`, while reuse, keep-alive,
+   repair, resurrection, live-session handles, and non-stage combinations
+   reject before launch; missing/`LegacyUnspecified` intent is accepted only on
+   legacy mode.
+7. Fake ACP success proving exact request IDs, full-state replacement,
    dependent effort appearing only after model selection, notification
    interleaving, ordered model then effort configuration, and exactly one
    prompt after both exact `currentValue` checks.
-7. Fake ACP negatives for alias-only, substring-only, duplicate, missing,
+8. Fake ACP negatives for alias-only, substring-only, duplicate, missing,
    malformed, empty-success, stale-snapshot, wrong-session, out-of-order,
    rejected, mismatched, and every numeric-limit overflow; each asserts zero
-   prompt bytes and bounded child cleanup.
-8. DB-backed settlement tests proving the typed failure, immutable failed
-   attempt, no P079/P086/fallback dispatch, and a distinct fresh execution for
-   an allowed bounded same-binding retry.
-9. Capability tests with old-schema, successful replacement, and failed
-   replacement fixtures, proving no new GraphQL document is sent before a
-   successful probe.
-10. GraphQL tests proving both active and topology paths use the same classifier,
+   prompt-write starts and bounded child cleanup.
+9. Short-write fixtures for every boundary from one byte through payload minus
+   one proving `prompt_delivery_unknown`, no zero-prompt fact, immutable
+   terminal settlement, and no automatic retry/repair/resurrection/fallback or
+   escalation for either new failure; possible late output remains quarantined.
+10. Old-reader/new-row compatibility across DB, GraphQL, MCP, and reports,
+    proving raw version-2 failure retention, old GraphQL enum value `UNKNOWN`,
+    and existing `inspect_logs` hint.
+11. GraphQL compatibility tests proving the old field/type/document work
+    unchanged on the new daemon and the new app never sends
+    `activeAgentExecutionsV2` to an old daemon.
+12. Capability-coordinator tests for error-free true, false, missing, partial
+    errors, timeout, decode failure, concurrent callers, exact state mapping,
+    generation change, no automatic restart, and an operator restart followed
+    by a distinct ready generation within 30 seconds.
+13. GraphQL tests proving both new active and topology paths use the same classifier,
     derive model/effort from the frozen profile rather than the current catalog,
-    and classify exact-looking v1, valid v2, invalid v2, and missing bindings.
-11. Swift decoding, bounded-scalar, and formatter goldens for Sol, Terra, Luna,
+    and classify exact-looking v1, valid v2, and missing bindings.
+14. Swift decoding, bounded-scalar, and formatter goldens for Sol, Terra, Luna,
     exact-looking legacy, generic legacy, missing effort, unknown bounded
-    values, compact copy, full copy, and accessibility output.
-12. Hosted Overview and Stages tests at 292 points with `.large` and
+    values, both terminal failure presentations, compact copy, full copy, and
+    accessibility output.
+15. Hosted Overview and Stages tests at 292 points with `.large` and
     `.accessibility3` text proving friendly variant, effort, planned qualifier,
     and status remain distinguishable; full accessibility/copy values are
-    available; focus and selection do not move; and parent accessibility does
-    not hide rows.
-13. Structural scans proving there is no feature flag, environment bypass,
-    current-catalog read in run readback, or second formatter.
+    available through keyboard command, context menu, and accessibility action;
+    focus and selection do not move; and parent accessibility does not hide
+    rows.
+16. Structural scans proving there is no feature flag, environment bypass,
+    current-catalog read in run readback, automatic capability-triggered daemon
+    restart, replacement of the old GraphQL field, or second formatter.
 
 The gate fails when any selected Rust or Swift suite executes zero tests. It
 does not invoke a live provider, network, remote UI host, or another proposal
@@ -489,15 +685,20 @@ gate.
   newly compiled run after release.
 - There is no disable switch, experiment percentage, or operator opt-in.
 - Pre-change frozen runs continue unchanged and visibly say legacy/unverified.
-- A configuration rejection fails that attempt visibly. Only a bounded
-  same-binding retry may react; repair, resurrection, fallback, provider switch,
-  and escalation do not.
+- Configuration rejection and prompt-delivery-unknown settle terminally and
+  visibly; retry, repair, resurrection, fallback, provider switch, and
+  escalation do not react.
+- A stale daemon produces a visible compatibility block. Capability probing
+  never restarts it; restart remains an explicit operator action.
 - Operational observation from a normal later run is useful but not required
   to merge this provider-free slice.
 
 ## Acceptance checklist
 
 - [ ] The active catalog contains exactly the approved seven Codex pairs.
+- [ ] Policy v1 is pinned to the normative digest/length, retained
+      append-only, and can coexist with a later policy without invalidating old
+      exact snapshots.
 - [ ] The Rust compiler rejects every matrix mutation before run creation;
       Swift `YAMLValidator` reports the same mutations as non-authoritative
       preflight feedback.
@@ -505,21 +706,35 @@ gate.
       including exact-looking values, remains on typed legacy behavior.
 - [ ] Existing generic frozen runs replay without byte mutation and without a
       fabricated Sol/Terra/Luna label.
-- [ ] Exact mode rejects reuse, keep-alive, repair, resurrection, supplied
+- [ ] Exact mode derives and rechecks its pair from frozen
+      `backend_profile_id`; another valid pair cannot be substituted.
+- [ ] Exact mode preserves fresh durable lineage for ordinary output stages but
+      rejects physical reuse, keep-alive, repair, resurrection, supplied live
       sessions, and non-stage ownership before child launch.
 - [ ] Exact invocations verify model and effort in order before the first
-      prompt, and every negative fixture proves zero prompt bytes.
-- [ ] Exact invocations use a fresh physical session; retry repeats the full
-      sequence.
+      prompt, and every pre-prompt negative fixture proves zero prompt-write
+      starts.
+- [ ] Exact invocations use a fresh physical session and neither new failure
+      enters automatic retry or escalation.
+- [ ] Instrumented writer tests prove no write attempt for configuration
+      rejection; every partial-write error settles as prompt delivery unknown
+      without a zero-prompt claim.
 - [ ] Overview and Stages show the same friendly variant, effort, and `planned`
       qualifier and expose the complete exact model ID through the shared full
       value, help, and copy affordance.
 - [ ] Active-agent effort is derived only from the frozen backend profile and
       remains nullable when unavailable.
-- [ ] GraphQL capability negotiation prevents a new run-detail document from
-      reaching an old daemon, and both readbacks expose the same typed mode.
+- [ ] The old GraphQL field/type remains unchanged; generation-bound,
+      single-flight capability negotiation prevents the V2 document from
+      reaching an old daemon, and both new readbacks expose the same typed mode.
+- [ ] Capability failure never restarts a daemon automatically; only an
+      operator action followed by a distinct ready generation permits re-probe.
 - [ ] Typed configuration rejection cannot enter repair, resurrection,
       fallback, provider switching, or escalation.
+- [ ] Old readers retain raw new failure values and decode the existing
+      `inspect_logs` action; no new action-hint vocabulary is introduced.
+- [ ] Terminal configuration states and complete model configuration are
+      keyboard, pointer, and accessibility readable without moving selection.
 - [ ] No public surface claims accepted/configured/actual provider identity.
 - [ ] No flag or bypass can disable the fresh-run behavior.
 - [ ] `./scripts/test-gate.sh codex-model-variant-slice` passes with nonzero
@@ -533,7 +748,7 @@ review, implementation, and closeout cycles before use:
 
 | Deferred child | Removed responsibility | Inherited review findings |
 |---|---|---|
-| [Provider accepted truth and prompt authority](2026-08-31-provider-accepted-truth-and-prompt-authority-design.md) | Durable accepted configuration, stable task occurrence, reuse, prompt permits, delivery-unknown settlement, fallback ambiguity | P2-01 and accepted-truth portions of the checkpoint |
+| [Provider accepted truth and prompt authority](2026-08-31-provider-accepted-truth-and-prompt-authority-design.md) | Durable accepted configuration, stable task occurrence, reuse, prompt permits, general post-dispatch delivery settlement, fallback ambiguity; excludes this slice's first-write terminal safety classification | P2-01 and accepted-truth portions of the checkpoint |
 | [Provider configuration migration and reconciliation](2026-08-31-provider-configuration-migration-and-reconciliation-design.md) | Class A registry, append-only reconciliation, bootstrap migration phases and manifests | P1-01, P1-05 |
 | [P079 repair output materialization](2026-08-31-p079-repair-output-materialization-design.md) | Staging, leases, chunk resume, history activation, crash recovery | P1-02 |
 | [P086 resurrection containment](2026-08-31-p086-resurrection-containment-design.md) | Claude attach protocol, secret resolver, root/MCP containment, output-only recovery | P1-03 |
