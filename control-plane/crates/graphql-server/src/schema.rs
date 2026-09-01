@@ -11217,18 +11217,37 @@ mod tests {
         );
     }
 
+    const P093_CODEX_PROVIDER_ALIASES: [&str; 5] = [
+        "codex",
+        "codex_acp",
+        "codex_cli",
+        "codex_cli_acp",
+        "openai_codex",
+    ];
+    const P093_NON_CODEX_PROVIDER_ALIASES: [&str; 12] = [
+        "claude",
+        "claude_acp",
+        "claude_agent",
+        "claude_agent_acp",
+        "gemini",
+        "gemini_acp",
+        "gemini_cli",
+        "gemini_cli_acp",
+        "auggie",
+        "auggie_acp",
+        "junie",
+        "junie_acp",
+    ];
+
     #[test]
     fn active_agent_provider_normalization_is_codex_only_and_resolver_local() {
-        for alias in [
-            "codex",
-            "codex_acp",
-            "codex_cli",
-            "codex_cli_acp",
-            "openai_codex",
-        ] {
+        for alias in P093_CODEX_PROVIDER_ALIASES {
             assert_eq!(p093_active_provider_for_readback(alias), "codex");
         }
-        for provider in ["claude_acp", "Gemini-CLI", "unknown-provider"] {
+        for provider in P093_NON_CODEX_PROVIDER_ALIASES
+            .into_iter()
+            .chain(["unknown-provider"])
+        {
             assert_eq!(p093_active_provider_for_readback(provider), provider);
         }
 
@@ -11274,16 +11293,10 @@ mod tests {
             Utc::now(),
         );
         stages::insert(&pool, &stage).await.unwrap();
-        let providers = [
-            "codex",
-            "codex_acp",
-            "codex_cli",
-            "codex_cli_acp",
-            "openai_codex",
-            "claude_acp",
-            "Gemini-CLI",
-            "unknown-provider",
-        ];
+        let providers = P093_CODEX_PROVIDER_ALIASES
+            .into_iter()
+            .chain(P093_NON_CODEX_PROVIDER_ALIASES)
+            .chain(["unknown-provider"]);
         for provider in providers {
             let execution = make_agent_execution(stage.id, "proposal_writer", provider, Utc::now());
             db::repos::agent_executions::insert(&pool, &execution)

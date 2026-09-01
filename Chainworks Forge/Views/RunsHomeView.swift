@@ -1509,6 +1509,46 @@ final class P031ThinReadDashboardModel: ObservableObject {
     }
 
 #if DEBUG
+    static func testLoaded(runDetail: P031RunDetailPresentation) -> P031ThinReadDashboardModel {
+        let freshness = runDetail.freshness
+        let selectedRunID = runDetail.runID ?? "test-run"
+        let runsHome = P031RunsHomePresentation(
+            orientation: nil,
+            rows: [],
+            freshness: freshness,
+            refreshFeedbackText: runDetail.refreshFeedbackText,
+            emptyStateTitle: nil,
+            errorDescription: nil
+        )
+        let approvals = P031ApprovalInboxPresentation(
+            rows: [],
+            freshness: freshness,
+            refreshFeedbackText: "No pending approvals",
+            emptyStateTitle: "No approvals",
+            errorDescription: nil
+        )
+        let daemon = P031DaemonLifecyclePresentation(
+            state: .ready,
+            buildSHA: nil,
+            pid: nil,
+            uptimeSeconds: nil,
+            title: "Control plane daemon",
+            detailLabel: "Test fixture",
+            badgeLabels: ["Running"],
+            copyItems: [],
+            freshness: freshness,
+            refreshFeedbackText: "Live projection",
+            errorDescription: nil
+        )
+        return P031ThinReadDashboardModel(
+            runsHome: runsHome,
+            runDetail: runDetail,
+            approvalInbox: approvals,
+            daemonLifecycle: daemon,
+            selectedRunID: selectedRunID
+        )
+    }
+
     static func previewLoaded() -> P031ThinReadDashboardModel {
         previewLoaded(includeCloseoutReadiness: false)
     }
@@ -6497,6 +6537,35 @@ struct P036ActiveAgentReadbackRow: View {
     let agent: RunsWorkbenchPresentationModel.ActiveTimelineAgent
 
     var body: some View {
+        P036ActiveAgentReadbackRowContent(agent: agent)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(activeAccessibilityLabel)
+            .accessibilityIdentifier("p036-active-agent-\(agent.id)")
+            .help(agent.plannedAssignment.fullAccessibilityValue)
+    }
+
+    private var statusLabel: String {
+        let status = agent.status.trimmingCharacters(in: .whitespacesAndNewlines)
+        return status.isEmpty ? "running" : status
+    }
+
+    private var activeAccessibilityLabel: String {
+        P036PlannedAssignmentAccessibility.overviewLabel(
+            agentTitle: agent.title,
+            status: statusLabel,
+            presentation: agent.plannedAssignment,
+            stage: agent.stageLabel,
+            task: agent.taskLabel,
+            session: agent.sessionID,
+            eventCount: agent.eventCount
+        )
+    }
+}
+
+struct P036ActiveAgentReadbackRowContent: View {
+    let agent: RunsWorkbenchPresentationModel.ActiveTimelineAgent
+
+    var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: "bolt.circle.fill")
                 .font(.system(size: 12, weight: .semibold))
@@ -6530,10 +6599,8 @@ struct P036ActiveAgentReadbackRow: View {
                     .lineLimit(1)
             }
         }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(activeAccessibilityLabel)
-        .accessibilityIdentifier("p036-active-agent-\(agent.id)")
-        .help(agent.plannedAssignment.fullAccessibilityValue)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("p036-active-agent-content-\(agent.id)")
     }
 
     private var statusLabel: String {
@@ -6550,18 +6617,6 @@ struct P036ActiveAgentReadbackRow: View {
             let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return trimmed.isEmpty ? nil : trimmed
         }
-    }
-
-    private var activeAccessibilityLabel: String {
-        P036PlannedAssignmentAccessibility.overviewLabel(
-            agentTitle: agent.title,
-            status: statusLabel,
-            presentation: agent.plannedAssignment,
-            stage: agent.stageLabel,
-            task: agent.taskLabel,
-            session: agent.sessionID,
-            eventCount: agent.eventCount
-        )
     }
 }
 
@@ -6922,6 +6977,28 @@ struct P036StageOccurrenceRow: View {
     let occurrence: RunsWorkbenchPresentationModel.StageOccurrence
 
     var body: some View {
+        P036StageOccurrenceRowContent(occurrence: occurrence)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(stageAccessibilityLabel)
+            .accessibilityIdentifier("p036-stage-occurrence-\(occurrence.id)")
+            .help(occurrence.plannedAssignment.fullAccessibilityValue)
+    }
+
+    private var stageAccessibilityLabel: String {
+        P036PlannedAssignmentAccessibility.stageOccurrenceLabel(
+            agentTitle: occurrence.agentTitle,
+            task: occurrence.taskName,
+            status: occurrence.statusText,
+            presentation: occurrence.plannedAssignment,
+            executionCount: occurrence.executionCountLabel
+        )
+    }
+}
+
+struct P036StageOccurrenceRowContent: View {
+    let occurrence: RunsWorkbenchPresentationModel.StageOccurrence
+
+    var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             Image(systemName: "person.crop.circle")
                 .font(.system(size: 11, weight: .medium))
@@ -6934,20 +7011,8 @@ struct P036StageOccurrenceRow: View {
                 P036StageOccurrenceDetailLine(occurrence: occurrence)
             }
         }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(stageAccessibilityLabel)
-        .accessibilityIdentifier("p036-stage-occurrence-\(occurrence.id)")
-        .help(occurrence.plannedAssignment.fullAccessibilityValue)
-    }
-
-    private var stageAccessibilityLabel: String {
-        P036PlannedAssignmentAccessibility.stageOccurrenceLabel(
-            agentTitle: occurrence.agentTitle,
-            task: occurrence.taskName,
-            status: occurrence.statusText,
-            presentation: occurrence.plannedAssignment,
-            executionCount: occurrence.executionCountLabel
-        )
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("p036-stage-occurrence-content-\(occurrence.id)")
     }
 }
 

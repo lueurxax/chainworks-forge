@@ -10,12 +10,12 @@
 
 use anyhow::{Context, Result};
 use domain::codex_model_variant_policy::{
-    load_pinned_policy_v1, CodexModelVariantPolicyV1, AUTHORED_CODEX_PROVIDER,
-    CANONICAL_CODEX_PROVIDER, CODEX_MODEL_VARIANT_POLICY_FILE_V1,
+    AUTHORED_CODEX_PROVIDER, CANONICAL_CODEX_PROVIDER, CODEX_MODEL_VARIANT_POLICY_BYTES_V1,
+    CODEX_MODEL_VARIANT_POLICY_FILE_V1, CodexModelVariantPolicyV1, load_pinned_policy_v1,
 };
 use domain::provider::ProviderFamily;
-use serde::de::{self, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor};
-use serde::Deserialize;
+use serde::de::{self, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor};
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io::Read;
@@ -123,7 +123,7 @@ where
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
     let policy_path = catalog_base.join(CODEX_MODEL_VARIANT_POLICY_FILE_V1);
-    let policy_bytes = std::fs::read(&policy_path).with_context(|| {
+    let policy_bytes = read_bounded_codex_policy_v1(&policy_path).with_context(|| {
         format!(
             "reading codex model variant policy at '{}'",
             policy_path.display()
@@ -164,45 +164,26 @@ fn read_bounded_new_run_yaml_v1(
     Ok(bytes)
 }
 
-fn parse_bounded_admission_yaml_v1(bytes: &[u8]) -> Result<serde_yaml::Value> {
-    let value = parse_duplicate_aware_yaml(bytes)?;
-    validate_new_run_yaml_complexity_v1(&value)?;
-    Ok(value)
+fn read_bounded_codex_policy_v1(path: &Path) -> Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(CODEX_MODEL_VARIANT_POLICY_BYTES_V1);
+    file.take(CODEX_MODEL_VARIANT_POLICY_BYTES_V1 as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > CODEX_MODEL_VARIANT_POLICY_BYTES_V1 {
+        anyhow::bail!(
+            "policy_bytes_mismatch: policy exceeds {} bytes",
+            CODEX_MODEL_VARIANT_POLICY_BYTES_V1
+        );
+    }
+    Ok(bytes)
 }
 
-fn validate_new_run_yaml_complexity_v1(root: &serde_yaml::Value) -> Result<()> {
-    let mut stack = vec![(root, 1usize)];
-    let mut node_count = 0usize;
-
-    while let Some((value, depth)) = stack.pop() {
-        node_count += 1;
-        if depth > MAX_NEW_RUN_YAML_DEPTH_V1 || node_count > MAX_NEW_RUN_YAML_NODES_V1 {
-            anyhow::bail!(
-                "new_run_yaml_complexity_exceeded: YAML exceeds depth {} or {} nodes",
-                MAX_NEW_RUN_YAML_DEPTH_V1,
-                MAX_NEW_RUN_YAML_NODES_V1
-            );
-        }
-        match value {
-            serde_yaml::Value::Sequence(values) => {
-                stack.extend(values.iter().map(|child| (child, depth + 1)));
-            }
-            serde_yaml::Value::Mapping(values) => {
-                for (key, child) in values {
-                    stack.push((key, depth + 1));
-                    stack.push((child, depth + 1));
-                }
-            }
-            serde_yaml::Value::Tagged(tagged) => {
-                stack.push((&tagged.value, depth + 1));
-            }
-            serde_yaml::Value::Null
-            | serde_yaml::Value::Bool(_)
-            | serde_yaml::Value::Number(_)
-            | serde_yaml::Value::String(_) => {}
-        }
-    }
-    Ok(())
+fn parse_bounded_admission_yaml_v1(bytes: &[u8]) -> Result<serde_yaml::Value> {
+    parse_duplicate_aware_yaml_with_budget_v1(
+        bytes,
+        MAX_NEW_RUN_YAML_DEPTH_V1,
+        MAX_NEW_RUN_YAML_NODES_V1,
+    )
 }
 
 fn compile_on_current_thread(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
@@ -859,143 +840,196 @@ fn load_raw_yaml_value(path: &str) -> Result<serde_yaml::Value> {
 
 struct DuplicateAwareYamlValue(serde_yaml::Value);
 
-impl<'de> Deserialize<'de> for DuplicateAwareYamlValue {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct DuplicateAwareVisitor;
+struct YamlDecodeBudgetV1 {
+    nodes: Cell<usize>,
+    max_depth: usize,
+    max_nodes: usize,
+}
 
-        impl<'de> Visitor<'de> for DuplicateAwareVisitor {
-            type Value = DuplicateAwareYamlValue;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a YAML value without duplicate mapping keys")
-            }
-
-            fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(DuplicateAwareYamlValue(serde_yaml::Value::Bool(value)))
-            }
-
-            fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(DuplicateAwareYamlValue(serde_yaml::Value::Number(
-                    value.into(),
-                )))
-            }
-
-            fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(DuplicateAwareYamlValue(serde_yaml::Value::Number(
-                    value.into(),
-                )))
-            }
-
-            fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(DuplicateAwareYamlValue(serde_yaml::Value::Number(
-                    value.into(),
-                )))
-            }
-
-            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(DuplicateAwareYamlValue(serde_yaml::Value::String(
-                    value.to_string(),
-                )))
-            }
-
-            fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(DuplicateAwareYamlValue(serde_yaml::Value::String(value)))
-            }
-
-            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(DuplicateAwareYamlValue(serde_yaml::Value::Null))
-            }
-
-            fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                self.visit_unit()
-            }
-
-            fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                DuplicateAwareYamlValue::deserialize(deserializer)
-            }
-
-            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let mut values = Vec::new();
-                while let Some(value) = sequence.next_element::<DuplicateAwareYamlValue>()? {
-                    values.push(value.0);
-                }
-                Ok(DuplicateAwareYamlValue(serde_yaml::Value::Sequence(values)))
-            }
-
-            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut values = serde_yaml::Mapping::new();
-                while let Some(key) = map.next_key::<DuplicateAwareYamlValue>()? {
-                    let value = map.next_value::<DuplicateAwareYamlValue>()?;
-                    if values.contains_key(&key.0) {
-                        return Err(de::Error::custom("duplicate YAML mapping key"));
-                    }
-                    values.insert(key.0, value.0);
-                }
-                Ok(DuplicateAwareYamlValue(serde_yaml::Value::Mapping(values)))
-            }
-
-            fn visit_enum<A>(self, data: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: EnumAccess<'de>,
-            {
-                let (tag, value) = data.variant::<String>()?;
-                let value = value.newtype_variant::<DuplicateAwareYamlValue>()?;
-                Ok(DuplicateAwareYamlValue(serde_yaml::Value::Tagged(
-                    Box::new(serde_yaml::value::TaggedValue {
-                        tag: serde_yaml::value::Tag::new(tag),
-                        value: value.0,
-                    }),
-                )))
-            }
+impl YamlDecodeBudgetV1 {
+    fn enter<E: de::Error>(&self, depth: usize) -> std::result::Result<(), E> {
+        let next_nodes = self.nodes.get().saturating_add(1);
+        if depth > self.max_depth || next_nodes > self.max_nodes {
+            return Err(E::custom(format!(
+                "new_run_yaml_complexity_exceeded: YAML reached depth {depth}/{} and node {next_nodes}/{}",
+                self.max_depth, self.max_nodes
+            )));
         }
-
-        deserializer.deserialize_any(DuplicateAwareVisitor)
+        self.nodes.set(next_nodes);
+        Ok(())
     }
 }
 
-fn parse_duplicate_aware_yaml(bytes: &[u8]) -> Result<serde_yaml::Value> {
+#[derive(Clone, Copy)]
+struct DuplicateAwareYamlSeed<'budget> {
+    budget: &'budget YamlDecodeBudgetV1,
+    depth: usize,
+}
+
+impl<'budget> DuplicateAwareYamlSeed<'budget> {
+    fn child(self) -> Self {
+        Self {
+            budget: self.budget,
+            depth: self.depth.saturating_add(1),
+        }
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for DuplicateAwareYamlSeed<'_> {
+    type Value = DuplicateAwareYamlValue;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        self.budget.enter::<D::Error>(self.depth)?;
+        deserializer.deserialize_any(DuplicateAwareYamlVisitor { seed: self })
+    }
+}
+
+struct DuplicateAwareYamlVisitor<'budget> {
+    seed: DuplicateAwareYamlSeed<'budget>,
+}
+
+impl<'de> Visitor<'de> for DuplicateAwareYamlVisitor<'_> {
+    type Value = DuplicateAwareYamlValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded YAML value without duplicate mapping keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(DuplicateAwareYamlValue(serde_yaml::Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(DuplicateAwareYamlValue(serde_yaml::Value::Number(
+            value.into(),
+        )))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(DuplicateAwareYamlValue(serde_yaml::Value::Number(
+            value.into(),
+        )))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(DuplicateAwareYamlValue(serde_yaml::Value::Number(
+            value.into(),
+        )))
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(DuplicateAwareYamlValue(serde_yaml::Value::String(
+            value.to_string(),
+        )))
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(DuplicateAwareYamlValue(serde_yaml::Value::String(value)))
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(DuplicateAwareYamlValue(serde_yaml::Value::Null))
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_unit()
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateAwareYamlVisitor { seed: self.seed })
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element_seed(self.seed.child())? {
+            values.push(value.0);
+        }
+        Ok(DuplicateAwareYamlValue(serde_yaml::Value::Sequence(values)))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_yaml::Mapping::new();
+        while let Some(key) = map.next_key_seed(self.seed.child())? {
+            let value = map.next_value_seed(self.seed.child())?;
+            if values.contains_key(&key.0) {
+                return Err(de::Error::custom("duplicate YAML mapping key"));
+            }
+            values.insert(key.0, value.0);
+        }
+        Ok(DuplicateAwareYamlValue(serde_yaml::Value::Mapping(values)))
+    }
+
+    fn visit_enum<A>(self, data: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: EnumAccess<'de>,
+    {
+        let (tag, value) = data.variant::<String>()?;
+        let value = value.newtype_variant_seed(self.seed.child())?;
+        Ok(DuplicateAwareYamlValue(serde_yaml::Value::Tagged(
+            Box::new(serde_yaml::value::TaggedValue {
+                tag: serde_yaml::value::Tag::new(tag),
+                value: value.0,
+            }),
+        )))
+    }
+}
+
+fn parse_duplicate_aware_yaml_with_budget_v1(
+    bytes: &[u8],
+    max_depth: usize,
+    max_nodes: usize,
+) -> Result<serde_yaml::Value> {
     let mut documents = serde_yaml::Deserializer::from_slice(bytes);
     let Some(document) = documents.next() else {
         anyhow::bail!("YAML document is empty");
     };
-    let value =
-        DuplicateAwareYamlValue::deserialize(document).context("duplicate-aware YAML decoding")?;
+    let budget = YamlDecodeBudgetV1 {
+        nodes: Cell::new(0),
+        max_depth,
+        max_nodes,
+    };
+    let value = DuplicateAwareYamlSeed {
+        budget: &budget,
+        depth: 1,
+    }
+    .deserialize(document)
+    .context("duplicate-aware YAML decoding")?;
     if documents.next().is_some() {
         anyhow::bail!("multiple YAML documents are not supported");
     }
@@ -2200,7 +2234,7 @@ mod new_run_source_tests {
             "]".repeat(MAX_NEW_RUN_YAML_DEPTH_V1 - 1)
         );
         parse_bounded_admission_yaml_v1(exact.as_bytes())
-            .expect("the documented maximum nesting depth should parse");
+            .unwrap_or_else(|error| panic!("exact depth failed: {error:#}"));
 
         let excessive = format!(
             "{}0{}",
@@ -2208,11 +2242,90 @@ mod new_run_source_tests {
             "]".repeat(MAX_NEW_RUN_YAML_DEPTH_V1)
         );
         let error = parse_bounded_admission_yaml_v1(excessive.as_bytes())
-            .expect_err("one level beyond the maximum must fail")
-            .to_string();
+            .expect_err("one level beyond the maximum must fail");
+        let error = format!("{error:#}");
         assert!(
             error.contains("new_run_yaml_complexity_exceeded"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn new_run_source_reader_enforces_node_budget_during_sequence_decode() {
+        let exact = "- 0\n".repeat(MAX_NEW_RUN_YAML_NODES_V1 - 1);
+        parse_duplicate_aware_yaml_with_budget_v1(
+            exact.as_bytes(),
+            MAX_NEW_RUN_YAML_DEPTH_V1,
+            MAX_NEW_RUN_YAML_NODES_V1,
+        )
+        .unwrap_or_else(|error| panic!("exact sequence failed: {error:#}"));
+
+        let plus_one = "- 0\n".repeat(MAX_NEW_RUN_YAML_NODES_V1);
+        let error = parse_duplicate_aware_yaml_with_budget_v1(
+            plus_one.as_bytes(),
+            MAX_NEW_RUN_YAML_DEPTH_V1,
+            MAX_NEW_RUN_YAML_NODES_V1,
+        )
+        .expect_err("the decoder must reject before allocating node 100,001");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("new_run_yaml_complexity_exceeded"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn new_run_source_reader_enforces_node_budget_during_map_decode() {
+        let mut exact = String::with_capacity(700_000);
+        for index in 0..49_998 {
+            exact.push_str(&format!("k{index}: 0\n"));
+        }
+        exact.push_str("tail: [0]\n");
+        parse_duplicate_aware_yaml_with_budget_v1(
+            exact.as_bytes(),
+            MAX_NEW_RUN_YAML_DEPTH_V1,
+            MAX_NEW_RUN_YAML_NODES_V1,
+        )
+        .unwrap_or_else(|error| panic!("exact map failed: {error:#}"));
+
+        let plus_one = exact.replacen("tail: [0]", "tail: [0, 1]", 1);
+        let error = parse_duplicate_aware_yaml_with_budget_v1(
+            plus_one.as_bytes(),
+            MAX_NEW_RUN_YAML_DEPTH_V1,
+            MAX_NEW_RUN_YAML_NODES_V1,
+        )
+        .expect_err("the decoder must reject the first over-budget map child");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("new_run_yaml_complexity_exceeded"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn new_run_source_reader_bounds_pinned_policy_before_loading() {
+        let root = tempfile::tempdir().unwrap();
+        let policy_path = root.path().join(CODEX_MODEL_VARIANT_POLICY_FILE_V1);
+        std::fs::write(
+            &policy_path,
+            vec![b' '; CODEX_MODEL_VARIANT_POLICY_BYTES_V1],
+        )
+        .unwrap();
+        assert_eq!(
+            read_bounded_codex_policy_v1(&policy_path)
+                .expect("the exact pinned length must be readable")
+                .len(),
+            CODEX_MODEL_VARIANT_POLICY_BYTES_V1
+        );
+
+        std::fs::write(
+            &policy_path,
+            vec![b' '; CODEX_MODEL_VARIANT_POLICY_BYTES_V1 + 1],
+        )
+        .unwrap();
+        let error = read_bounded_codex_policy_v1(&policy_path)
+            .expect_err("plus-one policy bytes must fail before an unbounded read")
+            .to_string();
+        assert!(error.contains("policy_bytes_mismatch"), "{error}");
     }
 }

@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import CryptoKit
 import Foundation
 import SwiftUI
@@ -411,25 +410,60 @@ struct CodexModelVariantTruthTests {
     func plannedVariantSurvivesDynamicTypeRange() throws {
         let regularSizes: [DynamicTypeSize] = [.xSmall, .small, .medium, .large]
         for size in regularSizes {
-            let line = P036PlannedAssignmentLine(
-                presentation: plannedTerra,
-                trailingComponents: []
+            let plannedOnly = hostedAccessibilityElements(
+                P036PlannedAssignmentLine(
+                    presentation: plannedTerra,
+                    trailingComponents: []
+                )
+                .environment(\.dynamicTypeSize, size),
+                width: 1_000
             )
-            .environment(\.dynamicTypeSize, size)
-            let naturalSize = hostedSize(line)
-            for width: CGFloat in [292, 520] {
-                let elements = hostedAccessibilityElements(line, width: width)
-                let token = try #require(
-                    elements.first { $0.text == "Terra" }
+            let plannedSuffix = try #require(
+                plannedOnly.first { $0.text == plannedTerra.visualSuffix }
+            )
+            let surfaces: [(String, CGFloat, AnyView)] = [
+                (
+                    "p036-stage-occurrence-content-occurrence-0",
+                    292,
+                    AnyView(
+                        P036StageOccurrenceRowContent(
+                            occurrence: stageOccurrence(
+                                status: "Running",
+                                taskName: "Draft a deliberately long proposal metadata suffix"
+                            )
+                        )
+                    )
+                ),
+                (
+                    "p036-active-agent-content-proposal-writer",
+                    496,
+                    AnyView(
+                        P036ActiveAgentReadbackRowContent(
+                            agent: activeAgent(
+                                id: "proposal-writer",
+                                stageID: "stage-current",
+                                selectionOrder: 1,
+                                taskLabel: "Draft a deliberately long proposal metadata suffix",
+                                sessionID: "session-with-a-long-readback-identifier"
+                            )
+                        )
+                    )
+                ),
+            ]
+            for (containerID, width, surface) in surfaces {
+                let elements = hostedAccessibilityElements(
+                    surface.environment(\.dynamicTypeSize, size),
+                    width: width,
+                    height: 96
                 )
+                let container = try #require(elements.first { $0.identifier == containerID })
+                let token = try #require(elements.first { $0.text == "Terra" })
                 let suffix = try #require(
-                    elements.first { $0.text == "gpt-5.6-terra · high · planned" }
+                    elements.first { $0.text?.hasPrefix(plannedTerra.visualSuffix) == true }
                 )
-                #expect(token.text == "Terra")
-                #expect(suffix.text == "gpt-5.6-terra · high · planned")
-                #expect(naturalSize.width <= width)
-                #expect(token.frame?.width ?? 0 > 0)
-                #expect(suffix.frame?.width ?? 0 > 0)
+                #expect((suffix.frame?.width ?? 0) + 0.5 >= (plannedSuffix.frame?.width ?? .infinity))
+                expectContained(token, in: container)
+                expectContained(suffix, in: container)
             }
         }
 
@@ -444,37 +478,44 @@ struct CodexModelVariantTruthTests {
             .accessibility5,
         ]
         for size in accessibilitySizes {
-            let line = P036PlannedAssignmentLine(
-                presentation: plannedTerra,
-                trailingComponents: ["Draft a deliberately long proposal metadata suffix"]
+            let stage = P036StageOccurrenceRowContent(
+                occurrence: stageOccurrence(
+                    status: "Running",
+                    taskName: "Draft a deliberately long proposal metadata suffix"
+                )
             )
             .environment(\.dynamicTypeSize, size)
-            let natural = hostedAccessibilityElements(line, width: 1_000)
-            let constrained = hostedAccessibilityElements(line, width: 292)
-            let naturalToken = try #require(
-                natural.first { $0.text == "Terra" }
+            let overview = P036ActiveAgentReadbackRowContent(
+                agent: activeAgent(
+                    id: "proposal-writer",
+                    stageID: "stage-current",
+                    selectionOrder: 1,
+                    taskLabel: "Draft a deliberately long proposal metadata suffix",
+                    sessionID: "session-with-a-long-readback-identifier"
+                )
             )
-            let naturalSuffix = try #require(
-                natural.first {
-                    $0.text?.hasPrefix("gpt-5.6-terra · high · planned") == true
-                }
-            )
-            let token = try #require(
-                constrained.first { $0.text == "Terra" }
-            )
-            let suffix = try #require(
-                constrained.first {
-                    $0.text?.hasPrefix("gpt-5.6-terra · high · planned") == true
-                }
-            )
-            #expect(token.text == "Terra")
-            #expect(suffix.text?.hasPrefix("gpt-5.6-terra · high · planned") == true)
-            #expect(abs((token.frame?.width ?? 0) - (naturalToken.frame?.width ?? 0)) < 0.5)
-            #expect((suffix.frame?.width ?? 0) <= (naturalSuffix.frame?.width ?? 0))
-            #expect((token.frame?.width ?? 0) > 0)
-            if let tokenFrame = token.frame, let suffixFrame = suffix.frame {
-                #expect(suffixFrame.maxX - tokenFrame.minX <= 292.5)
-                #expect(suffixFrame.minX >= tokenFrame.maxX)
+            .environment(\.dynamicTypeSize, size)
+            for (containerID, width, surface) in [
+                ("p036-stage-occurrence-content-occurrence-0", CGFloat(292), AnyView(stage)),
+                ("p036-active-agent-content-proposal-writer", CGFloat(496), AnyView(overview)),
+            ] {
+                let natural = hostedAccessibilityElements(surface, width: 1_000, height: 120)
+                let constrained = hostedAccessibilityElements(surface, width: width, height: 120)
+                let naturalToken = try #require(natural.first { $0.text == "Terra" })
+                let naturalSuffix = try #require(
+                    natural.first { $0.text?.hasPrefix(plannedTerra.visualSuffix) == true }
+                )
+                let container = try #require(
+                    constrained.first { $0.identifier == containerID }
+                )
+                let token = try #require(constrained.first { $0.text == "Terra" })
+                let suffix = try #require(
+                    constrained.first { $0.text?.hasPrefix(plannedTerra.visualSuffix) == true }
+                )
+                #expect(abs((token.frame?.width ?? 0) - (naturalToken.frame?.width ?? 0)) < 0.5)
+                #expect((suffix.frame?.width ?? .infinity) < (naturalSuffix.frame?.width ?? 0))
+                expectContained(token, in: container)
+                expectContained(suffix, in: container)
             }
 
             let rowStrings = hostedAccessibilityStrings(
@@ -491,17 +532,19 @@ struct CodexModelVariantTruthTests {
         let active = activeAgent(id: "proposal-writer", stageID: "stage-current", selectionOrder: 1)
         let overviewElements = hostedAccessibilityElements(
             P036ActiveAgentReadbackRow(agent: active),
-            width: 520
+            width: 496
         )
         let overview = try #require(
             overviewElements.first { $0.identifier == "p036-active-agent-proposal-writer" }
         )
         #expect(overview.help == plannedTerra.fullAccessibilityValue)
+        #expect((overview.frame?.width ?? 0) > 0)
+        #expect((overview.frame?.width ?? .infinity) <= 496)
 
         let stageElements = hostedAccessibilityElements(
-            P036StageOccurrenceRow(occurrence: stageOccurrence(status: "Running")),
-            width: 292,
-            height: 210
+            P036StageTopologyCard(stage: stageCard(occurrenceCount: 1)),
+            width: 316,
+            height: 234
         )
         let stage = try #require(
             stageElements.first { $0.identifier == "p036-stage-occurrence-occurrence-0" }
@@ -625,13 +668,23 @@ struct CodexModelVariantTruthTests {
         #expect(after.filter { $0.contains(", Paused, " + plannedValue + ",") }.count == 2)
     }
 
-    @Test("Status refresh preserves keyboard focus text selection and row selection")
-    func statusRefreshPreservesHostedInteractionState() throws {
-        let model = P036StatusRefreshProbeModel()
-        let host = NSHostingView(rootView: P036StatusRefreshProbe(model: model))
+    @Test("Production run-detail selection and focus survive status-only refresh")
+    func statusRefreshPreservesProductionInteractionState() throws {
+        let running = productionRunDetail(status: "Running")
+        let paused = productionRunDetail(status: "Paused")
+        let model = P031ThinReadDashboardModel.testLoaded(runDetail: running)
+        let workbench = RunsWorkbenchPresentationModel()
+        workbench.populate(from: running)
+        let host = NSHostingView(
+            rootView: RunsHomeView(
+                model: model,
+                workbench: workbench,
+                initialTab: .stages
+            )
+        )
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 360),
-            styleMask: [.titled],
+            contentRect: NSRect(x: 0, y: 0, width: 1_200, height: 800),
+            styleMask: [.titled, .resizable],
             backing: .buffered,
             defer: false
         )
@@ -643,21 +696,35 @@ struct CodexModelVariantTruthTests {
             window.contentView = nil
             window.close()
         }
-        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        enableSwiftUIAccessibilityTree()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
 
-        let field = try #require(firstDescendant(of: NSTextField.self, in: host))
-        field.selectText(nil)
-        let editor = try #require(field.currentEditor() as? NSTextView)
-        editor.selectedRange = NSRange(location: 2, length: 3)
-        #expect(window.firstResponder === editor)
-        #expect(model.selection == "stage-current")
+        let picker = try #require(
+            descendants(of: NSSegmentedControl.self, in: host)
+                .first { $0.segmentCount == P031RunDetailTab.allCases.count }
+        )
+        #expect(picker.selectedSegment == 1)
+        #expect(window.makeFirstResponder(picker))
+        let occurrenceID = "p036-stage-occurrence-stage-current-proposal_writer-Draft proposal"
+        let before = try #require(
+            accessibilityElements(from: host).first { $0.identifier == occurrenceID }
+        )
+        #expect(before.label?.contains(", Running, ") == true)
 
-        model.status = "Paused"
-        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        workbench.populate(from: paused)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
 
-        #expect(window.firstResponder === editor)
-        #expect(editor.selectedRange == NSRange(location: 2, length: 3))
-        #expect(model.selection == "stage-current")
+        let pickerAfter = try #require(
+            descendants(of: NSSegmentedControl.self, in: host)
+                .first { $0.segmentCount == P031RunDetailTab.allCases.count }
+        )
+        let after = try #require(
+            accessibilityElements(from: host).first { $0.identifier == occurrenceID }
+        )
+        #expect(pickerAfter.selectedSegment == 1)
+        #expect(window.firstResponder === picker)
+        #expect(after.label?.contains(", Paused, ") == true)
+        #expect(after.frame == before.frame)
     }
 
     private func pinnedPolicy() throws -> CodexModelVariantPolicyAvailability {
@@ -677,7 +744,9 @@ struct CodexModelVariantTruthTests {
         id: String,
         stageID: String?,
         selectionOrder: Int?,
-        status: String = "running"
+        status: String = "running",
+        taskLabel: String = "task",
+        sessionID: String? = nil
     ) -> RunsWorkbenchPresentationModel.ActiveTimelineAgent {
         RunsWorkbenchPresentationModel.ActiveTimelineAgent(
             id: id,
@@ -691,9 +760,9 @@ struct CodexModelVariantTruthTests {
             ),
             stageID: stageID,
             stageLabel: stageID,
-            taskLabel: "task",
+            taskLabel: taskLabel,
             status: status,
-            sessionID: nil,
+            sessionID: sessionID,
             latestAt: Date(timeIntervalSince1970: 1),
             eventCount: 1,
             selectionOrder: selectionOrder,
@@ -740,16 +809,93 @@ struct CodexModelVariantTruthTests {
 
     private func stageOccurrence(
         index: Int = 0,
-        status: String
+        status: String,
+        taskName: String = "Draft proposal"
     ) -> RunsWorkbenchPresentationModel.StageOccurrence {
         RunsWorkbenchPresentationModel.StageOccurrence(
             id: "occurrence-\(index)",
             agentTitle: "Proposal Writer \(index + 1)",
-            taskName: "Draft proposal",
+            taskName: taskName,
             statusText: status,
             providerLabel: plannedTerra.visualSuffix,
             plannedAssignment: plannedTerra,
             executionCountLabel: "1 attempt"
+        )
+    }
+
+    private func productionRunDetail(status: String) -> P031RunDetailPresentation {
+        let freshness = P031FreshnessSnapshot(state: .live, lastCheckedAt: Date())
+        return P031RunDetailPresentation(
+            title: "Model variant proof",
+            runID: "run-model-variant-proof",
+            workflowLabel: "model_variant_proof",
+            statusLabel: "Running",
+            progressLabel: nil,
+            pendingApprovalsLabel: nil,
+            ideaContext: nil,
+            stageTransitions: [],
+            stageTopology: [
+                P031StageTopologyPresentation(
+                    stageID: "stage-current",
+                    ordinal: 4,
+                    title: "Proposal reviewed",
+                    ownerAgentID: "lead_orchestrator",
+                    ownerAgentTitle: "Lead Orchestrator",
+                    status: "running",
+                    statusText: "Running",
+                    isCurrent: true,
+                    iterationText: nil,
+                    attemptText: "Attempt 1",
+                    startedLabel: nil,
+                    completedLabel: nil,
+                    durationLabel: nil,
+                    approvalRequired: false,
+                    artifactCount: 0,
+                    communicationCount: 1,
+                    occurrences: [
+                        P031StageTopologyOccurrencePresentation(
+                            agentID: "proposal_writer",
+                            agentTitle: "Proposal Writer",
+                            taskName: "Draft proposal",
+                            statusText: status,
+                            providerLabel: plannedTerra.visualSuffix,
+                            plannedAssignment: plannedTerra,
+                            executionCountLabel: "1 attempt"
+                        )
+                    ],
+                    transitions: []
+                )
+            ],
+            approvalRows: [],
+            artifactRows: [],
+            artifactViewerRows: [],
+            reportRows: [],
+            activeAgentTimelineEntries: [
+                P031ActiveAgentTimelinePresentation(
+                    id: "proposal-writer",
+                    title: "Proposal Writer",
+                    detail: "Draft proposal",
+                    timestamp: Date(timeIntervalSince1970: 1),
+                    stageID: "stage-current",
+                    providerID: "codex",
+                    modelID: "gpt-5.6-terra",
+                    plannedAssignment: plannedTerra,
+                    stageLabel: "Proposal reviewed",
+                    taskLabel: "Draft proposal",
+                    status: status.lowercased(),
+                    eventCount: 1,
+                    selectionOrder: 1,
+                    agentID: "proposal_writer",
+                    sessionID: nil
+                )
+            ],
+            catalogContext: nil,
+            freshness: freshness,
+            refreshFeedbackText: "Live projection",
+            emptyStateTitle: nil,
+            errorDescription: nil,
+            rawStatus: "running",
+            failedStages: 0
         )
     }
 
@@ -888,14 +1034,26 @@ struct CodexModelVariantTruthTests {
         return result
     }
 
-    private func firstDescendant<T: NSView>(of type: T.Type, in root: NSView) -> T? {
-        if let match = root as? T { return match }
-        for child in root.subviews {
-            if let match = firstDescendant(of: type, in: child) {
-                return match
-            }
+    private func expectContained(
+        _ child: P036AccessibilityElementSnapshot,
+        in container: P036AccessibilityElementSnapshot
+    ) {
+        guard let childFrame = child.frame, let containerFrame = container.frame else {
+            Issue.record("hosted layout proof requires concrete accessibility frames")
+            return
         }
-        return nil
+        #expect(containerFrame.insetBy(dx: -0.5, dy: -0.5).contains(childFrame))
+    }
+
+    private func descendants<T: NSView>(of type: T.Type, in root: NSView) -> [T] {
+        var matches: [T] = []
+        if let match = root as? T {
+            matches.append(match)
+        }
+        for child in root.subviews {
+            matches.append(contentsOf: descendants(of: type, in: child))
+        }
+        return matches
     }
 }
 
@@ -907,43 +1065,6 @@ private struct P036AccessibilityElementSnapshot {
     let frame: NSRect?
 
     var text: String? { value ?? label }
-}
-
-@MainActor
-private final class P036StatusRefreshProbeModel: ObservableObject {
-    @Published var status = "Running"
-    @Published var selection: String? = "stage-current"
-    @Published var text = "abcdef"
-}
-
-private struct P036StatusRefreshProbe: View {
-    @ObservedObject var model: P036StatusRefreshProbeModel
-
-    var body: some View {
-        VStack {
-            TextField("Focus probe", text: $model.text)
-            List(selection: $model.selection) {
-                Text("Selected stage").tag("stage-current")
-            }
-            .frame(height: 80)
-            P036StageOccurrenceRow(
-                occurrence: RunsWorkbenchPresentationModel.StageOccurrence(
-                    id: "interaction-occurrence",
-                    agentTitle: "Proposal Writer",
-                    taskName: "Draft proposal",
-                    statusText: model.status,
-                    providerLabel: "gpt-5.6-terra · high · planned",
-                    plannedAssignment: .planned(
-                        variantToken: "Terra",
-                        visualSuffix: "gpt-5.6-terra · high · planned",
-                        fullAccessibilityValue: "Codex · Terra · gpt-5.6-terra · high · planned"
-                    ),
-                    executionCountLabel: "1 attempt"
-                )
-            )
-        }
-        .padding()
-    }
 }
 
 private extension Data.SubSequence {

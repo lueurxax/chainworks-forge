@@ -3198,6 +3198,105 @@ fn persisted_snapshot_quartet_all_absent_uses_valid_mutable_live_paths() {
 }
 
 #[test]
+fn persisted_snapshot_quartet_replays_historical_generic_and_custom_tuples() {
+    let root = repository_root();
+    let temp = tempfile::tempdir_in(&root).unwrap();
+    let workflow_path = temp.path().join("workflow.yaml");
+    let catalog_path = temp.path().join("agents.yaml");
+    let workflow_bytes =
+        std::fs::read_to_string(root.join("examples/workflows/full-mvp-live.yaml")).unwrap();
+    let catalog_bytes = std::fs::read_to_string(root.join("examples/agents/agents.yaml"))
+        .unwrap()
+        .replacen(
+            "  codex_orchestrator_high:\n    provider: codex_acp\n    model: gpt-5.6-sol\n    effort: max",
+            "  codex_orchestrator_high:\n    provider: codex_acp\n    model: gpt-5.6\n    effort: custom-effort",
+            1,
+        )
+        .replacen(
+            "  codex_audit_high:\n    provider: codex_acp\n    model: gpt-5.6-sol\n    effort: ultra",
+            "  codex_audit_high:\n    provider: codex_acp\n    model: custom-model\n    effort: ultra",
+            1,
+        );
+    std::fs::write(&workflow_path, workflow_bytes).unwrap();
+    std::fs::write(&catalog_path, catalog_bytes).unwrap();
+    for skill in [
+        "code-implementation",
+        "implementation-audit",
+        "prepush-review",
+        "proposal-review-router",
+        "security-review",
+    ] {
+        let destination = temp.path().join("skills").join(skill);
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::copy(
+            root.join("examples/agents/skills")
+                .join(skill)
+                .join("SKILL.md"),
+            destination.join("SKILL.md"),
+        )
+        .unwrap();
+    }
+
+    let historical = workflow::compiler::compile(
+        workflow_path.to_str().unwrap(),
+        catalog_path.to_str().unwrap(),
+    )
+    .expect("the compatibility compiler must accept historical tuples");
+    let idea = idea(
+        "Historical quartet".into(),
+        "Replay authenticated generic and custom tuples".into(),
+    );
+    let mut persisted = run(&historical, &idea, "state_1_idea_received");
+    persisted.workflow_yaml_path = Some(workflow_path.to_string_lossy().into_owned());
+    persisted.agent_catalog_yaml_path = Some(catalog_path.to_string_lossy().into_owned());
+
+    std::fs::write(&workflow_path, "not: valid: yaml").unwrap();
+    std::fs::write(&catalog_path, "not: valid: yaml").unwrap();
+    let replayed = compile_run_plan_for_run(&persisted)
+        .unwrap()
+        .expect("a complete authenticated quartet must replay without live YAML");
+
+    assert_eq!(
+        replayed.workflow_snapshot_json,
+        historical.workflow_snapshot_json
+    );
+    assert_eq!(
+        replayed.catalog_snapshot_json,
+        historical.catalog_snapshot_json
+    );
+    assert_eq!(
+        replayed.workflow_snapshot_hash,
+        historical.workflow_snapshot_hash
+    );
+    assert_eq!(
+        replayed.catalog_snapshot_hash,
+        historical.catalog_snapshot_hash
+    );
+    let tuples = replayed
+        .states
+        .values()
+        .flat_map(|state| {
+            std::iter::once(&state.owner).chain(state.tasks.iter().map(|task| &task.agent))
+        })
+        .map(|agent| (agent.model.as_deref(), agent.effort.as_deref()))
+        .collect::<Vec<_>>();
+    assert!(
+        tuples.contains(&(Some("gpt-5.6"), Some("custom-effort"))),
+        "{tuples:?}"
+    );
+    assert!(
+        tuples.contains(&(Some("custom-model"), Some("ultra"))),
+        "{tuples:?}"
+    );
+
+    persisted.catalog_snapshot_hash = Some("0".repeat(64));
+    let error = compile_run_plan_for_run(&persisted)
+        .expect_err("a tampered historical quartet must fail before live fallback")
+        .to_string();
+    assert!(error.contains("stored snapshot digest mismatch"), "{error}");
+}
+
+#[test]
 fn legacy_prompt_validation_preserves_pre_v1_bytes_exactly() {
     let mut plan = compile_plan();
     plan.mission_context_version = None;
