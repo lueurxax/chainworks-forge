@@ -42,5 +42,5 @@ the planned model-label slice.
 ## Activation rule
 
 This inventory must be decomposed by operation family if its implementation
-proposal approaches 2,000 lines. The active model-label slice may add only the
-single nullable `effort` field described there.
+proposal approaches 2,000 lines. The active model-label slice uses existing
+topology/execution readback and adds no GraphQL field, ID, or operation.

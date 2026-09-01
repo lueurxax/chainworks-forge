@@ -52,7 +52,8 @@ This revision therefore makes these choices explicit:
 - Run snapshots already freeze each resolved agent's `provider`, `model`,
   `effort`, and backend profile.
 - `runStageTopology.occurrences` already exposes planned provider, model, and
-  effort from the frozen Run.
+  effort from a verified frozen Run. It already returns an empty topology for
+  snapshot-less or unparseable snapshot pairs.
 - `activeAgentExecutions` already exposes execution identity and model; the
   existing topology map supplies frozen stage/task assignments.
 - The Codex adapter already sends the requested model through its current
@@ -72,7 +73,8 @@ This revision therefore makes these choices explicit:
 4. Preserve the full pair through the existing adapter request.
 5. Render the same friendly variant, full model ID, effort, and `planned`
    qualifier in Overview and Stages.
-6. Preserve old frozen Runs and all existing execution/recovery behavior.
+6. Preserve verified old frozen Runs and all existing execution/recovery
+   behavior without describing mutable snapshot-less fallback as frozen truth.
 7. Enable the behavior unconditionally, with no feature flag or disable path.
 
 ## Non-goals
@@ -88,6 +90,9 @@ This revision therefore makes these choices explicit:
   topology paging, IDs, auth boundaries, MCP, reports, or Timeline.
 - Add copy buttons, menus, inspector surfaces, settings, or runtime model
   selection.
+- Backfill, migrate, or change execution behavior for snapshot-less legacy Runs.
+- Introduce distinct UI row identity for simultaneous executions of one agent;
+  that belongs to the deferred stable-occurrence/readback work.
 - Change Claude, Gemini, Auggie, or Junie bindings.
 - Require a live provider, network call, remote UI host, or dedicated
   Chainworks Run for merge evidence.
@@ -202,25 +207,35 @@ is feedback only.
 
 ### 2. New-Run admission
 
-Add typed workflow entrypoint `compile_for_new_run_v1`. It first performs the
-existing fresh YAML compilation, then validates the authored catalog and
-canonical resolved plan before returning `NewRunAdmissionV1`. `StartRun` is the
-only daemon caller and must receive this value before opening any Run/work
-insertion transaction. A validation failure writes zero Run, Stage, or work
-rows.
+Add typed workflow entrypoint `compile_for_new_run_v1`. `StartRun` is its only
+daemon caller. The entrypoint opens and reads each workflow and catalog source
+exactly once into owned byte buffers before any Run/work insertion transaction.
+A duplicate-aware YAML loader parses each buffer once into an owned value while
+its mapping visitor rejects repeated root or nested keys. Only after that check
+does it typed-decode from the same owned value. Compilation and snapshot
+serialization consume those decoded values rather than paths. The entrypoint
+must not call the legacy path, re-open either path, or pre-scan one read and
+decode another.
+
+The resulting `NewRunAdmissionV1` owns the compiled plan and snapshot payloads
+derived from those decoded values. It can be constructed only after
+authored-catalog and canonical-plan validation. `StartRun` must receive it
+before opening an insertion transaction. Any read, parse, decode, compile, or
+policy failure writes zero Run, Stage, or work rows.
 
 Admission enforces:
 
-- every Codex profile uses a declared model and allowed effort;
-- each of the seven reserved production profile IDs, when present,
-  byte-matches its policy row and uses provider `codex_acp`;
+- the authored catalog contains all seven reserved Codex profile IDs exactly
+  once and contains no other Codex profile;
+- every reserved row byte-matches its policy model/effort and uses authored
+  provider `codex_acp`; every resolved row uses canonical provider `codex`;
 - generic `gpt-5.6`, unknown variants, and Luna `ultra` reject; and
 - duplicate YAML mapping keys reject before typed decoding.
 
-The focused source gate separately requires canonical
-`examples/agents/agents.yaml` to contain all seven reserved rows exactly once
-and no additional Codex profile. Bounded test catalogs may use other profile
-IDs with supported pairs; they cannot impersonate or weaken a reserved row.
+Non-Codex profiles remain governed by existing validation. Relaxed fixture
+catalogs exist only behind `#[cfg(test)]` helpers that are absent from the daemon
+binary. The focused source gate also verifies canonical
+`examples/agents/agents.yaml` against the same exact-seven rule.
 
 The raw catalog snapshot retains authored provider `codex_acp`. Existing
 compiler canonicalization writes `codex` to `ResolvedAgent.provider`, work
@@ -228,10 +243,14 @@ payloads, `ExecutionRequest`, and GraphQL readback; model, effort, and backend
 profile remain byte-identical to the admitted row. No new Run schema version,
 DB column, or execution contract is needed.
 
-The policy check exists only in `compile_for_new_run_v1`. Existing `compile`,
-`compile_from_snapshot_json`, snapshot-less legacy fallback, and catalog
-retrofit keep their current compatibility behavior and never acquire current
-matrix admission. Old generic or custom Runs therefore replay byte-for-byte.
+The policy check exists only in `compile_for_new_run_v1`. Existing `compile` and
+`compile_from_snapshot_json` remain separate compatibility APIs and never
+acquire current-matrix admission. Verified frozen snapshot pairs, including
+generic or custom historical pairs, continue byte-for-byte. Snapshot-less
+legacy fallback keeps its current mutable live-path recompilation behavior; it
+is not byte-stable, receives no planned-label claim, and remains out of scope
+for migration or repair. Existing empty-topology readback for such Runs remains
+fail-closed.
 
 There is no YAML switch, environment override, app preference, rollout flag,
 or test-only production bypass. Non-production tests may construct a bounded
@@ -246,12 +265,18 @@ producer branch.
 
 The canonical production bridge is tested end to end for all seven rows:
 `compile_for_new_run_v1 -> standard InvokeAgent work payload encode/decode ->
-ExecutionRequest -> AcpSessionNewSpec`. It must retain canonical provider
-`codex`, the exact unsuffixed model, and exactly one separate best-effort
-`reasoning_effort` config option. It must not collapse values into
-`model/effort`, substitute generic `gpt-5.6`, or case-fold a policy-known
-value. The existing nonfatal behavior when that effort option is unsupported
-or rejected remains unchanged.
+ExecutionRequest -> AcpSessionNewSpec -> serialized ACP requests`. It must retain
+canonical provider `codex`, serialize the exact unsuffixed model in
+`session/new.params.model`, and emit exactly one separate best-effort
+`session/set_config_option` request for `reasoning_effort`. The effort is absent
+from required config options. The bridge must not collapse values into
+`model/effort`, substitute generic `gpt-5.6`, or case-fold a policy-known value.
+
+A provider-free scripted NDJSON peer returns a normal `session/new` result,
+then separately rejects the best-effort effort request with JSON-RPC
+Method-not-found and a generic rejection. In both cases the existing transport
+continues to the prompt; neither rejection is promoted to a required option or
+provider-acceptance claim.
 
 The current Codex ACP compatibility envelope, permission mode, process
 lifetime, and error behavior remain unchanged. This proposal neither calls
@@ -271,20 +296,31 @@ must not rewrite the frozen planned pair or change UI copy to
 No GraphQL schema changes are required:
 
 - Stages uses the existing `runStageTopology.occurrences` provider, model,
-  and effort values.
+  and effort values. An empty topology, including snapshot-less legacy, adds no
+  planned label.
 - `planned` is one provider/model/effort tuple from one frozen run-plan
   occurrence. Overview uses the existing StageExecution-to-stage mapping plus
   active agent ID to select candidates, then requires exactly one occurrence
   whose canonical provider and model byte-match the active execution. All
   three displayed planned fields come from that occurrence; the active row may
   select and verify it but may not donate one field.
-- No candidate, multiple candidates, missing effort, provider/model mismatch,
-  owner-only work, or an unrepresented P017/dynamic occurrence renders
-  `Planned assignment unavailable`. The existing raw execution model may remain
-  separately visible without a friendly label, effort, or `planned` qualifier.
+- A unique canonical-provider/model match with absent effort renders the known
+  model plus `Planned effort not recorded`. No candidate, multiple candidates,
+  provider/model mismatch, owner-only work, or an unrepresented P017/dynamic
+  occurrence renders `Planned assignment unavailable`. The existing raw
+  execution model may remain separately visible without a friendly label,
+  effort, or `planned` qualifier.
 - Health fallback and P058 that change the binding therefore cannot combine a
   target execution model with source topology effort. A same-binding retry may
   display planned identity only when the unique occurrence still matches.
+- Existing Overview filtering remains authoritative: stale or unmapped active
+  rows stay hidden and must never be attached to another stage merely to show
+  unavailable copy.
+- This slice adds no row and changes no row key. If the existing presentation
+  cannot represent simultaneous executions of one agent distinctly, it does
+  not claim to fix or validate that baseline case. Ambiguous repeated topology
+  candidates receive unavailable only on rows the existing view already
+  represents.
 
 The change must not alter root queries, authorization, topology stacks,
 filtering, occurrence identity, focus, selection, pagination, or stale-response
@@ -292,9 +328,9 @@ handling. It must not add a second query or broaden data access.
 
 ### 5. Shared presentation
 
-One pure Swift formatter receives provider, frozen model, and frozen effort and
-returns `compact` visible copy plus `full` help/accessibility copy. For known
-Codex IDs both are identical:
+One pure Swift formatter receives provider, frozen model, and frozen effort. It
+returns one bounded enum-backed presentation used unchanged for visible, help,
+and accessibility copy. For policy-known Codex IDs it emits:
 
 ```text
 Codex · Sol · gpt-5.6-sol · max · planned
@@ -302,7 +338,7 @@ Codex · Terra · gpt-5.6-terra · high · planned
 Codex · Luna · gpt-5.6-luna · high · planned
 ```
 
-Legacy and unavailable values remain honest:
+Recognized legacy and unavailable values remain honest:
 
 ```text
 Codex · gpt-5.6 · high · planned
@@ -310,45 +346,39 @@ Codex · Sol · gpt-5.6-sol · Planned effort not recorded
 Planned assignment unavailable
 ```
 
-| State | Compact planned line | Full help/accessibility value |
-|---|---|---|
-| unique known tuple | friendly name, full ID, effort, `planned` | identical complete line |
-| unique generic tuple | raw model, effort, `planned` | identical complete line |
-| unique unknown tuple | bounded compact raw model, effort, `planned` | bounded full raw model, effort, `planned` |
-| unique tuple, effort absent | model plus `Planned effort not recorded` | identical complete line |
-| no/ambiguous/stale/mismatched tuple | `Planned assignment unavailable` | same phrase; no inferred pair |
-| non-Codex | existing provider copy | unchanged |
+| State | Visible/help/accessibility value |
+|---|---|
+| unique policy-known tuple with allowed effort | friendly name, full ID, effort, `planned` |
+| unique literal legacy `gpt-5.6` with a parser-known effort | full ID, effort, `planned` |
+| unique policy-known or literal legacy model, effort absent | model plus `Planned effort not recorded` |
+| unknown model, unknown nonempty effort, no/ambiguous/mismatched tuple | `Planned assignment unavailable` |
+| stale/unmapped active row | hidden by existing filtering |
+| non-Codex | existing provider copy unchanged |
 
 Rules:
 
 - friendly names are byte-exact lookup labels, never proof of provider use;
-- the full model ID, effort, and `planned` qualifier remain visible in both
-  Overview and Stages;
-- the compact row may wrap but must not overlap, hide the variant, or change
-  card dimensions while status updates;
-- existing help/accessibility text uses the formatter's full output;
+- policy-known output keeps the full model ID, effort, and `planned` qualifier
+  visible in both Overview and Stages;
+- help/accessibility text is byte-identical to the visible planned line;
 - no new button, menu, shortcut, selection behavior, or topology ownership is
   introduced;
 - missing effort and missing assignment use the two distinct normative phrases
   in the table;
-- unknown nonempty values trim ASCII edge whitespace and escape C0/C1/DEL and
-  line breaks as uppercase `\u{HEX}`. The complete compact line is capped at
-  64 UTF-8 bytes and the full line at 96, both including ASCII suffix
-  `...[truncated]`; each cut ends on an extended grapheme-cluster or complete
-  escape boundary; and
+- unknown/custom model or effort strings are never interpolated into the new
+  planned line. Existing raw fields may retain their current presentation, but
+  receive no friendly name or planned qualifier; and
 - non-Codex providers retain current copy.
 
 Overview and Stages must call the same formatter. Source scans reject local
 Sol/Terra/Luna switch statements elsewhere in the app.
 
-At the existing 292-point card width, the regular metadata region reserves two
-wrapped compact lines; accessibility text categories use a deterministic
-four-line region. Height stays stable within a category. The 64-byte compact
-boundary, longest known value, and status refresh may not clip, overlap,
-resize within that category, reorder the agent/status/planned accessibility
-value, or change row identity/focus. Full copy remains available through
-existing help and accessibility without forcing the visible row to render 96
-bytes.
+The existing 292-point card width remains. The metadata line wraps vertically
+without truncation, and card height may adapt to the rendered policy-known copy
+and Dynamic Type category. The planned-metadata region height is a function only
+of that copy and text category; a status-only refresh may not change it, reorder
+the agent/status/planned accessibility value, or change row identity or focus.
+No fixed line-count or fixed-card-height claim applies at accessibility sizes.
 
 ## Failure behavior
 
@@ -356,10 +386,12 @@ bytes.
 |---|---|
 | New production catalog differs from the policy | compilation fails before Run creation |
 | Policy fixture missing, malformed, or digest-mismatched | compilation fails; Xcode validation reports the same issue |
-| Old frozen Run contains generic or custom model | replay unchanged; raw planned value is shown |
+| Verified old frozen Run contains literal generic model | replay unchanged; recognized generic planned line may be shown |
+| Verified old frozen Run contains custom model/effort | replay unchanged; new planned line is unavailable and existing raw field remains unqualified |
+| Snapshot-less legacy Run | current mutable recompilation behavior; topology remains empty and no planned label is added |
 | Overview has no unique matching frozen occurrence | `Planned assignment unavailable`; raw execution model may remain separately unqualified |
 | Provider ignores or later changes the request | existing runtime behavior; planned UI remains planned |
-| Unknown model/effort reaches formatter | bounded escaped raw value, never a friendly false match |
+| Unknown model/effort reaches formatter | `Planned assignment unavailable`; unknown text is not interpolated |
 
 No new retry, fallback, cancellation, failure-kind, operator-action, or
 quarantine behavior is introduced.
@@ -369,33 +401,41 @@ quarantine behavior is introduced.
 Add focused gate `codex-planned-variant-slice`. It is provider-free and runs
 only the following:
 
-1. Parser tests exercise duplicate keys, unknown fields, duplicate IDs,
+1. Policy-parser tests exercise duplicate keys, unknown fields, duplicate IDs,
    malformed rows, unsupported effort, generic production model, and Luna
-   `ultra` through `parse_policy_json_v1`. Loader tests independently exercise
-   LF/length/digest mutation and recompute the pinned bytes.
-2. New-Run admission tests mutation-test every model, effort, authored/canonical
-   provider, duplicate, missing profile, and extra Codex profile. `StartRun`
-   failures write zero Run/work rows; its test-only constructors are absent
-   from the daemon build.
-3. Frozen replay, snapshot-less legacy fallback, and catalog retrofit tests
-   prove old generic/custom behavior remains byte-identical and bypasses
-   current-policy admission.
-4. A provider-free table test carries all seven rows through canonical compile,
-   production work payload encode/decode, `ExecutionRequest`, and
-   `AcpSessionNewSpec`, asserting unsuffixed model, one separate effort, no
-   generic substitution, and unchanged nonfatal option rejection.
-5. Existing GraphQL tests prove topology still returns one frozen tuple. Swift
-   tests cover unique/no/multiple matches, repeated tasks, owner-only, dynamic,
-   health fallback, P058 same and changed binding, lead/P017 exclusion, stale
-   stage mapping, and provider/model mismatch. No new root, field, document, or
-   schema snapshot is added.
-6. Swift unit tests prove every visual/AX table row, Sol/Terra/Luna, generic,
-   unknown, every control class, exact 64/96-byte boundaries, plus-one
-   truncation, combining grapheme, and complete escape handling in Overview
-   and Stages.
-7. Swift presentation tests cover 292 points, the longest value,
-   accessibility size/order, and status refresh without clipping, height/focus/
-   identity loss; existing Overview stacks, selection, and filtering remain.
+   `ultra` through `parse_policy_json_v1`. Pinned-loader tests independently
+   exercise LF/length/digest mutation and recompute the pinned bytes.
+2. New-run loader tests prove each source is read once; duplicate root and
+   nested YAML keys fail before typed decoding from the checked value. Admission
+   mutation-tests every model, effort, authored/canonical provider, duplicate,
+   missing profile, and extra Codex profile. Every `StartRun` failure writes zero
+   Run/Stage/work rows, and relaxed helpers are absent from the daemon build.
+3. Verified frozen snapshot-pair replay remains byte-identical and bypasses
+   current-policy admission. A snapshot-less fixture changes live catalog bytes
+   and proves current mutable recompilation behavior plus empty topology/no
+   planned label; catalog-retrofit compatibility is not called by `StartRun`.
+4. A provider-free table carries all seven rows through compile, production
+   payload encode/decode, `ExecutionRequest`, and `AcpSessionNewSpec`, then
+   inspects serialized `session/new.params.model` and the single best-effort
+   `reasoning_effort` request. A scripted NDJSON peer rejects that request with
+   Method-not-found and generic error in separate cases; both still observe the
+   subsequent prompt and no required effort option.
+5. Existing GraphQL tests prove topology returns frozen tuples and remains empty
+   without verified snapshots. Swift tests cover unique/no/multiple candidates,
+   ambiguous repeated topology, owner-only, dynamic, health fallback, P058 same
+   and changed binding, lead/P017 exclusion, hidden stale/unmapped rows, and
+   provider/model mismatch. No new root, field, document, ID, or schema snapshot
+   is added; no test claims distinct simultaneous same-agent rows.
+6. Swift unit tests prove every visual/accessibility table row, Sol/Terra/Luna,
+   literal generic, missing effort, unknown model/effort, and every control
+   class in Overview and Stages. Delimiter, bidi, default-ignorable,
+   line-separator, literal-escape, and overlong unknown inputs all produce the
+   fixed unavailable phrase and are never interpolated.
+7. Hosted Swift presentation tests cover the 292-point width, 1/2/5 existing
+   occurrences, every supported Dynamic Type size, known/missing/unavailable
+   copy, and status refresh. Copy has no ellipsis, clipping, or overlap; adaptive
+   height is allowed across text categories but identity/focus and the planned
+   region height remain stable for status-only refreshes.
 8. Static scans prove there is no feature flag/disable path and no second
    variant lookup table.
 
@@ -407,7 +447,9 @@ is part of acceptance.
 
 - Update the seven catalog rows and formatter in one implementation change.
 - New Runs receive the matrix automatically after deployment.
-- Existing Runs continue from frozen snapshots without migration.
+- Existing Runs with verified frozen snapshots continue without migration.
+  Snapshot-less Runs retain current mutable fallback and receive no planned
+  label from this slice.
 - There is no enablement phase, kill switch, or disabled-by-default state.
 - Rollback reverts the implementation commit. Runs already frozen with named
   variants remain readable as raw planned values.
@@ -419,17 +461,19 @@ is part of acceptance.
 - [ ] The policy fixture is byte-pinned, append-only, and parsed by one strict
       Rust authority with distinct schema and byte-integrity failures.
 - [ ] The production catalog contains exactly the seven approved pairs.
-- [ ] Typed new-Run admission rejects every matrix mutation with zero Run/work
-      writes; old snapshot, legacy fallback, and retrofit paths replay unchanged.
+- [ ] Single-read typed new-Run admission rejects duplicate YAML and every
+      exact-seven matrix mutation with zero Run/Stage/work writes; verified
+      frozen snapshots replay unchanged and snapshot-less behavior is explicit.
 - [ ] Authored `codex_acp` canonicalizes to `codex`; the provider-free production
-      bridge preserves full model and one separate effort for all seven rows
-      without claiming provider acceptance.
+      bridge proves serialized model, one best-effort effort request, and
+      prompt continuation after effort rejection without claiming acceptance.
 - [ ] Overview and Stages use the same formatter and visibly show friendly
       variant, full ID, effort, and `planned` only from one frozen tuple.
 - [ ] No/ambiguous/mismatched assignments and missing effort use distinct
-      normative copy; unknown values remain bounded and honest.
+      normative copy; unknown values are never interpolated into planned copy.
 - [ ] Existing topology stacks, identities, focus, filtering, authorization,
-      retries, fan-out, recovery, and provider lifecycle are unchanged.
+      retries, fan-out, recovery, and provider lifecycle are unchanged; distinct
+      simultaneous same-agent row identity is explicitly deferred.
 - [ ] No public surface says configured, accepted, actual, or exact.
 - [ ] No feature flag or disable path exists.
 - [ ] `./scripts/test-gate.sh codex-planned-variant-slice` passes with
