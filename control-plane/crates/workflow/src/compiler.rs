@@ -10,8 +10,9 @@
 
 use anyhow::{Context, Result};
 use domain::codex_model_variant_policy::{
-    AUTHORED_CODEX_PROVIDER, CANONICAL_CODEX_PROVIDER, CODEX_MODEL_VARIANT_POLICY_BYTES_V1,
-    CODEX_MODEL_VARIANT_POLICY_FILE_V1, CodexModelVariantPolicyV1, load_pinned_policy_v1,
+    load_pinned_policy_v1, CodexModelVariantPolicyV1, AUTHORED_CODEX_PROVIDER,
+    CANONICAL_CODEX_PROVIDER, CODEX_MODEL_VARIANT_POLICY_BYTES_V1,
+    CODEX_MODEL_VARIANT_POLICY_FILE_V1,
 };
 use domain::provider::ProviderFamily;
 use serde::de::{self, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor};
@@ -2174,7 +2175,17 @@ mod new_run_source_tests {
     use std::path::PathBuf;
 
     fn repository_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
+        std::env::current_dir()
+            .expect("test process should have a working directory")
+            .ancestors()
+            .find(|candidate| {
+                candidate
+                    .join("examples/workflows/full-mvp-live.yaml")
+                    .is_file()
+                    && candidate.join("control-plane/Cargo.toml").is_file()
+            })
+            .map(std::path::Path::to_path_buf)
+            .expect("test working directory should be inside the Chainworks repository")
     }
 
     #[test]

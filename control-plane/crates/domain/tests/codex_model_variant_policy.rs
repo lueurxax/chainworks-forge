@@ -6,9 +6,22 @@ use domain::codex_model_variant_policy::{
     CODEX_MODEL_VARIANT_POLICY_BYTES_V1, CODEX_MODEL_VARIANT_POLICY_SHA256_V1,
 };
 
+fn repository_root() -> PathBuf {
+    std::env::current_dir()
+        .expect("test process should have a working directory")
+        .ancestors()
+        .find(|candidate| {
+            candidate
+                .join("examples/agents/codex-model-variant-matrix.v1.json")
+                .is_file()
+                && candidate.join("control-plane/Cargo.toml").is_file()
+        })
+        .map(std::path::Path::to_path_buf)
+        .expect("test working directory should be inside the Chainworks repository")
+}
+
 fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../examples/agents/codex-model-variant-matrix.v1.json")
+    repository_root().join("examples/agents/codex-model-variant-matrix.v1.json")
 }
 
 fn valid_fixture() -> Vec<u8> {

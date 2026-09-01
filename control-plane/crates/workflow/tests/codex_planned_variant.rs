@@ -89,9 +89,22 @@ agents:
     permission_profile: TEST
 "#;
 
+fn repository_root() -> PathBuf {
+    std::env::current_dir()
+        .expect("test process should have a working directory")
+        .ancestors()
+        .find(|candidate| {
+            candidate
+                .join("examples/agents/codex-model-variant-matrix.v1.json")
+                .is_file()
+                && candidate.join("control-plane/Cargo.toml").is_file()
+        })
+        .map(Path::to_path_buf)
+        .expect("test working directory should be inside the Chainworks repository")
+}
+
 fn policy_fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../examples/agents/codex-model-variant-matrix.v1.json")
+    repository_root().join("examples/agents/codex-model-variant-matrix.v1.json")
 }
 
 fn write_sources(catalog: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -119,7 +132,7 @@ fn path(value: &Path) -> &str {
 
 #[test]
 fn canonical_production_sources_satisfy_new_run_admission() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let root = repository_root();
     let workflow = root.join("examples/workflows/full-mvp-live.yaml");
     let catalog = root.join("examples/agents/agents.yaml");
     compile_for_new_run_v1(path(&workflow), path(&catalog))
