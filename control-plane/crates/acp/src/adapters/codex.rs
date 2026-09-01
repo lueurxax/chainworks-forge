@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use domain::codex_model_variant_policy::load_pinned_policy_v1;
 use domain::tool_policy::{
     DEFAULT_TOOL_OUTPUT_MAX_BYTES, DEFAULT_TOOL_OUTPUT_MAX_LINES, GENERATED_ROOT_DENYLIST,
     TOOL_GUARD_VERSION, TOOL_POLICY_VERSION,
@@ -16,6 +17,8 @@ use crate::adapters::{
 use crate::ExecutionRequest;
 
 const BINARY_ENV_VAR: &str = "CHAINWORKS_CODEX_ACP_BINARY";
+const PINNED_MODEL_VARIANT_POLICY_V1: &[u8] =
+    include_bytes!("../../../../../examples/agents/codex-model-variant-matrix.v1.json");
 
 /// Adapter for the OpenAI Codex CLI provider (`codex-acp`).
 ///
@@ -96,6 +99,20 @@ impl AcpAdapter for CodexAdapter {
         // medium when given a combined "model/effort" string, so we pass a
         // bare model and set reasoning_effort via session/set_config_option.
         let raw_model = req.model.as_deref().unwrap_or("gpt-5.6");
+        let exact_effort = match (req.model.as_deref(), req.effort.as_deref()) {
+            (Some(model), Some(effort)) if !model.contains('/') => {
+                let policy = load_pinned_policy_v1(PINNED_MODEL_VARIANT_POLICY_V1)
+                    .context("CodexAdapter: loading pinned model variant policy")?;
+                policy.variant(model).and_then(|variant| {
+                    variant
+                        .allowed_efforts
+                        .iter()
+                        .any(|allowed| allowed == effort)
+                        .then(|| effort.to_string())
+                })
+            }
+            _ => None,
+        };
         let (base_model, effort_from_model) = split_codex_model_effort(raw_model);
         let effort = req
             .effort
@@ -104,12 +121,16 @@ impl AcpAdapter for CodexAdapter {
             .or(effort_from_model);
 
         let mut config_options: Vec<(String, String)> = Vec::new();
-        if let Some(e) = effort.as_deref() {
+        let mut exact_best_effort_config_options = Vec::new();
+        if let Some(e) = exact_effort {
+            exact_best_effort_config_options.push(("reasoning_effort".into(), e));
+        } else if let Some(e) = effort.as_deref() {
             // Codex accepts low / medium / high / xhigh for reasoning_effort.
             config_options.push(("reasoning_effort".into(), e.to_string()));
         }
 
         let mut spec = AcpSessionNewSpec::new(base_model, "full-access");
+        spec.exact_best_effort_config_options = exact_best_effort_config_options;
         spec.config_options = config_options;
         Ok(spec)
     }
@@ -503,6 +524,48 @@ fn split_codex_model_effort(model: &str) -> (String, Option<String>) {
 mod tests {
     use super::*;
 
+    fn request_with_model_and_effort(
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> ExecutionRequest {
+        ExecutionRequest {
+            agent_execution_id: None,
+            run_id: domain::ids::RunId::new(),
+            stage_execution_id: None,
+            stage_id: "stage_codex".to_string(),
+            attempt_number: 1,
+            agent_id: "agent_codex".to_string(),
+            provider: "codex".to_string(),
+            model: model.map(ToOwned::to_owned),
+            effort: effort.map(ToOwned::to_owned),
+            workspace_root: String::new(),
+            prompt: "prompt".to_string(),
+            worktree_root: None,
+            worktree_write_enabled: false,
+            worktree_strategy: None,
+            expected_output_paths: Vec::new(),
+            expected_outputs: Vec::new(),
+            keep_session_alive: false,
+            reuse_existing_session: false,
+            session_generation_id: None,
+            provider_session_id: None,
+            provider_runtime_home: None,
+            p079_repair_canonical_paths: None,
+            mcp_servers: Vec::new(),
+            chainworks_meta_root: None,
+            legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
+            owner_kind: "stage_execution".to_string(),
+            owner_id: None,
+            origin_stage_id: None,
+            origin_stage_execution_id: None,
+            mediation_record_id: None,
+            toolchain_home: None,
+            toolchain_go_scope_enabled: false,
+        }
+    }
+
     #[test]
     fn splits_bare_model() {
         assert_eq!(
@@ -533,6 +596,142 @@ mod tests {
             split_codex_model_effort("gpt-5.4/"),
             ("gpt-5.4/".into(), None)
         );
+    }
+
+    #[test]
+    fn codex_effort_inputs_enter_exactly_one_lane() {
+        struct Case {
+            model: Option<&'static str>,
+            effort: Option<&'static str>,
+            expected_model: &'static str,
+            expected_exact: Option<&'static str>,
+            expected_fuzzy: Option<&'static str>,
+        }
+
+        let cases = [
+            Case {
+                model: Some("gpt-5.6-sol"),
+                effort: Some("max"),
+                expected_model: "gpt-5.6-sol",
+                expected_exact: Some("max"),
+                expected_fuzzy: None,
+            },
+            Case {
+                model: Some("gpt-5.6-terra"),
+                effort: Some("xhigh"),
+                expected_model: "gpt-5.6-terra",
+                expected_exact: Some("xhigh"),
+                expected_fuzzy: None,
+            },
+            Case {
+                model: Some("gpt-5.6-luna"),
+                effort: Some("ultra"),
+                expected_model: "gpt-5.6-luna",
+                expected_exact: None,
+                expected_fuzzy: Some("ultra"),
+            },
+            Case {
+                model: Some("gpt-5.6-sol"),
+                effort: Some("HIGH"),
+                expected_model: "gpt-5.6-sol",
+                expected_exact: None,
+                expected_fuzzy: Some("high"),
+            },
+            Case {
+                model: Some("gpt-5.6-sol"),
+                effort: Some(""),
+                expected_model: "gpt-5.6-sol",
+                expected_exact: None,
+                expected_fuzzy: Some(""),
+            },
+            Case {
+                model: Some("gpt-5.6"),
+                effort: Some("high"),
+                expected_model: "gpt-5.6",
+                expected_exact: None,
+                expected_fuzzy: Some("high"),
+            },
+            Case {
+                model: Some("custom-model"),
+                effort: Some("high"),
+                expected_model: "custom-model",
+                expected_exact: None,
+                expected_fuzzy: Some("high"),
+            },
+            Case {
+                model: Some("gpt-5.6-sol/max"),
+                effort: None,
+                expected_model: "gpt-5.6-sol",
+                expected_exact: None,
+                expected_fuzzy: Some("max"),
+            },
+            Case {
+                model: Some("gpt-5.6-sol/max"),
+                effort: Some("ultra"),
+                expected_model: "gpt-5.6-sol",
+                expected_exact: None,
+                expected_fuzzy: Some("ultra"),
+            },
+            Case {
+                model: Some("GPT-5.6-SOL"),
+                effort: Some("max"),
+                expected_model: "gpt-5.6-sol",
+                expected_exact: None,
+                expected_fuzzy: Some("max"),
+            },
+            Case {
+                model: Some("gpt-5.6-sol"),
+                effort: None,
+                expected_model: "gpt-5.6-sol",
+                expected_exact: None,
+                expected_fuzzy: None,
+            },
+            Case {
+                model: Some("gpt-5.6-sol/"),
+                effort: None,
+                expected_model: "gpt-5.6-sol/",
+                expected_exact: None,
+                expected_fuzzy: None,
+            },
+            Case {
+                model: None,
+                effort: None,
+                expected_model: "gpt-5.6",
+                expected_exact: None,
+                expected_fuzzy: None,
+            },
+        ];
+
+        let adapter = CodexAdapter::new_with_binary("/bin/codex-acp");
+        for case in cases {
+            let request = request_with_model_and_effort(case.model, case.effort);
+            let spec = adapter.prepare_session_new_spec(&request).unwrap();
+            let expected_exact = case
+                .expected_exact
+                .map(|value| vec![("reasoning_effort".to_string(), value.to_string())])
+                .unwrap_or_default();
+            let expected_fuzzy = case
+                .expected_fuzzy
+                .map(|value| vec![("reasoning_effort".to_string(), value.to_string())])
+                .unwrap_or_default();
+
+            assert_eq!(spec.model, case.expected_model, "model={:?}", case.model);
+            assert_eq!(
+                spec.exact_best_effort_config_options, expected_exact,
+                "model={:?} effort={:?}",
+                case.model, case.effort
+            );
+            assert_eq!(
+                spec.config_options, expected_fuzzy,
+                "model={:?} effort={:?}",
+                case.model, case.effort
+            );
+            assert!(
+                spec.exact_best_effort_config_options.is_empty() || spec.config_options.is_empty(),
+                "effort must never enter both lanes"
+            );
+            assert!(spec.required_config_options.is_empty());
+        }
     }
 
     #[test]

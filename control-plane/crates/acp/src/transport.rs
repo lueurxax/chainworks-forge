@@ -110,6 +110,11 @@ pub struct AcpSessionConfig<'a> {
     /// support the method respond with `Method not found`).
     pub config_options: Vec<(String, String)>,
 
+    /// Byte-exact best-effort options owned by a validated adapter policy.
+    /// Unlike `config_options`, values in this lane are never matched or
+    /// rewritten against provider-advertised option labels.
+    pub exact_best_effort_config_options: Vec<(String, String)>,
+
     /// Required session config options. A send or provider rejection fails
     /// session startup instead of silently falling back to provider defaults.
     pub required_config_options: Vec<(String, String)>,
@@ -141,6 +146,7 @@ impl Default for AcpSessionConfig<'_> {
                     }
                 }
             })),
+            exact_best_effort_config_options: Vec::new(),
             config_options: Vec::new(),
             required_config_options: Vec::new(),
             set_mode_after_session_new: false,
@@ -4952,6 +4958,53 @@ impl AcpTransportSession {
             )
             .await
             .context("ACP: session/set_mode handshake")?;
+        }
+
+        for (config_id, value) in &config.exact_best_effort_config_options {
+            let sco_id = next_id("session-set-exact-config-option");
+            if let Err(e) = send_ndjson(
+                &mut stdin,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": sco_id,
+                    "method": "session/set_config_option",
+                    "params": {
+                        "sessionId": session_id,
+                        "configId": config_id,
+                        "value": value,
+                    }
+                }),
+            )
+            .await
+            {
+                warn!(
+                    session_id = %session_id,
+                    config_id = %config_id,
+                    "ACP: failed to send exact best-effort session/set_config_option: {e}"
+                );
+                continue;
+            }
+
+            match await_response(
+                &mut reader,
+                &mut child,
+                &sco_id,
+                HANDSHAKE_TIMEOUT,
+                "exact best-effort session/set_config_option handshake",
+            )
+            .await
+            {
+                Ok(_) => debug!(
+                    session_id = %session_id,
+                    config_id = %config_id,
+                    "ACP: exact best-effort session/set_config_option applied"
+                ),
+                Err(e) => warn!(
+                    session_id = %session_id,
+                    config_id = %config_id,
+                    "ACP: exact best-effort session/set_config_option rejected: {e}"
+                ),
+            }
         }
 
         for (config_id, value) in &config.config_options {

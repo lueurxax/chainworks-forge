@@ -318,6 +318,80 @@ sys.exit(0)
         script.to_string_lossy().into_owned()
     }
 
+    pub fn create_exact_best_effort_config_script(
+        tmpdir: &std::path::Path,
+        observed_path: &std::path::Path,
+        rejection_code: Option<i64>,
+    ) -> String {
+        let script = tmpdir.join(if rejection_code.is_some() {
+            "acp_exact_config_rejected.py"
+        } else {
+            "acp_exact_config_applied.py"
+        });
+        let code = format!(
+            r#"#!/usr/bin/env python3
+import json, pathlib, sys
+
+observed_path = pathlib.Path({observed_path:?})
+rejection_code = {rejection_code}
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    return json.loads(line) if line else None
+
+msg = recv()
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"protocolVersion": 1}}}})
+
+msg = recv()
+if msg is None or msg.get("method") != "session/new":
+    sys.exit(1)
+model = msg.get("params", {{}}).get("model")
+session_id = "fixture-session-exact-config"
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{
+    "sessionId": session_id,
+    "configOptions": [{{
+        "id": "reasoning_effort",
+        "name": "Reasoning effort",
+        "options": [
+            {{"value": "provider-substitute", "name": "max", "description": "conflicting max spelling"}},
+            {{"value": "other", "name": "Maximum", "description": "contains max"}}
+        ]
+    }}]
+}}}})
+
+msg = recv()
+if msg is None or msg.get("method") != "session/set_config_option":
+    sys.exit(1)
+params = msg.get("params", {{}})
+observed_path.write_text(json.dumps({{"model": model, "config": params}}))
+if rejection_code is not None:
+    send({{"jsonrpc": "2.0", "id": msg["id"], "error": {{"code": rejection_code, "message": "effort unsupported"}}}})
+else:
+    send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{}}}})
+
+msg = recv()
+if msg is None or msg.get("method") != "session/prompt":
+    sys.exit(1)
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"stopReason": "end_turn", "sessionId": session_id}}}})
+recv()
+sys.exit(0)
+"#,
+            observed_path = observed_path.to_string_lossy(),
+            rejection_code = rejection_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "None".to_string()),
+        );
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
     /// Write a fixture ACP server script that completes the handshake but
     /// returns a JSON-RPC error for `session/prompt`, triggering `AgentStatus::Failed`.
     pub fn create_fail_script(tmpdir: &std::path::Path) -> String {
@@ -1724,6 +1798,18 @@ fn brokered_xcode_request(tmp: &tempfile::TempDir, provider: &str) -> acp::Execu
     }
 }
 
+#[cfg(unix)]
+fn codex_variant_request(tmp: &tempfile::TempDir) -> acp::ExecutionRequest {
+    let mut request = brokered_xcode_request(tmp, "codex");
+    request.stage_id = "stage_codex_variant".into();
+    request.agent_id = "codex-variant-agent".into();
+    request.model = Some("gpt-5.6-sol".into());
+    request.effort = Some("max".into());
+    request.prompt = "prove exact effort".into();
+    request.mcp_servers.clear();
+    request
+}
+
 /// ClaudeAgentAdapter drives the full ACP protocol and discovers artifacts
 /// created by the agent via workspace diff.
 #[cfg(unix)]
@@ -2350,6 +2436,90 @@ async fn transport_resolves_required_model_alias_from_session_config_options() {
     AcpTransportSession::start(child, &req, &config)
         .await
         .expect("model alias should resolve to the provider-advertised option value");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_policy_effort_bypasses_provider_option_alias_resolution() {
+    use acp::adapters::codex::CodexAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::transport::AcpTransportSession;
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let observed_path = tmp.path().join("observed-exact-config.json");
+    let script = fixture::create_exact_best_effort_config_script(tmp.path(), &observed_path, None);
+    let child = Command::new(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let request = codex_variant_request(&tmp);
+    let adapter = CodexAdapter::new_with_binary("/bin/codex-acp");
+    let spec = adapter.prepare_session_new_spec(&request).unwrap();
+    let config = spec.as_config();
+
+    let mut session = AcpTransportSession::start(child, &request, &config)
+        .await
+        .unwrap();
+    let result = session.prompt(&request).await.unwrap();
+    assert_eq!(result.0, domain::agent::AgentStatus::Completed);
+    session.close().await.unwrap();
+
+    let observed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(observed_path).unwrap()).unwrap();
+    assert_eq!(observed["model"], serde_json::json!("gpt-5.6-sol"));
+    assert_eq!(
+        observed["config"],
+        serde_json::json!({
+            "sessionId": "fixture-session-exact-config",
+            "configId": "reasoning_effort",
+            "value": "max"
+        })
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_policy_effort_rejection_is_best_effort_and_prompt_still_runs() {
+    use acp::adapters::codex::CodexAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::transport::AcpTransportSession;
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    for rejection_code in [-32601, -32000] {
+        let tmp = tempfile::tempdir().unwrap();
+        let observed_path = tmp
+            .path()
+            .join(format!("observed-rejected-config-{rejection_code}.json"));
+        let script = fixture::create_exact_best_effort_config_script(
+            tmp.path(),
+            &observed_path,
+            Some(rejection_code),
+        );
+        let child = Command::new(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let request = codex_variant_request(&tmp);
+        let adapter = CodexAdapter::new_with_binary("/bin/codex-acp");
+        let spec = adapter.prepare_session_new_spec(&request).unwrap();
+        assert!(spec.required_config_options.is_empty());
+        let config = spec.as_config();
+
+        let mut session = AcpTransportSession::start(child, &request, &config)
+            .await
+            .expect("best-effort rejection must not fail session startup");
+        let result = session.prompt(&request).await.unwrap();
+        assert_eq!(result.0, domain::agent::AgentStatus::Completed);
+        session.close().await.unwrap();
+        assert!(observed_path.is_file());
+    }
 }
 
 #[cfg(unix)]

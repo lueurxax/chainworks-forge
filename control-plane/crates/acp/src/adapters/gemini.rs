@@ -88,6 +88,7 @@ impl AcpAdapter for GeminiCliAdapter {
             model: &model_str,
             mode: "bypassPermissions",
             extra: None,
+            exact_best_effort_config_options: Vec::new(),
             config_options: Vec::new(),
             required_config_options: Vec::new(),
             set_mode_after_session_new: false,

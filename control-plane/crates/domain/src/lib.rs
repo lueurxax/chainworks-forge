@@ -7,6 +7,7 @@ pub mod closeout_readiness;
 pub mod closeout_readiness_mode;
 pub mod closeout_readiness_summary_accessor;
 pub mod code_writer_completion;
+pub mod codex_model_variant_policy;
 pub mod commands;
 pub mod continuation;
 pub mod discovery;

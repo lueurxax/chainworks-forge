@@ -1,6 +1,6 @@
 use chrono::Utc;
 use db::pool::create_pool;
-use db::repos::{ideas, runs};
+use db::repos::{ideas, runs, work_items};
 use domain::commands::{CallerContext, Command, PrincipalClass, StartRunCmd};
 use domain::escalation::EscalationLedger;
 use domain::idea::{Idea, IdeaStatus};
@@ -18,8 +18,10 @@ use engine::agent_mission_context::{
     validate_persisted_v1_payload_prompt_with_truth, validate_persisted_v1_prompt,
     MAX_IDEA_CONTEXT_BYTES, MAX_MISSION_CONTEXT_BYTES,
 };
-use engine::command_handler::{compile_run_plan_for_run, CommandHandler};
+use engine::command_handler::{compile_run_plan_for_run, CommandHandler, CommandResult};
 use engine::event_bus;
+use engine::executor::BackgroundExecutor;
+use engine::orchestrator::Orchestrator;
 use engine::work_queue::WorkQueue;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -2434,17 +2436,47 @@ contracts:
     format: json
     required_fields: [resolution_mode]
 backend_profiles:
-  test:
-    provider: codex
-    model: test-model
+  codex_orchestrator_high:
+    provider: codex_acp
+    model: gpt-5.6-sol
+    effort: max
+  codex_architect_high:
+    provider: codex_acp
+    model: gpt-5.6-sol
+    effort: xhigh
+  codex_audit_high:
+    provider: codex_acp
+    model: gpt-5.6-sol
+    effort: ultra
+  codex_writer_high:
+    provider: codex_acp
+    model: gpt-5.6-terra
+    effort: high
+  codex_builder_high:
+    provider: codex_acp
+    model: gpt-5.6-terra
+    effort: high
+  codex_orchestrator_acp:
+    provider: codex_acp
+    model: gpt-5.6-terra
+    effort: high
+  codex_ops_low:
+    provider: codex_acp
+    model: gpt-5.6-luna
+    effort: high
 agents:
   - id: lead
     system_role: lead
-    backend_profile: test
+    backend_profile: codex_orchestrator_high
     permission_profile: ORCH
     lead_resolution_contract: LeadResolutionContract
     prompt: Lead the run.
 "#,
+    )
+    .unwrap();
+    std::fs::copy(
+        repository_root().join("examples/agents/codex-model-variant-matrix.v1.json"),
+        root.join("codex-model-variant-matrix.v1.json"),
     )
     .unwrap();
     Command::StartRun(StartRunCmd {
@@ -2460,6 +2492,277 @@ agents:
         rollout_contract_preflight_policy_json: None,
         closeout_readiness_mode: None,
     })
+}
+
+fn matrix_bridge_start_run_fixture(root: &std::path::Path, idea_id: IdeaId) -> Command {
+    let command = start_run_fixture(root, idea_id);
+    std::fs::write(
+        root.join("workflow.yaml"),
+        r#"
+workflow:
+  id: codex-variant-production-bridge
+  family: codex_variant_production_bridge
+initial_state: work
+states:
+  work:
+    label: Work
+    owner: lead
+    run:
+      parallel:
+        - agent: lead
+          task: Orchestrate
+        - agent: architect
+          task: Architect
+        - agent: auditor
+          task: Audit
+        - agent: writer
+          task: Write
+        - agent: builder
+          task: Build
+        - agent: routine_orchestrator
+          task: Coordinate
+        - agent: operator
+          task: Operate
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("catalog.yaml"),
+        r#"
+schema_version: 1
+permission_profiles:
+  ORCH: {}
+contracts:
+  LeadResolutionContract:
+    format: json
+    required_fields: [resolution_mode]
+backend_profiles:
+  codex_orchestrator_high:
+    provider: codex_acp
+    model: gpt-5.6-sol
+    effort: max
+  codex_architect_high:
+    provider: codex_acp
+    model: gpt-5.6-sol
+    effort: xhigh
+  codex_audit_high:
+    provider: codex_acp
+    model: gpt-5.6-sol
+    effort: ultra
+  codex_writer_high:
+    provider: codex_acp
+    model: gpt-5.6-terra
+    effort: high
+  codex_builder_high:
+    provider: codex_acp
+    model: gpt-5.6-terra
+    effort: high
+  codex_orchestrator_acp:
+    provider: codex_acp
+    model: gpt-5.6-terra
+    effort: high
+  codex_ops_low:
+    provider: codex_acp
+    model: gpt-5.6-luna
+    effort: high
+agents:
+  - id: lead
+    system_role: lead
+    backend_profile: codex_orchestrator_high
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
+    prompt: Orchestrate the test.
+  - id: architect
+    backend_profile: codex_architect_high
+    permission_profile: ORCH
+    prompt: Architect the test.
+  - id: auditor
+    backend_profile: codex_audit_high
+    permission_profile: ORCH
+    prompt: Audit the test.
+  - id: writer
+    backend_profile: codex_writer_high
+    permission_profile: ORCH
+    prompt: Write the test.
+  - id: builder
+    backend_profile: codex_builder_high
+    permission_profile: ORCH
+    prompt: Build the test.
+  - id: routine_orchestrator
+    backend_profile: codex_orchestrator_acp
+    permission_profile: ORCH
+    prompt: Coordinate the test.
+  - id: operator
+    backend_profile: codex_ops_low
+    permission_profile: ORCH
+    prompt: Operate the test.
+"#,
+    )
+    .unwrap();
+    command
+}
+
+#[tokio::test]
+async fn production_start_run_rejects_matrix_drift_before_any_run_stage_or_work_write() {
+    let pool = test_pool().await;
+    let handler = CommandHandler::new(
+        pool.clone(),
+        event_bus::new_bus(32),
+        WorkQueue::new(pool.clone()),
+    );
+    const PROFILES: [&str; 7] = [
+        "codex_orchestrator_high",
+        "codex_architect_high",
+        "codex_audit_high",
+        "codex_writer_high",
+        "codex_builder_high",
+        "codex_orchestrator_acp",
+        "codex_ops_low",
+    ];
+
+    for profile_id in PROFILES {
+        for (field, replacement) in [
+            ("model", "gpt-5.6"),
+            ("effort", "medium"),
+            ("provider", "codex"),
+        ] {
+            assert_start_run_catalog_mutation_is_write_free(
+                &pool,
+                &handler,
+                &format!("{profile_id}.{field}"),
+                |profiles| {
+                    let profile = profiles
+                        .get_mut(serde_yaml::Value::String(profile_id.to_string()))
+                        .and_then(serde_yaml::Value::as_mapping_mut)
+                        .expect("reserved profile must exist");
+                    profile.insert(
+                        serde_yaml::Value::String(field.to_string()),
+                        serde_yaml::Value::String(replacement.to_string()),
+                    );
+                },
+            )
+            .await;
+        }
+
+        assert_start_run_catalog_mutation_is_write_free(
+            &pool,
+            &handler,
+            &format!("missing {profile_id}"),
+            |profiles| {
+                profiles.remove(serde_yaml::Value::String(profile_id.to_string()));
+            },
+        )
+        .await;
+    }
+
+    assert_start_run_catalog_mutation_is_write_free(
+        &pool,
+        &handler,
+        "extra Codex profile",
+        |profiles| {
+            let extra = profiles
+                .get(serde_yaml::Value::String("codex_builder_high".to_string()))
+                .expect("builder profile must exist")
+                .clone();
+            profiles.insert(serde_yaml::Value::String("codex_extra".to_string()), extra);
+        },
+    )
+    .await;
+
+    assert_start_run_catalog_text_mutation_is_write_free(
+        &pool,
+        &handler,
+        "duplicate root key",
+        |catalog| format!("{catalog}schema_version: 1\n"),
+    )
+    .await;
+    assert_start_run_catalog_text_mutation_is_write_free(
+        &pool,
+        &handler,
+        "duplicate nested key",
+        |catalog| {
+            catalog.replacen(
+                "    model: gpt-5.6-sol\n    effort: max",
+                "    model: gpt-5.6-sol\n    model: gpt-5.6-terra\n    effort: max",
+                1,
+            )
+        },
+    )
+    .await;
+}
+
+async fn assert_start_run_catalog_mutation_is_write_free(
+    pool: &SqlitePool,
+    handler: &CommandHandler,
+    case_name: &str,
+    mutate: impl FnOnce(&mut serde_yaml::Mapping),
+) {
+    assert_start_run_catalog_text_mutation_is_write_free(
+        pool,
+        handler,
+        case_name,
+        |catalog_text| {
+            let mut catalog: serde_yaml::Value = serde_yaml::from_str(&catalog_text).unwrap();
+            let profiles = catalog
+                .get_mut("backend_profiles")
+                .and_then(serde_yaml::Value::as_mapping_mut)
+                .expect("fixture backend_profiles must be a mapping");
+            mutate(profiles);
+            serde_yaml::to_string(&catalog).unwrap()
+        },
+    )
+    .await;
+}
+
+async fn assert_start_run_catalog_text_mutation_is_write_free(
+    pool: &SqlitePool,
+    handler: &CommandHandler,
+    case_name: &str,
+    mutate: impl FnOnce(String) -> String,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let valid_idea = idea(
+        format!("Matrix admission {case_name}"),
+        "Reject drift before writes.".into(),
+    );
+    ideas::insert(pool, &valid_idea).await.unwrap();
+    let command = start_run_fixture(root.path(), valid_idea.id);
+    let catalog_path = root.path().join("catalog.yaml");
+    let catalog = std::fs::read_to_string(&catalog_path).unwrap();
+    std::fs::write(&catalog_path, mutate(catalog)).unwrap();
+
+    let error = handler
+        .handle(
+            command,
+            CallerContext::mcp("operator", &PrincipalClass::Operator, "runs.start"),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("{case_name} must reject StartRun"))
+        .to_string();
+    assert!(
+        error.contains("codex_model_variant_matrix_v1")
+            || error.contains("duplicate YAML mapping key"),
+        "{case_name}: {error}"
+    );
+
+    let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let stage_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stage_executions")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let work_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_items")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        (run_count, stage_count, work_count),
+        (0, 0, 0),
+        "{case_name} wrote production state before admission"
+    );
 }
 
 #[tokio::test]
@@ -2510,6 +2813,269 @@ async fn production_start_run_rejects_missing_or_oversized_idea_before_run_and_w
         .await
         .unwrap();
     assert_eq!(work_items, 0, "failed preflight must enqueue no work");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn production_codex_variant_bridge_serializes_all_seven_admitted_rows() {
+    use acp::adapters::{
+        codex::CodexAdapter, AcpAdapter, AcpLaunchSpec, AcpSessionNewSpec, LaunchResourceGuard,
+    };
+    use acp::AcpRuntimeManager;
+    use std::os::unix::fs::PermissionsExt;
+
+    let pool = test_pool().await;
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace_root = std::fs::canonicalize(workspace.path()).unwrap();
+    let peer = tempfile::tempdir().unwrap();
+    let observed_path = peer.path().join("observed.ndjson");
+    let script = peer.path().join("codex_variant_peer.py");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/usr/bin/env python3
+import json, pathlib, sys
+
+observed = pathlib.Path({observed_path:?})
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    return json.loads(line) if line else None
+
+message = recv()
+send({{"jsonrpc":"2.0","id":message["id"],"result":{{"protocolVersion":1}}}})
+
+message = recv()
+if message is None or message.get("method") != "session/new":
+    sys.exit(2)
+model = message.get("params", {{}}).get("model")
+session_id = "codex-variant-" + str(message["id"])
+send({{"jsonrpc":"2.0","id":message["id"],"result":{{
+    "sessionId":session_id,
+    "configOptions":[{{
+        "id":"reasoning_effort",
+        "name":"Reasoning effort",
+        "options":[
+            {{"value":"provider-substitute","name":"max"}},
+            {{"value":"other","name":"Maximum"}}
+        ]
+    }}]
+}}}})
+
+message = recv()
+if message is None or message.get("method") != "session/set_config_option":
+    sys.exit(3)
+config = message.get("params", {{}})
+with observed.open("a") as output:
+    output.write(json.dumps({{"model":model,"config":config}}) + "\n")
+send({{"jsonrpc":"2.0","id":message["id"],"result":{{}}}})
+
+message = recv()
+if message is None or message.get("method") != "session/prompt":
+    sys.exit(4)
+send({{"jsonrpc":"2.0","id":message["id"],"result":{{"stopReason":"end_turn","sessionId":session_id}}}})
+"#,
+            observed_path = observed_path.to_string_lossy(),
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+
+    struct ScriptedCodexAdapter {
+        inner: CodexAdapter,
+        script: String,
+    }
+
+    #[async_trait::async_trait]
+    impl AcpAdapter for ScriptedCodexAdapter {
+        fn provider_name(&self) -> &str {
+            "codex"
+        }
+
+        fn prepare_launch_spec(
+            &self,
+            _req: &acp::ExecutionRequest,
+            _resources: &mut LaunchResourceGuard,
+        ) -> anyhow::Result<AcpLaunchSpec> {
+            Ok(AcpLaunchSpec::new(&self.script))
+        }
+
+        fn prepare_session_new_spec(
+            &self,
+            req: &acp::ExecutionRequest,
+        ) -> anyhow::Result<AcpSessionNewSpec> {
+            self.inner.prepare_session_new_spec(req)
+        }
+    }
+
+    let idea = idea(
+        "Codex variant production bridge".into(),
+        "Carry all admitted assignments through the standard queue.".into(),
+    );
+    ideas::insert(&pool, &idea).await.unwrap();
+    let work_queue = WorkQueue::new(pool.clone());
+    let events = event_bus::new_bus(64);
+    let handler = CommandHandler::new(pool.clone(), events.clone(), work_queue.clone());
+    let outcome = handler
+        .handle(
+            matrix_bridge_start_run_fixture(&workspace_root, idea.id),
+            CallerContext::mcp("operator", &PrincipalClass::Operator, "runs.start"),
+        )
+        .await
+        .unwrap();
+    let run_id = match outcome.result {
+        CommandResult::RunStarted { run_id } => run_id,
+        _ => panic!("unexpected StartRun result"),
+    };
+
+    let adapter = std::sync::Arc::new(ScriptedCodexAdapter {
+        inner: CodexAdapter::new_with_binary(script.to_string_lossy()),
+        script: script.to_string_lossy().into_owned(),
+    }) as std::sync::Arc<dyn AcpAdapter>;
+    let runtime = std::sync::Arc::new(AcpRuntimeManager::new_with_adapters(vec![adapter]));
+    let orchestrator = std::sync::Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    orchestrator.advance_run(run_id).await.unwrap();
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue.clone(),
+        orchestrator,
+        runtime,
+        events,
+    );
+
+    let invoke_items = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.kind == db::work_item::WorkItemKind::InvokeAgent)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        invoke_items.len(),
+        7,
+        "production fan-out must enqueue all seven rows"
+    );
+
+    let mut queued = invoke_items
+        .iter()
+        .map(|item| {
+            let encoded = item.payload_json.as_bytes();
+            let payload: serde_json::Value = serde_json::from_slice(encoded).unwrap();
+            let roundtrip = serde_json::to_vec(&payload).unwrap();
+            let decoded: serde_json::Value = serde_json::from_slice(&roundtrip).unwrap();
+            (
+                decoded["backend_profile_id"].as_str().unwrap().to_string(),
+                decoded["provider"].as_str().unwrap().to_string(),
+                decoded["model"].as_str().unwrap().to_string(),
+                decoded["effort"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    queued.sort();
+    let mut expected_queued = vec![
+        ("codex_architect_high", "codex", "gpt-5.6-sol", "xhigh"),
+        ("codex_audit_high", "codex", "gpt-5.6-sol", "ultra"),
+        ("codex_builder_high", "codex", "gpt-5.6-terra", "high"),
+        ("codex_ops_low", "codex", "gpt-5.6-luna", "high"),
+        ("codex_orchestrator_acp", "codex", "gpt-5.6-terra", "high"),
+        ("codex_orchestrator_high", "codex", "gpt-5.6-sol", "max"),
+        ("codex_writer_high", "codex", "gpt-5.6-terra", "high"),
+    ]
+    .into_iter()
+    .map(|(profile, provider, model, effort)| {
+        (
+            profile.to_string(),
+            provider.to_string(),
+            model.to_string(),
+            effort.to_string(),
+        )
+    })
+    .collect::<Vec<_>>();
+    expected_queued.sort();
+    assert_eq!(queued, expected_queued);
+
+    // Production queue selection deliberately applies a one-second compatibility
+    // window for legacy timestamps with mixed precision.
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    for _ in 0..24 {
+        let observed_count = std::fs::read_to_string(&observed_path)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        if observed_count == 7 {
+            break;
+        }
+        let processed = match executor.process_next_item().await {
+            Ok(processed) => processed,
+            Err(error) if error.to_string().contains("valid required outputs") => {
+                // This bridge fixture intentionally declares no artifact outputs: its
+                // acceptance boundary ends after the serialized ACP prompt. The
+                // production completion fence therefore rejects settlement after the
+                // request has been observed, which must not hide the remaining rows.
+                true
+            }
+            Err(error) => panic!("production bridge failed before ACP observation: {error:#}"),
+        };
+        if !processed {
+            let work_states = work_items::list_by_run(&pool, run_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|item| format!("{}:{}", item.kind, item.status))
+                .collect::<Vec<_>>();
+            let agent_states = sqlx::query_as::<_, (String, String)>(
+                r#"SELECT ae.agent_id, ae.status
+                   FROM agent_executions ae
+                   JOIN stage_executions se ON se.id = ae.stage_execution_id
+                   WHERE se.run_id = ?1
+                   ORDER BY ae.agent_id"#,
+            )
+            .bind(run_id.to_string())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            panic!(
+                "production queue stopped before all variants reached ACP: work={work_states:?} agents={agent_states:?}"
+            );
+        }
+    }
+    let mut observed = std::fs::read_to_string(&observed_path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(value["config"]["configId"], "reasoning_effort");
+            assert!(value["config"]["sessionId"].as_str().is_some());
+            (
+                value["model"].as_str().unwrap().to_string(),
+                value["config"]["value"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    observed.sort();
+    let mut expected_observed = vec![
+        ("gpt-5.6-sol", "max"),
+        ("gpt-5.6-sol", "xhigh"),
+        ("gpt-5.6-sol", "ultra"),
+        ("gpt-5.6-terra", "high"),
+        ("gpt-5.6-terra", "high"),
+        ("gpt-5.6-terra", "high"),
+        ("gpt-5.6-luna", "high"),
+    ]
+    .into_iter()
+    .map(|(model, effort)| (model.to_string(), effort.to_string()))
+    .collect::<Vec<_>>();
+    expected_observed.sort();
+    assert_eq!(observed, expected_observed);
 }
 
 #[test]

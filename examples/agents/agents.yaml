@@ -608,7 +608,7 @@ backend_profiles:
     runtime_profile: claude_agent_acp
   codex_writer_high:
     provider: codex_acp
-    model: gpt-5.6
+    model: gpt-5.6-terra
     effort: high
     temperature: 0.12
     max_turns: 18
@@ -638,7 +638,7 @@ backend_profiles:
     runtime_profile: claude_agent_acp
   codex_architect_high:
     provider: codex_acp
-    model: gpt-5.6
+    model: gpt-5.6-sol
     effort: xhigh
     temperature: 0.1
     max_turns: 16
@@ -649,7 +649,7 @@ backend_profiles:
     runtime_profile: codex_acp
   codex_builder_high:
     provider: codex_acp
-    model: gpt-5.6
+    model: gpt-5.6-terra
     effort: high
     temperature: 0.1
     max_turns: 24
@@ -670,8 +670,8 @@ backend_profiles:
     runtime_profile: claude_agent_acp
   codex_audit_high:
     provider: codex_acp
-    model: gpt-5.6
-    effort: xhigh
+    model: gpt-5.6-sol
+    effort: ultra
     temperature: 0.0
     max_turns: 18
     structured_output: required
@@ -699,8 +699,8 @@ backend_profiles:
     runtime_profile: claude_agent_acp
   codex_ops_low:
     provider: codex_acp
-    model: gpt-5.6
-    effort: low
+    model: gpt-5.6-luna
+    effort: high
     temperature: 0.0
     max_turns: 8
     structured_output: required
@@ -802,8 +802,8 @@ backend_profiles:
     mcp: []
   codex_orchestrator_acp:
     provider: codex_acp
-    model: gpt-5.6
-    effort: medium
+    model: gpt-5.6-terra
+    effort: high
     temperature: 0.1
     max_turns: 12
     structured_output: preferred
@@ -811,8 +811,8 @@ backend_profiles:
     runtime_profile: codex_acp
   codex_orchestrator_high:
     provider: codex_acp
-    model: gpt-5.6
-    effort: high
+    model: gpt-5.6-sol
+    effort: max
     temperature: 0.1
     max_turns: 16
     structured_output: required

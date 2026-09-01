@@ -5748,6 +5748,7 @@ struct P031ActiveAgentTimelinePresentation: Equatable, Sendable {
   let stageID: String?
   let providerID: String?
   let modelID: String?
+  let plannedAssignment: CodexPlannedAssignmentPresentation
   let stageLabel: String?
   let taskLabel: String?
   let status: String
@@ -5765,6 +5766,7 @@ struct P031ActiveAgentTimelinePresentation: Equatable, Sendable {
     stageID: String?,
     providerID: String? = nil,
     modelID: String? = nil,
+    plannedAssignment: CodexPlannedAssignmentPresentation = .unavailable,
     stageLabel: String? = nil,
     taskLabel: String? = nil,
     status: String = "running",
@@ -5781,6 +5783,7 @@ struct P031ActiveAgentTimelinePresentation: Equatable, Sendable {
     self.stageID = stageID
     self.providerID = providerID
     self.modelID = modelID
+    self.plannedAssignment = plannedAssignment
     self.stageLabel = stageLabel
     self.taskLabel = taskLabel
     self.status = status
@@ -5798,6 +5801,7 @@ struct P031StageTopologyOccurrencePresentation: Equatable, Sendable {
   let taskName: String
   let statusText: String
   let providerLabel: String
+  let plannedAssignment: CodexPlannedAssignmentPresentation
   let executionCountLabel: String?
 }
 
@@ -6799,7 +6803,8 @@ enum P031RunDetailPresenter {
     let reportRows = detail.reportMetadata.map(ReportMetadataRowPresenter.presentation)
     let activeAgentTimelineEntries = activeAgentTimelineEntries(
       from: detail.activeAgentExecutions,
-      stageByExecutionID: stageByExecutionID
+      stageByExecutionID: stageByExecutionID,
+      topology: detail.runStageTopology
     )
     let progressLabel: String?
     if let completedStages = run?.completedStages, let totalStages = run?.totalStages {
@@ -6904,9 +6909,11 @@ enum P031RunDetailPresenter {
 
   nonisolated private static func activeAgentTimelineEntries(
     from executions: [P031ActiveAgentExecutionReadModel],
-    stageByExecutionID: [String: P031StageReadModel]
+    stageByExecutionID: [String: P031StageReadModel],
+    topology: [P031RunStageTopologyReadModel]
   ) -> [P031ActiveAgentTimelinePresentation] {
-    executions.compactMap { execution in
+    let policy = CodexModelVariantPolicyLoader.loadBundled()
+    return executions.compactMap { execution in
       guard execution.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "running",
         execution.completedAt == nil,
         let startedAt = P031ReadBoundaryDateParser.date(from: execution.startedAt)
@@ -6936,6 +6943,29 @@ enum P031RunDetailPresenter {
         .joined(separator: " ")
       let title = execution.agentTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
       let timestamp = P031ReadBoundaryDateParser.date(from: execution.lastEventAt) ?? startedAt
+      let candidates: [P031PlannedAssignmentCandidate]
+      if let stageID = stage?.stageID {
+        candidates = topology
+          .filter { $0.stageID == stageID }
+          .flatMap(\.occurrences)
+          .map {
+            P031PlannedAssignmentCandidate(
+              agentID: $0.agentID,
+              provider: $0.provider,
+              model: $0.model,
+              effort: $0.effort
+            )
+          }
+      } else {
+        candidates = []
+      }
+      let plannedAssignment = P031PlannedAssignmentMatcher.presentation(
+        agentID: execution.agentID,
+        provider: execution.provider,
+        model: execution.model,
+        candidates: candidates,
+        policy: policy
+      )
 
       return P031ActiveAgentTimelinePresentation(
         id: "active-agent-\(execution.id)",
@@ -6945,6 +6975,7 @@ enum P031RunDetailPresenter {
         stageID: stage?.stageID,
         providerID: execution.provider,
         modelID: execution.model,
+        plannedAssignment: plannedAssignment,
         stageLabel: stageLabel?.isEmpty == false ? stageLabel : nil,
         taskLabel: execution.taskLabel,
         status: execution.status,
@@ -7311,6 +7342,7 @@ enum P031StageTopologyPresenter {
   nonisolated static func presentation(
     for node: P031RunStageTopologyReadModel
   ) -> P031StageTopologyPresentation {
+    let policy = CodexModelVariantPolicyLoader.loadBundled()
     let iterationText: String? = node.iteration.map { "Iteration \($0)" }
     let attemptText: String? = node.attemptNumber.map { "Attempt \($0)" }
     let startedAt = P031ReadBoundaryDateParser.date(from: node.startedAt)
@@ -7342,18 +7374,19 @@ enum P031StageTopologyPresenter {
       artifactCount: node.artifactCount,
       communicationCount: node.communicationCount,
       occurrences: node.occurrences.map { occurrence in
-        let providerParts = [
-          occurrence.provider,
-          occurrence.model,
-          occurrence.effort,
-        ].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-          .filter { !$0.isEmpty }
+        let plannedAssignment = CodexPlannedAssignmentFormatter.presentation(
+          provider: occurrence.provider,
+          model: occurrence.model,
+          effort: occurrence.effort,
+          policy: policy
+        )
         return P031StageTopologyOccurrencePresentation(
           agentID: occurrence.agentID,
           agentTitle: occurrence.agentTitle,
           taskName: occurrence.taskName,
           statusText: P031ThinPresentationFormatting.titleCase(occurrence.status),
-          providerLabel: providerParts.joined(separator: " · "),
+          providerLabel: plannedAssignment.visualSuffix,
+          plannedAssignment: plannedAssignment,
           executionCountLabel: occurrence.executionCount > 0
             ? "\(occurrence.executionCount) attempt\(occurrence.executionCount == 1 ? "" : "s")"
             : nil

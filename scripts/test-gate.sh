@@ -2706,6 +2706,8 @@ Available gates:
                   Proposal 086 Phase 1 operator-report gate: operator report field coverage
   proposal-087|p087  Proposal 087 read-path liveness and storage tiering gate
   agent-context-skills  Provider-free mission context, frozen Agent Skills, and source-inventory gate
+  codex-planned-variant-slice
+                  Pinned Codex model/effort admission, ACP, readback, and SwiftUI label gate
   proposal-094|p094  Proposal 094 workflow-owned blocker-boundary contract/readback gate
   proposal-096|p096  Proposal 096 bounded tool output and safe-search guard retained alias gate
   proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
@@ -12579,6 +12581,85 @@ PY
       run_p082_cargo_test -p mcp-server --test proposal_082_recovery_readback -- --nocapture
     )
     log "Proposal 082 gate passed"
+    ;;
+  codex-planned-variant-slice)
+    check_idle_environment allow_app
+    log "Codex planned variant slice: policy, admission, ACP, readback, and shared Swift presentation"
+    export CHAINWORKS_XCODE_CARGO_TARGET_DIR
+    CHAINWORKS_XCODE_CARGO_TARGET_DIR="$(chainworks_test_gate_cargo_target_dir "${CHAINWORKS_CODEX_VARIANT_CARGO_TARGET_DIR:-target/codex-planned-variant-slice}")"
+    export CARGO_TARGET_DIR="$CHAINWORKS_XCODE_CARGO_TARGET_DIR"
+    python3 - "$ROOT_DIR" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+app = root / "Chainworks Forge"
+swift_sources = list(app.rglob("*.swift"))
+source_text = "\n".join(path.read_text(encoding="utf-8") for path in swift_sources)
+for forbidden in ('"Sol"', '"Terra"', '"Luna"'):
+    if forbidden in source_text:
+        raise SystemExit(
+            f"codex-planned-variant-slice: app contains fallback display label {forbidden}"
+        )
+
+presentation = (app / "Support/CodexPlannedVariantPresentation.swift").read_text(encoding="utf-8")
+view = (app / "Views/RunsHomeView.swift").read_text(encoding="utf-8")
+project = (root / "Chainworks Forge.xcodeproj/project.pbxproj").read_text(encoding="utf-8")
+required = {
+    "single shared formatter": presentation.count("enum CodexPlannedAssignmentFormatter") == 1,
+    "separate fixed variant token": "Text(token)" in view and ".fixedSize(horizontal: true" in view,
+    "tail-truncating suffix": ".truncationMode(.tail)" in view,
+    "Overview and Stages shared row": view.count("P036PlannedAssignmentLine(") == 2,
+    "fail-closed current-stage wiring": "stageID: markedCurrentStage?.id" in view,
+    "Stage accessibility containment": ".accessibilityElement(children: .contain)" in view,
+    "pinned resource membership": "codex-model-variant-matrix.v1.json" in project,
+}
+for name, present in required.items():
+    if not present:
+        raise SystemExit(f"codex-planned-variant-slice: missing {name}")
+
+for forbidden in (
+    "CODEX_MODEL_VARIANT_ENABLED",
+    "codexModelVariantEnabled",
+    "disableCodexModelVariant",
+):
+    if forbidden in source_text:
+        raise SystemExit(f"codex-planned-variant-slice: feature flag is forbidden: {forbidden}")
+PY
+    run_targeted_tests \
+      "codex-planned-variant-slice-swift" \
+      "Chainworks ForgeTests/CodexModelVariantTruthTests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      run_codex_variant_cargo_test() {
+        local output status
+        set +e
+        output=$(cargo test "$@" 2>&1)
+        status=$?
+        set -e
+        printf '%s\n' "$output"
+        if [ "$status" -ne 0 ]; then
+          return "$status"
+        fi
+        if ! printf '%s\n' "$output" | grep -Eq '^running [1-9][0-9]* tests?$'; then
+          echo "FAILED: Codex planned variant filter selected zero tests: cargo test $*" >&2
+          return 1
+        fi
+      }
+
+      run_codex_variant_cargo_test -p domain --test codex_model_variant_policy -- --nocapture
+      run_codex_variant_cargo_test -p workflow --test codex_planned_variant -- --nocapture
+      run_codex_variant_cargo_test -p workflow --test snapshot_integrity -- --nocapture
+      run_codex_variant_cargo_test -p engine --test agent_context_skills production_start_run_ -- --nocapture
+      run_codex_variant_cargo_test -p engine --test agent_context_skills production_codex_variant_bridge_serializes_all_seven_admitted_rows -- --nocapture
+      run_codex_variant_cargo_test -p engine --test agent_context_skills persisted_snapshot_quartet_ -- --nocapture
+      run_codex_variant_cargo_test -p acp --lib codex_effort_inputs_enter_exactly_one_lane -- --nocapture
+      run_codex_variant_cargo_test -p acp --test integration codex_policy_effort_ -- --nocapture
+      run_codex_variant_cargo_test -p graphql-server --lib tampered_snapshot_quartet -- --nocapture
+      run_codex_variant_cargo_test -p graphql-server --lib active_agent_provider_normalization_ -- --nocapture
+      run_codex_variant_cargo_test -p graphql-server --lib p036_run_stage_topology_ -- --nocapture
+    )
+    log "Codex planned variant slice gate passed"
     ;;
   agent-context-skills)
     log "Agent context and skills gate: provider-free frozen context, bundle, and enqueue proofs"
