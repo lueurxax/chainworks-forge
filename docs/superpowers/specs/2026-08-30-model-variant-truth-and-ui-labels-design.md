@@ -72,9 +72,10 @@ This revision therefore makes these choices explicit:
    from the approved matrix.
 3. Freeze the authored full model ID and effort through existing RunPlan fields.
 4. Preserve the full pair through the existing adapter request.
-5. Render the same friendly variant, effort, and `planned` qualifier visibly in
-   Overview and Stages; retain the full model ID in regular-width copy and in
-   help/accessibility copy at every text size.
+5. At regular text sizes, render the same friendly variant, full model ID,
+   effort, and `planned` qualifier in Overview and Stages. Preserve the variant
+   token visually and the complete value through help/accessibility at every
+   supported text size.
 6. Preserve verified old frozen Runs and existing lifecycle/recovery semantics
    without describing mutable snapshot-less fallback as frozen truth.
 7. Enable the behavior unconditionally, with no feature flag or disable path.
@@ -203,9 +204,19 @@ with typed `policy_bytes_mismatch`, then calls the parser. Workflow, ACP tests,
 and Swift formatter tests consume this one policy source rather than
 maintaining another matrix.
 
-The Xcode bundle contains the same retained fixture for validation and
-presentation lookup. Rust remains the run-creation authority; Swift validation
-is feedback only.
+The Xcode project adds this exact file as an explicit app resource.
+`CodexModelVariantPolicyLoaderV1` is the only Swift lookup authority. It loads
+the named resource from `Bundle.main`, requires final LF, 1,479 bytes, and the
+literal SHA-256 above using CryptoKit, then decodes the fixed schema. It returns
+only `.available(policy)` or typed `.unavailable(reason)`; missing, unreadable,
+truncated, malformed, length-mismatched, digest-mismatched, or undecodable data
+all choose unavailable.
+
+Both formatters require `.available`. When the loader is unavailable, every
+Codex planned tuple renders `Planned assignment unavailable`; no friendly name,
+effort, or `planned` qualifier is inferred. There is no hard-coded Swift fallback
+matrix. Non-Codex existing copy remains unchanged. Rust remains run-creation
+authority; Swift validation controls presentation only.
 
 ### 2. New-Run admission
 
@@ -282,6 +293,28 @@ sends its admitted value byte-for-byte and never passes it through advertised
 option, casing, name, description, or substring resolution. Existing fuzzy
 best-effort options and required options for other adapters remain unchanged.
 
+The adapter classifies every Codex request into exactly one effort lane. An
+explicit `ExecutionRequest.effort` retains current precedence over a model
+suffix. Classification examines raw model and explicit-effort bytes before
+split/lowercase normalization; only the exact row below enters the exact lane.
+Legacy values then retain current lowercase normalization before entering the
+fuzzy lane.
+
+| Input class | Lane | Serialized effort behavior |
+|---|---|---|
+| byte-exact bare policy model plus separate byte-exact allowed effort | exact best-effort | one request with admitted bytes |
+| bare policy model plus unsupported, case-varied, or blank explicit effort | legacy fuzzy | one request with current normalized explicit value |
+| literal generic or custom bare model plus explicit effort | legacy fuzzy | one request with current normalized explicit value |
+| any combined `model/effort` with no explicit effort | legacy fuzzy | one request with current normalized suffix |
+| any combined form plus explicit effort | legacy fuzzy | one request with normalized explicit value; suffix emits nothing |
+| case-varied policy model, with any present effort | legacy fuzzy | one request with current normalized effective value |
+| any bare model with `effort = nil` | none | no config request |
+
+The default generic model follows the literal-generic rows. A trailing slash
+without a suffix and no explicit effort follows `none`. No class may populate
+both exact and fuzzy lanes, and `reasoning_effort` never enters
+`required_config_options`.
+
 A provider-free scripted NDJSON peer returns a normal `session/new` result,
 then separately rejects the best-effort effort request with JSON-RPC
 Method-not-found and a generic rejection. In both cases the existing transport
@@ -337,11 +370,15 @@ runtime fields, but they cannot receive a planned label from invalid evidence.
 - Health fallback and P058 that change the binding therefore cannot combine a
   target execution model with source topology effort. A same-binding retry may
   display planned identity only when the unique occurrence still matches.
-- The `activeAgentExecutions` resolver canonicalizes every known provider alias
-  with `ProviderFamily::canonicalize_known_alias` before GraphQL construction;
-  unknown providers remain raw and cannot receive a Codex label. This normalizes
-  standard, health-fallback, P058/backend-profile, same-backend retry, and
-  targeted-retry readback without rewriting frozen snapshots or internal rows.
+- Before GraphQL construction, the `activeAgentExecutions` resolver asks
+  `ProviderFamily::resolve` whether a provider belongs to the Codex family. Only
+  recognized Codex aliases emit canonical `codex`; every Claude, Gemini, Auggie,
+  Junie, and unknown provider string remains byte-identical to existing readback.
+  This normalizes Codex standard, health-fallback, P058/backend-profile,
+  same-backend retry, and targeted-retry rows without rewriting frozen snapshots
+  or internal rows. The normalization runs only inside
+  `p093_active_agent_executions` after shared conversion; it does not change
+  `GqlAgentExecution::from` or the stage-scoped `agentExecutions` query.
 - Overview filtering changes narrowly: when a current topology stage exists,
   only active rows whose resolved StageExecution maps to that exact stage are
   visible; when none exists, the current-stage agent card is empty. Stale,
@@ -361,14 +398,18 @@ second query or broaden data access.
 ### 5. Shared presentation
 
 One pure Swift formatter receives provider, frozen model, and frozen effort. It
-returns a bounded enum-backed presentation with `visualPrefix` and
-`fullAccessibilityValue`. For policy-known Codex IDs both contain:
+returns a bounded enum-backed presentation with optional nontruncating
+`variantToken`, truncatable `visualSuffix`, and `fullAccessibilityValue`. Their
+complete policy-known assembly is:
 
 ```text
-Codex · Sol · gpt-5.6-sol · max · planned
-Codex · Terra · gpt-5.6-terra · high · planned
-Codex · Luna · gpt-5.6-luna · high · planned
+Sol · gpt-5.6-sol · max · planned
+Terra · gpt-5.6-terra · high · planned
+Luna · gpt-5.6-luna · high · planned
 ```
+
+The corresponding full help/accessibility values retain provider context, for
+example `Codex · Sol · gpt-5.6-sol · max · planned`.
 
 Recognized legacy and unavailable values remain honest:
 
@@ -378,24 +419,24 @@ Codex · Sol · gpt-5.6-sol · Planned effort not recorded
 Planned assignment unavailable
 ```
 
-| State | `visualPrefix` | `fullAccessibilityValue` |
-|---|---|---|
-| unique policy-known tuple with allowed effort | friendly name first, then full ID, effort, `planned` | identical complete value |
-| unique literal legacy `gpt-5.6` with parser-known effort | full ID, effort, `planned` | identical complete value |
-| unique policy-known or literal legacy model, effort absent | friendly/model first, then `Planned effort not recorded` | identical complete value |
-| unknown model, unknown nonempty effort, no/ambiguous/mismatched tuple | `Planned assignment unavailable` | same phrase |
-| stale/unmapped active row | hidden by existing filtering | absent |
-| non-Codex | existing provider copy unchanged | existing accessibility copy unchanged |
+| State | `variantToken` | `visualSuffix` | `fullAccessibilityValue` |
+|---|---|---|---|
+| unique policy-known tuple with allowed effort | `Sol`, `Terra`, or `Luna` | full ID, effort, `planned` | `Codex`, friendly name, full ID, effort, `planned` |
+| unique literal legacy `gpt-5.6` with parser-known effort | `Codex` | full ID, effort, `planned` | complete assembled value |
+| unique policy-known or literal legacy model, effort absent | friendly name or `Codex` | model then `Planned effort not recorded` | provider, friendly/model, and the complete phrase |
+| unknown model, unknown nonempty effort, no/ambiguous/mismatched tuple | absent | `Planned assignment unavailable` | same phrase |
+| stale/unmapped active row | absent | hidden by existing filtering | absent |
+| non-Codex | existing provider copy unchanged | existing suffix unchanged | existing accessibility copy unchanged |
 
 Rules:
 
 - friendly names are byte-exact lookup labels, never proof of provider use;
-- policy-known output puts provider and friendly variant before the full model
-  ID, effort, and `planned`, so tail truncation cannot hide the variant;
-- at regular text sizes the complete policy-known prefix is visible. At
-  accessibility sizes the existing one-line metadata region may tail-truncate
-  only after the complete friendly variant token; help and VoiceOver always use
-  `fullAccessibilityValue`;
+- policy-known output puts only the short friendly variant in `variantToken`.
+  The suffix starts with the full model ID and contains effort plus `planned`;
+- for `.xSmall ... .large`, the complete policy-known visual assembly is
+  required. For `.xLarge ... .accessibility5`, the complete `variantToken`
+  remains visible while only `visualSuffix` may tail-truncate. Help and
+  VoiceOver always use `fullAccessibilityValue`;
 - no new button, menu, shortcut, selection behavior, or topology ownership is
   introduced;
 - missing effort and missing assignment use the two distinct normative phrases
@@ -408,10 +449,21 @@ Rules:
 Overview and Stages must call the same formatter. Source scans reject local
 Sol/Terra/Luna switch statements elsewhere in the app.
 
-Both surfaces keep their current one-line metadata geometry. They place
-`visualPrefix` before task/status/session suffixes and use tail truncation. The
-292-by-210 topology card, slot-height arithmetic, connector alignment, Overview
-row height, selection, and keyboard focus remain unchanged.
+Both surfaces keep their current one-line metadata geometry. For a Codex planned
+presentation they render `variantToken` as a separate plain `Text` with fixed
+horizontal size and higher layout priority, followed by one tail-truncating
+`Text` containing `visualSuffix` before task/status/session suffixes. No capsule,
+badge, or font-size override is added.
+
+`P036StageTopologyMetrics.cardWidth = 292` and `cardHeight = 210` describe the
+inner frame before the existing 12-point outer padding; the measured one-unit
+outer border is therefore 316 by 234. For `heightUnits = n`, inner height remains
+`n * 210 + (n - 1) * 12`, with 24 points added by outer padding. Existing
+connector segments remain 34 by 210 with 12-point column spacing. This slice
+adds no vertical line and preserves these measured frames, Overview row height,
+selection, and keyboard focus. It does not claim to repair the baseline
+outer-card/connector asymmetry or whole-card Dynamic Type reflow; those remain
+in [Verified provider truth UI](2026-08-31-verified-provider-truth-ui-design.md).
 
 Overview's combined accessibility label includes the full planned value. The
 Stages card stops overriding all occurrence children with one card label: its
@@ -438,7 +490,8 @@ exposes that value exactly once in the accessibility tree.
 | Condition | Result |
 |---|---|
 | New production catalog differs from the policy | compilation fails before Run creation |
-| Policy fixture missing, malformed, or digest-mismatched | compilation fails; Xcode validation reports the same issue |
+| Rust policy fixture missing, malformed, or digest-mismatched | new-Run compilation fails before writes |
+| Swift bundle fixture missing, unreadable, malformed, length/digest-mismatched, or undecodable | both surfaces render `Planned assignment unavailable`; no fallback matrix |
 | Verified old frozen Run contains literal generic model | replay unchanged; recognized generic planned line may be shown |
 | Verified old frozen Run contains custom model/effort | replay unchanged; new planned line is unavailable and existing raw field remains unqualified |
 | Snapshot-less legacy Run | current mutable recompilation behavior; topology remains empty and no planned label is added |
@@ -446,7 +499,7 @@ exposes that value exactly once in the accessibility tree.
 | Overview has no unique matching frozen occurrence | `Planned assignment unavailable`; raw execution model may remain separately unqualified |
 | Overview has no current topology stage | current-stage agent card is empty; no global fallback list |
 | Provider advertises conflicting spelling/substrings for effort | exact admitted effort is still sent once as best-effort |
-| Known fallback/retry provider alias reaches readback | GraphQL emits canonical provider family; unknown aliases remain raw/unlabelled |
+| Known Codex fallback/retry alias reaches readback | GraphQL emits `codex`; every non-Codex/unknown provider remains byte-identical and unlabelled by this formatter |
 | Provider ignores or later changes the request | existing runtime behavior; planned UI remains planned |
 | Unknown model/effort reaches formatter | `Planned assignment unavailable`; unknown text is not interpolated |
 
@@ -478,12 +531,20 @@ only the following:
    `reasoning_effort` request. Empty, case-variant, missing, and
    substring-conflicting advertised options cannot replace the admitted effort.
    A scripted peer rejects it with Method-not-found and generic error in separate
-   cases; both still observe the prompt and no required effort option.
-5. GraphQL tests prove known providers are canonical for standard,
-   health-fallback, P058/backend-profile, same-backend retry, and targeted-retry
-   rows while unknown providers remain raw. Swift tests cover unique/no/multiple
-   candidates, ambiguous repeated topology, owner-only, dynamic, health fallback,
-   P058 same/changed binding, lead/P017 exclusion, and provider/model mismatch.
+   cases; both still observe the prompt and no required effort option. The closed
+   compatibility table additionally covers policy/unsupported, literal generic,
+   custom, combined, case-varied, blank, explicit-over-suffix, trailing-slash,
+   and absent classes. Each asserts exactly one lane, `AcpSessionNewSpec`
+   membership, serialized request count/value, and no required effort option.
+5. Resolver-local GraphQL tests prove `p093_active_agent_executions` alone emits
+   `codex` for Codex standard, health-fallback, P058/backend-profile,
+   same-backend retry, and targeted-retry aliases. Stored provider, snapshot
+   bytes/hashes, shared `GqlAgentExecution::from`, stage-scoped
+   `agentExecutions.provider`, every non-Codex alias, and unknown providers remain
+   byte-identical. Swift tests cover
+   unique/no/multiple candidates, ambiguous repeated topology, owner-only,
+   dynamic, health fallback, P058 same/changed binding, lead/P017 exclusion, and
+   provider/model mismatch.
    Current-stage filtering fixtures cover mapped-current visible,
    mapped-noncurrent hidden, unresolved hidden, no-current-stage empty, completed
    hidden, and no cross-stage reassignment. No new root, field, document, ID, or
@@ -493,17 +554,21 @@ only the following:
    class in Overview and Stages. Delimiter, bidi, default-ignorable,
    line-separator, literal-escape, and overlong unknown inputs all produce the
    fixed unavailable phrase and are never interpolated.
-7. Hosted Swift presentation tests cover the 292-by-210 topology card, 1/2/5
-   existing occurrences, connector alignment, Overview rows, every supported
-   Dynamic Type size, known/missing/unavailable copy, and status refresh. The
-   complete longest known prefix is visible at regular sizes; accessibility
-   sizes retain the complete friendly variant before tail truncation and expose
-   the full value through help/VoiceOver. Fixed geometry, keyboard focus, row
-   identity, and selection remain stable. VoiceOver tests prove the Overview
-   combined label and the actual macOS accessibility tree prove separate Stage
-   occurrence children include each full planned value exactly once in the
-   normative order after status-only refresh.
-8. Static scans prove there is no feature flag/disable path and no second
+7. Swift loader tests inject missing, unreadable, truncated, malformed,
+   length/digest-mismatched, and undecodable resource data and assert unavailable
+   on both surfaces. A built-app resource test reads exactly 1,479 bytes and the
+   pinned digest from `Bundle.main`; source scans reject a fallback matrix.
+8. Provider-free in-process `NSHostingView` tests measure 292-by-210 inner,
+   316-by-234 one-unit outer, formula-derived multi-unit, and 34-by-210 connector
+   frames for 1/2/5 occurrences before and after the change. `.xSmall ... .large`
+   shows the complete longest assembly; `.xLarge ... .accessibility5` preserves
+   the separate variant token while only the suffix truncates. Planned-row
+   bounds, keyboard focus, row identity, selection, and status-only geometry do
+   not regress; no whole-card baseline Dynamic Type conformance is claimed.
+   Hosted inspection also proves the Overview combined label and actual macOS
+   accessibility tree expose each Stage occurrence's full planned value exactly
+   once in normative order after status-only refresh.
+9. Static scans prove there is no feature flag/disable path and no second
    variant lookup table.
 
 The gate fails if any selected Rust or Swift test filter executes zero tests.
@@ -537,11 +602,17 @@ is part of acceptance.
       bridge proves serialized model, one byte-exact best-effort effort request
       despite conflicting advertised options, and prompt continuation after
       effort rejection without claiming acceptance.
-- [ ] Known fallback/retry aliases are canonical at GraphQL readback; same model
-      may match one frozen tuple and changed/unknown provider or model cannot.
-- [ ] Overview and Stages use the same formatter and visibly show friendly
-      variant, effort, and `planned` only from one frozen tuple; full IDs remain
-      visible at regular size and available through help/VoiceOver at all sizes.
+- [ ] Every Codex effort input class enters exactly one exact/fuzzy/none lane;
+      admitted rows are exact, declared legacy behavior remains fuzzy, absent
+      emits none, and effort never becomes required.
+- [ ] Only active-agent resolver-local Codex fallback/retry aliases emit `codex`;
+      storage, snapshots, stage-scoped GraphQL, and non-Codex bytes stay unchanged.
+- [ ] The byte-pinned Swift bundle loader is the only label authority and every
+      resource failure renders unavailable without a fallback matrix.
+- [ ] Overview and Stages use the same formatter and, at regular size, visibly
+      show friendly variant, full ID, effort, and `planned` only from one frozen
+      tuple; the variant stays visible and the complete value remains available
+      through help/VoiceOver at all supported sizes.
 - [ ] No/ambiguous/mismatched assignments and missing effort use distinct
       normative copy; unknown values are never interpolated into planned copy.
 - [ ] Existing topology stacks, identities, keyboard focus, authorization,
@@ -549,6 +620,9 @@ is part of acceptance.
       current-stage filter fails closed, VoiceOver exposes planned copy exactly
       once per represented occurrence, and simultaneous same-agent row identity
       remains explicitly deferred.
+- [ ] Existing measured inner/outer/connector geometry is preserved; complete
+      copy is required only through `.large`, while the friendly variant token
+      and full help/VoiceOver value survive all supported accessibility sizes.
 - [ ] No public surface says configured, accepted, actual, or exact.
 - [ ] No feature flag or disable path exists.
 - [ ] `./scripts/test-gate.sh codex-planned-variant-slice` passes with
