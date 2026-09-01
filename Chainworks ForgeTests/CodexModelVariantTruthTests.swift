@@ -722,7 +722,9 @@ struct CodexModelVariantTruthTests {
             accessibilityElements(from: host).first { $0.identifier == occurrenceID }
         )
         #expect(pickerAfter.selectedSegment == 1)
-        #expect(window.firstResponder === picker)
+        #expect(pickerAfter === picker)
+        #expect(pickerAfter.window === window)
+        #expect(window.firstResponder === pickerAfter)
         #expect(after.label?.contains(", Paused, ") == true)
         #expect(after.frame == before.frame)
     }
