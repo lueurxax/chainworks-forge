@@ -127,6 +127,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
                             taskName: occurrence.taskName,
                             statusText: occurrence.statusText,
                             providerLabel: occurrence.providerLabel,
+                            plannedAssignment: occurrence.plannedAssignment,
                             executionCountLabel: occurrence.executionCountLabel
                         )
                     },
@@ -305,6 +306,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
                 title: entry.title,
                 providerID: entry.providerID,
                 modelID: entry.modelID,
+                plannedAssignment: entry.plannedAssignment,
                 stageID: entry.stageID,
                 stageLabel: entry.stageLabel,
                 taskLabel: entry.taskLabel,
@@ -515,6 +517,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
         let taskName: String
         let statusText: String
         let providerLabel: String
+        let plannedAssignment: CodexPlannedAssignmentPresentation
         let executionCountLabel: String?
     }
 
@@ -720,6 +723,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
         let title: String
         let providerID: String?
         let modelID: String?
+        let plannedAssignment: CodexPlannedAssignmentPresentation
         let stageID: String?
         let stageLabel: String?
         let taskLabel: String?
@@ -735,6 +739,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
             title: String,
             providerID: String?,
             modelID: String? = nil,
+            plannedAssignment: CodexPlannedAssignmentPresentation = .unavailable,
             stageID: String?,
             stageLabel: String?,
             taskLabel: String?,
@@ -749,6 +754,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
             self.title = title
             self.providerID = providerID
             self.modelID = modelID
+            self.plannedAssignment = plannedAssignment
             self.stageID = stageID
             self.stageLabel = stageLabel
             self.taskLabel = taskLabel
@@ -759,6 +765,28 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
             self.selectionOrder = selectionOrder
             self.selectionUnavailableReason = selectionUnavailableReason
         }
+    }
+
+    nonisolated static func activeAgents(
+        _ agents: [ActiveTimelineAgent],
+        forCurrentStageID stageID: String?
+    ) -> [ActiveTimelineAgent] {
+        guard let stageID else { return [] }
+        return agents
+            .filter {
+                $0.stageID == stageID
+                    && $0.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                        == "running"
+            }
+            .sorted {
+                if let lhs = $0.selectionOrder, let rhs = $1.selectionOrder, lhs != rhs {
+                    return lhs < rhs
+                }
+                if $0.latestAt != $1.latestAt {
+                    return $0.latestAt > $1.latestAt
+                }
+                return $0.title.localizedStandardCompare($1.title) == .orderedAscending
+            }
     }
 
     struct TimelineEntry: Identifiable, Equatable {

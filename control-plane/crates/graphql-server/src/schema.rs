@@ -1568,6 +1568,7 @@ async fn stage_from_projection_or_canonical(
 fn p036_stage_topology_order(plan: &workflow::plan::RunPlan) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut ordered = Vec::new();
+    let mut terminal = Vec::new();
     let mut queue = VecDeque::from([plan.initial_state.clone()]);
 
     while let Some(stage_id) = queue.pop_front() {
@@ -1577,7 +1578,11 @@ fn p036_stage_topology_order(plan: &workflow::plan::RunPlan) -> Vec<String> {
         let Some(state) = plan.states.get(&stage_id) else {
             continue;
         };
-        ordered.push(stage_id.clone());
+        if state.is_end {
+            terminal.push(stage_id.clone());
+        } else {
+            ordered.push(stage_id.clone());
+        }
         for transition in &state.transitions {
             if !seen.contains(&transition.to) {
                 queue.push_back(transition.to.clone());
@@ -1592,7 +1597,14 @@ fn p036_stage_topology_order(plan: &workflow::plan::RunPlan) -> Vec<String> {
         .cloned()
         .collect();
     remaining.sort();
-    ordered.extend(remaining);
+    for stage_id in remaining {
+        if plan.states.get(&stage_id).is_some_and(|state| state.is_end) {
+            terminal.push(stage_id);
+        } else {
+            ordered.push(stage_id);
+        }
+    }
+    ordered.extend(terminal);
     ordered
 }
 
@@ -1763,6 +1775,17 @@ fn p036_topology_nodes(
         .collect()
 }
 
+fn p093_active_provider_for_readback(provider: &str) -> String {
+    if matches!(
+        domain::provider::ProviderFamily::resolve(provider),
+        Ok(domain::provider::ProviderFamily::Codex)
+    ) {
+        "codex".to_string()
+    } else {
+        provider.to_string()
+    }
+}
+
 async fn p093_active_agent_executions(
     pool: &SqlitePool,
     run_id: RunId,
@@ -1775,16 +1798,31 @@ async fn p093_active_agent_executions(
     .await?;
 
     let plan = match runs::find_by_id(pool, run_id).await? {
-        Some(run) => {
-            let workflow = run.workflow_snapshot_json.as_deref().unwrap_or_default();
-            let catalog = run.catalog_snapshot_json.as_deref().unwrap_or_default();
-            if workflow.trim().is_empty() || catalog.trim().is_empty() {
-                None
-            } else {
+        Some(run) => match workflow::snapshot_integrity::verify_complete_pair_v1(
+            run.workflow_snapshot_json.as_deref(),
+            run.catalog_snapshot_json.as_deref(),
+            run.workflow_snapshot_hash.as_deref(),
+            run.catalog_snapshot_hash.as_deref(),
+        ) {
+            workflow::snapshot_integrity::SnapshotIntegrityV1::Verified(pair) => {
                 let catalog_path = run.agent_catalog_yaml_path.as_deref().unwrap_or(".");
-                workflow::compiler::compile_from_snapshot_json(workflow, catalog, catalog_path).ok()
+                workflow::compiler::compile_from_snapshot_json(
+                    pair.workflow_json,
+                    pair.catalog_json,
+                    catalog_path,
+                )
+                .ok()
             }
-        }
+            workflow::snapshot_integrity::SnapshotIntegrityV1::Absent => None,
+            workflow::snapshot_integrity::SnapshotIntegrityV1::Invalid(reason) => {
+                warn!(
+                    run_id = %run.id,
+                    reason = reason.as_str(),
+                    "P093 active-agent plan enrichment rejected an invalid frozen snapshot quartet"
+                );
+                None
+            }
+        },
         None => None,
     };
 
@@ -1830,6 +1868,7 @@ async fn p093_active_agent_executions(
                 })
                 .cloned();
             let mut gql = GqlAgentExecution::from(execution);
+            gql.provider = p093_active_provider_for_readback(&gql.provider);
             gql.agent_title = Some(p036_agent_title(&gql.agent_id));
             gql.stage_label = stage_row.map(|row| row.label.clone());
             gql.task_label = task_label;
@@ -2155,20 +2194,28 @@ impl QueryRoot {
         let Some(run) = runs::find_by_id(pool, run_id).await? else {
             return Ok(vec![]);
         };
-        let Some(workflow_snapshot_json) = run.workflow_snapshot_json.as_deref() else {
-            return Ok(vec![]);
+        let pair = match workflow::snapshot_integrity::verify_complete_pair_v1(
+            run.workflow_snapshot_json.as_deref(),
+            run.catalog_snapshot_json.as_deref(),
+            run.workflow_snapshot_hash.as_deref(),
+            run.catalog_snapshot_hash.as_deref(),
+        ) {
+            workflow::snapshot_integrity::SnapshotIntegrityV1::Verified(pair) => pair,
+            workflow::snapshot_integrity::SnapshotIntegrityV1::Absent => return Ok(vec![]),
+            workflow::snapshot_integrity::SnapshotIntegrityV1::Invalid(reason) => {
+                warn!(
+                    run_id = %run.id,
+                    reason = reason.as_str(),
+                    "P036 runStageTopology rejected an invalid frozen snapshot quartet"
+                );
+                return Ok(vec![]);
+            }
         };
-        let Some(catalog_snapshot_json) = run.catalog_snapshot_json.as_deref() else {
-            return Ok(vec![]);
-        };
-        if workflow_snapshot_json.trim().is_empty() || catalog_snapshot_json.trim().is_empty() {
-            return Ok(vec![]);
-        }
 
         let catalog_path = run.agent_catalog_yaml_path.as_deref().unwrap_or(".");
         let plan = match workflow::compiler::compile_from_snapshot_json(
-            workflow_snapshot_json,
-            catalog_snapshot_json,
+            pair.workflow_json,
+            pair.catalog_json,
             catalog_path,
         ) {
             Ok(plan) => plan,
@@ -9017,14 +9064,11 @@ mod tests {
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
         let workflow_path = "../../../examples/workflows/full-mvp-live.yaml";
         let catalog_path = "../../../examples/agents/agents.yaml";
-        let workflow_snapshot = workflow::definition::load(workflow_path).unwrap();
-        let catalog_snapshot = workflow::catalog::load(catalog_path).unwrap();
         let mut run = make_run(run_id, idea_id);
         run.status = domain::run::RunStatus::Running;
         run.workflow_yaml_path = Some(workflow_path.into());
         run.agent_catalog_yaml_path = Some(catalog_path.into());
-        run.workflow_snapshot_json = Some(serde_json::to_string(&workflow_snapshot).unwrap());
-        run.catalog_snapshot_json = Some(serde_json::to_string(&catalog_snapshot).unwrap());
+        set_verified_snapshots(&mut run, workflow_path, catalog_path);
         runs::insert(&pool, &run).await.unwrap();
 
         let later = Utc::now() + chrono::Duration::seconds(30);
@@ -9121,14 +9165,11 @@ mod tests {
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
         let workflow_path = "../../../examples/workflows/full-mvp-live.yaml";
         let catalog_path = "../../../examples/agents/agents.yaml";
-        let workflow_snapshot = workflow::definition::load(workflow_path).unwrap();
-        let catalog_snapshot = workflow::catalog::load(catalog_path).unwrap();
         let mut run = make_run(run_id, idea_id);
         run.status = domain::run::RunStatus::Running;
         run.workflow_yaml_path = Some(workflow_path.into());
         run.agent_catalog_yaml_path = Some(catalog_path.into());
-        run.workflow_snapshot_json = Some(serde_json::to_string(&workflow_snapshot).unwrap());
-        run.catalog_snapshot_json = Some(serde_json::to_string(&catalog_snapshot).unwrap());
+        set_verified_snapshots(&mut run, workflow_path, catalog_path);
         runs::insert(&pool, &run).await.unwrap();
 
         let started = Utc::now();
@@ -9280,6 +9321,14 @@ mod tests {
             review_routing_json: None,
             closeout_readiness_mode: None,
         }
+    }
+
+    fn set_verified_snapshots(run: &mut domain::run::Run, workflow_path: &str, catalog_path: &str) {
+        let plan = workflow::compiler::compile(workflow_path, catalog_path).unwrap();
+        run.workflow_snapshot_hash = Some(plan.workflow_snapshot_hash);
+        run.catalog_snapshot_hash = Some(plan.catalog_snapshot_hash);
+        run.workflow_snapshot_json = Some(plan.workflow_snapshot_json);
+        run.catalog_snapshot_json = Some(plan.catalog_snapshot_json);
     }
 
     fn make_stage_execution(
@@ -10771,15 +10820,12 @@ mod tests {
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
         let workflow_path = "../../../examples/workflows/full-mvp-live.yaml";
         let catalog_path = "../../../examples/agents/agents.yaml";
-        let workflow_snapshot = workflow::definition::load(workflow_path).unwrap();
-        let catalog_snapshot = workflow::catalog::load(catalog_path).unwrap();
         let mut run = make_run(run_id, idea_id);
         run.status = domain::run::RunStatus::Running;
         run.current_state = Some("state_2_proposal_drafted".into());
         run.workflow_yaml_path = Some(workflow_path.into());
         run.agent_catalog_yaml_path = Some(catalog_path.into());
-        run.workflow_snapshot_json = Some(serde_json::to_string(&workflow_snapshot).unwrap());
-        run.catalog_snapshot_json = Some(serde_json::to_string(&catalog_snapshot).unwrap());
+        set_verified_snapshots(&mut run, workflow_path, catalog_path);
         runs::insert(&pool, &run).await.unwrap();
 
         let stage_execution_id = domain::ids::StageExecutionId::new();
@@ -11004,6 +11050,201 @@ mod tests {
         assert_eq!(
             response.data.into_json().unwrap()["runStageTopology"],
             serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn planned_readback_fails_closed_for_tampered_snapshot_quartet() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let workflow_path = "../../../examples/workflows/full-mvp-live.yaml";
+        let catalog_path = "../../../examples/agents/agents.yaml";
+        let mut run = make_run(run_id, idea_id);
+        run.status = domain::run::RunStatus::Running;
+        run.workflow_yaml_path = Some(workflow_path.into());
+        run.agent_catalog_yaml_path = Some(catalog_path.into());
+        set_verified_snapshots(&mut run, workflow_path, catalog_path);
+        run.catalog_snapshot_hash = Some("0".repeat(64));
+        runs::insert(&pool, &run).await.unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"query {{ runStageTopology(runId: "{run_id}") {{ stageId label }} }}"#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(response.errors.is_empty(), "{response:?}");
+        assert_eq!(
+            response.data.into_json().unwrap()["runStageTopology"],
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn active_agent_plan_enrichment_fails_closed_for_tampered_snapshot_quartet() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let workflow_path = "../../../examples/workflows/full-mvp-live.yaml";
+        let catalog_path = "../../../examples/agents/agents.yaml";
+        let mut run = make_run(run_id, idea_id);
+        run.status = domain::run::RunStatus::Running;
+        run.workflow_yaml_path = Some(workflow_path.into());
+        run.agent_catalog_yaml_path = Some(catalog_path.into());
+        set_verified_snapshots(&mut run, workflow_path, catalog_path);
+        run.workflow_snapshot_hash = Some("0".repeat(64));
+        runs::insert(&pool, &run).await.unwrap();
+
+        let stage = make_stage_execution(
+            run_id,
+            "state_2_proposal_drafted",
+            "Proposal drafted",
+            Utc::now(),
+        );
+        let execution = make_agent_execution(stage.id, "proposal_writer", "codex", Utc::now());
+        stages::insert(&pool, &stage).await.unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let rows = p093_active_agent_executions(&pool, run_id, vec![execution])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].selection_order, None);
+        assert_eq!(rows[0].task_label, None);
+        assert_eq!(
+            rows[0].selection_unavailable_reason.as_deref(),
+            Some("snapshot_unavailable")
+        );
+    }
+
+    #[test]
+    fn active_agent_provider_normalization_is_codex_only_and_resolver_local() {
+        for alias in [
+            "codex",
+            "codex_acp",
+            "codex_cli",
+            "codex_cli_acp",
+            "openai_codex",
+        ] {
+            assert_eq!(p093_active_provider_for_readback(alias), "codex");
+        }
+        for provider in ["claude_acp", "Gemini-CLI", "unknown-provider"] {
+            assert_eq!(p093_active_provider_for_readback(provider), provider);
+        }
+
+        let execution = make_agent_execution(
+            domain::ids::StageExecutionId::new(),
+            "proposal_writer",
+            "codex_acp",
+            Utc::now(),
+        );
+        let stage_scoped = GqlAgentExecution::from(execution);
+        assert_eq!(
+            stage_scoped.provider, "codex_acp",
+            "storage/stage-scoped conversion must remain byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_agent_provider_normalization_preserves_storage_and_frozen_snapshots() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let workflow_path = "../../../examples/workflows/full-mvp-live.yaml";
+        let catalog_path = "../../../examples/agents/agents.yaml";
+        let mut run = make_run(run_id, idea_id);
+        run.status = domain::run::RunStatus::Running;
+        run.current_state = Some("state_2_proposal_drafted".into());
+        run.workflow_yaml_path = Some(workflow_path.into());
+        run.agent_catalog_yaml_path = Some(catalog_path.into());
+        set_verified_snapshots(&mut run, workflow_path, catalog_path);
+        let frozen_before = (
+            run.workflow_snapshot_json.clone(),
+            run.catalog_snapshot_json.clone(),
+            run.workflow_snapshot_hash.clone(),
+            run.catalog_snapshot_hash.clone(),
+        );
+        runs::insert(&pool, &run).await.unwrap();
+
+        let stage = make_stage_execution(
+            run_id,
+            "state_2_proposal_drafted",
+            "Proposal drafted",
+            Utc::now(),
+        );
+        stages::insert(&pool, &stage).await.unwrap();
+        let providers = [
+            "codex",
+            "codex_acp",
+            "codex_cli",
+            "codex_cli_acp",
+            "openai_codex",
+            "claude_acp",
+            "Gemini-CLI",
+            "unknown-provider",
+        ];
+        for provider in providers {
+            let execution = make_agent_execution(stage.id, "proposal_writer", provider, Utc::now());
+            db::repos::agent_executions::insert(&pool, &execution)
+                .await
+                .unwrap();
+        }
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let stored = db::repos::agent_executions::list_by_run(&pool, run_id)
+            .await
+            .unwrap();
+        let stored_by_id = stored
+            .iter()
+            .map(|execution| (execution.id.to_string(), execution.provider.clone()))
+            .collect::<HashMap<_, _>>();
+        let active = p093_active_agent_executions(&pool, run_id, stored.clone())
+            .await
+            .unwrap();
+        for row in active {
+            let stored_provider = &stored_by_id[row.id.as_str()];
+            let expected: &str = if matches!(
+                stored_provider.as_str(),
+                "codex" | "codex_acp" | "codex_cli" | "codex_cli_acp" | "openai_codex"
+            ) {
+                "codex"
+            } else {
+                stored_provider.as_str()
+            };
+            assert_eq!(row.provider, expected);
+        }
+        for execution in stored {
+            let stage_scoped = GqlAgentExecution::from(execution.clone());
+            assert_eq!(stage_scoped.provider, execution.provider);
+        }
+
+        let persisted = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                persisted.workflow_snapshot_json,
+                persisted.catalog_snapshot_json,
+                persisted.workflow_snapshot_hash,
+                persisted.catalog_snapshot_hash,
+            ),
+            frozen_before
         );
     }
 

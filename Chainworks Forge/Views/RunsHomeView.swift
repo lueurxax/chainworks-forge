@@ -5918,8 +5918,12 @@ private struct P036OverviewCommandCenterCard: View {
     let artifacts: [RunsWorkbenchPresentationModel.ArtifactReportRow]
     let recoveryEvidence: [RunsWorkbenchPresentationModel.RecoveryEvidenceRow]
 
-    private var currentStage: RunsWorkbenchPresentationModel.StageCard? {
+    private var markedCurrentStage: RunsWorkbenchPresentationModel.StageCard? {
         map.stages.first(where: \.isCurrent)
+    }
+
+    private var currentStage: RunsWorkbenchPresentationModel.StageCard? {
+        markedCurrentStage
             ?? map.stages.first(where: { $0.status == "active" })
             ?? map.stages.first(where: { $0.status == "blocked" })
     }
@@ -5976,9 +5980,9 @@ private struct P036OverviewCommandCenterCard: View {
 
                 P036ActiveAgentsReadbackCard(
                     title: "Agents in work",
-                    subtitle: currentStage.map { "Current stage · \($0.title)" } ?? "Latest active-agent readback",
+                    subtitle: markedCurrentStage.map { "Current stage · \($0.title)" } ?? "No current topology stage",
                     agents: activeAgents,
-                    stageID: currentStage?.id,
+                    stageID: markedCurrentStage?.id,
                     emptyText: "No active agent executions for the current stage."
                 )
 
@@ -6445,18 +6449,7 @@ private struct P036ActiveAgentsReadbackCard: View {
     let emptyText: String
 
     private var visibleAgents: [RunsWorkbenchPresentationModel.ActiveTimelineAgent] {
-        let scoped = stageID.map { id in
-            agents.filter { $0.stageID == id }
-        } ?? agents
-        return scoped.sorted {
-            if let lhs = $0.selectionOrder, let rhs = $1.selectionOrder, lhs != rhs {
-                return lhs < rhs
-            }
-            if $0.latestAt != $1.latestAt {
-                return $0.latestAt > $1.latestAt
-            }
-            return $0.title.localizedStandardCompare($1.title) == .orderedAscending
-        }
+        RunsWorkbenchPresentationModel.activeAgents(agents, forCurrentStageID: stageID)
     }
 
     var body: some View {
@@ -6500,7 +6493,7 @@ private struct P036ActiveAgentsReadbackCard: View {
     }
 }
 
-private struct P036ActiveAgentReadbackRow: View {
+struct P036ActiveAgentReadbackRow: View {
     let agent: RunsWorkbenchPresentationModel.ActiveTimelineAgent
 
     var body: some View {
@@ -6522,11 +6515,10 @@ private struct P036ActiveAgentReadbackRow: View {
                         .lineLimit(1)
                 }
 
-                Text(detailText)
-                    .font(ForgeTypography.micro)
-                    .foregroundStyle(ForgeColor.Text.tertiary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                P036PlannedAssignmentLine(
+                    presentation: agent.plannedAssignment,
+                    trailingComponents: activeTrailingComponents
+                )
             }
 
             Spacer(minLength: 8)
@@ -6538,8 +6530,8 @@ private struct P036ActiveAgentReadbackRow: View {
                     .lineLimit(1)
             }
         }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(agent.title), \(statusLabel), \(detailText), \(agent.eventCount) events")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(activeAccessibilityLabel)
     }
 
     private var statusLabel: String {
@@ -6547,21 +6539,8 @@ private struct P036ActiveAgentReadbackRow: View {
         return status.isEmpty ? "running" : status
     }
 
-    private var providerModelLabel: String? {
-        let parts = [
-            agent.providerID,
-            agent.modelID,
-        ].compactMap { value -> String? in
-            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            return trimmed.isEmpty ? nil : trimmed
-        }
-        guard !parts.isEmpty else { return nil }
-        return parts.joined(separator: " · ")
-    }
-
-    private var detailText: String {
+    private var activeTrailingComponents: [String] {
         [
-            providerModelLabel,
             agent.stageLabel,
             agent.taskLabel,
             agent.sessionID.map { "session \($0)" },
@@ -6569,7 +6548,48 @@ private struct P036ActiveAgentReadbackRow: View {
             let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return trimmed.isEmpty ? nil : trimmed
         }
-        .joined(separator: " · ")
+    }
+
+    private var activeAccessibilityLabel: String {
+        P036PlannedAssignmentAccessibility.overviewLabel(
+            agentTitle: agent.title,
+            status: statusLabel,
+            presentation: agent.plannedAssignment,
+            stage: agent.stageLabel,
+            task: agent.taskLabel,
+            session: agent.sessionID,
+            eventCount: agent.eventCount
+        )
+    }
+}
+
+struct P036PlannedAssignmentLine: View {
+    let presentation: CodexPlannedAssignmentPresentation
+    let trailingComponents: [String]
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 4) {
+            if let token = presentation.variantToken {
+                Text(token)
+                    .font(ForgeTypography.micro.weight(.semibold))
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .layoutPriority(2)
+            }
+            Text(suffixText)
+                .font(ForgeTypography.micro)
+                .foregroundStyle(ForgeColor.Text.tertiary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .layoutPriority(1)
+        }
+        .help(presentation.fullAccessibilityValue)
+    }
+
+    private var suffixText: String {
+        ([presentation.visualSuffix] + trailingComponents)
+            .filter { !$0.isEmpty }
+            .joined(separator: " · ")
     }
 }
 
@@ -6611,7 +6631,7 @@ private struct P036StageMapCard: View {
     }
 }
 
-private enum P036StageTopologyMetrics {
+enum P036StageTopologyMetrics {
     static let cardWidth: CGFloat = 292
     static let cardHeight: CGFloat = 210
     static let cardGap: CGFloat = 12
@@ -6679,7 +6699,7 @@ private struct P036StageTopologyConnectorColumnView: View {
     }
 }
 
-private struct P036StageTopologyConnectorView: View {
+struct P036StageTopologyConnectorView: View {
     let style: RunsWorkbenchPresentationModel.StageTopologyConnector.Style
 
     var body: some View {
@@ -6744,7 +6764,7 @@ private struct P036StageTopologyBridgeLane: View {
     }
 }
 
-private struct P036StageTopologyCard: View {
+struct P036StageTopologyCard: View {
     let stage: RunsWorkbenchPresentationModel.StageCard
     let heightUnits: Int
 
@@ -6782,6 +6802,8 @@ private struct P036StageTopologyCard: View {
                     size: .small
                 )
             }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(stageHeaderAccessibilityLabel)
 
             HStack(spacing: 6) {
                 ForEach(stageMetadataChips, id: \.self) { label in
@@ -6794,6 +6816,7 @@ private struct P036StageTopologyCard: View {
                         .background(ForgeColor.Surface.muted, in: Capsule())
                 }
             }
+            .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 6) {
                 ForEach(stage.occurrences) { occurrence in
@@ -6841,8 +6864,11 @@ private struct P036StageTopologyCard: View {
                 )
         }
         .modifier(P036RunningPulse(isActive: stage.status == "active" && stage.isCurrent))
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(stage.ordinal). \(stage.title), \(stage.ownerAgentTitle), \(statusLabel(for: stage.status)), \(stageMetadata)")
+        .accessibilityElement(children: .contain)
+    }
+
+    private var stageHeaderAccessibilityLabel: String {
+        "\(stage.ordinal). \(stage.title), \(stage.ownerAgentTitle), \(statusLabel(for: stage.status)), \(stageMetadata)"
     }
 
     private var stageMetadata: String {
@@ -6890,7 +6916,7 @@ private struct P036StageTopologyCard: View {
     }
 }
 
-private struct P036StageOccurrenceRow: View {
+struct P036StageOccurrenceRow: View {
     let occurrence: RunsWorkbenchPresentationModel.StageOccurrence
 
     var body: some View {
@@ -6903,21 +6929,32 @@ private struct P036StageOccurrenceRow: View {
                     .font(ForgeTypography.micro.weight(.semibold))
                     .foregroundStyle(ForgeColor.Text.primary)
                     .lineLimit(1)
-                Text(detailText)
-                    .font(ForgeTypography.micro)
-                    .foregroundStyle(ForgeColor.Text.tertiary)
-                    .lineLimit(1)
+                P036PlannedAssignmentLine(
+                    presentation: occurrence.plannedAssignment,
+                    trailingComponents: stageTrailingComponents
+                )
             }
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(stageAccessibilityLabel)
     }
 
-    private var detailText: String {
+    private var stageTrailingComponents: [String] {
         [
             occurrence.taskName,
             occurrence.statusText,
             occurrence.executionCountLabel,
-            occurrence.providerLabel.isEmpty ? nil : occurrence.providerLabel
-        ].compactMap { $0 }.joined(separator: " · ")
+        ].compactMap { $0 }
+    }
+
+    private var stageAccessibilityLabel: String {
+        P036PlannedAssignmentAccessibility.stageOccurrenceLabel(
+            agentTitle: occurrence.agentTitle,
+            task: occurrence.taskName,
+            status: occurrence.statusText,
+            presentation: occurrence.plannedAssignment,
+            executionCount: occurrence.executionCountLabel
+        )
     }
 }
 

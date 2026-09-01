@@ -1775,31 +1775,33 @@ pub fn compile_run_plan_from_snapshot(run: &Run) -> Result<Option<workflow::plan
 }
 
 fn verified_run_snapshot_pair(run: &Run) -> Result<Option<(&str, &str)>> {
-    match (
+    match workflow::snapshot_integrity::verify_complete_pair_v1(
         run.workflow_snapshot_json.as_deref(),
         run.catalog_snapshot_json.as_deref(),
         run.workflow_snapshot_hash.as_deref(),
         run.catalog_snapshot_hash.as_deref(),
     ) {
-        (None, None, None, None) => Ok(None),
-        (Some(workflow_json), Some(catalog_json), Some(workflow_hash), Some(catalog_hash))
-            if !workflow_json.trim().is_empty()
-                && !catalog_json.trim().is_empty()
-                && !workflow_hash.trim().is_empty()
-                && !catalog_hash.trim().is_empty() =>
-        {
-            let actual_workflow_hash = format!("{:x}", Sha256::digest(workflow_json.as_bytes()));
-            let actual_catalog_hash = format!("{:x}", Sha256::digest(catalog_json.as_bytes()));
-            if actual_workflow_hash != workflow_hash || actual_catalog_hash != catalog_hash {
+        workflow::snapshot_integrity::SnapshotIntegrityV1::Absent => Ok(None),
+        workflow::snapshot_integrity::SnapshotIntegrityV1::Verified(pair) => {
+            Ok(Some((pair.workflow_json, pair.catalog_json)))
+        }
+        workflow::snapshot_integrity::SnapshotIntegrityV1::Invalid(reason) => match reason {
+            workflow::snapshot_integrity::SnapshotIntegrityInvalidReasonV1::IncompleteQuartet => {
+                anyhow::bail!(
+                    "frozen_snapshot_contract_incompatible: Run must store neither snapshot field nor the complete JSON/hash quartet"
+                )
+            }
+            workflow::snapshot_integrity::SnapshotIntegrityInvalidReasonV1::MalformedHash => {
+                anyhow::bail!(
+                    "frozen_snapshot_contract_incompatible: stored snapshot hash is not canonical lowercase SHA-256"
+                )
+            }
+            workflow::snapshot_integrity::SnapshotIntegrityInvalidReasonV1::DigestMismatch => {
                 anyhow::bail!(
                     "frozen_snapshot_contract_incompatible: stored snapshot digest mismatch"
-                );
+                )
             }
-            Ok(Some((workflow_json, catalog_json)))
-        }
-        _ => anyhow::bail!(
-            "frozen_snapshot_contract_incompatible: Run must store neither snapshot field nor the complete JSON/hash quartet"
-        ),
+        },
     }
 }
 
@@ -2993,11 +2995,11 @@ impl CommandHandler {
                 let run_id = RunId::new();
                 // Compile the plan early to fail fast on invalid YAML before
                 // persisting anything.
-                let plan = match workflow::compiler::compile(
+                let admission = match workflow::compiler::compile_for_new_run_v1(
                     &c.workflow_yaml_path,
                     &c.agent_catalog_yaml_path,
                 ) {
-                    Ok(plan) => plan,
+                    Ok(admission) => admission,
                     Err(error) => {
                         let message = error.to_string();
                         // OPS-002 (P017 R4): emit phase_c_validation_outcome_total
@@ -3021,6 +3023,7 @@ impl CommandHandler {
                         return Err(error);
                     }
                 };
+                let plan = admission.into_plan();
 
                 let mission_idea = match ideas::find_by_id(&self.pool, c.idea_id).await {
                     Ok(Some(idea)) => idea,

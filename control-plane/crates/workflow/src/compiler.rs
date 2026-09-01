@@ -9,8 +9,15 @@
 //! 5. Return a `RunPlan`
 
 use anyhow::{Context, Result};
+use domain::codex_model_variant_policy::{
+    load_pinned_policy_v1, CodexModelVariantPolicyV1, AUTHORED_CODEX_PROVIDER,
+    CANONICAL_CODEX_PROVIDER, CODEX_MODEL_VARIANT_POLICY_FILE_V1,
+};
 use domain::provider::ProviderFamily;
+use serde::de::{self, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor};
+use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::path::Path;
 use std::thread;
 use tracing::{info, warn};
@@ -31,6 +38,88 @@ pub fn compile(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
     let workflow_path = workflow_path.to_string();
     let catalog_path = catalog_path.to_string();
     compile_on_dedicated_stack(move || compile_on_current_thread(&workflow_path, &catalog_path))
+}
+
+#[derive(Debug)]
+pub struct NewRunAdmissionV1 {
+    plan: RunPlan,
+}
+
+impl NewRunAdmissionV1 {
+    pub fn plan(&self) -> &RunPlan {
+        &self.plan
+    }
+
+    pub fn into_plan(self) -> RunPlan {
+        self.plan
+    }
+}
+
+/// Compile the only plan shape admitted for a newly created production Run.
+/// Workflow and catalog sources are each read once, duplicate-checked, and
+/// typed-decoded from the same owned YAML value before compilation.
+pub fn compile_for_new_run_v1(
+    workflow_path: &str,
+    catalog_path: &str,
+) -> Result<NewRunAdmissionV1> {
+    let workflow_path = workflow_path.to_string();
+    let catalog_path = catalog_path.to_string();
+    let plan = compile_on_dedicated_stack(move || {
+        compile_for_new_run_v1_on_current_thread(&workflow_path, &catalog_path)
+    })?;
+    Ok(NewRunAdmissionV1 { plan })
+}
+
+fn compile_for_new_run_v1_on_current_thread(
+    workflow_path: &str,
+    catalog_path: &str,
+) -> Result<RunPlan> {
+    let workflow_bytes = std::fs::read(workflow_path)
+        .with_context(|| format!("reading workflow YAML at '{workflow_path}'"))?;
+    let catalog_bytes = std::fs::read(catalog_path)
+        .with_context(|| format!("reading agent catalog YAML at '{catalog_path}'"))?;
+
+    let workflow_raw = parse_duplicate_aware_yaml(&workflow_bytes).map_err(|error| {
+        anyhow::anyhow!("parsing workflow YAML at '{workflow_path}': {error:#}")
+    })?;
+    let catalog_raw = parse_duplicate_aware_yaml(&catalog_bytes).map_err(|error| {
+        anyhow::anyhow!("parsing agent catalog YAML at '{catalog_path}': {error:#}")
+    })?;
+    let wf: definition::WorkflowFile = serde_yaml::from_value(workflow_raw.clone())
+        .with_context(|| format!("decoding workflow YAML at '{workflow_path}'"))?;
+    let cat: catalog::AgentCatalogFile = serde_yaml::from_value(catalog_raw.clone())
+        .with_context(|| format!("decoding agent catalog YAML at '{catalog_path}'"))?;
+
+    let catalog_base = Path::new(catalog_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let policy_path = catalog_base.join(CODEX_MODEL_VARIANT_POLICY_FILE_V1);
+    let policy_bytes = std::fs::read(&policy_path).with_context(|| {
+        format!(
+            "reading codex model variant policy at '{}'",
+            policy_path.display()
+        )
+    })?;
+    let policy = load_pinned_policy_v1(&policy_bytes)
+        .map_err(|error| anyhow::anyhow!("loading codex model variant policy: {error}"))?;
+    validate_authored_codex_matrix(&cat, &policy)?;
+
+    let (catalog_snapshot_json, embedded_skill_bundles) =
+        prepare_initial_catalog_snapshot(&cat, &catalog_raw, &catalog_base)?;
+    let plan = compile_loaded(
+        wf,
+        cat,
+        workflow_raw,
+        catalog_raw,
+        &catalog_base,
+        None,
+        Some(catalog_snapshot_json),
+        Some(embedded_skill_bundles),
+        Some("agent_mission_context_v1".to_string()),
+    )?;
+    validate_resolved_codex_matrix(&plan, &policy)?;
+    Ok(plan)
 }
 
 fn compile_on_current_thread(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
@@ -683,6 +772,227 @@ fn load_raw_yaml_value(path: &str) -> Result<serde_yaml::Value> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("reading YAML at '{path}'"))?;
     serde_yaml::from_str(&content).with_context(|| format!("parsing YAML at '{path}'"))
+}
+
+struct DuplicateAwareYamlValue(serde_yaml::Value);
+
+impl<'de> Deserialize<'de> for DuplicateAwareYamlValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct DuplicateAwareVisitor;
+
+        impl<'de> Visitor<'de> for DuplicateAwareVisitor {
+            type Value = DuplicateAwareYamlValue;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a YAML value without duplicate mapping keys")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(DuplicateAwareYamlValue(serde_yaml::Value::Bool(value)))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(DuplicateAwareYamlValue(serde_yaml::Value::Number(
+                    value.into(),
+                )))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(DuplicateAwareYamlValue(serde_yaml::Value::Number(
+                    value.into(),
+                )))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(DuplicateAwareYamlValue(serde_yaml::Value::Number(
+                    value.into(),
+                )))
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(DuplicateAwareYamlValue(serde_yaml::Value::String(
+                    value.to_string(),
+                )))
+            }
+
+            fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(DuplicateAwareYamlValue(serde_yaml::Value::String(value)))
+            }
+
+            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(DuplicateAwareYamlValue(serde_yaml::Value::Null))
+            }
+
+            fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_unit()
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                DuplicateAwareYamlValue::deserialize(deserializer)
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                while let Some(value) = sequence.next_element::<DuplicateAwareYamlValue>()? {
+                    values.push(value.0);
+                }
+                Ok(DuplicateAwareYamlValue(serde_yaml::Value::Sequence(values)))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut values = serde_yaml::Mapping::new();
+                while let Some(key) = map.next_key::<DuplicateAwareYamlValue>()? {
+                    let value = map.next_value::<DuplicateAwareYamlValue>()?;
+                    if values.contains_key(&key.0) {
+                        return Err(de::Error::custom("duplicate YAML mapping key"));
+                    }
+                    values.insert(key.0, value.0);
+                }
+                Ok(DuplicateAwareYamlValue(serde_yaml::Value::Mapping(values)))
+            }
+
+            fn visit_enum<A>(self, data: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: EnumAccess<'de>,
+            {
+                let (tag, value) = data.variant::<String>()?;
+                let value = value.newtype_variant::<DuplicateAwareYamlValue>()?;
+                Ok(DuplicateAwareYamlValue(serde_yaml::Value::Tagged(
+                    Box::new(serde_yaml::value::TaggedValue {
+                        tag: serde_yaml::value::Tag::new(tag),
+                        value: value.0,
+                    }),
+                )))
+            }
+        }
+
+        deserializer.deserialize_any(DuplicateAwareVisitor)
+    }
+}
+
+fn parse_duplicate_aware_yaml(bytes: &[u8]) -> Result<serde_yaml::Value> {
+    let mut documents = serde_yaml::Deserializer::from_slice(bytes);
+    let Some(document) = documents.next() else {
+        anyhow::bail!("YAML document is empty");
+    };
+    let value =
+        DuplicateAwareYamlValue::deserialize(document).context("duplicate-aware YAML decoding")?;
+    if documents.next().is_some() {
+        anyhow::bail!("multiple YAML documents are not supported");
+    }
+    Ok(value.0)
+}
+
+fn validate_authored_codex_matrix(
+    catalog: &catalog::AgentCatalogFile,
+    policy: &CodexModelVariantPolicyV1,
+) -> Result<()> {
+    let profiles = catalog.backend_profiles.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("codex_model_variant_matrix_v1: backend_profiles missing")
+    })?;
+    let expected_ids: HashSet<&str> = policy
+        .production_profiles
+        .iter()
+        .map(|profile| profile.backend_profile_id.as_str())
+        .collect();
+    let actual_codex_ids: HashSet<&str> = profiles
+        .iter()
+        .filter_map(|(profile_id, profile)| {
+            (ProviderFamily::resolve(&profile.provider).ok() == Some(ProviderFamily::Codex))
+                .then_some(profile_id.as_str())
+        })
+        .collect();
+    if actual_codex_ids != expected_ids {
+        anyhow::bail!(
+            "codex_model_variant_matrix_v1: production catalog must contain exactly the seven reserved Codex profiles"
+        );
+    }
+
+    for expected in &policy.production_profiles {
+        let profile = profiles.get(&expected.backend_profile_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "codex_model_variant_matrix_v1: missing reserved profile '{}'",
+                expected.backend_profile_id
+            )
+        })?;
+        if profile.provider != AUTHORED_CODEX_PROVIDER
+            || profile.model.as_deref() != Some(expected.model_id.as_str())
+            || profile.effort.as_deref() != Some(expected.effort.as_str())
+        {
+            anyhow::bail!(
+                "codex_model_variant_matrix_v1: profile '{}' must use authored provider '{}', model '{}', effort '{}'",
+                expected.backend_profile_id,
+                AUTHORED_CODEX_PROVIDER,
+                expected.model_id,
+                expected.effort
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_resolved_codex_matrix(
+    plan: &RunPlan,
+    policy: &CodexModelVariantPolicyV1,
+) -> Result<()> {
+    for state in plan.states.values() {
+        for agent in std::iter::once(&state.owner)
+            .chain(state.tasks.iter().map(|task| &task.agent))
+            .chain(state.post_approval_tasks.iter().map(|task| &task.agent))
+        {
+            let Some(profile_id) = agent.backend_profile_id.as_deref() else {
+                continue;
+            };
+            let Some(expected) = policy.production_profile(profile_id) else {
+                continue;
+            };
+            if agent.provider != CANONICAL_CODEX_PROVIDER
+                || agent.model.as_deref() != Some(expected.model_id.as_str())
+                || agent.effort.as_deref() != Some(expected.effort.as_str())
+            {
+                anyhow::bail!(
+                    "codex_model_variant_matrix_v1: resolved profile '{profile_id}' does not preserve canonical provider/model/effort"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn sort_json_value(value: serde_json::Value) -> serde_json::Value {

@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "policy_id": "codex_model_variant_matrix_v1",
+  "provider": "codex_acp",
+  "canonical_provider": "codex",
+  "variants": [
+    {
+      "model_id": "gpt-5.6-sol",
+      "display_name": "Sol",
+      "allowed_efforts": ["low", "medium", "high", "xhigh", "max", "ultra"]
+    },
+    {
+      "model_id": "gpt-5.6-terra",
+      "display_name": "Terra",
+      "allowed_efforts": ["low", "medium", "high", "xhigh", "max", "ultra"]
+    },
+    {
+      "model_id": "gpt-5.6-luna",
+      "display_name": "Luna",
+      "allowed_efforts": ["low", "medium", "high", "xhigh", "max"]
+    }
+  ],
+  "production_profiles": [
+    {
+      "backend_profile_id": "codex_orchestrator_high",
+      "model_id": "gpt-5.6-sol",
+      "effort": "max"
+    },
+    {
+      "backend_profile_id": "codex_architect_high",
+      "model_id": "gpt-5.6-sol",
+      "effort": "xhigh"
+    },
+    {
+      "backend_profile_id": "codex_audit_high",
+      "model_id": "gpt-5.6-sol",
+      "effort": "ultra"
+    },
+    {
+      "backend_profile_id": "codex_writer_high",
+      "model_id": "gpt-5.6-terra",
+      "effort": "high"
+    },
+    {
+      "backend_profile_id": "codex_builder_high",
+      "model_id": "gpt-5.6-terra",
+      "effort": "high"
+    },
+    {
+      "backend_profile_id": "codex_orchestrator_acp",
+      "model_id": "gpt-5.6-terra",
+      "effort": "high"
+    },
+    {
+      "backend_profile_id": "codex_ops_low",
+      "model_id": "gpt-5.6-luna",
+      "effort": "high"
+    }
+  ]
+}
