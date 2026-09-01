@@ -1568,7 +1568,6 @@ async fn stage_from_projection_or_canonical(
 fn p036_stage_topology_order(plan: &workflow::plan::RunPlan) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut ordered = Vec::new();
-    let mut terminal = Vec::new();
     let mut queue = VecDeque::from([plan.initial_state.clone()]);
 
     while let Some(stage_id) = queue.pop_front() {
@@ -1578,11 +1577,7 @@ fn p036_stage_topology_order(plan: &workflow::plan::RunPlan) -> Vec<String> {
         let Some(state) = plan.states.get(&stage_id) else {
             continue;
         };
-        if state.is_end {
-            terminal.push(stage_id.clone());
-        } else {
-            ordered.push(stage_id.clone());
-        }
+        ordered.push(stage_id.clone());
         for transition in &state.transitions {
             if !seen.contains(&transition.to) {
                 queue.push_back(transition.to.clone());
@@ -1597,14 +1592,7 @@ fn p036_stage_topology_order(plan: &workflow::plan::RunPlan) -> Vec<String> {
         .cloned()
         .collect();
     remaining.sort();
-    for stage_id in remaining {
-        if plan.states.get(&stage_id).is_some_and(|state| state.is_end) {
-            terminal.push(stage_id);
-        } else {
-            ordered.push(stage_id);
-        }
-    }
-    ordered.extend(terminal);
+    ordered.extend(remaining);
     ordered
 }
 
@@ -11012,8 +11000,8 @@ mod tests {
             .position(|stage| stage["stageId"] == serde_json::json!("state_12_workflow_complete"))
             .expect("workflow complete stage should be present");
         assert!(
-            refined_index < complete_index,
-            "topology order should not place Workflow complete before the refinement branch"
+            complete_index < refined_index,
+            "topology order must preserve the pre-slice breadth-first traversal"
         );
     }
 
@@ -11023,7 +11011,22 @@ mod tests {
         let idea_id = IdeaId::new();
         let run_id = RunId::new();
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-        runs::insert(&pool, &make_run(run_id, idea_id))
+        let mut run = make_run(run_id, idea_id);
+        run.workflow_yaml_path = Some("../../../examples/workflows/full-mvp-live.yaml".into());
+        run.agent_catalog_yaml_path = Some("../../../examples/agents/agents.yaml".into());
+        runs::insert(&pool, &run).await.unwrap();
+        let stage = make_stage_execution(
+            run_id,
+            "state_2_proposal_drafted",
+            "Proposal drafted",
+            Utc::now(),
+        );
+        let execution = make_agent_execution(stage.id, "proposal_writer", "codex_acp", Utc::now());
+        stages::insert(&pool, &stage).await.unwrap();
+        db::repos::agent_executions::insert(&pool, &execution)
+            .await
+            .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
             .await
             .unwrap();
 
@@ -11037,7 +11040,14 @@ mod tests {
         let response = schema
             .execute(
                 Request::new(format!(
-                    r#"query {{ runStageTopology(runId: "{run_id}") {{ stageId label }} }}"#
+                    r#"
+                    query {{
+                      runStageTopology(runId: "{run_id}") {{ stageId label }}
+                      activeAgentExecutions(runId: "{run_id}") {{
+                        provider taskLabel selectionOrder selectionUnavailableReason
+                      }}
+                    }}
+                "#
                 ))
                 .data(test_principal()),
             )
@@ -11047,9 +11057,84 @@ mod tests {
             response.errors.is_empty(),
             "missing snapshots should fail closed as empty readback, not an API error: {response:?}"
         );
+        let json = response.data.into_json().unwrap();
+        assert_eq!(json["runStageTopology"], serde_json::json!([]));
+        assert_eq!(json["activeAgentExecutions"].as_array().unwrap().len(), 1);
+        assert_eq!(json["activeAgentExecutions"][0]["provider"], "codex");
+        assert!(json["activeAgentExecutions"][0]["taskLabel"].is_null());
+        assert!(json["activeAgentExecutions"][0]["selectionOrder"].is_null());
         assert_eq!(
-            response.data.into_json().unwrap()["runStageTopology"],
-            serde_json::json!([])
+            json["activeAgentExecutions"][0]["selectionUnavailableReason"],
+            "snapshot_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn hash_valid_uncompileable_snapshot_fails_closed_in_both_public_plan_resolvers() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let workflow_path = "../../../examples/workflows/full-mvp-live.yaml";
+        let catalog_path = "../../../examples/agents/agents.yaml";
+        let mut run = make_run(run_id, idea_id);
+        run.status = domain::run::RunStatus::Running;
+        run.workflow_yaml_path = Some(workflow_path.into());
+        run.agent_catalog_yaml_path = Some(catalog_path.into());
+        set_verified_snapshots(&mut run, workflow_path, catalog_path);
+        let malformed = r#"{"workflow":{"id":"hash-valid-but-uncompileable"}}"#;
+        run.workflow_snapshot_json = Some(malformed.into());
+        run.workflow_snapshot_hash = Some(sha256_digest(malformed));
+        runs::insert(&pool, &run).await.unwrap();
+
+        let stage = make_stage_execution(
+            run_id,
+            "state_2_proposal_drafted",
+            "Proposal drafted",
+            Utc::now(),
+        );
+        let execution = make_agent_execution(stage.id, "proposal_writer", "codex_acp", Utc::now());
+        stages::insert(&pool, &stage).await.unwrap();
+        db::repos::agent_executions::insert(&pool, &execution)
+            .await
+            .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query {{
+                      runStageTopology(runId: "{run_id}") {{ stageId }}
+                      activeAgentExecutions(runId: "{run_id}") {{
+                        provider taskLabel selectionOrder selectionUnavailableReason
+                      }}
+                    }}
+                "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(response.errors.is_empty(), "{response:?}");
+        let json = response.data.into_json().unwrap();
+        assert_eq!(json["runStageTopology"], serde_json::json!([]));
+        assert_eq!(json["activeAgentExecutions"].as_array().unwrap().len(), 1);
+        assert_eq!(json["activeAgentExecutions"][0]["provider"], "codex");
+        assert!(json["activeAgentExecutions"][0]["taskLabel"].is_null());
+        assert!(json["activeAgentExecutions"][0]["selectionOrder"].is_null());
+        assert_eq!(
+            json["activeAgentExecutions"][0]["selectionUnavailableReason"],
+            "snapshot_unavailable"
         );
     }
 
@@ -11231,9 +11316,69 @@ mod tests {
             };
             assert_eq!(row.provider, expected);
         }
-        for execution in stored {
+        for execution in &stored {
             let stage_scoped = GqlAgentExecution::from(execution.clone());
             assert_eq!(stage_scoped.provider, execution.provider);
+        }
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query {{
+                      activeAgentExecutions(runId: "{run_id}") {{ id provider }}
+                      agentExecutions(stageExecutionId: "{}") {{ id provider }}
+                    }}
+                "#,
+                    stage.id
+                ))
+                .data(test_principal()),
+            )
+            .await;
+        assert!(response.errors.is_empty(), "{response:?}");
+        let json = response.data.into_json().unwrap();
+        let active_by_id = json["activeAgentExecutions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["id"].as_str().unwrap().to_string(),
+                    row["provider"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let stage_scoped_by_id = json["agentExecutions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["id"].as_str().unwrap().to_string(),
+                    row["provider"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(active_by_id.len(), stored_by_id.len());
+        assert_eq!(stage_scoped_by_id.len(), stored_by_id.len());
+        for (id, stored_provider) in &stored_by_id {
+            let active_expected = if matches!(
+                stored_provider.as_str(),
+                "codex" | "codex_acp" | "codex_cli" | "codex_cli_acp" | "openai_codex"
+            ) {
+                "codex"
+            } else {
+                stored_provider.as_str()
+            };
+            assert_eq!(active_by_id[id].as_str(), active_expected);
+            assert_eq!(stage_scoped_by_id[id].as_str(), stored_provider.as_str());
         }
 
         let persisted = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();

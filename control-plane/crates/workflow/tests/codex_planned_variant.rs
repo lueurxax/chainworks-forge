@@ -233,3 +233,49 @@ fn new_run_admission_rejects_missing_or_mutated_policy_bytes() {
         .to_string();
     assert!(error.contains("policy_bytes_mismatch"), "{error}");
 }
+
+#[test]
+fn verified_generic_and_custom_historical_replay_is_byte_identical() {
+    let historical_catalog = CATALOG
+        .replacen("model: gpt-5.6-sol", "model: gpt-5.6", 1)
+        .replacen("model: gpt-5.6-sol", "model: custom-model", 1)
+        .replacen("effort: xhigh", "effort: custom-effort", 1);
+    let (_root, workflow_path, catalog_path) = write_sources(&historical_catalog);
+    let original = workflow::compiler::compile(path(&workflow_path), path(&catalog_path))
+        .expect("the compatibility compiler must retain historical generic/custom tuples");
+
+    fs::write(&workflow_path, "not: valid: yaml").unwrap();
+    fs::write(&catalog_path, "not: valid: yaml").unwrap();
+    let replayed = workflow::compiler::compile_from_snapshot_json(
+        &original.workflow_snapshot_json,
+        &original.catalog_snapshot_json,
+        path(&catalog_path),
+    )
+    .expect("verified replay must not re-admit frozen tuples against the current matrix");
+
+    assert_eq!(
+        replayed.workflow_snapshot_json,
+        original.workflow_snapshot_json
+    );
+    assert_eq!(
+        replayed.catalog_snapshot_json,
+        original.catalog_snapshot_json
+    );
+    assert_eq!(
+        replayed.workflow_snapshot_hash,
+        original.workflow_snapshot_hash
+    );
+    assert_eq!(
+        replayed.catalog_snapshot_hash,
+        original.catalog_snapshot_hash
+    );
+    assert_eq!(
+        replayed.states["work"].owner.model.as_deref(),
+        Some("gpt-5.6")
+    );
+    assert!(replayed.states["work"]
+        .tasks
+        .iter()
+        .any(|task| task.agent.model.as_deref() == Some("custom-model")
+            && task.agent.effort.as_deref() == Some("custom-effort")));
+}

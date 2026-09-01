@@ -319,13 +319,23 @@ nonisolated enum P036PlannedAssignmentAccessibility {
         presentation: CodexPlannedAssignmentPresentation,
         executionCount: String?
     ) -> String {
-        joinedNonempty([
+        let detailComponents: [String?]
+        if presentation.isCodexPlannedLine {
+            detailComponents = [
+                presentation.fullAccessibilityValue,
+                executionCount,
+            ]
+        } else {
+            detailComponents = [
+                executionCount,
+                presentation.fullAccessibilityValue,
+            ]
+        }
+        return joinedNonempty([
             agentTitle,
             task,
             status,
-            presentation.fullAccessibilityValue,
-            executionCount,
-        ])
+        ] + detailComponents)
     }
 
     private static func joinedNonempty(_ values: [String?]) -> String {

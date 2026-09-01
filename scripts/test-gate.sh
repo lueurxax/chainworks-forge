@@ -12648,6 +12648,7 @@ PY
       }
 
       run_codex_variant_cargo_test -p domain --test codex_model_variant_policy -- --nocapture
+      run_codex_variant_cargo_test -p workflow --lib new_run_source_reader_ -- --nocapture
       run_codex_variant_cargo_test -p workflow --test codex_planned_variant -- --nocapture
       run_codex_variant_cargo_test -p workflow --test snapshot_integrity -- --nocapture
       run_codex_variant_cargo_test -p engine --test agent_context_skills production_start_run_ -- --nocapture
@@ -12655,7 +12656,9 @@ PY
       run_codex_variant_cargo_test -p engine --test agent_context_skills persisted_snapshot_quartet_ -- --nocapture
       run_codex_variant_cargo_test -p acp --lib codex_effort_inputs_enter_exactly_one_lane -- --nocapture
       run_codex_variant_cargo_test -p acp --test integration codex_policy_effort_ -- --nocapture
+      run_codex_variant_cargo_test -p acp --test integration codex_closed_effort_table_serializes_exactly_one_wire_lane -- --nocapture
       run_codex_variant_cargo_test -p graphql-server --lib tampered_snapshot_quartet -- --nocapture
+      run_codex_variant_cargo_test -p graphql-server --lib hash_valid_uncompileable_snapshot_fails_closed_in_both_public_plan_resolvers -- --nocapture
       run_codex_variant_cargo_test -p graphql-server --lib active_agent_provider_normalization_ -- --nocapture
       run_codex_variant_cargo_test -p graphql-server --lib p036_run_stage_topology_ -- --nocapture
     )
