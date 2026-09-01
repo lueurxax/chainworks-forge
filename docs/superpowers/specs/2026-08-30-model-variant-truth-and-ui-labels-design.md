@@ -292,8 +292,9 @@ handling. It must not add a second query or broaden data access.
 
 ### 5. Shared presentation
 
-One pure Swift formatter receives provider, frozen model, and frozen effort.
-For known Codex IDs it emits:
+One pure Swift formatter receives provider, frozen model, and frozen effort and
+returns `compact` visible copy plus `full` help/accessibility copy. For known
+Codex IDs both are identical:
 
 ```text
 Codex · Sol · gpt-5.6-sol · max · planned
@@ -309,10 +310,11 @@ Codex · Sol · gpt-5.6-sol · Planned effort not recorded
 Planned assignment unavailable
 ```
 
-| State | Planned line | Accessibility value |
+| State | Compact planned line | Full help/accessibility value |
 |---|---|---|
 | unique known tuple | friendly name, full ID, effort, `planned` | identical complete line |
-| unique generic/unknown tuple | bounded raw model, effort, `planned` | identical complete line |
+| unique generic tuple | raw model, effort, `planned` | identical complete line |
+| unique unknown tuple | bounded compact raw model, effort, `planned` | bounded full raw model, effort, `planned` |
 | unique tuple, effort absent | model plus `Planned effort not recorded` | identical complete line |
 | no/ambiguous/stale/mismatched tuple | `Planned assignment unavailable` | same phrase; no inferred pair |
 | non-Codex | existing provider copy | unchanged |
@@ -324,24 +326,29 @@ Rules:
   Overview and Stages;
 - the compact row may wrap but must not overlap, hide the variant, or change
   card dimensions while status updates;
-- existing help/accessibility text uses the same complete formatter output;
+- existing help/accessibility text uses the formatter's full output;
 - no new button, menu, shortcut, selection behavior, or topology ownership is
   introduced;
 - missing effort and missing assignment use the two distinct normative phrases
   in the table;
-- unknown nonempty values trim ASCII edge whitespace, escape C0/C1/DEL and line
-  breaks as uppercase `\u{HEX}`, then cap output at 96 UTF-8 bytes including
-  the ASCII suffix `...[truncated]`; the cut ends on an extended grapheme-cluster
-  or complete escape boundary; and
+- unknown nonempty values trim ASCII edge whitespace and escape C0/C1/DEL and
+  line breaks as uppercase `\u{HEX}`. The complete compact line is capped at
+  64 UTF-8 bytes and the full line at 96, both including ASCII suffix
+  `...[truncated]`; each cut ends on an extended grapheme-cluster or complete
+  escape boundary; and
 - non-Codex providers retain current copy.
 
 Overview and Stages must call the same formatter. Source scans reject local
 Sol/Terra/Luna switch statements elsewhere in the app.
 
-At the existing 292-point card width, the metadata region reserves two wrapped
-lines and stable height. The longest known/unknown value, accessibility text
-size, and status refresh may not clip, overlap, resize the card, reorder the
-agent/status/planned accessibility value, or change row identity/focus.
+At the existing 292-point card width, the regular metadata region reserves two
+wrapped compact lines; accessibility text categories use a deterministic
+four-line region. Height stays stable within a category. The 64-byte compact
+boundary, longest known value, and status refresh may not clip, overlap,
+resize within that category, reorder the agent/status/planned accessibility
+value, or change row identity/focus. Full copy remains available through
+existing help and accessibility without forcing the visible row to render 96
+bytes.
 
 ## Failure behavior
 
@@ -383,8 +390,9 @@ only the following:
    stage mapping, and provider/model mismatch. No new root, field, document, or
    schema snapshot is added.
 6. Swift unit tests prove every visual/AX table row, Sol/Terra/Luna, generic,
-   unknown, every control class, exact 96-byte boundary, plus-one truncation,
-   combining grapheme, and complete escape handling in Overview and Stages.
+   unknown, every control class, exact 64/96-byte boundaries, plus-one
+   truncation, combining grapheme, and complete escape handling in Overview
+   and Stages.
 7. Swift presentation tests cover 292 points, the longest value,
    accessibility size/order, and status refresh without clipping, height/focus/
    identity loss; existing Overview stacks, selection, and filtering remain.
