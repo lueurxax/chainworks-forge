@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import CryptoKit
 import Foundation
 import SwiftUI
@@ -367,22 +368,69 @@ struct CodexModelVariantTruthTests {
             )
                 == "Proposal Writer, Draft proposal, Running, Codex · Terra · gpt-5.6-terra · high · planned, 1 attempt"
         )
+
+        for provider in ["claude_acp", "gemini_acp", "auggie_acp", "junie_acp", "unknown_provider"] {
+            let existingValue = "\(provider) · existing-model · high"
+            #expect(
+                P036PlannedAssignmentAccessibility.stageOccurrenceLabel(
+                    agentTitle: "Agent",
+                    task: "Task",
+                    status: "Running",
+                    presentation: .nonCodex(existingValue: existingValue),
+                    executionCount: "1 attempt"
+                ) == "Agent, Task, Running, 1 attempt, \(existingValue)"
+            )
+        }
+    }
+
+    @Test("Non-Codex Stage visual metadata preserves the legacy component order")
+    func nonCodexStageVisualOrderIsUnchanged() throws {
+        for provider in ["claude_acp", "gemini_acp", "auggie_acp", "junie_acp", "unknown_provider"] {
+            let existingValue = "\(provider) · existing-model · high"
+            let occurrence = RunsWorkbenchPresentationModel.StageOccurrence(
+                id: "\(provider)-occurrence",
+                agentTitle: "Agent",
+                taskName: "Task",
+                statusText: "Running",
+                providerLabel: existingValue,
+                plannedAssignment: .nonCodex(existingValue: existingValue),
+                executionCountLabel: "1 attempt"
+            )
+            let elements = hostedAccessibilityElements(
+                P036StageOccurrenceDetailLine(occurrence: occurrence),
+                width: 292
+            )
+            let detail = try #require(
+                elements.first { $0.identifier == "p036-stage-legacy-detail" }
+            )
+            #expect(detail.text == "Task · Running · 1 attempt · \(existingValue)")
+        }
     }
 
     @Test("Planned variant survives every supported Dynamic Type size")
-    func plannedVariantSurvivesDynamicTypeRange() {
+    func plannedVariantSurvivesDynamicTypeRange() throws {
         let regularSizes: [DynamicTypeSize] = [.xSmall, .small, .medium, .large]
         for size in regularSizes {
-            let strings = hostedAccessibilityStrings(
-                P036PlannedAssignmentLine(
-                    presentation: plannedTerra,
-                    trailingComponents: ["Draft proposal"]
-                )
-                .environment(\.dynamicTypeSize, size),
-                width: 520
+            let line = P036PlannedAssignmentLine(
+                presentation: plannedTerra,
+                trailingComponents: []
             )
-            #expect(strings.contains("Terra"))
-            #expect(strings.contains("gpt-5.6-terra · high · planned · Draft proposal"))
+            .environment(\.dynamicTypeSize, size)
+            let naturalSize = hostedSize(line)
+            for width: CGFloat in [292, 520] {
+                let elements = hostedAccessibilityElements(line, width: width)
+                let token = try #require(
+                    elements.first { $0.text == "Terra" }
+                )
+                let suffix = try #require(
+                    elements.first { $0.text == "gpt-5.6-terra · high · planned" }
+                )
+                #expect(token.text == "Terra")
+                #expect(suffix.text == "gpt-5.6-terra · high · planned")
+                #expect(naturalSize.width <= width)
+                #expect(token.frame?.width ?? 0 > 0)
+                #expect(suffix.frame?.width ?? 0 > 0)
+            }
         }
 
         let accessibilitySizes: [DynamicTypeSize] = [
@@ -396,15 +444,38 @@ struct CodexModelVariantTruthTests {
             .accessibility5,
         ]
         for size in accessibilitySizes {
-            let lineStrings = hostedAccessibilityStrings(
-                P036PlannedAssignmentLine(
-                    presentation: plannedTerra,
-                    trailingComponents: ["Draft proposal"]
-                )
-                .environment(\.dynamicTypeSize, size),
-                width: 180
+            let line = P036PlannedAssignmentLine(
+                presentation: plannedTerra,
+                trailingComponents: ["Draft a deliberately long proposal metadata suffix"]
             )
-            #expect(lineStrings.contains("Terra"))
+            .environment(\.dynamicTypeSize, size)
+            let natural = hostedAccessibilityElements(line, width: 1_000)
+            let constrained = hostedAccessibilityElements(line, width: 292)
+            let naturalToken = try #require(
+                natural.first { $0.text == "Terra" }
+            )
+            let naturalSuffix = try #require(
+                natural.first {
+                    $0.text?.hasPrefix("gpt-5.6-terra · high · planned") == true
+                }
+            )
+            let token = try #require(
+                constrained.first { $0.text == "Terra" }
+            )
+            let suffix = try #require(
+                constrained.first {
+                    $0.text?.hasPrefix("gpt-5.6-terra · high · planned") == true
+                }
+            )
+            #expect(token.text == "Terra")
+            #expect(suffix.text?.hasPrefix("gpt-5.6-terra · high · planned") == true)
+            #expect(abs((token.frame?.width ?? 0) - (naturalToken.frame?.width ?? 0)) < 0.5)
+            #expect((suffix.frame?.width ?? 0) <= (naturalSuffix.frame?.width ?? 0))
+            #expect((token.frame?.width ?? 0) > 0)
+            if let tokenFrame = token.frame, let suffixFrame = suffix.frame {
+                #expect(suffixFrame.maxX - tokenFrame.minX <= 292.5)
+                #expect(suffixFrame.minX >= tokenFrame.maxX)
+            }
 
             let rowStrings = hostedAccessibilityStrings(
                 P036StageOccurrenceRow(occurrence: stageOccurrence(status: "Running"))
@@ -413,6 +484,32 @@ struct CodexModelVariantTruthTests {
             )
             #expect(rowStrings.filter { $0.contains(plannedTerra.fullAccessibilityValue) }.count == 1)
         }
+    }
+
+    @Test("Hosted rows expose exact help and remain within planned bounds")
+    func hostedRowsExposeHelpAndBounds() throws {
+        let active = activeAgent(id: "proposal-writer", stageID: "stage-current", selectionOrder: 1)
+        let overviewElements = hostedAccessibilityElements(
+            P036ActiveAgentReadbackRow(agent: active),
+            width: 520
+        )
+        let overview = try #require(
+            overviewElements.first { $0.identifier == "p036-active-agent-proposal-writer" }
+        )
+        #expect(overview.help == plannedTerra.fullAccessibilityValue)
+
+        let stageElements = hostedAccessibilityElements(
+            P036StageOccurrenceRow(occurrence: stageOccurrence(status: "Running")),
+            width: 292,
+            height: 210
+        )
+        let stage = try #require(
+            stageElements.first { $0.identifier == "p036-stage-occurrence-occurrence-0" }
+        )
+        #expect(stage.help == plannedTerra.fullAccessibilityValue)
+        #expect((stage.frame?.width ?? 0) > 0)
+        #expect((stage.frame?.width ?? .infinity) <= 292)
+        #expect((stage.frame?.height ?? .infinity) <= 210)
     }
 
     @Test("Hosted Overview row exposes the combined planned label exactly once")
@@ -526,6 +623,41 @@ struct CodexModelVariantTruthTests {
         #expect(before.filter { $0.contains(plannedValue) }.count == 2)
         #expect(after.filter { $0.contains(plannedValue) }.count == 2)
         #expect(after.filter { $0.contains(", Paused, " + plannedValue + ",") }.count == 2)
+    }
+
+    @Test("Status refresh preserves keyboard focus text selection and row selection")
+    func statusRefreshPreservesHostedInteractionState() throws {
+        let model = P036StatusRefreshProbeModel()
+        let host = NSHostingView(rootView: P036StatusRefreshProbe(model: model))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 360),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        window.makeKeyAndOrderFront(nil)
+        defer {
+            window.orderOut(nil)
+            window.contentView = nil
+            window.close()
+        }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+
+        let field = try #require(firstDescendant(of: NSTextField.self, in: host))
+        field.selectText(nil)
+        let editor = try #require(field.currentEditor() as? NSTextView)
+        editor.selectedRange = NSRange(location: 2, length: 3)
+        #expect(window.firstResponder === editor)
+        #expect(model.selection == "stage-current")
+
+        model.status = "Paused"
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+
+        #expect(window.firstResponder === editor)
+        #expect(editor.selectedRange == NSRange(location: 2, length: 3))
+        #expect(model.selection == "stage-current")
     }
 
     private func pinnedPolicy() throws -> CodexModelVariantPolicyAvailability {
@@ -665,6 +797,35 @@ struct CodexModelVariantTruthTests {
         return accessibilityStrings(from: host)
     }
 
+    private func hostedAccessibilityElements<Content: View>(
+        _ content: Content,
+        width: CGFloat,
+        height: CGFloat = 234
+    ) -> [P036AccessibilityElementSnapshot] {
+        let frame = NSRect(x: 0, y: 0, width: width, height: height)
+        let host = NSHostingView(rootView: content)
+        let window = NSWindow(
+            contentRect: frame,
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Codex planned variant visual proof"
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        window.makeKeyAndOrderFront(nil)
+        defer {
+            window.orderOut(nil)
+            window.contentView = nil
+            window.close()
+        }
+
+        enableSwiftUIAccessibilityTree()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        window.displayIfNeeded()
+        return accessibilityElements(from: host)
+    }
+
     private func accessibilityStrings(from root: NSView) -> [String] {
         var result: [String] = []
         var visited = Set<ObjectIdentifier>()
@@ -689,6 +850,99 @@ struct CodexModelVariantTruthTests {
 
         visit(root)
         return result
+    }
+
+    private func accessibilityElements(from root: NSView) -> [P036AccessibilityElementSnapshot] {
+        var result: [P036AccessibilityElementSnapshot] = []
+        var visited = Set<ObjectIdentifier>()
+
+        func stringValue(_ object: NSObject, _ key: String) -> String? {
+            guard object.responds(to: NSSelectorFromString(key)) else { return nil }
+            return object.value(forKey: key) as? String
+        }
+
+        func visit(_ element: Any) {
+            guard let object = element as? NSObject else { return }
+            guard visited.insert(ObjectIdentifier(object)).inserted else { return }
+            let frame = object.responds(to: NSSelectorFromString("accessibilityFrame"))
+                ? (object.value(forKey: "accessibilityFrame") as? NSValue)?.rectValue
+                : nil
+            result.append(
+                P036AccessibilityElementSnapshot(
+                    identifier: stringValue(object, "accessibilityIdentifier"),
+                    label: stringValue(object, "accessibilityLabel"),
+                    value: stringValue(object, "accessibilityValue"),
+                    help: stringValue(object, "accessibilityHelp"),
+                    frame: frame
+                )
+            )
+            if object.responds(to: NSSelectorFromString("accessibilityChildren")),
+               let children = object.value(forKey: "accessibilityChildren") as? [Any] {
+                for child in children {
+                    visit(child)
+                }
+            }
+        }
+
+        visit(root)
+        return result
+    }
+
+    private func firstDescendant<T: NSView>(of type: T.Type, in root: NSView) -> T? {
+        if let match = root as? T { return match }
+        for child in root.subviews {
+            if let match = firstDescendant(of: type, in: child) {
+                return match
+            }
+        }
+        return nil
+    }
+}
+
+private struct P036AccessibilityElementSnapshot {
+    let identifier: String?
+    let label: String?
+    let value: String?
+    let help: String?
+    let frame: NSRect?
+
+    var text: String? { value ?? label }
+}
+
+@MainActor
+private final class P036StatusRefreshProbeModel: ObservableObject {
+    @Published var status = "Running"
+    @Published var selection: String? = "stage-current"
+    @Published var text = "abcdef"
+}
+
+private struct P036StatusRefreshProbe: View {
+    @ObservedObject var model: P036StatusRefreshProbeModel
+
+    var body: some View {
+        VStack {
+            TextField("Focus probe", text: $model.text)
+            List(selection: $model.selection) {
+                Text("Selected stage").tag("stage-current")
+            }
+            .frame(height: 80)
+            P036StageOccurrenceRow(
+                occurrence: RunsWorkbenchPresentationModel.StageOccurrence(
+                    id: "interaction-occurrence",
+                    agentTitle: "Proposal Writer",
+                    taskName: "Draft proposal",
+                    statusText: model.status,
+                    providerLabel: "gpt-5.6-terra · high · planned",
+                    plannedAssignment: .planned(
+                        variantToken: "Terra",
+                        visualSuffix: "gpt-5.6-terra · high · planned",
+                        fullAccessibilityValue: "Codex · Terra · gpt-5.6-terra · high · planned"
+                    ),
+                    executionCountLabel: "1 attempt"
+                )
+            )
+        }
+        .padding()
     }
 }
 

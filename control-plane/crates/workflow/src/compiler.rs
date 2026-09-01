@@ -18,6 +18,7 @@ use serde::de::{self, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::io::Read;
 use std::path::Path;
 use std::thread;
 use tracing::{info, warn};
@@ -28,6 +29,10 @@ use crate::direct_command::DirectCommandScan;
 use crate::plan::*;
 
 const WORKFLOW_COMPILE_STACK_BYTES: usize = 16 * 1024 * 1024;
+const MAX_NEW_RUN_WORKFLOW_YAML_BYTES_V1: usize = 4 * 1024 * 1024;
+const MAX_NEW_RUN_CATALOG_YAML_BYTES_V1: usize = 8 * 1024 * 1024;
+const MAX_NEW_RUN_YAML_DEPTH_V1: usize = 64;
+const MAX_NEW_RUN_YAML_NODES_V1: usize = 100_000;
 
 /// Compile a workflow YAML + agent catalog YAML into a `RunPlan`.
 ///
@@ -74,15 +79,38 @@ fn compile_for_new_run_v1_on_current_thread(
     workflow_path: &str,
     catalog_path: &str,
 ) -> Result<RunPlan> {
-    let workflow_bytes = std::fs::read(workflow_path)
-        .with_context(|| format!("reading workflow YAML at '{workflow_path}'"))?;
-    let catalog_bytes = std::fs::read(catalog_path)
-        .with_context(|| format!("reading agent catalog YAML at '{catalog_path}'"))?;
+    compile_for_new_run_v1_with_reader_on_current_thread(
+        workflow_path,
+        catalog_path,
+        |path, limit, source_name| read_bounded_new_run_yaml_v1(path, limit, source_name),
+    )
+}
 
-    let workflow_raw = parse_duplicate_aware_yaml(&workflow_bytes).map_err(|error| {
+fn compile_for_new_run_v1_with_reader_on_current_thread<F>(
+    workflow_path: &str,
+    catalog_path: &str,
+    mut read_source: F,
+) -> Result<RunPlan>
+where
+    F: FnMut(&Path, usize, &'static str) -> Result<Vec<u8>>,
+{
+    let workflow_bytes = read_source(
+        Path::new(workflow_path),
+        MAX_NEW_RUN_WORKFLOW_YAML_BYTES_V1,
+        "workflow",
+    )
+    .with_context(|| format!("reading workflow YAML at '{workflow_path}'"))?;
+    let catalog_bytes = read_source(
+        Path::new(catalog_path),
+        MAX_NEW_RUN_CATALOG_YAML_BYTES_V1,
+        "agent catalog",
+    )
+    .with_context(|| format!("reading agent catalog YAML at '{catalog_path}'"))?;
+
+    let workflow_raw = parse_bounded_admission_yaml_v1(&workflow_bytes).map_err(|error| {
         anyhow::anyhow!("parsing workflow YAML at '{workflow_path}': {error:#}")
     })?;
-    let catalog_raw = parse_duplicate_aware_yaml(&catalog_bytes).map_err(|error| {
+    let catalog_raw = parse_bounded_admission_yaml_v1(&catalog_bytes).map_err(|error| {
         anyhow::anyhow!("parsing agent catalog YAML at '{catalog_path}': {error:#}")
     })?;
     let wf: definition::WorkflowFile = serde_yaml::from_value(workflow_raw.clone())
@@ -120,6 +148,61 @@ fn compile_for_new_run_v1_on_current_thread(
     )?;
     validate_resolved_codex_matrix(&plan, &policy)?;
     Ok(plan)
+}
+
+fn read_bounded_new_run_yaml_v1(
+    path: &Path,
+    limit: usize,
+    source_name: &'static str,
+) -> Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        anyhow::bail!("new_run_yaml_size_exceeded: {source_name} YAML exceeds {limit} bytes");
+    }
+    Ok(bytes)
+}
+
+fn parse_bounded_admission_yaml_v1(bytes: &[u8]) -> Result<serde_yaml::Value> {
+    let value = parse_duplicate_aware_yaml(bytes)?;
+    validate_new_run_yaml_complexity_v1(&value)?;
+    Ok(value)
+}
+
+fn validate_new_run_yaml_complexity_v1(root: &serde_yaml::Value) -> Result<()> {
+    let mut stack = vec![(root, 1usize)];
+    let mut node_count = 0usize;
+
+    while let Some((value, depth)) = stack.pop() {
+        node_count += 1;
+        if depth > MAX_NEW_RUN_YAML_DEPTH_V1 || node_count > MAX_NEW_RUN_YAML_NODES_V1 {
+            anyhow::bail!(
+                "new_run_yaml_complexity_exceeded: YAML exceeds depth {} or {} nodes",
+                MAX_NEW_RUN_YAML_DEPTH_V1,
+                MAX_NEW_RUN_YAML_NODES_V1
+            );
+        }
+        match value {
+            serde_yaml::Value::Sequence(values) => {
+                stack.extend(values.iter().map(|child| (child, depth + 1)));
+            }
+            serde_yaml::Value::Mapping(values) => {
+                for (key, child) in values {
+                    stack.push((key, depth + 1));
+                    stack.push((child, depth + 1));
+                }
+            }
+            serde_yaml::Value::Tagged(tagged) => {
+                stack.push((&tagged.value, depth + 1));
+            }
+            serde_yaml::Value::Null
+            | serde_yaml::Value::Bool(_)
+            | serde_yaml::Value::Number(_)
+            | serde_yaml::Value::String(_) => {}
+        }
+    }
+    Ok(())
 }
 
 fn compile_on_current_thread(workflow_path: &str, catalog_path: &str) -> Result<RunPlan> {
@@ -2047,5 +2130,89 @@ fn yaml_to_json(v: &serde_yaml::Value) -> serde_json::Value {
             serde_json::Value::Object(obj)
         }
         serde_yaml::Value::Tagged(tagged) => yaml_to_json(&tagged.value),
+    }
+}
+
+#[cfg(test)]
+mod new_run_source_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn repository_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
+    }
+
+    #[test]
+    fn new_run_source_reader_reads_workflow_and_catalog_exactly_once() {
+        let root = repository_root();
+        let workflow = root.join("examples/workflows/full-mvp-live.yaml");
+        let catalog = root.join("examples/agents/agents.yaml");
+        let mut reads = HashMap::<PathBuf, usize>::new();
+
+        let plan = compile_for_new_run_v1_with_reader_on_current_thread(
+            workflow.to_str().unwrap(),
+            catalog.to_str().unwrap(),
+            |path, limit, source_name| {
+                let count = reads.entry(path.to_path_buf()).or_default();
+                *count += 1;
+                anyhow::ensure!(*count == 1, "source reopened: {}", path.display());
+                read_bounded_new_run_yaml_v1(path, limit, source_name)
+            },
+        )
+        .expect("canonical sources should compile through a one-shot reader");
+
+        assert_eq!(reads.get(&workflow), Some(&1));
+        assert_eq!(reads.get(&catalog), Some(&1));
+        assert_eq!(reads.len(), 2);
+        assert!(!plan.states.is_empty());
+    }
+
+    #[test]
+    fn new_run_source_reader_enforces_exact_byte_limits_before_parse() {
+        let root = tempfile::tempdir().unwrap();
+        for (name, limit) in [
+            ("workflow", MAX_NEW_RUN_WORKFLOW_YAML_BYTES_V1),
+            ("catalog", MAX_NEW_RUN_CATALOG_YAML_BYTES_V1),
+        ] {
+            let path = root.path().join(format!("{name}.yaml"));
+            std::fs::write(&path, vec![b' '; limit]).unwrap();
+            assert_eq!(
+                read_bounded_new_run_yaml_v1(&path, limit, name)
+                    .expect("exact-limit source should be readable")
+                    .len(),
+                limit
+            );
+
+            std::fs::write(&path, vec![b' '; limit + 1]).unwrap();
+            let error = read_bounded_new_run_yaml_v1(&path, limit, name)
+                .expect_err("plus-one source must fail before parsing")
+                .to_string();
+            assert!(error.contains("new_run_yaml_size_exceeded"), "{error}");
+        }
+    }
+
+    #[test]
+    fn new_run_source_reader_rejects_excessive_yaml_nesting() {
+        let exact = format!(
+            "{}0{}",
+            "[".repeat(MAX_NEW_RUN_YAML_DEPTH_V1 - 1),
+            "]".repeat(MAX_NEW_RUN_YAML_DEPTH_V1 - 1)
+        );
+        parse_bounded_admission_yaml_v1(exact.as_bytes())
+            .expect("the documented maximum nesting depth should parse");
+
+        let excessive = format!(
+            "{}0{}",
+            "[".repeat(MAX_NEW_RUN_YAML_DEPTH_V1),
+            "]".repeat(MAX_NEW_RUN_YAML_DEPTH_V1)
+        );
+        let error = parse_bounded_admission_yaml_v1(excessive.as_bytes())
+            .expect_err("one level beyond the maximum must fail")
+            .to_string();
+        assert!(
+            error.contains("new_run_yaml_complexity_exceeded"),
+            "{error}"
+        );
     }
 }

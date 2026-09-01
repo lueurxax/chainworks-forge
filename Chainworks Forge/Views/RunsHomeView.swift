@@ -6532,6 +6532,8 @@ struct P036ActiveAgentReadbackRow: View {
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(activeAccessibilityLabel)
+        .accessibilityIdentifier("p036-active-agent-\(agent.id)")
+        .help(agent.plannedAssignment.fullAccessibilityValue)
     }
 
     private var statusLabel: String {
@@ -6929,22 +6931,13 @@ struct P036StageOccurrenceRow: View {
                     .font(ForgeTypography.micro.weight(.semibold))
                     .foregroundStyle(ForgeColor.Text.primary)
                     .lineLimit(1)
-                P036PlannedAssignmentLine(
-                    presentation: occurrence.plannedAssignment,
-                    trailingComponents: stageTrailingComponents
-                )
+                P036StageOccurrenceDetailLine(occurrence: occurrence)
             }
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(stageAccessibilityLabel)
-    }
-
-    private var stageTrailingComponents: [String] {
-        [
-            occurrence.taskName,
-            occurrence.statusText,
-            occurrence.executionCountLabel,
-        ].compactMap { $0 }
+        .accessibilityIdentifier("p036-stage-occurrence-\(occurrence.id)")
+        .help(occurrence.plannedAssignment.fullAccessibilityValue)
     }
 
     private var stageAccessibilityLabel: String {
@@ -6955,6 +6948,39 @@ struct P036StageOccurrenceRow: View {
             presentation: occurrence.plannedAssignment,
             executionCount: occurrence.executionCountLabel
         )
+    }
+}
+
+struct P036StageOccurrenceDetailLine: View {
+    let occurrence: RunsWorkbenchPresentationModel.StageOccurrence
+
+    var body: some View {
+        if occurrence.plannedAssignment.isCodexPlannedLine {
+            P036PlannedAssignmentLine(
+                presentation: occurrence.plannedAssignment,
+                trailingComponents: stageTrailingComponents
+            )
+        } else {
+            Text(legacyDetailText)
+                .font(ForgeTypography.micro)
+                .foregroundStyle(ForgeColor.Text.tertiary)
+                .lineLimit(1)
+                .accessibilityIdentifier("p036-stage-legacy-detail")
+        }
+    }
+
+    private var stageTrailingComponents: [String] {
+        [
+            occurrence.taskName,
+            occurrence.statusText,
+            occurrence.executionCountLabel,
+        ].compactMap { $0 }
+    }
+
+    private var legacyDetailText: String {
+        (stageTrailingComponents + [occurrence.plannedAssignment.visualSuffix])
+            .filter { !$0.isEmpty }
+            .joined(separator: " · ")
     }
 }
 

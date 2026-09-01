@@ -3158,6 +3158,46 @@ fn persisted_snapshot_quartet_exhausts_all_presence_states_and_never_falls_back(
 }
 
 #[test]
+fn persisted_snapshot_quartet_all_absent_uses_valid_mutable_live_paths() {
+    let root = repository_root();
+    let source_workflow = root.join("examples/workflows/full-mvp-live.yaml");
+    let catalog = root.join("examples/agents/agents.yaml");
+    let temp = tempfile::tempdir().unwrap();
+    let mutable_workflow = temp.path().join("workflow.yaml");
+    let original_bytes = std::fs::read_to_string(&source_workflow).unwrap();
+    std::fs::write(&mutable_workflow, &original_bytes).unwrap();
+
+    let plan = compile_plan();
+    let idea = idea("Legacy mutable paths".into(), "Compatibility proof".into());
+    let mut persisted = run(&plan, &idea, "state_1_idea_received");
+    persisted.workflow_snapshot_json = None;
+    persisted.workflow_snapshot_hash = None;
+    persisted.catalog_snapshot_json = None;
+    persisted.catalog_snapshot_hash = None;
+    persisted.workflow_yaml_path = Some(mutable_workflow.to_string_lossy().into_owned());
+    persisted.agent_catalog_yaml_path = Some(catalog.to_string_lossy().into_owned());
+
+    let before = compile_run_plan_for_run(&persisted)
+        .unwrap()
+        .expect("all-absent legacy state with valid paths must compile live");
+    assert_eq!(
+        before.states["state_1_idea_received"].label,
+        "Idea received"
+    );
+
+    let changed_bytes =
+        original_bytes.replacen("label: Idea received", "label: Mutable idea received", 1);
+    std::fs::write(&mutable_workflow, changed_bytes).unwrap();
+    let after = compile_run_plan_for_run(&persisted)
+        .unwrap()
+        .expect("legacy fallback must retain its mutable live-path behavior");
+    assert_eq!(
+        after.states["state_1_idea_received"].label,
+        "Mutable idea received"
+    );
+}
+
+#[test]
 fn legacy_prompt_validation_preserves_pre_v1_bytes_exactly() {
     let mut plan = compile_plan();
     plan.mission_context_version = None;

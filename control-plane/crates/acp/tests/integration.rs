@@ -392,6 +392,69 @@ sys.exit(0)
         script.to_string_lossy().into_owned()
     }
 
+    pub fn create_config_wire_recorder_script(
+        tmpdir: &std::path::Path,
+        observed_path: &std::path::Path,
+    ) -> String {
+        let script = tmpdir.join("acp_config_wire_recorder.py");
+        let code = format!(
+            r#"#!/usr/bin/env python3
+import json, pathlib, sys
+
+observed_path = pathlib.Path({observed_path:?})
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    return json.loads(line) if line else None
+
+msg = recv()
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"protocolVersion": 1}}}})
+
+msg = recv()
+if msg is None or msg.get("method") != "session/new":
+    sys.exit(1)
+model = msg.get("params", {{}}).get("model")
+session_id = "fixture-session-config-wire-recorder"
+send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"sessionId": session_id}}}})
+
+configs = []
+prompt_count = 0
+while True:
+    msg = recv()
+    if msg is None:
+        sys.exit(1)
+    method = msg.get("method")
+    if method == "session/set_config_option":
+        configs.append(msg.get("params", {{}}))
+        send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{}}}})
+    elif method == "session/prompt":
+        prompt_count += 1
+        observed_path.write_text(json.dumps({{
+            "model": model,
+            "configs": configs,
+            "prompt_count": prompt_count
+        }}))
+        send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{
+            "stopReason": "end_turn", "sessionId": session_id
+        }}}})
+        recv()
+        sys.exit(0)
+    else:
+        sys.exit(1)
+"#,
+            observed_path = observed_path.to_string_lossy(),
+        );
+        std::fs::write(&script, code).unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
     /// Write a fixture ACP server script that completes the handshake but
     /// returns a JSON-RPC error for `session/prompt`, triggering `AgentStatus::Failed`.
     pub fn create_fail_script(tmpdir: &std::path::Path) -> String {
@@ -2519,6 +2582,178 @@ async fn codex_policy_effort_rejection_is_best_effort_and_prompt_still_runs() {
         assert_eq!(result.0, domain::agent::AgentStatus::Completed);
         session.close().await.unwrap();
         assert!(observed_path.is_file());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_closed_effort_table_serializes_exactly_one_wire_lane() {
+    use acp::adapters::codex::CodexAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::transport::AcpTransportSession;
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    struct Case {
+        name: &'static str,
+        model: Option<&'static str>,
+        effort: Option<&'static str>,
+        expected_model: &'static str,
+        expected_effort: Option<&'static str>,
+        exact_lane: bool,
+    }
+
+    let cases = [
+        Case {
+            name: "policy_exact",
+            model: Some("gpt-5.6-sol"),
+            effort: Some("max"),
+            expected_model: "gpt-5.6-sol",
+            expected_effort: Some("max"),
+            exact_lane: true,
+        },
+        Case {
+            name: "policy_unsupported",
+            model: Some("gpt-5.6-luna"),
+            effort: Some("ultra"),
+            expected_model: "gpt-5.6-luna",
+            expected_effort: Some("ultra"),
+            exact_lane: false,
+        },
+        Case {
+            name: "policy_case_varied_effort",
+            model: Some("gpt-5.6-sol"),
+            effort: Some("HIGH"),
+            expected_model: "gpt-5.6-sol",
+            expected_effort: Some("high"),
+            exact_lane: false,
+        },
+        Case {
+            name: "policy_blank_effort",
+            model: Some("gpt-5.6-sol"),
+            effort: Some(""),
+            expected_model: "gpt-5.6-sol",
+            expected_effort: Some(""),
+            exact_lane: false,
+        },
+        Case {
+            name: "generic",
+            model: Some("gpt-5.6"),
+            effort: Some("high"),
+            expected_model: "gpt-5.6",
+            expected_effort: Some("high"),
+            exact_lane: false,
+        },
+        Case {
+            name: "custom",
+            model: Some("custom-model"),
+            effort: Some("high"),
+            expected_model: "custom-model",
+            expected_effort: Some("high"),
+            exact_lane: false,
+        },
+        Case {
+            name: "combined",
+            model: Some("gpt-5.6-sol/max"),
+            effort: None,
+            expected_model: "gpt-5.6-sol",
+            expected_effort: Some("max"),
+            exact_lane: false,
+        },
+        Case {
+            name: "explicit_over_suffix",
+            model: Some("gpt-5.6-sol/max"),
+            effort: Some("ultra"),
+            expected_model: "gpt-5.6-sol",
+            expected_effort: Some("ultra"),
+            exact_lane: false,
+        },
+        Case {
+            name: "case_varied_model",
+            model: Some("GPT-5.6-SOL"),
+            effort: Some("max"),
+            expected_model: "gpt-5.6-sol",
+            expected_effort: Some("max"),
+            exact_lane: false,
+        },
+        Case {
+            name: "bare_absent",
+            model: Some("gpt-5.6-sol"),
+            effort: None,
+            expected_model: "gpt-5.6-sol",
+            expected_effort: None,
+            exact_lane: false,
+        },
+        Case {
+            name: "trailing_slash",
+            model: Some("gpt-5.6-sol/"),
+            effort: None,
+            expected_model: "gpt-5.6-sol/",
+            expected_effort: None,
+            exact_lane: false,
+        },
+        Case {
+            name: "default_absent",
+            model: None,
+            effort: None,
+            expected_model: "gpt-5.6",
+            expected_effort: None,
+            exact_lane: false,
+        },
+    ];
+
+    for case in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let observed_path = tmp.path().join(format!("observed-{}.json", case.name));
+        let script = fixture::create_config_wire_recorder_script(tmp.path(), &observed_path);
+        let child = Command::new(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut request = codex_variant_request(&tmp);
+        request.model = case.model.map(ToOwned::to_owned);
+        request.effort = case.effort.map(ToOwned::to_owned);
+        let spec = CodexAdapter::new_with_binary("/bin/codex-acp")
+            .prepare_session_new_spec(&request)
+            .unwrap();
+        assert!(spec.required_config_options.is_empty(), "{}", case.name);
+        assert_eq!(
+            !spec.exact_best_effort_config_options.is_empty(),
+            case.exact_lane,
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            usize::from(!spec.exact_best_effort_config_options.is_empty())
+                + usize::from(!spec.config_options.is_empty()),
+            usize::from(case.expected_effort.is_some()),
+            "{} must enter exactly one effort lane",
+            case.name
+        );
+
+        let mut session = AcpTransportSession::start(child, &request, &spec.as_config())
+            .await
+            .unwrap();
+        session.prompt(&request).await.unwrap();
+        session.close().await.unwrap();
+
+        let observed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&observed_path).unwrap()).unwrap();
+        assert_eq!(observed["model"], case.expected_model, "{}", case.name);
+        assert_eq!(observed["prompt_count"], 1, "{}", case.name);
+        let configs = observed["configs"].as_array().unwrap();
+        assert_eq!(
+            configs.len(),
+            usize::from(case.expected_effort.is_some()),
+            "{}",
+            case.name
+        );
+        if let Some(expected_effort) = case.expected_effort {
+            assert_eq!(configs[0]["configId"], "reasoning_effort", "{}", case.name);
+            assert_eq!(configs[0]["value"], expected_effort, "{}", case.name);
+        }
     }
 }
 
