@@ -765,7 +765,155 @@ async fn resolve_targeted_p058_retry_candidate(
         );
     }
 
-    Ok(Some((ledger, tier_id, tier_kind_raw, None)))
+    let backend_override = resolve_targeted_p058_retry_backend_override(
+        pool,
+        run_id,
+        &ledger,
+        &tier_id,
+        &tier_kind_raw,
+    )
+    .await?;
+
+    Ok(Some((ledger, tier_id, tier_kind_raw, backend_override)))
+}
+
+/// An active targeted-retry ledger is the authority for the escalation tier.
+/// When that tier selects a backend profile, re-resolve it from the frozen plan
+/// instead of inheriting the source work item's stale provider binding.
+async fn resolve_targeted_p058_retry_backend_override(
+    pool: &SqlitePool,
+    run_id: RunId,
+    ledger: &domain::escalation::EscalationLedger,
+    tier_id: &str,
+    tier_kind_raw: &str,
+) -> Result<Option<EscalationBackendProfileOverride>> {
+    if tier_kind_raw != "backend_profile" {
+        return Ok(None);
+    }
+    let Some(run) = db::repos::runs::find_by_id(pool, run_id).await? else {
+        return Ok(None);
+    };
+    let Some(plan) = crate::command_handler::compile_run_plan_from_snapshot(&run)? else {
+        return Ok(None);
+    };
+    let policy = plan
+        .escalation_policies
+        .iter()
+        .find(|policy| policy.policy_id == ledger.policy_id)
+        .with_context(|| {
+            format!(
+                "targeted P058 retry ledger {} references policy {} absent from the frozen plan",
+                ledger.id, ledger.policy_id
+            )
+        })?;
+    let tier = policy
+        .tiers
+        .iter()
+        .find(|tier| tier.tier_id == tier_id)
+        .with_context(|| {
+            format!(
+                "targeted P058 retry ledger {} references tier {} absent from frozen policy {}",
+                ledger.id, tier_id, ledger.policy_id
+            )
+        })?;
+    if tier.kind != "backend_profile" {
+        anyhow::bail!(
+            "targeted P058 retry ledger {} declares backend_profile tier {}, but frozen policy {} defines kind {}",
+            ledger.id,
+            tier_id,
+            ledger.policy_id,
+            tier.kind
+        );
+    }
+    resolve_escalation_backend_profile_override(&run, tier)?
+        .with_context(|| {
+            format!(
+            "targeted P058 retry ledger {} tier {} does not resolve to a frozen backend profile",
+            ledger.id, tier_id
+        )
+        })
+        .map(Some)
+}
+
+/// P058 tier selection belongs to the durable ledger. A targeted retry may be
+/// created from an earlier attempt whose copied payload still names the prior
+/// tier, so refresh that non-authoritative snapshot before claiming the work.
+async fn refresh_targeted_p058_retry_escalation_context(
+    pool: &SqlitePool,
+    payload: &mut serde_json::Value,
+    run_id: RunId,
+    stage_id: &str,
+    agent_id: &str,
+) -> Result<bool> {
+    let Some(source_escalation) = targeted_p058_escalation_context(pool, payload).await? else {
+        return Ok(false);
+    };
+    let Some(ledger_id) = source_escalation
+        .get("ledger_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+    else {
+        return Ok(false);
+    };
+    let Some(ledger) = escalation_repo::find_ledger_by_id(pool, &ledger_id).await? else {
+        return Ok(false);
+    };
+    if ledger.run_id != run_id || ledger.stage_id != stage_id || ledger.agent_id != agent_id {
+        anyhow::bail!(
+            "targeted P058 retry ledger identity mismatch: ledger {} belongs to run {} stage {} agent {}, not run {} stage {} agent {}",
+            ledger.id,
+            ledger.run_id,
+            ledger.stage_id,
+            ledger.agent_id,
+            run_id,
+            stage_id,
+            agent_id,
+        );
+    }
+    if ledger.status_raw != "active" {
+        return Ok(false);
+    }
+    let tier_id = ledger
+        .current_tier_id
+        .as_deref()
+        .context("targeted P058 retry ledger is missing current_tier_id")?;
+    let tier_kind_raw = ledger
+        .current_tier_kind_raw
+        .as_deref()
+        .context("targeted P058 retry ledger is missing current_tier_kind_raw")?;
+
+    let Some(targeted_retry) = payload
+        .get_mut("targeted_retry")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(false);
+    };
+    let escalation = targeted_retry
+        .entry("escalation")
+        .or_insert_with(|| serde_json::json!({}));
+    let escalation = escalation
+        .as_object_mut()
+        .context("targeted P058 retry escalation must be an object")?;
+
+    let mut changed = false;
+    for (key, value) in [
+        ("ledger_id", ledger.id),
+        ("policy_id", ledger.policy_id),
+        ("tier_id", tier_id.to_string()),
+        ("tier_kind_raw", tier_kind_raw.to_string()),
+        ("trigger_raw", ledger.trigger_raw.unwrap_or_default()),
+    ] {
+        if escalation.get(key).and_then(serde_json::Value::as_str) != Some(value.as_str()) {
+            escalation.insert(key.to_string(), serde_json::Value::String(value));
+            changed = true;
+        }
+    }
+    let chain_attempt_index = serde_json::json!(ledger.chain_attempt_index);
+    if escalation.get("chain_attempt_index") != Some(&chain_attempt_index) {
+        escalation.insert("chain_attempt_index".to_string(), chain_attempt_index);
+        changed = true;
+    }
+    Ok(changed)
 }
 
 /// Recover the P058 ledger reference from the targeted retry payload or its
@@ -1619,21 +1767,20 @@ async fn claim_invoke_agent_work_item_with_start(
         .and_then(|value| value.as_str())
         .unwrap_or(&stage_id)
         .to_string();
-    let provider = payload
-        .get("provider")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| anyhow::anyhow!("InvokeAgent payload missing provider"))?
-        .to_string();
-    let model = payload
-        .get("model")
-        .and_then(|value| value.as_str())
-        .map(String::from);
+    refresh_targeted_p058_retry_escalation_context(
+        pool,
+        &mut payload,
+        run_id,
+        &stage_id,
+        &agent_id,
+    )
+    .await?;
     let task_name = payload
         .get("task_name")
         .and_then(|value| value.as_str())
         .unwrap_or(&stage_id)
         .to_string();
-    let payload_backend_profile_id = payload
+    let initial_backend_profile_id = payload
         .get("backend_profile_id")
         .and_then(|value| value.as_str())
         .map(String::from);
@@ -1664,13 +1811,42 @@ async fn claim_invoke_agent_work_item_with_start(
             &stage_id,
             &stage_execution_id.to_string(),
             &agent_id,
-            payload_backend_profile_id.as_deref(),
+            initial_backend_profile_id.as_deref(),
         )
         .await
         .with_context(|| {
             format!("P058 escalation chain resolution failed for run={run_id} stage={stage_id}")
         })?
     };
+
+    if let Some(candidate) = esc_candidate.as_ref() {
+        if let Some(backend_override) = candidate.3.as_ref() {
+            let (fallback_provider, fallback_model, fallback_backend_profile_id) =
+                apply_escalation_backend_override(&mut payload, backend_override);
+            info!(
+                work_item_id = %item.id,
+                escalation_ledger_id = %candidate.0.id,
+                escalation_tier_id = %candidate.1,
+                fallback_provider = %fallback_provider,
+                fallback_model = fallback_model.as_deref().unwrap_or("none"),
+                fallback_backend_profile_id = %fallback_backend_profile_id,
+                "P058 escalation retry applied frozen backend profile"
+            );
+        }
+    }
+    let provider = payload
+        .get("provider")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("InvokeAgent payload missing provider"))?
+        .to_string();
+    let model = payload
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(String::from);
+    let payload_backend_profile_id = payload
+        .get("backend_profile_id")
+        .and_then(|value| value.as_str())
+        .map(String::from);
 
     let artifact_claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
         run_id,
@@ -4477,6 +4653,21 @@ fn retry_after_or_default_for_provider_quota(
     }
 }
 
+fn provider_quota_retry_after_from_runtime_receipt(
+    runtime_receipt: &acp::AcpRuntimeReceipt,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    runtime_receipt
+        .provider_error_message_redacted
+        .as_deref()
+        .map(observation_from_acp_error_message)
+        .and_then(|observation| match observation {
+            crate::failure_classifier::RuntimeFailureObservation::ProviderQuota { retry_after } => {
+                retry_after
+            }
+            _ => None,
+        })
+}
+
 fn runtime_prompt_receipt_record_from_receipt(
     agent_exec_id: domain::ids::AgentExecutionId,
     receipt: &acp::AcpRuntimeReceipt,
@@ -4578,19 +4769,23 @@ fn suppress_interactive_review_xcode_mcp_for_invocation(
     backend_profile_id: Option<&str>,
     permission_profile: Option<&str>,
 ) -> bool {
-    let readonly_review_permission =
-        matches!(permission_profile, Some("RO_VERIFY" | "RO_PREPUSH_VERIFY"));
+    let readonly_review_permission = matches!(
+        permission_profile,
+        Some("RO_REVIEW" | "RO_VERIFY" | "RO_PREPUSH_VERIFY")
+    );
     let proposal_authoring = matches!(agent_id, "proposal_writer")
         || matches!(permission_profile, Some("PROPOSAL_WRITE"));
     proposal_authoring
         || (readonly_review_permission
-            && (matches!(
-                agent_id,
-                "proposal_implementation_auditor" | "prepush_code_reviewer"
-            ) || matches!(
-                backend_profile_id,
-                Some("codex_audit_high" | "claude_prepush_medium")
-            )))
+            && (agent_id.starts_with("proposal_reviewer_")
+                || matches!(
+                    agent_id,
+                    "proposal_implementation_auditor" | "prepush_code_reviewer"
+                )
+                || matches!(
+                    backend_profile_id,
+                    Some("codex_audit_high" | "claude_prepush_medium")
+                )))
 }
 
 fn ensure_xcode_mcp_requested_for_host_execution(
@@ -4753,16 +4948,15 @@ fn runtime_facts_for_execution_result(
         .filter(|classification| classification.failure_kind == AgentFailureKind::ProviderQuota)
         .cloned()
         .or_else(|| {
-            runtime_receipt
-                .and_then(|receipt| receipt.failure_phase.as_deref())
-                .is_some_and(|phase| phase == "provider_quota")
-                .then(|| {
+            runtime_receipt.and_then(|receipt| {
+                (receipt.failure_phase.as_deref() == Some("provider_quota")).then(|| {
                     classify_observation(
                         crate::failure_classifier::RuntimeFailureObservation::ProviderQuota {
-                            retry_after: None,
+                            retry_after: provider_quota_retry_after_from_runtime_receipt(receipt),
                         },
                     )
                 })
+            })
         });
     match validation_summary.and_then(|summary| summary.failure_class.as_ref()) {
         Some(domain::validation::ValidationFailureClass::NoOutputProduced)
@@ -11222,7 +11416,7 @@ impl BackgroundExecutor {
             }
 
             WorkItemKind::InvokeAgent => {
-                let payload: serde_json::Value = serde_json::from_str(&item.payload_json)?;
+                let mut payload: serde_json::Value = serde_json::from_str(&item.payload_json)?;
                 let run_id = self.extract_run_id(&item)?;
 
                 let stage_id = payload["stage_id"]
@@ -11293,6 +11487,14 @@ impl BackgroundExecutor {
                 let run = db::repos::runs::find_by_id(&self.pool, run_id)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("Run not found: {}", run_id))?;
+                if let Some(plan) = crate::command_handler::compile_run_plan_from_snapshot(&run)? {
+                    crate::orchestrator::append_current_proposal_writer_backlog_context(
+                        &plan,
+                        &run,
+                        &agent_id,
+                        &mut payload,
+                    )?;
+                }
                 // Use the prompt from the work item payload if provided
                 // (workflow-driven runs include the agent's system prompt from YAML).
                 let mut prompt = payload["prompt"]
@@ -19509,6 +19711,26 @@ fn append_status_allowed_values_for_declared_output(prompt: &mut String, output:
     let Some(schema) = output.schema.as_ref() else {
         return;
     };
+    if schema.contract_id
+        == crate::quality_gate_boundary::QUALITY_GATE_BLOCKER_ASSESSMENT_V1_CONTRACT_ID
+    {
+        let values = |items: &[&str]| {
+            items
+                .iter()
+                .map(|value| format!("`{value}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        prompt.push_str(&format!(
+            "  For `blockers[*]`, use only these validator-owned enum values: \\\n+             `owner_class`: {}; `blocker_class`: {}; `evidence_freshness`: {}; \\\n+             `severity`: {}. Do not invent aliases.\\n",
+            values(crate::quality_gate_boundary::QUALITY_GATE_BLOCKER_OWNER_CLASSES),
+            values(crate::quality_gate_boundary::QUALITY_GATE_BLOCKER_CLASSES),
+            values(
+                crate::quality_gate_boundary::QUALITY_GATE_BLOCKER_EVIDENCE_FRESHNESS_VALUES
+            ),
+            values(crate::quality_gate_boundary::QUALITY_GATE_BLOCKER_SEVERITY_VALUES),
+        ));
+    }
     if schema.contract_id == IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID {
         prompt.push_str(
             "  Allowed `handoff_tasks[*].owner_class` values: `docs`, `manual_evidence`, \
@@ -19595,6 +19817,21 @@ fn append_proposal_current_freeze_readiness_guidance(
          implementation details or release-criteria computation outside `rollout_contract_v1.metrics`. \
          In particular, do not emit `metrics.implementation` or \
          `metrics.release_criteria_computation`.\n",
+    );
+    prompt.push_str(
+        "Nested rollout-contract objects are closed schemas. Omit optional objects when they \
+         are not applicable; do not invent keys or replace scalar values with nested records:\n\
+         - `hold_conditions_detail` may be a string array or an object whose values are strings; \
+           nested objects are invalid.\n\
+         - `migrations` may contain only `not_applicable` (boolean), `justification` (string), \
+           and `description` (string). When `not_applicable` is true, `justification` is required.\n\
+         - `rollback_disposition` may contain only `mode` (string), `data_loss_risk` (one of \
+           `none`, `low`, `medium`, `high`), and optional `steps` (string array).\n\
+         - `cutover_policy`, when present, must include non-empty `revision` and `applicable_to` \
+           strings. Its only allowed keys are `revision`, `enforcement_mode_at_cutover` \
+           (`enforce`, `permissive`, or `disabled`), `applicable_to`, \
+           `grandfathered_rendering` (`not_applicable`), and \
+           `effective_timestamp_iso8601`.\n",
     );
     let example = serde_json::json!({
         "rollout_contract_v1":
@@ -23382,7 +23619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn targeted_p058_retry_reuses_the_durable_ledger_for_the_fallback_execution() {
+    async fn targeted_p058_retry_refreshes_stale_tier_from_the_durable_ledger() {
         let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
         let run_id = RunId::new();
         let now = chrono::Utc::now();
@@ -23411,7 +23648,7 @@ mod tests {
             policy_id: "proposal_writer_quota_escalation".into(),
             policy_hash: "sha256:p058-test".into(),
             status_raw: "active".into(),
-            current_tier_id: Some("claude_writer_fallback".into()),
+            current_tier_id: Some("gemini_reasoning_fallback".into()),
             current_tier_kind_raw: Some("backend_profile".into()),
             chain_attempt_index: 1,
             trigger_raw: Some("stale_no_output".into()),
@@ -23425,7 +23662,7 @@ mod tests {
             .await
             .unwrap();
 
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "targeted_retry": {
                 "escalation": {
                     "ledger_id": ledger.id,
@@ -23433,6 +23670,21 @@ mod tests {
                 }
             }
         });
+        assert!(refresh_targeted_p058_retry_escalation_context(
+            &pool,
+            &mut payload,
+            run_id,
+            "state_5_proposal_refined",
+            "proposal_writer",
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            payload
+                .pointer("/targeted_retry/escalation/tier_id")
+                .and_then(serde_json::Value::as_str),
+            Some("gemini_reasoning_fallback")
+        );
         let candidate = resolve_targeted_p058_retry_candidate(
             &pool,
             &payload,
@@ -23445,7 +23697,7 @@ mod tests {
         .expect("P058 retry must retain its existing ledger");
 
         assert_eq!(candidate.0.id, ledger.id);
-        assert_eq!(candidate.1, "claude_writer_fallback");
+        assert_eq!(candidate.1, "gemini_reasoning_fallback");
         assert_eq!(candidate.2, "backend_profile");
 
         let source_item = WorkItem {
@@ -23487,12 +23739,21 @@ mod tests {
             last_error: None,
         };
         work_items::enqueue(&pool, &bridge_item).await.unwrap();
-        let recovered_payload = serde_json::json!({
+        let mut recovered_payload = serde_json::json!({
             "targeted_retry": {
                 "reason": "operator_targeted_retry",
                 "source_work_item_id": bridge_item.id
             }
         });
+        assert!(refresh_targeted_p058_retry_escalation_context(
+            &pool,
+            &mut recovered_payload,
+            run_id,
+            "state_5_proposal_refined",
+            "proposal_writer",
+        )
+        .await
+        .unwrap());
         let recovered = resolve_targeted_p058_retry_candidate(
             &pool,
             &recovered_payload,
@@ -24526,6 +24787,38 @@ plain progress line without gate evidence";
         assert!(prompt.contains("do not emit `metrics.implementation`"));
         assert!(prompt.contains("`metrics.release_criteria_computation`"));
         assert!(!prompt.contains("{\"status\":\"complete\"}"));
+    }
+
+    #[test]
+    fn runtime_invocation_contract_lists_rollout_nested_schema_rules() {
+        let declared_outputs = vec![DeclaredOutput {
+            output_name: "proposal_current".to_string(),
+            target_path: "/workspace/.chainworks/runs/run-1/proposals/current.md".to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        }];
+
+        let prompt = prompt_with_runtime_invocation_contract(
+            "Refine proposal".to_string(),
+            RuntimeInvocationContractInput {
+                run_id: RunId::new().to_string(),
+                stage_id: "state_5_proposal_refined".to_string(),
+                stage_execution_id: domain::ids::StageExecutionId::new().to_string(),
+                agent_execution_id: domain::ids::AgentExecutionId::new().to_string(),
+                work_item_id: "p058-invoke:stage:0".to_string(),
+                session_generation_id: None,
+                session_reuse_disposition: None,
+                declared_outputs: &declared_outputs,
+            },
+        );
+
+        assert!(prompt.contains("Nested rollout-contract objects are closed schemas"));
+        assert!(prompt.contains("`hold_conditions_detail` may be a string array"));
+        assert!(prompt.contains("`migrations` may contain only `not_applicable`"));
+        assert!(prompt.contains("`rollback_disposition` may contain only `mode`"));
+        assert!(prompt.contains("when present, must include non-empty `revision`"));
     }
 
     #[test]
@@ -25973,7 +26266,62 @@ plain progress line without gate evidence";
     }
 
     #[test]
+    fn quality_gate_runtime_contract_prompt_includes_validator_enums() {
+        let declared_outputs = vec![DeclaredOutput {
+            output_name: "quality_gate_blocker_assessment".to_string(),
+            target_path: "/workspace/.chainworks/quality-gate/blocker-assessment.json".to_string(),
+            schema: Some(workflow::plan::OutputSchema {
+                contract_id:
+                    crate::quality_gate_boundary::QUALITY_GATE_BLOCKER_ASSESSMENT_V1_CONTRACT_ID
+                        .to_string(),
+                format: "json".to_string(),
+                human_format: None,
+                machine_format: Some("json".to_string()),
+                validation_mode: Some("strict_structured".to_string()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec!["schema_version".to_string(), "blockers".to_string()],
+            }),
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        }];
+        let prompt = prompt_with_runtime_invocation_contract(
+            "Assess blockers.".to_string(),
+            RuntimeInvocationContractInput {
+                run_id: "run-1".to_string(),
+                stage_id: "state_9_quality_gate_blocker_assessed".to_string(),
+                stage_execution_id: "stage-exec-1".to_string(),
+                agent_execution_id: "agent-exec-1".to_string(),
+                work_item_id: "p058-invoke:stage-exec-1:0".to_string(),
+                session_generation_id: None,
+                session_reuse_disposition: None,
+                declared_outputs: &declared_outputs,
+            },
+        );
+
+        for values in [
+            crate::quality_gate_boundary::QUALITY_GATE_BLOCKER_OWNER_CLASSES,
+            crate::quality_gate_boundary::QUALITY_GATE_BLOCKER_CLASSES,
+            crate::quality_gate_boundary::QUALITY_GATE_BLOCKER_EVIDENCE_FRESHNESS_VALUES,
+            crate::quality_gate_boundary::QUALITY_GATE_BLOCKER_SEVERITY_VALUES,
+        ] {
+            for value in values {
+                assert!(
+                    prompt.contains(&format!("`{value}`")),
+                    "runtime prompt must include validator enum {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn p051_runtime_guard_suppresses_interactive_xcode_mcp_for_review_invocations() {
+        assert!(suppress_interactive_review_xcode_mcp_for_invocation(
+            "proposal_reviewer_reliability",
+            Some("codex_architect_high"),
+            Some("RO_REVIEW")
+        ));
         assert!(suppress_interactive_review_xcode_mcp_for_invocation(
             "proposal_implementation_auditor",
             Some("codex_audit_high"),
@@ -26355,6 +26703,56 @@ plain progress line without gate evidence";
             facts.output_settlement,
             AgentOutputSettlement::MissingRequiredOutputs
         );
+    }
+
+    #[test]
+    fn provider_quota_runtime_receipt_preserves_explicit_claude_reset_time() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-30T05:50:47Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let expected_retry_after = chrono::DateTime::parse_from_rfc3339("2026-08-30T10:10:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let validation = TaskValidationSummary {
+            output_results: vec![],
+            contract_metadata: vec![],
+            raw_output_exists: false,
+            failure_class: Some(domain::validation::ValidationFailureClass::NoOutputProduced),
+            failure_summary: Some("required output was not produced".into()),
+        };
+        let mut receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 2,
+                session_update_count: 1,
+                permission_request_count: 0,
+                permission_grant_sent_count: 0,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 0,
+                agent_thought_chunk_count: 0,
+                tool_call_count: 0,
+                tool_call_update_count: 0,
+                plan_update_count: 0,
+                meaningful_progress_count: 0,
+                unknown_notification_count: 1,
+            },
+            Some("provider_quota"),
+        );
+        receipt.provider = "claude".into();
+        receipt.provider_error_message_redacted =
+            Some("You've hit your session limit; resets 1:10pm (Asia/Nicosia)".into());
+
+        let facts = runtime_facts_for_execution_result(
+            domain::ids::AgentExecutionId::new(),
+            AgentStatus::Failed,
+            Some(&validation),
+            None,
+            now,
+            None,
+            Some(&receipt),
+            None,
+        );
+
+        assert_eq!(facts.retry_after, Some(expected_retry_after));
     }
 
     #[test]

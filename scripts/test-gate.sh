@@ -85,6 +85,7 @@ P077_UI_EVIDENCE_PATH="docs/reference/p077-closeout-readiness-ui-evidence.md"
 FAST_TESTS=(
   "Chainworks ForgeTests/Proposal081ApprovalActionAttemptStoreTests"
   "Chainworks ForgeTests/ArtifactPathClipboardTests"
+  "Chainworks ForgeTests/CodexModelVariantTruthTests"
   "Chainworks ForgeTests/ForgeGlassTests"
   "Chainworks ForgeTests/P089TempArtifactInventoryTests"
   "Chainworks ForgeTests/ProcessSupportTests"
@@ -8641,10 +8642,10 @@ if providers != ["claude", "codex", "junie"]:
         f"proposal-088: provider independence fixture must cover claude/codex/junie, got {providers!r}"
     )
 
-proposal = root / "docs/proposals/088-code-writer-completion-contract-and-output-freshness.md"
-if not proposal.exists():
-    raise SystemExit("proposal-088: missing proposal document")
-proposal_text = proposal.read_text()
+reference = root / "docs/reference/output-contracts-failure-evidence-and-recovery.md"
+if not reference.exists():
+    raise SystemExit("proposal-088: missing stable output-contract reference")
+reference_text = reference.read_text()
 for required_term in [
     "code_writer_completion_repair_v1",
     "worktree_fingerprint_v1",
@@ -8653,8 +8654,8 @@ for required_term in [
     "current_attempt_diff",
     "preexisting_dirty_work",
 ]:
-    if required_term not in proposal_text:
-        raise SystemExit(f"proposal-088: proposal missing required term {required_term!r}")
+    if required_term not in reference_text:
+        raise SystemExit(f"proposal-088: stable reference missing required term {required_term!r}")
 
 gates_doc = root / "docs/reference/test-gates.md"
 if not gates_doc.exists():
@@ -9254,10 +9255,10 @@ if not domain_inv.exists():
     fail("domain/src/temp_artifact_inventory.rs not found")
 domain_inv_text = domain_inv.read_text()
 for required_symbol in [
-    "TempArtifactInventoryMode",
-    "TempArtifactInventoryConfig",
+    "InventoryMode",
+    "InventoryStatus",
     "ByteCountString",
-    "disabled_inventory_response",
+    "validate_inventory_limit",
     "CHAINWORKS_TEMP_ARTIFACT_INVENTORY_MODE",
 ]:
     if required_symbol not in domain_inv_text:
@@ -9278,17 +9279,17 @@ for required_gql in [
         fail(f"graphql-server types missing required symbol: {required_gql!r}")
 
 # (8) Verify the MCP tool file exists with correct tool name.
-mcp_tool = root / "control-plane/crates/mcp-server/src/tools/temp_artifact_inventory.rs"
+mcp_tool = root / "control-plane/crates/mcp-server/src/tools/temp_artifacts.rs"
 if not mcp_tool.exists():
-    fail("mcp-server/src/tools/temp_artifact_inventory.rs not found")
+    fail("mcp-server/src/tools/temp_artifacts.rs not found")
 mcp_tool_text = mcp_tool.read_text()
 if "temp_artifacts.inventory.preview" not in mcp_tool_text:
     fail("mcp tool must be named temp_artifacts.inventory.preview")
 
-# (9) Verify TempArtifactInventoryPreview capability is in domain.
+# (9) Verify TempArtifactsInventoryPreview capability is in domain.
 domain_caps = root / "control-plane/crates/domain/src/capabilities.rs"
-if "TempArtifactInventoryPreview" not in domain_caps.read_text():
-    fail("domain/src/capabilities.rs missing TempArtifactInventoryPreview")
+if "TempArtifactsInventoryPreview" not in domain_caps.read_text():
+    fail("domain/src/capabilities.rs missing TempArtifactsInventoryPreview")
 
 print("proposal-089-temp-inventory static checks passed")
 PY
@@ -13015,6 +13016,34 @@ for term in [
 
 print("proposal-096 retained alias static checks passed")
 PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      p096_cargo_target="$(chainworks_test_gate_cargo_target_dir "${CHAINWORKS_PROPOSAL_096_CARGO_TARGET_DIR:-target/proposal-096-gate}")"
+      run_p096_cargo_test() {
+        local output status
+        set +e
+        output=$(CARGO_TARGET_DIR="$p096_cargo_target" cargo test "$@" 2>&1)
+        status=$?
+        set -e
+        printf '%s\n' "$output"
+        if [ "$status" -ne 0 ]; then
+          return "$status"
+        fi
+        if ! printf '%s\n' "$output" | grep -Eq '^running [1-9][0-9]* tests?$'; then
+          echo "FAILED: P096 cargo test filter selected zero tests: cargo test $*" >&2
+          return 1
+        fi
+      }
+
+      run_p096_cargo_test -p domain tool_policy -- --nocapture
+      run_p096_cargo_test -p acp permission_preflight_denies_broad_rg_with_typed_error -- --nocapture
+      run_p096_cargo_test -p acp codex_local_activity_classifies_cumulative_tool_output_budget -- --nocapture
+      run_p096_cargo_test -p acp codex_local_activity_classifies_wrapper_truncation_marker_as_budget_exceeded -- --nocapture
+      run_p096_cargo_test -p acp safe_search_wrapper -- --nocapture
+      run_p096_cargo_test -p engine bounded_tool_output_classifies_before_provider_internal_fallback -- --nocapture
+      run_p096_cargo_test -p engine tool_output_budget_failure_requires_session_invalidation -- --nocapture
+      run_p096_cargo_test -p mcp-server proposal_096_runtime_health_includes_tool_output_guard -- --nocapture
+    )
     log "Proposal 096 gate passed"
     ;;
   proposal-089-temp-inventory|p089-temp-inventory)

@@ -493,6 +493,13 @@ async fn resume_escalation_tx(
         }),
     );
 
+    crate::orchestrator::append_current_proposal_writer_backlog_context(
+        &plan,
+        &run,
+        &ledger.agent_id,
+        &mut retry_payload,
+    )?;
+
     let previous_window =
         escalation::find_latest_deadline_window_by_ledger_tx(tx, &ledger.id).await?;
     let wall_clock_seconds = i64::try_from(policy.max_chain_wall_clock_seconds)

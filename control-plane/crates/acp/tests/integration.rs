@@ -3583,14 +3583,14 @@ async fn xcode_mcp_bridge_pool_serializes_initialize_per_xcode_pid() {
 
 #[cfg(unix)]
 #[tokio::test(start_paused = true)]
-async fn xcode_mcp_bridge_pool_records_action_required_after_initialize_lock_wait() {
+async fn xcode_mcp_bridge_pool_records_slow_initialize_lock_without_human_action_claim() {
     use acp::{
         HostProbeContext, XcodeBrokerLeaseAttacher, XcodeMcpBackend, XcodeMcpBackendRequestContext,
         XcodeMcpBridgePool, XcodeMcpBridgePoolConfig, XcodeProcessCandidate,
         XcodeRuntimeObservationSink,
     };
     use domain::ids::AgentExecutionId;
-    use domain::xcode_runtime::{XcodeRuntimeFailureClass, XcodeRuntimeObservationUpdate};
+    use domain::xcode_runtime::XcodeRuntimeObservationUpdate;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -3722,27 +3722,24 @@ async fn xcode_mcp_bridge_pool_records_action_required_after_initialize_lock_wai
     tokio::task::yield_now().await;
 
     let updates = sink.updates.lock().await;
-    let action_required = updates
+    let slow_initialization = updates
         .iter()
         .filter_map(|update| match update {
             XcodeRuntimeObservationUpdate::McpBrokerObservation(observation)
-                if observation.backend_start_disposition == "initialize_action_required" =>
+                if observation.backend_start_disposition == "initialize_slow" =>
             {
                 Some(observation)
             }
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(action_required.len(), 1);
-    assert_eq!(
-        action_required[0].backend_failure_class,
-        Some(XcodeRuntimeFailureClass::XcodeMcpActionRequired)
-    );
-    assert!(action_required[0]
+    assert_eq!(slow_initialization.len(), 1);
+    assert_eq!(slow_initialization[0].backend_failure_class, None);
+    assert!(slow_initialization[0]
         .status_update
         .as_deref()
         .unwrap_or_default()
-        .contains("Action Required: Check Xcode"));
+        .contains("initialize is still waiting"));
     drop(updates);
 
     tokio::time::advance(Duration::from_secs(1)).await;
@@ -3753,14 +3750,14 @@ async fn xcode_mcp_bridge_pool_records_action_required_after_initialize_lock_wai
 
 #[cfg(unix)]
 #[tokio::test(start_paused = true)]
-async fn xcode_mcp_bridge_pool_records_action_required_during_slow_tools_list() {
+async fn xcode_mcp_bridge_pool_records_slow_tools_list_without_human_action_claim() {
     use acp::{
         HostProbeContext, XcodeBrokerLeaseAttacher, XcodeMcpBackend, XcodeMcpBackendRequestContext,
         XcodeMcpBridgePool, XcodeMcpBridgePoolConfig, XcodeProcessCandidate,
         XcodeRuntimeObservationSink,
     };
     use domain::ids::AgentExecutionId;
-    use domain::xcode_runtime::{XcodeRuntimeFailureClass, XcodeRuntimeObservationUpdate};
+    use domain::xcode_runtime::XcodeRuntimeObservationUpdate;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Mutex;
@@ -3860,27 +3857,24 @@ async fn xcode_mcp_bridge_pool_records_action_required_during_slow_tools_list() 
     tokio::task::yield_now().await;
 
     let updates = sink.updates.lock().await;
-    let action_required = updates
+    let slow_request = updates
         .iter()
         .filter_map(|update| match update {
             XcodeRuntimeObservationUpdate::McpBrokerObservation(observation)
-                if observation.backend_start_disposition == "backend_request_action_required" =>
+                if observation.backend_start_disposition == "backend_request_slow" =>
             {
                 Some(observation)
             }
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(action_required.len(), 1);
-    assert_eq!(
-        action_required[0].backend_failure_class,
-        Some(XcodeRuntimeFailureClass::XcodeMcpActionRequired)
-    );
-    assert!(action_required[0]
+    assert_eq!(slow_request.len(), 1);
+    assert_eq!(slow_request[0].backend_failure_class, None);
+    assert!(slow_request[0]
         .status_update
         .as_deref()
         .unwrap_or_default()
-        .contains("Action Required: Check Xcode"));
+        .contains("is still pending"));
     drop(updates);
 
     tokio::time::advance(Duration::from_secs(1)).await;
@@ -4026,7 +4020,7 @@ async fn xcode_mcp_bridge_pool_times_out_backend_request_after_action_required_b
 
 #[cfg(unix)]
 #[test]
-fn xcode_mcp_broker_default_timeouts_allow_human_consent_without_provider_race() {
+fn xcode_mcp_broker_default_timeouts_allow_startup_without_provider_race() {
     use acp::{XcodeMcpBridgePoolConfig, XcodeMcpProcessBackendConfig};
     use std::time::Duration;
 

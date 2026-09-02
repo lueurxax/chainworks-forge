@@ -202,6 +202,50 @@ Important:
   inline security/pre-push bytes, while newly compiled runs freeze both external
   bundles
 
+### `codex-planned-variant-slice`
+
+Provider-free contract gate for the byte-pinned Codex planned-model matrix,
+frozen snapshot compatibility, best-effort effort dispatch, existing GraphQL
+readback, and shared Overview/Stages labels. Operational truth lives in
+[`provider-binding-truth.md#codex-planned-variant-policy`](provider-binding-truth.md#codex-planned-variant-policy).
+
+Scope:
+
+- verifies the strict 1,479-byte V1 policy fixture and exact seven production
+  backend-profile/model/effort rows
+- proves duplicate-safe single-read new-Run admission and zero writes on every
+  policy/source failure
+- covers complete, absent, partial, malformed, tampered, mismatched, and
+  historical snapshot pairs without live-source fallback for stored snapshots
+- carries all seven rows through production payloads and ACP serialization,
+  with exactly one best-effort `reasoning_effort` lane
+- proves prompt continuation when the provider rejects the best-effort effort
+  request, without claiming accepted or actual provider truth
+- verifies resolver-local Codex alias normalization and fail-closed topology
+  enrichment without changing stored/stage-scoped/non-Codex provider bytes
+- exercises the shared Swift formatter, resource failures, current-stage
+  filtering, geometry, Dynamic Type, accessibility, selection, and post-refresh
+  focus identity
+- rejects a second label matrix, feature flag, disable path, and any selected
+  Rust or Swift filter that executes zero tests
+
+Use when:
+
+- changing the Codex model matrix, catalog bindings, new-Run admission,
+  snapshot verification, Codex effort serialization, active-execution provider
+  normalization, or planned model labels
+
+Host policy:
+
+- local Rust toolchain, Python 3, and the local macOS unit-test host
+- no daemon, network, live provider, remote UI host, or dedicated product Run
+
+Command:
+
+```bash
+./scripts/test-gate.sh codex-planned-variant-slice
+```
+
 ### `ui-smoke`
 
 Focused operator-shell UI smoke gate.
@@ -2184,7 +2228,9 @@ Important:
 
 ### `proposal-088|p088`
 
-Code-writer completion handoff, output freshness, and repair diagnostics gate.
+Retained historical alias for the implemented code-writer completion handoff,
+output freshness, and repair diagnostics contract. Operational truth lives in
+[output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md#code-writer-completion-freshness-and-repair-p088-retained-alias).
 
 Scope:
 
@@ -2207,6 +2253,7 @@ Important:
 - public readback must preserve known enum values and fail closed for unknown future values
 - `implementationCompletion` must be projected from canonical linked receipt truth, not from latest historical receipt by timestamp
 - required evidence write failures must surface as `completion_receipt_partial_write` / `storage_write_failed`, not clean missing fields
+- partial-write startup recovery is enabled by default and bounded by the P088 directory-entry scan limit
 
 ### `proposal-089|p089`
 
@@ -2610,6 +2657,35 @@ Important:
 - `p094` is accepted as an alias
 - static contract checks run before the focused Rust tests
 - a missing required route field, unknown enum, or non-array blocker collection must never normalize to `pass`
+
+### `proposal-096|p096`
+
+Retained historical alias for the bounded tool output and safe-search guard
+implemented at the ACP/provider runtime boundary. Durable behavior is documented
+in [`bounded-tool-output-and-safe-search-policy.md`](bounded-tool-output-and-safe-search-policy.md).
+
+Scope:
+
+- verifies the shared policy versions and complete generated/build-root denylist
+- proves broad `rg`/`find` requests are denied before permission grant while narrow or fully excluded searches remain allowed
+- executes the Codex wrapper behavior matrix, including exit code and line/byte caps
+- proves oversized output and wrapper truncation markers classify as `tool_output_budget_exceeded`
+- proves budget failures invalidate the provider session and remain distinct from preflight denial
+- verifies `runtime.health.toolOutputGuard` policy and enforcement readback
+- fails closed if any focused Rust filter selects zero tests
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-096
+./scripts/test-gate.sh p096
+```
+
+Important:
+
+- `p096` is accepted as an alias
+- prompt guidance is advisory; runtime preflight and provider wrappers are authoritative
+- this is a behavioral gate, not a static alias-only check
 
 ### `proposal-080|p080`
 

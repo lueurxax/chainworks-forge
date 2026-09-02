@@ -9280,6 +9280,15 @@ fn build_task_prompt(
                      - If `pass` is `false`, at least one of `blocker_count > 0`, non-empty `blocking_issues`, or non-empty `blocking_required_changes` must be true.\n\
                      - Approved summaries must not carry blocker evidence in blocker fields.",
                 ));
+            } else if schema.contract_id == "proposal_decomposition_plan_v1" {
+                parts.push(String::from(
+                    "Required routing invariants for `proposal_decomposition_plan_v1`:\n\
+                     - `requires_split` must be a boolean.\n\
+                     - `implementation_start_decision` must be exactly one of `ready_with_declared_boundaries` or `split_required`; never invent a blocker status such as `blocked_external_prerequisite`.\n\
+                     - When `requires_split` is `false`, `implementation_start_decision` must be `ready_with_declared_boundaries`.\n\
+                     - When `requires_split` is `true`, `implementation_start_decision` must be `split_required` and `split_candidates` must include at least one object with non-empty string `candidate_id` and `reason`.\n\
+                     - Route any implementation-start uncertainty through a concrete split candidate; this workflow has no third blocked-decision route.",
+                ));
             }
         }
     }
@@ -9658,6 +9667,53 @@ fn workspace_absolute_path(path: &str, workspace_root: &str) -> String {
     }
 }
 
+pub(crate) fn current_proposal_writer_backlog_context(
+    plan: &workflow::plan::RunPlan,
+    run: &domain::run::Run,
+) -> Option<String> {
+    let template = plan.artifact_paths.get("score_lift_backlog")?;
+    let resolved = resolve_path_template(
+        template,
+        &run.workspace_root,
+        run.chainworks_meta_root.as_deref(),
+    );
+    let artifact_path = workspace_absolute_path(&resolved, &run.workspace_root);
+    Some(proposal_writer_authoritative_backlog_context(
+        &artifact_path,
+        &artifact_path,
+    ))
+}
+
+/// Retries retain historical work-item payloads, but the score-lift backlog is
+/// current run input. Append its authority block after any persisted prompt.
+pub(crate) fn append_current_proposal_writer_backlog_context(
+    plan: &workflow::plan::RunPlan,
+    run: &domain::run::Run,
+    agent_id: &str,
+    payload: &mut serde_json::Value,
+) -> Result<bool> {
+    if agent_id != "proposal_writer" {
+        return Ok(false);
+    }
+    let Some(context) = current_proposal_writer_backlog_context(plan, run) else {
+        return Ok(false);
+    };
+    let Some(object) = payload.as_object_mut() else {
+        return Ok(false);
+    };
+    let Some(prompt) = object.get("prompt").and_then(serde_json::Value::as_str) else {
+        return Ok(false);
+    };
+    if prompt.ends_with(&context) {
+        return Ok(false);
+    }
+    object.insert(
+        "prompt".into(),
+        serde_json::json!(format!("{prompt}\n\n{context}")),
+    );
+    Ok(true)
+}
+
 fn proposal_writer_authoritative_backlog_context(
     artifact_path: &str,
     display_path: &str,
@@ -9949,6 +10005,10 @@ mod tests {
         facts.supervision_classification = None;
         facts.failure_kind = Some(AgentFailureKind::MissingRequiredOutputs);
         assert!(!p058_requires_provider_force_detach(Some(&facts)));
+
+        facts.failure_kind = Some(AgentFailureKind::McpPermissionModalStall);
+        assert!(!p058_requires_provider_force_detach(Some(&facts)));
+
         assert!(!p058_requires_provider_force_detach(None));
     }
 
@@ -10691,6 +10751,109 @@ mod tests {
             fallback["failed_agent_execution_id"],
             serde_json::json!(failed_exec_id.to_string())
         );
+    }
+
+    #[test]
+    fn persisted_dynamic_health_fallback_payload_uses_frozen_target_profile_authority() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let plan = workflow::compiler::compile(
+            root.join("examples/workflows/full-mvp-live.yaml")
+                .to_str()
+                .unwrap(),
+            root.join("examples/agents/agents.yaml").to_str().unwrap(),
+        )
+        .expect("full MVP plan must compile");
+        assert_eq!(
+            plan.mission_context_version.as_deref(),
+            Some("agent_mission_context_v1")
+        );
+
+        let state = plan
+            .states
+            .get("state_4_proposal_reviewed")
+            .expect("proposal review state must be frozen");
+        let binding = plan
+            .dynamic_candidate_bindings
+            .iter()
+            .find(|binding| binding.agent_id == "proposal_reviewer_reliability")
+            .expect("reliability reviewer must have a dynamic binding");
+        let frozen_agent: ResolvedAgent =
+            serde_json::from_str(&binding.resolved_agent_snapshot_json)
+                .expect("dynamic binding must contain the resolved frozen agent");
+        let mut fallback_agent = frozen_agent.clone();
+        fallback_agent.backend_profile_id = Some("codex_architect_high".into());
+        fallback_agent.provider = "codex_acp".into();
+        fallback_agent.model = Some("gpt-5.6".into());
+        fallback_agent.effort = Some("xhigh".into());
+        fallback_agent.max_turns = Some(16);
+        fallback_agent.temperature = Some(0.1);
+
+        let task = CompiledTask {
+            agent: fallback_agent.clone(),
+            task_name: "dynamic_review_proposal_reviewer_reliability".into(),
+            inputs: vec!["idea_brief".into(), "proposal_current".into()],
+            outputs: vec!["proposal_review_reliability".into()],
+            output_policies: HashMap::new(),
+            output_schemas: HashMap::new(),
+            parallel: true,
+            phase: 0,
+            selected_outputs_from: None,
+        };
+        let run_id = RunId::new();
+        let run = test_run(run_id);
+        let idea = test_idea(run.idea_id);
+        let prompt = crate::agent_mission_context::finalize_task_prompt_v1(
+            &plan,
+            &run,
+            state,
+            &task,
+            &idea,
+            "review the proposal",
+        )
+        .expect("fallback task prompt must preserve the frozen mission context");
+
+        let payload = serde_json::json!({
+            "run_id": run_id.to_string(),
+            "stage_id": state.id,
+            "task_name": task.task_name,
+            "task_outputs": task.outputs,
+            "agent_id": task.agent.agent_id,
+            "backend_profile_id": task.agent.backend_profile_id,
+            "provider": task.agent.provider,
+            "model": task.agent.model,
+            "effort": task.agent.effort,
+            "max_turns": task.agent.max_turns,
+            "temperature": task.agent.temperature,
+            "permission_profile": task.agent.permission_profile,
+            "skill_ref": task.agent.skill_ref,
+            "skill_role": task.agent.skill_role,
+            "skill_snapshot_hash": task.agent.skill_snapshot_hash,
+            "requested_mcp_server_ids": task.agent.requested_mcp_server_ids,
+            "worktree_write_enabled": task.agent.worktree_write_enabled,
+            "worktree_strategy": task.agent.worktree_strategy,
+            "session_reuse_scope": task.agent.session_reuse_scope,
+            "session_family_id": task.agent.session_family_id,
+            "xcode_broker_required": task.agent.xcode_broker_required,
+            "xcode_shim_injection_signal": task.agent.xcode_shim_injection_signal,
+            "requires_xcode_host_execution": task.agent.requires_xcode_host_execution,
+            "output_contract": task.agent.output_contract,
+            "prompt": prompt,
+            "p060_dynamic_phase": 0,
+            "p060_binding_id": binding.binding_id,
+            "provider_health_fallback": {
+                "reason": "prior_run_local_provider_output_failure",
+                "failed_agent_execution_id": AgentExecutionId::new().to_string(),
+                "from_provider": frozen_agent.provider,
+                "to_provider": fallback_agent.provider,
+                "from_backend_profile_id": frozen_agent.backend_profile_id,
+                "to_backend_profile_id": fallback_agent.backend_profile_id,
+            }
+        });
+
+        crate::agent_mission_context::validate_persisted_v1_payload_prompt_with_truth(
+            &plan, &run, &idea, &payload,
+        )
+        .expect("attested health fallback must remain compatible with the frozen plan");
     }
 
     #[tokio::test]
@@ -13988,6 +14151,55 @@ mod tests {
     }
 
     #[test]
+    fn proposal_decomposition_prompt_requires_a_transition_valid_decision_pair() {
+        let run_id = RunId::new();
+        let run = test_run(run_id);
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "proposal_decomposition_plan".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/proposal/decomposition-plan.json".into(),
+        );
+        let mut task = reviewer_task();
+        task.agent.agent_id = "lead_orchestrator".into();
+        task.task_name = "decompose_proposal_before_implementation".into();
+        task.outputs = vec!["proposal_decomposition_plan".into()];
+        task.output_schemas.clear();
+        task.output_schemas.insert(
+            "proposal_decomposition_plan".into(),
+            OutputSchema {
+                contract_id: "proposal_decomposition_plan_v1".into(),
+                format: "json".into(),
+                human_format: None,
+                machine_format: Some("json".into()),
+                validation_mode: Some("strict_structured".into()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec![
+                    "schema_version".into(),
+                    "requires_split".into(),
+                    "implementation_start_decision".into(),
+                ],
+            },
+        );
+
+        let prompt = build_task_prompt(&task, &plan, &run, None, None, None)
+            .expect("proposal decomposition prompt should build");
+
+        assert!(prompt.contains(
+            "`implementation_start_decision` must be exactly one of `ready_with_declared_boundaries` or `split_required`"
+        ));
+        assert!(prompt
+            .contains("never invent a blocker status such as `blocked_external_prerequisite`"));
+        assert!(prompt.contains(
+            "When `requires_split` is `false`, `implementation_start_decision` must be `ready_with_declared_boundaries`"
+        ));
+        assert!(prompt.contains(
+            "When `requires_split` is `true`, `implementation_start_decision` must be `split_required`"
+        ));
+        assert!(prompt.contains("non-empty string `candidate_id` and `reason`"));
+    }
+
+    #[test]
     fn proposal_writer_prompt_inlines_authoritative_score_lift_backlog_context() {
         let tmp = tempfile::tempdir().unwrap();
         let run_id = RunId::new();
@@ -14050,6 +14262,61 @@ mod tests {
         assert!(prompt.contains(
             "If existing proposal text or reused session memory mentions an older review pass"
         ));
+    }
+
+    #[test]
+    fn proposal_writer_backlog_rehydration_is_current_and_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(format!(".chainworks/runs/{run_id}"));
+
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "score_lift_backlog".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/score-lift-backlog.json".into(),
+        );
+        let backlog_path = tmp.path().join(format!(
+            ".chainworks/runs/{run_id}/reviews/proposal/score-lift-backlog.json"
+        ));
+        std::fs::create_dir_all(backlog_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            backlog_path,
+            serde_json::json!({
+                "review_pass_id": "current-review-pass",
+                "items": [{"id": "CURRENT-001"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut payload = serde_json::json!({
+            "prompt": "Refine the proposal\n\n### Authoritative Proposal Review Backlog\n- review_pass_id: `stale-review-pass`"
+        });
+        assert!(append_current_proposal_writer_backlog_context(
+            &plan,
+            &run,
+            "proposal_writer",
+            &mut payload,
+        )
+        .unwrap());
+        let prompt = payload["prompt"].as_str().unwrap();
+        assert!(prompt.contains("review_pass_id: `current-review-pass`"));
+        assert!(
+            prompt.rfind("review_pass_id: `current-review-pass`")
+                > prompt.rfind("review_pass_id: `stale-review-pass`")
+        );
+
+        let once = payload.clone();
+        assert!(!append_current_proposal_writer_backlog_context(
+            &plan,
+            &run,
+            "proposal_writer",
+            &mut payload,
+        )
+        .unwrap());
+        assert_eq!(payload, once);
     }
 
     #[test]

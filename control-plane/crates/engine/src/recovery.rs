@@ -305,7 +305,7 @@ fn p088_startup_receipt_recovery_max_files() -> usize {
     std::env::var("CHAINWORKS_P088_STARTUP_RECEIPT_RECOVERY_MAX_FILES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0)
+        .unwrap_or(256)
 }
 
 fn terminal_human_pause_suppresses_targeted_retry(payload: &serde_json::Value) -> bool {
@@ -406,6 +406,24 @@ mod tests {
                 "accept_or_retry_degraded_outputs",
                 "valid_outputs_from_failed_execution"
             )
+        );
+    }
+
+    #[test]
+    fn xcode_broker_timeout_requires_xcode_inspection_before_retry() {
+        let mut facts = domain::agent::AgentExecutionRuntimeFacts::defaults_for(
+            domain::ids::AgentExecutionId::new(),
+            Utc::now(),
+        );
+        facts.failure_kind = Some(AgentFailureKind::McpStartupTimeout);
+        facts.transport_error_code = Some(
+            crate::failure_classifier::XCODE_MCP_BROKER_UNRESPONSIVE_TRANSPORT_ERROR_CODE
+                .to_string(),
+        );
+
+        assert_eq!(
+            recovery_action_from_runtime_facts(Some(&facts)),
+            ("inspect_xcode_then_retry", "xcode_mcp_broker_unresponsive")
         );
     }
 
@@ -534,6 +552,14 @@ fn recovery_action_from_runtime_facts(
     let Some(facts) = facts else {
         return ("retry_stage", "stage_settled_failed");
     };
+    if matches!(
+        facts.failure_kind.as_ref(),
+        Some(AgentFailureKind::McpStartupTimeout)
+    ) && facts.transport_error_code.as_deref()
+        == Some(crate::failure_classifier::XCODE_MCP_BROKER_UNRESPONSIVE_TRANSPORT_ERROR_CODE)
+    {
+        return ("inspect_xcode_then_retry", "xcode_mcp_broker_unresponsive");
+    }
     match (&facts.failure_kind, &facts.output_settlement) {
         (Some(AgentFailureKind::ProviderQuota), _) => {
             ("wait_until_retry_after", "provider_quota_retry_budget")
@@ -1725,11 +1751,11 @@ impl RecoveryService {
             let Ok(entry) = entry else {
                 continue;
             };
+            inspected += 1;
             let path = entry.path().join("code-writer-completion-receipt-v1.json");
             if !path.exists() {
                 continue;
             }
-            inspected += 1;
             let raw = match std::fs::read_to_string(&path) {
                 Ok(raw) => raw,
                 Err(e) => {

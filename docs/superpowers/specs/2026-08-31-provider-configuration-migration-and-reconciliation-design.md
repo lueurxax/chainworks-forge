@@ -10,7 +10,8 @@ Reserved focused gate: `provider-configuration-migration`
 
 Own the storage migration, bootstrap, and restart reconciliation needed by a
 future durable provider-configuration authority. It is separate from the
-active planned-label slice, which adds no authority tables.
+implemented [planned-binding contract](../../reference/provider-binding-truth.md),
+which adds no authority tables.
 
 ## Owned scope
 

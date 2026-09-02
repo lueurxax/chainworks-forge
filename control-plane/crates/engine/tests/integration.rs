@@ -6,16 +6,17 @@ use std::sync::{
 use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
-    agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, approvals,
-    artifact_contracts, artifacts, code_writer_completion_receipts, escalation, ideas, projections,
-    retry_operator_instructions, retry_payload_recovery_events, retry_stage_execution_authorities,
-    runs, scheduler, sessions, side_effects, stages, startup_repairs, work_items,
-    workflow_conflicts,
+    agent_execution_runtime_facts, agent_execution_runtime_receipts, agent_executions,
+    agent_retry_budget_ledger, approvals, artifact_contracts, artifacts,
+    code_writer_completion_receipts, escalation, ideas, projections, retry_operator_instructions,
+    retry_payload_recovery_events, retry_stage_execution_authorities, runs, scheduler, sessions,
+    side_effects, stages, startup_repairs, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItemKind, WorkItemStatus};
 use domain::agent::{
-    AgentExecution, AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement,
-    AgentStatus, ArtifactSourceClaimState, OperatorActionHint,
+    AgentExecution, AgentExecutionRuntimeFacts, AgentExecutionRuntimeReceiptRecord,
+    AgentFailureKind, AgentOutputSettlement, AgentStatus, ArtifactSourceClaimState,
+    OperatorActionHint,
 };
 use domain::approval::{Approval, ApprovalDecision};
 use domain::artifact::{Artifact, ArtifactFormat};
@@ -5287,6 +5288,401 @@ async fn quota_ledger_elapsed_auto_resume_schedules_stage_retry_once() {
         .filter(|s| s.stage_id == "implementation" && s.attempt_number > 1)
         .count();
     assert_eq!(retry_stage_count, 1, "auto retry must be idempotent");
+}
+
+#[tokio::test]
+async fn quota_ledger_elapsed_auto_resume_does_not_roll_clock_reset_into_next_day() {
+    let pool = test_pool().await;
+    let failed_at = chrono::DateTime::parse_from_rfc3339("2026-08-31T22:41:36Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let retry_after = chrono::DateTime::parse_from_rfc3339("2026-09-01T02:40:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let poll_after_reset = chrono::DateTime::parse_from_rfc3339("2026-09-01T02:40:14Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("implementation".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Failed);
+    stage.stage_id = "implementation".into();
+    stage.completed_at = Some(failed_at);
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let mut agent = make_agent_execution(stage_exec_id, AgentStatus::Failed);
+    agent.agent_id = "code_writer".into();
+    agent.completed_at = Some(failed_at);
+    agent_executions::insert(&pool, &agent).await.unwrap();
+
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent.id, failed_at);
+    facts.failure_kind = Some(AgentFailureKind::ProviderQuota);
+    facts.retry_after = Some(retry_after);
+    agent_execution_runtime_facts::upsert(&pool, &facts)
+        .await
+        .unwrap();
+    let ledger = agent_retry_budget_ledger::upsert_quota_failure(
+        &pool,
+        run_id,
+        stage_exec_id,
+        agent.id,
+        Some(retry_after),
+    )
+    .await
+    .unwrap();
+    agent_execution_runtime_receipts::upsert(
+        &pool,
+        &AgentExecutionRuntimeReceiptRecord {
+            agent_execution_id: agent.id,
+            provider: "claude_acp".into(),
+            transport_family: "acp_stdio".into(),
+            status: "failed".into(),
+            failure_phase: Some("provider_quota".into()),
+            event_count: 1,
+            last_event_kind: Some("provider_failure".into()),
+            last_event_at_ms: Some(1),
+            receipt_json: serde_json::json!({
+                "completed_at": "2026-08-31T22:41:36Z",
+                "provider_error_message_redacted":
+                    "You've hit your session limit; resets 5:40am (Asia/Nicosia)"
+            })
+            .to_string(),
+            created_at: failed_at,
+            updated_at: failed_at,
+        },
+    )
+    .await
+    .unwrap();
+
+    let scheduled = make_command_handler(pool.clone())
+        .auto_resume_elapsed_quota_ledgers(poll_after_reset)
+        .await
+        .unwrap();
+    assert_eq!(scheduled, 1, "elapsed quota reset must schedule a retry");
+
+    let mut tx = pool.begin().await.unwrap();
+    let ledger_after = agent_retry_budget_ledger::find_by_id_tx(&mut tx, &ledger.id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(ledger_after.state, "reset_elapsed_retry_scheduled");
+    assert!(ledger_after.normal_budget_consumed);
+    assert_eq!(ledger_after.retry_after, Some(retry_after));
+}
+
+#[tokio::test]
+async fn quota_ledger_auto_resume_reconciles_historical_daily_reset_before_retrying() {
+    let pool = test_pool().await;
+    let failed_at = chrono::DateTime::parse_from_rfc3339("2026-08-15T17:36:32Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let original_retry_after = chrono::DateTime::parse_from_rfc3339("2026-08-15T21:40:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let incorrectly_deferred_retry_after =
+        chrono::DateTime::parse_from_rfc3339("2026-09-01T21:40:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+    let recovery_now = chrono::DateTime::parse_from_rfc3339("2026-09-01T09:17:56Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("proposal_refined".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Failed);
+    stage.stage_id = "proposal_refined".into();
+    stage.completed_at = Some(failed_at);
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let mut agent = make_agent_execution(stage_exec_id, AgentStatus::Failed);
+    agent.agent_id = "proposal_writer".into();
+    agent.completed_at = Some(failed_at);
+    agent_executions::insert(&pool, &agent).await.unwrap();
+
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent.id, failed_at);
+    facts.failure_kind = Some(AgentFailureKind::ProviderQuota);
+    facts.retry_after = Some(original_retry_after);
+    agent_execution_runtime_facts::upsert(&pool, &facts)
+        .await
+        .unwrap();
+    let ledger = agent_retry_budget_ledger::upsert_quota_failure(
+        &pool,
+        run_id,
+        stage_exec_id,
+        agent.id,
+        Some(original_retry_after),
+    )
+    .await
+    .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    agent_retry_budget_ledger::defer_reset_elapsed_retry_tx(
+        &mut tx,
+        &ledger.id,
+        incorrectly_deferred_retry_after,
+        failed_at,
+    )
+    .await
+    .unwrap();
+    agent_execution_runtime_facts::update_provider_quota_retry_after_tx(
+        &mut tx,
+        agent.id,
+        incorrectly_deferred_retry_after,
+        failed_at,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    agent_execution_runtime_receipts::upsert(
+        &pool,
+        &AgentExecutionRuntimeReceiptRecord {
+            agent_execution_id: agent.id,
+            provider: "claude_acp".into(),
+            transport_family: "acp_stdio".into(),
+            status: "failed".into(),
+            failure_phase: Some("provider_quota".into()),
+            event_count: 1,
+            last_event_kind: Some("provider_failure".into()),
+            last_event_at_ms: Some(1),
+            receipt_json: serde_json::json!({
+                "provider_error_message_redacted":
+                    "You've hit your session limit; resets 12:40am (Asia/Nicosia)"
+            })
+            .to_string(),
+            created_at: failed_at,
+            updated_at: failed_at,
+        },
+    )
+    .await
+    .unwrap();
+
+    let scheduled = make_command_handler(pool.clone())
+        .auto_resume_elapsed_quota_ledgers(recovery_now)
+        .await
+        .unwrap();
+    assert_eq!(
+        scheduled, 1,
+        "historical quota reset should schedule one retry"
+    );
+
+    let mut tx = pool.begin().await.unwrap();
+    let ledger_after = agent_retry_budget_ledger::find_by_id_tx(&mut tx, &ledger.id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(ledger_after.retry_after, Some(original_retry_after));
+    assert_eq!(ledger_after.state, "reset_elapsed_retry_scheduled");
+    assert!(ledger_after.normal_budget_consumed);
+
+    let facts_after = agent_execution_runtime_facts::find_by_execution_id(&pool, agent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(facts_after.retry_after, Some(original_retry_after));
+}
+
+#[tokio::test]
+async fn quota_ledger_auto_resume_defers_fallback_before_explicit_claude_reset() {
+    let pool = test_pool().await;
+    let retry_now = Utc::now();
+    let fallback_retry_after = retry_now - chrono::Duration::minutes(1);
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("proposal_refined".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Failed);
+    stage.stage_id = "proposal_refined".into();
+    stage.completed_at = Some(fallback_retry_after);
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let mut agent = make_agent_execution(stage_exec_id, AgentStatus::Failed);
+    agent.agent_id = "proposal_writer".into();
+    agent.completed_at = Some(fallback_retry_after);
+    agent_executions::insert(&pool, &agent).await.unwrap();
+
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent.id, fallback_retry_after);
+    facts.failure_kind = Some(AgentFailureKind::ProviderQuota);
+    facts.retry_after = Some(fallback_retry_after);
+    agent_execution_runtime_facts::upsert(&pool, &facts)
+        .await
+        .unwrap();
+    let ledger = agent_retry_budget_ledger::upsert_quota_failure(
+        &pool,
+        run_id,
+        stage_exec_id,
+        agent.id,
+        Some(fallback_retry_after),
+    )
+    .await
+    .unwrap();
+    agent_execution_runtime_receipts::upsert(
+        &pool,
+        &AgentExecutionRuntimeReceiptRecord {
+            agent_execution_id: agent.id,
+            provider: "claude_acp".into(),
+            transport_family: "acp_stdio".into(),
+            status: "failed".into(),
+            failure_phase: Some("provider_quota".into()),
+            event_count: 1,
+            last_event_kind: Some("provider_failure".into()),
+            last_event_at_ms: Some(1),
+            receipt_json: serde_json::json!({
+                "provider_error_message_redacted":
+                    "You've hit your session limit; resets 11:59pm (Asia/Nicosia)"
+            })
+            .to_string(),
+            created_at: fallback_retry_after,
+            updated_at: fallback_retry_after,
+        },
+    )
+    .await
+    .unwrap();
+
+    let scheduled = make_command_handler(pool.clone())
+        .auto_resume_elapsed_quota_ledgers(retry_now)
+        .await
+        .unwrap();
+    assert_eq!(scheduled, 0, "must not retry before the provider reset");
+
+    let mut tx = pool.begin().await.unwrap();
+    let ledger_after = agent_retry_budget_ledger::find_by_id_tx(&mut tx, &ledger.id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(ledger_after.state, "waiting_for_reset");
+    assert!(!ledger_after.normal_budget_consumed);
+    assert!(ledger_after.retry_after.expect("explicit reset time") > retry_now);
+
+    let facts_after = agent_execution_runtime_facts::find_by_execution_id(&pool, agent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(facts_after.retry_after, ledger_after.retry_after);
+    assert!(stages::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .iter()
+        .all(|stage| stage.attempt_number == 1));
+}
+
+#[tokio::test]
+async fn quota_ledger_elapsed_auto_resume_selects_current_stage_despite_newer_historical_ledger() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let earlier_stage_exec_id = StageExecutionId::new();
+    let latest_stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("proposal_refined".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut earlier_stage = make_stage(earlier_stage_exec_id, run_id, StageStatus::Failed);
+    earlier_stage.stage_id = "proposal_reviewed".into();
+    earlier_stage.started_at = Utc::now() - chrono::Duration::minutes(3);
+    earlier_stage.completed_at = Some(Utc::now() - chrono::Duration::minutes(2));
+    stages::insert(&pool, &earlier_stage).await.unwrap();
+    let mut earlier_agent = make_agent_execution(earlier_stage_exec_id, AgentStatus::Failed);
+    earlier_agent.agent_id = "proposal_reviewer".into();
+    earlier_agent.completed_at = Some(Utc::now() - chrono::Duration::minutes(2));
+    agent_executions::insert(&pool, &earlier_agent)
+        .await
+        .unwrap();
+
+    let mut latest_stage = make_stage(latest_stage_exec_id, run_id, StageStatus::Failed);
+    latest_stage.stage_id = "proposal_refined".into();
+    latest_stage.started_at = Utc::now() - chrono::Duration::minutes(15);
+    latest_stage.completed_at = Some(Utc::now() - chrono::Duration::minutes(10));
+    stages::insert(&pool, &latest_stage).await.unwrap();
+    let mut latest_agent = make_agent_execution(latest_stage_exec_id, AgentStatus::Failed);
+    latest_agent.agent_id = "proposal_writer".into();
+    latest_agent.completed_at = Some(Utc::now() - chrono::Duration::minutes(10));
+    agent_executions::insert(&pool, &latest_agent)
+        .await
+        .unwrap();
+
+    let earlier_retry_after = Utc::now() - chrono::Duration::minutes(2);
+    let mut earlier_facts = AgentExecutionRuntimeFacts::defaults_for(earlier_agent.id, Utc::now());
+    earlier_facts.failure_kind = Some(AgentFailureKind::ProviderQuota);
+    earlier_facts.retry_after = Some(earlier_retry_after);
+    agent_execution_runtime_facts::upsert(&pool, &earlier_facts)
+        .await
+        .unwrap();
+    let earlier_ledger = agent_retry_budget_ledger::upsert_quota_failure(
+        &pool,
+        run_id,
+        earlier_stage_exec_id,
+        earlier_agent.id,
+        Some(earlier_retry_after),
+    )
+    .await
+    .unwrap();
+
+    let latest_retry_after = Utc::now() - chrono::Duration::minutes(1);
+    let mut latest_facts = AgentExecutionRuntimeFacts::defaults_for(latest_agent.id, Utc::now());
+    latest_facts.failure_kind = Some(AgentFailureKind::ProviderQuota);
+    latest_facts.retry_after = Some(latest_retry_after);
+    agent_execution_runtime_facts::upsert(&pool, &latest_facts)
+        .await
+        .unwrap();
+    let latest_ledger = agent_retry_budget_ledger::upsert_quota_failure(
+        &pool,
+        run_id,
+        latest_stage_exec_id,
+        latest_agent.id,
+        Some(latest_retry_after),
+    )
+    .await
+    .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    assert_eq!(
+        handler
+            .auto_resume_elapsed_quota_ledgers(Utc::now())
+            .await
+            .unwrap(),
+        1
+    );
+
+    let stages_after = stages::list_by_run(&pool, run_id).await.unwrap();
+    assert!(stages_after
+        .iter()
+        .any(|stage| { stage.stage_id == "proposal_refined" && stage.attempt_number == 2 }));
+    assert!(!stages_after
+        .iter()
+        .any(|stage| { stage.stage_id == "proposal_reviewed" && stage.attempt_number == 2 }));
+
+    let mut tx = pool.begin().await.unwrap();
+    let earlier_after = agent_retry_budget_ledger::find_by_id_tx(&mut tx, &earlier_ledger.id)
+        .await
+        .unwrap();
+    let latest_after = agent_retry_budget_ledger::find_by_id_tx(&mut tx, &latest_ledger.id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(!earlier_after.normal_budget_consumed);
+    assert!(latest_after.normal_budget_consumed);
 }
 
 #[tokio::test]
@@ -14913,6 +15309,10 @@ async fn proposal_088_code_writer_stale_implementation_active_enters_receipt_pat
         )
         .await
         .unwrap();
+
+    // The indexed scheduler cutoff intentionally admits newly enqueued work
+    // after the current whole-second window has elapsed.
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
 
     let error = executor
         .process_next_item()

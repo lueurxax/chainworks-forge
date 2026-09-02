@@ -17,9 +17,9 @@ use thiserror::Error as ThisError;
 use tracing::{info, warn};
 
 use db::repos::{
-    agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger,
-    approval_mutation_idempotency, approvals, artifact_contracts, audit_log, closeout,
-    code_writer_completion_receipts, command_idempotency, command_journal,
+    agent_execution_runtime_facts, agent_execution_runtime_receipts, agent_executions,
+    agent_retry_budget_ledger, approval_mutation_idempotency, approvals, artifact_contracts,
+    audit_log, closeout, code_writer_completion_receipts, command_idempotency, command_journal,
     escalation as escalation_repo, ideas, legacy_discovery_overrides, mcp_command_idempotency,
     projections, provider_sessions, retry_operator_instructions, retry_stage_execution_authorities,
     runs, scheduler, sessions, side_effects as side_effects_repo, stages, work_items,
@@ -68,6 +68,7 @@ use crate::closeout_fingerprint::{
 };
 use crate::closeout_loop_budget::closeout_loop_budget_remaining;
 use crate::event_bus::EventSender;
+use crate::failure_classifier::provider_quota_retry_after_from_message_at;
 use crate::preflight::{
     missing_delivery_configuration_preflight, run_delivery_preflight, DeliveryPreflightResult,
 };
@@ -77,6 +78,18 @@ use crate::synthesizers::closeout_readiness::{
     SynthesizerInputs, NO_DIFF_CONVERGENCE_THRESHOLD,
 };
 use crate::work_queue::WorkQueue;
+
+/// A retry was correctly rejected because its provider quota reset window has
+/// not elapsed. MCP maps this typed error to an operator-safe response rather
+/// than exposing the command handler's internal error text.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "quota retry_after has not elapsed for stage {stage_execution_id}; retry after {retry_after} or set consume_quota_budget_now=true"
+)]
+pub struct ProviderQuotaRetryAfterError {
+    pub stage_execution_id: StageExecutionId,
+    pub retry_after: DateTime<Utc>,
+}
 
 fn run_forbids_retry(run: &Run) -> bool {
     matches!(
@@ -1874,6 +1887,7 @@ async fn active_p058_escalation_context_for_targeted_retry(
     stage_id: &str,
     source_stage_execution_id: StageExecutionId,
     agent_id: &str,
+    source_payload: &serde_json::Value,
 ) -> Result<Option<serde_json::Value>> {
     let mut matching = escalation_repo::find_ledgers_by_run(pool, run_id)
         .await?
@@ -1885,19 +1899,49 @@ async fn active_p058_escalation_context_for_targeted_retry(
                     == Some(source_stage_execution_id.to_string().as_str())
                 && ledger.agent_id == agent_id
         });
-    let Some(ledger) = matching.next() else {
-        return Ok(None);
+    let ledger = match matching.next() {
+        Some(ledger) => {
+            if let Some(duplicate) = matching.next() {
+                anyhow::bail!(
+                    "ambiguous active P058 ledgers for targeted retry: {} and {} both match run {} stage execution {} agent {}",
+                    ledger.id,
+                    duplicate.id,
+                    run_id,
+                    source_stage_execution_id,
+                    agent_id,
+                );
+            }
+            ledger
+        }
+        None => {
+            let Some(ledger_id) = source_payload
+                .pointer("/targeted_retry/escalation/ledger_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return Ok(None);
+            };
+            let Some(ledger) = escalation_repo::find_ledger_by_id(pool, ledger_id).await? else {
+                return Ok(None);
+            };
+            if ledger.status_raw != "active" {
+                return Ok(None);
+            }
+            if ledger.run_id != run_id || ledger.stage_id != stage_id || ledger.agent_id != agent_id
+            {
+                anyhow::bail!(
+                    "targeted retry escalation ledger {} belongs to run {} stage {} agent {}, not run {} stage {} agent {}",
+                    ledger.id,
+                    ledger.run_id,
+                    ledger.stage_id,
+                    ledger.agent_id,
+                    run_id,
+                    stage_id,
+                    agent_id,
+                );
+            }
+            ledger
+        }
     };
-    if let Some(duplicate) = matching.next() {
-        anyhow::bail!(
-            "ambiguous active P058 ledgers for targeted retry: {} and {} both match run {} stage execution {} agent {}",
-            ledger.id,
-            duplicate.id,
-            run_id,
-            source_stage_execution_id,
-            agent_id,
-        );
-    }
     let tier_id = ledger
         .current_tier_id
         .as_deref()
@@ -2489,12 +2533,88 @@ impl CommandHandler {
     }
 
     pub async fn auto_resume_elapsed_quota_ledgers(&self, now: DateTime<Utc>) -> Result<u64> {
+        let historical_candidates =
+            agent_retry_budget_ledger::list_historical_quota_reset_candidates(&self.pool, now)
+                .await?;
+        for candidate in historical_candidates {
+            let Some(receipt_retry_after) = self
+                .explicit_provider_quota_retry_after(candidate.agent_execution_id)
+                .await?
+                .filter(|retry_after| *retry_after <= now && *retry_after < candidate.retry_after)
+            else {
+                continue;
+            };
+
+            let mut tx = self
+                .begin_command_transaction(
+                    "command.QuotaLedgerHistoricalResetReconcile",
+                    format!("quota-historical-reset-reconcile:{}", candidate.ledger_id),
+                )
+                .await?;
+            agent_retry_budget_ledger::reconcile_historical_quota_reset_tx(
+                &mut tx,
+                &candidate.ledger_id,
+                receipt_retry_after,
+                now,
+            )
+            .await?;
+            agent_execution_runtime_facts::reconcile_provider_quota_retry_after_tx(
+                &mut tx,
+                candidate.agent_execution_id,
+                receipt_retry_after,
+                now,
+            )
+            .await?;
+            tx.commit().await?;
+            info!(
+                ledger_id = %candidate.ledger_id,
+                agent_execution_id = %candidate.agent_execution_id,
+                retry_after = %receipt_retry_after,
+                "reconciled historical quota ledger to elapsed provider reset"
+            );
+        }
+
         let candidates =
             agent_retry_budget_ledger::list_reset_elapsed_auto_retry_candidates(&self.pool, now)
                 .await?;
         let mut scheduled = 0;
 
         for candidate in candidates {
+            if let Some(provider_retry_after) = self
+                .explicit_provider_quota_retry_after(candidate.agent_execution_id)
+                .await?
+                .filter(|retry_after| *retry_after > now && *retry_after > candidate.retry_after)
+            {
+                let mut tx = self
+                    .begin_command_transaction(
+                        "command.QuotaLedgerAutoResumeDefer",
+                        format!("quota-auto-retry-defer:{}", candidate.ledger_id),
+                    )
+                    .await?;
+                agent_retry_budget_ledger::defer_reset_elapsed_retry_tx(
+                    &mut tx,
+                    &candidate.ledger_id,
+                    provider_retry_after,
+                    now,
+                )
+                .await?;
+                agent_execution_runtime_facts::update_provider_quota_retry_after_tx(
+                    &mut tx,
+                    candidate.agent_execution_id,
+                    provider_retry_after,
+                    now,
+                )
+                .await?;
+                tx.commit().await?;
+                info!(
+                    ledger_id = %candidate.ledger_id,
+                    agent_execution_id = %candidate.agent_execution_id,
+                    retry_after = %provider_retry_after,
+                    "deferred elapsed quota ledger to explicit provider reset"
+                );
+                continue;
+            }
+
             let active_work = work_items::list_by_run(&self.pool, candidate.run_id)
                 .await?
                 .into_iter()
@@ -2569,6 +2689,31 @@ impl CommandHandler {
         }
 
         Ok(scheduled)
+    }
+
+    async fn explicit_provider_quota_retry_after(
+        &self,
+        agent_execution_id: domain::ids::AgentExecutionId,
+    ) -> Result<Option<DateTime<Utc>>> {
+        let receipt =
+            agent_execution_runtime_receipts::find_by_execution_id(&self.pool, agent_execution_id)
+                .await?;
+        Ok(receipt.and_then(|receipt| {
+            serde_json::from_str::<serde_json::Value>(&receipt.receipt_json)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("provider_error_message_redacted")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                // A reset clock such as "resets 5:40am" belongs to the failed
+                // provider attempt. Re-parsing it at an elapsed-ledger poll
+                // immediately after 05:40 would otherwise select tomorrow.
+                .and_then(|message| {
+                    provider_quota_retry_after_from_message_at(&message, receipt.created_at)
+                })
+        }))
     }
 
     fn maybe_inject_retry_stage_failure(&self, step: &str) -> Result<()> {
@@ -7340,6 +7485,7 @@ impl CommandHandler {
             stage_id,
             old_stage.id,
             &target_exec.agent_id,
+            &retry_payload,
         )
         .await?;
         let p088_completion_retry_evidence =
@@ -7462,6 +7608,15 @@ impl CommandHandler {
                         }),
                     );
                 }
+            }
+
+            if let Some(plan) = frozen_plan.as_ref() {
+                crate::orchestrator::append_current_proposal_writer_backlog_context(
+                    plan,
+                    &run,
+                    &target_exec.agent_id,
+                    &mut retry_payload,
+                )?;
             }
         } else {
             return Err(anyhow!(
@@ -10275,11 +10430,11 @@ async fn apply_quota_retry_budget_for_stage_tx(
         match ledger.retry_after {
             Some(retry_after) if retry_after > now => {
                 if !consume_quota_budget_now {
-                    return Err(anyhow!(
-                        "quota retry_after has not elapsed for stage {}; retry after {} or set consume_quota_budget_now=true",
+                    return Err(ProviderQuotaRetryAfterError {
                         stage_execution_id,
-                        retry_after.to_rfc3339()
-                    ));
+                        retry_after,
+                    }
+                    .into());
                 }
                 agent_retry_budget_ledger::consume_early_quota_retry_tx(tx, &ledger.id, journal_id)
                     .await?;

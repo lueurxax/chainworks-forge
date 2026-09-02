@@ -38,5 +38,6 @@ to fresh Codex model/effort selection.
 ## Activation rule
 
 Provider egress and diagnostics containment is a separate dependency. This
-document cannot broaden the active model-label slice or enable Codex
-resurrection implicitly.
+document cannot broaden the implemented
+[planned-binding contract](../../reference/provider-binding-truth.md) or enable
+Codex resurrection implicitly.

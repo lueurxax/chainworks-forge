@@ -3062,9 +3062,7 @@ mod tests {
         if let Some(ty) = schema.get("type") {
             let allowed: Vec<&str> = match ty {
                 serde_json::Value::String(s) => vec![s.as_str()],
-                serde_json::Value::Array(arr) => {
-                    arr.iter().filter_map(|v| v.as_str()).collect()
-                }
+                serde_json::Value::Array(arr) => arr.iter().filter_map(|v| v.as_str()).collect(),
                 _ => vec![],
             };
             if !allowed.is_empty()
@@ -3077,9 +3075,10 @@ mod tests {
                 ));
             }
         }
-        if let (Some(pattern), Some(s)) =
-            (schema.get("pattern").and_then(|v| v.as_str()), instance.as_str())
-        {
+        if let (Some(pattern), Some(s)) = (
+            schema.get("pattern").and_then(|v| v.as_str()),
+            instance.as_str(),
+        ) {
             if !matches_known_pattern(pattern, s) {
                 errors.push(format!(
                     "{path}: value {s:?} does not match pattern {pattern:?}"
@@ -3205,7 +3204,10 @@ mod tests {
             .expect("ok");
 
         assert_eq!(result["status"], "error");
-        assert!(!result["errors"].as_array().expect("errors array").is_empty());
+        assert!(!result["errors"]
+            .as_array()
+            .expect("errors array")
+            .is_empty());
         assert_validates_against_mcp_result_schema(&result);
     }
 
@@ -3230,7 +3232,10 @@ mod tests {
 
         assert_eq!(result["status"], "complete");
         assert_eq!(result["rows"].as_array().expect("rows array").len(), 1);
-        assert!(result["dry_run"].is_object(), "default include_dry_run=true");
+        assert!(
+            result["dry_run"].is_object(),
+            "default include_dry_run=true"
+        );
         assert_validates_against_mcp_result_schema(&result);
     }
 }

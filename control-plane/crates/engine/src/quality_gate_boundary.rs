@@ -2,6 +2,73 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+pub(crate) const QUALITY_GATE_BLOCKER_ASSESSMENT_V1_CONTRACT_ID: &str =
+    "quality_gate_blocker_assessment_v1";
+
+pub(crate) const QUALITY_GATE_BLOCKER_OWNER_CLASSES: &[&str] = &[
+    "output_settlement",
+    "missing_required_outputs",
+    "side_effect",
+    "side_effect_reconciliation",
+    "runtime_recovery",
+    "provider_recovery",
+    "review_refresh",
+    "stale_review",
+    "security_reviewer",
+    "prepush_reviewer",
+    "implementation_auditor",
+    "unknown",
+    "code_writer",
+    "local_code",
+    "docs_guardian",
+    "test_owner",
+    "implementation",
+    "invalid_claim",
+    "invalid_blocker_claim",
+    "blocked_no_progress",
+    "no_progress",
+    "followup_proposal",
+    "external_blocker",
+    "external_evidence",
+    "external_environment",
+    "release_evidence",
+    "operator",
+    "remote_host",
+];
+
+pub(crate) const QUALITY_GATE_BLOCKER_CLASSES: &[&str] = &[
+    "output_settlement",
+    "missing_required_outputs",
+    "side_effect",
+    "side_effect_reconciliation",
+    "runtime_recovery",
+    "provider_recovery",
+    "review_refresh",
+    "stale_review",
+    "local_code_tail",
+    "local_code",
+    "code_issue",
+    "docs_guardian",
+    "test_failure",
+    "implementation",
+    "invalid_claim",
+    "invalid_blocker_claim",
+    "blocked_no_progress",
+    "no_progress",
+    "followup_proposal",
+    "external_blocker",
+    "external_evidence",
+    "external_environment",
+    "remote_environment_required",
+    "release_evidence",
+    "operator_decision_required",
+];
+
+pub(crate) const QUALITY_GATE_BLOCKER_EVIDENCE_FRESHNESS_VALUES: &[&str] =
+    &["fresh", "stale", "unknown", "superseded"];
+
+pub(crate) const QUALITY_GATE_BLOCKER_SEVERITY_VALUES: &[&str] = &["hard", "soft", "advisory"];
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoundaryEvaluation {
     pub status: String,
@@ -371,10 +438,9 @@ fn parse_blockers(assessment: &serde_json::Value) -> Result<(Vec<BoundaryBlocker
                         .push(format!("blocker[{idx}].evidence_freshness is required"));
                     "unknown".to_string()
                 });
-            if !matches!(
-                evidence_freshness.as_str(),
-                "fresh" | "stale" | "unknown" | "superseded"
-            ) {
+            if !QUALITY_GATE_BLOCKER_EVIDENCE_FRESHNESS_VALUES
+                .contains(&evidence_freshness.as_str())
+            {
                 validation_errors.push(format!(
                     "blocker[{idx}].evidence_freshness has unknown value {evidence_freshness}"
                 ));
@@ -479,7 +545,7 @@ fn parse_blockers(assessment: &serde_json::Value) -> Result<(Vec<BoundaryBlocker
                 is_code_writer_blocking,
                 severity: required_string_field(object, idx, "severity", &mut validation_errors)
                     .map(|severity| {
-                        if !matches!(severity.as_str(), "hard" | "soft" | "advisory") {
+                        if !QUALITY_GATE_BLOCKER_SEVERITY_VALUES.contains(&severity.as_str()) {
                             validation_errors.push(format!(
                                 "blocker[{idx}].severity has unknown value {severity}"
                             ));
@@ -508,68 +574,11 @@ fn parse_blockers(assessment: &serde_json::Value) -> Result<(Vec<BoundaryBlocker
 }
 
 fn valid_owner_class(owner_class: &str) -> bool {
-    matches!(
-        owner_class,
-        "output_settlement"
-            | "missing_required_outputs"
-            | "side_effect"
-            | "side_effect_reconciliation"
-            | "runtime_recovery"
-            | "provider_recovery"
-            | "review_refresh"
-            | "stale_review"
-            | "security_reviewer"
-            | "prepush_reviewer"
-            | "implementation_auditor"
-            | "unknown"
-            | "code_writer"
-            | "local_code"
-            | "docs_guardian"
-            | "test_owner"
-            | "implementation"
-            | "invalid_claim"
-            | "invalid_blocker_claim"
-            | "blocked_no_progress"
-            | "no_progress"
-            | "followup_proposal"
-            | "external_blocker"
-            | "external_evidence"
-            | "external_environment"
-            | "release_evidence"
-            | "operator"
-            | "remote_host"
-    )
+    QUALITY_GATE_BLOCKER_OWNER_CLASSES.contains(&owner_class)
 }
 
 fn valid_blocker_class(blocker_class: &str) -> bool {
-    matches!(
-        blocker_class,
-        "output_settlement"
-            | "missing_required_outputs"
-            | "side_effect"
-            | "side_effect_reconciliation"
-            | "runtime_recovery"
-            | "provider_recovery"
-            | "review_refresh"
-            | "stale_review"
-            | "local_code_tail"
-            | "local_code"
-            | "code_issue"
-            | "docs_guardian"
-            | "test_failure"
-            | "implementation"
-            | "invalid_claim"
-            | "invalid_blocker_claim"
-            | "blocked_no_progress"
-            | "no_progress"
-            | "followup_proposal"
-            | "external_blocker"
-            | "external_evidence"
-            | "external_environment"
-            | "remote_environment_required"
-            | "release_evidence"
-            | "operator_decision_required"
-    )
+    QUALITY_GATE_BLOCKER_CLASSES.contains(&blocker_class)
 }
 
 fn string_field(

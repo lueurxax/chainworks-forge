@@ -50,6 +50,13 @@ pub struct QuotaLedgerAutoRetryCandidate {
     pub retry_after: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoricalQuotaResetCandidate {
+    pub ledger_id: String,
+    pub agent_execution_id: AgentExecutionId,
+    pub retry_after: DateTime<Utc>,
+}
+
 pub async fn upsert_quota_failure(
     pool: &SqlitePool,
     run_id: RunId,
@@ -251,6 +258,93 @@ pub async fn mark_elapsed_provider_quota_waits_tx(
     Ok(updated)
 }
 
+pub async fn defer_reset_elapsed_retry_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    ledger_id: &str,
+    retry_after: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+) -> Result<AgentRetryBudgetLedgerRow> {
+    let updated = sqlx::query(
+        r#"UPDATE agent_retry_budget_ledger
+           SET retry_after = ?1,
+               state = 'waiting_for_reset',
+               updated_at = ?2
+           WHERE id = ?3
+             AND failure_kind = ?4
+             AND normal_budget_consumed = 0
+             AND state IN ('waiting_for_reset', 'reset_elapsed')
+             AND (retry_after IS NULL OR retry_after < ?1)"#,
+    )
+    .bind(retry_after.to_rfc3339())
+    .bind(updated_at.to_rfc3339())
+    .bind(ledger_id)
+    .bind(AgentFailureKind::ProviderQuota.to_string())
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        anyhow::bail!("quota ledger {ledger_id} cannot be deferred to a later provider reset");
+    }
+    find_by_id_tx(tx, ledger_id).await
+}
+
+pub async fn list_historical_quota_reset_candidates(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+) -> Result<Vec<HistoricalQuotaResetCandidate>> {
+    let rows = sqlx::query(
+        r#"SELECT ledger.id AS ledger_id,
+                  ledger.agent_execution_id AS agent_execution_id,
+                  ledger.retry_after AS retry_after
+           FROM agent_retry_budget_ledger ledger
+           INNER JOIN agent_executions ae ON ae.id = ledger.agent_execution_id
+           WHERE ledger.failure_kind = ?1
+             AND ledger.normal_budget_consumed = 0
+             AND ledger.state = 'waiting_for_reset'
+             AND ledger.retry_after IS NOT NULL
+             AND ledger.retry_after > ?2
+             AND ae.status = 'failed'
+           ORDER BY ledger.retry_after ASC, ledger.created_at ASC"#,
+    )
+    .bind(AgentFailureKind::ProviderQuota.to_string())
+    .bind(now.to_rfc3339())
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(parse_historical_quota_reset_candidate_row)
+        .collect()
+}
+
+pub async fn reconcile_historical_quota_reset_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    ledger_id: &str,
+    retry_after: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+) -> Result<AgentRetryBudgetLedgerRow> {
+    let updated = sqlx::query(
+        r#"UPDATE agent_retry_budget_ledger
+           SET retry_after = ?1,
+               state = 'reset_elapsed',
+               updated_at = ?2
+           WHERE id = ?3
+             AND failure_kind = ?4
+             AND normal_budget_consumed = 0
+             AND state = 'waiting_for_reset'
+             AND retry_after > ?1"#,
+    )
+    .bind(retry_after.to_rfc3339())
+    .bind(updated_at.to_rfc3339())
+    .bind(ledger_id)
+    .bind(AgentFailureKind::ProviderQuota.to_string())
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        anyhow::bail!("quota ledger {ledger_id} cannot be reconciled to a prior provider reset");
+    }
+    find_by_id_tx(tx, ledger_id).await
+}
+
 pub async fn list_reset_elapsed_auto_retry_candidates(
     pool: &SqlitePool,
     now: DateTime<Utc>,
@@ -277,9 +371,13 @@ pub async fn list_reset_elapsed_auto_retry_candidates(
              AND ledger.stage_execution_id IS NOT NULL
              AND r.status = ?3
              AND r.cancellation_settled_at IS NULL
+             AND se.stage_id = r.current_state
              AND ae.status = 'failed'
              AND facts.failure_kind = ?1
-           ORDER BY ledger.retry_after ASC, ledger.created_at ASC"#,
+           ORDER BY se.started_at DESC,
+                    se.attempt_number DESC,
+                    ledger.created_at DESC,
+                    ledger.id DESC"#,
     )
     .bind(AgentFailureKind::ProviderQuota.to_string())
     .bind(now.to_rfc3339())
@@ -593,6 +691,20 @@ fn parse_auto_retry_candidate_row(
             .parse()
             .map_err(|e| anyhow::anyhow!("{e}"))?,
         stage_id: row.get("stage_id"),
+        agent_execution_id: agent_execution_id
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        retry_after: DateTime::parse_from_rfc3339(&retry_after)?.with_timezone(&Utc),
+    })
+}
+
+fn parse_historical_quota_reset_candidate_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<HistoricalQuotaResetCandidate> {
+    let agent_execution_id: String = row.get("agent_execution_id");
+    let retry_after: String = row.get("retry_after");
+    Ok(HistoricalQuotaResetCandidate {
+        ledger_id: row.get("ledger_id"),
         agent_execution_id: agent_execution_id
             .parse()
             .map_err(|e| anyhow::anyhow!("{e}"))?,

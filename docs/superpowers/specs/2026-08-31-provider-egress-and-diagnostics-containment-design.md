@@ -38,4 +38,4 @@ runtime security boundary, independent of model labels and P086 semantics.
 
 A later security-reviewed proposal must select one provider adapter as the
 first implementation cut. No broad provider egress change belongs to the
-active model-variant proposal.
+implemented [planned-binding contract](../../reference/provider-binding-truth.md).

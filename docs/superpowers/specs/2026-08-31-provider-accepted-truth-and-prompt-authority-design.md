@@ -7,9 +7,10 @@ Reserved focused gate: `provider-accepted-truth`
 
 ## Purpose
 
-Preserve the durable provider-acceptance scope removed from the active Codex
-variant slice. This document is an inventory only. It must be refined and
-reviewed independently before implementation.
+Preserve provider-acceptance scope beyond the implemented planned-binding
+contract in [Provider Binding Truth](../../reference/provider-binding-truth.md).
+This document is an inventory only. It must be refined and reviewed
+independently before implementation.
 
 ## Owned scope
 
@@ -31,7 +32,7 @@ reviewed independently before implementation.
 
 - P083 execution ownership truth.
 - Typed P070/P081 boundary authorization.
-- The active planned-label slice supplies only frozen run-plan identity. This
+- The implemented planned-binding contract supplies only frozen run-plan identity. This
   child owns any future rule that prevents prompts without provider proof.
 - Provider configuration migration/reconciliation must define durable storage
   and restart ownership.
@@ -49,5 +50,5 @@ reviewed independently before implementation.
 
 Scheduling requires a new bounded proposal below 2,000 lines with one
 implementation cut, exact schemas, a focused gate, and explicit exclusions.
-Nothing in this inventory may be implemented under the active model-label
-proposal.
+Nothing in this inventory may be introduced by changing the implemented
+planned-binding contract or its retained gate.

@@ -60,6 +60,14 @@ pub fn classify_trigger_from_failure_kind(
 pub fn classify_trigger_from_runtime_facts(
     facts: &AgentExecutionRuntimeFacts,
 ) -> Option<&'static str> {
+    if matches!(
+        facts.failure_kind.as_ref(),
+        Some(AgentFailureKind::McpStartupTimeout)
+    ) && facts.transport_error_code.as_deref()
+        == Some(crate::failure_classifier::XCODE_MCP_BROKER_UNRESPONSIVE_TRANSPORT_ERROR_CODE)
+    {
+        return None;
+    }
     if facts
         .transport_error_code
         .as_deref()
@@ -818,5 +826,19 @@ mod tests {
             classify_trigger_from_runtime_facts(&facts),
             Some("transport_failure")
         );
+    }
+
+    #[test]
+    fn xcode_broker_unresponsive_runtime_facts_do_not_escalate_providers() {
+        let now = Utc::now();
+        let agent_execution_id = AgentExecutionId::new();
+        let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+        facts.failure_kind = Some(AgentFailureKind::McpStartupTimeout);
+        facts.transport_error_code = Some(
+            crate::failure_classifier::XCODE_MCP_BROKER_UNRESPONSIVE_TRANSPORT_ERROR_CODE
+                .to_string(),
+        );
+
+        assert_eq!(classify_trigger_from_runtime_facts(&facts), None);
     }
 }

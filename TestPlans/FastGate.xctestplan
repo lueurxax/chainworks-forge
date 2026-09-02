@@ -18,6 +18,7 @@
       "selectedTests": [
         "Proposal081ApprovalActionAttemptStoreTests",
         "ArtifactPathClipboardTests",
+        "CodexModelVariantTruthTests",
         "ForgeGlassTests",
         "P089TempArtifactInventoryTests",
         "ProcessSupportTests",

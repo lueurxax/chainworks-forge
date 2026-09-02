@@ -38,6 +38,27 @@ fn embedded_shadow_boundary_policy() -> Arc<auth::boundary::BoundaryPolicy> {
     )
 }
 
+fn provider_quota_retry_after_response(
+    id: Option<serde_json::Value>,
+    tool_name: &str,
+    request_id: Option<&str>,
+    error: &anyhow::Error,
+) -> Option<JsonRpcResponse> {
+    let quota_wait =
+        error.downcast_ref::<engine::command_handler::ProviderQuotaRetryAfterError>()?;
+    Some(JsonRpcResponse::error_with_data(
+        id,
+        -32077,
+        "provider quota retry window has not elapsed",
+        serde_json::json!({
+            "code": "PROVIDER_QUOTA_RETRY_AFTER",
+            "tool_name": tool_name,
+            "retry_after": quota_wait.retry_after.to_rfc3339(),
+            "request_id": request_id,
+        }),
+    ))
+}
+
 async fn write_json_line<T: serde::Serialize>(stdout: &Arc<Mutex<tokio::io::Stdout>>, value: &T) {
     if let Ok(json) = serde_json::to_string(value) {
         let mut stdout = stdout.lock().await;
@@ -1063,6 +1084,14 @@ impl McpServer {
                         // plus the ambient request_id for correlation.
                         let rid = crate::request_context::current_request_id();
                         let error_text = e.to_string();
+                        if let Some(response) = provider_quota_retry_after_response(
+                            id.clone(),
+                            canonical_tool_name,
+                            rid.as_deref(),
+                            &e,
+                        ) {
+                            return response;
+                        }
                         if error_text.starts_with("IDEMPOTENCY_IN_FLIGHT") {
                             return JsonRpcResponse::error_with_data(
                                 id,
@@ -4364,6 +4393,38 @@ mod tests {
         auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
     }
 
+    #[test]
+    fn provider_quota_retry_after_is_a_typed_mcp_error() {
+        let retry_after = chrono::DateTime::parse_from_rfc3339("2026-09-01T02:40:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let error = anyhow::Error::new(engine::command_handler::ProviderQuotaRetryAfterError {
+            stage_execution_id: domain::ids::StageExecutionId::new(),
+            retry_after,
+        });
+
+        let response = provider_quota_retry_after_response(
+            Some(serde_json::json!(1)),
+            "stages.retry",
+            Some("request-123"),
+            &error,
+        )
+        .expect("provider quota retry wait must have a typed MCP response");
+
+        let error = response.error.expect("typed response must be an MCP error");
+        assert_eq!(error.code, -32077);
+        assert_eq!(error.message, "provider quota retry window has not elapsed");
+        let data = error.data.expect("typed response must include error data");
+        assert_eq!(data["code"], "PROVIDER_QUOTA_RETRY_AFTER");
+        assert_eq!(data["tool_name"], "stages.retry");
+        assert_eq!(data["retry_after"], "2026-09-01T02:40:00+00:00");
+        assert_eq!(data["request_id"], "request-123");
+        assert!(
+            data.get("stage_execution_id").is_none(),
+            "MCP response must not expose internal stage identifiers"
+        );
+    }
+
     fn observer_principal() -> auth::Principal {
         auth::Principal::new("test-observer", auth::PrincipalClass::Observer)
     }
@@ -4705,6 +4766,69 @@ mod tests {
                 .as_bool()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn proposal_096_runtime_health_includes_tool_output_guard() {
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+
+        let payload = call_tool_and_parse(
+            &server,
+            &operator_principal(),
+            "runtime.health",
+            serde_json::json!({}),
+        )
+        .await;
+        let guard = &payload["toolOutputGuard"];
+
+        assert_eq!(guard["status"], "available");
+        assert_eq!(guard["policyReadback"]["status"], "available");
+        assert_eq!(guard["enforcement"]["status"], "configured");
+        assert_eq!(
+            guard["enforcement"]["pathStrategy"],
+            "runtime_home_bin_prepend"
+        );
+        assert_eq!(
+            guard["enforcement"]["activeProbeStatus"],
+            "not_run_by_runtime_health"
+        );
+        assert_eq!(
+            guard["policyVersion"],
+            domain::tool_policy::TOOL_POLICY_VERSION
+        );
+        assert_eq!(
+            guard["guardVersion"],
+            domain::tool_policy::TOOL_GUARD_VERSION
+        );
+        assert_eq!(
+            guard["maxOutputBytes"].as_u64(),
+            Some(domain::tool_policy::DEFAULT_TOOL_OUTPUT_MAX_BYTES)
+        );
+        assert_eq!(
+            guard["maxOutputLines"].as_u64(),
+            Some(domain::tool_policy::DEFAULT_TOOL_OUTPUT_MAX_LINES)
+        );
+        assert_eq!(
+            guard["maxCumulativeOutputBytes"].as_u64(),
+            Some(domain::tool_policy::DEFAULT_CUMULATIVE_TOOL_OUTPUT_MAX_BYTES)
+        );
+
+        let denylist = guard["generatedRootDenylist"]
+            .as_array()
+            .expect("toolOutputGuard.generatedRootDenylist must be an array");
+        for required in domain::tool_policy::GENERATED_ROOT_DENYLIST {
+            assert!(
+                denylist
+                    .iter()
+                    .any(|value| value.as_str() == Some(required)),
+                "toolOutputGuard.generatedRootDenylist missing {required}"
+            );
+        }
     }
 
     #[tokio::test]

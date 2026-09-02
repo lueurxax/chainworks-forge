@@ -8,8 +8,8 @@ Reserved focused gate: `p031-bounded-runtime-readback`
 
 ## Purpose
 
-Own the complete bounded GraphQL/Swift runtime-readback redesign removed from
-the planned model-label slice.
+Own the complete bounded GraphQL/Swift runtime-readback redesign beyond the
+implemented [planned-binding contract](../../reference/provider-binding-truth.md).
 
 ## Owned scope
 
@@ -42,5 +42,6 @@ the planned model-label slice.
 ## Activation rule
 
 This inventory must be decomposed by operation family if its implementation
-proposal approaches 2,000 lines. The active model-label slice uses existing
-topology/execution readback and adds no GraphQL field, ID, or operation.
+proposal approaches 2,000 lines. The implemented planned-binding contract uses
+existing topology/execution readback and adds no GraphQL field, ID, or
+operation.

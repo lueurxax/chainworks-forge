@@ -58,7 +58,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 ### Outputs, contracts, and feedback
 
 - [reference/structured-output-envelope-and-contract-validation.md](reference/structured-output-envelope-and-contract-validation.md) — Named envelopes, contract binding, validation, Junie canary proof, failure substrate
-- [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, quality-gate blocker boundary contracts/readback, implementation self-assessment and handoff, failed-stage evidence, Junie code-writer completion-boundary subtypes, staged repair settlement, narrow recovery
+- [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, quality-gate blocker boundary contracts/readback, implementation self-assessment and handoff, P088 code-writer completion freshness/receipt recovery, failed-stage evidence, staged repair settlement, and narrow recovery
 - [reference/implementation-closeout-readiness.md](reference/implementation-closeout-readiness.md) — Active closeout readiness authority, state-9 release routing, readback, rollout evidence, and retained gate aliases
 - [reference/managed-temporary-artifact-inventory.md](reference/managed-temporary-artifact-inventory.md) — Read-only and dry-run-only managed temporary artifact inventory slice, GraphQL/MCP/report readback, ByteCountString validation, path redaction contract, and scanner boundaries
 - [reference/proposal-loop-feedback-fidelity-and-rereview.md](reference/proposal-loop-feedback-fidelity-and-rereview.md) — Review-corpus fidelity, backlog carry-forward, targeted rereview
@@ -73,7 +73,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 - [reference/full-mvp-delivery.md](reference/full-mvp-delivery.md) — Repo-backed delivery slice: worktrees, implementation loop, manual release, assessment and handoff
 - [proposals/064-run-worktree-main-sync-and-cross-run-knowledge-transfer.md](proposals/064-run-worktree-main-sync-and-cross-run-knowledge-transfer.md) — Run worktree main sync and cross-run knowledge transfer (Phase 0 contract freeze)
 - [reference/project-workspace-contract.md](reference/project-workspace-contract.md) — Idea-owned workspace and frozen run project contract
-- [reference/provider-binding-truth.md](reference/provider-binding-truth.md) — Provider/model truth and provenance contract
+- [reference/provider-binding-truth.md](reference/provider-binding-truth.md) — Frozen provider/model truth, Codex planned-variant admission/dispatch/readback, shared UI labels, and provenance
 - [reference/mvp-sign-off.md](reference/mvp-sign-off.md) — Benchmark, recovery/export, launch-gate sign-off
 
 ### Operator experience

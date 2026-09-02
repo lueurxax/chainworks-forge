@@ -518,6 +518,10 @@ async fn proposal_088_targeted_retry_recovery_carries_preserved_evidence_to_acti
         Some("operator_retry_completion_recovery")
     );
 
+    // The indexed scheduler cutoff intentionally admits newly enqueued work
+    // after the current whole-second window has elapsed.
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
     let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
         .await
         .unwrap()

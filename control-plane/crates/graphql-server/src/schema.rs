@@ -16883,10 +16883,7 @@ mod tests {
 
         for scalar in ["ByteCountString", "DateTime", "JSON"] {
             let needle = format!("scalar {scalar}");
-            assert!(
-                fixture_sdl.contains(&needle),
-                "fixture missing `{needle}`"
-            );
+            assert!(fixture_sdl.contains(&needle), "fixture missing `{needle}`");
             assert!(live_sdl.contains(&needle), "live SDL missing `{needle}`");
         }
 
@@ -17042,14 +17039,26 @@ mod tests {
 
         // (fixture field key, GraphQL type block, field line to look for)
         let checks: &[(&str, &str, &str)] = &[
-            ("generatedAt", "TempArtifactInventory", "generatedAt: DateTime"),
+            (
+                "generatedAt",
+                "TempArtifactInventory",
+                "generatedAt: DateTime",
+            ),
             (
                 "limitsApplied.scanDeadlineAt",
                 "TempArtifactInventoryLimitsApplied",
                 "scanDeadlineAt: DateTime",
             ),
-            ("rows[].lastTouchedAt", "TempArtifactRow", "lastTouchedAt: DateTime"),
-            ("dryRun.generatedAt", "TempArtifactDryRun", "generatedAt: DateTime"),
+            (
+                "rows[].lastTouchedAt",
+                "TempArtifactRow",
+                "lastTouchedAt: DateTime",
+            ),
+            (
+                "dryRun.generatedAt",
+                "TempArtifactDryRun",
+                "generatedAt: DateTime",
+            ),
         ];
 
         for (fixture_key, gql_type, expected_line) in checks {

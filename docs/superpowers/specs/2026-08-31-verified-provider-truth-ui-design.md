@@ -8,7 +8,9 @@ Reserved focused gate: `verified-provider-truth-ui`
 ## Purpose
 
 Own UI states that become meaningful only after durable accepted provider truth
-and prompt authority exist. The active slice displays planned identity only.
+and prompt authority exist. The implemented
+[planned-binding contract](../../reference/provider-binding-truth.md) displays
+planned identity only.
 
 ## Owned scope
 

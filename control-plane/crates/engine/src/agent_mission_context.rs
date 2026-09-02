@@ -910,6 +910,7 @@ fn validate_persisted_payload_authority(
     };
     require_payload_string(object, "agent_id", assignment_agent_id)?;
     let agent = frozen_agent(plan, assignment_agent_id)?;
+    let provider_authority = health_fallback_provider_authority(plan, object, &agent)?;
 
     if context.runtime.permission_profile != agent.permission_profile
         || context.runtime.worktree_write_enabled != agent.worktree_write_enabled
@@ -919,15 +920,32 @@ fn validate_persisted_payload_authority(
             "frozen_snapshot_contract_incompatible: persisted mission runtime differs from frozen agent authority"
         );
     }
+    let (backend_profile_id, provider, model, effort, max_turns) = provider_authority
+        .as_ref()
+        .map(|authority| {
+            (
+                authority.backend_profile_id.clone(),
+                authority.provider.clone(),
+                authority.model.clone(),
+                authority.effort.clone(),
+                authority.max_turns,
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                agent.backend_profile_id.clone(),
+                agent.provider.clone(),
+                agent.model.clone(),
+                agent.effort.clone(),
+                agent.max_turns,
+            )
+        });
     for (field, expected) in [
-        (
-            "backend_profile_id",
-            serde_json::json!(agent.backend_profile_id),
-        ),
-        ("provider", serde_json::json!(agent.provider)),
-        ("model", serde_json::json!(agent.model)),
-        ("effort", serde_json::json!(agent.effort)),
-        ("max_turns", serde_json::json!(agent.max_turns)),
+        ("backend_profile_id", serde_json::json!(backend_profile_id)),
+        ("provider", serde_json::json!(provider)),
+        ("model", serde_json::json!(model)),
+        ("effort", serde_json::json!(effort)),
+        ("max_turns", serde_json::json!(max_turns)),
         ("temperature", serde_json::json!(agent.temperature)),
         (
             "permission_profile",
@@ -982,6 +1000,117 @@ fn validate_persisted_payload_authority(
         )?;
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct HealthFallbackProviderAuthority {
+    backend_profile_id: Option<String>,
+    provider: String,
+    model: Option<String>,
+    effort: Option<String>,
+    max_turns: Option<u32>,
+}
+
+fn health_fallback_provider_authority(
+    plan: &RunPlan,
+    payload: &serde_json::Map<String, serde_json::Value>,
+    frozen_agent: &ResolvedAgent,
+) -> Result<Option<HealthFallbackProviderAuthority>> {
+    let Some(raw_fallback) = payload.get("provider_health_fallback") else {
+        return Ok(None);
+    };
+    if raw_fallback.is_null() {
+        return Ok(None);
+    }
+    let fallback = raw_fallback.as_object().ok_or_else(|| {
+        anyhow::anyhow!(
+            "frozen_snapshot_contract_incompatible: provider health fallback attestation must be an object"
+        )
+    })?;
+    let reason = fallback
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "frozen_snapshot_contract_incompatible: provider health fallback has no reason"
+            )
+        })?;
+    let frozen_backend_profile_id = frozen_agent.backend_profile_id.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "frozen_snapshot_contract_incompatible: health fallback source has no frozen backend profile"
+        )
+    })?;
+    require_payload_string(fallback, "from_provider", &frozen_agent.provider)?;
+    require_payload_string(
+        fallback,
+        "from_backend_profile_id",
+        frozen_backend_profile_id,
+    )?;
+
+    let target_backend_profile_id = fallback
+        .get("to_backend_profile_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "frozen_snapshot_contract_incompatible: provider health fallback has no target backend profile"
+            )
+        })?;
+    let catalog: AgentCatalogFile =
+        serde_json::from_str(&plan.catalog_snapshot_json).map_err(|error| {
+            anyhow::anyhow!(
+                "frozen_snapshot_contract_incompatible: frozen agent catalog is malformed: {error}"
+            )
+        })?;
+    let profile = catalog
+        .backend_profiles
+        .as_ref()
+        .and_then(|profiles| profiles.get(target_backend_profile_id))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "frozen_snapshot_contract_incompatible: provider health fallback target profile is absent from frozen catalog"
+            )
+        })?;
+    require_payload_string(fallback, "to_provider", &profile.provider)?;
+
+    match reason {
+        "prior_run_local_provider_output_failure" => {
+            let failed_execution_id = fallback
+                .get("failed_agent_execution_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "frozen_snapshot_contract_incompatible: provider health fallback has no failed execution identity"
+                    )
+                })?;
+            if failed_execution_id != failed_execution_id.trim() {
+                anyhow::bail!(
+                    "frozen_snapshot_contract_incompatible: provider health fallback execution identity is malformed"
+                );
+            }
+        }
+        "junie_code_writer_unavailable" => {
+            if frozen_agent.agent_id != "code_writer"
+                || !matches!(frozen_agent.provider.as_str(), "junie" | "junie_acp")
+                || target_backend_profile_id != "claude_builder_high"
+            {
+                anyhow::bail!(
+                    "frozen_snapshot_contract_incompatible: forced Junie fallback does not match frozen code-writer authority"
+                );
+            }
+        }
+        _ => anyhow::bail!(
+            "frozen_snapshot_contract_incompatible: unsupported provider health fallback reason '{reason}'"
+        ),
+    }
+
+    Ok(Some(HealthFallbackProviderAuthority {
+        backend_profile_id: Some(target_backend_profile_id.to_string()),
+        provider: profile.provider.clone(),
+        model: profile.model.clone(),
+        effort: profile.effort.clone(),
+        max_turns: profile.max_turns,
+    }))
 }
 
 fn dynamic_review_output_name(agent_id: &str) -> String {

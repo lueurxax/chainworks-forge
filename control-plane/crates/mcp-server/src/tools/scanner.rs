@@ -1704,9 +1704,8 @@ mod tests {
     }
 
     fn load_status_by_field_matrix_fixture() -> serde_json::Value {
-        let path = workspace_root_for_fixtures().join(
-            "docs/evidence/089/temp-inventory/contracts/status-by-field-matrix.fixture.json",
-        );
+        let path = workspace_root_for_fixtures()
+            .join("docs/evidence/089/temp-inventory/contracts/status-by-field-matrix.fixture.json");
         let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         serde_json::from_str(&raw).expect("fixture must be valid JSON")
@@ -1729,11 +1728,13 @@ mod tests {
     ) {
         let entry = mapping_entry(fixture, condition);
         assert_eq!(
-            entry["lifecycle_classification"], classification.as_str(),
+            entry["lifecycle_classification"],
+            classification.as_str(),
             "condition {condition:?}: lifecycle_classification mismatch"
         );
         assert_eq!(
-            entry["dry_run_recommendation"], recommendation.as_str(),
+            entry["dry_run_recommendation"],
+            recommendation.as_str(),
             "condition {condition:?}: dry_run_recommendation mismatch"
         );
     }

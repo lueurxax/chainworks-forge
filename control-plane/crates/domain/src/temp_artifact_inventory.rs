@@ -1274,9 +1274,8 @@ mod tests {
     }
 
     fn load_status_by_field_matrix_fixture() -> serde_json::Value {
-        let path = workspace_root_for_fixtures().join(
-            "docs/evidence/089/temp-inventory/contracts/status-by-field-matrix.fixture.json",
-        );
+        let path = workspace_root_for_fixtures()
+            .join("docs/evidence/089/temp-inventory/contracts/status-by-field-matrix.fixture.json");
         let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         serde_json::from_str(&raw).expect("fixture must be valid JSON")
@@ -1312,8 +1311,12 @@ mod tests {
 
         assert_eq!(
             fixture_domain_values(&fixture, "enabled_state"),
-            [EnabledState::Enabled, EnabledState::Disabled, EnabledState::Unknown]
-                .map(|v| v.as_str().to_string())
+            [
+                EnabledState::Enabled,
+                EnabledState::Disabled,
+                EnabledState::Unknown
+            ]
+            .map(|v| v.as_str().to_string())
         );
 
         assert_eq!(

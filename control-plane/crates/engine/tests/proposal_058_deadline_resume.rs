@@ -1,9 +1,10 @@
 use chrono::{Duration, Utc};
 use db::pool::create_pool;
-use db::repos::{escalation as escalation_repo, ideas, runs, stages, work_items};
+use db::repos::{agent_executions, escalation as escalation_repo, ideas, runs, stages, work_items};
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::commands::{
     CallerContext, Command, PrincipalClass, ResumeEscalationChainCmd, ResumeEscalationDeadlineCmd,
+    RetryStageCmd,
 };
 use domain::escalation::{EscalationExecutionMetadata, EscalationLedger};
 use domain::idea::{Idea, IdeaStatus};
@@ -27,6 +28,7 @@ struct Fixture {
     source_stage_execution_id: StageExecutionId,
     source_agent_execution_id: AgentExecutionId,
     ledger_created_at: chrono::DateTime<Utc>,
+    _workspace: tempfile::TempDir,
 }
 
 fn snapshot_hash(snapshot: &str) -> String {
@@ -44,6 +46,21 @@ async fn setup_fixture(pause_reason: &str) -> Fixture {
     let handler = CommandHandler::new(pool.clone(), events, WorkQueue::new(pool.clone()));
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace_root = workspace.path().to_string_lossy().into_owned();
+    let backlog_path = workspace.path().join(format!(
+        ".chainworks/runs/{run_id}/reviews/proposal/score-lift-backlog.json"
+    ));
+    std::fs::create_dir_all(backlog_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &backlog_path,
+        serde_json::json!({
+            "review_pass_id": "current-review-pass",
+            "items": [{"id": "CURRENT-001"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
     let workflow_snapshot = serde_json::json!({
         "workflow": {"id": "p058_deadline_resume"},
         "initial_state": "state_5_proposal_refined",
@@ -57,6 +74,9 @@ async fn setup_fixture(pause_reason: &str) -> Fixture {
     })
     .to_string();
     let catalog_snapshot = serde_json::json!({
+        "artifacts": {
+            "score_lift_backlog": "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/score-lift-backlog.json"
+        },
         "backend_profiles": {
             "claude_writer_primary": {
                 "provider": "claude_acp",
@@ -144,8 +164,8 @@ async fn setup_fixture(pause_reason: &str) -> Fixture {
         status: RunStatus::Blocked,
         workflow_id: "p058_deadline_resume".into(),
         workflow_title: "P058 deadline resume".into(),
-        workspace_root: "/tmp/p058-deadline-resume".into(),
-        artifact_root: "/tmp/p058-deadline-resume/.chainworks".into(),
+        workspace_root: workspace_root.clone(),
+        artifact_root: format!("{workspace_root}/.chainworks"),
         started_at: Utc::now(),
         completed_at: None,
         cancellation_requested_at: None,
@@ -170,7 +190,7 @@ async fn setup_fixture(pause_reason: &str) -> Fixture {
         catalog_snapshot_json: Some(catalog_snapshot),
         drift_detected_at: None,
         drift_details_json: None,
-        chainworks_meta_root: None,
+        chainworks_meta_root: Some(format!(".chainworks/runs/{run_id}")),
         review_routing_json: None,
         closeout_readiness_mode: None,
     };
@@ -290,7 +310,7 @@ async fn setup_fixture(pause_reason: &str) -> Fixture {
                 "model": "opus",
                 "effort": "high",
                 "max_turns": 12,
-                "prompt": "Refine the proposal",
+                "prompt": "Refine the proposal\n\n### Authoritative Proposal Review Backlog\n- review_pass_id: `stale-review-pass`",
                 "output_contract": "proposal_v1",
                 "task_outputs": ["proposal_current"],
                 "declared_outputs": [],
@@ -318,6 +338,7 @@ async fn setup_fixture(pause_reason: &str) -> Fixture {
         source_stage_execution_id,
         source_agent_execution_id,
         ledger_created_at,
+        _workspace: workspace,
     }
 }
 
@@ -372,6 +393,140 @@ fn chain_operator_caller() -> CallerContext {
         &PrincipalClass::Operator,
         "runs.resume_escalation_chain",
     )
+}
+
+#[tokio::test]
+async fn p095_targeted_retry_rehydrates_current_proposal_backlog_before_enqueue() {
+    let fixture = setup_fixture("escalation_deadline_elapsed").await;
+
+    fixture
+        .handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id: fixture.run_id,
+                stage_id: "state_5_proposal_refined".into(),
+                consume_quota_budget_now: false,
+                agent_execution_id: Some(fixture.source_agent_execution_id),
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .expect("targeted retry should be scheduled");
+
+    let pending = work_items::list_by_run(&fixture.pool, fixture.run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| {
+            item.kind == WorkItemKind::InvokeAgent && item.status == WorkItemStatus::Pending
+        })
+        .expect("targeted retry InvokeAgent work item");
+    let payload: serde_json::Value = serde_json::from_str(&pending.payload_json).unwrap();
+    let prompt = payload["prompt"].as_str().unwrap();
+
+    assert!(prompt.contains("review_pass_id: `stale-review-pass`"));
+    assert!(prompt.contains("review_pass_id: `current-review-pass`"));
+    assert!(
+        prompt.rfind("review_pass_id: `current-review-pass`")
+            > prompt.rfind("review_pass_id: `stale-review-pass`"),
+        "the current materialized backlog must override copied retry history"
+    );
+}
+
+#[tokio::test]
+async fn p095_targeted_retry_refreshes_active_ledger_and_applies_its_backend_profile() {
+    let fixture = setup_fixture("escalation_deadline_elapsed").await;
+    sqlx::query(
+        "UPDATE escalation_ledger SET status_raw = 'active', stage_execution_id = 'prior-p058-resume', current_tier_id = ?1, current_tier_kind_raw = 'backend_profile' WHERE id = ?2",
+    )
+    .bind(CURRENT_TIER_ID)
+    .bind(LEDGER_ID)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE work_items SET payload_json = json_set(payload_json, '$.targeted_retry.escalation', json(?1)) WHERE id = 'p058-deadline-source-invoke'",
+    )
+    .bind(
+        serde_json::json!({
+            "ledger_id": LEDGER_ID,
+            "tier_id": "claude_writer_fallback",
+            "tier_kind_raw": "backend_profile"
+        })
+        .to_string(),
+    )
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+
+    fixture
+        .handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id: fixture.run_id,
+                stage_id: "state_5_proposal_refined".into(),
+                consume_quota_budget_now: false,
+                agent_execution_id: Some(fixture.source_agent_execution_id),
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .expect("targeted retry should use the active ledger tier");
+
+    let pending = work_items::list_by_run(&fixture.pool, fixture.run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| {
+            item.kind == WorkItemKind::InvokeAgent && item.status == WorkItemStatus::Pending
+        })
+        .expect("targeted retry InvokeAgent work item");
+    let payload: serde_json::Value = serde_json::from_str(&pending.payload_json).unwrap();
+    assert_eq!(
+        payload
+            .pointer("/targeted_retry/escalation/tier_id")
+            .and_then(serde_json::Value::as_str),
+        Some(CURRENT_TIER_ID)
+    );
+
+    sqlx::query(
+        "UPDATE work_items SET payload_json = json_set(payload_json, '$.session_reuse_scope', 'per_execution'), scheduled_at = ?1 WHERE id = ?2",
+    )
+    .bind("2000-01-01T00:00:00Z")
+    .bind(&pending.id)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+
+    let claim = engine::executor::claim_next_invoke_agent_with_start(&fixture.pool)
+        .await
+        .unwrap();
+    assert!(
+        claim.is_some(),
+        "targeted retry InvokeAgent should be claimed; work items: {:?}",
+        work_items::list_by_run(&fixture.pool, fixture.run_id)
+            .await
+            .unwrap()
+    );
+    let claimed = claim.unwrap();
+    let execution = agent_executions::find_by_id(&fixture.pool, claimed.agent_execution_id)
+        .await
+        .unwrap()
+        .expect("claim should persist an agent execution");
+    assert_eq!(execution.provider, "gemini");
+    assert_eq!(execution.model.as_deref(), Some("gemini-3.1-pro-preview"));
+    assert_eq!(
+        execution.backend_profile_id.as_deref(),
+        Some("gemini_reasoning")
+    );
 }
 
 #[tokio::test]
@@ -811,6 +966,14 @@ async fn p058_operator_resume_exhausted_chain_atomically_queues_explicit_tier() 
     assert_eq!(
         payload.pointer("/targeted_retry/escalation/deadline_window_id"),
         Some(&serde_json::json!(window_id))
+    );
+
+    let prompt = payload["prompt"].as_str().unwrap();
+    assert!(prompt.contains("review_pass_id: `stale-review-pass`"));
+    assert!(prompt.contains("review_pass_id: `current-review-pass`"));
+    assert!(
+        prompt.rfind("review_pass_id: `current-review-pass`")
+            > prompt.rfind("review_pass_id: `stale-review-pass`")
     );
 
     let authority_count: i64 = sqlx::query_scalar(

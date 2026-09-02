@@ -37,5 +37,7 @@ Codex model selection and UI labeling.
 
 ## Activation rule
 
-This inventory is not part of the model-variant gate. A future P079 proposal
-must define one bounded publication cut and its own retained gate.
+This inventory is not part of the retained
+[`codex-planned-variant-slice`](../../reference/test-gates.md#codex-planned-variant-slice)
+gate. A future P079 proposal must define one bounded publication cut and its
+own retained gate.

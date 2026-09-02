@@ -20,6 +20,11 @@ use domain::discovery::{
     LegacyBroadDiscoverySnapshot, NoopDiscoveryOperationRecorder, PrePromptExpectedOutputContext,
     PrePromptExpectedOutputMetadata, StdDiscoveryFilesystem,
 };
+use domain::tool_policy::{
+    preflight_shell_command, ToolPreflightDecision, DEFAULT_CUMULATIVE_TOOL_OUTPUT_MAX_BYTES,
+    DEFAULT_TOOL_OUTPUT_MAX_BYTES, DEFAULT_TOOL_OUTPUT_MAX_LINES, GENERATED_ROOT_DENYLIST,
+    TOOL_GUARD_VERSION, TOOL_POLICY_VERSION,
+};
 use domain::xcode_runtime::XcodeShimWarningEvent;
 use serde::Deserialize;
 use serde_json::Value;
@@ -978,6 +983,8 @@ struct CodexLocalActivitySummary {
     unbounded_tool_outputs: u64,
     max_original_token_count: Option<u64>,
     max_total_output_lines: Option<u64>,
+    cumulative_function_output_bytes: u64,
+    session_store_bytes_read: u64,
     turn_aborted_after_open_process: bool,
     last_pathology: Option<String>,
     last_event_type: Option<String>,
@@ -1081,7 +1088,12 @@ impl CodexLocalActivityMonitor {
             self.offset = 0;
         }
         if len > self.offset {
-            let bytes_to_read = (len - self.offset).min(CLAUDE_LOCAL_ACTIVITY_MAX_READ_BYTES);
+            let pending_bytes = len - self.offset;
+            let bytes_to_read = pending_bytes.min(CLAUDE_LOCAL_ACTIVITY_MAX_READ_BYTES);
+            if pending_bytes > DEFAULT_CUMULATIVE_TOOL_OUTPUT_MAX_BYTES {
+                self.summary.unbounded_tool_outputs += 1;
+                self.summary.last_pathology = Some("tool_output_budget_exceeded".to_string());
+            }
             let mut file = std::fs::File::open(session_path).with_context(|| {
                 format!(
                     "Codex local activity: open session {}",
@@ -1103,6 +1115,14 @@ impl CodexLocalActivityMonitor {
                 )
             })?;
             self.offset = self.offset.saturating_add(bytes_to_read);
+            self.summary.session_store_bytes_read = self
+                .summary
+                .session_store_bytes_read
+                .saturating_add(bytes_to_read);
+            if self.summary.session_store_bytes_read > DEFAULT_CUMULATIVE_TOOL_OUTPUT_MAX_BYTES {
+                self.summary.unbounded_tool_outputs += 1;
+                self.summary.last_pathology = Some("tool_output_budget_exceeded".to_string());
+            }
             for line in chunk.lines().map(str::trim).filter(|line| !line.is_empty()) {
                 if let Ok(entry) = serde_json::from_str::<Value>(line) {
                     if self.observe_entry(&entry) {
@@ -1150,7 +1170,11 @@ impl CodexLocalActivityMonitor {
                 .unwrap_or_else(|| "none".to_string())
         );
         Some(ProviderFailureEvent {
-            failure_phase: "codex_tool_session_control_failure",
+            failure_phase: if pathology == "tool_output_budget_exceeded" {
+                "tool_output_budget_exceeded"
+            } else {
+                "codex_tool_session_control_failure"
+            },
             message: format!(
                 "Codex tool/session control failure: {pathology}; {}",
                 self.summary_for_error()
@@ -1251,6 +1275,17 @@ impl CodexLocalActivityMonitor {
         self.summary.function_outputs += 1;
         self.summary.last_event_type = Some("function_call_output".to_string());
         self.observe_function_output_pathology(output);
+        self.summary.cumulative_function_output_bytes = self
+            .summary
+            .cumulative_function_output_bytes
+            .saturating_add(output.len() as u64);
+        if (output.len() as u64) > DEFAULT_TOOL_OUTPUT_MAX_BYTES
+            || self.summary.cumulative_function_output_bytes
+                > DEFAULT_CUMULATIVE_TOOL_OUTPUT_MAX_BYTES
+        {
+            self.summary.unbounded_tool_outputs += 1;
+            self.summary.last_pathology = Some("tool_output_budget_exceeded".to_string());
+        }
         if output.contains("aborted by user") {
             self.summary.turn_aborted = true;
             self.active_call_process_ids.clear();
@@ -1286,6 +1321,12 @@ impl CodexLocalActivityMonitor {
     }
 
     fn observe_function_output_pathology(&mut self, output: &str) {
+        if output.contains(
+            "tool_output_budget_exceeded: output truncated by Chainworks safe-search guard",
+        ) {
+            self.summary.unbounded_tool_outputs += 1;
+            self.summary.last_pathology = Some("tool_output_budget_exceeded".to_string());
+        }
         if output.contains("write_stdin failed: stdin is closed") {
             self.summary.stdin_closed_control_failures += 1;
             self.summary.last_pathology = Some("codex_tool_stdin_closed".to_string());
@@ -1309,7 +1350,8 @@ impl CodexLocalActivityMonitor {
                     .map(|current| current.max(count))
                     .unwrap_or(count),
             );
-            if count > CODEX_UNBOUNDED_TOOL_OUTPUT_LINE_CAP {
+            if count > CODEX_UNBOUNDED_TOOL_OUTPUT_LINE_CAP || count > DEFAULT_TOOL_OUTPUT_MAX_LINES
+            {
                 self.summary.unbounded_tool_outputs += 1;
                 self.summary.last_pathology = Some("codex_unbounded_tool_output".to_string());
             }
@@ -1330,7 +1372,7 @@ impl CodexLocalActivityMonitor {
 
     fn summary_for_error(&self) -> String {
         format!(
-            "local_event_count={}, function_calls={}, function_outputs={}, running_processes_started={}, running_process_outputs={}, running_processes_finished={}, background_agent_waits_started={}, background_agent_waits_finished={}, open_processes={}, open_background_agent_waits={}, turn_aborted={}, turn_completed={}, stdin_closed_control_failures={}, unbounded_tool_outputs={}, max_original_token_count={}, max_total_output_lines={}, turn_aborted_after_open_process={}, last_pathology={}, last_event_type={}",
+            "local_event_count={}, function_calls={}, function_outputs={}, running_processes_started={}, running_process_outputs={}, running_processes_finished={}, background_agent_waits_started={}, background_agent_waits_finished={}, open_processes={}, open_background_agent_waits={}, turn_aborted={}, turn_completed={}, stdin_closed_control_failures={}, unbounded_tool_outputs={}, max_original_token_count={}, max_total_output_lines={}, cumulative_function_output_bytes={}, session_store_bytes_read={}, turn_aborted_after_open_process={}, last_pathology={}, last_event_type={}",
             self.summary.event_count,
             self.summary.function_calls,
             self.summary.function_outputs,
@@ -1353,6 +1395,8 @@ impl CodexLocalActivityMonitor {
                 .max_total_output_lines
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "none".to_string()),
+            self.summary.cumulative_function_output_bytes,
+            self.summary.session_store_bytes_read,
             self.summary.turn_aborted_after_open_process,
             self.summary.last_pathology.as_deref().unwrap_or("none"),
             self.summary.last_event_type.as_deref().unwrap_or("none"),
@@ -3010,6 +3054,26 @@ pub(crate) async fn probe_initialize_with_timeout(
 // ---------------------------------------------------------------------------
 
 fn build_permission_grant(request_id: &Value, params: &Value) -> Option<Value> {
+    if let Some(denial) = permission_preflight_denial(params) {
+        return Some(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32096,
+                "message": denial.agent_error_text(),
+                "data": {
+                    "classification": denial.code,
+                    "preflightCode": denial.code,
+                    "matchedTool": denial.matched_tool,
+                    "command": denial.command,
+                    "policyVersion": TOOL_POLICY_VERSION,
+                    "guardVersion": TOOL_GUARD_VERSION,
+                    "generatedRootDenylist": GENERATED_ROOT_DENYLIST,
+                }
+            }
+        }));
+    }
+
     let options = permission_options(params);
     let option_id = permission_preferred_auto_grant_option(&options)?;
 
@@ -3023,6 +3087,45 @@ fn build_permission_grant(request_id: &Value, params: &Value) -> Option<Value> {
             }
         }
     }))
+}
+
+fn permission_preflight_denial(params: &Value) -> Option<domain::tool_policy::ToolPreflightDenial> {
+    let mut candidates = Vec::new();
+    collect_permission_strings(params, &mut candidates);
+    candidates.into_iter().find_map(|candidate| {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() || trimmed.len() > 4096 {
+            return None;
+        }
+        match preflight_shell_command(trimmed) {
+            ToolPreflightDecision::Allow => None,
+            ToolPreflightDecision::Deny(denial) => Some(denial),
+        }
+    })
+}
+
+fn collect_permission_strings(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(value) => out.push(value.clone()),
+        Value::Array(values) => {
+            for value in values {
+                collect_permission_strings(value, out);
+            }
+        }
+        Value::Object(map) => {
+            for (key, value) in map {
+                if matches!(
+                    key.as_str(),
+                    "command" | "cmd" | "title" | "description" | "arguments" | "input" | "name"
+                ) || value.is_object()
+                    || value.is_array()
+                {
+                    collect_permission_strings(value, out);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// SEC-P079-001: P079 repair-specific permission grant builder.
@@ -3436,6 +3539,12 @@ fn summarize_permission_grant(grant: &Value) -> String {
         .get("id")
         .and_then(normalize_jsonrpc_id)
         .unwrap_or_else(|| Value::Null.to_string());
+    if let Some(message) = grant["error"]["message"].as_str() {
+        return format!(
+            "id={request_id};error={}",
+            truncate_runtime_receipt_detail(message)
+        );
+    }
     let option_id = grant["result"]["outcome"]["optionId"]
         .as_str()
         .unwrap_or("unknown");
@@ -6212,6 +6321,28 @@ impl AcpTransportSession {
                                 },
                                 p079_receipt_payload,
                             );
+                            let tool_preflight_denial = permission_preflight_denial(&params);
+                            if let Some(denial) = tool_preflight_denial.as_ref() {
+                                let detail = format!(
+                                    "code={};tool={};policy_version={};guard_version={}",
+                                    denial.code,
+                                    denial.matched_tool,
+                                    TOOL_POLICY_VERSION,
+                                    TOOL_GUARD_VERSION
+                                );
+                                runtime_receipt
+                                    .push_event("tool_preflight_denied", Some(detail.clone()));
+                                record_prompt_progress_detail_for_session(
+                                    req,
+                                    &progress_sink,
+                                    &self.session_id,
+                                    AcpPromptProgressKind::MeaningfulProgress,
+                                    Some("Tool preflight denied".to_string()),
+                                    Some(detail),
+                                    Some("tool_preflight_denied".to_string()),
+                                )
+                                .await;
+                            }
                             // SEC-MED-001: record structured decision on the roundtrip
                             // regardless of allow/deny outcome.
                             if p079_canonical_paths.is_some() {
@@ -6370,7 +6501,9 @@ impl AcpTransportSession {
                                     tokio::time::sleep(self.permission_grant_debounce).await;
                                 }
                                 // SEC-P079-001: in P079 repair mode only grant allow_once; never allow_always.
-                                let grant_option = if p079_canonical_paths.is_some() {
+                                let grant_option = if tool_preflight_denial.is_some() {
+                                    build_permission_grant(req_id, &params)
+                                } else if p079_canonical_paths.is_some() {
                                     build_p079_repair_permission_grant(req_id, &params)
                                 } else {
                                     build_permission_grant(req_id, &params)
@@ -6415,9 +6548,17 @@ impl AcpTransportSession {
                                             &progress_sink,
                                             &self.session_id,
                                             AcpPromptProgressKind::MeaningfulProgress,
-                                            Some("Permission granted".to_string()),
+                                            Some(if grant.get("error").is_some() {
+                                                "Permission preflight denied".to_string()
+                                            } else {
+                                                "Permission granted".to_string()
+                                            }),
                                             Some(grant_summary.clone()),
-                                            Some("permission_grant".to_string()),
+                                            Some(if grant.get("error").is_some() {
+                                                "permission_preflight_denied".to_string()
+                                            } else {
+                                                "permission_grant".to_string()
+                                            }),
                                         )
                                         .await;
                                         debug!(
@@ -9279,5 +9420,75 @@ Tests result:
                 "safe tool name '{name}' must pass through unchanged"
             );
         }
+    }
+
+    #[test]
+    fn permission_preflight_denies_broad_rg_with_typed_error() {
+        let params = serde_json::json!({
+            "toolCall": {
+                "title": "Run command",
+                "command": "rg prompt_stream_failed ."
+            },
+            "options": [
+                {"kind": "allow_once", "optionId": "allow_once"},
+                {"kind": "reject_once", "optionId": "reject_once"}
+            ]
+        });
+
+        let response =
+            build_permission_grant(&serde_json::json!(7), &params).expect("typed denial");
+
+        assert_eq!(response["id"], serde_json::json!(7));
+        assert_eq!(
+            response["error"]["data"]["classification"],
+            "tool_output_budget_preflight_denied"
+        );
+        assert_eq!(
+            response["error"]["data"]["preflightCode"],
+            "tool_output_budget_preflight_denied"
+        );
+        assert!(response["error"]["message"].as_str().is_some_and(
+            |message| message.contains("rg prompt_stream_failed control-plane/crates/acp/src")
+        ));
+    }
+
+    #[test]
+    fn codex_local_activity_classifies_cumulative_tool_output_budget() {
+        let mut monitor =
+            CodexLocalActivityMonitor::new_for_path(PathBuf::from("/tmp/nonexistent.jsonl"));
+        let output = "x".repeat((domain::tool_policy::DEFAULT_TOOL_OUTPUT_MAX_BYTES as usize) + 1);
+        let payload = serde_json::json!({
+            "type": "function_call_output",
+            "call_id": "call_rg",
+            "output": output,
+        });
+
+        assert!(monitor.observe_function_call_output(&payload));
+        let failure = monitor
+            .provider_failure_event_from_local_activity()
+            .expect("budget failure");
+        assert_eq!(failure.failure_phase, "tool_output_budget_exceeded");
+        assert!(failure.detail.contains("tool_output_budget_exceeded"));
+        assert!(monitor
+            .summary_for_error()
+            .contains("cumulative_function_output_bytes="));
+    }
+
+    #[test]
+    fn codex_local_activity_classifies_wrapper_truncation_marker_as_budget_exceeded() {
+        let mut monitor =
+            CodexLocalActivityMonitor::new_for_path(PathBuf::from("/tmp/nonexistent.jsonl"));
+        let payload = serde_json::json!({
+            "type": "function_call_output",
+            "call_id": "call_rg",
+            "output": "line-2000\ntool_output_budget_exceeded: output truncated by Chainworks safe-search guard\n",
+        });
+
+        assert!(monitor.observe_function_call_output(&payload));
+        let failure = monitor
+            .provider_failure_event_from_local_activity()
+            .expect("wrapper truncation marker should be budget evidence");
+        assert_eq!(failure.failure_phase, "tool_output_budget_exceeded");
+        assert!(failure.detail.contains("tool_output_budget_exceeded"));
     }
 }

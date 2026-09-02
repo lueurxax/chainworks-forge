@@ -139,6 +139,54 @@ pub async fn update_session_reuse_reason_tx(
     Ok(())
 }
 
+pub async fn update_provider_quota_retry_after_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    agent_execution_id: AgentExecutionId,
+    retry_after: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+) -> Result<u64> {
+    let updated = sqlx::query(
+        r#"UPDATE agent_execution_runtime_facts
+           SET retry_after = ?1,
+               updated_at = ?2
+           WHERE agent_execution_id = ?3
+             AND failure_kind = ?4
+             AND (retry_after IS NULL OR retry_after < ?1)"#,
+    )
+    .bind(retry_after.to_rfc3339())
+    .bind(updated_at.to_rfc3339())
+    .bind(agent_execution_id.to_string())
+    .bind(AgentFailureKind::ProviderQuota.to_string())
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(updated)
+}
+
+pub async fn reconcile_provider_quota_retry_after_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    agent_execution_id: AgentExecutionId,
+    retry_after: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+) -> Result<u64> {
+    let updated = sqlx::query(
+        r#"UPDATE agent_execution_runtime_facts
+           SET retry_after = ?1,
+               updated_at = ?2
+           WHERE agent_execution_id = ?3
+             AND failure_kind = ?4
+             AND retry_after > ?1"#,
+    )
+    .bind(retry_after.to_rfc3339())
+    .bind(updated_at.to_rfc3339())
+    .bind(agent_execution_id.to_string())
+    .bind(AgentFailureKind::ProviderQuota.to_string())
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(updated)
+}
+
 pub async fn find_by_execution_id(
     pool: &SqlitePool,
     agent_execution_id: AgentExecutionId,

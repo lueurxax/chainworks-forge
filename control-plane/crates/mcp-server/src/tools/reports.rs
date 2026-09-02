@@ -247,6 +247,8 @@ pub async fn execute(
             let code_writer_completion_receipts =
                 code_writer_completion_receipts_json(pool, run_id).await?;
             let implementation_completion = implementation_completion_json(pool, run_id).await?;
+            let p094_boundary_readback = p094_boundary_readback_json(pool, run_id).await?;
+            let p094_rollout_decision = p094_rollout_decision_json(pool, run_id).await?;
             reports.push(serde_json::json!({
                 "id": uuid::Uuid::new_v4().to_string(),
                 "run_id": run_id.to_string(),
@@ -276,6 +278,8 @@ pub async fn execute(
                 "retryAuthority": retry_authority_current_json(pool, run_id).await?,
                 "retryAuthorityHistory": retry_authority_history_json(pool, run_id).await?,
                 "p091OrphanRepairReadback": p091_orphan_repair_readback_json(pool, run_id).await?,
+                "p094_boundary_readback": p094_boundary_readback.clone(),
+                "p094_rollout_decision": p094_rollout_decision,
                 "implementation_handoff_status": implementation_handoff_status_json(pool, run_id).await?,
                 "implementation_self_assessment_summary": implementation_self_assessment_summary_json(pool, run_id).await?,
                 "rollout_contract_readback": rollout_contract_readback,
@@ -317,6 +321,7 @@ pub async fn execute(
                     "report_version": 1,
                     "active_index": projection.active_index_json,
                     "run_state_projection": projection.run_state_json,
+                    "p094_boundary_readback": p094_boundary_readback,
                     "operator_overrides": overrides,
                     "legacy_discovery_overrides": legacy_discovery_overrides::list_by_run(pool, run_id).await?,
                 }));

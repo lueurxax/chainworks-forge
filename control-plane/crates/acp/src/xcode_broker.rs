@@ -32,8 +32,8 @@ use crate::{
     ResolvedMcpServerTransport, XcodeRuntimeObservationSink,
 };
 
-const XCODE_MCP_ACTION_REQUIRED_AFTER: Duration = Duration::from_secs(5);
-const XCODE_MCP_HUMAN_CONSENT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const XCODE_MCP_SLOW_REQUEST_AFTER: Duration = Duration::from_secs(5);
+const XCODE_MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const XCODE_MCP_FIRST_CONNECT_TIMEOUT: Duration = Duration::from_secs(12 * 60);
 const XCODE_MCP_ACTIVE_LEASE_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 #[cfg(test)]
@@ -64,7 +64,7 @@ impl Default for XcodeMcpBridgePoolConfig {
             max_active_leases: 8,
             max_queued_leases: 16,
             queue_timeout: Duration::from_secs(45),
-            spawn_init_timeout: XCODE_MCP_HUMAN_CONSENT_TIMEOUT,
+            spawn_init_timeout: XCODE_MCP_REQUEST_TIMEOUT,
             first_connect_timeout: XCODE_MCP_FIRST_CONNECT_TIMEOUT,
             broker_disabled: false,
             tool_allowlists_by_hash: BTreeMap::new(),
@@ -126,7 +126,7 @@ impl Default for XcodeMcpProcessBackendConfig {
         Self {
             command: "xcrun".to_string(),
             args: vec!["mcpbridge".to_string()],
-            request_timeout: XCODE_MCP_HUMAN_CONSENT_TIMEOUT,
+            request_timeout: XCODE_MCP_REQUEST_TIMEOUT,
         }
     }
 }
@@ -937,7 +937,7 @@ impl XcodeMcpBridgePool {
         let lock_key = initialize_lock_key(&context);
         let lock = self.initialize_lock_for(&lock_key).await;
         let wait_started = Instant::now();
-        let lock_guard = if self.config.spawn_init_timeout <= XCODE_MCP_ACTION_REQUIRED_AFTER {
+        let lock_guard = if self.config.spawn_init_timeout <= XCODE_MCP_SLOW_REQUEST_AFTER {
             match tokio::time::timeout(self.config.spawn_init_timeout, lock.lock()).await {
                 Ok(lock_guard) => lock_guard,
                 Err(_) => {
@@ -960,15 +960,15 @@ impl XcodeMcpBridgePool {
         } else {
             tokio::select! {
                 lock_guard = lock.lock() => lock_guard,
-                _ = tokio::time::sleep(XCODE_MCP_ACTION_REQUIRED_AFTER) => {
+                _ = tokio::time::sleep(XCODE_MCP_SLOW_REQUEST_AFTER) => {
                     let wait_ms = wait_started.elapsed().as_millis() as i64;
                     let observation = self.initialize_observation(
                         &context,
-                        "initialize_action_required",
-                        Some(XcodeRuntimeFailureClass::XcodeMcpActionRequired),
+                        "initialize_slow",
+                        None,
                         wait_ms,
                         format!(
-                            "Action Required: Check Xcode after waiting {} ms for initialize lock '{}'",
+                            "Brokered Xcode MCP initialize is still waiting after {} ms for lock '{}'",
                             wait_ms, lock_key
                         ),
                     );
@@ -1041,18 +1041,18 @@ impl XcodeMcpBridgePool {
         let response = if backend_manages_request_timeout {
             tokio::select! {
                 response = &mut response_fut => response,
-                _ = tokio::time::sleep(XCODE_MCP_ACTION_REQUIRED_AFTER) => {
+                _ = tokio::time::sleep(XCODE_MCP_SLOW_REQUEST_AFTER) => {
                     let wait_ms = started.elapsed().as_millis() as i64;
                     let backend_process_id = backend.backend_process_id(&context.lease_id).await;
                     let observation = self.backend_request_observation(
                         &context,
-                        "backend_request_action_required",
-                        Some(XcodeRuntimeFailureClass::XcodeMcpActionRequired),
+                        "backend_request_slow",
+                        None,
                         wait_ms,
                         backend_process_id,
                         format!(
-                            "Action Required: Check Xcode after waiting {} ms for brokered Xcode MCP method '{}' on lease '{}'",
-                            wait_ms, method, context.lease_id
+                            "Brokered Xcode MCP method '{}' is still pending after {} ms on lease '{}'",
+                            method, wait_ms, context.lease_id
                         ),
                     );
                     self.record_observation(context.agent_execution_id, observation)
@@ -1060,7 +1060,7 @@ impl XcodeMcpBridgePool {
                     response_fut.await
                 }
             }
-        } else if self.config.spawn_init_timeout <= XCODE_MCP_ACTION_REQUIRED_AFTER {
+        } else if self.config.spawn_init_timeout <= XCODE_MCP_SLOW_REQUEST_AFTER {
             match tokio::time::timeout(self.config.spawn_init_timeout, &mut response_fut).await {
                 Ok(response) => response,
                 Err(_) => Err(anyhow::anyhow!(
@@ -1073,18 +1073,18 @@ impl XcodeMcpBridgePool {
         } else {
             tokio::select! {
                 response = &mut response_fut => response,
-                _ = tokio::time::sleep(XCODE_MCP_ACTION_REQUIRED_AFTER) => {
+                _ = tokio::time::sleep(XCODE_MCP_SLOW_REQUEST_AFTER) => {
                     let wait_ms = started.elapsed().as_millis() as i64;
                     let backend_process_id = backend.backend_process_id(&context.lease_id).await;
                     let observation = self.backend_request_observation(
                         &context,
-                        "backend_request_action_required",
-                        Some(XcodeRuntimeFailureClass::XcodeMcpActionRequired),
+                        "backend_request_slow",
+                        None,
                         wait_ms,
                         backend_process_id,
                         format!(
-                            "Action Required: Check Xcode after waiting {} ms for brokered Xcode MCP method '{}' on lease '{}'",
-                            wait_ms, method, context.lease_id
+                            "Brokered Xcode MCP method '{}' is still pending after {} ms on lease '{}'",
+                            method, wait_ms, context.lease_id
                         ),
                     );
                     self.record_observation(context.agent_execution_id, observation)

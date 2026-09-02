@@ -22,6 +22,7 @@ use engine::executor::BackgroundExecutor;
 use engine::orchestrator::Orchestrator;
 use engine::recovery::RecoveryService;
 use engine::work_queue::WorkQueue;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -94,6 +95,13 @@ fn test_agent_catalog_yaml_path() -> String {
         "{}/../../../examples/agents/agents.yaml",
         env!("CARGO_MANIFEST_DIR")
     )
+}
+
+fn attach_frozen_snapshots(run: &mut Run, workflow_json: &str, catalog_json: &str) {
+    run.workflow_snapshot_hash = Some(format!("{:x}", Sha256::digest(workflow_json.as_bytes())));
+    run.catalog_snapshot_hash = Some(format!("{:x}", Sha256::digest(catalog_json.as_bytes())));
+    run.workflow_snapshot_json = Some(workflow_json.into());
+    run.catalog_snapshot_json = Some(catalog_json.into());
 }
 
 #[tokio::test]
@@ -174,7 +182,7 @@ async fn proposal_058_claim_start_precreates_execution_and_active_artifact_claim
             run_id: Some(run_id),
             stage_id: Some("implementation".into()),
             created_at: now,
-            scheduled_at: now,
+            scheduled_at: now - Duration::seconds(2),
             attempt_count: 0,
             last_error: None,
         },
@@ -381,7 +389,7 @@ async fn proposal_058_claim_start_without_session_scope_does_not_fabricate_gener
             run_id: Some(run_id),
             stage_id: Some("docs".into()),
             created_at: now,
-            scheduled_at: now,
+            scheduled_at: now - Duration::seconds(2),
             attempt_count: 0,
             last_error: None,
         },
@@ -603,7 +611,7 @@ async fn proposal_058_reclaimed_null_scope_payload_clears_legacy_fake_generation
             run_id: Some(run_id),
             stage_id: Some("docs".into()),
             created_at: now,
-            scheduled_at: now,
+            scheduled_at: now - Duration::seconds(2),
             attempt_count: 0,
             last_error: None,
         },
@@ -724,7 +732,7 @@ async fn proposal_058_startup_recovery_requeues_preclaimed_invoke_with_fresh_exe
             run_id: Some(run_id),
             stage_id: Some("implementation".into()),
             created_at: now,
-            scheduled_at: now,
+            scheduled_at: now - Duration::seconds(2),
             attempt_count: 0,
             last_error: None,
         },
@@ -892,7 +900,7 @@ async fn proposal_058_xcode_mcp_invoke_claim_respects_configured_xcode_capacity(
                 run_id: Some(run_id),
                 stage_id: Some("implementation".into()),
                 created_at: now,
-                scheduled_at: now,
+                scheduled_at: now - Duration::seconds(2),
                 attempt_count: 0,
                 last_error: None,
             },
@@ -1077,7 +1085,7 @@ async fn proposal_090_junie_preflight_running_does_not_consume_provider_capacity
             run_id: Some(run_id),
             stage_id: Some("implementation_b".into()),
             created_at: Utc::now(),
-            scheduled_at: Utc::now(),
+            scheduled_at: Utc::now() - Duration::seconds(2),
             attempt_count: 0,
             last_error: None,
         },
@@ -1172,7 +1180,7 @@ async fn proposal_058_startup_repair_settles_terminal_preclaimed_invoke_executio
             run_id: Some(run_id),
             stage_id: Some("implementation".into()),
             created_at: now,
-            scheduled_at: now,
+            scheduled_at: now - Duration::seconds(2),
             attempt_count: 0,
             last_error: None,
         },
@@ -1282,7 +1290,7 @@ async fn proposal_058_sessionless_invoke_agent_fails_closed_before_execution_cre
             run_id: Some(run_id),
             stage_id: Some("implementation".into()),
             created_at: now,
-            scheduled_at: now,
+            scheduled_at: now - Duration::seconds(2),
             attempt_count: 0,
             last_error: None,
         },
@@ -1392,7 +1400,7 @@ async fn proposal_058_explicit_null_session_reuse_scope_claims_as_no_reuse() {
             run_id: Some(run_id),
             stage_id: Some("implementation".into()),
             created_at: now,
-            scheduled_at: now,
+            scheduled_at: now - Duration::seconds(2),
             attempt_count: 0,
             last_error: None,
         },
@@ -1503,7 +1511,7 @@ async fn proposal_058_declared_output_claim_gets_durable_generation_without_reus
             run_id: Some(run_id),
             stage_id: Some("state_9_implementation_reviewed".into()),
             created_at: now,
-            scheduled_at: now,
+            scheduled_at: now - Duration::seconds(2),
             attempt_count: 0,
             last_error: None,
         },
@@ -1625,7 +1633,7 @@ async fn proposal_058_production_executor_fails_sessionless_invoke_before_proces
             run_id: Some(run_id),
             stage_id: Some("implementation".into()),
             created_at: now,
-            scheduled_at: now,
+            scheduled_at: now - Duration::seconds(2),
             attempt_count: 0,
             last_error: None,
         },
@@ -1742,7 +1750,7 @@ async fn proposal_058_production_loop_claims_pending_invoke_agent_items() {
             run_id: Some(run_id),
             stage_id: Some("implementation".into()),
             created_at: now,
-            scheduled_at: now,
+            scheduled_at: now - Duration::seconds(2),
             attempt_count: 0,
             last_error: None,
         },
@@ -2754,8 +2762,7 @@ async fn p058_high_001_claim_uses_payload_backend_profile_for_escalation() {
 
     // Run with frozen workflow + catalog snapshots so compile_run_plan_from_snapshot succeeds.
     let mut run = make_run(run_id, idea_id);
-    run.workflow_snapshot_json = Some(workflow_json.into());
-    run.catalog_snapshot_json = Some(catalog_json.into());
+    attach_frozen_snapshots(&mut run, workflow_json, catalog_json);
     runs::insert(&pool, &run).await.unwrap();
 
     stages::insert(
@@ -2815,7 +2822,7 @@ async fn p058_high_001_claim_uses_payload_backend_profile_for_escalation() {
             run_id: Some(run_id),
             stage_id: Some("task_state".into()),
             created_at: now,
-            scheduled_at: now,
+            scheduled_at: now - Duration::seconds(2),
             attempt_count: 0,
             last_error: None,
         },
@@ -2960,8 +2967,7 @@ async fn p058_claim_uses_quota_free_escalation_backend_before_provider_quota_wai
     .unwrap();
 
     let mut run = make_run(run_id, idea_id);
-    run.workflow_snapshot_json = Some(workflow_json.into());
-    run.catalog_snapshot_json = Some(catalog_json.into());
+    attach_frozen_snapshots(&mut run, workflow_json, catalog_json);
     runs::insert(&pool, &run).await.unwrap();
 
     stages::insert(
@@ -3106,7 +3112,7 @@ async fn p058_claim_uses_quota_free_escalation_backend_before_provider_quota_wai
             run_id: Some(run_id),
             stage_id: Some("impl_state".into()),
             created_at: now,
-            scheduled_at: now,
+            scheduled_at: now - Duration::seconds(2),
             attempt_count: 0,
             last_error: None,
         },
@@ -3219,8 +3225,7 @@ async fn p058_claim_writes_execution_metadata_row() {
     .unwrap();
 
     let mut run = make_run(run_id, idea_id);
-    run.workflow_snapshot_json = Some(workflow_json.into());
-    run.catalog_snapshot_json = Some(catalog_json.into());
+    attach_frozen_snapshots(&mut run, workflow_json, catalog_json);
     runs::insert(&pool, &run).await.unwrap();
 
     stages::insert(
@@ -3276,7 +3281,7 @@ async fn p058_claim_writes_execution_metadata_row() {
             run_id: Some(run_id),
             stage_id: Some("impl_state".into()),
             created_at: now,
-            scheduled_at: now,
+            scheduled_at: now - Duration::seconds(2),
             attempt_count: 0,
             last_error: None,
         },
@@ -3393,8 +3398,7 @@ async fn p058_startup_recovery_force_detaches_running_escalation_execution() {
     .unwrap();
 
     let mut run = make_run(run_id, idea_id);
-    run.workflow_snapshot_json = Some(workflow_json.into());
-    run.catalog_snapshot_json = Some(catalog_json.into());
+    attach_frozen_snapshots(&mut run, workflow_json, catalog_json);
     runs::insert(&pool, &run).await.unwrap();
 
     stages::insert(
@@ -3450,7 +3454,7 @@ async fn p058_startup_recovery_force_detaches_running_escalation_execution() {
             run_id: Some(run_id),
             stage_id: Some("impl_state".into()),
             created_at: now,
-            scheduled_at: now,
+            scheduled_at: now - Duration::seconds(2),
             attempt_count: 0,
             last_error: None,
         },
@@ -3682,7 +3686,7 @@ async fn proposal_058_claim_start_concurrent_claimers_leave_exactly_one_agent_ex
             run_id: Some(run_id),
             stage_id: Some("implementation".into()),
             created_at: now,
-            scheduled_at: now,
+            scheduled_at: now - Duration::seconds(2),
             attempt_count: 0,
             last_error: None,
         },

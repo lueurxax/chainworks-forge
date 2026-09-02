@@ -63,7 +63,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [release-gate.md](release-gate.md) — Manual release gate: post-approval task execution, N-phase ordering, native deterministic git/publish, canonical release artifacts, **durable side-effect ledger**, and `delivery_receipt` settlement
 - [executable-rollout-gate-template.md](executable-rollout-gate-template.md) — `rollout_contract_v1` / `rollout_contract_check_v1` / `operator_readback_v1` schemas, run-start preflight contract, security/path/authorization guidance, and retained historical alias self-contract
 - [project-workspace-contract.md](project-workspace-contract.md) — `requires_project_access`, idea-owned workspace root, frozen run workspace contract
-- [provider-binding-truth.md](provider-binding-truth.md) — Frozen provider/model truth, provenance, and cross-family mismatch handling
+- [provider-binding-truth.md](provider-binding-truth.md) — Frozen provider/model truth, byte-pinned Codex planned variants, new-Run admission, best-effort effort dispatch, GraphQL readback, shared UI labels, provenance, and mismatch handling
 - [idea-lifecycle.md](idea-lifecycle.md) — Active vs archived idea contract, archive/restore eligibility, cross-surface truth
 - [live-workflow-map.md](live-workflow-map.md) — Run-detail topology, state vocabulary, handoff counters, loop/fallback visibility
 - [full-mvp-delivery.md](full-mvp-delivery.md) — Repo-backed `Full MVP Live` slice: frozen delivery config, dedicated worktree, implementation loop, manual release, implementation self-assessment, and handoff routing

@@ -39,4 +39,5 @@ replacement run without changing the original snapshot.
 ## Activation rule
 
 This is a standalone run-lifecycle proposal. It cannot be introduced as error
-recovery for the active model-label slice.
+recovery by changing the implemented
+[planned-binding contract](../../reference/provider-binding-truth.md).

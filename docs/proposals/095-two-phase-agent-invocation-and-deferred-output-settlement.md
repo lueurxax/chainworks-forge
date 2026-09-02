@@ -5,7 +5,7 @@
 | Date | 2026-05-28 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | implemented [P079 output repair/fallback contract](../reference/output-contracts-failure-evidence-and-recovery.md#p079-output-contract-repair-and-fallback-details), P086 agent work continuation and provider-session resumption, P088 code-writer completion contract and output freshness, implemented workflow-owned quality-gate boundary contract in [`workflow-execution-engine.md`](../reference/workflow-execution-engine.md#quality-gate-blocker-boundary-transitions) and [`output-contracts-failure-evidence-and-recovery.md`](../reference/output-contracts-failure-evidence-and-recovery.md#workflow-owned-quality-gate-boundary-contracts), implemented storage/evidence-spooling baseline |
+| Depends on | implemented [P079 output repair/fallback contract](../reference/output-contracts-failure-evidence-and-recovery.md#p079-output-contract-repair-and-fallback-details), implemented P086 agent work continuation and provider-session resumption baseline, implemented [code-writer completion freshness and repair contract](../reference/output-contracts-failure-evidence-and-recovery.md#code-writer-completion-freshness-and-repair-p088-retained-alias) (retained P088 alias), implemented workflow-owned quality-gate boundary contract in [`workflow-execution-engine.md`](../reference/workflow-execution-engine.md#quality-gate-blocker-boundary-transitions) and [`output-contracts-failure-evidence-and-recovery.md`](../reference/output-contracts-failure-evidence-and-recovery.md#workflow-owned-quality-gate-boundary-contracts), implemented storage/evidence-spooling baseline |
 | Related | `docs/reference/acp-runtime-transport.md`, `docs/reference/rust-control-plane.md`, `docs/reference/workflow-execution-engine.md`, `docs/reference/output-contracts-failure-evidence-and-recovery.md`, `docs/reference/agent-work-continuation.md` |
 | Scope | Define the normal `code_writer` invocation lifecycle as a short work turn, server-owned deterministic readback, separate output collection turn, and strict settlement. |
 | Non-goal | No Rust/Swift implementation in this proposal, no loosening of output contracts, no new SwiftUI mutations, and no change to release/publish/git-push/upload side-effect safety. |
@@ -330,12 +330,13 @@ continuation, normal deterministic readback and output collection may be
 required. P086 preserves useful work context; P095 defines the normal
 work/output separation.
 
-### P088 Code-Writer Completion Contract and Output Freshness
+### Code-Writer Completion Contract and Output Freshness
 
 P095 makes work completion and output settlement separate facts. Changed files,
 test results, and tool traces prove work happened; they do not prove output
 settled. Fresh output must come from the P095 output collection turn or a valid
-P079/P088 repair path. Stale artifacts from previous attempts remain invalid.
+[P079 repair or retained-P088 completion path](../reference/output-contracts-failure-evidence-and-recovery.md#code-writer-completion-freshness-and-repair-p088-retained-alias).
+Stale artifacts from previous attempts remain invalid.
 
 ### Workflow-Owned Quality-Gate Boundary Contract
 
@@ -379,7 +380,7 @@ P095 is implementation-ready only when a later implementation pass can prove:
 - Do not implement code changes in this proposal.
 - Do not change release side-effect safety.
 - Do not weaken output contracts.
-- Do not replace P079, P086, P088, or the implemented workflow-owned quality-gate boundary contract.
+- Do not replace the implemented P079 repair, P086 continuation, code-writer completion-freshness, or workflow-owned quality-gate boundary contracts.
 - Do not add SwiftUI mutations.
 - Do not require this mode for all agents.
 - Do not create a generic prompt-rule engine.

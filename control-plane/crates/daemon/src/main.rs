@@ -743,6 +743,7 @@ async fn run_daemon() -> Result<()> {
         // can record accurate policy_mode and fixture_version in audit_log entries.
         .with_boundary_policy(Arc::clone(&boundary_policy)),
     );
+    let _quota_auto_resume_handle = spawn_quota_auto_resume_task(cmd_handler.clone());
     let orchestrator = Arc::new(Orchestrator::new_with_db_writer(
         pool.clone(),
         events.clone(),
@@ -1219,6 +1220,37 @@ fn spawn_audit_checkpoint_task(pool: SqlitePool) -> tokio::task::JoinHandle<()> 
                 Ok(false) => {}
                 Err(err) => {
                     warn!(err = %err, "P081 audit checkpoint write failed");
+                }
+            }
+        }
+    })
+}
+
+/// Schedules the one permitted post-reset retry for each expired provider quota
+/// ledger. The handler owns eligibility, retry authority, and idempotency; this
+/// task only makes that already-tested recovery path reachable in production.
+fn spawn_quota_auto_resume_task(
+    command_handler: Arc<CommandHandler>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            std::env::var("CHAINWORKS_QUOTA_AUTO_RESUME_INTERVAL_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(30),
+        ));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            match command_handler
+                .auto_resume_elapsed_quota_ledgers(chrono::Utc::now())
+                .await
+            {
+                Ok(0) => {}
+                Ok(scheduled) => info!(scheduled, "scheduled elapsed quota ledger retry"),
+                Err(error) => {
+                    warn!(error = %error, "failed to schedule elapsed quota ledger retries")
                 }
             }
         }
@@ -2139,6 +2171,26 @@ mcp:
         assert!(
             source.contains("thread_stack_size(DAEMON_WORKER_STACK_BYTES)"),
             "the daemon runtime must set an explicit worker stack size for deep MCP command paths"
+        );
+    }
+
+    #[test]
+    fn daemon_starts_elapsed_quota_auto_resume_task_after_building_command_handler() {
+        let source = include_str!("main.rs");
+        let handler_index = source
+            .find("let cmd_handler = Arc::new(")
+            .expect("daemon must build one shared command handler");
+        let task_index = source
+            .find("spawn_quota_auto_resume_task(cmd_handler.clone())")
+            .expect("daemon startup must wire elapsed quota recovery into production");
+
+        assert!(
+            task_index > handler_index,
+            "quota auto-resume must use the configured shared command handler"
+        );
+        assert!(
+            source.contains(".auto_resume_elapsed_quota_ledgers(chrono::Utc::now())"),
+            "quota auto-resume task must invoke the idempotent command-handler recovery"
         );
     }
 }

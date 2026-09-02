@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use db::pool::create_pool;
 use db::repos::work_items;
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
@@ -22,7 +22,7 @@ fn work_item(id: &str, kind: WorkItemKind) -> WorkItem {
         run_id: None,
         stage_id: None,
         created_at: now,
-        scheduled_at: now,
+        scheduled_at: now - Duration::seconds(2),
         attempt_count: 0,
         last_error: None,
     }
