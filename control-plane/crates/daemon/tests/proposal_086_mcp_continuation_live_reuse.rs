@@ -32,6 +32,19 @@ async fn test_pool() -> sqlx::SqlitePool {
     pool
 }
 
+async fn process_due_item(
+    executor: &BackgroundExecutor,
+    pool: &sqlx::SqlitePool,
+) -> anyhow::Result<bool> {
+    // The scheduler's indexable cutoff trails wall time. Make fixture work due
+    // explicitly instead of relying on the duration of unrelated test setup.
+    sqlx::query("UPDATE work_items SET scheduled_at = ?1 WHERE status = 'pending'")
+        .bind((Utc::now() - chrono::Duration::seconds(2)).to_rfc3339())
+        .execute(pool)
+        .await?;
+    executor.process_next_item().await
+}
+
 fn make_reuse_fixture_script(tmpdir: &std::path::Path) -> String {
     let script = tmpdir.join("p086_acp_reuse.py");
     let marker = tmpdir.join("markers.jsonl");
@@ -555,6 +568,33 @@ async fn seed_run_with_completed_code_writer(
     .await
     .unwrap();
 
+    // Continuations must retain the exact durable invocation source, including
+    // the legacy no-manifest case exercised by these existing fixtures.
+    db::repos::work_items::enqueue(
+        pool,
+        &db::work_item::WorkItem {
+            id: format!("source-invoke:{agent_execution_id}"),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_execution_id": stage_execution_id.to_string(),
+                "agent_id": "code_writer",
+                "p058_claimed": {"agent_execution_id": agent_execution_id.to_string()},
+                "prompt": "first turn"
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Completed,
+            run_id: Some(run_id),
+            stage_id: Some("state_10_implementation_refined".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
     (run_id, stage_execution_id, agent_execution_id)
 }
 
@@ -650,6 +690,104 @@ async fn call_continue_work_with_mode(
 
 #[cfg(unix)]
 #[tokio::test]
+async fn p049_resurrection_missing_snapshot_never_launches_provider() {
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let workspace = root.to_str().unwrap();
+    let (run_id, stage_id, agent_id) = seed_run_with_completed_code_writer(&pool, workspace).await;
+    let source = root.join("source.md");
+    std::fs::write(&source, "necessary input").unwrap();
+    let mut builder = acp::input_context::InputContextBuilder::new(workspace, run_id, 0);
+    builder
+        .artifact_context(
+            "proposal",
+            source.to_str().unwrap(),
+            source.to_str().unwrap(),
+        )
+        .unwrap();
+    let prompt = builder.finish("first turn".into()).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(
+        prompt
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("CHAINWORKS_INPUT_MANIFEST_V1 ")
+            .unwrap(),
+    )
+    .unwrap();
+    std::fs::remove_file(manifest["artifacts"][0]["path"].as_str().unwrap()).unwrap();
+    sqlx::query(
+        "UPDATE work_items SET payload_json = json_set(payload_json, '$.prompt', ?1) WHERE id = ?2",
+    )
+    .bind(prompt)
+    .bind(format!("source-invoke:{agent_id}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let script = make_resurrection_fixture_script(&root, "fixture-session-reuse");
+    let code = std::fs::read_to_string(&script).unwrap().replacen(
+        "msg = recv()",
+        "mark({'event': 'process_started'})\nmsg = recv()",
+        1,
+    );
+    std::fs::write(&script, code).unwrap();
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![Arc::new(
+        ClaudeAgentAdapter::new_with_binary(script),
+    )]));
+    let events = event_bus::new_bus(64);
+    let queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        queue.clone(),
+    ));
+    let handler = Arc::new(CommandHandler::new(
+        pool.clone(),
+        events.clone(),
+        queue.clone(),
+    ));
+    let server = McpServer::new(pool.clone(), handler, auth::PrincipalTable::test_fixture())
+        .with_acp_runtime(acp.clone());
+    let admitted = call_continue_work_with_mode(
+        &server,
+        agent_id,
+        run_id,
+        stage_id,
+        "provider_session_resurrection",
+        "01890f3d-7df9-7cc8-98c4-dc0c0c073989",
+    )
+    .await;
+    assert_eq!(admitted["outcome"], "accepted");
+    let continuation_id = admitted["continuation_id"].as_str().unwrap();
+    let executor = BackgroundExecutor::new(pool.clone(), queue, orchestrator, acp, events);
+    assert!(
+        timeout(Duration::from_secs(10), process_due_item(&executor, &pool))
+            .await
+            .unwrap()
+            .unwrap()
+    );
+    assert!(
+        !root.join("markers.jsonl").exists(),
+        "input failure must precede provider process launch"
+    );
+    let row = db::repos::agent_work_continuations::find_by_id(&pool, continuation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "failed");
+    assert!(
+        row.failure_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("input_context"),
+        "{row:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn p086_mcp_continue_work_reuses_live_acp_session_and_materializes_terminal_artifacts() {
     let pool = test_pool().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -706,6 +844,7 @@ async fn p086_mcp_continue_work_reuses_live_acp_session_and_materializes_termina
             toolchain_go_scope_enabled: false,
 
             p079_repair_canonical_paths: None,
+            input_manifest: None,
         })
         .await
         .unwrap();
@@ -749,7 +888,7 @@ async fn p086_mcp_continue_work_reuses_live_acp_session_and_materializes_termina
         acp.clone(),
         events,
     );
-    let processed = timeout(Duration::from_secs(10), executor.process_next_item())
+    let processed = timeout(Duration::from_secs(10), process_due_item(&executor, &pool))
         .await
         .unwrap_or_else(|_| {
             let markers_path = tmp.path().join("markers.jsonl");
@@ -942,7 +1081,7 @@ async fn p086_mcp_continue_work_resurrects_provider_session_and_records_v2_recei
         acp.clone(),
         events,
     );
-    let processed = timeout(Duration::from_secs(10), executor.process_next_item())
+    let processed = timeout(Duration::from_secs(10), process_due_item(&executor, &pool))
         .await
         .unwrap_or_else(|_| {
             let markers_path = workspace_root_path.join("markers.jsonl");
@@ -1078,7 +1217,7 @@ async fn p086_resurrection_rejects_uncorrelated_terminal_response() {
         acp.clone(),
         events,
     );
-    let processed = timeout(Duration::from_secs(10), executor.process_next_item())
+    let processed = timeout(Duration::from_secs(10), process_due_item(&executor, &pool))
         .await
         .unwrap_or_else(|_| {
             let markers_path = workspace_root_path.join("markers.jsonl");
@@ -1211,7 +1350,7 @@ async fn p086_resurrection_fail_closes_when_attach_receipt_persistence_fails() {
         acp.clone(),
         events,
     );
-    let processed = timeout(Duration::from_secs(10), executor.process_next_item())
+    let processed = timeout(Duration::from_secs(10), process_due_item(&executor, &pool))
         .await
         .unwrap_or_else(|_| {
             let markers_path = workspace_root_path.join("markers.jsonl");
@@ -1345,7 +1484,7 @@ async fn p086_resurrection_records_claude_session_store_recovery_in_raw_receipt(
         acp.clone(),
         events,
     );
-    let processed = timeout(Duration::from_secs(10), executor.process_next_item())
+    let processed = timeout(Duration::from_secs(10), process_due_item(&executor, &pool))
         .await
         .unwrap_or_else(|_| {
             let markers_path = workspace_root_path.join("markers.jsonl");
@@ -1451,7 +1590,7 @@ async fn p086_mcp_continue_work_rejects_resurrection_identity_mismatch_before_pr
         acp.clone(),
         events,
     );
-    let processed = timeout(Duration::from_secs(10), executor.process_next_item())
+    let processed = timeout(Duration::from_secs(10), process_due_item(&executor, &pool))
         .await
         .unwrap()
         .unwrap();

@@ -7625,6 +7625,42 @@ impl CommandHandler {
             ));
         }
 
+        // Rehydrate before the retry transaction, including pressure introduced
+        // by the current backlog. Never enqueue the historical oversized prompt.
+        if retry_payload
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|prompt| prompt.len() > acp::input_context::MAX_PROMPT_BYTES)
+        {
+            let plan = frozen_plan
+                .as_ref()
+                .ok_or_else(|| anyhow!("input_context_retry_frozen_plan_missing"))?;
+            let idea = ideas::find_by_id(&self.pool, run.idea_id)
+                .await?
+                .ok_or_else(|| anyhow!("input_context_retry_idea_missing"))?;
+            crate::orchestrator::Orchestrator::new(
+                self.pool.clone(),
+                self.events.clone(),
+                self.work_queue.clone(),
+            )
+            .rehydrate_targeted_retry_prompt(plan, &run, &idea, &old_stage, &mut retry_payload)
+            .await?;
+            let mut projected_payload = retry_payload.clone();
+            crate::orchestrator::append_current_proposal_writer_backlog_context(
+                plan,
+                &run,
+                &target_exec.agent_id,
+                &mut projected_payload,
+            )?;
+            let projected_bytes = crate::executor::validate_rehydrated_retry_prompt_budget(
+                &projected_payload,
+                validated_instruction,
+                &retry_work_item_id,
+            )?;
+            retry_payload["p049_prompt_rehydration"]["projected_final_prompt_bytes"] =
+                serde_json::json!(projected_bytes);
+        }
+
         let retry_tx_started = Instant::now();
         let mut retry_tx = self
             .begin_command_transaction("command.RetryAgentExecution", journal.id.clone())

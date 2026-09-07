@@ -335,6 +335,7 @@ impl AcpRuntimeManager {
 
     /// Start a fresh ACP session and keep it alive if requested.
     pub async fn start_session(&self, mut req: ExecutionRequest) -> Result<ExecutionResult> {
+        crate::input_context::bind_request_manifest(&mut req)?;
         req.provider = canonical_acp_provider(&req.provider);
         let provider = req.provider.clone();
         let adapter = self.adapter_for(&provider).await?;
@@ -506,6 +507,7 @@ impl AcpRuntimeManager {
         mut req: ExecutionRequest,
         launch_observer: Option<Arc<dyn AcpLaunchObserver>>,
     ) -> Result<ProviderSessionResurrectionAttachResult> {
+        crate::input_context::bind_request_manifest(&mut req)?;
         req.provider = canonical_acp_provider(&req.provider);
         let provider = req.provider.clone();
         let adapter = self.adapter_for(&provider).await?;
@@ -809,8 +811,9 @@ impl AcpRuntimeManager {
     pub async fn prompt_session(
         &self,
         session_generation_id: &str,
-        req: ExecutionRequest,
+        mut req: ExecutionRequest,
     ) -> Result<ExecutionResult> {
+        crate::input_context::bind_request_manifest(&mut req)?;
         let session = self.live_session(session_generation_id).await?;
         if let Some(expected_provider_session_id) = req.provider_session_id.as_deref() {
             let actual_provider_session_id = session.provider_session_id().await;
@@ -963,6 +966,7 @@ impl AcpRuntimeManager {
 
     /// Route an execution request to the matching adapter or live session.
     pub async fn execute(&self, mut req: ExecutionRequest) -> Result<ExecutionResult> {
+        crate::input_context::bind_request_manifest(&mut req)?;
         req.provider = canonical_acp_provider(&req.provider);
         let result = if req.reuse_existing_session {
             let session_generation_id = req.session_generation_id.clone().ok_or_else(|| {
@@ -1376,6 +1380,7 @@ mod tests {
             toolchain_go_scope_enabled: true,
 
             p079_repair_canonical_paths: None,
+            input_manifest: None,
         }
     }
 
@@ -1528,6 +1533,7 @@ mod tests {
             toolchain_go_scope_enabled: false,
 
             p079_repair_canonical_paths: None,
+            input_manifest: None,
         };
 
         manager
@@ -1599,6 +1605,7 @@ mod tests {
             toolchain_go_scope_enabled: false,
 
             p079_repair_canonical_paths: None,
+            input_manifest: None,
         };
         let mut launch_spec = crate::adapters::AcpLaunchSpec::new("/bin/sh");
 

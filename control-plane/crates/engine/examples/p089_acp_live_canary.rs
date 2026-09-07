@@ -295,6 +295,7 @@ tests_result={}
         toolchain_go_scope_enabled: false,
 
         p079_repair_canonical_paths: None,
+        input_manifest: None,
     };
 
     let started_at = Utc::now();

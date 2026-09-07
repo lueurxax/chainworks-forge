@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod input_context;
 pub mod manager;
 pub mod session;
 pub mod toolchain_lease;
@@ -76,6 +77,9 @@ pub struct ExecutionRequest {
     pub effort: Option<String>,
     pub workspace_root: String,
     pub prompt: String,
+    /// Lossless input binding retained when repair/continuation replaces prompt text.
+    #[serde(default)]
+    pub input_manifest: Option<input_context::InputManifest>,
     /// Provisioned worktree root path (Proposal 007). When set and
     /// `worktree_write_enabled` is true, the ACP session uses this as cwd.
     #[serde(default)]

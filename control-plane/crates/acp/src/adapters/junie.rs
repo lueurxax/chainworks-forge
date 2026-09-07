@@ -408,6 +408,7 @@ mod tests {
             toolchain_go_scope_enabled: false,
 
             p079_repair_canonical_paths: None,
+            input_manifest: None,
         }
     }
 

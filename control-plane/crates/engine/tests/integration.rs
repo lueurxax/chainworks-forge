@@ -7615,6 +7615,317 @@ async fn test_targeted_retry_falls_back_from_codex_timeout_proposal_reviewer_bac
 }
 
 #[tokio::test]
+async fn p049_targeted_retry_rehydrates_historical_oversized_prompt() {
+    assert_p049_targeted_rehydration("historical").await;
+}
+
+#[tokio::test]
+async fn p049_targeted_retry_rehydrates_when_current_backlog_pushes_prompt_over_cap() {
+    assert_p049_targeted_rehydration("backlog_overflow").await;
+}
+
+#[tokio::test]
+async fn p049_targeted_retry_rehydration_rejects_unrecoverable_authority_without_enqueue() {
+    for scenario in [
+        "missing_source",
+        "unknown_task",
+        "frozen_missing",
+        "mandatory_too_large",
+        "existing_binding",
+        "mismatched_inputs",
+    ] {
+        assert_p049_targeted_rehydration(scenario).await;
+    }
+}
+
+#[tokio::test]
+async fn p049_targeted_retry_rejects_dynamic_aggregation_without_payload_marker() {
+    assert_p049_targeted_rehydration("dynamic_aggregation").await;
+}
+
+#[tokio::test]
+async fn p049_targeted_retry_rejects_mandatory_context_exhausting_runtime_reserve() {
+    assert_p049_targeted_rehydration("mandatory_exhausts_runtime_reserve").await;
+}
+
+#[tokio::test]
+async fn p049_targeted_retry_rejects_final_backlog_addition_before_enqueue() {
+    assert_p049_targeted_rehydration("late_backlog_too_large").await;
+}
+
+async fn assert_p049_targeted_rehydration(scenario: &str) {
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_id = "state_5_proposal_refined";
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let proposal = format!(
+        "{}\nFINAL_REQUIRED_FACT",
+        "proposal evidence\n".repeat(6000)
+    );
+    std::fs::write(tmp.path().join("proposal.md"), &proposal).unwrap();
+    std::fs::write(
+        tmp.path().join("backlog.json"),
+        serde_json::json!({
+            "review_pass_id": "current-pass", "proposal_revision_id": "current-revision",
+            "items": if scenario == "late_backlog_too_large" {
+                (0..2300).map(|i| serde_json::json!({"id": format!("ITEM-{i:06}")})).collect::<Vec<_>>()
+            } else { vec![serde_json::json!({"id": "CURRENT-ITEM"})] }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut workflow_value = serde_json::json!({
+        "workflow": {"id": "p049_targeted"}, "initial_state": stage_id,
+        "states": {stage_id: {"label": "Refine", "owner": "proposal_writer", "type": "end",
+            "run": {"sequence": [{"agent": "proposal_writer", "task": "refine_proposal_from_reviews",
+                "inputs": ["proposal_current", "score_lift_backlog"], "outputs": ["proposal_revision_summary"]}]}}}
+    });
+    if scenario == "dynamic_aggregation" {
+        workflow_value["states"][stage_id]["run"]["sequence"][0]["selected_outputs_from"] = serde_json::json!({
+            "source_plan": "agent_selection_plan_v1", "output_contract": "proposal_review_v1"
+        });
+    }
+    let workflow_json = workflow_value.to_string();
+    let catalog_json = serde_json::json!({
+        "backend_profiles": {"writer": {"provider": "claude", "model": "sonnet"}},
+        "permission_profiles": {"lead_perm": {}},
+        "contracts": {"lead_contract": {"format": "json"}, "proposal_revision_summary_v1": {"format": "json", "required_fields": ["FROZEN_REQUIRED_FIELD"]}},
+        "agents": [
+            {"id": "proposal_writer", "backend_profile": "writer", "prompt": match scenario {
+                "mandatory_too_large" => "FROZEN_SYSTEM_OBLIGATION".repeat(4000),
+                "mandatory_exhausts_runtime_reserve" => "FROZEN_SYSTEM_OBLIGATION".repeat(2200),
+                _ => "FROZEN_SYSTEM_OBLIGATION".into(),
+            }},
+            {"id": "lead_orchestrator", "system_role": "lead", "backend_profile": "writer", "permission_profile": "lead_perm", "lead_resolution_contract": "lead_contract"}
+        ],
+        "artifacts": {"proposal_current": "proposal.md", "score_lift_backlog": "backlog.json", "proposal_revision_summary": "summary.json"}
+    }).to_string();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some(stage_id.into());
+    run.workspace_root = tmp.path().to_string_lossy().into_owned();
+    run.artifact_root = run.workspace_root.clone();
+    run.workflow_snapshot_hash = Some(sha256_hex(&workflow_json));
+    run.catalog_snapshot_hash = Some(sha256_hex(&catalog_json));
+    run.workflow_snapshot_json = Some(workflow_json);
+    run.catalog_snapshot_json = Some(catalog_json);
+    if scenario == "frozen_missing" {
+        run.workflow_snapshot_json = None;
+        run.catalog_snapshot_json = None;
+        run.workflow_snapshot_hash = None;
+        run.catalog_snapshot_hash = None;
+    }
+    runs::insert(&pool, &run).await.unwrap();
+    let mut old_stage = make_stage(StageExecutionId::new(), run_id, StageStatus::Failed);
+    old_stage.stage_id = stage_id.into();
+    stages::insert(&pool, &old_stage).await.unwrap();
+    let mut failed = make_agent_execution(old_stage.id, AgentStatus::Failed);
+    failed.agent_id = "proposal_writer".into();
+    failed.provider = "claude".into();
+    failed.model = Some("sonnet".into());
+    agent_executions::insert(&pool, &failed).await.unwrap();
+    let mut old_prompt = if scenario == "backlog_overflow" {
+        "x".repeat(acp::input_context::MAX_PROMPT_BYTES - 32)
+    } else {
+        format!(
+            "HISTORICAL_FLAT_PROMPT\n{}",
+            "old proposal input\n".repeat(6000)
+        )
+    };
+    if scenario == "existing_binding" {
+        let mut inputs =
+            acp::input_context::InputContextBuilder::new(&run.workspace_root, run_id, 0);
+        inputs
+            .captured_artifact_context("proposal_current", &proposal, "proposal.md")
+            .unwrap();
+        old_prompt = inputs.finish(old_prompt).unwrap();
+    }
+    let source_id = format!("p058-invoke:{}:0", old_stage.id);
+    let mut source = serde_json::json!({
+        "run_id": run_id, "stage_id": stage_id, "stage_execution_id": old_stage.id,
+        "agent_id": "proposal_writer", "provider": "claude", "model": "sonnet", "backend_profile_id": "writer",
+        "task_name": "refine_proposal_from_reviews", "task_inputs": ["proposal_current", "score_lift_backlog"],
+        "task_outputs": ["proposal_revision_summary"], "task_index": 0, "total_tasks": 1,
+        "prompt": old_prompt, "p058_claimed": {"agent_execution_id": failed.id},
+        "auto_contract_output_retry": {"reason": "missing_required_outputs"}
+    });
+    if scenario == "unknown_task" {
+        source["task_name"] = serde_json::json!("not_in_frozen_plan");
+    }
+    if scenario == "mismatched_inputs" {
+        source["task_inputs"] =
+            serde_json::json!(["proposal_current", "score_lift_backlog", "extra_obligation"]);
+    }
+    if scenario == "missing_source" {
+        std::fs::remove_file(tmp.path().join("proposal.md")).unwrap();
+    }
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: source_id.clone(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: source.to_string(),
+            status: WorkItemStatus::Failed,
+            run_id: Some(run_id),
+            stage_id: Some(stage_id.into()),
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+    let mut rejection = make_approval(
+        run_id,
+        "state_6_implementation_approval",
+        ApprovalDecision::Rejected,
+    );
+    rejection.comment = Some("PRESERVE_APPROVAL_OBLIGATION".into());
+    approvals::insert(&pool, &rejection).await.unwrap();
+
+    let result = make_command_handler(pool.clone())
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: stage_id.into(),
+                consume_quota_budget_now: true,
+                agent_execution_id: Some(failed.id),
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: Some("PRESERVE_RETRY_OBLIGATION".into()),
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await;
+    if !matches!(scenario, "historical" | "backlog_overflow") {
+        let error = result.err().expect(scenario).to_string();
+        assert!(error.contains("input_context_"), "{scenario}: {error}");
+        assert_eq!(
+            stages::list_by_run(&pool, run_id).await.unwrap().len(),
+            1,
+            "{scenario}"
+        );
+        let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+        assert_eq!(items.len(), 1, "{scenario}: no provider work may be queued");
+        assert_eq!(items[0].payload_json, source.to_string());
+        assert_eq!(
+            runs::find_by_id(&pool, run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RunStatus::Blocked
+        );
+        return;
+    }
+    result.unwrap();
+    let pending: Vec<_> = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|item| {
+            item.kind == WorkItemKind::InvokeAgent && item.status == WorkItemStatus::Pending
+        })
+        .collect();
+    assert_eq!(pending.len(), 1);
+    let payload: serde_json::Value = serde_json::from_str(&pending[0].payload_json).unwrap();
+    let prompt = payload["prompt"].as_str().unwrap();
+    assert!(
+        prompt.len() <= acp::input_context::MAX_PROMPT_BYTES,
+        "targeted retry copied {} historical bytes",
+        prompt.len()
+    );
+    assert!(!prompt.contains("HISTORICAL_FLAT_PROMPT"));
+    for required in [
+        "FROZEN_SYSTEM_OBLIGATION",
+        "FROZEN_REQUIRED_FIELD",
+        "current-pass",
+        "CURRENT-ITEM",
+        "allowed_backlog_item_ids: `CURRENT-ITEM`",
+        "PRESERVE_APPROVAL_OBLIGATION",
+        "CHAINWORKS_OUTPUT",
+        "proposal_revision_summary",
+    ] {
+        assert!(prompt.contains(required), "missing {required}");
+    }
+    assert_eq!(
+        payload.pointer("/targeted_retry/source_agent_execution_id"),
+        Some(&serde_json::json!(failed.id))
+    );
+    assert_eq!(
+        payload.pointer("/targeted_retry/source_work_item_id"),
+        Some(&serde_json::json!(source_id))
+    );
+    assert_eq!(
+        payload["auto_contract_output_retry"],
+        source["auto_contract_output_retry"]
+    );
+    let instructions = retry_operator_instructions::list_by_run(&pool, run_id)
+        .await
+        .unwrap();
+    assert_eq!(instructions.len(), 1);
+    assert_eq!(
+        instructions[0].instruction_text,
+        "PRESERVE_RETRY_OBLIGATION"
+    );
+    let manifest = acp::input_context::manifest_from_prompt(prompt)
+        .unwrap()
+        .expect("manifest-backed replacement");
+    let manifest_json = serde_json::to_value(&manifest).unwrap();
+    let snapshot = manifest_json["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "proposal_current")
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(snapshot["path"].as_str().unwrap()).unwrap(),
+        proposal
+    );
+    assert_eq!(snapshot["sha256"], sha256_hex(&proposal));
+    let original = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.id == source_id)
+        .unwrap();
+    assert_eq!(
+        original.payload_json,
+        source.to_string(),
+        "source evidence must remain unchanged"
+    );
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let manager =
+        acp::AcpRuntimeManager::new_with_adapters(vec![Arc::new(InputContextPreflightAdapter {
+            calls: calls.clone(),
+            message: Some("bounded_replacement_reached_fixture"),
+        })]);
+    let request_json = serde_json::json!({
+        "run_id": run_id, "stage_id": stage_id, "agent_id": "proposal_writer", "provider": "claude",
+        "model": "sonnet", "prompt": old_prompt, "workspace_root": run.workspace_root,
+        "timeout_seconds": 10, "declared_outputs": []
+    });
+    let mut request: acp::ExecutionRequest = serde_json::from_value(request_json).unwrap();
+    if scenario == "historical" {
+        let old_error = manager.execute(request.clone()).await.unwrap_err();
+        assert!(old_error
+            .to_string()
+            .contains("input_context_prompt_too_large"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+    request.prompt = prompt.into();
+    let replacement_error = manager.execute(request).await.unwrap_err();
+    assert!(replacement_error
+        .to_string()
+        .contains("bounded_replacement_reached_fixture"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn test_targeted_retry_falls_back_from_codex_timeout_proposal_writer_backend() {
     let pool = test_pool().await;
 
@@ -11621,6 +11932,495 @@ async fn test_invoke_agent_startup_error_marks_agent_execution_failed() {
         }),
         "failed invoke_agent must enqueue AdvanceRun so fan-in can settle the stage"
     );
+}
+
+struct InputContextPreflightAdapter {
+    calls: Arc<AtomicUsize>,
+    message: Option<&'static str>,
+}
+
+#[async_trait::async_trait]
+impl acp::adapters::AcpAdapter for InputContextPreflightAdapter {
+    fn provider_name(&self) -> &str {
+        "claude"
+    }
+
+    async fn execute(&self, req: acp::ExecutionRequest) -> anyhow::Result<acp::ExecutionResult> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let message = self
+            .message
+            .expect("oversized prompt must not reach the provider adapter");
+        let now = Utc::now().to_rfc3339();
+        let receipt = acp::AcpRuntimeReceipt {
+            schema_version: 1,
+            transport_family: "acp_stdio".into(),
+            provider: req.provider,
+            model: req.model,
+            provider_session_id: None,
+            session_generation_id: req.session_generation_id,
+            status: "failed".into(),
+            failure_phase: Some("input_context_preflight".into()),
+            jsonrpc_error_code: None,
+            provider_error_message_redacted: Some(message.into()),
+            started_at: now.clone(),
+            completed_at: Some(now),
+            xcode_shim_injected: false,
+            requires_xcode_host_execution: false,
+            handshake: Default::default(),
+            counters: Default::default(),
+            permission_roundtrips: Vec::new(),
+            first_events: Vec::new(),
+            last_events: Vec::new(),
+            claude_diagnostics: None,
+            p079_unsafe_continuation: false,
+        };
+        Err(anyhow::Error::new(acp::AcpExecutionError::new(
+            message,
+            Some(receipt),
+        )))
+    }
+}
+
+async fn assert_input_context_failure_stays_terminal(
+    prompt: String,
+    fixture_message: Option<&'static str>,
+    reject_diagnostic_write: bool,
+) {
+    use engine::executor::BackgroundExecutor;
+
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let workflow_json = serde_json::json!({
+        "workflow": {"id": "p049_preflight"},
+        "initial_state": "review",
+        "states": {"review": {
+            "label": "Review", "owner": "proposal_reviewer_product_owner", "type": "end",
+            "run": {"sequence": [{"agent": "proposal_reviewer_product_owner", "task": "Review", "outputs": ["proposal_review_po"]}]}
+        }}
+    }).to_string();
+    let catalog_json = serde_json::json!({
+        "backend_profiles": {
+            "claude_product_high": {"provider": "claude", "model": "sonnet"},
+            "codex_architect_high": {"provider": "codex", "model": "gpt-5.6", "effort": "xhigh"},
+            "lead_profile": {"provider": "claude", "model": "sonnet"}
+        },
+        "permission_profiles": {"lead_perm": {}},
+        "contracts": {"lead_contract": {"format": "json"}},
+        "agents": [
+            {"id": "proposal_reviewer_product_owner", "backend_profile": "claude_product_high", "output_contract": "proposal_review_v1"},
+            {"id": "lead_orchestrator", "system_role": "lead", "backend_profile": "lead_profile", "permission_profile": "lead_perm", "lead_resolution_contract": "lead_contract"}
+        ],
+        "artifacts": {"proposal_review_po": ".chainworks/review/po.json"}
+    }).to_string();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = tmp.path().to_string_lossy().into_owned();
+    run.artifact_root = run.workspace_root.clone();
+    run.current_state = Some("review".into());
+    run.workflow_yaml_path = Some("frozen-workflow.yaml".into());
+    run.agent_catalog_yaml_path = Some("frozen-agents.yaml".into());
+    run.workflow_snapshot_hash = Some(sha256_hex(&workflow_json));
+    run.catalog_snapshot_hash = Some(sha256_hex(&catalog_json));
+    run.workflow_snapshot_json = Some(workflow_json);
+    run.catalog_snapshot_json = Some(catalog_json);
+    runs::insert(&pool, &run).await.unwrap();
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "review".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let mut runtime_events = events.subscribe();
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let acp = Arc::new(acp::AcpRuntimeManager::new_with_adapters(vec![Arc::new(
+        InputContextPreflightAdapter {
+            calls: calls.clone(),
+            message: fixture_message,
+        },
+    )]));
+    let executor =
+        BackgroundExecutor::new(pool.clone(), work_queue.clone(), orchestrator, acp, events);
+    work_queue.enqueue(WorkItemKind::InvokeAgent, Some(run_id), Some("review".into()), serde_json::json!({
+        "run_id": run_id.to_string(), "stage_id": "review", "stage_execution_id": stage_exec_id.to_string(),
+        "agent_id": "proposal_reviewer_product_owner", "provider": "claude", "model": "sonnet",
+        "backend_profile_id": "claude_product_high", "output_contract": "proposal_review_v1",
+        "task_outputs": ["proposal_review_po"], "prompt": prompt,
+        "session_reuse_scope": "same_agent_family_within_run", "session_family_id": "p049-review"
+    })).await.unwrap();
+
+    if reject_diagnostic_write {
+        sqlx::query("CREATE TRIGGER p049_reject_diagnostics BEFORE INSERT ON agent_execution_runtime_facts WHEN NEW.supervision_classification = 'input_context_preflight_failed' BEGIN SELECT RAISE(FAIL, 'database is locked: injected diagnostic failure'); END")
+            .execute(&pool).await.unwrap();
+    }
+    // The queue's indexable due cutoff intentionally trails wall time by a second.
+    sqlx::query("UPDATE work_items SET scheduled_at = ?1 WHERE run_id = ?2 AND status = 'pending'")
+        .bind((Utc::now() - chrono::Duration::seconds(2)).to_rfc3339())
+        .bind(run_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let result = executor.process_next_item().await;
+    let queue_diagnostics: Vec<_> = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|item| (item.kind, item.status, item.last_error))
+        .collect();
+    assert!(
+        result.is_err(),
+        "input preflight must fail, not requeue: {result:?}; queue={queue_diagnostics:?}"
+    );
+    let error = result.unwrap_err();
+    assert!(format!("{error:#}").contains("input_context_"), "{error:#}");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        usize::from(fixture_message.is_some())
+    );
+    let executions = agent_executions::find_by_stage(&pool, stage_exec_id)
+        .await
+        .unwrap();
+    assert_eq!(executions.len(), 1);
+    let execution = &executions[0];
+    assert_eq!(execution.status, AgentStatus::Failed);
+    assert!(execution.completed_at.is_some());
+    let facts = agent_execution_runtime_facts::find_by_execution_id(&pool, execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    if reject_diagnostic_write {
+        assert!(error
+            .to_string()
+            .contains("Failed to persist input context preflight diagnostics"));
+        assert_eq!(
+            facts.failure_kind, None,
+            "failed diagnostic transaction must roll back"
+        );
+        assert!(
+            agent_execution_runtime_receipts::find_by_execution_id(&pool, execution.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+        let invokes: Vec<_> = items
+            .iter()
+            .filter(|item| item.kind == WorkItemKind::InvokeAgent)
+            .collect();
+        assert_eq!(invokes.len(), 1);
+        assert_eq!(invokes[0].status, WorkItemStatus::Failed);
+        assert!(invokes[0]
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("injected diagnostic failure"));
+    } else {
+        assert_eq!(facts.failure_kind, Some(AgentFailureKind::Unknown));
+        assert_eq!(
+            facts.operator_action_hint,
+            Some(OperatorActionHint::InspectLogs)
+        );
+        assert_eq!(facts.output_settlement, AgentOutputSettlement::None);
+        assert_eq!(facts.retry_after, None);
+        assert_eq!(facts.transport_error_code, None);
+        assert_eq!(
+            facts.supervision_classification.as_deref(),
+            Some("input_context_preflight_failed")
+        );
+        assert_eq!(facts.runtime_preflight_provider_launched, Some(false));
+        assert!(facts
+            .failure_kind_raw_debug
+            .as_deref()
+            .unwrap()
+            .contains("input_context_"));
+        let receipt = agent_execution_runtime_receipts::find_by_execution_id(&pool, execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receipt.failure_phase.as_deref(),
+            Some("input_context_preflight")
+        );
+        let receipt: acp::AcpRuntimeReceipt = serde_json::from_str(&receipt.receipt_json).unwrap();
+        assert_eq!(receipt.handshake.prompt_sent_at_ms, None);
+        assert_eq!(receipt.counters.total_messages, 0);
+        let mut event_kinds = Vec::new();
+        while let Ok(event) = runtime_events.try_recv() {
+            if let domain::events::DomainEvent::RuntimeStatusChanged { event_kind, .. } = event {
+                event_kinds.push(event_kind);
+            }
+        }
+        if fixture_message.is_none() {
+            assert!(
+                !event_kinds.iter().any(|kind| kind == "session_started"),
+                "rejected admission must not emit session_started: {event_kinds:?}"
+            );
+        }
+        assert!(
+            event_kinds
+                .iter()
+                .any(|kind| kind == "input_context_preflight_failed"),
+            "input failure must emit its preflight event: {event_kinds:?}"
+        );
+    }
+
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    assert!(items.iter().any(
+        |item| item.kind == WorkItemKind::InvokeAgent && item.status == WorkItemStatus::Failed
+    ));
+    assert!(items.iter().any(
+        |item| item.kind == WorkItemKind::AdvanceRun && item.status == WorkItemStatus::Pending
+    ));
+    sqlx::query("UPDATE work_items SET scheduled_at = ?1 WHERE run_id = ?2 AND kind = 'advance_run' AND status = 'pending'")
+        .bind((Utc::now() - chrono::Duration::seconds(2)).to_rfc3339())
+        .bind(run_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        executor.process_next_item().await.unwrap(),
+        "AdvanceRun must settle the failed stage"
+    );
+    assert_eq!(
+        stages::find_by_id(&pool, stage_exec_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        StageStatus::Failed
+    );
+    assert_eq!(
+        runs::find_by_id(&pool, run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        RunStatus::Blocked
+    );
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item.kind == WorkItemKind::InvokeAgent)
+            .count(),
+        1,
+        "no fallback or retry invocation may be enqueued"
+    );
+    assert_eq!(
+        stages::list_by_run(&pool, run_id).await.unwrap().len(),
+        1,
+        "no retry stage may be created"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        usize::from(fixture_message.is_some())
+    );
+}
+
+#[tokio::test]
+async fn p049_input_context_receipt_failure_stays_terminal_after_advance() {
+    for message in [
+        "input_context_snapshot_unreadable: session closed during active prompt",
+        "input_context_snapshot_changed: session identity conflict",
+        "input_context_snapshot_changed: database is locked",
+    ] {
+        assert_input_context_failure_stays_terminal(
+            "Review frozen inputs".into(),
+            Some(message),
+            false,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn p049_input_context_oversized_raw_prompt_stays_terminal_after_advance() {
+    assert_input_context_failure_stays_terminal("x".repeat(65537), None, false).await;
+}
+
+#[tokio::test]
+async fn p049_input_context_runtime_contract_pushes_final_prompt_over_cap() {
+    assert_input_context_failure_stays_terminal("x".repeat(65504), None, false).await;
+}
+
+#[tokio::test]
+async fn p049_input_context_diagnostic_write_failure_is_reported_without_retry() {
+    assert_input_context_failure_stays_terminal(
+        "Review frozen inputs".into(),
+        Some("input_context_snapshot_changed"),
+        true,
+    )
+    .await;
+}
+
+struct InputContextContinuationLaunchProbe(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl acp::adapters::AcpAdapter for InputContextContinuationLaunchProbe {
+    fn provider_name(&self) -> &str {
+        "claude"
+    }
+
+    fn provider_session_resurrection_capability(
+        &self,
+    ) -> Option<acp::adapters::ProviderSessionResurrectionCapability> {
+        acp::adapters::provider_session_resurrection_capability_for_provider("claude")
+    }
+
+    fn prepare_launch_spec(
+        &self,
+        _req: &acp::ExecutionRequest,
+        _resources: &mut acp::adapters::LaunchResourceGuard,
+    ) -> anyhow::Result<acp::adapters::AcpLaunchSpec> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        anyhow::bail!("unexpected P049 continuation provider launch")
+    }
+
+    async fn execute(&self, _req: acp::ExecutionRequest) -> anyhow::Result<acp::ExecutionResult> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        anyhow::bail!("unexpected P049 continuation prompt")
+    }
+}
+
+#[tokio::test]
+async fn p049_input_context_resurrection_rejects_deleted_snapshot_and_oversized_final_prompt_before_launch(
+) {
+    use engine::executor::BackgroundExecutor;
+
+    for scenario in [
+        "deleted_snapshot",
+        "oversized_final_prompt",
+        "missing_source",
+        "ambiguous_source",
+    ] {
+        let delete_snapshot = scenario == "deleted_snapshot";
+        let pool = test_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let stage_id = StageExecutionId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let mut run = make_run(run_id, idea_id, RunStatus::Running);
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.artifact_root = run.workspace_root.clone();
+        runs::insert(&pool, &run).await.unwrap();
+        stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Completed))
+            .await
+            .unwrap();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query("INSERT INTO session_lineages (id,run_id,agent_id,lineage_id,session_reuse_scope,created_at) VALUES ('p049-lineage',?1,'code_writer','p049-lineage','stage',?2)")
+            .bind(run_id.to_string()).bind(&now).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO session_generations (id,lineage_id,generation,invocation_owner_key,binding_fingerprint,working_directory,workspace_mode,runtime_provider,runtime_model,provider_session_id,status,turn_count,created_at) VALUES ('p049-session','p049-lineage',1,'owner','binding',?1,'shared','claude','sonnet','provider-session','closed',1,?2)")
+            .bind(&run.workspace_root).bind(&now).execute(&pool).await.unwrap();
+        let mut execution = make_agent_execution(stage_id, AgentStatus::Completed);
+        execution.agent_id = "code_writer".into();
+        execution.owner_kind = Some("stage_execution".into());
+        execution.owner_id = Some(stage_id.to_string());
+        execution.session_generation_id = Some("p049-session".into());
+        agent_executions::insert(&pool, &execution).await.unwrap();
+
+        let source_prompt = if delete_snapshot {
+            let mut builder =
+                acp::input_context::InputContextBuilder::new(&run.workspace_root, run_id, 0);
+            builder
+                .captured_artifact_context("proposal", "frozen input", "proposal.md")
+                .unwrap();
+            let prompt = builder.finish("Original implementation".into()).unwrap();
+            let manifest: serde_json::Value = serde_json::from_str(
+                prompt
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .strip_prefix("CHAINWORKS_INPUT_MANIFEST_V1 ")
+                    .unwrap(),
+            )
+            .unwrap();
+            std::fs::remove_file(manifest["artifacts"][0]["path"].as_str().unwrap()).unwrap();
+            prompt
+        } else {
+            "Legacy original task with no artifact snapshots".into()
+        };
+        let payload = serde_json::json!({"stage_execution_id": stage_id, "p058_claimed": {"agent_execution_id": execution.id}, "prompt": source_prompt});
+        if scenario != "missing_source" {
+            sqlx::query("INSERT INTO work_items (id,kind,payload_json,status,run_id,created_at,scheduled_at) VALUES ('p049-source','invoke_agent',?1,'completed',?2,?3,?3)")
+                .bind(payload.to_string()).bind(run_id.to_string()).bind(&now).execute(&pool).await.unwrap();
+        }
+        if scenario == "ambiguous_source" {
+            sqlx::query("INSERT INTO work_items (id,kind,payload_json,status,run_id,created_at,scheduled_at) SELECT 'p049-duplicate',kind,payload_json,status,run_id,created_at,scheduled_at FROM work_items WHERE id = 'p049-source'")
+                .execute(&pool).await.unwrap();
+        }
+        let instruction = if scenario == "oversized_final_prompt" {
+            "x".repeat(65537)
+        } else {
+            "Continue".into()
+        };
+        sqlx::query("INSERT INTO agent_work_continuations (id,run_id,stage_execution_id,agent_execution_id,mode,trigger_kind,status,idempotency_scope,idempotency_key,request_fingerprint_sha256,budget_json,created_at,updated_at) VALUES ('p049-cont',?1,?2,?3,'provider_session_resurrection','operator_mcp','queued','scope','key',?4,?5,?6,?6)")
+            .bind(run_id.to_string()).bind(stage_id.to_string()).bind(execution.id.to_string())
+            .bind("a".repeat(64)).bind(serde_json::json!({"operator_instruction": instruction}).to_string())
+            .bind(&now).execute(&pool).await.unwrap();
+        let events = event_bus::new_bus(64);
+        let queue = WorkQueue::new(pool.clone());
+        let orchestrator = Arc::new(Orchestrator::new(
+            pool.clone(),
+            events.clone(),
+            queue.clone(),
+        ));
+        let launches = Arc::new(AtomicUsize::new(0));
+        let manager = Arc::new(acp::AcpRuntimeManager::new_with_adapters(vec![Arc::new(
+            InputContextContinuationLaunchProbe(launches.clone()),
+        )]));
+        let executor =
+            BackgroundExecutor::new(pool.clone(), queue.clone(), orchestrator, manager, events);
+        queue
+            .enqueue(
+                WorkItemKind::ProcessContinuation,
+                Some(run_id),
+                Some("stage_test".into()),
+                serde_json::json!({"continuation_id": "p049-cont"}),
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE work_items SET scheduled_at = ?1 WHERE kind = 'process_continuation'")
+            .bind((Utc::now() - chrono::Duration::seconds(2)).to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(executor.process_next_item().await.unwrap());
+        let continuation = db::repos::agent_work_continuations::find_by_id(&pool, "p049-cont")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(launches.load(Ordering::SeqCst), 0, "P086 must validate the actual prompt and original snapshots before attaching a provider: {scenario}");
+        assert_eq!(continuation.status, "failed");
+        let reason = continuation.failure_reason.as_deref().unwrap();
+        assert!(
+            reason.contains("input_context_preflight_failed"),
+            "{scenario}: {reason}"
+        );
+        assert!(
+            reason.len() <= 256,
+            "preflight diagnostic must stay bounded: {reason}"
+        );
+        assert!(
+            continuation.continuation_report_artifact_id.is_some(),
+            "failure diagnostic must be durable"
+        );
+        assert_eq!(
+            agent_executions::find_by_id(&pool, execution.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            AgentStatus::Completed
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -17935,6 +18735,7 @@ fn test_execution_request_carries_chainworks_meta_root() {
         toolchain_go_scope_enabled: false,
 
         p079_repair_canonical_paths: None,
+        input_manifest: None,
     };
     assert_eq!(
         req.chainworks_meta_root.as_deref(),

@@ -2296,6 +2296,7 @@ impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExe
                 toolchain_home: None,
                 toolchain_go_scope_enabled: false,
                 p079_repair_canonical_paths: None,
+                input_manifest: None,
             })
             .await?;
         if result.status != AgentStatus::Completed {
@@ -4575,6 +4576,38 @@ fn degraded_policy_allows_valid_failed_outputs(
     })
 }
 
+async fn input_manifest_for_continuation(
+    pool: &SqlitePool,
+    run_id: RunId,
+    stage_execution_id: &str,
+    agent_execution_id: &str,
+) -> Result<Option<acp::input_context::InputManifest>> {
+    let payloads: Vec<String> = sqlx::query_scalar(
+        "SELECT payload_json FROM work_items
+         WHERE kind = 'invoke_agent' AND run_id = ?1
+           AND json_extract(payload_json, '$.stage_execution_id') = ?2
+           AND json_extract(payload_json, '$.p058_claimed.agent_execution_id') = ?3
+         LIMIT 2",
+    )
+    .bind(run_id.to_string())
+    .bind(stage_execution_id)
+    .bind(agent_execution_id)
+    .fetch_all(pool)
+    .await
+    .context("input_context_continuation_source_unavailable")?;
+    let [payload_json] = payloads.as_slice() else {
+        anyhow::bail!("input_context_continuation_source_missing_or_ambiguous");
+    };
+    let payload: serde_json::Value =
+        serde_json::from_str(payload_json).context("input_context_continuation_source_invalid")?;
+    let prompt = payload
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .context("input_context_continuation_source_prompt_missing")?;
+    acp::input_context::manifest_from_prompt(prompt)
+        .map_err(|_| anyhow::anyhow!("input_context_continuation_manifest_invalid"))
+}
+
 fn runtime_facts_for_acp_error(
     agent_exec_id: domain::ids::AgentExecutionId,
     error: &Error,
@@ -4582,13 +4615,24 @@ fn runtime_facts_for_acp_error(
 ) -> AgentExecutionRuntimeFacts {
     let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, now);
     let message = error.to_string();
+    facts.failure_kind_raw_debug = Some(redact_runtime_message(&format!("{error:#}")));
+    facts.failure_message_redacted = Some(redact_runtime_message(&message));
+    if acp::input_context::is_input_context_error(error) {
+        facts.failure_kind = Some(AgentFailureKind::Unknown);
+        facts.operator_action_hint = Some(OperatorActionHint::InspectLogs);
+        facts.output_settlement = AgentOutputSettlement::None;
+        facts.retry_after = None;
+        facts.transport_error_code = None;
+        facts.supervision_classification = Some("input_context_preflight_failed".into());
+        facts.runtime_preflight_phase = Some("failed_no_launch".into());
+        facts.runtime_preflight_provider_launched = Some(false);
+        return facts;
+    }
     let classification = classify_observation(observation_from_acp_error_message(&message));
     let provider_startup_failure = classification_skips_output_contract_repair(&classification);
     facts.retry_after = retry_after_or_default_for_provider_quota(&classification, now);
     facts.failure_kind = Some(classification.failure_kind);
     facts.operator_action_hint = Some(classification.operator_action_hint);
-    facts.failure_kind_raw_debug = Some(redact_runtime_message(&format!("{error:#}")));
-    facts.failure_message_redacted = Some(redact_runtime_message(&message));
     facts.output_settlement = if provider_startup_failure {
         AgentOutputSettlement::None
     } else {
@@ -4912,6 +4956,9 @@ fn is_work_item_requeued(error: &Error) -> bool {
 }
 
 fn is_transient_persistence_contention_error(error: &Error) -> bool {
+    if acp::input_context::is_input_context_error(error) {
+        return false;
+    }
     let message = format!("{error:#}").to_ascii_lowercase();
     message.contains("error returned from database: (code: 5)")
         || message.contains("error returned from database: (code: 6)")
@@ -9077,6 +9124,37 @@ impl BackgroundExecutor {
             return Ok(());
         }
 
+        let input_manifest = match input_manifest_for_continuation(
+            &self.pool,
+            run_id,
+            &cont.stage_execution_id,
+            &cont.agent_execution_id,
+        )
+        .await
+        {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let reason = format!(
+                    "input_context_preflight_failed: {}",
+                    redact_runtime_message(&error.to_string()),
+                );
+                self.settle_p086_continuation_with_materialized_artifacts(
+                    &run,
+                    &stage_id,
+                    &provider,
+                    model,
+                    &cont,
+                    "failed",
+                    Some(&reason),
+                    None,
+                    worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
         // 4. Live-handle continuation needs the original runtime generation id.
         // Provider-session resurrection owns a new attach process, then proves
         // the requested provider session id before sending any prompt. P086 also
@@ -9251,58 +9329,73 @@ impl BackgroundExecutor {
                 worker_pid,
                 daemon_generation_id: daemon_generation_id.clone(),
             });
-            let attach_result = self
-                .acp
-                .attach_provider_session_for_resurrection_with_launch_observer(
-                    acp::ExecutionRequest {
-                        agent_execution_id: None,
-                        run_id,
-                        stage_execution_id: Some(cont.stage_execution_id.clone()),
-                        stage_id: format!(
-                            "resurrection_attach_{}",
-                            &continuation_id[..8.min(continuation_id.len())]
-                        ),
-                        attempt_number: 1,
-                        agent_id: "code_writer".to_string(),
-                        provider: provider.clone(),
-                        model: model.clone(),
-                        effort: None,
-                        workspace_root: workspace_root.clone(),
-                        prompt: String::new(),
-                        worktree_root: worktree_root.clone(),
-                        worktree_write_enabled: worktree_root.is_some(),
-                        worktree_strategy: None,
-                        expected_output_paths: Vec::new(),
-                        expected_outputs: Vec::new(),
-                        keep_session_alive: true,
-                        reuse_existing_session: false,
-                        session_generation_id: Some(session_generation_id.clone()),
-                        provider_session_id: Some(provider_session_id.clone()),
-                        provider_runtime_home: None,
-                        mcp_servers: Vec::new(),
-                        chainworks_meta_root: ctx.chainworks_meta_root.clone(),
-                        legacy_broad_discovery_policy:
-                            domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
-                        xcode_shim_injection_signal: false,
-                        requires_xcode_host_execution: false,
-                        owner_kind: "stage_execution".to_string(),
-                        owner_id: Some(cont.stage_execution_id.clone()),
-                        origin_stage_id: None,
-                        origin_stage_execution_id: None,
-                        mediation_record_id: None,
-                        toolchain_home: None,
-                        toolchain_go_scope_enabled: false,
-                        p079_repair_canonical_paths: None,
-                    },
-                    Some(launch_observer),
-                )
-                .await;
+            let continuation_prompt = Self::p086_continuation_prompt(
+                &cont,
+                &session_generation_id,
+                Some(&provider_session_id),
+                canonical_worktree_root,
+            );
+            let mut attach_request = acp::ExecutionRequest {
+                agent_execution_id: None,
+                run_id,
+                stage_execution_id: Some(cont.stage_execution_id.clone()),
+                stage_id: format!(
+                    "resurrection_attach_{}",
+                    &continuation_id[..8.min(continuation_id.len())]
+                ),
+                attempt_number: 1,
+                agent_id: "code_writer".to_string(),
+                provider: provider.clone(),
+                model: model.clone(),
+                effort: None,
+                workspace_root: workspace_root.clone(),
+                prompt: continuation_prompt.clone(),
+                worktree_root: worktree_root.clone(),
+                worktree_write_enabled: worktree_root.is_some(),
+                worktree_strategy: None,
+                expected_output_paths: Vec::new(),
+                expected_outputs: Vec::new(),
+                keep_session_alive: true,
+                reuse_existing_session: false,
+                session_generation_id: Some(session_generation_id.clone()),
+                provider_session_id: Some(provider_session_id.clone()),
+                provider_runtime_home: None,
+                mcp_servers: Vec::new(),
+                chainworks_meta_root: ctx.chainworks_meta_root.clone(),
+                legacy_broad_discovery_policy:
+                    domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+                xcode_shim_injection_signal: false,
+                requires_xcode_host_execution: false,
+                owner_kind: "stage_execution".to_string(),
+                owner_id: Some(cont.stage_execution_id.clone()),
+                origin_stage_id: None,
+                origin_stage_execution_id: None,
+                mediation_record_id: None,
+                toolchain_home: None,
+                toolchain_go_scope_enabled: false,
+                p079_repair_canonical_paths: None,
+                input_manifest: input_manifest.clone(),
+            };
+            let attach_result = match acp::input_context::bind_request_manifest(&mut attach_request)
+            {
+                Ok(()) => {
+                    self.acp
+                        .attach_provider_session_for_resurrection_with_launch_observer(
+                            attach_request,
+                            Some(launch_observer),
+                        )
+                        .await
+                }
+                Err(error) => Err(error),
+            };
 
             let attach_result = match attach_result {
                 Ok(result) => result,
                 Err(err) => {
                     let err_text = err.to_string();
-                    let failure_class = if err_text.contains("identity_mismatch") {
+                    let failure_class = if acp::input_context::is_input_context_error(&err) {
+                        "input_context_preflight_failed"
+                    } else if err_text.contains("identity_mismatch") {
                         "actual_session_mismatch"
                     } else if err_text.contains("unsupported") {
                         "unsupported"
@@ -9809,12 +9902,6 @@ impl BackgroundExecutor {
             )
             .await?;
 
-            let continuation_prompt = Self::p086_continuation_prompt(
-                &cont,
-                &session_generation_id,
-                Some(&provider_session_id),
-                canonical_worktree_root,
-            );
             let exec_result = self
                 .acp
                 .execute(acp::ExecutionRequest {
@@ -9856,6 +9943,7 @@ impl BackgroundExecutor {
                     toolchain_home: None,
                     toolchain_go_scope_enabled: false,
                     p079_repair_canonical_paths: None,
+                    input_manifest: input_manifest.clone(),
                 })
                 .await;
             let _ = self.acp.close_session(&session_generation_id).await;
@@ -10033,6 +10121,15 @@ impl BackgroundExecutor {
                         error = %err,
                         "P086 provider-session resurrection prompt failed"
                     );
+                    let (failure_reason, failure_class) =
+                        if acp::input_context::is_input_context_error(&err) {
+                            (
+                                "input_context_preflight_failed",
+                                "input_context_preflight_failed",
+                            )
+                        } else {
+                            ("provider_error", "provider_rejected")
+                        };
                     self.settle_p086_continuation_with_materialized_artifacts(
                         &run,
                         &stage_id,
@@ -10040,7 +10137,7 @@ impl BackgroundExecutor {
                         model,
                         &cont,
                         "failed",
-                        Some("provider_error"),
+                        Some(failure_reason),
                         None,
                         worktree_root.as_deref().or(Some(workspace_root.as_str())),
                         output_only_source_baseline.as_ref(),
@@ -10057,7 +10154,7 @@ impl BackgroundExecutor {
                     current_receipt_json["resurrection_phase"] =
                         serde_json::Value::String("failed_closed".to_string());
                     current_receipt_json["failure_class"] =
-                        serde_json::Value::String("provider_rejected".to_string());
+                        serde_json::Value::String(failure_class.to_string());
                     current_receipt_json["resurrection_last_heartbeat_at"] =
                         serde_json::Value::String(failed_at.clone());
                     self.refresh_p086_resurrection_attach_receipt(
@@ -10349,6 +10446,7 @@ impl BackgroundExecutor {
                 toolchain_home: None,
                 toolchain_go_scope_enabled: false,
                 p079_repair_canonical_paths: None,
+                input_manifest: input_manifest.clone(),
             })
             .await;
 
@@ -10459,6 +10557,11 @@ impl BackgroundExecutor {
                     error = %err,
                     "P086 continuation ACP call failed; settling to failed"
                 );
+                let failure_reason = if acp::input_context::is_input_context_error(&err) {
+                    "input_context_preflight_failed"
+                } else {
+                    "provider_error"
+                };
                 self.settle_p086_continuation_with_materialized_artifacts(
                     &run,
                     &stage_id,
@@ -10466,7 +10569,7 @@ impl BackgroundExecutor {
                     model,
                     &cont,
                     "failed",
-                    Some("provider_error"),
+                    Some(failure_reason),
                     None,
                     worktree_root.as_deref().or(Some(workspace_root.as_str())),
                     None,
@@ -12294,7 +12397,7 @@ impl BackgroundExecutor {
                         .unwrap_or(false),
                     xcode_shim_required,
                 );
-                let req = acp::ExecutionRequest {
+                let mut req = acp::ExecutionRequest {
                     agent_execution_id: Some(agent_exec_id),
                     run_id,
                     stage_execution_id: stage_execution_id.map(|id| id.to_string()),
@@ -12352,6 +12455,7 @@ impl BackgroundExecutor {
                     toolchain_home: None,
                     toolchain_go_scope_enabled: false,
                     p079_repair_canonical_paths: None,
+                    input_manifest: None,
                 };
                 let p088_code_writer_completion_candidate =
                     agent_id == "code_writer" && !declared_outputs.is_empty();
@@ -12403,34 +12507,92 @@ impl BackgroundExecutor {
                 } else {
                     None
                 };
-                // Runtime event: session starting
-                let _ = self
-                    .events
-                    .send(domain::events::DomainEvent::RuntimeStatusChanged {
-                        run_id,
-                        stage_id: stage_id.clone(),
-                        agent_id: agent_id.clone(),
-                        provider: provider.clone(),
-                        event_kind: "session_started".to_string(),
-                    });
+                let admission = acp::input_context::bind_request_manifest(&mut req);
+                if admission.is_ok() {
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::RuntimeStatusChanged {
+                            run_id,
+                            stage_id: stage_id.clone(),
+                            agent_id: agent_id.clone(),
+                            provider: provider.clone(),
+                            event_kind: "session_started".to_string(),
+                        });
 
-                if let Err(error) =
-                    p090_prepare_junie_preflight_remediation(&self.pool, agent_exec_id, &req).await
-                {
-                    warn!(
-                        run_id = %run_id,
-                        stage_id = %stage_id,
-                        agent_id = %agent_id,
-                        agent_execution_id = %agent_exec_id,
-                        error = %error,
-                        "P090 Junie preflight remediation preparation failed; adapter preflight will enforce final launch decision"
-                    );
+                    if let Err(error) =
+                        p090_prepare_junie_preflight_remediation(&self.pool, agent_exec_id, &req)
+                            .await
+                    {
+                        warn!(
+                            run_id = %run_id,
+                            stage_id = %stage_id,
+                            agent_id = %agent_id,
+                            agent_execution_id = %agent_exec_id,
+                            error = %error,
+                            "P090 Junie preflight remediation preparation failed; adapter preflight will enforce final launch decision"
+                        );
+                    }
                 }
 
-                let mut result = match self.acp.execute(req.clone()).await {
+                let execution_result = match admission {
+                    Ok(()) => self.acp.execute(req.clone()).await,
+                    Err(error) => Err(error),
+                };
+                let mut result = match execution_result {
                     Ok(result) => result,
                     Err(error) => {
                         let completed_at = chrono::Utc::now();
+                        if acp::input_context::is_input_context_error(&error) {
+                            let runtime_facts =
+                                runtime_facts_for_acp_error(agent_exec_id, &error, completed_at);
+                            let persistence_result: Result<()> = async {
+                                let mut tx = self
+                                    .begin_executor_transaction(
+                                        "executor.input_context_preflight_failed",
+                                        format!("input_context_preflight_failed:{agent_exec_id}"),
+                                    )
+                                    .await?;
+                                agent_executions::update_completed_tx(
+                                    &mut tx,
+                                    agent_exec_id,
+                                    AgentStatus::Failed,
+                                    completed_at,
+                                )
+                                .await?;
+                                agent_execution_runtime_facts::upsert_tx(&mut tx, &runtime_facts)
+                                    .await?;
+                                if let Some(receipt) = acp::runtime_receipt_from_error(&error) {
+                                    let record = runtime_receipt_record_from_receipt(
+                                        agent_exec_id,
+                                        receipt,
+                                        completed_at,
+                                    )?;
+                                    agent_execution_runtime_receipts::upsert_tx(&mut tx, &record)
+                                        .await?;
+                                }
+                                tx.commit().await?;
+                                Ok(())
+                            }
+                            .await;
+                            if let Err(persistence_error) = persistence_result {
+                                // Retain the structured input failure so outer DB retry heuristics
+                                // cannot turn a diagnostic write failure into another provider attempt.
+                                return Err(error.context(format!(
+                                    "Failed to persist input context preflight diagnostics: {}",
+                                    redact_runtime_message(&format!("{persistence_error:#}")),
+                                )));
+                            }
+                            let _ = self.events.send(
+                                domain::events::DomainEvent::RuntimeStatusChanged {
+                                    run_id,
+                                    stage_id: stage_id.clone(),
+                                    agent_id: agent_id.clone(),
+                                    provider: provider.clone(),
+                                    event_kind: "input_context_preflight_failed".into(),
+                                },
+                            );
+                            return Err(error);
+                        }
                         if let Some(claimed) = preclaimed_start.as_ref() {
                             if self
                                 .auto_requeue_junie_provider_capacity_after_preflight(
@@ -19607,6 +19769,49 @@ struct RuntimeInvocationContractInput<'a> {
     session_generation_id: Option<String>,
     session_reuse_disposition: Option<String>,
     declared_outputs: &'a [DeclaredOutput],
+}
+
+/// Budget a rehydrated retry before committing its attempt. Use the same late
+/// instruction/contract renderers as dispatch, with conservative session fields.
+pub(crate) fn validate_rehydrated_retry_prompt_budget(
+    payload: &serde_json::Value,
+    operator_instruction: Option<&str>,
+    work_item_id: &str,
+) -> Result<usize> {
+    let field = |name: &str| -> Result<String> {
+        payload[name]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("input_context_retry_payload_incomplete"))
+    };
+    let mut prompt = field("prompt")?;
+    if let Some(instruction) = operator_instruction {
+        append_operator_retry_instruction_prompt(
+            &mut prompt,
+            instruction,
+            &domain::retry_instruction::instruction_sha256(instruction),
+        );
+    }
+    let outputs: Vec<DeclaredOutput> = serde_json::from_value(payload["declared_outputs"].clone())
+        .context("input_context_retry_outputs_invalid")?;
+    let prompt = prompt_with_runtime_invocation_contract(
+        prompt,
+        RuntimeInvocationContractInput {
+            run_id: field("run_id")?,
+            stage_id: field("stage_id")?,
+            stage_execution_id: field("stage_execution_id")?,
+            agent_execution_id: uuid::Uuid::nil().to_string(),
+            work_item_id: work_item_id.into(),
+            session_generation_id: Some(uuid::Uuid::nil().to_string()),
+            session_reuse_disposition: Some("x".repeat(128)),
+            declared_outputs: &outputs,
+        },
+    );
+    anyhow::ensure!(
+        prompt.len() <= acp::input_context::MAX_PROMPT_BYTES,
+        "input_context_retry_final_prompt_too_large"
+    );
+    Ok(prompt.len())
 }
 
 fn prompt_with_runtime_invocation_contract(
@@ -26863,6 +27068,150 @@ plain progress line without gate evidence";
         );
     }
 
+    #[tokio::test]
+    async fn p049_input_context_continuation_recovers_only_exact_durable_source() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let run_id = RunId::new();
+        let stage_id = domain::ids::StageExecutionId::new().to_string();
+        let agent_id = domain::ids::AgentExecutionId::new().to_string();
+        let manifest = serde_json::json!({
+            "run_id": run_id,
+            "artifacts": [{"name": "proposal", "path": "/frozen/proposal", "size_bytes": 7, "sha256": "a".repeat(64)}]
+        });
+        let payload = serde_json::json!({
+            "stage_execution_id": stage_id,
+            "p058_claimed": {"agent_execution_id": agent_id},
+            "prompt": format!("CHAINWORKS_INPUT_MANIFEST_V1 {manifest}\nOriginal task")
+        });
+        sqlx::query("INSERT INTO work_items (id, kind, payload_json, status, run_id, created_at, scheduled_at) VALUES ('source', 'invoke_agent', ?1, 'completed', ?2, ?3, ?3)")
+            .bind(payload.to_string())
+            .bind(run_id.to_string())
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&pool).await.unwrap();
+
+        let recovered = input_manifest_for_continuation(&pool, run_id, &stage_id, &agent_id)
+            .await
+            .unwrap()
+            .expect("continuation must retain the source manifest after replacing its prompt");
+        assert_eq!(serde_json::to_value(recovered).unwrap(), manifest);
+        for (candidate_run, candidate_stage, candidate_agent) in [
+            (RunId::new(), stage_id.clone(), agent_id.clone()),
+            (run_id, "other-stage".into(), agent_id.clone()),
+            (run_id, stage_id.clone(), "other-attempt".into()),
+        ] {
+            let error = input_manifest_for_continuation(
+                &pool,
+                candidate_run,
+                &candidate_stage,
+                &candidate_agent,
+            )
+            .await
+            .expect_err("missing exact source must fail closed");
+            assert!(error
+                .to_string()
+                .contains("input_context_continuation_source"));
+        }
+
+        sqlx::query("INSERT INTO work_items (id, kind, payload_json, status, run_id, created_at, scheduled_at) SELECT 'duplicate', kind, payload_json, status, run_id, created_at, scheduled_at FROM work_items WHERE id = 'source'")
+            .execute(&pool).await.unwrap();
+        assert!(
+            input_manifest_for_continuation(&pool, run_id, &stage_id, &agent_id)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn p049_input_context_continuation_rejects_unreadable_binding_not_legacy_prompt() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let run_id = RunId::new();
+        for (prompt, expected_error) in [
+            (None, true),
+            (Some("CHAINWORKS_INPUT_MANIFEST_V1 {invalid}"), true),
+            (Some("Legacy task with no bound artifact snapshots"), false),
+        ] {
+            let payload = serde_json::json!({
+                "stage_execution_id": "stage", "p058_claimed": {"agent_execution_id": "agent"}, "prompt": prompt
+            });
+            sqlx::query("INSERT OR REPLACE INTO work_items (id, kind, payload_json, status, run_id, created_at, scheduled_at) VALUES ('source', 'invoke_agent', ?1, 'completed', ?2, ?3, ?3)")
+                .bind(payload.to_string()).bind(run_id.to_string()).bind(chrono::Utc::now().to_rfc3339())
+                .execute(&pool).await.unwrap();
+            let result = input_manifest_for_continuation(&pool, run_id, "stage", "agent").await;
+            if expected_error {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("input_context_continuation_"));
+            } else {
+                assert_eq!(result.unwrap(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn p049_input_context_preflight_runtime_facts_are_non_retryable() {
+        for reason in [
+            "input_context_prompt_too_large",
+            "input_context_snapshot_unreadable",
+            "input_context_snapshot_changed",
+        ] {
+            let mut receipt =
+                sample_runtime_receipt(Default::default(), Some("input_context_preflight"));
+            receipt.provider_session_id = None;
+            receipt.handshake = Default::default();
+            receipt.first_events.clear();
+            receipt.last_events.clear();
+            let error = anyhow::Error::new(acp::AcpExecutionError::new(
+                format!("{reason} token=p049-secret"),
+                Some(receipt),
+            ))
+            .context("ACP request rejected");
+
+            let facts = runtime_facts_for_acp_error(
+                domain::ids::AgentExecutionId::new(),
+                &error,
+                chrono::Utc::now(),
+            );
+
+            assert_eq!(facts.failure_kind, Some(AgentFailureKind::Unknown));
+            assert_eq!(
+                facts.operator_action_hint,
+                Some(OperatorActionHint::InspectLogs)
+            );
+            assert_eq!(facts.output_settlement, AgentOutputSettlement::None);
+            assert!(!facts.valid_required_outputs);
+            assert_eq!(facts.retry_after, None);
+            assert_eq!(facts.transport_error_code, None);
+            assert_eq!(
+                facts.supervision_classification.as_deref(),
+                Some("input_context_preflight_failed")
+            );
+            assert_eq!(facts.runtime_preflight_provider_launched, Some(false));
+            let diagnostic = facts.failure_kind_raw_debug.as_deref().unwrap();
+            assert!(diagnostic.contains(reason));
+            assert!(!diagnostic.contains("p049-secret"));
+            assert_eq!(
+                crate::shadow_escalation::classify_trigger_from_runtime_facts(&facts),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn p049_input_context_preflight_is_not_transient_persistence_contention() {
+        let receipt = sample_runtime_receipt(Default::default(), Some("input_context_preflight"));
+        let error = anyhow::Error::new(acp::AcpExecutionError::new(
+            "input_context_snapshot_changed: database is locked",
+            Some(receipt),
+        ))
+        .context("ACP preflight failed");
+
+        assert!(!is_transient_persistence_contention_error(&error));
+        assert!(is_transient_persistence_contention_error(&anyhow::anyhow!(
+            "database is locked"
+        )));
+    }
+
     #[test]
     fn acp_initialize_runtime_facts_keep_redacted_error_chain_detail() {
         let error = anyhow::anyhow!(
@@ -27385,6 +27734,7 @@ plain progress line without gate evidence";
             toolchain_go_scope_enabled: false,
 
             p079_repair_canonical_paths: None,
+            input_manifest: None,
         };
 
         p090_prepare_junie_preflight_remediation(&pool, agent_execution_id, &req)

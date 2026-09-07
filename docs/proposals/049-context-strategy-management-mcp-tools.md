@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Date | 2026-04-17 |
-| Status | Draft |
+| Status | Draft; bounded input handoff slice implemented, strategy tools remain proposed |
 | Author | Andrey Khasanov |
 | Depends on | [../reference/query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md) |
 | Scope | Add context strategy assignment, querying, pressure monitoring, handoff compilation, and simulation to the MCP tool surface, with a file-based strategy profile registry. |
@@ -13,7 +13,7 @@
 
 ## 1. Context and Motivation
 
-The Swift app has Context Strategy support (Proposal 019): strategy profile assignment, handoff packet compilation, limit pressure tracking, promoted artifact management. The control-plane has **none of this** — no strategy profiles, no handoff logic, no budget tracking.
+The Swift app has Context Strategy support (Proposal 019): strategy profile assignment, handoff packet compilation, limit pressure tracking, promoted artifact management. The control-plane now implements a bounded, lossless input handoff and a final pre-ACP prompt byte cap, described in [ACP Runtime Transport](../reference/acp-runtime-transport.md#bounded-input-handoff-p049-slice). Strategy profiles, pressure history, and the management tools below remain proposed; this limited production slice does not complete P049.
 
 Context strategy matters because agent invocations have finite context windows. A Code Writer receiving the full proposal, all review feedback, implementation plan, and audit report may exceed the context limit. The strategy profile controls:
 

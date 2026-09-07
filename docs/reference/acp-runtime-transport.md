@@ -41,6 +41,7 @@ It does not define:
 - [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md)
 - [live-provider-execution-slice.md](live-provider-execution-slice.md)
 - [bounded-tool-output-and-safe-search-policy.md](bounded-tool-output-and-safe-search-policy.md)
+- [P049 bounded input handoff proof and recovery conditions](../evidence/p049-bounded-input-handoff-2026-09-07.md)
 
 ## Canonical transport contract
 
@@ -64,6 +65,122 @@ The control plane still owns:
 - recovery,
 - reports,
 - and frozen run truth.
+
+## Bounded input handoff (P049 slice)
+
+The Rust task prompt builder uses a lossless artifact handoff, not summarization
+or silent truncation. System instructions, frozen mission/skill authority,
+output contracts, task instructions, and the proposal writer's current backlog
+authority remain inline. Backlog authority and its input snapshot are derived
+from the same bounded capture when building a task. Dispatch still appends the
+current backlog authority after a historical retry prompt.
+
+- At most 24 KiB of materialized artifact context is inline in aggregate. The
+  builder reduces this budget when mandatory context exceeds 24 KiB, reserving
+  16 KiB of the final 64 KiB ceiling for runtime contracts and retry additions.
+- Other existing UTF-8 input artifacts are copied in full to
+  `<effective-cwd>/.chainworks/input-snapshots/<run-id>/<sha256>.data`.
+  Effective cwd follows the actual ACP worktree strategy, including `meta_only`.
+- The first-line `CHAINWORKS_INPUT_MANIFEST_V1` JSON records logical name,
+  absolute snapshot path, byte count, SHA-256, and run ownership. It is persisted
+  with the work-item prompt. `ExecutionRequest.input_manifest` retains the
+  structured binding when a repair replaces the prompt; it survives request
+  serialization. Continuations recover it from the exact original run/stage/
+  execution-owned invocation, not a nearby stage or a guessed latest prompt;
+  missing or ambiguous provenance fails closed. No raw input content is copied
+  to runtime failure diagnostics.
+- Publication uses a private temporary file, sync, mode `0400`, and an atomic
+  no-overwrite hard link. Directory-relative opens reject symlinks, nonregular
+  files, foreign-owned directories, and group/world-writable directories.
+  A matching digest reuses the sealed snapshot; it never overwrites a revision.
+- Acquisition is bounded at 16 MiB per source and 64 MiB per task; the manifest
+  admits at most 128 references and 64 MiB in total. Unsupported/non-UTF-8,
+  nonregular, unreadable, or concurrently changed sources fail closed. Missing
+  or empty source inputs retain the existing path-only behavior, not a fabricated
+  snapshot, except during historical retry rehydration described below.
+  A missing *referenced snapshot* always fails admission.
+- After all runtime/retry additions, manager `execute`, `start_session`, and
+  `prompt_session`, and provider-session resurrection attach enforce
+  **64 KiB of UTF-8 prompt bytes**, including metadata,
+  and validate reference ownership, read-root containment, permissions, byte
+  count, and digest before adapter lookup, session launch, or prompt reuse.
+  An irreducibly large mandatory prompt is rejected, never trimmed.
+  Resurrection validates the actual continuation prompt and recovered input
+  binding before creating the attach process, not only before the later send.
+
+Admission failures persist an `input_context_preflight` runtime receipt and
+`input_context_preflight_failed` supervision classification. They are not
+provider timeouts, transport errors, quota events, or missing-output failures.
+They must not launch a provider or trigger automatic contract-output/provider
+fallback, including an escalation ledger carrying an older trigger. The failed
+stage still settles through the normal work-queue/AdvanceRun path for operator
+inspection.
+
+Source acquisition/publication failures during prompt construction use the
+existing durable prompt-finalization failure record and block the stage/run
+before that task is enqueued. They do not leave an empty running stage waiting
+for a provider invocation that was never created.
+
+### Historical Targeted Retry Rehydration
+
+`stages.retry` with `agent_execution_id` checks the copied invocation after
+adding current proposal-backlog authority. If that historical flat prompt
+exceeds 64 KiB, it rebuilds the prompt from the verified frozen run-plan task
+before the retry transaction creates a stage or enqueues provider work.
+It resolves exactly one task by source stage, task name, and agent; persisted
+input/output lists must agree with that task. Current artifacts are captured
+again, with no missing/empty/path-only substitute, and the existing bounded
+builder retains system/mission/skill instructions and all output contracts.
+The current approval rejection and applicable workflow-conflict instruction
+are reconstructed from their durable records. Declared outputs are regenerated
+from frozen task authority; retry identity, escalation/fallback metadata, and
+operator-instruction bindings continue through the existing retry path.
+The original work item is unchanged. `p049_prompt_rehydration` records the
+replaced prompt's size/digest (including appended backlog context), replacement
+size, and frozen-task authority. Rehydrated prompts must leave the 16-KiB
+runtime reserve intact (at most 48 KiB before dispatch additions). Before the
+retry transaction, the command also budgets the current dispatch backlog,
+validated operator instruction, and runtime output contract using the executor's
+actual renderers, UUID-sized future execution/session identifiers, and a
+conservative 128-byte session-disposition allowance. A projected final prompt
+over 64 KiB rejects the command; its admitted size is recorded as
+`projected_final_prompt_bytes`. Actual ACP admission still applies after late
+operator instructions and runtime contracts, including source changes between
+scheduling and dispatch.
+
+No frozen plan, missing/ambiguous task, inconsistent task inputs/outputs,
+unavailable required source, or irreducibly oversized mandatory instructions
+rejects the command without creating a retry attempt. Already manifest-bound
+prompts are not rehydrated, so retry cannot bypass a failed snapshot binding.
+Code-writer source-context reconstruction, dynamic fan-out payloads and
+`selected_outputs_from` aggregation tasks, owner-only states, and mediation
+contexts are outside this bounded rehydration path and
+fail closed when oversized. Normal bounded retries and repair/continuation
+bindings keep their existing behavior. This does not automatically retry a run
+or establish that prompt size was the sole cause of its previous failure.
+
+The reference is lossless input availability, not proof that a provider reasoned
+over every byte. The prompt requires full snapshot reads and verification and
+prohibits broader permission requests. No provider permissions are expanded.
+Read-only content-addressed publication and preflight checks do not provide a
+lifetime filesystem sandbox against a hostile process running as the same OS
+user; such a process can change ownership-controlled files after admission.
+Snapshots must remain available for their run and pending retries/continuations;
+this slice adds no independent cleanup or strategy-profile service.
+
+Focused proof, from `control-plane/`:
+
+```bash
+../scripts/cargo-managed test -p acp --test input_pressure
+../scripts/cargo-managed test -p engine --lib p049_
+../scripts/cargo-managed test -p engine --test integration p049_
+../scripts/cargo-managed test -p daemon --test proposal_086_mcp_continuation_live_reuse -- --test-threads=1
+```
+
+This is a partial P049 implementation; the proposal's
+strategy MCP tools, pressure registry, simulation, and automatic adaptation are
+not implemented by this slice. A successful fixture is not a live-provider
+acceptance claim or authorization to retry a blocked run.
 
 ## Runtime selection model
 
