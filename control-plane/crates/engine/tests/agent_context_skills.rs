@@ -2439,15 +2439,15 @@ backend_profiles:
   codex_orchestrator_high:
     provider: codex_acp
     model: gpt-5.6-sol
-    effort: max
+    effort: high
   codex_architect_high:
     provider: codex_acp
     model: gpt-5.6-sol
-    effort: xhigh
+    effort: high
   codex_audit_high:
     provider: codex_acp
     model: gpt-5.6-sol
-    effort: ultra
+    effort: high
   codex_writer_high:
     provider: codex_acp
     model: gpt-5.6-terra
@@ -2463,6 +2463,18 @@ backend_profiles:
   codex_ops_low:
     provider: codex_acp
     model: gpt-5.6-luna
+    effort: high
+  astra_orchestrator_critical:
+    provider: codex_acp
+    model: gpt-6-astra
+    effort: high
+  astra_audit_critical:
+    provider: codex_acp
+    model: gpt-6-astra
+    effort: high
+  astra_builder_critical:
+    provider: codex_acp
+    model: gpt-6-astra
     effort: high
 agents:
   - id: lead
@@ -2523,6 +2535,12 @@ states:
           task: Coordinate
         - agent: operator
           task: Operate
+        - agent: critical_orchestrator
+          task: Critical coordination
+        - agent: critical_auditor
+          task: Critical audit
+        - agent: critical_builder
+          task: Critical build
 "#,
     )
     .unwrap();
@@ -2540,15 +2558,15 @@ backend_profiles:
   codex_orchestrator_high:
     provider: codex_acp
     model: gpt-5.6-sol
-    effort: max
+    effort: high
   codex_architect_high:
     provider: codex_acp
     model: gpt-5.6-sol
-    effort: xhigh
+    effort: high
   codex_audit_high:
     provider: codex_acp
     model: gpt-5.6-sol
-    effort: ultra
+    effort: high
   codex_writer_high:
     provider: codex_acp
     model: gpt-5.6-terra
@@ -2564,6 +2582,18 @@ backend_profiles:
   codex_ops_low:
     provider: codex_acp
     model: gpt-5.6-luna
+    effort: high
+  astra_orchestrator_critical:
+    provider: codex_acp
+    model: gpt-6-astra
+    effort: high
+  astra_audit_critical:
+    provider: codex_acp
+    model: gpt-6-astra
+    effort: high
+  astra_builder_critical:
+    provider: codex_acp
+    model: gpt-6-astra
     effort: high
 agents:
   - id: lead
@@ -2596,6 +2626,18 @@ agents:
     backend_profile: codex_ops_low
     permission_profile: ORCH
     prompt: Operate the test.
+  - id: critical_orchestrator
+    backend_profile: astra_orchestrator_critical
+    permission_profile: ORCH
+    prompt: Coordinate the critical test.
+  - id: critical_auditor
+    backend_profile: astra_audit_critical
+    permission_profile: ORCH
+    prompt: Audit the critical test.
+  - id: critical_builder
+    backend_profile: astra_builder_critical
+    permission_profile: ORCH
+    prompt: Build the critical test.
 "#,
     )
     .unwrap();
@@ -2610,7 +2652,7 @@ async fn production_start_run_rejects_matrix_drift_before_any_run_stage_or_work_
         event_bus::new_bus(32),
         WorkQueue::new(pool.clone()),
     );
-    const PROFILES: [&str; 7] = [
+    const PROFILES: [&str; 10] = [
         "codex_orchestrator_high",
         "codex_architect_high",
         "codex_audit_high",
@@ -2618,6 +2660,9 @@ async fn production_start_run_rejects_matrix_drift_before_any_run_stage_or_work_
         "codex_builder_high",
         "codex_orchestrator_acp",
         "codex_ops_low",
+        "astra_orchestrator_critical",
+        "astra_audit_critical",
+        "astra_builder_critical",
     ];
 
     for profile_id in PROFILES {
@@ -2682,8 +2727,8 @@ async fn production_start_run_rejects_matrix_drift_before_any_run_stage_or_work_
         "duplicate nested key",
         |catalog| {
             catalog.replacen(
-                "    model: gpt-5.6-sol\n    effort: max",
-                "    model: gpt-5.6-sol\n    model: gpt-5.6-terra\n    effort: max",
+                "    model: gpt-5.6-sol\n    effort: high",
+                "    model: gpt-5.6-sol\n    model: gpt-5.6-terra\n    effort: high",
                 1,
             )
         },
@@ -2817,7 +2862,8 @@ async fn production_start_run_rejects_missing_or_oversized_idea_before_run_and_w
 
 #[cfg(unix)]
 #[tokio::test]
-async fn production_codex_variant_bridge_serializes_all_seven_admitted_rows() {
+// boundary-no-op: model fixture coverage only; runtime authorization is unchanged.
+async fn production_codex_variant_bridge_serializes_all_admitted_rows() {
     use acp::adapters::{
         codex::CodexAdapter, AcpAdapter, AcpLaunchSpec, AcpSessionNewSpec, LaunchResourceGuard,
     };
@@ -2961,8 +3007,8 @@ send({{"jsonrpc":"2.0","id":message["id"],"result":{{"stopReason":"end_turn","se
         .collect::<Vec<_>>();
     assert_eq!(
         invoke_items.len(),
-        7,
-        "production fan-out must enqueue all seven rows"
+        10,
+        "production fan-out must enqueue all ten rows"
     );
 
     let mut queued = invoke_items
@@ -2982,12 +3028,20 @@ send({{"jsonrpc":"2.0","id":message["id"],"result":{{"stopReason":"end_turn","se
         .collect::<Vec<_>>();
     queued.sort();
     let mut expected_queued = vec![
-        ("codex_architect_high", "codex", "gpt-5.6-sol", "xhigh"),
-        ("codex_audit_high", "codex", "gpt-5.6-sol", "ultra"),
+        (
+            "astra_orchestrator_critical",
+            "codex",
+            "gpt-6-astra",
+            "high",
+        ),
+        ("astra_audit_critical", "codex", "gpt-6-astra", "high"),
+        ("astra_builder_critical", "codex", "gpt-6-astra", "high"),
+        ("codex_architect_high", "codex", "gpt-5.6-sol", "high"),
+        ("codex_audit_high", "codex", "gpt-5.6-sol", "high"),
         ("codex_builder_high", "codex", "gpt-5.6-terra", "high"),
         ("codex_ops_low", "codex", "gpt-5.6-luna", "high"),
         ("codex_orchestrator_acp", "codex", "gpt-5.6-terra", "high"),
-        ("codex_orchestrator_high", "codex", "gpt-5.6-sol", "max"),
+        ("codex_orchestrator_high", "codex", "gpt-5.6-sol", "high"),
         ("codex_writer_high", "codex", "gpt-5.6-terra", "high"),
     ]
     .into_iter()
@@ -3006,12 +3060,14 @@ send({{"jsonrpc":"2.0","id":message["id"],"result":{{"stopReason":"end_turn","se
     // Production queue selection deliberately applies a one-second compatibility
     // window for legacy timestamps with mixed precision.
     tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-    for _ in 0..24 {
+    // Each invocation also schedules queue bookkeeping; scale the bounded drain
+    // with the admitted rows instead of retaining the original seven-row limit.
+    for _ in 0..invoke_items.len() * 4 {
         let observed_count = std::fs::read_to_string(&observed_path)
             .unwrap_or_default()
             .lines()
             .count();
-        if observed_count == 7 {
+        if observed_count == expected_queued.len() {
             break;
         }
         let processed = match executor.process_next_item().await {
@@ -3063,9 +3119,12 @@ send({{"jsonrpc":"2.0","id":message["id"],"result":{{"stopReason":"end_turn","se
         .collect::<Vec<_>>();
     observed.sort();
     let mut expected_observed = vec![
-        ("gpt-5.6-sol", "max"),
-        ("gpt-5.6-sol", "xhigh"),
-        ("gpt-5.6-sol", "ultra"),
+        ("gpt-5.6-sol", "high"),
+        ("gpt-5.6-sol", "high"),
+        ("gpt-5.6-sol", "high"),
+        ("gpt-6-astra", "high"),
+        ("gpt-6-astra", "high"),
+        ("gpt-6-astra", "high"),
         ("gpt-5.6-terra", "high"),
         ("gpt-5.6-terra", "high"),
         ("gpt-5.6-terra", "high"),
@@ -3208,12 +3267,12 @@ fn persisted_snapshot_quartet_replays_historical_generic_and_custom_tuples() {
     let catalog_bytes = std::fs::read_to_string(root.join("examples/agents/agents.yaml"))
         .unwrap()
         .replacen(
-            "  codex_orchestrator_high:\n    provider: codex_acp\n    model: gpt-5.6-sol\n    effort: max",
+            "  codex_orchestrator_high:\n    provider: codex_acp\n    model: gpt-5.6-sol\n    effort: high",
             "  codex_orchestrator_high:\n    provider: codex_acp\n    model: gpt-5.6\n    effort: custom-effort",
             1,
         )
         .replacen(
-            "  codex_audit_high:\n    provider: codex_acp\n    model: gpt-5.6-sol\n    effort: ultra",
+            "  codex_audit_high:\n    provider: codex_acp\n    model: gpt-5.6-sol\n    effort: high",
             "  codex_audit_high:\n    provider: codex_acp\n    model: custom-model\n    effort: ultra",
             1,
         );

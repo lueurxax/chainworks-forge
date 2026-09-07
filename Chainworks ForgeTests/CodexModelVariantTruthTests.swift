@@ -18,10 +18,10 @@ struct CodexModelVariantTruthTests {
         )
         let data = try Data(contentsOf: url)
 
-        #expect(data.count == 1_479)
+        #expect(data.count == 1_994)
         #expect(
             SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-                == "b6ad3f2047466a34da42241eae6b790f60bb835d9e6826cb77b51eb3fc558911"
+                == "e2e78059d4d03936d4c88e0009435b8b9540611cd2fb1c08707004bd154d26b0"
         )
         guard case .available = CodexModelVariantPolicyLoader.load(data: data) else {
             Issue.record("pinned bundled policy must load")
@@ -70,6 +70,14 @@ struct CodexModelVariantTruthTests {
     func formatterCoversKnownLegacyMissingAndUnavailableStates() throws {
         let policy = try pinnedPolicy()
 
+        #expect(
+            CodexPlannedAssignmentFormatter.presentation(
+                provider: "codex",
+                model: "gpt-6-astra",
+                effort: "high",
+                policy: policy
+            ).variantToken == "Astra"
+        )
         #expect(
             CodexPlannedAssignmentFormatter.presentation(
                 provider: "codex",

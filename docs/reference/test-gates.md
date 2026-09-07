@@ -211,13 +211,14 @@ readback, and shared Overview/Stages labels. Operational truth lives in
 
 Scope:
 
-- verifies the strict 1,479-byte V1 policy fixture and exact seven production
+- verifies the strict 1,994-byte V1 policy fixture and exact ten production
   backend-profile/model/effort rows
 - proves duplicate-safe single-read new-Run admission and zero writes on every
   policy/source failure
 - covers complete, absent, partial, malformed, tampered, mismatched, and
   historical snapshot pairs without live-source fallback for stored snapshots
-- carries all seven rows through production payloads and ACP serialization,
+- checks role-specific bounded escalation chains against the full-MVP catalog
+- carries all ten rows through production payloads and ACP serialization,
   with exactly one best-effort `reasoning_effort` lane
 - proves prompt continuation when the provider rejects the best-effort effort
   request, without claiming accepted or actual provider truth

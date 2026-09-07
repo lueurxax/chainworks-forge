@@ -58,28 +58,38 @@ Run-centric surfaces must prefer this frozen snapshot over mutable current provi
 ## Codex planned-variant policy
 
 The canonical policy is
-`examples/agents/codex-model-variant-matrix.v1.json`. Version 1 is an
-append-only UTF-8 fixture with one final LF, exactly 1,479 bytes, and SHA-256
-`b6ad3f2047466a34da42241eae6b790f60bb835d9e6826cb77b51eb3fc558911`.
-Vocabulary revisions use a new file and policy ID rather than replacing these
-bytes.
+`examples/agents/codex-model-variant-matrix.v1.json`. The reviewed 2026-09-07
+content revision retains schema/policy V1 and is UTF-8 with one final LF,
+exactly 1,994 bytes, and SHA-256
+`e2e78059d4d03936d4c88e0009435b8b9540611cd2fb1c08707004bd154d26b0`.
+This coordinated catalog, Rust pin, and Swift resource/pin refresh supersedes
+the original append-only-content rule. Content changes require a reviewed
+pin update and matching app/daemon rebuild; schema changes require a new
+schema/policy version. There is no runtime acceptance of arbitrary file edits.
+The previous 1,479-byte digest
+`b6ad3f2047466a34da42241eae6b790f60bb835d9e6826cb77b51eb3fc558911`
+is historical release evidence, not the current new-Run admission policy.
 
 The production matrix is:
 
 | Backend profile | Planned model | Effort |
 |---|---|---|
-| `codex_orchestrator_high` | `gpt-5.6-sol` | `max` |
-| `codex_architect_high` | `gpt-5.6-sol` | `xhigh` |
-| `codex_audit_high` | `gpt-5.6-sol` | `ultra` |
+| `codex_orchestrator_high` | `gpt-5.6-sol` | `high` |
+| `codex_architect_high` | `gpt-5.6-sol` | `high` |
+| `codex_audit_high` | `gpt-5.6-sol` | `high` |
 | `codex_writer_high` | `gpt-5.6-terra` | `high` |
 | `codex_builder_high` | `gpt-5.6-terra` | `high` |
 | `codex_orchestrator_acp` | `gpt-5.6-terra` | `high` |
 | `codex_ops_low` | `gpt-5.6-luna` | `high` |
+| `astra_orchestrator_critical` | `gpt-6-astra` | `high` |
+| `astra_audit_critical` | `gpt-6-astra` | `high` |
+| `astra_builder_critical` | `gpt-6-astra` | `high` |
 
 The historical `codex_ops_low` identifier remains stable. Sol and Terra allow
-`low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; Luna allows the same set
-except `ultra`. Generic `gpt-5.6`, unknown variants, and Luna `ultra` are not
-valid production rows.
+`low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; Luna and Astra allow
+the same set except `ultra`. Generic `gpt-5.6`, unknown variants, and
+Luna/Astra `ultra` are not valid production rows. These are locally admitted
+planned assignments, not evidence of provider acceptance or account access.
 
 `domain::codex_model_variant_policy` owns the strict Rust parser and pinned
 loader. It distinguishes the authored catalog provider `codex_acp` from the
@@ -93,12 +103,47 @@ The same fixture is an explicit app resource.
 unreadable, truncated, malformed, digest-mismatched, or undecodable resource
 bytes produce unavailable presentation; Swift contains no fallback matrix.
 
+### 2026-09-07 catalog refresh
+
+The default catalog uses Sol/high for orchestration, architecture and audit,
+Terra/high for proposal writing, Sonnet 5 for code writing, Opus 5 for selected
+deep review/security roles, and Gemini 3.8 Flash for fast review/docs work.
+Astra/high is a final critical fallback, not the default for every task.
+Gemini 3.5 Flash Lite handles routing and release operations.
+The retained Luna profile stays at `high`, including its historical
+`codex_ops_low` identifier. Unused Junie/Auggie profiles and the Junie startup
+requirement are removed from this catalog, not from provider support.
+
+All 25 agents retain their prompts, skills, contracts, permissions, and
+session/approval boundaries. Twelve P058 policies now have three
+single-attempt backend tiers followed by human pause, with the existing
+7,200-second ceiling and trigger vocabulary. The first tier matches the
+assigned role. Stage 7 selects separate lead and code-writer policies;
+stage 10 narrows the code-writer selector so docs keep the docs chain.
+Pre-push review has its own chain; side-effecting release agents have none.
+
+Claude/Gemini `effort` and all `temperature` overrides are omitted because
+the current adapters do not forward them. Retained `max_turns` is catalog
+metadata, not proof of an enforced provider-call budget. This is a model
+allocation change: it does not change quota pools, implement provider
+entitlements, or fix unrelated lifecycle/output-contract failures.
+
+Model IDs were checked against official
+[Codex models](https://learn.chatgpt.com/docs/models),
+[Claude models](https://platform.claude.com/docs/en/models/overview),
+[Gemini 3.8 Flash](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash),
+and [Gemini 3.5 Flash Lite](https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite).
+Deployment requires matching rebuilt app/daemon artifacts and a separately
+authorized provider-access smoke test. Provider-free gates below prove local
+admission, role selection, serialization, and replay, not remote acceptance.
+Existing frozen snapshots and live sessions must not be rewritten.
+
 ## New-Run admission
 
 `compile_for_new_run_v1` is the typed production entrypoint used by
 `StartRun`. It reads workflow and catalog sources once into owned bytes,
 rejects duplicate YAML mapping keys before typed decoding, compiles from the
-checked values, and validates the exact seven-row Codex matrix before any
+checked values, and validates the exact ten-row Codex matrix before any
 Run, Stage, or work insertion transaction opens.
 
 The resulting `NewRunAdmissionV1` contains the compiled plan and snapshot
@@ -267,7 +312,7 @@ Therefore:
 ## Verification
 
 `./scripts/test-gate.sh codex-planned-variant-slice` is the retained stable
-proof gate. It is provider-free and covers the pinned policy, exact-seven
+proof gate. It is provider-free and covers the pinned policy, exact-ten
 new-Run admission, snapshot compatibility, production ACP bridge, closed
 effort lanes, GraphQL normalization and topology, shared Swift formatting,
 resource failures, geometry, Dynamic Type, accessibility, selection, and focus.

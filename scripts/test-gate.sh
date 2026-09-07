@@ -12597,7 +12597,7 @@ root = Path(sys.argv[1])
 app = root / "Chainworks Forge"
 swift_sources = list(app.rglob("*.swift"))
 source_text = "\n".join(path.read_text(encoding="utf-8") for path in swift_sources)
-for forbidden in ('"Sol"', '"Terra"', '"Luna"'):
+for forbidden in ('"Sol"', '"Terra"', '"Luna"', '"Astra"'):
     if forbidden in source_text:
         raise SystemExit(
             f"codex-planned-variant-slice: app contains fallback display label {forbidden}"
@@ -12653,7 +12653,7 @@ PY
       run_codex_variant_cargo_test -p workflow --test codex_planned_variant -- --nocapture
       run_codex_variant_cargo_test -p workflow --test snapshot_integrity -- --nocapture
       run_codex_variant_cargo_test -p engine --test agent_context_skills production_start_run_ -- --nocapture
-      run_codex_variant_cargo_test -p engine --test agent_context_skills production_codex_variant_bridge_serializes_all_seven_admitted_rows -- --nocapture
+      run_codex_variant_cargo_test -p engine --test agent_context_skills production_codex_variant_bridge_serializes_all_admitted_rows -- --nocapture
       run_codex_variant_cargo_test -p engine --test agent_context_skills persisted_snapshot_quartet_ -- --nocapture
       run_codex_variant_cargo_test -p acp --lib codex_effort_inputs_enter_exactly_one_lane -- --nocapture
       run_codex_variant_cargo_test -p acp --test integration codex_policy_effort_ -- --nocapture

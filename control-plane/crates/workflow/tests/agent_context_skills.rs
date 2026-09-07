@@ -362,7 +362,7 @@ fn current_review_skill_surface(root: &Path) -> serde_json::Value {
         "backend_profiles": selected_object_entries(
             &catalog,
             "backend_profiles",
-            &["claude_security_high", "claude_prepush_medium"],
+            &["claude_security_high", "claude_prepush_medium", "gemini_prepush_flash"],
         ),
         "permission_profiles": selected_object_entries(
             &catalog,
@@ -403,6 +403,33 @@ fn assert_review_surface_matches(
         .ok_or_else(|| "security/prepush migration surface drifted".to_string())
 }
 
+fn expected_review_skill_surface_after_model_refresh(
+    mut migrated: serde_json::Value,
+) -> serde_json::Value {
+    // Keep the historical before-state fixture intact; only the reviewed model
+    // allocation changes are allowed on top of the original skill migration.
+    for profile_id in ["claude_security_high", "claude_prepush_medium"] {
+        let profile = migrated["backend_profiles"][profile_id]
+            .as_object_mut()
+            .unwrap();
+        assert_eq!(profile["model"], "opus");
+        profile.insert("model".into(), serde_json::json!("claude-opus-5"));
+        profile.remove("effort");
+        profile.remove("temperature");
+    }
+    migrated["agents"]["prepush_code_reviewer"]["backend_profile"] =
+        serde_json::json!("gemini_prepush_flash");
+    migrated["backend_profiles"]["gemini_prepush_flash"] = serde_json::json!({
+        "provider": "gemini_acp",
+        "model": "gemini-3.8-flash",
+        "max_turns": 12,
+        "structured_output": "required",
+        "mcp": [],
+        "runtime_profile": "gemini_cli_acp",
+    });
+    migrated
+}
+
 #[test]
 fn security_and_prepush_migration_preserves_complete_before_state() {
     let root = repository_root();
@@ -414,7 +441,9 @@ fn security_and_prepush_migration_preserves_complete_before_state() {
         .unwrap(),
     )
     .unwrap();
-    let expected = expected_review_skill_surface_after_migration(before);
+    let expected = expected_review_skill_surface_after_model_refresh(
+        expected_review_skill_surface_after_migration(before),
+    );
     let actual = current_review_skill_surface(&root);
 
     assert_review_surface_matches(&expected, &actual).unwrap();
@@ -436,12 +465,14 @@ fn security_and_prepush_migration_preserves_complete_before_state() {
         "/agents/prepush_code_reviewer/requires_human_approval",
         "/backend_profiles/claude_security_high/provider",
         "/backend_profiles/claude_security_high/model",
-        "/backend_profiles/claude_security_high/effort",
         "/backend_profiles/claude_security_high/mcp/0",
         "/backend_profiles/claude_prepush_medium/provider",
         "/backend_profiles/claude_prepush_medium/model",
-        "/backend_profiles/claude_prepush_medium/effort",
         "/backend_profiles/claude_prepush_medium/mcp",
+        "/backend_profiles/gemini_prepush_flash/provider",
+        "/backend_profiles/gemini_prepush_flash/model",
+        "/backend_profiles/gemini_prepush_flash/mcp",
+        "/backend_profiles/gemini_prepush_flash/runtime_profile",
         "/permission_profiles/RO_VERIFY/git/status",
         "/permission_profiles/RO_VERIFY/filesystem/write/0",
         "/permission_profiles/RO_PREPUSH_VERIFY/git/status",
@@ -472,6 +503,18 @@ fn security_and_prepush_migration_preserves_complete_before_state() {
             assert_review_surface_matches(&expected, &mutated).is_err(),
             "authority mutation must fail parity: {pointer}"
         );
+    }
+
+    for profile_id in [
+        "claude_security_high",
+        "claude_prepush_medium",
+        "gemini_prepush_flash",
+    ] {
+        for field in ["effort", "temperature"] {
+            let mut mutated = expected.clone();
+            mutated["backend_profiles"][profile_id][field] = serde_json::json!("unsupported");
+            assert!(assert_review_surface_matches(&expected, &mutated).is_err());
+        }
     }
 
     for agent_id in ["security_checker", "prepush_code_reviewer"] {

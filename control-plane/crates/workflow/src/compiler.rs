@@ -1058,7 +1058,7 @@ fn validate_authored_codex_matrix(
         .collect();
     if actual_codex_ids != expected_ids {
         anyhow::bail!(
-            "codex_model_variant_matrix_v1: production catalog must contain exactly the seven reserved Codex profiles"
+            "codex_model_variant_matrix_v1: production catalog must exactly match the reserved Codex profiles in the pinned policy"
         );
     }
 

@@ -25,6 +25,12 @@ states:
           task: Coordinate
         - agent: operator
           task: Operate
+        - agent: critical_orchestrator
+          task: Critical coordination
+        - agent: critical_auditor
+          task: Critical audit
+        - agent: critical_builder
+          task: Critical build
 "#;
 
 const CATALOG: &str = r#"schema_version: 1
@@ -32,15 +38,15 @@ backend_profiles:
   codex_orchestrator_high:
     provider: codex_acp
     model: gpt-5.6-sol
-    effort: max
+    effort: high
   codex_architect_high:
     provider: codex_acp
     model: gpt-5.6-sol
-    effort: xhigh
+    effort: high
   codex_audit_high:
     provider: codex_acp
     model: gpt-5.6-sol
-    effort: ultra
+    effort: high
   codex_writer_high:
     provider: codex_acp
     model: gpt-5.6-terra
@@ -56,6 +62,18 @@ backend_profiles:
   codex_ops_low:
     provider: codex_acp
     model: gpt-5.6-luna
+    effort: high
+  astra_orchestrator_critical:
+    provider: codex_acp
+    model: gpt-6-astra
+    effort: high
+  astra_audit_critical:
+    provider: codex_acp
+    model: gpt-6-astra
+    effort: high
+  astra_builder_critical:
+    provider: codex_acp
+    model: gpt-6-astra
     effort: high
 permission_profiles:
   TEST: {}
@@ -86,6 +104,15 @@ agents:
     permission_profile: TEST
   - id: operator
     backend_profile: codex_ops_low
+    permission_profile: TEST
+  - id: critical_orchestrator
+    backend_profile: astra_orchestrator_critical
+    permission_profile: TEST
+  - id: critical_auditor
+    backend_profile: astra_audit_critical
+    permission_profile: TEST
+  - id: critical_builder
+    backend_profile: astra_builder_critical
     permission_profile: TEST
 "#;
 
@@ -140,7 +167,110 @@ fn canonical_production_sources_satisfy_new_run_admission() {
 }
 
 #[test]
-fn new_run_admission_freezes_all_seven_canonical_bindings() {
+fn canonical_production_escalations_preserve_role_bindings_and_bounded_attempts() {
+    use workflow::escalation_policy::resolve_policy_for_agent;
+
+    let root = repository_root();
+    let admission = compile_for_new_run_v1(
+        path(&root.join("examples/workflows/full-mvp-live.yaml")),
+        path(&root.join("examples/agents/agents.yaml")),
+    )
+    .unwrap();
+    let plan = admission.plan();
+    assert_eq!(plan.escalation_policies.len(), 12);
+    for policy in &plan.escalation_policies {
+        assert!(policy.enabled_default);
+        assert_eq!(policy.max_chain_attempts, 3, "{}", policy.policy_id);
+        assert_eq!(
+            policy.max_chain_wall_clock_seconds, 7200,
+            "{}",
+            policy.policy_id
+        );
+        assert_eq!(policy.tiers.len(), 4, "{}", policy.policy_id);
+        assert_eq!(policy.tiers[3].kind, "pause", "{}", policy.policy_id);
+        for tier in &policy.tiers[..3] {
+            assert_eq!(tier.kind, "backend_profile", "{}", policy.policy_id);
+            assert_eq!(tier.max_attempts, Some(1), "{}", policy.policy_id);
+        }
+    }
+
+    for (stage_id, state) in &plan.states {
+        for agent in std::iter::once(&state.owner).chain(state.tasks.iter().map(|task| &task.agent))
+        {
+            if let Some(resolved) = resolve_policy_for_agent(
+                &plan.escalation_policies,
+                stage_id,
+                &agent.agent_id,
+                agent.backend_profile_id.as_deref(),
+            ) {
+                let policy = plan
+                    .escalation_policies
+                    .iter()
+                    .find(|policy| policy.policy_id == resolved.policy_id)
+                    .unwrap();
+                assert_eq!(
+                    policy.tiers[0].backend_profile_id, agent.backend_profile_id,
+                    "{stage_id}/{} must start with its assigned role profile",
+                    agent.agent_id
+                );
+            }
+        }
+    }
+
+    for (stage_id, agent_id, profile_id, expected_policy) in [
+        (
+            "state_7_implementation_started",
+            "lead_orchestrator",
+            "codex_orchestrator_high",
+            Some("lead_implementation_start_quota_escalation"),
+        ),
+        (
+            "state_7_implementation_started",
+            "code_writer",
+            "claude_builder_high",
+            Some("implementation_start_code_writer_escalation"),
+        ),
+        (
+            "state_10_implementation_refined",
+            "code_writer",
+            "claude_builder_high",
+            Some("implementation_refinement_codex_quota_escalation"),
+        ),
+        (
+            "state_10_implementation_refined",
+            "docs_guardian",
+            "gemini_docs_flash",
+            Some("docs_guardian_quota_escalation"),
+        ),
+        (
+            "state_11_manual_release",
+            "commit_and_push_to_github",
+            "gemini_ops_flash_lite",
+            None,
+        ),
+        (
+            "state_11_manual_release",
+            "build_archive_and_push_connect",
+            "gemini_ops_flash_lite",
+            None,
+        ),
+    ] {
+        let resolved = resolve_policy_for_agent(
+            &plan.escalation_policies,
+            stage_id,
+            agent_id,
+            Some(profile_id),
+        );
+        assert_eq!(
+            resolved.as_ref().map(|policy| policy.policy_id.as_str()),
+            expected_policy,
+            "{stage_id}/{agent_id}"
+        );
+    }
+}
+
+#[test]
+fn new_run_admission_freezes_all_admitted_canonical_bindings() {
     let admission = compile(CATALOG).expect("approved matrix must compile");
     let plan = admission.plan();
     let state = plan.states.get("work").unwrap();
@@ -156,17 +286,25 @@ fn new_run_admission_freezes_all_seven_canonical_bindings() {
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(bindings.len(), 7);
+    assert_eq!(bindings.len(), 10);
     assert!(bindings
         .iter()
         .all(|(_, provider, _, _)| *provider == "codex"));
-    assert!(bindings.contains(&("codex_orchestrator_high", "codex", "gpt-5.6-sol", "max")));
-    assert!(bindings.contains(&("codex_architect_high", "codex", "gpt-5.6-sol", "xhigh")));
-    assert!(bindings.contains(&("codex_audit_high", "codex", "gpt-5.6-sol", "ultra")));
+    assert!(bindings.contains(&("codex_orchestrator_high", "codex", "gpt-5.6-sol", "high")));
+    assert!(bindings.contains(&("codex_architect_high", "codex", "gpt-5.6-sol", "high")));
+    assert!(bindings.contains(&("codex_audit_high", "codex", "gpt-5.6-sol", "high")));
     assert!(bindings.contains(&("codex_writer_high", "codex", "gpt-5.6-terra", "high")));
     assert!(bindings.contains(&("codex_builder_high", "codex", "gpt-5.6-terra", "high")));
     assert!(bindings.contains(&("codex_orchestrator_acp", "codex", "gpt-5.6-terra", "high")));
     assert!(bindings.contains(&("codex_ops_low", "codex", "gpt-5.6-luna", "high")));
+    assert!(bindings.contains(&(
+        "astra_orchestrator_critical",
+        "codex",
+        "gpt-6-astra",
+        "high"
+    )));
+    assert!(bindings.contains(&("astra_audit_critical", "codex", "gpt-6-astra", "high")));
+    assert!(bindings.contains(&("astra_builder_critical", "codex", "gpt-6-astra", "high")));
 }
 
 #[test]
@@ -178,8 +316,8 @@ fn new_run_admission_rejects_duplicate_root_and_nested_yaml_keys() {
     assert!(error.contains("duplicate YAML mapping key"), "{error}");
 
     let duplicate_nested = CATALOG.replacen(
-        "    model: gpt-5.6-sol\n    effort: max",
-        "    model: gpt-5.6-sol\n    model: gpt-5.6-terra\n    effort: max",
+        "    model: gpt-5.6-sol\n    effort: high",
+        "    model: gpt-5.6-sol\n    model: gpt-5.6-terra\n    effort: high",
         1,
     );
     let error = compile(&duplicate_nested)
@@ -197,7 +335,7 @@ fn new_run_admission_rejects_every_reserved_matrix_shape_mutation() {
         ),
         (
             "wrong effort",
-            CATALOG.replacen("effort: max", "effort: medium", 1),
+            CATALOG.replacen("effort: high", "effort: medium", 1),
         ),
         (
             "wrong authored provider",
@@ -250,9 +388,21 @@ fn new_run_admission_rejects_missing_or_mutated_policy_bytes() {
 #[test]
 fn verified_generic_and_custom_historical_replay_is_byte_identical() {
     let historical_catalog = CATALOG
-        .replacen("model: gpt-5.6-sol", "model: gpt-5.6", 1)
-        .replacen("model: gpt-5.6-sol", "model: custom-model", 1)
-        .replacen("effort: xhigh", "effort: custom-effort", 1);
+        .replacen(
+            "model: gpt-5.6-sol\n    effort: high",
+            "model: gpt-5.6\n    effort: max",
+            1,
+        )
+        .replacen(
+            "model: gpt-5.6-sol\n    effort: high",
+            "model: custom-model\n    effort: custom-effort",
+            1,
+        )
+        .replacen(
+            "model: gpt-5.6-sol\n    effort: high",
+            "model: gpt-5.6-sol\n    effort: ultra",
+            1,
+        );
     let (_root, workflow_path, catalog_path) = write_sources(&historical_catalog);
     let original = workflow::compiler::compile(path(&workflow_path), path(&catalog_path))
         .expect("the compatibility compiler must retain historical generic/custom tuples");
@@ -286,6 +436,12 @@ fn verified_generic_and_custom_historical_replay_is_byte_identical() {
         replayed.states["work"].owner.model.as_deref(),
         Some("gpt-5.6")
     );
+    assert_eq!(replayed.states["work"].owner.effort.as_deref(), Some("max"));
+    assert!(replayed.states["work"]
+        .tasks
+        .iter()
+        .any(|task| task.agent.model.as_deref() == Some("gpt-5.6-sol")
+            && task.agent.effort.as_deref() == Some("ultra")));
     assert!(replayed.states["work"]
         .tasks
         .iter()

@@ -32,17 +32,17 @@ fn valid_fixture() -> Vec<u8> {
 fn pinned_policy_bytes_and_matrix_are_exact() {
     let bytes = valid_fixture();
     assert_eq!(bytes.len(), CODEX_MODEL_VARIANT_POLICY_BYTES_V1);
-    assert_eq!(CODEX_MODEL_VARIANT_POLICY_BYTES_V1, 1_479);
+    assert_eq!(CODEX_MODEL_VARIANT_POLICY_BYTES_V1, 1_994);
     assert_eq!(
         CODEX_MODEL_VARIANT_POLICY_SHA256_V1,
-        "b6ad3f2047466a34da42241eae6b790f60bb835d9e6826cb77b51eb3fc558911"
+        "e2e78059d4d03936d4c88e0009435b8b9540611cd2fb1c08707004bd154d26b0"
     );
 
     let policy = load_pinned_policy_v1(&bytes).expect("fixture must match the pinned contract");
     assert_eq!(policy.provider, AUTHORED_CODEX_PROVIDER);
     assert_eq!(policy.canonical_provider, CANONICAL_CODEX_PROVIDER);
-    assert_eq!(policy.variants.len(), 3);
-    assert_eq!(policy.production_profiles.len(), 7);
+    assert_eq!(policy.variants.len(), 4);
+    assert_eq!(policy.production_profiles.len(), 10);
     assert_eq!(
         policy
             .production_profile("codex_orchestrator_high")
@@ -55,7 +55,7 @@ fn pinned_policy_bytes_and_matrix_are_exact() {
             .production_profile("codex_audit_high")
             .expect("audit profile")
             .effort,
-        "ultra"
+        "high"
     );
     assert!(!policy
         .variant("gpt-5.6-luna")
@@ -110,8 +110,8 @@ fn parser_rejects_duplicate_ids_and_invalid_production_rows() {
     );
 
     let generic = text.replacen(
-        "\"model_id\": \"gpt-5.6-sol\",\n      \"effort\": \"max\"",
-        "\"model_id\": \"gpt-5.6\",\n      \"effort\": \"max\"",
+        "\"model_id\": \"gpt-5.6-sol\",\n      \"effort\": \"high\"",
+        "\"model_id\": \"gpt-5.6\",\n      \"effort\": \"high\"",
         1,
     );
     assert_eq!(
@@ -129,6 +129,18 @@ fn parser_rejects_duplicate_ids_and_invalid_production_rows() {
     assert_eq!(
         parse_policy_json_v1(luna_ultra.as_bytes())
             .expect_err("Luna ultra must fail")
+            .code(),
+        "policy_schema_invalid"
+    );
+
+    let astra_ultra = text.replacen(
+        "\"model_id\": \"gpt-6-astra\",\n      \"effort\": \"high\"",
+        "\"model_id\": \"gpt-6-astra\",\n      \"effort\": \"ultra\"",
+        1,
+    );
+    assert_eq!(
+        parse_policy_json_v1(astra_ultra.as_bytes())
+            .expect_err("Astra ultra is outside the admitted vocabulary")
             .code(),
         "policy_schema_invalid"
     );

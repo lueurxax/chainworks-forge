@@ -7,9 +7,9 @@ use thiserror::Error;
 pub const AUTHORED_CODEX_PROVIDER: &str = "codex_acp";
 pub const CANONICAL_CODEX_PROVIDER: &str = "codex";
 pub const CODEX_MODEL_VARIANT_POLICY_FILE_V1: &str = "codex-model-variant-matrix.v1.json";
-pub const CODEX_MODEL_VARIANT_POLICY_BYTES_V1: usize = 1_479;
+pub const CODEX_MODEL_VARIANT_POLICY_BYTES_V1: usize = 1_994;
 pub const CODEX_MODEL_VARIANT_POLICY_SHA256_V1: &str =
-    "b6ad3f2047466a34da42241eae6b790f60bb835d9e6826cb77b51eb3fc558911";
+    "e2e78059d4d03936d4c88e0009435b8b9540611cd2fb1c08707004bd154d26b0";
 
 const POLICY_ID_V1: &str = "codex_model_variant_matrix_v1";
 const EFFORT_VOCABULARY: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];

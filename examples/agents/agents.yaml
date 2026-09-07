@@ -1,3 +1,6 @@
+# Model refresh 2026-09-07; see docs/reference/provider-binding-truth.md.
+# New runs use the sibling pinned matrix; existing snapshots retain their assignments.
+# Claude/Gemini effort is omitted because current adapters do not forward it.
 schema_version: 1
 app:
   name: Chainworks
@@ -11,7 +14,6 @@ app:
     - codex_acp
     - claude_acp
     - gemini_acp
-    - junie
 x_p060_score_weights: &p060_score_weights
   force_include: 5
   stack_matches: 4
@@ -590,18 +592,14 @@ runtime_profiles:
 backend_profiles:
   claude_orchestrator_high:
     provider: claude_acp
-    model: opus
-    effort: high
-    temperature: 0.1
+    model: claude-opus-5
     max_turns: 20
     structured_output: required
     mcp: []
     runtime_profile: claude_agent_acp
   claude_writer_high:
     provider: claude_acp
-    model: opus
-    effort: high
-    temperature: 0.15
+    model: claude-opus-5
     max_turns: 18
     structured_output: preferred
     mcp: []
@@ -610,89 +608,68 @@ backend_profiles:
     provider: codex_acp
     model: gpt-5.6-terra
     effort: high
-    temperature: 0.12
     max_turns: 18
     structured_output: preferred
     mcp:
-      - xcode
-      - context7
+    - xcode
+    - context7
     runtime_profile: codex_acp
   claude_product_high:
     provider: claude_acp
-    model: opus
-    effort: high
-    temperature: 0.1
+    model: claude-opus-5
     max_turns: 14
     structured_output: required
     mcp:
-      - xcode
-    runtime_profile: claude_agent_acp
-  claude_design_medium:
-    provider: claude_acp
-    model: opus
-    effort: medium
-    temperature: 0.2
-    max_turns: 12
-    structured_output: required
-    mcp: []
+    - xcode
     runtime_profile: claude_agent_acp
   codex_architect_high:
     provider: codex_acp
     model: gpt-5.6-sol
-    effort: xhigh
-    temperature: 0.1
+    effort: high
     max_turns: 16
     structured_output: required
     mcp:
-      - xcode
-      - context7
+    - xcode
+    - context7
     runtime_profile: codex_acp
   codex_builder_high:
     provider: codex_acp
     model: gpt-5.6-terra
     effort: high
-    temperature: 0.1
     max_turns: 24
     structured_output: required
     mcp:
-      - context7
-      - xcode
+    - context7
+    - xcode
     runtime_profile: codex_acp
   claude_builder_high:
     provider: claude_acp
-    model: sonnet
-    effort: high
-    temperature: 0.1
+    model: claude-sonnet-5
     max_turns: 24
     structured_output: required
     mcp:
-      - xcode
+    - xcode
     runtime_profile: claude_agent_acp
   codex_audit_high:
     provider: codex_acp
     model: gpt-5.6-sol
-    effort: ultra
-    temperature: 0.0
+    effort: high
     max_turns: 18
     structured_output: required
     mcp:
-      - xcode
+    - xcode
     runtime_profile: codex_acp
   claude_security_high:
     provider: claude_acp
-    model: opus
-    effort: high
-    temperature: 0.0
+    model: claude-opus-5
     max_turns: 16
     structured_output: required
     mcp:
-      - context7
+    - context7
     runtime_profile: claude_agent_acp
   claude_prepush_medium:
     provider: claude_acp
-    model: opus
-    effort: medium
-    temperature: 0.1
+    model: claude-opus-5
     max_turns: 12
     structured_output: required
     mcp: []
@@ -701,93 +678,60 @@ backend_profiles:
     provider: codex_acp
     model: gpt-5.6-luna
     effort: high
-    temperature: 0.0
     max_turns: 8
     structured_output: required
     mcp: []
     runtime_profile: codex_acp
   claude_docs_medium:
     provider: claude_acp
-    model: opus
-    effort: medium
-    temperature: 0.2
+    model: claude-sonnet-5
     max_turns: 12
     structured_output: required
     mcp:
-      - xcode
+    - xcode
     runtime_profile: claude_agent_acp
   claude_steward_high:
     provider: claude_acp
-    model: opus
-    effort: high
-    temperature: 0.1
+    model: claude-opus-5
     max_turns: 16
     structured_output: required
     mcp:
-      - context7
+    - context7
     runtime_profile: claude_agent_acp
   claude_auditor_medium:
     provider: claude_acp
-    model: opus
-    effort: medium
-    temperature: 0.0
+    model: claude-opus-5
     max_turns: 14
     structured_output: required
     mcp:
-      - context7
+    - context7
     runtime_profile: claude_agent_acp
   claude_retrospective_medium:
     provider: claude_acp
-    model: opus
-    effort: medium
-    temperature: 0.1
+    model: claude-sonnet-5
     max_turns: 12
     structured_output: required
     mcp:
-      - context7
+    - context7
     runtime_profile: claude_agent_acp
-  gemini_3_1_pro_preview_high:
+  gemini_reasoning_flash:
     provider: gemini_acp
     runtime_profile: gemini_cli_acp
-    model: gemini-3.1-pro-preview
-    effort: high
-    temperature: 0.1
+    model: gemini-3.8-flash
     max_turns: 16
     structured_output: required
     mcp: []
-  gemini_3_6_flash_medium:
+  gemini_review_flash:
     provider: gemini_acp
     runtime_profile: gemini_cli_acp
-    model: gemini-3.6-flash
-    effort: medium
-    temperature: 0.2
-    max_turns: 12
-    structured_output: required
-    mcp: []
-  gemini_reasoning_pro_high:
-    provider: gemini_acp
-    runtime_profile: gemini_cli_acp
-    model: gemini-3.1-pro-preview
-    effort: high
-    temperature: 0.1
-    max_turns: 16
-    structured_output: required
-    mcp: []
-  gemini_review_pro:
-    provider: gemini_acp
-    runtime_profile: gemini_cli_acp
-    model: gemini-3.1-pro-preview
-    effort: medium
-    temperature: 0.2
+    model: gemini-3.8-flash
     max_turns: 12
     structured_output: required
     mcp: []
   gemini_docs_flash:
     provider: gemini_acp
     runtime_profile: gemini_cli_acp
-    model: gemini-3.6-flash
-    effort: medium
-    temperature: 0.2
+    model: gemini-3.8-flash
     max_turns: 12
     structured_output: required
     mcp: []
@@ -795,8 +739,6 @@ backend_profiles:
     provider: gemini_acp
     runtime_profile: gemini_cli_acp
     model: gemini-3.5-flash-lite
-    effort: low
-    temperature: 0.0
     max_turns: 8
     structured_output: required
     mcp: []
@@ -804,7 +746,6 @@ backend_profiles:
     provider: codex_acp
     model: gpt-5.6-terra
     effort: high
-    temperature: 0.1
     max_turns: 12
     structured_output: preferred
     mcp: []
@@ -812,57 +753,55 @@ backend_profiles:
   codex_orchestrator_high:
     provider: codex_acp
     model: gpt-5.6-sol
-    effort: max
-    temperature: 0.1
+    effort: high
     max_turns: 16
     structured_output: required
     mcp: []
     runtime_profile: codex_acp
-  auggie_orchestrator_acp:
-    provider: auggie
-    model: auggie-default
-    effort: medium
-    temperature: 0.1
-    max_turns: 12
-    structured_output: preferred
-    mcp: []
-    runtime_profile: auggie_cli_acp
-  junie_planner_acp:
-    provider: junie
-    model: junie-default
-    effort: medium
-    temperature: 0.1
-    max_turns: 12
-    structured_output: preferred
-    mcp: []
-    runtime_profile: junie_cli_acp
-  junie_code_editor_acp:
-    provider: junie
-    model: junie-default
-    effort: high
-    temperature: 0.1
+  gemini_builder_flash:
+    provider: gemini_acp
+    model: gemini-3.8-flash
     max_turns: 24
-    structured_output: preferred
-    mcp: []
-    runtime_profile: junie_cli_acp
-  junie_explorer_acp:
-    provider: junie
-    model: junie-default
-    effort: medium
-    temperature: 0.1
-    max_turns: 10
-    structured_output: preferred
-    mcp: []
-    runtime_profile: junie_cli_acp
-  junie_orchestrator_acp:
-    provider: junie
-    model: junie-default
-    effort: medium
-    temperature: 0.1
+    structured_output: required
+    mcp:
+    - context7
+    - xcode
+    runtime_profile: gemini_cli_acp
+  gemini_prepush_flash:
+    provider: gemini_acp
+    model: gemini-3.8-flash
     max_turns: 12
-    structured_output: preferred
+    structured_output: required
     mcp: []
-    runtime_profile: junie_cli_acp
+    runtime_profile: gemini_cli_acp
+  astra_orchestrator_critical:
+    provider: codex_acp
+    model: gpt-6-astra
+    effort: high
+    max_turns: 16
+    structured_output: required
+    mcp: []
+    runtime_profile: codex_acp
+  astra_builder_critical:
+    provider: codex_acp
+    model: gpt-6-astra
+    effort: high
+    max_turns: 24
+    structured_output: required
+    mcp:
+    - context7
+    - xcode
+    runtime_profile: codex_acp
+  astra_audit_critical:
+    provider: codex_acp
+    model: gpt-6-astra
+    effort: high
+    max_turns: 18
+    structured_output: required
+    mcp:
+    - xcode
+    - context7
+    runtime_profile: codex_acp
 permission_profiles:
   ORCH:
     filesystem:
@@ -1236,300 +1175,335 @@ permission_profiles:
     mcp:
       legacy_allow: []
       runtime_authority: false
+# Model-only fallback chains; existing triggers and 7200s ceiling are unchanged.
 escalation_policies:
-  - policy_id: lead_implementation_start_quota_escalation
-    schema_version: escalation_policy_v1
-    enabled_default: true
-    applies_to:
-      stage_id: state_7_implementation_started
-    max_chain_attempts: 3
-    max_chain_wall_clock_seconds: 7200
-    triggers:
-      - provider_quota_exhausted
-      - transport_failure
-      - contract_output_failure
-      - stale_no_output
-    tiers:
-      - tier_id: claude_opus_orchestrator
-        kind: backend_profile
-        backend_profile_id: claude_orchestrator_high
-        max_attempts: 1
-      - tier_id: gemini_reasoning_fallback
-        kind: backend_profile
-        backend_profile_id: gemini_reasoning_pro_high
-        max_attempts: 1
-      - tier_id: human_pause
-        kind: pause
-  - policy_id: code_writer_quota_escalation
-    schema_version: escalation_policy_v1
-    enabled_default: true
-    applies_to:
-      backend_profile_id: claude_builder_high
-    max_chain_attempts: 3
-    max_chain_wall_clock_seconds: 7200
-    triggers:
-      - provider_quota_exhausted
-      - transport_failure
-      - contract_output_failure
-      - stale_no_output
-    tiers:
-      - tier_id: codex_builder_fallback
-        kind: backend_profile
-        backend_profile_id: codex_builder_high
-        max_attempts: 1
-      - tier_id: claude_builder_same_backend
-        kind: backend_profile
-        backend_profile_id: claude_builder_high
-        max_attempts: 1
-      - tier_id: gemini_reasoning_fallback
-        kind: backend_profile
-        backend_profile_id: gemini_reasoning_pro_high
-        max_attempts: 1
-      - tier_id: human_pause
-        kind: pause
-  - policy_id: implementation_refinement_codex_quota_escalation
-    schema_version: escalation_policy_v1
-    enabled_default: true
-    applies_to:
-      stage_id: state_10_implementation_refined
-    max_chain_attempts: 3
-    max_chain_wall_clock_seconds: 7200
-    triggers:
-      - provider_quota_exhausted
-      - transport_failure
-      - contract_output_failure
-      - stale_no_output
-    tiers:
-      - tier_id: codex_builder_fallback
-        kind: backend_profile
-        backend_profile_id: codex_builder_high
-        max_attempts: 1
-      - tier_id: claude_builder_same_backend
-        kind: backend_profile
-        backend_profile_id: claude_builder_high
-        max_attempts: 1
-      - tier_id: gemini_reasoning_fallback
-        kind: backend_profile
-        backend_profile_id: gemini_reasoning_pro_high
-        max_attempts: 1
-      - tier_id: human_pause
-        kind: pause
-  - policy_id: proposal_writer_quota_escalation
-    schema_version: escalation_policy_v1
-    enabled_default: true
-    applies_to:
-      backend_profile_id: codex_writer_high
-    max_chain_attempts: 3
-    max_chain_wall_clock_seconds: 7200
-    triggers:
-      - provider_quota_exhausted
-      - transport_failure
-      - contract_output_failure
-      - stale_no_output
-    tiers:
-      - tier_id: codex_writer_same_backend
-        kind: backend_profile
-        backend_profile_id: codex_writer_high
-        max_attempts: 1
-      - tier_id: claude_writer_fallback
-        kind: backend_profile
-        backend_profile_id: claude_writer_high
-        max_attempts: 1
-      - tier_id: gemini_reasoning_fallback
-        kind: backend_profile
-        backend_profile_id: gemini_reasoning_pro_high
-        max_attempts: 1
-      - tier_id: human_pause
-        kind: pause
-  - policy_id: gemini_reviewer_quota_escalation
-    schema_version: escalation_policy_v1
-    enabled_default: true
-    applies_to:
-      backend_profile_id: gemini_review_pro
-    max_chain_attempts: 3
-    max_chain_wall_clock_seconds: 7200
-    triggers:
-      - provider_quota_exhausted
-      - transport_failure
-      - contract_output_failure
-      - stale_no_output
-    tiers:
-      - tier_id: gemini_review_same_backend
-        kind: backend_profile
-        backend_profile_id: gemini_review_pro
-        max_attempts: 1
-      - tier_id: codex_architect_fallback
-        kind: backend_profile
-        backend_profile_id: codex_architect_high
-        max_attempts: 1
-      - tier_id: claude_product_fallback
-        kind: backend_profile
-        backend_profile_id: claude_product_high
-        max_attempts: 1
-      - tier_id: human_pause
-        kind: pause
-  - policy_id: claude_reviewer_quota_escalation
-    schema_version: escalation_policy_v1
-    enabled_default: true
-    applies_to:
-      backend_profile_id: claude_product_high
-    max_chain_attempts: 3
-    max_chain_wall_clock_seconds: 7200
-    triggers:
-      - provider_quota_exhausted
-      - transport_failure
-      - contract_output_failure
-      - stale_no_output
-    tiers:
-      - tier_id: claude_product_same_backend
-        kind: backend_profile
-        backend_profile_id: claude_product_high
-        max_attempts: 1
-      - tier_id: codex_architect_fallback
-        kind: backend_profile
-        backend_profile_id: codex_architect_high
-        max_attempts: 1
-      - tier_id: gemini_review_fallback
-        kind: backend_profile
-        backend_profile_id: gemini_review_pro
-        max_attempts: 1
-      - tier_id: human_pause
-        kind: pause
-  - policy_id: codex_reviewer_quota_escalation
-    schema_version: escalation_policy_v1
-    enabled_default: true
-    applies_to:
-      backend_profile_id: codex_architect_high
-    max_chain_attempts: 3
-    max_chain_wall_clock_seconds: 7200
-    triggers:
-      - provider_quota_exhausted
-      - transport_failure
-      - contract_output_failure
-      - stale_no_output
-    tiers:
-      - tier_id: codex_architect_same_backend
-        kind: backend_profile
-        backend_profile_id: codex_architect_high
-        max_attempts: 1
-      - tier_id: claude_product_fallback
-        kind: backend_profile
-        backend_profile_id: claude_product_high
-        max_attempts: 1
-      - tier_id: gemini_review_fallback
-        kind: backend_profile
-        backend_profile_id: gemini_review_pro
-        max_attempts: 1
-      - tier_id: human_pause
-        kind: pause
-  - policy_id: implementation_auditor_quota_escalation
-    schema_version: escalation_policy_v1
-    enabled_default: true
-    applies_to:
-      backend_profile_id: codex_audit_high
-    max_chain_attempts: 3
-    max_chain_wall_clock_seconds: 7200
-    triggers:
-      - provider_quota_exhausted
-      - transport_failure
-      - contract_output_failure
-      - stale_no_output
-    tiers:
-      - tier_id: codex_audit_same_backend
-        kind: backend_profile
-        backend_profile_id: codex_audit_high
-        max_attempts: 1
-      - tier_id: claude_auditor_fallback
-        kind: backend_profile
-        backend_profile_id: claude_auditor_medium
-        max_attempts: 1
-      - tier_id: gemini_reasoning_fallback
-        kind: backend_profile
-        backend_profile_id: gemini_reasoning_pro_high
-        max_attempts: 1
-      - tier_id: human_pause
-        kind: pause
-  - policy_id: security_checker_quota_escalation
-    schema_version: escalation_policy_v1
-    enabled_default: true
-    applies_to:
-      backend_profile_id: claude_security_high
-    max_chain_attempts: 3
-    max_chain_wall_clock_seconds: 7200
-    triggers:
-      - provider_quota_exhausted
-      - transport_failure
-      - contract_output_failure
-      - stale_no_output
-    tiers:
-      - tier_id: claude_security_same_backend
-        kind: backend_profile
-        backend_profile_id: claude_security_high
-        max_attempts: 1
-      - tier_id: codex_architect_fallback
-        kind: backend_profile
-        backend_profile_id: codex_architect_high
-        max_attempts: 1
-      - tier_id: gemini_review_fallback
-        kind: backend_profile
-        backend_profile_id: gemini_review_pro
-        max_attempts: 1
-      - tier_id: human_pause
-        kind: pause
-  - policy_id: prepush_reviewer_quota_escalation
-    schema_version: escalation_policy_v1
-    enabled_default: true
-    applies_to:
-      backend_profile_id: claude_prepush_medium
-    max_chain_attempts: 3
-    max_chain_wall_clock_seconds: 7200
-    triggers:
-      - provider_quota_exhausted
-      - transport_failure
-      - contract_output_failure
-      - stale_no_output
-    tiers:
-      - tier_id: claude_prepush_same_backend
-        kind: backend_profile
-        backend_profile_id: claude_prepush_medium
-        max_attempts: 1
-      - tier_id: codex_audit_fallback
-        kind: backend_profile
-        backend_profile_id: codex_audit_high
-        max_attempts: 1
-      - tier_id: gemini_review_fallback
-        kind: backend_profile
-        backend_profile_id: gemini_review_pro
-        max_attempts: 1
-      - tier_id: human_pause
-        kind: pause
-  - policy_id: docs_guardian_quota_escalation
-    schema_version: escalation_policy_v1
-    enabled_default: true
-    applies_to:
-      backend_profile_id: gemini_docs_flash
-    max_chain_attempts: 3
-    max_chain_wall_clock_seconds: 7200
-    triggers:
-      - provider_quota_exhausted
-      - transport_failure
-      - contract_output_failure
-      - stale_no_output
-    tiers:
-      - tier_id: gemini_docs_same_backend
-        kind: backend_profile
-        backend_profile_id: gemini_docs_flash
-        max_attempts: 1
-      - tier_id: claude_docs_fallback
-        kind: backend_profile
-        backend_profile_id: claude_docs_medium
-        max_attempts: 1
-      - tier_id: codex_audit_fallback
-        kind: backend_profile
-        backend_profile_id: codex_audit_high
-        max_attempts: 1
-      - tier_id: human_pause
-        kind: pause
+- policy_id: lead_implementation_start_quota_escalation
+  schema_version: escalation_policy_v1
+  enabled_default: true
+  applies_to:
+    stage_id: state_7_implementation_started
+  max_chain_attempts: 3
+  max_chain_wall_clock_seconds: 7200
+  triggers:
+  - provider_quota_exhausted
+  - transport_failure
+  - contract_output_failure
+  - stale_no_output
+  tiers:
+  - tier_id: tier_0_codex_orchestrator_high
+    kind: backend_profile
+    backend_profile_id: codex_orchestrator_high
+    max_attempts: 1
+  - tier_id: tier_1_claude_orchestrator_high
+    kind: backend_profile
+    backend_profile_id: claude_orchestrator_high
+    max_attempts: 1
+  - tier_id: tier_2_astra_orchestrator_critical
+    kind: backend_profile
+    backend_profile_id: astra_orchestrator_critical
+    max_attempts: 1
+  - tier_id: human_pause
+    kind: pause
+- policy_id: implementation_start_code_writer_escalation
+  schema_version: escalation_policy_v1
+  enabled_default: true
+  applies_to:
+    stage_id: state_7_implementation_started
+    agent_id: code_writer
+  max_chain_attempts: 3
+  max_chain_wall_clock_seconds: 7200
+  triggers:
+  - provider_quota_exhausted
+  - transport_failure
+  - contract_output_failure
+  - stale_no_output
+  tiers:
+  - tier_id: tier_0_claude_builder_high
+    kind: backend_profile
+    backend_profile_id: claude_builder_high
+    max_attempts: 1
+  - tier_id: tier_1_gemini_builder_flash
+    kind: backend_profile
+    backend_profile_id: gemini_builder_flash
+    max_attempts: 1
+  - tier_id: tier_2_astra_builder_critical
+    kind: backend_profile
+    backend_profile_id: astra_builder_critical
+    max_attempts: 1
+  - tier_id: human_pause
+    kind: pause
+- policy_id: code_writer_quota_escalation
+  schema_version: escalation_policy_v1
+  enabled_default: true
+  applies_to:
+    backend_profile_id: claude_builder_high
+  max_chain_attempts: 3
+  max_chain_wall_clock_seconds: 7200
+  triggers:
+  - provider_quota_exhausted
+  - transport_failure
+  - contract_output_failure
+  - stale_no_output
+  tiers:
+  - tier_id: tier_0_claude_builder_high
+    kind: backend_profile
+    backend_profile_id: claude_builder_high
+    max_attempts: 1
+  - tier_id: tier_1_gemini_builder_flash
+    kind: backend_profile
+    backend_profile_id: gemini_builder_flash
+    max_attempts: 1
+  - tier_id: tier_2_astra_builder_critical
+    kind: backend_profile
+    backend_profile_id: astra_builder_critical
+    max_attempts: 1
+  - tier_id: human_pause
+    kind: pause
+- policy_id: implementation_refinement_codex_quota_escalation
+  schema_version: escalation_policy_v1
+  enabled_default: true
+  applies_to:
+    stage_id: state_10_implementation_refined
+    agent_id: code_writer
+  max_chain_attempts: 3
+  max_chain_wall_clock_seconds: 7200
+  triggers:
+  - provider_quota_exhausted
+  - transport_failure
+  - contract_output_failure
+  - stale_no_output
+  tiers:
+  - tier_id: tier_0_claude_builder_high
+    kind: backend_profile
+    backend_profile_id: claude_builder_high
+    max_attempts: 1
+  - tier_id: tier_1_gemini_builder_flash
+    kind: backend_profile
+    backend_profile_id: gemini_builder_flash
+    max_attempts: 1
+  - tier_id: tier_2_astra_builder_critical
+    kind: backend_profile
+    backend_profile_id: astra_builder_critical
+    max_attempts: 1
+  - tier_id: human_pause
+    kind: pause
+- policy_id: proposal_writer_quota_escalation
+  schema_version: escalation_policy_v1
+  enabled_default: true
+  applies_to:
+    backend_profile_id: codex_writer_high
+  max_chain_attempts: 3
+  max_chain_wall_clock_seconds: 7200
+  triggers:
+  - provider_quota_exhausted
+  - transport_failure
+  - contract_output_failure
+  - stale_no_output
+  tiers:
+  - tier_id: tier_0_codex_writer_high
+    kind: backend_profile
+    backend_profile_id: codex_writer_high
+    max_attempts: 1
+  - tier_id: tier_1_claude_writer_high
+    kind: backend_profile
+    backend_profile_id: claude_writer_high
+    max_attempts: 1
+  - tier_id: tier_2_astra_orchestrator_critical
+    kind: backend_profile
+    backend_profile_id: astra_orchestrator_critical
+    max_attempts: 1
+  - tier_id: human_pause
+    kind: pause
+- policy_id: gemini_reviewer_quota_escalation
+  schema_version: escalation_policy_v1
+  enabled_default: true
+  applies_to:
+    backend_profile_id: gemini_review_flash
+  max_chain_attempts: 3
+  max_chain_wall_clock_seconds: 7200
+  triggers:
+  - provider_quota_exhausted
+  - transport_failure
+  - contract_output_failure
+  - stale_no_output
+  tiers:
+  - tier_id: tier_0_gemini_review_flash
+    kind: backend_profile
+    backend_profile_id: gemini_review_flash
+    max_attempts: 1
+  - tier_id: tier_1_claude_product_high
+    kind: backend_profile
+    backend_profile_id: claude_product_high
+    max_attempts: 1
+  - tier_id: tier_2_codex_architect_high
+    kind: backend_profile
+    backend_profile_id: codex_architect_high
+    max_attempts: 1
+  - tier_id: human_pause
+    kind: pause
+- policy_id: claude_reviewer_quota_escalation
+  schema_version: escalation_policy_v1
+  enabled_default: true
+  applies_to:
+    backend_profile_id: claude_product_high
+  max_chain_attempts: 3
+  max_chain_wall_clock_seconds: 7200
+  triggers:
+  - provider_quota_exhausted
+  - transport_failure
+  - contract_output_failure
+  - stale_no_output
+  tiers:
+  - tier_id: tier_0_claude_product_high
+    kind: backend_profile
+    backend_profile_id: claude_product_high
+    max_attempts: 1
+  - tier_id: tier_1_gemini_review_flash
+    kind: backend_profile
+    backend_profile_id: gemini_review_flash
+    max_attempts: 1
+  - tier_id: tier_2_codex_architect_high
+    kind: backend_profile
+    backend_profile_id: codex_architect_high
+    max_attempts: 1
+  - tier_id: human_pause
+    kind: pause
+- policy_id: codex_reviewer_quota_escalation
+  schema_version: escalation_policy_v1
+  enabled_default: true
+  applies_to:
+    backend_profile_id: codex_architect_high
+  max_chain_attempts: 3
+  max_chain_wall_clock_seconds: 7200
+  triggers:
+  - provider_quota_exhausted
+  - transport_failure
+  - contract_output_failure
+  - stale_no_output
+  tiers:
+  - tier_id: tier_0_codex_architect_high
+    kind: backend_profile
+    backend_profile_id: codex_architect_high
+    max_attempts: 1
+  - tier_id: tier_1_claude_product_high
+    kind: backend_profile
+    backend_profile_id: claude_product_high
+    max_attempts: 1
+  - tier_id: tier_2_gemini_review_flash
+    kind: backend_profile
+    backend_profile_id: gemini_review_flash
+    max_attempts: 1
+  - tier_id: human_pause
+    kind: pause
+- policy_id: implementation_auditor_quota_escalation
+  schema_version: escalation_policy_v1
+  enabled_default: true
+  applies_to:
+    backend_profile_id: codex_audit_high
+  max_chain_attempts: 3
+  max_chain_wall_clock_seconds: 7200
+  triggers:
+  - provider_quota_exhausted
+  - transport_failure
+  - contract_output_failure
+  - stale_no_output
+  tiers:
+  - tier_id: tier_0_codex_audit_high
+    kind: backend_profile
+    backend_profile_id: codex_audit_high
+    max_attempts: 1
+  - tier_id: tier_1_claude_auditor_medium
+    kind: backend_profile
+    backend_profile_id: claude_auditor_medium
+    max_attempts: 1
+  - tier_id: tier_2_astra_audit_critical
+    kind: backend_profile
+    backend_profile_id: astra_audit_critical
+    max_attempts: 1
+  - tier_id: human_pause
+    kind: pause
+- policy_id: security_checker_quota_escalation
+  schema_version: escalation_policy_v1
+  enabled_default: true
+  applies_to:
+    backend_profile_id: claude_security_high
+  max_chain_attempts: 3
+  max_chain_wall_clock_seconds: 7200
+  triggers:
+  - provider_quota_exhausted
+  - transport_failure
+  - contract_output_failure
+  - stale_no_output
+  tiers:
+  - tier_id: tier_0_claude_security_high
+    kind: backend_profile
+    backend_profile_id: claude_security_high
+    max_attempts: 1
+  - tier_id: tier_1_codex_architect_high
+    kind: backend_profile
+    backend_profile_id: codex_architect_high
+    max_attempts: 1
+  - tier_id: tier_2_astra_audit_critical
+    kind: backend_profile
+    backend_profile_id: astra_audit_critical
+    max_attempts: 1
+  - tier_id: human_pause
+    kind: pause
+- policy_id: prepush_reviewer_quota_escalation
+  schema_version: escalation_policy_v1
+  enabled_default: true
+  applies_to:
+    backend_profile_id: gemini_prepush_flash
+  max_chain_attempts: 3
+  max_chain_wall_clock_seconds: 7200
+  triggers:
+  - provider_quota_exhausted
+  - transport_failure
+  - contract_output_failure
+  - stale_no_output
+  tiers:
+  - tier_id: tier_0_gemini_prepush_flash
+    kind: backend_profile
+    backend_profile_id: gemini_prepush_flash
+    max_attempts: 1
+  - tier_id: tier_1_claude_prepush_medium
+    kind: backend_profile
+    backend_profile_id: claude_prepush_medium
+    max_attempts: 1
+  - tier_id: tier_2_codex_audit_high
+    kind: backend_profile
+    backend_profile_id: codex_audit_high
+    max_attempts: 1
+  - tier_id: human_pause
+    kind: pause
+- policy_id: docs_guardian_quota_escalation
+  schema_version: escalation_policy_v1
+  enabled_default: true
+  applies_to:
+    backend_profile_id: gemini_docs_flash
+  max_chain_attempts: 3
+  max_chain_wall_clock_seconds: 7200
+  triggers:
+  - provider_quota_exhausted
+  - transport_failure
+  - contract_output_failure
+  - stale_no_output
+  tiers:
+  - tier_id: tier_0_gemini_docs_flash
+    kind: backend_profile
+    backend_profile_id: gemini_docs_flash
+    max_attempts: 1
+  - tier_id: tier_1_claude_docs_medium
+    kind: backend_profile
+    backend_profile_id: claude_docs_medium
+    max_attempts: 1
+  - tier_id: tier_2_codex_orchestrator_acp
+    kind: backend_profile
+    backend_profile_id: codex_orchestrator_acp
+    max_attempts: 1
+  - tier_id: human_pause
+    kind: pause
+
 agents:
   - id: lead_orchestrator
     title: Lead / Orchestrator
@@ -1637,7 +1611,7 @@ agents:
   - id: proposal_reviewer_ux
     title: Proposal Reviewer / UX
     mode: proposal_review.ux
-    backend_profile: gemini_review_pro
+    backend_profile: gemini_review_flash
     permission_profile: RO_REVIEW
     skill_ref: proposal_review_router_skill
     skill_role: ux_designer
@@ -1679,7 +1653,7 @@ agents:
   - id: proposal_reviewer_ui
     title: Proposal Reviewer / UI
     mode: proposal_review.ui
-    backend_profile: gemini_review_pro
+    backend_profile: gemini_review_flash
     permission_profile: RO_REVIEW
     skill_ref: proposal_review_router_skill
     skill_role: architect
@@ -1763,7 +1737,7 @@ agents:
   - id: proposal_review_router
     title: Proposal Review Router
     mode: system.routing
-    backend_profile: junie_planner_acp
+    backend_profile: gemini_ops_flash_lite
     permission_profile: RO_REVIEW
     skill_ref: proposal_review_router_skill
     inputs:
@@ -1806,7 +1780,7 @@ agents:
   - id: proposal_reviewer_macos
     title: Proposal Reviewer / macOS
     mode: proposal_review.macos
-    backend_profile: gemini_review_pro
+    backend_profile: gemini_review_flash
     permission_profile: RO_REVIEW
     skill_ref: proposal_review_router_skill
     skill_role: ui_designer
@@ -2228,7 +2202,7 @@ agents:
   - id: prepush_code_reviewer
     title: Pre-push Code Reviewer
     mode: prepush_review
-    backend_profile: claude_prepush_medium
+    backend_profile: gemini_prepush_flash
     permission_profile: RO_PREPUSH_VERIFY
     skill_ref: prepush_review_core
     required_tools:

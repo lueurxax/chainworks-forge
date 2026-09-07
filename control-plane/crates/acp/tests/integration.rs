@@ -2615,6 +2615,14 @@ async fn codex_closed_effort_table_serializes_exactly_one_wire_lane() {
 
     let cases = [
         Case {
+            name: "astra_policy_exact",
+            model: Some("gpt-6-astra"),
+            effort: Some("high"),
+            expected_model: "gpt-6-astra",
+            expected_effort: Some("high"),
+            exact_lane: true,
+        },
+        Case {
             name: "policy_exact",
             model: Some("gpt-5.6-sol"),
             effort: Some("max"),

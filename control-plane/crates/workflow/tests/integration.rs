@@ -398,7 +398,7 @@ fn test_parse_agent_catalog() {
     let profiles = cat.backend_profiles.as_ref().expect("has backend_profiles");
     assert!(profiles.contains_key("claude_orchestrator_high"));
     assert!(profiles.contains_key("codex_builder_high"));
-    assert!(profiles.contains_key("gemini_review_pro"));
+    assert!(profiles.contains_key("gemini_review_flash"));
 
     let agents = cat.agents.as_ref().expect("has agents");
     let agent_ids: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
@@ -1095,7 +1095,7 @@ fn test_compile_full_mvp_live_plan() {
         s1.owner.provider, "codex",
         "lead_orchestrator uses the canonical Codex orchestration profile"
     );
-    assert_eq!(s1.owner.model.as_deref(), Some("gpt-5.6"));
+    assert_eq!(s1.owner.model.as_deref(), Some("gpt-5.6-sol"));
     assert_eq!(s1.owner.effort.as_deref(), Some("high"));
     assert!(
         s1.owner
@@ -1137,7 +1137,7 @@ fn test_compile_full_mvp_live_plan() {
     for (policy_id, backend_profile_id) in [
         ("code_writer_quota_escalation", "claude_builder_high"),
         ("proposal_writer_quota_escalation", "codex_writer_high"),
-        ("gemini_reviewer_quota_escalation", "gemini_review_pro"),
+        ("gemini_reviewer_quota_escalation", "gemini_review_flash"),
         ("claude_reviewer_quota_escalation", "claude_product_high"),
         ("codex_reviewer_quota_escalation", "codex_architect_high"),
         (
@@ -1145,7 +1145,7 @@ fn test_compile_full_mvp_live_plan() {
             "codex_audit_high",
         ),
         ("security_checker_quota_escalation", "claude_security_high"),
-        ("prepush_reviewer_quota_escalation", "claude_prepush_medium"),
+        ("prepush_reviewer_quota_escalation", "gemini_prepush_flash"),
         ("docs_guardian_quota_escalation", "gemini_docs_flash"),
     ] {
         assert!(
@@ -1160,6 +1160,11 @@ fn test_compile_full_mvp_live_plan() {
     let cw_task = s7.tasks.iter().find(|t| t.agent.agent_id == "code_writer");
     assert!(cw_task.is_some(), "state_7 should have code_writer task");
     assert_eq!(cw_task.unwrap().agent.provider, "claude");
+    assert_eq!(
+        cw_task.unwrap().agent.model.as_deref(),
+        Some("claude-sonnet-5")
+    );
+    assert_eq!(cw_task.unwrap().agent.effort, None);
     assert_eq!(
         cw_task.unwrap().agent.requested_mcp_server_ids,
         vec!["xcode".to_string()],

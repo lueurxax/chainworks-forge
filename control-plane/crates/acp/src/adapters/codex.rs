@@ -611,6 +611,13 @@ mod tests {
 
         let cases = [
             Case {
+                model: Some("gpt-6-astra"),
+                effort: Some("high"),
+                expected_model: "gpt-6-astra",
+                expected_exact: Some("high"),
+                expected_fuzzy: None,
+            },
+            Case {
                 model: Some("gpt-5.6-sol"),
                 effort: Some("max"),
                 expected_model: "gpt-5.6-sol",
