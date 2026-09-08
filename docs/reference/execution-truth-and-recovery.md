@@ -438,8 +438,47 @@ Rules:
   before retry.
 - Retries are exempt from provider quota retry budget but still count against
   active execution capacity.
-- Late or partial outputs from superseded host-interrupted attempts are skipped
-  unless existing settlement rules allow promotion.
+- Before requesting runtime close, a writer transaction freezes the exact affected
+  execution set and commits `cleanup_pending` evidence. This durable fence revokes
+  old-worker settlement authority while executions remain `running` for capacity
+  accounting. Cleanup runs outside the writer transaction; a second transaction
+  cancels and settles those exact executions without reselecting only running rows.
+  This also avoids reentrant writer waits from Xcode lease-release observations.
+- Cleanup, retry evidence and source-claim supersession are matched to the exact
+  execution, not every invocation in its stage. A sibling whose cleanup failed
+  is not requeued by another sibling's successful cleanup.
+- The closed session generation is invalidated in the host recovery transaction
+  before its retry becomes claimable. A late `active_prompt_transport_closed`
+  result from the superseded execution preserves the host retry and its evidence,
+  even if the replacement is already running/completed or the old invocation
+  reached its ordinary auto-requeue limit.
+- Worker completion, failure and transient-persistence requeue are fenced by the
+  claimed `agent_execution_id` and execution cancellation in the write
+  transaction. A stale worker cannot finalize a replacement or enqueue its
+  failure advance. When cleanup fails, cancellation keeps the old worker from
+  bypassing the cleanup hold, even if its work item retains the running preclaim
+  or host-evidence diagnostics fail. General queue APIs keep their intentional
+  pending-item settlement semantics.
+- No-op captured-attempt finalizers explicitly finish their queued transaction;
+  they do not report dropped-transaction failures to the writer.
+- If recovery is interrupted between phases, the existing startup requeue path
+  retires the old generation and resolves its pending fence in the same transaction
+  as a successful requeue, including journal-backed crash replay. Evidence records
+  `retry_recovered_on_startup` and `unknown_after_restart`, not cleanup success.
+  Existing startup retry budgets and exhaustion holds are unchanged.
+- Successful provider results also check durable host ownership before output
+  discovery, repair or persistence. Artifact import rechecks durable host ownership
+  in its writer transaction before inserting artifacts, activating generations or
+  closing claims; completed cleanup does not restore an old attempt's authority.
+  Accepted output and terminal agent status commit together, so host recovery cannot
+  capture an execution between artifact acceptance and completion. Mediation-owned
+  completion uses the same host fence in its settlement transaction.
+- A host-fenced late result leaves retry/cleanup hold, source claim, agent and stage
+  truth untouched and cannot enqueue advance. Non-host P082 cancelled-late-output
+  quarantine retains its existing claim-CAS settlement semantics.
+
+Provider-free regression proof:
+[host recovery and late ACP finalization](../evidence/host-interruption-active-prompt-finalization-2026-09-07.md).
 
 ### Startup Recovery
 

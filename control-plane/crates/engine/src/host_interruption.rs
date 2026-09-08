@@ -6,7 +6,7 @@ use acp::AcpRuntimeManager;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use db::repos::{agent_executions, artifact_contracts, scheduler, work_items};
+use db::repos::{agent_executions, scheduler, sessions, work_items};
 use db::write_class::WriteLane;
 use db::writer::{class_a_operation, DbWriter};
 use domain::agent::AgentStatus;
@@ -27,7 +27,6 @@ const RUNTIME_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 #[derive(Clone)]
 pub struct HostInterruptionService {
-    pool: SqlitePool,
     work_queue: WorkQueue,
     capacity_config: InvokeAgentCapacityConfig,
     db_writer: Arc<DbWriter>,
@@ -279,13 +278,12 @@ impl HostInterruptionService {
     }
 
     pub fn with_capacity_config_and_db_writer(
-        pool: SqlitePool,
+        _pool: SqlitePool,
         work_queue: WorkQueue,
         capacity_config: InvokeAgentCapacityConfig,
         db_writer: Arc<DbWriter>,
     ) -> Self {
         Self {
-            pool,
             work_queue,
             capacity_config,
             db_writer,
@@ -310,14 +308,13 @@ impl HostInterruptionService {
     }
 
     pub fn with_capacity_config_runtime_cleanup_and_db_writer(
-        pool: SqlitePool,
+        _pool: SqlitePool,
         work_queue: WorkQueue,
         capacity_config: InvokeAgentCapacityConfig,
         runtime_cleanup: Arc<dyn HostInterruptionRuntimeCleanup>,
         db_writer: Arc<DbWriter>,
     ) -> Self {
         Self {
-            pool,
             work_queue,
             capacity_config,
             db_writer,
@@ -347,13 +344,12 @@ impl HostInterruptionService {
             return self.record_non_disruptive_epoch(event, now).await;
         }
 
-        let cleanup_summary = self.cleanup_runtime_sessions_for_event(&event, now).await?;
         let transaction_started = Instant::now();
         let writer_wait_started_at = Instant::now();
         let mut tx = self
             .begin_transaction(
-                "host_interruption.record_and_requeue",
-                format!("host_interruption.record_and_requeue:{}", event.started_at),
+                "host_interruption.prepare_recovery",
+                format!("host_interruption.prepare_recovery:{}", event.started_at),
             )
             .await?;
         let writer_wait_ms = writer_wait_started_at.elapsed().as_millis() as i64;
@@ -370,13 +366,59 @@ impl HostInterruptionService {
         scheduler::insert_host_interruption_epoch_tx(&mut tx, &epoch).await?;
 
         let affected_end = event.ended_at.unwrap_or(now);
-        let affected = agent_executions::list_running_across_interval_tx(
+        let candidates = agent_executions::list_running_across_interval_tx(
             &mut tx,
             event.started_at,
             affected_end,
         )
         .await?;
 
+        let mut affected = Vec::new();
+        for execution in candidates {
+            if work_items::host_interruption_cleanup_holds_attempt_tx(&mut tx, execution.id).await?
+            {
+                continue;
+            }
+            scheduler::insert_host_interruption_affected_execution_tx(
+                &mut tx,
+                &scheduler::HostInterruptionAffectedExecution {
+                    epoch_id: epoch.id.clone(),
+                    agent_execution_id: execution.id.to_string(),
+                    run_id: Some(execution.run_id.to_string()),
+                    stage_execution_id: execution.stage_execution_id.to_string(),
+                    provider_family: execution.provider_family.clone(),
+                    action: event.kind.operator_action().to_string(),
+                    previous_status: "running".to_string(),
+                    settlement_status: "cleanup_pending".to_string(),
+                    cleanup_status: "pending".to_string(),
+                    quota_budget_effect: "not_consumed".to_string(),
+                    retry_enqueued_at: None,
+                    created_at: now,
+                },
+            )
+            .await?;
+            affected.push(execution);
+        }
+        // Persist ownership before signalling the prompt. Keep executions running
+        // until cleanup settles so their active capacity slots remain reserved.
+        tx.commit()
+            .await
+            .context("commit host interruption cleanup fence")?;
+        db::pool::log_write_transaction("host_interruption.prepare_recovery", transaction_started);
+
+        // request_close_session can release Xcode leases through this same writer.
+        // No SQLite transaction may remain open while runtime cleanup runs.
+        let cleanup_summary = self.cleanup_runtime_sessions(&affected).await;
+        let transaction_started = Instant::now();
+        let settlement_wait_started_at = Instant::now();
+        let mut tx = self
+            .begin_transaction(
+                "host_interruption.record_and_requeue",
+                format!("host_interruption.record_and_requeue:{}", epoch.id),
+            )
+            .await?;
+        let writer_wait_ms =
+            writer_wait_ms + settlement_wait_started_at.elapsed().as_millis() as i64;
         for execution in &affected {
             agent_executions::update_completed_tx(
                 &mut tx,
@@ -472,7 +514,7 @@ impl HostInterruptionService {
                 }
             }
 
-            scheduler::insert_host_interruption_affected_execution_tx(
+            scheduler::settle_host_interruption_affected_execution_tx(
                 &mut tx,
                 &scheduler::HostInterruptionAffectedExecution {
                     epoch_id: epoch.id.clone(),
@@ -569,22 +611,13 @@ impl HostInterruptionService {
         })
     }
 
-    async fn cleanup_runtime_sessions_for_event(
+    async fn cleanup_runtime_sessions(
         &self,
-        event: &HostInterruptionEvent,
-        now: DateTime<Utc>,
-    ) -> Result<RuntimeCleanupSummary> {
+        affected: &[agent_executions::RunningAgentExecution],
+    ) -> RuntimeCleanupSummary {
         let Some(runtime_cleanup) = &self.runtime_cleanup else {
-            return Ok(RuntimeCleanupSummary::default());
+            return RuntimeCleanupSummary::default();
         };
-
-        let affected_end = event.ended_at.unwrap_or(now);
-        let affected = agent_executions::list_running_across_interval(
-            &self.pool,
-            event.started_at,
-            affected_end,
-        )
-        .await?;
 
         let mut summary = RuntimeCleanupSummary::default();
         for execution in affected {
@@ -635,7 +668,7 @@ impl HostInterruptionService {
             }
         }
 
-        Ok(summary)
+        summary
     }
 }
 
@@ -653,25 +686,53 @@ async fn requeue_retry_for_execution_tx(
     scheduled_at: DateTime<Utc>,
     epoch_id: &str,
 ) -> Result<Option<String>> {
-    let requeued_work_item_ids =
-        work_items::requeue_running_invoke_agent_by_stage_for_host_interruption_tx(
-            tx,
-            execution.run_id,
-            &execution.stage_id,
-            execution.stage_execution_id,
-            scheduled_at,
-        )
-        .await?;
+    let requeued_work_item_ids = work_items::requeue_running_invoke_agent_for_host_interruption_tx(
+        tx,
+        execution.run_id,
+        &execution.stage_id,
+        execution.stage_execution_id,
+        execution.id,
+        scheduled_at,
+        epoch_id,
+    )
+    .await?;
     let superseding_work_item_id = requeued_work_item_ids.first().cloned();
-    if let Some(work_item_id) = superseding_work_item_id.as_deref() {
-        artifact_contracts::mark_active_claims_superseded_pending_retry_for_stage_tx(
-            tx,
-            execution.run_id,
-            &execution.stage_execution_id.to_string(),
-            work_item_id,
-            epoch_id,
-        )
-        .await?;
+    if superseding_work_item_id.is_some() {
+        // Retire the closed generation before the retry becomes claimable; the
+        // old prompt can still be unwinding after runtime cleanup has returned.
+        if let Some(generation_id) = execution.session_generation_id.as_deref() {
+            if let Some(generation) = sessions::find_generation_by_id_tx(tx, generation_id).await? {
+                if generation.status == domain::session::SessionGenerationStatus::Active {
+                    let ended_at = Utc::now();
+                    sessions::end_generation_tx(
+                        tx,
+                        generation_id,
+                        domain::session::SessionGenerationStatus::Invalidated,
+                        "host_interruption",
+                        ended_at,
+                    )
+                    .await?;
+                    sessions::insert_event_tx(
+                        tx,
+                        &domain::session::SessionEvent {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            lineage_id: generation.lineage_id,
+                            generation_id: generation_id.to_string(),
+                            event_type: domain::session::SessionEventType::Invalidated,
+                            recorded_at: ended_at,
+                            details_json: Some(
+                                serde_json::json!({
+                                    "reason": "host_interruption",
+                                    "epoch_id": epoch_id,
+                                })
+                                .to_string(),
+                            ),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
     }
     Ok(superseding_work_item_id)
 }

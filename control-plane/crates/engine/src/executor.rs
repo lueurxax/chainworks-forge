@@ -10741,40 +10741,44 @@ impl BackgroundExecutor {
         item_id: &str,
         error_message: &str,
     ) {
-        match agent_executions::find_by_id(&self.pool, agent_execution_id).await {
-            Ok(Some(execution)) if execution.status == AgentStatus::Running => {
-                if let Err(update_error) = agent_executions::update_completed(
-                    &self.pool,
+        let result: Result<bool> = async {
+            let mut tx = self
+                .begin_executor_transaction(
+                    "executor.close_failed_invoke_execution",
+                    format!("close_failed_invoke_execution:{agent_execution_id}"),
+                )
+                .await?;
+            let execution = agent_executions::find_by_id_tx(&mut tx, agent_execution_id).await?;
+            let should_fail = execution
+                .is_some_and(|execution| execution.status == AgentStatus::Running)
+                && !work_items::host_interruption_cleanup_holds_attempt_tx(
+                    &mut tx,
+                    agent_execution_id,
+                )
+                .await?;
+            if should_fail {
+                agent_executions::update_completed_tx(
+                    &mut tx,
                     agent_execution_id,
                     AgentStatus::Failed,
                     chrono::Utc::now(),
                 )
-                .await
-                {
-                    error!(
-                        item_id = %item_id,
-                        agent_execution_id = %agent_execution_id,
-                        error = %update_error,
-                        "Failed to close running agent execution after InvokeAgent work item failure"
-                    );
-                } else {
-                    warn!(
-                        item_id = %item_id,
-                        agent_execution_id = %agent_execution_id,
-                        failure = %error_message,
-                        "Closed stale running agent execution after InvokeAgent work item failure"
-                    );
-                }
+                .await?;
             }
-            Ok(Some(_)) | Ok(None) => {}
-            Err(find_error) => {
-                error!(
-                    item_id = %item_id,
-                    agent_execution_id = %agent_execution_id,
-                    error = %find_error,
-                    "Failed to inspect agent execution after InvokeAgent work item failure"
-                );
-            }
+            tx.commit().await?;
+            Ok(should_fail)
+        }
+        .await;
+        match result {
+            Ok(true) => warn!(
+                item_id = %item_id, agent_execution_id = %agent_execution_id, failure = %error_message,
+                "Closed stale running agent execution after InvokeAgent work item failure"
+            ),
+            Ok(false) => {}
+            Err(error) => error!(
+                item_id = %item_id, agent_execution_id = %agent_execution_id, error = %error,
+                "Failed to close running agent execution after InvokeAgent work item failure"
+            ),
         }
     }
 
@@ -10797,13 +10801,19 @@ impl BackgroundExecutor {
                 info!(item_id = %item_id, kind = %kind, "process_next_item: processing");
                 match Box::pin(self.process_item(item)).await {
                     Ok(()) => {
-                        if let Err(e) = self.work_queue.complete(&item_id).await {
+                        if let Err(e) = self
+                            .work_queue
+                            .complete_attempt(&item_id, claimed_agent_execution_id)
+                            .await
+                        {
                             if is_transient_persistence_contention_error(&e) {
                                 let message = e.to_string();
                                 let requeued = self
                                     .work_queue
-                                    .requeue_after_transient_persistence_contention(
-                                        &item_id, &message,
+                                    .requeue_attempt_after_transient_persistence_contention(
+                                        &item_id,
+                                        &message,
+                                        claimed_agent_execution_id,
                                     )
                                     .await?;
                                 if requeued {
@@ -10811,8 +10821,10 @@ impl BackgroundExecutor {
                                     return Ok(true);
                                 }
                             }
-                            if let Err(fail_error) =
-                                self.work_queue.fail(&item_id, &e.to_string()).await
+                            if let Err(fail_error) = self
+                                .work_queue
+                                .fail_attempt(&item_id, &e.to_string(), claimed_agent_execution_id)
+                                .await
                             {
                                 error!(
                                     item_id = %item_id,
@@ -10832,13 +10844,19 @@ impl BackgroundExecutor {
                         let message = e.to_string();
                         let requeued = self
                             .work_queue
-                            .requeue_after_transient_persistence_contention(&item_id, &message)
+                            .requeue_attempt_after_transient_persistence_contention(
+                                &item_id,
+                                &message,
+                                claimed_agent_execution_id,
+                            )
                             .await?;
                         if requeued {
                             warn!(item_id = %item_id, kind = %kind, error = %message, "Work item requeued after transient SQLite contention");
                             Ok(true)
                         } else {
-                            self.work_queue.fail(&item_id, &message).await?;
+                            self.work_queue
+                                .fail_attempt(&item_id, &message, claimed_agent_execution_id)
+                                .await?;
                             if let Some(agent_execution_id) = claimed_agent_execution_id {
                                 self.mark_agent_execution_failed_if_running(
                                     agent_execution_id,
@@ -10852,7 +10870,9 @@ impl BackgroundExecutor {
                     }
                     Err(e) => {
                         let message = e.to_string();
-                        self.work_queue.fail(&item_id, &message).await?;
+                        self.work_queue
+                            .fail_attempt(&item_id, &message, claimed_agent_execution_id)
+                            .await?;
                         if let Some(agent_execution_id) = claimed_agent_execution_id {
                             self.mark_agent_execution_failed_if_running(
                                 agent_execution_id,
@@ -11053,45 +11073,111 @@ impl BackgroundExecutor {
         provider: &str,
         error: &Error,
         completed_at: chrono::DateTime<chrono::Utc>,
+        allow_auto_requeue: bool,
     ) -> Result<bool> {
         let message = error.to_string();
-        if !is_active_prompt_closed_transport_error(&message)
-            || item.attempt_count >= ACTIVE_PROMPT_CLOSE_AUTO_RECOVERY_MAX_ATTEMPTS
-        {
+        if !is_active_prompt_closed_transport_error(&message) {
             return Ok(false);
         }
 
+        // The host retry and this finalizer serialize on the same writer. A
+        // stale invocation must not fail, complete, or requeue its replacement.
+        let mut tx = self
+            .begin_executor_transaction(
+                "executor.active_prompt_close_recovery",
+                format!(
+                    "active_prompt_close_recovery:{}",
+                    claimed.agent_execution_id
+                ),
+            )
+            .await?;
+        if work_items::host_interruption_retry_supersedes_claim_tx(
+            &mut tx,
+            &item.id,
+            &claimed.artifact_claim_key,
+        )
+        .await?
+        {
+            tx.commit().await?;
+            return Ok(true);
+        }
+        if !work_items::is_current_invoke_agent_attempt_tx(
+            &mut tx,
+            &item.id,
+            claimed.agent_execution_id,
+        )
+        .await?
+        {
+            tx.commit()
+                .await
+                .context("commit non-owning active prompt close no-op")?;
+            return Ok(true);
+        }
+        if !allow_auto_requeue
+            || item.attempt_count >= ACTIVE_PROMPT_CLOSE_AUTO_RECOVERY_MAX_ATTEMPTS
+        {
+            // Settle before releasing the writer so host recovery cannot select
+            // this execution in the gap before ordinary failure/P088 handling.
+            agent_executions::update_completed_tx(
+                &mut tx,
+                claimed.agent_execution_id,
+                AgentStatus::Failed,
+                completed_at,
+            )
+            .await?;
+            agent_execution_runtime_facts::upsert_tx(
+                &mut tx,
+                &runtime_facts_for_acp_error(claimed.agent_execution_id, error, completed_at),
+            )
+            .await?;
+            tx.commit().await?;
+            return Ok(false);
+        }
+        let requeued = work_items::requeue_running_invoke_agent_after_active_prompt_close_tx(
+            &mut tx,
+            &item.id,
+            &claimed.artifact_claim_key,
+            policy_decision.map(|decision| decision.generation.id.as_str()),
+            completed_at,
+            "active_prompt_transport_closed",
+        )
+        .await?;
+        if !requeued {
+            tx.commit()
+                .await
+                .context("commit unmatched active prompt close no-op")?;
+            return Ok(false);
+        }
         let runtime_facts =
             runtime_facts_for_acp_error(claimed.agent_execution_id, error, completed_at);
-        agent_executions::update_completed(
-            &self.pool,
+        agent_executions::update_completed_tx(
+            &mut tx,
             claimed.agent_execution_id,
             AgentStatus::Failed,
             completed_at,
         )
         .await?;
-        agent_execution_runtime_facts::upsert(&self.pool, &runtime_facts).await?;
+        agent_execution_runtime_facts::upsert_tx(&mut tx, &runtime_facts).await?;
         if let Some(receipt) = acp::runtime_receipt_from_error(error) {
             let receipt_record = runtime_receipt_record_from_receipt(
                 claimed.agent_execution_id,
                 receipt,
                 completed_at,
             )?;
-            agent_execution_runtime_receipts::upsert(&self.pool, &receipt_record).await?;
+            agent_execution_runtime_receipts::upsert_tx(&mut tx, &receipt_record).await?;
         }
 
         if let Some(decision) = policy_decision {
-            let _ = self.acp.close_session(&decision.generation.id).await;
-            sessions::end_generation(
-                &self.pool,
+            sessions::end_generation_tx(
+                &mut tx,
                 &decision.generation.id,
                 domain::session::SessionGenerationStatus::Invalidated,
                 "active_prompt_transport_closed",
                 completed_at,
             )
             .await?;
-            sessions::insert_event(
-                &self.pool,
+            sessions::insert_event_tx(
+                &mut tx,
                 &domain::session::SessionEvent {
                     id: uuid::Uuid::new_v4().to_string(),
                     lineage_id: decision.lineage.id.clone(),
@@ -11107,20 +11193,15 @@ impl BackgroundExecutor {
             .await?;
         }
 
-        let requeued = work_items::requeue_running_invoke_agent_after_active_prompt_close(
-            &self.pool,
-            &item.id,
-            &claimed.artifact_claim_key,
-            policy_decision.map(|decision| decision.generation.id.as_str()),
-            completed_at,
-            "active_prompt_transport_closed",
-        )
-        .await?;
-        if !requeued {
-            return Ok(false);
+        tx.commit().await?;
+        if let Some(decision) = policy_decision {
+            let _ = self.acp.close_session(&decision.generation.id).await;
         }
-
-        self.work_queue.refresh_scheduler_projection().await?;
+        if let Err(error) = self.work_queue.refresh_scheduler_projection().await {
+            // Ownership has already transferred. A projection failure must not
+            // route the old worker through fail(pending) after this commit.
+            warn!(work_item_id = %item.id, error = %error, "Failed to refresh scheduler after active prompt requeue");
+        }
         let _ = self
             .events
             .send(domain::events::DomainEvent::RuntimeStatusChanged {
@@ -11335,13 +11416,17 @@ impl BackgroundExecutor {
                         tokio::spawn(async move {
                             match Box::pin(executor.process_item(item)).await {
                                 Ok(()) => {
-                                    if let Err(e) = executor.work_queue.complete(&item_id).await {
+                                    if let Err(e) = executor
+                                        .work_queue
+                                        .complete_attempt(&item_id, claimed_agent_execution_id)
+                                        .await
+                                    {
                                         if is_transient_persistence_contention_error(&e) {
                                             let message = e.to_string();
                                             match executor
                                                 .work_queue
-                                                .requeue_after_transient_persistence_contention(
-                                                    &item_id, &message,
+                                                .requeue_attempt_after_transient_persistence_contention(
+                                                    &item_id, &message, claimed_agent_execution_id,
                                                 )
                                                 .await
                                             {
@@ -11359,7 +11444,11 @@ impl BackgroundExecutor {
                                             error!(item_id = %item_id, error = %e, "Failed to mark work item complete");
                                             if let Err(e2) = executor
                                                 .work_queue
-                                                .fail(&item_id, &e.to_string())
+                                                .fail_attempt(
+                                                    &item_id,
+                                                    &e.to_string(),
+                                                    claimed_agent_execution_id,
+                                                )
                                                 .await
                                             {
                                                 error!(item_id = %item_id, error = %e2, "Failed to mark work item failed after completion rejection");
@@ -11374,8 +11463,10 @@ impl BackgroundExecutor {
                                     let message = e.to_string();
                                     match executor
                                         .work_queue
-                                        .requeue_after_transient_persistence_contention(
-                                            &item_id, &message,
+                                        .requeue_attempt_after_transient_persistence_contention(
+                                            &item_id,
+                                            &message,
+                                            claimed_agent_execution_id,
                                         )
                                         .await
                                     {
@@ -11383,8 +11474,14 @@ impl BackgroundExecutor {
                                             warn!(item_id = %item_id, kind = %kind, error = %message, "Work item requeued after transient SQLite contention");
                                         }
                                         Ok(false) => {
-                                            if let Err(e2) =
-                                                executor.work_queue.fail(&item_id, &message).await
+                                            if let Err(e2) = executor
+                                                .work_queue
+                                                .fail_attempt(
+                                                    &item_id,
+                                                    &message,
+                                                    claimed_agent_execution_id,
+                                                )
+                                                .await
                                             {
                                                 error!(item_id = %item_id, error = %e2, "Failed to mark work item failed after transient contention requeue no-op");
                                             } else if let Some(agent_execution_id) =
@@ -11406,8 +11503,14 @@ impl BackgroundExecutor {
                                 }
                                 Err(e) => {
                                     error!(item_id = %item_id, kind = %kind, error = %e, "Work item failed");
-                                    if let Err(e2) =
-                                        executor.work_queue.fail(&item_id, &e.to_string()).await
+                                    if let Err(e2) = executor
+                                        .work_queue
+                                        .fail_attempt(
+                                            &item_id,
+                                            &e.to_string(),
+                                            claimed_agent_execution_id,
+                                        )
+                                        .await
                                     {
                                         error!(item_id = %item_id, error = %e2, "Failed to mark work item failed");
                                     } else if let Some(agent_execution_id) =
@@ -12636,28 +12739,27 @@ impl BackgroundExecutor {
                                 .into());
                             }
                         }
-                        if !p088_code_writer_completion_candidate {
-                            if let Some(claimed) = preclaimed_start.as_ref() {
-                                if self
-                                    .auto_requeue_active_prompt_close(
-                                        &item,
-                                        claimed,
-                                        policy_decision.as_ref(),
-                                        run_id,
-                                        &stage_id,
-                                        &agent_id,
-                                        &provider,
-                                        &error,
-                                        completed_at,
-                                    )
-                                    .await?
-                                {
-                                    return Err(WorkItemRequeued {
-                                        work_item_id: item.id.clone(),
-                                        reason: "active_prompt_transport_closed",
-                                    }
-                                    .into());
+                        if let Some(claimed) = preclaimed_start.as_ref() {
+                            if self
+                                .auto_requeue_active_prompt_close(
+                                    &item,
+                                    claimed,
+                                    policy_decision.as_ref(),
+                                    run_id,
+                                    &stage_id,
+                                    &agent_id,
+                                    &provider,
+                                    &error,
+                                    completed_at,
+                                    !p088_code_writer_completion_candidate,
+                                )
+                                .await?
+                            {
+                                return Err(WorkItemRequeued {
+                                    work_item_id: item.id.clone(),
+                                    reason: "active_prompt_transport_closed",
                                 }
+                                .into());
                             }
                         }
                         let mut runtime_facts =
@@ -12900,6 +13002,29 @@ impl BackgroundExecutor {
                         );
                         return Ok(());
                     }
+                }
+
+                // Reject a host-fenced result before discovery, repair or artifact writes.
+                // Non-host supersession still reaches P082 claim-CAS quarantine.
+                // Authoritative settlement rechecks under its own writer transaction below.
+                let mut result_ownership_tx = self
+                    .begin_executor_transaction(
+                        "executor.provider_result_ownership",
+                        format!("provider_result_ownership:{agent_exec_id}"),
+                    )
+                    .await?;
+                let host_owns_result = work_items::host_interruption_owns_attempt_tx(
+                    &mut result_ownership_tx,
+                    agent_exec_id,
+                )
+                .await?;
+                result_ownership_tx.commit().await?;
+                if host_owns_result {
+                    return Err(WorkItemRequeued {
+                        work_item_id: item.id.clone(),
+                        reason: "host_interruption_owns_provider_result",
+                    }
+                    .into());
                 }
 
                 // P017 B2-004: Check mediation staleness for mediation-owned executions.
@@ -15374,6 +15499,19 @@ impl BackgroundExecutor {
                             format!("mediation.complete_with_attribution:{agent_exec_id}"),
                         )
                         .await?;
+                    if work_items::host_interruption_owns_attempt_tx(
+                        &mut completion_tx,
+                        agent_exec_id,
+                    )
+                    .await?
+                    {
+                        completion_tx.commit().await?;
+                        return Err(WorkItemRequeued {
+                            work_item_id: item.id.clone(),
+                            reason: "host_interruption_owns_provider_result",
+                        }
+                        .into());
+                    }
                     if let Some(artifact) = mediation_transcript_artifact.as_ref() {
                         artifacts::insert_tx(&mut completion_tx, artifact).await?;
                     }
@@ -16130,14 +16268,6 @@ impl BackgroundExecutor {
                         persisted_artifacts.push(validation_artifact);
                     }
                 }
-
-                agent_executions::update_completed(
-                    &self.pool,
-                    agent_exec_id,
-                    final_agent_status.clone(),
-                    completed_at,
-                )
-                .await?;
 
                 self.maybe_admit_p086_lead_auto_continuation(
                     &run,
@@ -17913,6 +18043,14 @@ impl BackgroundExecutor {
                 format!("executor.import_declared_outputs:{agent_exec_id}"),
             )
             .await?;
+        if work_items::host_interruption_owns_attempt_tx(&mut tx, agent_exec_id).await? {
+            tx.commit().await?;
+            return Err(WorkItemRequeued {
+                work_item_id: work_item_id.to_string(),
+                reason: "host_interruption_owns_provider_result",
+            }
+            .into());
+        }
         for artifact in &declared_artifacts_to_insert {
             artifacts::insert_tx(&mut tx, artifact).await?;
         }
@@ -18097,6 +18235,18 @@ impl BackgroundExecutor {
             )
             .await?
         };
+        // Accepted output and terminal execution share the host-recovery lock.
+        // Host phase one cannot select this attempt after its artifact commit.
+        // P082 cancelled-late-output handling above retains its own terminal truth.
+        if !ignored_late_outputs {
+            agent_executions::update_completed_tx(
+                &mut tx,
+                agent_exec_id,
+                final_agent_status.clone(),
+                completed_at,
+            )
+            .await?;
+        }
         artifact_contracts::close_source_generation_claim_tx(&mut tx, artifact_claim_key).await?;
         tx.commit().await?;
         db::pool::log_write_transaction("executor.import_declared_outputs", tx_started);

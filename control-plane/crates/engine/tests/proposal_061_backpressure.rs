@@ -2817,6 +2817,236 @@ async fn network_migration_records_epoch_without_cancelling_active_prompt() {
 }
 
 #[tokio::test]
+async fn host_interruption_fanout_requeues_each_execution_with_its_own_evidence() {
+    assert_host_interruption_fanout(false).await;
+}
+
+#[tokio::test]
+async fn host_interruption_fanout_does_not_requeue_sibling_whose_cleanup_failed() {
+    assert_host_interruption_fanout(true).await;
+}
+
+async fn assert_host_interruption_fanout(fail_second_cleanup: bool) {
+    let pool = test_pool().await;
+    let now = Utc::now();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_id = StageExecutionId::new();
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "same-stage host recovery".into(),
+            body: "independent active prompts".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(&pool, &make_stage(run_id, stage_id, "parallel"))
+        .await
+        .unwrap();
+    let mut claim_keys = Vec::new();
+    for i in 0..2 {
+        let generation_id = format!("host-fanout-generation-{i}");
+        let lineage_id = format!("host-fanout-lineage-{i}");
+        sessions::insert_lineage(
+            &pool,
+            &SessionLineage {
+                id: lineage_id.clone(),
+                run_id: run_id.to_string(),
+                agent_id: format!("agent-{i}"),
+                lineage_id: lineage_id.clone(),
+                session_reuse_scope: "same_agent_family_within_run".into(),
+                session_family_id: Some(format!("agent-{i}")),
+                active_generation_id: Some(generation_id.clone()),
+                created_at: now,
+                closed_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        sessions::insert_generation(
+            &pool,
+            &SessionGeneration {
+                id: generation_id.clone(),
+                lineage_id: lineage_id.clone(),
+                generation: 1,
+                invocation_owner_key: format!("owner-{i}"),
+                provider_session_id: Some(format!("provider-{i}")),
+                binding_fingerprint: "fixture".into(),
+                rehydrated_from_checkpoint_artifact_id: None,
+                working_directory: "/tmp".into(),
+                workspace_mode: "read_only".into(),
+                runtime_provider: "claude".into(),
+                runtime_model: "default".into(),
+                status: SessionGenerationStatus::Active,
+                turn_count: 1,
+                estimated_input_tokens: 0,
+                latest_cached_input_tokens: None,
+                latest_output_tokens: None,
+                latest_model_context_window: None,
+                cumulative_prompt_tokens: 0,
+                cumulative_cost_cents: 0,
+                created_at: now,
+                last_activity_at: None,
+                ended_at: None,
+                end_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut execution = make_running_execution(stage_id, "claude");
+        execution.agent_id = format!("agent-{i}");
+        execution.started_at = now - Duration::seconds(30);
+        execution.session_lineage_id = Some(lineage_id);
+        execution.session_generation_id = Some(generation_id.clone());
+        agent_executions::insert(&pool, &execution).await.unwrap();
+        let mut item = make_invoke_work_item(
+            &format!("host-fanout-{i}"),
+            run_id,
+            stage_id,
+            "parallel",
+            "claude",
+            -30,
+        );
+        item.status = WorkItemStatus::Running;
+        item.attempt_count = 1;
+        let key = ArtifactSourceGenerationClaimKey {
+            run_id,
+            owner_kind: OwnerKind::StageExecution,
+            owner_id: stage_id.to_string(),
+            stage_execution_id: Some(stage_id),
+            agent_execution_id: execution.id,
+            source_work_item_id: item.id.clone(),
+        };
+        let mut payload: serde_json::Value = serde_json::from_str(&item.payload_json).unwrap();
+        payload["agent_id"] = serde_json::json!(execution.agent_id);
+        payload["p058_claimed"] =
+            serde_json::json!({ "agent_execution_id": execution.id, "artifact_claim_key": key });
+        item.payload_json = payload.to_string();
+        work_items::enqueue(&pool, &item).await.unwrap();
+        artifact_contracts::insert_source_generation_claim(
+            &pool,
+            ArtifactSourceGenerationClaim {
+                key: key.clone(),
+                current_session_generation_id: Some(generation_id),
+                claim_state: ArtifactSourceClaimState::Active,
+                superseding_work_item_id: None,
+                superseded_by_agent_execution_id: None,
+                supersession_journal_id: None,
+                superseded_at: None,
+                closed_at: None,
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        claim_keys.push(key);
+    }
+    let cleanup = Arc::new(RecordingRuntimeCleanup {
+        fail_generation: fail_second_cleanup.then(|| "host-fanout-generation-1".to_string()),
+        ..Default::default()
+    });
+    let service = HostInterruptionService::with_capacity_config_and_runtime_cleanup(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        DomainInvokeAgentCapacityConfig::default(),
+        cleanup,
+    );
+    let summary = service
+        .record_and_requeue(HostInterruptionEvent {
+            kind: HostInterruptionKind::SystemSleep,
+            started_at: now - Duration::seconds(40),
+            ended_at: Some(now),
+            monotonic_gap_ms: None,
+            wall_clock_gap_ms: Some(40_000),
+            details_json: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(summary.affected_executions, 2);
+    assert_eq!(
+        summary.retries_enqueued,
+        if fail_second_cleanup { 1 } else { 2 }
+    );
+    assert_eq!(summary.retries_missing_work_item, 0);
+    let readback = scheduler::list_host_interruption_epochs_by_run(&pool, &run_id.to_string())
+        .await
+        .unwrap();
+    for (i, key) in claim_keys.iter().enumerate() {
+        let failed_cleanup = fail_second_cleanup && i == 1;
+        let item = work_items::find_by_id(&pool, &key.source_work_item_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            item.status,
+            if failed_cleanup {
+                WorkItemStatus::Running
+            } else {
+                WorkItemStatus::Pending
+            }
+        );
+        let claim = artifact_contracts::load_source_generation_claim(&pool, key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            claim.claim_state,
+            if failed_cleanup {
+                ArtifactSourceClaimState::Active
+            } else {
+                ArtifactSourceClaimState::SupersededPendingRetry
+            }
+        );
+        assert_eq!(
+            claim.superseding_work_item_id.as_deref(),
+            (!failed_cleanup).then_some(key.source_work_item_id.as_str())
+        );
+        let generation =
+            sessions::find_generation_by_id(&pool, &format!("host-fanout-generation-{i}"))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            generation.status,
+            if failed_cleanup {
+                SessionGenerationStatus::Active
+            } else {
+                SessionGenerationStatus::Invalidated
+            }
+        );
+        let affected = readback[0]
+            .affected_executions
+            .iter()
+            .find(|row| row.agent_execution_id == key.agent_execution_id.to_string())
+            .unwrap();
+        assert_eq!(affected.quota_budget_effect, "not_consumed");
+        assert_eq!(
+            affected.retry_enqueued_at,
+            (!failed_cleanup).then_some(item.scheduled_at)
+        );
+        let mut tx = pool.begin().await.unwrap();
+        assert_eq!(
+            work_items::host_interruption_retry_supersedes_claim_tx(&mut tx, &item.id, key)
+                .await
+                .unwrap(),
+            !failed_cleanup
+        );
+        tx.rollback().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn host_interruption_late_output_from_superseded_attempt_cannot_promote_over_retry_generation(
 ) {
     let pool = test_pool().await;

@@ -582,6 +582,31 @@ pub async fn insert_host_interruption_affected_execution_tx(
     Ok(())
 }
 
+pub async fn settle_host_interruption_affected_execution_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    affected: &HostInterruptionAffectedExecution,
+) -> Result<()> {
+    let updated = sqlx::query(
+        r#"UPDATE host_interruption_affected_executions
+           SET settlement_status = ?1, cleanup_status = ?2, retry_enqueued_at = ?3
+           WHERE epoch_id = ?4 AND agent_execution_id = ?5
+             AND settlement_status = 'cleanup_pending' AND cleanup_status = 'pending'"#,
+    )
+    .bind(&affected.settlement_status)
+    .bind(&affected.cleanup_status)
+    .bind(affected.retry_enqueued_at.map(|value| value.to_rfc3339()))
+    .bind(&affected.epoch_id)
+    .bind(&affected.agent_execution_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    anyhow::ensure!(
+        updated == 1,
+        "host interruption cleanup fence lost before settlement"
+    );
+    Ok(())
+}
+
 pub async fn list_host_interruption_epochs_by_run(
     pool: &SqlitePool,
     run_id: &str,

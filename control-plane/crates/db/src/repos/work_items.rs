@@ -1518,6 +1518,10 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
         let payload_json: String = row.get("payload_json");
         let mut payload = serde_json::from_str::<serde_json::Value>(&payload_json)
             .unwrap_or_else(|_| serde_json::json!({}));
+        let interrupted_execution_id = payload
+            .pointer("/p058_claimed/agent_execution_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned);
         supersede_abandoned_preclaim_for_retry_tx(tx, &item_id, &payload, scheduled_at).await?;
         let (source_command_journal_id_opt, projection_integrity) =
             p082_resolve_source_command_journal_id_for_work_item_tx(
@@ -1563,6 +1567,15 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
             .await
             .context("requeue running InvokeAgent work item on startup (no journal)")?
             .rows_affected();
+            if updated > 0 {
+                settle_host_cleanup_after_startup_requeue_tx(
+                    tx,
+                    &item_id,
+                    interrupted_execution_id.as_deref(),
+                    scheduled_at,
+                )
+                .await?;
+            }
             requeued += updated;
             continue;
         };
@@ -1719,6 +1732,13 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
                 .context("replay startup requeue for InvokeAgent work item")?
                 .rows_affected();
                 if updated > 0 {
+                    settle_host_cleanup_after_startup_requeue_tx(
+                        tx,
+                        &item_id,
+                        interrupted_execution_id.as_deref(),
+                        scheduled_at,
+                    )
+                    .await?;
                     crate::metrics::increment_counter_with_label(
                         "p082_recovery_idempotency_replay_total",
                         "P082-R15:repair_crash_resume_idempotent",
@@ -1828,6 +1848,13 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
         .context("requeue running InvokeAgent work item on startup")?
         .rows_affected();
         if updated > 0 {
+            settle_host_cleanup_after_startup_requeue_tx(
+                tx,
+                &item_id,
+                interrupted_execution_id.as_deref(),
+                scheduled_at,
+            )
+            .await?;
             crate::metrics::increment_counter_with_label(
                 "p082_recovery_idempotency_replay_total",
                 "P082-R01:startup_requeue_once",
@@ -1836,6 +1863,63 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
         requeued += updated;
     }
     Ok(requeued)
+}
+
+async fn settle_host_cleanup_after_startup_requeue_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item_id: &str,
+    agent_execution_id: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let Some(agent_execution_id) = agent_execution_id else {
+        return Ok(());
+    };
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        r#"SELECT h.epoch_id, ae.session_generation_id
+           FROM host_interruption_affected_executions h
+           JOIN agent_executions ae ON ae.id = h.agent_execution_id AND ae.stage_execution_id = h.stage_execution_id
+           JOIN work_items wi ON wi.id = ?1 AND wi.run_id = h.run_id
+             AND json_valid(wi.payload_json) AND json_extract(wi.payload_json, '$.stage_execution_id') = h.stage_execution_id
+           WHERE h.agent_execution_id = ?2 AND h.settlement_status = 'cleanup_pending'
+             AND h.cleanup_status = 'pending' AND wi.status = 'pending'"#,
+    ).bind(work_item_id).bind(agent_execution_id).fetch_all(&mut **tx).await?;
+    for (epoch_id, generation_id) in rows {
+        if let Some(generation_id) = generation_id {
+            if let Some(generation) =
+                super::sessions::find_generation_by_id_tx(tx, &generation_id).await?
+            {
+                if generation.status == domain::session::SessionGenerationStatus::Active {
+                    super::sessions::end_generation_tx(
+                        tx,
+                        &generation_id,
+                        domain::session::SessionGenerationStatus::Invalidated,
+                        "host_interruption_startup_recovery",
+                        now,
+                    )
+                    .await?;
+                    super::sessions::insert_event_tx(tx, &domain::session::SessionEvent {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        lineage_id: generation.lineage_id,
+                        generation_id,
+                        event_type: domain::session::SessionEventType::Invalidated,
+                        recorded_at: now,
+                        details_json: Some(serde_json::json!({
+                            "reason": "host_interruption_startup_recovery", "epoch_id": epoch_id,
+                        }).to_string()),
+                    }).await?;
+                }
+            }
+        }
+        // Startup repair owns this retry. Do not claim the interrupted cleanup
+        // succeeded or let its old generation/phase-one fence leak into reuse.
+        sqlx::query(
+            r#"UPDATE host_interruption_affected_executions
+               SET settlement_status = 'retry_recovered_on_startup', cleanup_status = 'unknown_after_restart', retry_enqueued_at = ?1
+               WHERE epoch_id = ?2 AND agent_execution_id = ?3 AND settlement_status = 'cleanup_pending'"#,
+        ).bind(now.to_rfc3339()).bind(epoch_id).bind(agent_execution_id)
+            .execute(&mut **tx).await?;
+    }
+    Ok(())
 }
 
 pub async fn complete_running_invoke_agents_with_terminal_valid_outputs_on_startup(
@@ -2720,6 +2804,38 @@ pub async fn requeue_running_invoke_agent_by_stage_for_host_interruption_tx(
     stage_execution_id: StageExecutionId,
     scheduled_at: DateTime<Utc>,
 ) -> Result<Vec<String>> {
+    requeue_host_interrupted_invoke_tx(tx, run_id, stage_id, stage_execution_id, scheduled_at, None)
+        .await
+}
+
+pub async fn requeue_running_invoke_agent_for_host_interruption_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    stage_id: &str,
+    stage_execution_id: StageExecutionId,
+    agent_execution_id: AgentExecutionId,
+    scheduled_at: DateTime<Utc>,
+    epoch_id: &str,
+) -> Result<Vec<String>> {
+    requeue_host_interrupted_invoke_tx(
+        tx,
+        run_id,
+        stage_id,
+        stage_execution_id,
+        scheduled_at,
+        Some((agent_execution_id, epoch_id)),
+    )
+    .await
+}
+
+async fn requeue_host_interrupted_invoke_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    stage_id: &str,
+    stage_execution_id: StageExecutionId,
+    scheduled_at: DateTime<Utc>,
+    execution: Option<(AgentExecutionId, &str)>,
+) -> Result<Vec<String>> {
     let run_id = run_id.to_string();
     let stage_execution_id = stage_execution_id.to_string();
     let running = WorkItemStatus::Running.to_string();
@@ -2738,6 +2854,16 @@ pub async fn requeue_running_invoke_agent_by_stage_for_host_interruption_tx(
     .await
     .context("load running InvokeAgent work items for host interruption requeue")?;
 
+    let legacy_agent_id = if let Some((agent_execution_id, _)) = execution {
+        sqlx::query_scalar::<_, String>("SELECT agent_id FROM agent_executions WHERE id = ?1")
+            .bind(agent_execution_id.to_string())
+            .fetch_optional(&mut **tx)
+            .await?
+    } else {
+        None
+    };
+    let candidate_count = rows.len();
+
     let pending = WorkItemStatus::Pending.to_string();
     let scheduled_at_rfc3339 = scheduled_at.to_rfc3339();
     let mut requeued = Vec::new();
@@ -2755,6 +2881,24 @@ pub async fn requeue_running_invoke_agent_by_stage_for_host_interruption_tx(
             != Some(stage_execution_id.as_str())
         {
             continue;
+        }
+        if let Some((agent_execution_id, _)) = execution {
+            let matches_execution = if let Some(claimed) = payload.get("p058_claimed") {
+                claimed
+                    .get("agent_execution_id")
+                    .and_then(|value| value.as_str())
+                    == Some(agent_execution_id.to_string().as_str())
+            } else {
+                // Older unclaimed fixtures/rows are safe only when there is a
+                // single unambiguous stage candidate for this exact agent.
+                candidate_count == 1
+                    && legacy_agent_id.is_some()
+                    && payload.get("agent_id").and_then(|value| value.as_str())
+                        == legacy_agent_id.as_deref()
+            };
+            if !matches_execution {
+                continue;
+            }
         }
         supersede_abandoned_preclaim_for_retry_tx(tx, &item_id, &payload, scheduled_at).await?;
         if let Some(object) = payload.as_object_mut() {
@@ -2788,11 +2932,91 @@ pub async fn requeue_running_invoke_agent_by_stage_for_host_interruption_tx(
         .context("requeue running InvokeAgent work item for host interruption")?
         .rows_affected();
         if updated == 1 {
+            if let Some((agent_execution_id, epoch_id)) = execution {
+                sqlx::query(
+                    r#"UPDATE artifact_source_generation_claims
+                       SET claim_state = 'superseded_pending_retry', superseding_work_item_id = ?1,
+                           supersession_journal_id = ?2, superseded_at = COALESCE(superseded_at, ?3), updated_at = ?3
+                       WHERE run_id = ?4 AND owner_kind = 'stage_execution' AND owner_id = ?5
+                         AND stage_execution_id = ?5 AND agent_execution_id = ?6 AND source_work_item_id = ?1
+                         AND (claim_state = 'active' OR (claim_state = 'superseded_pending_retry' AND superseding_work_item_id = ?1))"#,
+                )
+                .bind(&item_id).bind(epoch_id).bind(&scheduled_at_rfc3339).bind(&run_id)
+                .bind(&stage_execution_id).bind(agent_execution_id.to_string())
+                .execute(&mut **tx).await.context("supersede exact host-interrupted source claim")?;
+            }
             requeued.push(item_id);
         }
     }
 
     Ok(requeued)
+}
+
+/// Durable supersession, not a lingering payload marker, fences the old invocation
+/// even after the host retry has been claimed or completed.
+pub async fn host_interruption_retry_supersedes_claim_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item_id: &str,
+    claim_key: &ArtifactSourceGenerationClaimKey,
+) -> Result<bool> {
+    let superseded: i64 = sqlx::query_scalar(
+        r#"SELECT EXISTS (
+            SELECT 1 FROM artifact_source_generation_claims c
+            INNER JOIN host_interruption_affected_executions h
+                ON h.agent_execution_id = c.agent_execution_id
+                AND h.run_id = c.run_id AND h.stage_execution_id = c.stage_execution_id
+            WHERE c.run_id = ?1 AND c.owner_kind = ?2 AND c.owner_id = ?3
+                AND c.agent_execution_id = ?4 AND c.source_work_item_id = ?5
+                AND c.source_work_item_id = ?6 AND c.superseding_work_item_id = ?6
+                AND c.claim_state IN ('superseded_pending_retry', 'superseded')
+                AND h.cleanup_status IN ('succeeded', 'not_required')
+                AND h.settlement_status IN ('retry_enqueued', 'retry_deferred_capacity')
+                AND h.retry_enqueued_at IS NOT NULL
+        )"#,
+    )
+    .bind(claim_key.run_id.to_string())
+    .bind(claim_key.owner_kind.to_string())
+    .bind(&claim_key.owner_id)
+    .bind(claim_key.agent_execution_id.to_string())
+    .bind(&claim_key.source_work_item_id)
+    .bind(work_item_id)
+    .fetch_one(&mut **tx)
+    .await
+    .context("check host interruption ownership of superseded invocation")?;
+    Ok(superseded != 0)
+}
+
+/// Phase-one ownership is durable while runtime cleanup runs without a DB lock.
+pub async fn host_interruption_cleanup_holds_attempt_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    agent_execution_id: AgentExecutionId,
+) -> Result<bool> {
+    let held: i64 = sqlx::query_scalar(
+        r#"SELECT EXISTS (
+            SELECT 1 FROM host_interruption_affected_executions
+            WHERE agent_execution_id = ?1 AND settlement_status = 'cleanup_pending'
+              AND cleanup_status = 'pending' AND retry_enqueued_at IS NULL
+        )"#,
+    )
+    .bind(agent_execution_id.to_string())
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(held != 0)
+}
+
+/// An affected attempt never regains result authority when cleanup settles.
+pub async fn host_interruption_owns_attempt_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    agent_execution_id: AgentExecutionId,
+) -> Result<bool> {
+    let affected: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM host_interruption_affected_executions WHERE agent_execution_id = ?1)",
+    )
+    .bind(agent_execution_id.to_string())
+    .fetch_one(&mut **tx)
+    .await
+    .context("check durable host ownership of provider result")?;
+    Ok(affected != 0)
 }
 
 pub async fn requeue_running_invoke_agent_after_active_prompt_close(
@@ -2856,6 +3080,19 @@ pub async fn requeue_running_invoke_agent_after_active_prompt_close_tx(
     let payload_json: String = row.get("payload_json");
     let mut payload: serde_json::Value =
         serde_json::from_str(&payload_json).context("parse InvokeAgent payload for requeue")?;
+    let current_claim = payload
+        .pointer("/p058_claimed/artifact_claim_key")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<ArtifactSourceGenerationClaimKey>(value).ok());
+    if current_claim.as_ref() != Some(claim_key)
+        || claim_key.source_work_item_id != work_item_id
+        || payload
+            .pointer("/p058_claimed/agent_execution_id")
+            .and_then(|value| value.as_str())
+            != Some(claim_key.agent_execution_id.to_string().as_str())
+    {
+        return Ok(false);
+    }
     if let Some(object) = payload.as_object_mut() {
         object.remove("p058_claimed");
         object.insert(
@@ -3057,6 +3294,15 @@ pub async fn complete_with_capacity(
     id: &str,
     capacity: &InvokeAgentCapacityConfig,
 ) -> Result<scheduler::RefreshQueueSummariesResult> {
+    complete_attempt_with_capacity(pool, id, None, capacity).await
+}
+
+pub async fn complete_attempt_with_capacity(
+    pool: &SqlitePool,
+    id: &str,
+    expected_agent_execution_id: Option<AgentExecutionId>,
+    capacity: &InvokeAgentCapacityConfig,
+) -> Result<scheduler::RefreshQueueSummariesResult> {
     let tx_started = Instant::now();
     let mut tx = begin_registered_immediate_transaction(
         pool,
@@ -3081,6 +3327,20 @@ pub async fn complete_with_capacity(
         let kind: String = row.get("kind");
         let run_id: Option<String> = row.get("run_id");
         let previous_status: String = row.get("status");
+        if !matches_work_item_attempt_tx(
+            &mut tx,
+            &kind,
+            &previous_status,
+            row.get("payload_json"),
+            expected_agent_execution_id,
+        )
+        .await?
+        {
+            tx.commit()
+                .await
+                .context("commit stale-attempt complete no-op")?;
+            return Ok(scheduler::RefreshQueueSummariesResult::default());
+        }
         if !matches!(previous_status.as_str(), "pending" | "running") {
             tx.commit()
                 .await
@@ -3372,6 +3632,16 @@ pub async fn fail_with_capacity(
     error: &str,
     capacity: &InvokeAgentCapacityConfig,
 ) -> Result<scheduler::RefreshQueueSummariesResult> {
+    fail_attempt_with_capacity(pool, id, error, None, capacity).await
+}
+
+pub async fn fail_attempt_with_capacity(
+    pool: &SqlitePool,
+    id: &str,
+    error: &str,
+    expected_agent_execution_id: Option<AgentExecutionId>,
+    capacity: &InvokeAgentCapacityConfig,
+) -> Result<scheduler::RefreshQueueSummariesResult> {
     let tx_started = Instant::now();
     let mut tx = begin_registered_immediate_transaction(
         pool,
@@ -3395,6 +3665,20 @@ pub async fn fail_with_capacity(
         let kind: String = row.get("kind");
         let run_id: Option<String> = row.get("run_id");
         let previous_status: String = row.get("status");
+        if !matches_work_item_attempt_tx(
+            &mut tx,
+            &kind,
+            &previous_status,
+            row.get("payload_json"),
+            expected_agent_execution_id,
+        )
+        .await?
+        {
+            tx.commit()
+                .await
+                .context("commit stale-attempt fail no-op")?;
+            return Ok(scheduler::RefreshQueueSummariesResult::default());
+        }
         if !matches!(previous_status.as_str(), "pending" | "running") {
             tx.commit().await.context("commit terminal fail no-op")?;
             log_write_transaction("work_items.fail.terminal_noop", tx_started);
@@ -3978,6 +4262,16 @@ pub async fn requeue_running_after_transient_persistence_contention(
     now: DateTime<Utc>,
     error: &str,
 ) -> Result<bool> {
+    requeue_attempt_after_transient_persistence_contention(pool, id, now, error, None).await
+}
+
+pub async fn requeue_attempt_after_transient_persistence_contention(
+    pool: &SqlitePool,
+    id: &str,
+    now: DateTime<Utc>,
+    error: &str,
+    expected_agent_execution_id: Option<AgentExecutionId>,
+) -> Result<bool> {
     let tx_started = Instant::now();
     let mut tx = begin_registered_immediate_transaction(
         pool,
@@ -3989,12 +4283,14 @@ pub async fn requeue_running_after_transient_persistence_contention(
         "work_items.requeue_transient_persistence_contention",
     )
     .await?;
-    let row = sqlx::query(r#"SELECT attempt_count FROM work_items WHERE id = ?1 AND status = ?2"#)
-        .bind(id)
-        .bind(WorkItemStatus::Running.to_string())
-        .fetch_optional(&mut **tx)
-        .await
-        .context("load running work item for transient persistence requeue")?;
+    let row = sqlx::query(
+        r#"SELECT attempt_count, kind, payload_json FROM work_items WHERE id = ?1 AND status = ?2"#,
+    )
+    .bind(id)
+    .bind(WorkItemStatus::Running.to_string())
+    .fetch_optional(&mut **tx)
+    .await
+    .context("load running work item for transient persistence requeue")?;
 
     let Some(row) = row else {
         tx.commit()
@@ -4007,6 +4303,20 @@ pub async fn requeue_running_after_transient_persistence_contention(
         return Ok(false);
     };
 
+    if !matches_work_item_attempt_tx(
+        &mut tx,
+        row.get("kind"),
+        "running",
+        row.get("payload_json"),
+        expected_agent_execution_id,
+    )
+    .await?
+    {
+        tx.commit()
+            .await
+            .context("commit stale-attempt transient requeue no-op")?;
+        return Ok(false);
+    }
     let attempt_count: i64 = row.get("attempt_count");
     let backoff_seconds = (1_i64 << attempt_count.clamp(0, 6)).min(60);
     let scheduled_at = now + chrono::Duration::seconds(backoff_seconds);
@@ -4038,6 +4348,67 @@ pub async fn requeue_running_after_transient_persistence_contention(
         tx_started,
     );
     Ok(updated == 1)
+}
+
+async fn matches_work_item_attempt_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    kind: &str,
+    status: &str,
+    payload_json: &str,
+    expected_agent_execution_id: Option<AgentExecutionId>,
+) -> Result<bool> {
+    let Some(expected) = expected_agent_execution_id else {
+        return Ok(true);
+    };
+    let matches = kind == "invoke_agent"
+        && status == "running"
+        && serde_json::from_str::<serde_json::Value>(payload_json)
+            .ok()
+            .and_then(|payload| {
+                payload
+                    .pointer("/p058_claimed/agent_execution_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            })
+            .as_deref()
+            == Some(expected.to_string().as_str());
+    if !matches {
+        return Ok(false);
+    }
+    // Failed cleanup can retain the running preclaim, but host cancellation
+    // still revokes this worker's authority to settle or retry that attempt.
+    let cancelled: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM agent_executions WHERE id = ?1 AND status = 'cancelled')",
+    )
+    .bind(expected.to_string())
+    .fetch_one(&mut **tx)
+    .await?;
+    if cancelled != 0 {
+        return Ok(false);
+    }
+    Ok(!host_interruption_cleanup_holds_attempt_tx(tx, expected).await?)
+}
+
+pub async fn is_current_invoke_agent_attempt_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+    agent_execution_id: AgentExecutionId,
+) -> Result<bool> {
+    let row = sqlx::query("SELECT kind, status, payload_json FROM work_items WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    matches_work_item_attempt_tx(
+        tx,
+        row.get("kind"),
+        row.get("status"),
+        row.get("payload_json"),
+        Some(agent_execution_id),
+    )
+    .await
 }
 
 pub async fn cancel_running_by_run(pool: &SqlitePool, run_id: RunId) -> Result<()> {
@@ -6613,6 +6984,105 @@ mod tests {
                 .map(str::to_string),
             Some(stage_execution_id.to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn attempt_finalizers_preserve_replaced_invoke_owner() {
+        let pool = test_pool().await;
+        let writer = std::sync::Arc::new(crate::writer::DbWriter::new(pool.clone()));
+        crate::writer::register_shared_writer(&pool, writer.clone())
+            .await
+            .unwrap();
+        let capacity = InvokeAgentCapacityConfig::default();
+        let old_execution = AgentExecutionId::new();
+        let replacement = AgentExecutionId::new();
+        for status in [
+            WorkItemStatus::Pending,
+            WorkItemStatus::Running,
+            WorkItemStatus::Completed,
+        ] {
+            let item = WorkItem {
+                id: format!("replaced-attempt-{status}"),
+                kind: WorkItemKind::InvokeAgent,
+                payload_json:
+                    serde_json::json!({ "p058_claimed": { "agent_execution_id": replacement } })
+                        .to_string(),
+                status: status.clone(),
+                run_id: None,
+                stage_id: None,
+                created_at: Utc::now(),
+                scheduled_at: Utc::now(),
+                attempt_count: 2,
+                last_error: None,
+            };
+            enqueue(&pool, &item).await.unwrap();
+            fail_attempt_with_capacity(
+                &pool,
+                &item.id,
+                "stale close",
+                Some(old_execution),
+                &capacity,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                writer.heartbeat.snapshot().total_queued,
+                0,
+                "fail no-op must explicitly finish its writer transaction"
+            );
+            complete_attempt_with_capacity(&pool, &item.id, Some(old_execution), &capacity)
+                .await
+                .unwrap();
+            assert_eq!(
+                writer.heartbeat.snapshot().total_queued,
+                0,
+                "complete no-op must explicitly finish its writer transaction"
+            );
+            assert!(!requeue_attempt_after_transient_persistence_contention(
+                &pool,
+                &item.id,
+                Utc::now(),
+                "database is locked",
+                Some(old_execution)
+            )
+            .await
+            .unwrap());
+            assert_eq!(
+                writer.heartbeat.snapshot().total_queued,
+                0,
+                "requeue no-op must explicitly finish its writer transaction"
+            );
+            let after = find_by_id(&pool, &item.id).await.unwrap().unwrap();
+            assert_eq!(after.status, status);
+            assert_eq!(after.payload_json, item.payload_json);
+            assert_eq!(after.scheduled_at, item.scheduled_at);
+            assert_eq!(after.attempt_count, 2);
+            assert!(after.last_error.is_none());
+            if status == WorkItemStatus::Running {
+                fail_attempt_with_capacity(
+                    &pool,
+                    &item.id,
+                    "current failure",
+                    Some(replacement),
+                    &capacity,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    find_by_id(&pool, &item.id).await.unwrap().unwrap().status,
+                    WorkItemStatus::Failed
+                );
+            } else if status == WorkItemStatus::Pending {
+                // General pending failure remains an intentional, separate API.
+                fail_with_capacity(&pool, &item.id, "operator failure", &capacity)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    find_by_id(&pool, &item.id).await.unwrap().unwrap().status,
+                    WorkItemStatus::Failed
+                );
+            }
+        }
     }
 
     #[tokio::test]

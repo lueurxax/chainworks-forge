@@ -15718,7 +15718,12 @@ impl acp::adapters::AcpAdapter for ActivePromptCloseOnceAdapter {
                 .expect("test request should carry agent execution id"),
             status: AgentStatus::Completed,
             artifact_paths: Vec::new(),
-            discovered_artifacts: Vec::new(),
+            discovered_artifacts: vec![acp::DiscoveredArtifact {
+                name: "prompt_recovery_report".into(),
+                content: br#"{"summary":"fresh retry completed"}"#.to_vec(),
+                source_path: None,
+                source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
+            }],
             pre_prompt_expected_outputs: Vec::new(),
             completion_text_capture: Default::default(),
             transcript_text: Some("recovered".into()),
@@ -15920,6 +15925,15 @@ async fn test_junie_post_preflight_capacity_requeues_without_failing_stage() {
 
 #[tokio::test]
 async fn test_invoke_agent_active_prompt_close_auto_requeues_with_fresh_attempt() {
+    assert_ordinary_active_prompt_recovery(false).await;
+}
+
+#[tokio::test]
+async fn test_active_prompt_close_at_limit_does_not_trust_host_retry_marker() {
+    assert_ordinary_active_prompt_recovery(true).await;
+}
+
+async fn assert_ordinary_active_prompt_recovery(at_limit_with_untrusted_marker: bool) {
     use acp::AcpRuntimeManager;
     use engine::executor::BackgroundExecutor;
 
@@ -15970,11 +15984,51 @@ async fn test_invoke_agent_active_prompt_close_auto_requeues_with_fresh_attempt(
                 "legacy_broad_discovery_policy": "workflow_opt_in",
                 "session_reuse_scope": "same_agent_family_within_run",
                 "session_family_id": "recovery-family",
+                "declared_outputs": [{
+                    "output_name": "prompt_recovery_report",
+                    "target_path": std::path::Path::new(&workspace_root).join("prompt_recovery_report.json"),
+                    "schema": {
+                        "contract_id": "prompt_recovery_report_v1", "format": "json",
+                        "machine_format": "json", "validation_mode": "strict_structured",
+                        "normalized_artifact_name": "prompt_recovery_report", "required_fields": ["summary"]
+                    }
+                }]
             }),
         )
         .await
         .unwrap();
 
+    // The scheduler's indexed legacy timestamp cutoff is one second behind now.
+    sqlx::query("UPDATE work_items SET scheduled_at = ?1, attempt_count = ?2 WHERE run_id = ?3")
+        .bind((Utc::now() - chrono::Duration::seconds(2)).to_rfc3339())
+        .bind(if at_limit_with_untrusted_marker { 2 } else { 0 })
+        .bind(run_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    if at_limit_with_untrusted_marker {
+        sqlx::query("UPDATE work_items SET payload_json = json_set(payload_json, '$.host_interruption_retry', json(?1)) WHERE run_id = ?2")
+            .bind(serde_json::json!({"stage_execution_id": stage_exec_id, "scheduled_at": Utc::now()}).to_string())
+            .bind(run_id.to_string()).execute(&pool).await.unwrap();
+        assert!(executor.process_next_item().await.is_err());
+        let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .find(|item| item.kind == WorkItemKind::InvokeAgent)
+                .unwrap()
+                .status,
+            WorkItemStatus::Failed
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.id.starts_with("advance-after-invoke:"))
+                .count(),
+            1
+        );
+        return;
+    }
     assert!(executor.process_next_item().await.unwrap());
     let items = work_items::list_by_run(&pool, run_id).await.unwrap();
     let invoke = items
@@ -16000,6 +16054,12 @@ async fn test_invoke_agent_active_prompt_close_auto_requeues_with_fresh_attempt(
     assert_eq!(executions_after_first.len(), 1);
     assert_eq!(executions_after_first[0].status, AgentStatus::Failed);
 
+    sqlx::query("UPDATE work_items SET scheduled_at = ?1 WHERE id = ?2")
+        .bind((Utc::now() - chrono::Duration::seconds(2)).to_rfc3339())
+        .bind(&invoke.id)
+        .execute(&pool)
+        .await
+        .unwrap();
     assert!(executor.process_next_item().await.unwrap());
     let executions_after_second = agent_executions::find_by_stage(&pool, stage_exec_id)
         .await
@@ -16017,6 +16077,1024 @@ async fn test_invoke_agent_active_prompt_close_auto_requeues_with_fresh_attempt(
         .find(|item| item.kind == db::work_item::WorkItemKind::InvokeAgent)
         .expect("InvokeAgent work item should exist after recovery");
     assert_eq!(invoke.status, db::work_item::WorkItemStatus::Completed);
+}
+
+#[derive(Default)]
+struct HostInterruptedPromptAdapter {
+    complete_old_prompt: bool,
+    started: tokio::sync::Notify,
+    return_closed: tokio::sync::Notify,
+    retry_started: tokio::sync::Notify,
+    finish_retry: tokio::sync::Notify,
+    requests: std::sync::Mutex<Vec<acp::ExecutionRequest>>,
+}
+
+#[async_trait::async_trait]
+impl acp::adapters::AcpAdapter for HostInterruptedPromptAdapter {
+    fn provider_name(&self) -> &str {
+        "claude"
+    }
+
+    async fn execute(&self, req: acp::ExecutionRequest) -> anyhow::Result<acp::ExecutionResult> {
+        let attempt = {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(req.clone());
+            requests.len()
+        };
+        if attempt == 1 {
+            self.started.notify_one();
+            self.return_closed.notified().await;
+            if !self.complete_old_prompt {
+                anyhow::bail!("ACP session closed during active prompt");
+            }
+        } else {
+            self.retry_started.notify_one();
+            self.finish_retry.notified().await;
+        }
+        let mut result = ActivePromptCloseOnceAdapter {
+            attempts: AtomicUsize::new(1),
+        }
+        .execute(req)
+        .await?;
+        if self.complete_old_prompt {
+            result.discovered_artifacts[0].content = br#"{"implementation_complete":true,"verification_green":true,"remaining_code_tasks":[],"handoff_tasks":[],"known_risks":[],"tests_run":["fixture"],"docs_impacted":[]}"#.to_vec();
+        }
+        Ok(result)
+    }
+}
+
+#[derive(Default)]
+struct HostInterruptedPromptCleanup {
+    closed_generations: std::sync::Mutex<Vec<String>>,
+    fail: bool,
+    close_before_settlement: bool,
+    close_requested: tokio::sync::Notify,
+    finish_cleanup: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl engine::host_interruption::HostInterruptionRuntimeCleanup for HostInterruptedPromptCleanup {
+    async fn close_session_generation(&self, generation_id: &str) -> anyhow::Result<()> {
+        self.closed_generations
+            .lock()
+            .unwrap()
+            .push(generation_id.to_owned());
+        if self.close_before_settlement {
+            self.close_requested.notify_one();
+            self.finish_cleanup.notified().await;
+        }
+        if self.fail {
+            anyhow::bail!("fixture session cleanup failed");
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn host_interruption_pending_retry_survives_old_active_prompt_close() {
+    assert_host_interruption_prompt_race(HostRetryProgress::Pending, 0, false).await;
+}
+
+#[tokio::test]
+async fn host_interruption_running_retry_survives_old_active_prompt_close() {
+    assert_host_interruption_prompt_race(HostRetryProgress::Running, 0, false).await;
+}
+
+#[tokio::test]
+async fn host_interruption_retry_survives_old_active_prompt_close_at_retry_limit() {
+    assert_host_interruption_prompt_race(HostRetryProgress::Pending, 2, false).await;
+}
+
+#[tokio::test]
+async fn host_interruption_completed_retry_survives_old_active_prompt_close() {
+    assert_host_interruption_prompt_race(HostRetryProgress::Completed, 0, false).await;
+}
+
+#[tokio::test]
+async fn host_interruption_retry_survives_old_worker_error_finalizer() {
+    assert_host_interruption_prompt_race(HostRetryProgress::Running, 0, true).await;
+}
+
+#[tokio::test]
+async fn host_interruption_cleanup_hold_survives_old_active_prompt_close() {
+    assert_host_interruption_prompt_race(HostRetryProgress::CleanupFailed, 0, false).await;
+}
+
+#[tokio::test]
+async fn host_interruption_cleanup_hold_survives_old_active_prompt_close_at_limit() {
+    assert_host_interruption_prompt_race(HostRetryProgress::CleanupFailed, 2, false).await;
+}
+
+#[tokio::test]
+async fn host_interruption_cleanup_hold_survives_old_worker_error_finalizer() {
+    assert_host_interruption_prompt_race(HostRetryProgress::CleanupFailed, 0, true).await;
+}
+
+#[tokio::test]
+async fn host_interruption_close_before_settlement_preserves_retry() {
+    assert_host_interruption_prompt_order(HostRetryProgress::Pending, 0, false, true).await;
+}
+
+#[tokio::test]
+async fn host_interruption_close_before_settlement_preserves_retry_at_limit() {
+    assert_host_interruption_prompt_order(HostRetryProgress::Pending, 2, false, true).await;
+}
+
+#[tokio::test]
+async fn host_interruption_close_before_settlement_preserves_cleanup_hold() {
+    assert_host_interruption_prompt_order(HostRetryProgress::CleanupFailed, 0, false, true).await;
+}
+
+#[tokio::test]
+async fn host_interruption_close_before_settlement_preserves_cleanup_hold_at_limit() {
+    assert_host_interruption_prompt_order(HostRetryProgress::CleanupFailed, 2, false, true).await;
+}
+
+#[tokio::test]
+async fn host_interruption_close_before_settlement_survives_diagnostic_failure() {
+    assert_host_interruption_prompt_order(HostRetryProgress::Pending, 2, true, true).await;
+}
+
+#[tokio::test]
+async fn host_interruption_interrupted_cleanup_recovers_via_startup_repair() {
+    assert_host_interruption_prompt_order(HostRetryProgress::InterruptedCleanup, 0, false, true)
+        .await;
+}
+
+#[tokio::test]
+async fn host_interruption_interrupted_cleanup_recovers_via_startup_replay() {
+    assert_host_interruption_prompt_order(
+        HostRetryProgress::InterruptedCleanupReplay,
+        0,
+        false,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn host_interruption_completed_result_before_settlement_preserves_retry() {
+    assert_host_interruption_prompt_result(HostRetryProgress::Pending, 0, false, true, true).await;
+}
+
+#[tokio::test]
+async fn host_interruption_completed_result_before_settlement_preserves_cleanup_hold() {
+    assert_host_interruption_prompt_result(HostRetryProgress::CleanupFailed, 0, false, true, true)
+        .await;
+}
+
+#[tokio::test]
+async fn p082_non_host_cancel_at_provider_result_gate_preserves_late_output_quarantine() {
+    assert_host_interruption_prompt_result(
+        HostRetryProgress::NonHostCancelledAtResultGate,
+        0,
+        false,
+        false,
+        true,
+    )
+    .await;
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum HostRetryProgress {
+    Pending,
+    Running,
+    Completed,
+    CleanupFailed,
+    InterruptedCleanup,
+    InterruptedCleanupReplay,
+    NonHostCancelledAtResultGate,
+}
+
+async fn assert_host_interruption_prompt_race(
+    progress: HostRetryProgress,
+    initial_attempt_count: i64,
+    fail_diagnostic_read: bool,
+) {
+    assert_host_interruption_prompt_order(
+        progress,
+        initial_attempt_count,
+        fail_diagnostic_read,
+        false,
+    )
+    .await;
+}
+
+async fn assert_host_interruption_prompt_order(
+    progress: HostRetryProgress,
+    initial_attempt_count: i64,
+    fail_diagnostic_read: bool,
+    close_before_settlement: bool,
+) {
+    assert_host_interruption_prompt_result(
+        progress,
+        initial_attempt_count,
+        fail_diagnostic_read,
+        close_before_settlement,
+        false,
+    )
+    .await;
+}
+
+async fn assert_host_interruption_prompt_result(
+    progress: HostRetryProgress,
+    initial_attempt_count: i64,
+    fail_diagnostic_read: bool,
+    close_before_settlement: bool,
+    complete_old_prompt: bool,
+) {
+    use engine::host_interruption::{
+        HostInterruptionEvent, HostInterruptionKind, HostInterruptionService,
+    };
+
+    let workspace = tempfile::tempdir().unwrap();
+    let pool = if progress == HostRetryProgress::NonHostCancelledAtResultGate {
+        file_backed_test_pool(&workspace.path().join("result-gate.sqlite")).await
+    } else {
+        test_pool().await
+    };
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = workspace.path().display().to_string();
+    run.artifact_root = run.workspace_root.clone();
+    runs::insert(&pool, &run).await.unwrap();
+    let mut stage = make_stage(stage_execution_id, run_id, StageStatus::Running);
+    stage.stage_id = "host_interruption_prompt_race".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let adapter = Arc::new(HostInterruptedPromptAdapter {
+        complete_old_prompt,
+        ..Default::default()
+    });
+    let acp = Arc::new(acp::AcpRuntimeManager::new_with_adapters(vec![
+        adapter.clone()
+    ]));
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = Arc::new(
+        if progress == HostRetryProgress::NonHostCancelledAtResultGate {
+            engine::executor::BackgroundExecutor::new_with_steward_runtime_inputs_and_db_writer(
+                pool.clone(),
+                work_queue.clone(),
+                orchestrator,
+                acp,
+                events,
+                Arc::new(steward_test_runtime_inputs()),
+                db::writer::shared_writer_for(&pool).await,
+            )
+        } else {
+            engine::executor::BackgroundExecutor::new(
+                pool.clone(),
+                work_queue.clone(),
+                orchestrator,
+                acp,
+                events,
+            )
+        },
+    );
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: format!("p058-targeted-retry:{stage_execution_id}:host-race"),
+            kind: WorkItemKind::InvokeAgent,
+            run_id: Some(run_id),
+            stage_id: Some(stage.stage_id.clone()),
+            status: WorkItemStatus::Pending,
+            created_at: Utc::now(),
+            scheduled_at: Utc::now() - chrono::Duration::seconds(2),
+            attempt_count: initial_attempt_count,
+            last_error: None,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": stage.stage_id,
+                "stage_execution_id": stage_execution_id.to_string(),
+                "agent_id": "host-interrupted-agent",
+                "provider": "claude",
+                "prompt": "continue after wake",
+                "legacy_broad_discovery_policy": "workflow_opt_in",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "host-interrupted-agent",
+                "declared_outputs": [{
+                    "output_name": "prompt_recovery_report",
+                    "target_path": workspace.path().join("prompt_recovery_report.json"),
+                    "schema": {
+                        "contract_id": if complete_old_prompt { "implementation_self_assessment_v2" } else { "prompt_recovery_report_v1" },
+                        "format": "json",
+                        "machine_format": "json",
+                        "validation_mode": "strict_structured",
+                        "normalized_artifact_name": "prompt_recovery_report",
+                        "required_fields": if complete_old_prompt {
+                            vec!["implementation_complete", "verification_green", "remaining_code_tasks", "handoff_tasks", "known_risks", "tests_run", "docs_impacted"]
+                        } else { vec!["summary"] }
+                    }
+                }],
+            })
+            .to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let old_executor = executor.clone();
+    let mut processing = tokio::spawn(async move { old_executor.process_next_item().await });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::select! {
+            _ = adapter.started.notified() => {},
+            outcome = &mut processing => panic!("worker ended before fixture prompt: {outcome:?}"),
+        }
+    })
+    .await
+    .expect("fixture prompt must start before host interruption");
+    let execution = agent_executions::find_by_stage(&pool, stage_execution_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let old_generation = execution.session_generation_id.as_ref().unwrap();
+    let running = work_items::list_by_run(&pool, run_id).await.unwrap();
+    let claimed: serde_json::Value = serde_json::from_str(&running[0].payload_json).unwrap();
+    let claim_key =
+        serde_json::from_value(claimed["p058_claimed"]["artifact_claim_key"].clone()).unwrap();
+    if progress == HostRetryProgress::NonHostCancelledAtResultGate {
+        let writer = db::writer::shared_writer_for(&pool).await.unwrap();
+        let mut cancellation_tx = writer
+            .begin_immediate_transaction(
+                db::writer::class_a_operation(
+                    "fixture.cancel_at_result_gate",
+                    db::write_class::WriteLane::CriticalBarrier,
+                    "fixture.cancel_at_result_gate",
+                ),
+                "fixture cancellation barrier",
+            )
+            .await
+            .unwrap();
+        adapter.return_closed.notify_one();
+        // WAL permits the old Running read while this transaction holds the writer.
+        // The queued result gate proves cancellation commits after that read.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while writer
+                .heartbeat
+                .lane_pending_count
+                .iter()
+                .map(|count| count.load(Ordering::SeqCst))
+                .sum::<i64>()
+                <= 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider-result ownership gate must wait behind cancellation");
+        agent_executions::update_completed_tx(
+            &mut cancellation_tx,
+            execution.id,
+            AgentStatus::Cancelled,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        artifact_contracts::close_source_generation_claim_tx(&mut cancellation_tx, &claim_key)
+            .await
+            .unwrap();
+        cancellation_tx.commit().await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), processing)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        );
+        let facts = agent_execution_runtime_facts::find_by_execution_id(&pool, execution.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            facts.as_ref().map(|facts| facts.output_settlement.clone()),
+            Some(AgentOutputSettlement::IgnoredLateOutputs),
+            "non-host cancellation must still reach P082 claim-CAS quarantine"
+        );
+        assert_eq!(
+            work_items::find_by_id(&pool, &running[0].id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            WorkItemStatus::Failed
+        );
+        assert_eq!(
+            agent_executions::find_by_id(&pool, execution.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            AgentStatus::Cancelled
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM active_artifact_contracts WHERE run_id = ?1"
+            )
+            .bind(run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        return;
+    }
+    let mut processing = Some(processing);
+    let mut old_outcome = None;
+    let cleanup = Arc::new(HostInterruptedPromptCleanup {
+        fail: progress == HostRetryProgress::CleanupFailed,
+        close_before_settlement,
+        ..Default::default()
+    });
+    let service = HostInterruptionService::with_capacity_config_and_runtime_cleanup(
+        pool.clone(),
+        work_queue,
+        domain::provider::InvokeAgentCapacityConfig::default(),
+        cleanup.clone(),
+    );
+    let event = HostInterruptionEvent {
+        kind: HostInterruptionKind::SystemSleep,
+        started_at: execution.started_at,
+        ended_at: Some(Utc::now()),
+        monotonic_gap_ms: None,
+        wall_clock_gap_ms: Some(70_120),
+        details_json: Some(r#"{"source":"deterministic_prompt_close_fixture"}"#.into()),
+    };
+    let summary = if close_before_settlement {
+        let mut recovering = tokio::spawn(async move { service.record_and_requeue(event).await });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                _ = cleanup.close_requested.notified() => {},
+                outcome = &mut recovering => panic!("host recovery ended before close request: {outcome:?}"),
+            }
+        }).await.unwrap();
+        if fail_diagnostic_read {
+            sqlx::query(
+                "ALTER TABLE host_interruption_affected_executions RENAME TO fixture_host_evidence",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        adapter.return_closed.notify_one();
+        old_outcome = Some(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                processing.take().unwrap(),
+            )
+            .await
+            .expect("old finalizer must finish while host cleanup is paused")
+            .unwrap(),
+        );
+        if fail_diagnostic_read {
+            sqlx::query(
+                "ALTER TABLE fixture_host_evidence RENAME TO host_interruption_affected_executions",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let before_settlement = work_items::find_by_id(&pool, &running[0].id)
+            .await
+            .unwrap()
+            .unwrap();
+        let before_execution = agent_executions::find_by_id(&pool, execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let epochs = scheduler::list_host_interruption_epochs_by_run(&pool, &run_id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(epochs.len(), 1);
+        assert_eq!(
+            epochs[0].affected_executions[0].settlement_status,
+            "cleanup_pending"
+        );
+        assert!(epochs[0].affected_executions[0].retry_enqueued_at.is_none());
+        if complete_old_prompt {
+            let active_generations: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM active_artifact_contracts a JOIN artifact_contract_generations g ON g.generation_id = a.generation_id WHERE g.source_agent_execution_id = ?1",
+            )
+            .bind(execution.id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let source_claim = artifact_contracts::load_source_generation_claim(&pool, &claim_key)
+                .await
+                .unwrap()
+                .unwrap();
+            let current_stage = stages::find_by_id(&pool, stage_execution_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let work_items = work_items::list_by_run(&pool, run_id).await.unwrap();
+            assert_eq!(
+                (
+                    active_generations,
+                    source_claim.claim_state,
+                    before_execution.status.clone(),
+                    current_stage.status,
+                    work_items.len()
+                ),
+                (
+                    0,
+                    ArtifactSourceClaimState::Active,
+                    AgentStatus::Running,
+                    StageStatus::Running,
+                    1
+                ),
+                "host pre-close fence must reject the entire late successful settlement"
+            );
+            assert!(source_claim.closed_at.is_none());
+            assert!(before_execution.completed_at.is_none());
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM artifacts WHERE run_id = ?1")
+                    .bind(run_id.to_string())
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                0,
+                "old provider output must not be imported while cleanup is pending"
+            );
+        }
+        if matches!(
+            progress,
+            HostRetryProgress::InterruptedCleanup | HostRetryProgress::InterruptedCleanupReplay
+        ) {
+            recovering.abort();
+            assert!(recovering.await.unwrap_err().is_cancelled());
+            assert!(old_outcome.take().unwrap().unwrap());
+            if progress == HostRetryProgress::InterruptedCleanupReplay {
+                let journal_id = uuid::Uuid::new_v4().to_string();
+                let repair_id = format!("p082-requeue:{journal_id}:{}:1", running[0].id);
+                sqlx::query("INSERT INTO command_journal (id, command_type, payload_json, result_status, run_id, created_at, completed_at) VALUES (?1, 'retry_stage', '{}', 'completed', ?2, ?3, ?3)")
+                    .bind(&journal_id).bind(run_id.to_string()).bind(Utc::now().to_rfc3339())
+                    .execute(&pool).await.unwrap();
+                db::repos::startup_repairs::record(
+                    &pool,
+                    &repair_id,
+                    &run_id.to_string(),
+                    "p082_requeue_once",
+                    Utc::now(),
+                    Some("{}"),
+                )
+                .await
+                .unwrap();
+                let mut payload: serde_json::Value =
+                    serde_json::from_str(&running[0].payload_json).unwrap();
+                payload["source_command_journal_id"] = serde_json::json!(journal_id);
+                payload["p061_startup_recovery"] = serde_json::json!({
+                    "startup_repair_id": repair_id, "source_work_item_id": running[0].id, "requeue_generation": 1,
+                });
+                sqlx::query("UPDATE work_items SET payload_json = ?1 WHERE id = ?2")
+                    .bind(payload.to_string())
+                    .bind(&running[0].id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            let recovery = engine::recovery::RecoveryService::new(
+                pool.clone(),
+                WorkQueue::new(pool.clone()),
+                event_bus::new_bus(16),
+            );
+            recovery.run_startup_repair().await.unwrap();
+            let recovered = work_items::find_by_id(&pool, &running[0].id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.status, WorkItemStatus::Pending);
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&recovered.payload_json)
+                    .unwrap()
+                    .get("p058_claimed")
+                    .is_none()
+            );
+            assert_eq!(
+                sessions::find_generation_by_id(&pool, old_generation)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                domain::session::SessionGenerationStatus::Invalidated,
+                "startup recovery must not reuse a generation left behind a cleanup fence"
+            );
+            let epochs =
+                scheduler::list_host_interruption_epochs_by_run(&pool, &run_id.to_string())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                epochs[0].affected_executions[0].settlement_status,
+                "retry_recovered_on_startup"
+            );
+            assert_eq!(
+                epochs[0].affected_executions[0].cleanup_status,
+                "unknown_after_restart"
+            );
+            sqlx::query("UPDATE work_items SET scheduled_at = ?1 WHERE id = ?2")
+                .bind((Utc::now() - chrono::Duration::seconds(2)).to_rfc3339())
+                .bind(&recovered.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            adapter.finish_retry.notify_one();
+            assert!(executor.process_next_item().await.unwrap());
+            assert_eq!(
+                work_items::find_by_id(&pool, &recovered.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                WorkItemStatus::Completed
+            );
+            let requests = adapter.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_ne!(
+                requests[0].session_generation_id,
+                requests[1].session_generation_id
+            );
+            assert!(!requests[1].reuse_existing_session);
+            return;
+        }
+        cleanup.finish_cleanup.notify_one();
+        let summary = recovering.await.unwrap().unwrap();
+        assert_eq!(
+            summary.affected_executions, 1,
+            "host ownership must precede its close signal"
+        );
+        assert_eq!(before_settlement.status, WorkItemStatus::Running);
+        assert_eq!(before_settlement.payload_json, running[0].payload_json);
+        assert_eq!(
+            before_execution.status,
+            AgentStatus::Running,
+            "pending cleanup must retain its active capacity slot"
+        );
+        summary
+    } else {
+        service.record_and_requeue(event).await.unwrap()
+    };
+    if progress == HostRetryProgress::CleanupFailed {
+        assert_eq!(summary.runtime_cleanup_failed, 1);
+        assert_eq!(summary.retries_deferred_cleanup_failed, 1);
+        assert_eq!(summary.retries_enqueued, 0);
+        let held = work_items::find_by_id(&pool, &running[0].id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.status, WorkItemStatus::Running);
+        if fail_diagnostic_read {
+            sqlx::query(
+                "ALTER TABLE host_interruption_affected_executions RENAME TO fixture_host_evidence",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let outcome = if let Some(outcome) = old_outcome.take() {
+            outcome
+        } else {
+            adapter.return_closed.notify_one();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                processing.take().unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        };
+        if fail_diagnostic_read {
+            sqlx::query(
+                "ALTER TABLE fixture_host_evidence RENAME TO host_interruption_affected_executions",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            assert!(format!("{:#}", outcome.unwrap_err()).contains("no such table"));
+        } else {
+            assert!(outcome.unwrap());
+        }
+        let capacity = domain::provider::InvokeAgentCapacityConfig::default();
+        work_items::complete_attempt_with_capacity(&pool, &held.id, Some(execution.id), &capacity)
+            .await
+            .unwrap();
+        work_items::fail_attempt_with_capacity(
+            &pool,
+            &held.id,
+            "late error",
+            Some(execution.id),
+            &capacity,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !work_items::requeue_attempt_after_transient_persistence_contention(
+                &pool,
+                &held.id,
+                Utc::now(),
+                "database is locked",
+                Some(execution.id),
+            )
+            .await
+            .unwrap()
+        );
+        let after = work_items::list_by_run(&pool, run_id).await.unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "cleanup hold must not enqueue failure advance"
+        );
+        assert_eq!(
+            after[0].status, held.status,
+            "late completion must preserve cleanup hold"
+        );
+        assert_eq!(after[0].payload_json, held.payload_json);
+        assert_eq!(after[0].scheduled_at, held.scheduled_at);
+        assert_eq!(after[0].attempt_count, held.attempt_count);
+        assert_eq!(after[0].last_error, held.last_error);
+        assert_eq!(
+            agent_executions::find_by_id(&pool, execution.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            AgentStatus::Cancelled
+        );
+        assert_eq!(
+            stages::find_by_id(&pool, stage_execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            StageStatus::Running
+        );
+        assert_eq!(
+            artifact_contracts::load_source_generation_claim(&pool, &claim_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .claim_state,
+            ArtifactSourceClaimState::Active
+        );
+        assert_eq!(
+            sessions::find_generation_by_id(&pool, old_generation)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            domain::session::SessionGenerationStatus::Active
+        );
+        let epochs = scheduler::list_host_interruption_epochs_by_run(&pool, &run_id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(epochs.len(), 1);
+        let evidence = &epochs[0].affected_executions[0];
+        assert_eq!(evidence.cleanup_status, "failed");
+        assert_eq!(evidence.settlement_status, "retry_deferred_cleanup_failed");
+        assert_eq!(evidence.quota_budget_effect, "not_consumed");
+        assert!(evidence.retry_enqueued_at.is_none());
+        assert_eq!(adapter.requests.lock().unwrap().len(), 1);
+        return;
+    }
+    assert_eq!(summary.runtime_cleanup_succeeded, 1);
+    assert_eq!(summary.retries_enqueued, 1);
+    assert_eq!(
+        cleanup.closed_generations.lock().unwrap().as_slice(),
+        [old_generation.clone()]
+    );
+    let pending = work_items::list_by_run(&pool, run_id).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    let pending = &pending[0];
+    assert_eq!(pending.status, WorkItemStatus::Pending);
+    let pending_payload: serde_json::Value = serde_json::from_str(&pending.payload_json).unwrap();
+    assert!(pending_payload.get("p058_claimed").is_none());
+    assert_eq!(
+        pending_payload["host_interruption_retry"]["stage_execution_id"],
+        stage_execution_id.to_string()
+    );
+    assert_eq!(
+        sessions::find_generation_by_id(&pool, old_generation)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        domain::session::SessionGenerationStatus::Invalidated,
+        "host recovery must retire the closed generation before its retry is eligible"
+    );
+
+    let mut retry_processing = if progress != HostRetryProgress::Pending {
+        // Make only the fixture's jittered retry eligible; Notify controls the race.
+        sqlx::query("UPDATE work_items SET scheduled_at = ?1 WHERE id = ?2")
+            .bind((Utc::now() - chrono::Duration::seconds(2)).to_rfc3339())
+            .bind(&pending.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let retry_executor = executor.clone();
+        let mut task = tokio::spawn(async move { retry_executor.process_next_item().await });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                _ = adapter.retry_started.notified() => {},
+                outcome = &mut task => panic!("retry ended before fixture prompt: {outcome:?}"),
+            }
+        })
+        .await
+        .expect("retry prompt must start");
+        Some(task)
+    } else {
+        None
+    };
+    if progress == HostRetryProgress::Completed {
+        adapter.finish_retry.notify_one();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            retry_processing.take().unwrap()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap());
+    }
+    let owned_retry = work_items::find_by_id(&pool, &pending.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let owned_item_count = work_items::list_by_run(&pool, run_id).await.unwrap().len();
+    let owned_stage_status = stages::find_by_id(&pool, stage_execution_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .status;
+    if fail_diagnostic_read {
+        // Force the old worker's generic error finalizer after host ownership
+        // transferred, without a production-only test hook or live DB access.
+        sqlx::query(
+            "ALTER TABLE host_interruption_affected_executions RENAME TO fixture_host_evidence",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // The host transaction has committed before the old prompt can return.
+    let outcome = if let Some(outcome) = old_outcome.take() {
+        outcome
+    } else {
+        adapter.return_closed.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            processing.take().unwrap(),
+        )
+        .await
+        .expect("old invocation must settle")
+        .unwrap()
+    };
+    if fail_diagnostic_read {
+        sqlx::query(
+            "ALTER TABLE fixture_host_evidence RENAME TO host_interruption_affected_executions",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let after = work_items::list_by_run(&pool, run_id).await.unwrap();
+    let retry = after.iter().find(|item| item.id == pending.id).unwrap();
+    assert_eq!(
+        retry.status, owned_retry.status,
+        "stale prompt must not change host retry ownership"
+    );
+    assert_eq!(
+        after.len(),
+        owned_item_count,
+        "stale prompt must not enqueue failure advance work"
+    );
+    assert_eq!(retry.payload_json, owned_retry.payload_json);
+    assert_eq!(retry.scheduled_at, owned_retry.scheduled_at);
+    assert_eq!(retry.attempt_count, owned_retry.attempt_count);
+    assert!(retry.last_error.is_none());
+    if fail_diagnostic_read {
+        assert!(format!("{:#}", outcome.unwrap_err()).contains("no such table"));
+    } else {
+        assert!(outcome.unwrap());
+    }
+    assert_eq!(
+        agent_executions::find_by_id(&pool, execution.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        AgentStatus::Cancelled
+    );
+    assert_eq!(
+        stages::find_by_id(&pool, stage_execution_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        owned_stage_status
+    );
+    let claim = artifact_contracts::load_source_generation_claim(&pool, &claim_key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        claim.superseding_work_item_id.as_deref(),
+        Some(pending.id.as_str())
+    );
+    assert_eq!(
+        claim.claim_state,
+        if progress != HostRetryProgress::Pending {
+            ArtifactSourceClaimState::Superseded
+        } else {
+            ArtifactSourceClaimState::SupersededPendingRetry
+        }
+    );
+    let readback = scheduler::list_host_interruption_epochs_by_run(&pool, &run_id.to_string())
+        .await
+        .unwrap();
+    assert_eq!(readback.len(), 1);
+    assert_eq!(
+        readback[0].affected_executions[0].quota_budget_effect,
+        "not_consumed"
+    );
+    assert_eq!(
+        readback[0].affected_executions[0].retry_enqueued_at,
+        Some(pending.scheduled_at)
+    );
+
+    if let Some(task) = retry_processing {
+        adapter.finish_retry.notify_one();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        );
+    } else if progress == HostRetryProgress::Pending {
+        sqlx::query("UPDATE work_items SET scheduled_at = ?1 WHERE id = ?2")
+            .bind((Utc::now() - chrono::Duration::seconds(2)).to_rfc3339())
+            .bind(&pending.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        adapter.finish_retry.notify_one();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            executor.process_next_item()
+        )
+        .await
+        .unwrap()
+        .unwrap());
+    }
+    let requests = adapter.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_ne!(
+        requests[1].session_generation_id,
+        requests[0].session_generation_id
+    );
+    assert!(!requests[1].reuse_existing_session);
+    assert!(requests[1].provider_session_id.is_none());
+    drop(requests);
+    let final_items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    if complete_old_prompt {
+        let active_sources: Vec<String> = sqlx::query_scalar(
+            "SELECT g.source_agent_execution_id FROM active_artifact_contracts a JOIN artifact_contract_generations g ON g.generation_id = a.generation_id WHERE a.run_id = ?1",
+        )
+        .bind(run_id.to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            active_sources.len(),
+            1,
+            "only the fresh retry output is active"
+        );
+        assert_ne!(active_sources[0], execution.id.to_string());
+    }
+    assert_eq!(
+        final_items
+            .iter()
+            .find(|item| item.id == pending.id)
+            .unwrap()
+            .status,
+        WorkItemStatus::Completed
+    );
+    assert_eq!(
+        final_items
+            .iter()
+            .filter(|item| item.id.starts_with("advance-after-invoke:"))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -19825,6 +20903,15 @@ async fn p082_r17_cancelled_late_output_import_path_quarantines_without_active_m
 
 #[tokio::test]
 async fn p082_successful_import_then_complete_accepts_closed_claim_and_enqueues_advance() {
+    assert_successful_import_respects_host_fence(false).await;
+}
+
+#[tokio::test]
+async fn host_interruption_import_transaction_rejects_completed_result() {
+    assert_successful_import_respects_host_fence(true).await;
+}
+
+async fn assert_successful_import_respects_host_fence(host_fenced: bool) {
     use acp::AcpRuntimeManager;
     use domain::agent::ArtifactSourceClaimState;
     use domain::artifact_contracts::{
@@ -19974,7 +21061,43 @@ async fn p082_successful_import_then_complete_accepts_closed_claim_and_enqueues_
         Arc::new(AcpRuntimeManager::new_with_adapters(vec![])),
         events,
     );
-    executor
+    if host_fenced {
+        scheduler::insert_host_interruption_epoch(
+            &pool,
+            &scheduler::HostInterruptionEpoch {
+                id: "import-fence".into(),
+                kind: "system_sleep".into(),
+                started_at: now,
+                ended_at: Some(now),
+                monotonic_gap_ms: None,
+                wall_clock_gap_ms: None,
+                details_json: None,
+                created_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        scheduler::insert_host_interruption_affected_execution(
+            &pool,
+            &scheduler::HostInterruptionAffectedExecution {
+                epoch_id: "import-fence".into(),
+                agent_execution_id: agent_execution_id.to_string(),
+                run_id: Some(run_id.to_string()),
+                stage_execution_id: stage_execution_id.to_string(),
+                provider_family: Some("codex".into()),
+                action: "requeue".into(),
+                previous_status: "running".into(),
+                settlement_status: "cleanup_pending".into(),
+                cleanup_status: "pending".into(),
+                quota_budget_effect: "not_consumed".into(),
+                retry_enqueued_at: None,
+                created_at: now,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let imported = executor
         .p082_import_declared_contract_outputs_for_regression(
             &[declared],
             &[captured],
@@ -19992,8 +21115,68 @@ async fn p082_successful_import_then_complete_accepts_closed_claim_and_enqueues_
             AgentStatus::Completed,
             now,
         )
-        .await
-        .expect("import successful declared output through executor path");
+        .await;
+    if host_fenced {
+        assert!(
+            imported.is_err(),
+            "the import transaction must reject a host-fenced result"
+        );
+        assert_eq!(
+            artifact_contracts::load_source_generation_claim(&pool, &claim_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .claim_state,
+            ArtifactSourceClaimState::Active
+        );
+        assert_eq!(
+            agent_executions::find_by_id(&pool, agent_execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            AgentStatus::Running
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM artifact_contract_generations WHERE run_id = ?1"
+            )
+            .bind(run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM artifacts WHERE run_id = ?1")
+                .bind(run_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            agent_execution_runtime_facts::find_by_execution_id(&pool, agent_execution_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            work_items::list_by_run(&pool, run_id).await.unwrap().len(),
+            1
+        );
+        return;
+    }
+    imported.expect("import successful declared output through executor path");
+    assert_eq!(
+        agent_executions::find_by_id(&pool, agent_execution_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        AgentStatus::Completed,
+        "accepted output and terminal execution must commit together before host can claim it"
+    );
 
     let facts = agent_execution_runtime_facts::find_by_execution_id(&pool, agent_execution_id)
         .await
@@ -20009,6 +21192,23 @@ async fn p082_successful_import_then_complete_accepts_closed_claim_and_enqueues_
         .expect("load source claim")
         .expect("source claim");
     assert_eq!(claim.claim_state, ArtifactSourceClaimState::Closed);
+
+    let later_host =
+        engine::host_interruption::HostInterruptionService::new(pool.clone(), work_queue.clone())
+            .record_and_requeue(engine::host_interruption::HostInterruptionEvent {
+                kind: engine::host_interruption::HostInterruptionKind::SystemSleep,
+                started_at: now,
+                ended_at: Some(Utc::now()),
+                monotonic_gap_ms: None,
+                wall_clock_gap_ms: None,
+                details_json: None,
+            })
+            .await
+            .unwrap();
+    assert_eq!(
+        later_host.affected_executions, 0,
+        "committed import wins before host capture"
+    );
 
     work_queue
         .complete(work_item_id)

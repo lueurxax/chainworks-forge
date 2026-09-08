@@ -100,15 +100,43 @@ impl WorkQueue {
     }
 
     pub async fn complete(&self, id: &str) -> Result<()> {
-        let result =
-            work_items::complete_with_capacity(&self.pool, id, &self.capacity_config).await?;
+        self.complete_attempt(id, None).await
+    }
+
+    pub async fn complete_attempt(
+        &self,
+        id: &str,
+        expected: Option<domain::ids::AgentExecutionId>,
+    ) -> Result<()> {
+        let result = work_items::complete_attempt_with_capacity(
+            &self.pool,
+            id,
+            expected,
+            &self.capacity_config,
+        )
+        .await?;
         self.publish_scheduler_notification(result);
         Ok(())
     }
 
     pub async fn fail(&self, id: &str, error: &str) -> Result<()> {
-        let result =
-            work_items::fail_with_capacity(&self.pool, id, error, &self.capacity_config).await?;
+        self.fail_attempt(id, error, None).await
+    }
+
+    pub async fn fail_attempt(
+        &self,
+        id: &str,
+        error: &str,
+        expected: Option<domain::ids::AgentExecutionId>,
+    ) -> Result<()> {
+        let result = work_items::fail_attempt_with_capacity(
+            &self.pool,
+            id,
+            error,
+            expected,
+            &self.capacity_config,
+        )
+        .await?;
         self.publish_scheduler_notification(result);
         Ok(())
     }
@@ -130,11 +158,22 @@ impl WorkQueue {
         id: &str,
         error: &str,
     ) -> Result<bool> {
-        let requeued = work_items::requeue_running_after_transient_persistence_contention(
+        self.requeue_attempt_after_transient_persistence_contention(id, error, None)
+            .await
+    }
+
+    pub async fn requeue_attempt_after_transient_persistence_contention(
+        &self,
+        id: &str,
+        error: &str,
+        expected: Option<domain::ids::AgentExecutionId>,
+    ) -> Result<bool> {
+        let requeued = work_items::requeue_attempt_after_transient_persistence_contention(
             &self.pool,
             id,
             Utc::now(),
             error,
+            expected,
         )
         .await?;
         if requeued {
