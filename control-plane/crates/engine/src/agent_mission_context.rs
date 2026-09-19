@@ -911,6 +911,30 @@ fn validate_persisted_payload_authority(
     require_payload_string(object, "agent_id", assignment_agent_id)?;
     let agent = frozen_agent(plan, assignment_agent_id)?;
     let provider_authority = health_fallback_provider_authority(plan, object, &agent)?;
+    let worktree_strategy = match &context.assignment {
+        PersistedAssignment::Task {
+            origin,
+            task,
+            agent_id,
+            ..
+        } if origin == "static" => {
+            let frozen_task = plan
+                .states
+                .get(&context.stage.state_id)
+                .into_iter()
+                .flat_map(|state| state.tasks.iter().chain(&state.post_approval_tasks))
+                .find(|candidate| {
+                    candidate.task_name == *task && candidate.agent.agent_id == *agent_id
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "frozen_snapshot_contract_incompatible: persisted static task is absent from frozen state"
+                    )
+                })?;
+            crate::worktree::effective_worktree_strategy_for_task(frozen_task)
+        }
+        _ => agent.worktree_strategy.clone(),
+    };
 
     if context.runtime.permission_profile != agent.permission_profile
         || context.runtime.worktree_write_enabled != agent.worktree_write_enabled
@@ -965,10 +989,7 @@ fn validate_persisted_payload_authority(
             "worktree_write_enabled",
             serde_json::json!(agent.worktree_write_enabled),
         ),
-        (
-            "worktree_strategy",
-            serde_json::json!(agent.worktree_strategy),
-        ),
+        ("worktree_strategy", serde_json::json!(worktree_strategy)),
         (
             "session_reuse_scope",
             serde_json::json!(agent.session_reuse_scope),

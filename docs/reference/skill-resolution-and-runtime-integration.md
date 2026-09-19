@@ -150,6 +150,17 @@ mutation or retry/work/state writes. P058 lead-tier construction performs a
 second validation after replacing agent authority and before opening its write
 transaction.
 
+For static tasks (including post-approval tasks), copied `worktree_strategy`
+must equal the effective strategy computed from the exact frozen state/task
+binding using the same helper as enqueue and prompt read-root selection.
+An explicit strategy wins. The existing read-only `security_checker`,
+`proposal_implementation_auditor`, and `prepush_code_reviewer` fallback is
+`shared_implementation_worktree`; it is not a payload-selected permission.
+Owner, dynamic-review, and mediation assignments retain their explicit/raw
+agent strategy. Missing or substituted task authority and any different
+strategy fail closed before retry mutation. This comparison does not repair
+already failed advance items or change provider/Xcode preflight behavior.
+
 ## Skill truth model
 
 ### Catalog truth

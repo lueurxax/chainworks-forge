@@ -47,6 +47,7 @@ use crate::synthesizers::closeout_readiness::{
     SynthesizerInputs as CloseoutSynthesizerInputs,
 };
 use crate::work_queue::WorkQueue;
+use crate::worktree::{effective_worktree_strategy_for_task, task_reads_implementation_worktree};
 use db::write_class::WriteLane;
 use db::writer::{class_a_operation, DbWriter};
 use std::path::{Component, Path};
@@ -9577,12 +9578,6 @@ fn finalize_legacy_prompt(agent: &workflow::plan::ResolvedAgent, body: &str) -> 
     parts.join("\n")
 }
 
-fn effective_worktree_strategy_for_task(task: &workflow::plan::CompiledTask) -> Option<String> {
-    task.agent.worktree_strategy.clone().or_else(|| {
-        task_reads_implementation_worktree(task).then_some("shared_implementation_worktree".into())
-    })
-}
-
 /// Resolve one frozen agent binding without consulting the live catalog.
 fn resolved_agent_from_plan<'a>(
     plan: &'a workflow::plan::RunPlan,
@@ -9594,16 +9589,6 @@ fn resolved_agent_from_plan<'a>(
             .chain(state.post_approval_tasks.iter().map(|task| &task.agent))
             .find(|agent| agent.agent_id == agent_id)
     })
-}
-
-fn task_reads_implementation_worktree(task: &workflow::plan::CompiledTask) -> bool {
-    if task.agent.worktree_write_enabled || task.agent.worktree_strategy.is_some() {
-        return false;
-    }
-    matches!(
-        task.agent.agent_id.as_str(),
-        "security_checker" | "proposal_implementation_auditor" | "prepush_code_reviewer"
-    )
 }
 
 /// Build prompt for the owner agent when no explicit tasks are defined.
@@ -10137,6 +10122,7 @@ fn base_branch_from_catalog_snapshot_json(catalog_snapshot_json: &str) -> Option
 
 #[cfg(test)]
 mod tests {
+    mod worktree_strategy;
     use super::*;
     use chrono::{Duration, Utc};
     use db::pool::create_pool;

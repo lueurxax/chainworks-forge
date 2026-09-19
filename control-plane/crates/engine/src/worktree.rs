@@ -12,6 +12,25 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{info, warn};
 
+/// The invocation strategy is derived from frozen task authority, not a copied payload.
+pub(crate) fn effective_worktree_strategy_for_task(
+    task: &workflow::plan::CompiledTask,
+) -> Option<String> {
+    task.agent.worktree_strategy.clone().or_else(|| {
+        task_reads_implementation_worktree(task).then_some("shared_implementation_worktree".into())
+    })
+}
+
+pub(crate) fn task_reads_implementation_worktree(task: &workflow::plan::CompiledTask) -> bool {
+    if task.agent.worktree_write_enabled || task.agent.worktree_strategy.is_some() {
+        return false;
+    }
+    matches!(
+        task.agent.agent_id.as_str(),
+        "security_checker" | "proposal_implementation_auditor" | "prepush_code_reviewer"
+    )
+}
+
 /// Result of a successful worktree provisioning.
 pub struct WorktreeProvisionResult {
     pub worktree_root: String,
