@@ -11805,17 +11805,13 @@ impl BackgroundExecutor {
                     serde_json::from_value(payload["stage_degraded_output_policy"].clone())
                         .unwrap_or_default();
 
-                let effective_working_directory = if worktree_write_enabled
-                    || matches!(
-                        worktree_strategy.as_deref(),
-                        Some("dedicated") | Some("shared_implementation_worktree")
-                    ) {
-                    run.worktree_root
-                        .clone()
-                        .unwrap_or_else(|| run.workspace_root.clone())
-                } else {
-                    run.workspace_root.clone()
-                };
+                let effective_working_directory = domain::execution_root::select_execution_root(
+                    &run.workspace_root,
+                    run.worktree_root.as_deref(),
+                    worktree_write_enabled,
+                    worktree_strategy.as_deref(),
+                )?
+                .to_owned();
                 let workspace_mode = if worktree_write_enabled {
                     "write_enabled".to_string()
                 } else {
@@ -11823,10 +11819,10 @@ impl BackgroundExecutor {
                 };
                 crate::mcp::attach_xcode_broker_execution_context(
                     &mut mcp_resolution.payloads,
-                    &run.workspace_root,
+                    &effective_working_directory,
                     permission_profile.as_deref(),
                 );
-                let xcode_broker_contract_hash =
+                let mut xcode_broker_contract_hash =
                     crate::mcp::xcode_broker_contract_hash(&mcp_resolution.payloads);
                 let resolved_model = model.clone().unwrap_or_else(|| "default".into());
                 let now = chrono::Utc::now();
@@ -11875,6 +11871,65 @@ impl BackgroundExecutor {
                             anyhow::anyhow!("Stage-owned execution requires stage_execution_id")
                         })?
                         .to_string()
+                };
+                let headless_preparation = if self.acp.headless_xcode_enabled()
+                    && (xcode_broker_required
+                        || xcode_shim_required
+                        || requires_xcode_host_execution)
+                {
+                    let selectors = mcp_resolution
+                        .payloads
+                        .iter()
+                        .filter_map(|payload| match &payload.transport {
+                            acp::ResolvedMcpServerTransport::XcodeBrokerIntent { intent } => {
+                                Some(intent.xcode_pid_selector.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    anyhow::ensure!(
+                        selectors.windows(2).all(|pair| pair[0] == pair[1]),
+                        "headless_project_selector_conflict"
+                    );
+                    let journal = Arc::new(crate::xcode_effect_journal::DbXcodeEffectJournal::new(
+                        self.pool.clone(),
+                        self.db_writer.clone(),
+                        run_id.inner(),
+                        owner_execution_lineage_id.clone(),
+                    ));
+                    let prepared = self
+                        .acp
+                        .prepare_headless_xcode(
+                            acp::xcode_headless_runtime::HeadlessPreparationInput {
+                                run_id,
+                                invocation_id: agent_exec_id,
+                                owner_lineage: owner_execution_lineage_id.clone(),
+                                root: acp::execution_root::resolve_execution_root(
+                                    &run.workspace_root,
+                                    run.worktree_root.as_deref(),
+                                    worktree_write_enabled,
+                                    worktree_strategy.as_deref(),
+                                )?,
+                                project_selector: selectors.into_iter().next().flatten(),
+                                permission_policy:
+                                    crate::xcode_effect_journal::frozen_xcode_permission_policy(
+                                        run.catalog_snapshot_json.as_deref(),
+                                        permission_profile.as_deref(),
+                                    )?,
+                                timeout: std::time::Duration::from_secs(24 * 60 * 60),
+                            },
+                            journal,
+                        )
+                        .await?;
+                    xcode_broker_contract_hash = Some(domain::xcode_contract::canonical_digest(
+                        "cw.xcode.session.v1",
+                        &serde_json::json!({
+                            "broker_contract":xcode_broker_contract_hash,"headless_binding":prepared.binding_digest(),
+                        }),
+                    )?);
+                    Some(prepared)
+                } else {
+                    None
                 };
                 let policy_input = SessionPolicyInput {
                     run_id: run_id.to_string(),
@@ -12560,6 +12615,9 @@ impl BackgroundExecutor {
                     p079_repair_canonical_paths: None,
                     input_manifest: None,
                 };
+                if let Some(prepared) = &headless_preparation {
+                    self.acp.commit_headless_xcode(prepared, &req)?;
+                }
                 let p088_code_writer_completion_candidate =
                     agent_id == "code_writer" && !declared_outputs.is_empty();
                 let p088_operator_retry_completion_recovery = p088_code_writer_completion_candidate

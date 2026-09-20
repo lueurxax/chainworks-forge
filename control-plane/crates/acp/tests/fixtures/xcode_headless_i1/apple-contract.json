@@ -1,0 +1,123 @@
+{
+  "sources": {
+    "mcp-2025-06-18.json": "e00d534d7dbbc705ecc2211da80759281d8f42f423c408f67529a535723ab020",
+    "mcp-2024-11-05.json": "8f6c31fbccae1cac96e10f6018724bf57534b4cbae7226fcc9c7e0d5302981a0"
+  },
+  "tools": [
+    {
+      "description": "Opens an Xcode workspace or project at the given path and returns its workspace identifier, which other tools can use to target it.",
+      "inputSchema": {
+        "properties": {
+          "path": {
+            "description": "Absolute path to the .xcworkspace or .xcodeproj to open",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "XcodeOpenWorkspace",
+      "outputSchema": {
+        "properties": {
+          "activeRunDestination": {
+            "description": "The active run destination of the opened workspace, if any",
+            "type": "string"
+          },
+          "activeScheme": {
+            "description": "The active scheme of the opened workspace, if any",
+            "type": "string"
+          },
+          "message": {
+            "description": "A warning or informational message about the workspace state",
+            "type": "string"
+          },
+          "workspaceIdentifier": {
+            "description": "The identifier of the opened workspace",
+            "type": "string"
+          },
+          "workspacePath": {
+            "description": "The resolved path of the opened workspace",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspaceIdentifier"
+        ],
+        "type": "object"
+      },
+      "title": "Open Workspace"
+    },
+    {
+      "description": "Reads the contents of a file within the Xcode project organization. Returns content in cat -n format with line numbers. Supports reading up to 600 lines by default with optional offset and limit parameters for large files. Output is JSON-encoded e.g. backslashes, quotes, and newlines appear escaped (\\\\, \\\", \\n). Account for this when interpreting file content.",
+      "inputSchema": {
+        "properties": {
+          "filePath": {
+            "description": "The path to the file within the Xcode project organization (e.g., 'ProjectName/Sources/MyFile.swift')",
+            "type": "string"
+          },
+          "limit": {
+            "description": "The number of lines to read (only provide if the file is too large to read at once)",
+            "type": "integer"
+          },
+          "offset": {
+            "description": "The line number to start reading from (only provide if the file is too large to read at once)",
+            "type": "integer"
+          },
+          "workspaceIdentifier": {
+            "description": "Identifies the target workspace directly (used in headless mode): its workspace identifier (e.g. workspace1) or its absolute path.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "filePath"
+        ],
+        "type": "object"
+      },
+      "name": "XcodeRead",
+      "outputSchema": {
+        "properties": {
+          "content": {
+            "description": "The file contents formatted with line numbers (cat -n style)",
+            "type": "string"
+          },
+          "filePath": {
+            "description": "The project path that was read",
+            "type": "string"
+          },
+          "fileSize": {
+            "description": "Size of the file in bytes",
+            "type": "integer"
+          },
+          "linesRead": {
+            "description": "Number of lines actually read",
+            "type": "integer"
+          },
+          "message": {
+            "description": "Optional message about the operation",
+            "type": "string"
+          },
+          "startLine": {
+            "description": "The line number where reading started",
+            "type": "integer"
+          },
+          "totalLines": {
+            "description": "Total number of lines in the file",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "content",
+          "filePath",
+          "totalLines",
+          "linesRead",
+          "startLine",
+          "fileSize"
+        ],
+        "type": "object"
+      },
+      "title": "Read"
+    }
+  ]
+}

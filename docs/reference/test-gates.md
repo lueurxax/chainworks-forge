@@ -1403,6 +1403,26 @@ Important:
 - it verifies the wired release adapters and receipt/readback lifecycle without live external side effects
 - it verifies startup/watchdog recovery, lease renewal markers, side-effect evidence spooling, public conflict disposition, and rollout/operator readback parity
 
+### Headless Xcode Offline Gates
+
+These gates exercise the headless replacement without launching Apple tools,
+granting permissions, opening projects, or running local UI tests:
+
+- `xcode-headless-shim`: canonical-script dispatch, authenticated socket binding,
+  bounded output, process-group cancellation and settlement fixtures.
+- `xcode-headless-catalog`: explicit frozen read/gate capabilities, canonical
+  command detection, and preservation of unrelated catalog behavior.
+- `xcode-headless-project-trust`: durable private project admission, revocation,
+  identity replacement and filesystem/lock validation.
+- `xcode-headless-host-startup`: opt-in one-shot startup policy and readiness
+  fixtures; this is not live cold-start evidence.
+
+All use managed, locked, offline Cargo and disable automatic cache cleanup for
+the run. `CHAINWORKS_XCODE_CARGO_TARGET_DIR` can select an existing shared gate
+cache. Canonical `build`, `fast`, `full` and remote UI gates retain their existing
+semantics; none of these offline gates substitutes for packaged-host acceptance.
+The implemented route is described in [headless runtime](xcode-headless-runtime.md).
+
 ### `p051-scaffold`
 
 Historical bridge-pool scaffold gate alias for the shared Xcode MCP bridge pool substrate.

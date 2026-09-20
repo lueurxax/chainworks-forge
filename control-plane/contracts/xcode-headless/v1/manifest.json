@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "trust_policy_id": "trusted_local_project_v1",
+  "trust_policy": "policy.json",
+  "trust_policy_digest_domain": "cw.xcode.trust-policy.v1",
+  "trust_policy_digest": "d172d6beb3acfa3e063f28588a856dda4079ba7f841de3e3e47fb81182eaa907",
+  "canonicalization": "RFC8785; serde_json_canonicalizer=0.3.2; safe integers only",
+  "manifest_digest_domain": "cw.xcode.manifest.v1",
+  "manifest_digest_payload": [
+    "manifest",
+    "schemas",
+    "upstream_capture",
+    "trust_policy"
+  ],
+  "schema_digest_domain": "cw.xcode.schema.v1",
+  "schema_digest_payload": [
+    "entry",
+    "request",
+    "result",
+    "error",
+    "upstream_result",
+    "upstream_capture"
+  ],
+  "upstream_contract_id": "xcode-tools/25317/mcp-2025-06-18/open-read-i1",
+  "upstream_capture": "upstream-capture.json",
+  "upstream_capture_role": "historical_schema_pin_not_admission",
+  "initialize_schema": "schemas.json#/$defs/initialize",
+  "maximum_upstream_tools": 256,
+  "upstream_tool_policy": "unique names; exact captured open/read definitions; all other tools unadmitted",
+  "wire_policy": {
+    "maximum_json_bytes": 1048576,
+    "maximum_depth": 128,
+    "duplicate_keys": "reject_at_every_depth",
+    "invalid_unicode": "reject",
+    "numeric_policy": "reject integer magnitudes above 9007199254740991 before JCS",
+    "structured_content": "required",
+    "text_content": "optional single JSON text item equal to structuredContent",
+    "unknown_envelope_fields": "reject",
+    "upstream_errors": "static typed error; never forward raw content",
+    "schema_extensions": {
+      "x-maxUtf8Bytes": "UTF-8 byte bound, additionally enforced to JSON Schema maxLength",
+      "x-runtime-constraints": "mandatory contextual constraints enforced by domain::xcode_contract"
+    }
+  },
+  "entries": [
+    {
+      "name": "workspace_open",
+      "version": 1,
+      "visibility": "internal",
+      "upstream_name": "XcodeOpenWorkspace",
+      "effect": "mutate",
+      "request_schema": "schemas.json#/$defs/openArguments",
+      "result_schema": "schemas.json#/$defs/openResult",
+      "error_schema": "schemas.json#/$defs/errorResult",
+      "upstream_result_schema": "schemas.json#/$defs/openEnvelope",
+      "upstream_contract_id": "xcode-tools/25317/mcp-2025-06-18/open-read-i1",
+      "workspace_arguments": [],
+      "path_arguments": [
+        "path"
+      ],
+      "handle_inputs": [],
+      "handle_outputs": [
+        "workspaceIdentifier"
+      ],
+      "completion_rule": "validated mapping is evidence only; controller must verify project and host and durably record outcome before binding; uncertain effects remain unknown; never replay",
+      "trust_policy_id": "trusted_local_project_v1",
+      "trust_policy_digest": "d172d6beb3acfa3e063f28588a856dda4079ba7f841de3e3e47fb81182eaa907",
+      "required_permissions": [
+        "filesystem_read",
+        "filesystem_write"
+      ],
+      "repository_gate_policy": "internal workspace preparation only; durable dispatch fence required; no build or test admission"
+    },
+    {
+      "name": "XcodeRead",
+      "version": 1,
+      "visibility": "provider",
+      "upstream_name": "XcodeRead",
+      "effect": "read",
+      "request_schema": "schemas.json#/$defs/readArguments",
+      "result_schema": "schemas.json#/$defs/readResult",
+      "error_schema": "schemas.json#/$defs/errorResult",
+      "upstream_result_schema": "schemas.json#/$defs/readEnvelope",
+      "upstream_contract_id": "xcode-tools/25317/mcp-2025-06-18/open-read-i1",
+      "workspace_arguments": [
+        "workspaceIdentifier"
+      ],
+      "path_arguments": [
+        "filePath"
+      ],
+      "handle_inputs": [],
+      "handle_outputs": [],
+      "completion_rule": "validated synchronous bounded read result; optional Apple message is validated and dropped",
+      "trust_policy_id": "trusted_local_project_v1",
+      "trust_policy_digest": "d172d6beb3acfa3e063f28588a856dda4079ba7f841de3e3e47fb81182eaa907",
+      "required_permissions": [
+        "filesystem_read"
+      ],
+      "repository_gate_policy": "read only; organization paths may refer outside checkout under trusted project policy; controller must authorize binding and permissions"
+    }
+  ]
+}

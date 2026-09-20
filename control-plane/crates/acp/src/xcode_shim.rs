@@ -12,10 +12,24 @@ use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::process::Command;
+use uuid::Uuid;
+
+/// Implemented by the server runtime that owns project admission and the journal fence.
+#[async_trait::async_trait]
+pub trait XcodeShimDispatchAuthority: Send + Sync {
+    async fn dispatch(
+        &self,
+        invocation_id: AgentExecutionId,
+        operation_key: Uuid,
+        request: XcodeShimDispatchRequest,
+        config: &XcodeHostExecutorProcessConfig,
+        observation_sink: &dyn crate::XcodeRuntimeObservationSink,
+    ) -> anyhow::Result<XcodeShimDispatchOutcome>;
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,6 +80,21 @@ pub trait XcodeShimProcessInspector: Send + Sync {
 #[async_trait::async_trait]
 pub trait XcodeShimGrantResolver: Send + Sync {
     async fn resolve_grant(&self, token_id: &str) -> anyhow::Result<XcodeShimResolvedDispatch>;
+
+    fn requires_headless_authority(&self) -> bool {
+        false
+    }
+
+    /// Legacy fixture route. The production registry must override this method.
+    async fn dispatch_authorized(
+        &self,
+        _operation_key: Option<Uuid>,
+        request: XcodeShimDispatchRequest,
+        config: &XcodeHostExecutorProcessConfig,
+        observation_sink: &dyn crate::XcodeRuntimeObservationSink,
+    ) -> anyhow::Result<XcodeShimDispatchOutcome> {
+        Ok(dispatch_xcode_shim_request(request, config, observation_sink).await)
+    }
 }
 
 #[cfg(unix)]
@@ -108,6 +137,7 @@ pub struct XcodeShimGrantRecord {
 }
 
 pub trait XcodeShimGrantStore: Send + Sync {
+    fn bind_xcode_shim_invocation(&self, _token_id: &str, _invocation_id: AgentExecutionId) {}
     fn insert_xcode_shim_grant(&self, record: XcodeShimGrantRecord);
     fn set_xcode_shim_grant_active_prompt(&self, token_id: &str, active_prompt: bool) -> bool;
     fn remove_xcode_shim_grant(&self, token_id: &str) -> Option<XcodeShimGrantRecord>;
@@ -163,6 +193,8 @@ impl XcodeShimDispatchOutcome {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct XcodeShimSocketDispatchRequest {
+    #[serde(default)]
+    pub operation_key: Option<Uuid>,
     #[serde(default)]
     pub agent_execution_id: Option<AgentExecutionId>,
     pub token_id: String,
@@ -254,6 +286,8 @@ pub struct XcodeHostExecutorProcessOutput {
     pub event: XcodeHostExecutorEvent,
     pub stdout: String,
     pub stderr: String,
+    #[serde(default)]
+    pub process_group_settled: bool,
 }
 
 impl XcodeHostExecutorProcessOutput {
@@ -591,6 +625,7 @@ impl XcodeHostExecutorPlan {
         let exit_status = output.status.code().unwrap_or(-1) as i64;
 
         Ok(XcodeHostExecutorProcessOutput {
+            process_group_settled: false,
             event: XcodeHostExecutorEvent {
                 ts: started_at,
                 tool: self.tool.clone(),
@@ -607,6 +642,559 @@ impl XcodeHostExecutorPlan {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
     }
+}
+
+/// Server-pinned script identity, not a client-supplied authority document.
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct XcodeCanonicalGateIdentity {
+    pub root: PathBuf,
+    pub root_device: u64,
+    pub root_inode: u64,
+    pub script_path: PathBuf,
+    pub script_device: u64,
+    pub script_inode: u64,
+    pub script_sha256: String,
+    pub gate: String,
+    pub args: Vec<String>,
+}
+
+// This is the closed positional schema of scripts/test-gate.sh, not shell parsing.
+fn canonical_gate_name(args: &[String]) -> anyhow::Result<&str> {
+    anyhow::ensure!(args.len() <= 1, "xcode_gate_invalid_arguments");
+    let gate = args.first().map(String::as_str).unwrap_or("list");
+    let canonical = match gate {
+        "-h" | "--help" => "list",
+        "list"
+        | "guardrails"
+        | "build"
+        | "fast"
+        | "full"
+        | "ui-smoke"
+        | "agent-context-skills"
+        | "codex-planned-variant-slice"
+        | "xcode-headless-shim"
+        | "xcode-headless-catalog"
+        | "xcode-headless-project-trust"
+        | "xcode-headless-host-startup"
+        | "p051-scaffold"
+        | "p079-swift-readback"
+        | "p086-continuation-preflight"
+        | "p086-continuation-readback"
+        | "p086-continuation-negative-fixtures"
+        | "p086-continuation-operator-report" => gate,
+        other => {
+            let suffix = other
+                .strip_prefix("proposal-")
+                .or_else(|| other.strip_prefix('p'))
+                .ok_or_else(|| anyhow::anyhow!("xcode_gate_unknown_gate"))?;
+            anyhow::ensure!(
+                matches!(
+                    suffix,
+                    "006"
+                        | "012"
+                        | "013"
+                        | "014"
+                        | "015"
+                        | "017"
+                        | "018"
+                        | "019"
+                        | "022"
+                        | "024"
+                        | "025"
+                        | "026"
+                        | "027"
+                        | "027r"
+                        | "029"
+                        | "029-mcp"
+                        | "031"
+                        | "031-readiness"
+                        | "032"
+                        | "033"
+                        | "036"
+                        | "037"
+                        | "041"
+                        | "042"
+                        | "042-swift"
+                        | "042-packaging"
+                        | "043"
+                        | "044"
+                        | "045"
+                        | "046"
+                        | "047"
+                        | "048"
+                        | "050"
+                        | "051"
+                        | "053"
+                        | "054"
+                        | "054-v1-retirement"
+                        | "057"
+                        | "058"
+                        | "060"
+                        | "060-baseline"
+                        | "060-storage"
+                        | "060-router-fixtures"
+                        | "060-snapshot-inventory"
+                        | "060-fixed-quartet"
+                        | "060-ticket-map"
+                        | "060-calibration"
+                        | "061"
+                        | "064"
+                        | "065"
+                        | "066"
+                        | "072"
+                        | "075"
+                        | "076"
+                        | "077"
+                        | "077-ui"
+                        | "078"
+                        | "079"
+                        | "080"
+                        | "081"
+                        | "082"
+                        | "083"
+                        | "084"
+                        | "085"
+                        | "086"
+                        | "087"
+                        | "088"
+                        | "089"
+                        | "089-temp-inventory"
+                        | "090"
+                        | "091"
+                        | "092"
+                        | "093"
+                        | "094"
+                        | "096"
+                ),
+                "xcode_gate_unknown_gate"
+            );
+            gate
+        }
+    };
+    Ok(canonical)
+}
+
+#[cfg(unix)]
+pub fn pin_headless_canonical_gate(
+    root: &Path,
+    args: &[String],
+) -> anyhow::Result<XcodeCanonicalGateIdentity> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let gate = canonical_gate_name(args)?.to_owned();
+    let root = root.canonicalize().context("xcode_gate_root_missing")?;
+    let root_metadata = std::fs::metadata(&root)?;
+    anyhow::ensure!(root_metadata.is_dir(), "xcode_gate_root_not_directory");
+    let script_path = root.join("scripts/test-gate.sh");
+    anyhow::ensure!(
+        script_path.canonicalize()? == script_path,
+        "xcode_gate_script_redirected"
+    );
+    let file = std::fs::File::open(&script_path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(metadata.is_file(), "xcode_gate_script_not_file");
+    let mut source = Vec::new();
+    file.take(4 * 1024 * 1024 + 1).read_to_end(&mut source)?;
+    anyhow::ensure!(
+        source.len() <= 4 * 1024 * 1024,
+        "xcode_gate_script_too_large"
+    );
+    Ok(XcodeCanonicalGateIdentity {
+        root,
+        root_device: root_metadata.dev(),
+        root_inode: root_metadata.ino(),
+        script_path,
+        script_device: metadata.dev(),
+        script_inode: metadata.ino(),
+        script_sha256: format!("{:x}", Sha256::digest(&source)),
+        gate,
+        args: args.to_vec(),
+    })
+}
+
+#[cfg(unix)]
+struct GateProcessGroup(Option<u32>);
+
+#[cfg(unix)]
+impl GateProcessGroup {
+    fn stop(&mut self) {
+        if let Some(pid) = self.0.take() {
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GateProcessGroup {
+    fn drop(&mut self) {
+        // The child owns its process group. Also stop descendants on cancellation/drop.
+        self.stop();
+    }
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct GateOutput {
+    retained: Vec<u8>,
+    truncated: bool,
+}
+
+#[cfg(unix)]
+impl GateOutput {
+    async fn drain(
+        &mut self,
+        mut reader: impl tokio::io::AsyncRead + Unpin,
+    ) -> std::io::Result<()> {
+        let mut buffer = [0u8; 8192];
+        loop {
+            let count = reader.read(&mut buffer).await?;
+            if count == 0 {
+                return Ok(());
+            }
+            let keep = count.min((64usize * 1024).saturating_sub(self.retained.len()));
+            self.retained.extend_from_slice(&buffer[..keep]);
+            self.truncated |= keep < count;
+        }
+    }
+
+    fn text(mut self) -> String {
+        let mut text = String::from_utf8_lossy(&self.retained).into_owned();
+        if text.len() > 64 * 1024 {
+            let mut end = 64 * 1024;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            self.truncated = true;
+        }
+        if self.truncated {
+            text.push_str("\n[xcode gate output truncated]\n");
+        }
+        text
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn gate_group_has_children(leader: u32) -> std::io::Result<bool> {
+    unsafe extern "C" {
+        fn proc_listpids(
+            kind: u32,
+            info: u32,
+            buffer: *mut libc::c_void,
+            size: libc::c_int,
+        ) -> libc::c_int;
+    }
+    let mut pids = [0i32; 4096];
+    let capacity = std::mem::size_of_val(&pids) as libc::c_int;
+    let bytes = unsafe { proc_listpids(2, leader, pids.as_mut_ptr().cast(), capacity) };
+    if bytes <= 0 || bytes >= capacity || bytes as usize % std::mem::size_of::<i32>() != 0 {
+        return Err(std::io::Error::other("xcode_gate_group_inspection_failed"));
+    }
+    Ok(pids[..bytes as usize / std::mem::size_of::<i32>()]
+        .iter()
+        .any(|pid| *pid > 0 && *pid != leader as i32))
+}
+
+#[cfg(target_os = "linux")]
+fn gate_group_has_children(leader: u32) -> std::io::Result<bool> {
+    for (index, entry) in std::fs::read_dir("/proc")?.enumerate() {
+        if index > 65536 {
+            return Err(std::io::Error::other("xcode_gate_group_inspection_limit"));
+        }
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == leader {
+            continue;
+        }
+        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let fields = stat
+            .rsplit_once(')')
+            .ok_or_else(|| std::io::Error::other("xcode_gate_group_stat"))?
+            .1;
+        if fields
+            .split_whitespace()
+            .nth(2)
+            .and_then(|value| value.parse::<u32>().ok())
+            == Some(leader)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn gate_group_has_children(_leader: u32) -> std::io::Result<bool> {
+    Err(std::io::Error::other(
+        "xcode_gate_group_inspection_unsupported",
+    ))
+}
+
+#[cfg(unix)]
+async fn wait_gate_group_terminal(leader: u32) -> std::io::Result<()> {
+    loop {
+        let exited = {
+            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    leader as libc::id_t,
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            unsafe { info.assume_init() }.si_signo != 0
+        };
+        // WNOWAIT pins the zombie leader so its PID/PGID cannot be recycled before cleanup.
+        if exited && !gate_group_has_children(leader)? {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(unix)]
+struct GateCancellation(Option<tokio::sync::oneshot::Sender<()>>);
+
+#[cfg(unix)]
+impl Drop for GateCancellation {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn drive_gate_process(
+    mut command: Command,
+    deadline: Duration,
+    mut cancel: tokio::sync::oneshot::Receiver<()>,
+) -> anyhow::Result<(i64, Option<String>, String, String, bool)> {
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            return Ok((
+                126,
+                Some("xcode_gate_spawn_failed".into()),
+                String::new(),
+                String::new(),
+                false,
+            ))
+        }
+    };
+    let pid = child.id().context("xcode_gate_child_pid_missing")?;
+    let mut group = GateProcessGroup(Some(pid));
+    let stdout = child.stdout.take().context("xcode_gate_stdout_missing")?;
+    let stderr = child.stderr.take().context("xcode_gate_stderr_missing")?;
+    let mut output = GateOutput::default();
+    let mut errors = GateOutput::default();
+    let completed = tokio::select! {
+        result = tokio::time::timeout(deadline, async {
+            tokio::try_join!(output.drain(stdout), errors.drain(stderr), wait_gate_group_terminal(pid))?;
+            Ok::<_, std::io::Error>(())
+        }) => match result {
+            Ok(Ok(())) => None,
+            Ok(Err(_)) => Some("xcode_gate_cleanup_unverified"),
+            Err(_) => Some("xcode_gate_timeout"),
+        },
+        _ = &mut cancel => Some("xcode_gate_cancelled"),
+    };
+    if completed.is_some() {
+        group.stop();
+        let _ = tokio::time::timeout(Duration::from_secs(1), wait_gate_group_terminal(pid)).await;
+    }
+    let status = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+    // Never signal a PGID after reaping its leader, even on a failed wait.
+    group.0 = None;
+    let (code, reason, settled) = match (completed, status) {
+        (Some(reason), _) => (
+            if reason == "xcode_gate_timeout" {
+                124
+            } else {
+                -1
+            },
+            Some(reason.to_owned()),
+            false,
+        ),
+        (None, Ok(Ok(status))) => match status.code() {
+            Some(0) => (0, None, true),
+            Some(code) => (
+                i64::from(code),
+                Some("xcode_gate_nonzero_exit".into()),
+                true,
+            ),
+            None => (-1, Some("xcode_gate_signaled".into()), true),
+        },
+        (None, _) => (-1, Some("xcode_gate_wait_failed".into()), false),
+    };
+    Ok((code, reason, output.text(), errors.text(), settled))
+}
+
+/// Low-level execution only: the parent must already hold the journal fence and permit,
+/// and replace request root/cwd/env with the prepared server binding before calling.
+#[cfg(unix)]
+pub async fn dispatch_headless_canonical_gate(
+    request: XcodeShimDispatchRequest,
+    identity: &XcodeCanonicalGateIdentity,
+    config: &XcodeHostExecutorProcessConfig,
+    observation_sink: &dyn crate::XcodeRuntimeObservationSink,
+) -> anyhow::Result<XcodeShimDispatchOutcome> {
+    let input = &request.plan_input;
+    anyhow::ensure!(
+        input.invoked_tool == "chainworks-test-gate",
+        "xcode_shim_use_canonical_gate"
+    );
+    anyhow::ensure!(input.args == identity.args, "xcode_gate_arguments_changed");
+    anyhow::ensure!(
+        Path::new(&input.workspace_root).canonicalize()? == identity.root
+            && Path::new(&input.cwd).canonicalize()? == identity.root,
+        "xcode_gate_root_changed"
+    );
+    let mut attempt = request.attempt.clone();
+    attempt.now_epoch_ms = Utc::now().timestamp_millis();
+    let authorization = request.grant.authorize(&attempt);
+    anyhow::ensure!(
+        authorization.allowed && attempt.active_prompt,
+        "xcode_gate_authorization_rejected"
+    );
+    anyhow::ensure!(
+        pin_headless_canonical_gate(&identity.root, &input.args)? == *identity,
+        "xcode_gate_script_identity_changed"
+    );
+
+    let mut env = input.provider_env.clone();
+    let shim_dir = env.get("CHAINWORKS_XCODE_SHIM_DIR").cloned();
+    let dropped = env
+        .keys()
+        .filter(|key| {
+            key.starts_with("CHAINWORKS_XCODE_SHIM_")
+                || matches!(
+                    key.as_str(),
+                    "CHAINWORKS_TEST_GATE_ROOT_DIR" | "BASH_ENV" | "ENV"
+                )
+                || key.starts_with("BASH_FUNC_")
+                || key.starts_with("DYLD_")
+                || key.starts_with("LD_")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in &dropped {
+        env.remove(key);
+    }
+    if let Some(path) = env.get("PATH").cloned() {
+        let paths = std::env::split_paths(&path)
+            .filter(|path| {
+                path.is_absolute()
+                    && shim_dir.as_ref().is_none_or(|shim| path != Path::new(shim))
+                    && !path.join("chainworks-test-gate").exists()
+            })
+            .collect::<Vec<_>>();
+        env.insert(
+            "PATH".into(),
+            std::env::join_paths(paths)?.to_string_lossy().into_owned(),
+        );
+    } else {
+        env.insert("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into());
+    }
+    let plan = XcodeHostExecutorPlan {
+        tool: identity.script_path.to_string_lossy().into_owned(),
+        argv: input.args.clone(),
+        cwd: identity.root.to_string_lossy().into_owned(),
+        env_allowlist_applied: env.keys().cloned().collect(),
+        env,
+        env_dropped_from_provider: dropped,
+        selected_simulator_id: None,
+    };
+    let policy = XcodeShimCommandPolicy {
+        invoked_tool: input.invoked_tool.clone(),
+        args: input.args.clone(),
+        decision: XcodeShimRouteDecision::HostExecutor,
+        reason_code: None,
+    };
+    let started_at = Utc::now();
+    let timer = Instant::now();
+    // Fixed interpreter + exact script file + argv: no shell command text or tool-path overrides.
+    let mut command = Command::new("/bin/bash");
+    command
+        .arg(&identity.script_path)
+        .args(&identity.args)
+        .current_dir(&identity.root)
+        .env_clear()
+        .envs(&plan.env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .process_group(0);
+    let (cancel, receiver) = tokio::sync::oneshot::channel();
+    let mut cancellation = GateCancellation(Some(cancel));
+    // Cancellation notifies, never aborts, the owning driver. It joins drains and reaps.
+    let driver = tokio::spawn(drive_gate_process(
+        command,
+        config.timeout.min(Duration::from_secs(86400)),
+        receiver,
+    ));
+    let (exit_status, reason_code, stdout, stderr, process_group_settled) = driver.await??;
+    cancellation.0 = None;
+    let process_output = XcodeHostExecutorProcessOutput {
+        process_group_settled,
+        event: XcodeHostExecutorEvent {
+            ts: started_at,
+            tool: plan.tool.clone(),
+            argv: plan.argv.clone(),
+            cwd: plan.cwd.clone(),
+            host_env_disposition: "server_owned_shim_cleared".into(),
+            env_allowlist_applied: plan.env_allowlist_applied.clone(),
+            env_dropped_from_provider: plan.env_dropped_from_provider.clone(),
+            selected_simulator_id: None,
+            exit_status,
+            duration_ms: timer.elapsed().as_millis().min(i64::MAX as u128) as i64,
+        },
+        stdout,
+        stderr,
+    };
+    record_shim_invocation(
+        request.agent_execution_id,
+        &request.grant,
+        &attempt,
+        input,
+        &policy,
+        reason_code.as_deref().unwrap_or("canonical_gate"),
+        exit_status,
+        observation_sink,
+    )
+    .await;
+    record_host_executor_event(
+        request.agent_execution_id,
+        process_output.event.clone(),
+        observation_sink,
+    )
+    .await;
+    Ok(XcodeShimDispatchOutcome {
+        authorization,
+        policy,
+        plan: Some(plan),
+        process_output: Some(process_output),
+        exit_status,
+        reason_code,
+    })
 }
 
 pub async fn dispatch_xcode_shim_request(
@@ -830,6 +1418,7 @@ async fn execute_xcrun_passthrough_process(
     let exit_status = output.status.code().unwrap_or(-1) as i64;
 
     Ok(XcodeHostExecutorProcessOutput {
+        process_group_settled: false,
         event: XcodeHostExecutorEvent {
             ts: started_at,
             tool: "xcrun".to_string(),
@@ -871,6 +1460,34 @@ pub async fn dispatch_xcode_shim_socket_request(
 }
 
 #[cfg(unix)]
+async fn read_xcode_shim_socket_request<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> anyhow::Result<XcodeShimSocketDispatchRequest> {
+    const LIMIT: usize = 1024 * 1024;
+    let mut line = Vec::new();
+    let mut bounded = reader.take((LIMIT + 1) as u64);
+    let count = tokio::time::timeout(Duration::from_secs(5), bounded.read_until(b'\n', &mut line))
+        .await
+        .context("xcode_shim_socket_read_timeout")??;
+    anyhow::ensure!(count != 0, "xcode_shim_socket_empty_request");
+    anyhow::ensure!(count <= LIMIT, "xcode_shim_socket_request_too_large");
+    anyhow::ensure!(
+        line.last() == Some(&b'\n'),
+        "xcode_shim_socket_incomplete_request"
+    );
+    let value = domain::xcode_contract::parse_unique_json(&line)?;
+    if let Some(key) = value.get("operation_key").filter(|key| !key.is_null()) {
+        let key = key.as_str().context("xcode_shim_invalid_operation_key")?;
+        let parsed = Uuid::parse_str(key).context("xcode_shim_invalid_operation_key")?;
+        anyhow::ensure!(
+            !parsed.is_nil() && parsed.to_string() == key,
+            "xcode_shim_invalid_operation_key"
+        );
+    }
+    Ok(serde_json::from_value(value)?)
+}
+
+#[cfg(unix)]
 pub async fn handle_xcode_shim_unix_stream(
     stream: UnixStream,
     grant: XcodeShimDispatchGrant,
@@ -880,13 +1497,7 @@ pub async fn handle_xcode_shim_unix_stream(
 ) -> anyhow::Result<XcodeShimDispatchOutcome> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let bytes = reader.read_line(&mut line).await?;
-    if bytes == 0 {
-        anyhow::bail!("xcode_shim_socket_empty_request");
-    }
-
-    let request: XcodeShimSocketDispatchRequest = serde_json::from_str(&line)?;
+    let request = read_xcode_shim_socket_request(&mut reader).await?;
     let outcome =
         dispatch_xcode_shim_socket_request(request, grant, peer_process, config, observation_sink)
             .await;
@@ -921,25 +1532,43 @@ pub async fn handle_xcode_shim_unix_stream_with_grant_resolver(
 ) -> anyhow::Result<XcodeShimDispatchOutcome> {
     let credentials = xcode_shim_peer_credentials(&stream)?;
     let peer_process = process_inspector.inspect_peer(credentials)?;
+    if grant_resolver.requires_headless_authority() {
+        anyhow::ensure!(
+            peer_process.pid == credentials.pid && peer_process.uid == credentials.uid,
+            "xcode_shim_peer_inspection_mismatch"
+        );
+    }
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let bytes = reader.read_line(&mut line).await?;
-    if bytes == 0 {
-        anyhow::bail!("xcode_shim_socket_empty_request");
-    }
-
-    let mut request: XcodeShimSocketDispatchRequest = serde_json::from_str(&line)?;
+    let mut request = read_xcode_shim_socket_request(&mut reader).await?;
     let resolved = grant_resolver.resolve_grant(&request.token_id).await?;
     request.active_prompt = resolved.active_prompt;
-    let outcome = dispatch_xcode_shim_socket_request(
-        request,
-        resolved.grant,
-        peer_process,
-        config,
-        observation_sink,
-    )
-    .await;
+    if grant_resolver.requires_headless_authority() {
+        request.agent_execution_id = None;
+        request.now_epoch_ms = Utc::now().timestamp_millis();
+    }
+    let operation_key = request.operation_key;
+    let dispatch_request = XcodeShimDispatchRequest {
+        agent_execution_id: request.agent_execution_id,
+        grant: resolved.grant,
+        attempt: XcodeShimDispatchAttempt {
+            token_id: request.token_id,
+            token_secret: request.token_secret,
+            peer_process,
+            now_epoch_ms: request.now_epoch_ms,
+            active_prompt: resolved.active_prompt,
+        },
+        plan_input: request.plan_input,
+    };
+    // Authentication precedes the server hook, including its journal/admission side effects.
+    let authorization = dispatch_request.grant.authorize(&dispatch_request.attempt);
+    let outcome = if !authorization.allowed {
+        dispatch_xcode_shim_request(dispatch_request, config, observation_sink).await
+    } else {
+        grant_resolver
+            .dispatch_authorized(operation_key, dispatch_request, config, observation_sink)
+            .await?
+    };
     let response_outcome = outcome.redacted_for_socket_response();
     writer
         .write_all(&serde_json::to_vec(&response_outcome)?)
@@ -2093,6 +2722,7 @@ mod tests {
         input.args = args(&["-c", "printf socket-stdout; exit 4"]);
         let request = XcodeShimSocketDispatchRequest {
             agent_execution_id: Some(AgentExecutionId::new()),
+            operation_key: None,
             token_id: "token-a".to_string(),
             token_secret: "secret-a".to_string(),
             now_epoch_ms: 1_500,
@@ -2186,6 +2816,7 @@ mod tests {
         input.args = args(&["-c", "printf credential-stdout; exit 5"]);
         let request = XcodeShimSocketDispatchRequest {
             agent_execution_id: Some(AgentExecutionId::new()),
+            operation_key: None,
             token_id: "token-live".to_string(),
             token_secret: "secret-live".to_string(),
             now_epoch_ms: 1_500,
@@ -2301,6 +2932,7 @@ mod tests {
         input.args = args(&["-c", "printf resolver-stdout; exit 6"]);
         let request = XcodeShimSocketDispatchRequest {
             agent_execution_id: Some(AgentExecutionId::new()),
+            operation_key: None,
             token_id: "token-live".to_string(),
             token_secret: "secret-live".to_string(),
             now_epoch_ms: 1_500,
@@ -2398,6 +3030,7 @@ mod tests {
     async fn socket_dispatch_with_grant_resolver_rejects_unknown_token() {
         let request = XcodeShimSocketDispatchRequest {
             agent_execution_id: Some(AgentExecutionId::new()),
+            operation_key: None,
             token_id: "missing-token".to_string(),
             token_secret: "secret-live".to_string(),
             now_epoch_ms: 1_500,
@@ -2475,6 +3108,7 @@ mod tests {
             .insert("SCHEME".to_string(), "token=raw-env-token".to_string());
         let request = XcodeShimSocketDispatchRequest {
             agent_execution_id: Some(AgentExecutionId::new()),
+            operation_key: None,
             token_id: "token-a".to_string(),
             token_secret: "secret-a".to_string(),
             now_epoch_ms: 1_500,
@@ -2547,6 +3181,7 @@ mod tests {
         peer_process.pid = 43;
         let request = XcodeShimSocketDispatchRequest {
             agent_execution_id: Some(AgentExecutionId::new()),
+            operation_key: None,
             token_id: "token-a".to_string(),
             token_secret: "secret-a".to_string(),
             now_epoch_ms: 1_500,

@@ -22,6 +22,7 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::manager::{BrokeredXcodeLeaseAttachment, XcodeBrokerLeaseAttacher};
+use crate::xcode_headless_runtime::HeadlessRuntime;
 use crate::xcode_target::{
     probe_local_xcode_host, target_resolver_failure_class, HostProbeContext,
     LocalXcodeHostProbeConfig, XcodeTargetResolver, XcodeTargetSelectionConfidence,
@@ -92,6 +93,14 @@ struct LeaseRecord {
     first_connect_deadline: Instant,
     mcp_policy: BrokerMcpPolicy,
     target_snapshot: Option<XcodeTargetSnapshot>,
+    headless_binding: Option<HeadlessLeaseBinding>,
+}
+
+#[derive(Clone, Debug)]
+struct HeadlessLeaseBinding {
+    digest: String,
+    session_generation_id: Option<String>,
+    runtime_id: String,
 }
 
 #[derive(Default)]
@@ -112,6 +121,27 @@ pub struct XcodeMcpBridgePool {
     observation_sink: Arc<dyn XcodeRuntimeObservationSink>,
     backend: Option<Arc<dyn XcodeMcpBackend>>,
     observation_persistence_failures: AtomicU64,
+    headless_runtime: Option<Arc<HeadlessRuntime>>,
+}
+
+struct HeadlessMcpBackend(Arc<HeadlessRuntime>);
+
+#[async_trait]
+impl XcodeMcpBackend for HeadlessMcpBackend {
+    async fn forward_json_rpc(
+        &self,
+        context: XcodeMcpBackendRequestContext,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let invocation = context
+            .agent_execution_id
+            .ok_or_else(|| anyhow::anyhow!("headless_invocation_required"))?;
+        self.0.forward(invocation, request).await
+    }
+
+    fn manages_request_timeout(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -599,6 +629,23 @@ impl Drop for QueueLeasePermit<'_> {
 }
 
 impl XcodeMcpBridgePool {
+    /// Production admission uses committed headless authority, never the IDE resolver.
+    pub fn new_with_headless_runtime(
+        mut config: XcodeMcpBridgePoolConfig,
+        observation_sink: Arc<dyn XcodeRuntimeObservationSink>,
+        runtime: Arc<HeadlessRuntime>,
+    ) -> Self {
+        config.use_local_host_probe = false;
+        config.target_probe_context = None;
+        let mut pool = Self::new_with_sink_and_backend(
+            config,
+            observation_sink,
+            Arc::new(HeadlessMcpBackend(runtime.clone())),
+        );
+        pool.headless_runtime = Some(runtime);
+        pool
+    }
+
     pub fn new(config: XcodeMcpBridgePoolConfig) -> Self {
         Self::new_with_sink(config, Arc::new(NoopXcodeRuntimeObservationSink))
     }
@@ -649,6 +696,7 @@ impl XcodeMcpBridgePool {
             observation_sink,
             backend,
             observation_persistence_failures: AtomicU64::new(0),
+            headless_runtime: None,
         }
     }
 
@@ -772,18 +820,15 @@ impl XcodeMcpBridgePool {
         lease_id: &str,
         authorization_header: Option<&str>,
     ) -> Result<XcodeBrokerHttpRouteState> {
-        if self.broker_disabled() {
-            bail!("xcode_mcp_broker_disabled: brokered Xcode MCP route is disabled");
-        }
         let Some(actual_hash) = authorization_hash_from_header(authorization_header) else {
-            bail!("xcode_mcp_unauthorized: missing or invalid Xcode MCP lease bearer token");
+            bail!("xcode_mcp_unauthorized: unauthorized");
         };
 
         let (agent_execution_id, observation, route_state) = {
             let mut state = self.state.lock().await;
             let sibling_leases = state.leases.len().saturating_sub(1) as i64;
             let Some(lease) = state.leases.get_mut(lease_id) else {
-                bail!("xcode_mcp_first_connect_timeout: lease '{lease_id}' is not available");
+                bail!("xcode_mcp_unauthorized: unauthorized");
             };
             // SEC-P079-LOW-001: constant-time hash comparison to avoid timing side channels.
             let hash_match: bool = lease
@@ -792,10 +837,13 @@ impl XcodeMcpBridgePool {
                 .ct_eq(actual_hash.as_bytes())
                 .into();
             if !hash_match {
-                bail!("xcode_mcp_unauthorized: bearer token does not match lease '{lease_id}'");
+                bail!("xcode_mcp_unauthorized: unauthorized");
             }
             if lease.state == XcodeMcpLeaseState::Closing {
-                bail!("xcode_mcp_first_connect_timeout: lease '{lease_id}' is closing");
+                bail!("xcode_mcp_unauthorized: unauthorized");
+            }
+            if self.broker_disabled() {
+                bail!("xcode_mcp_broker_disabled: brokered Xcode MCP route is disabled");
             }
             if lease.state == XcodeMcpLeaseState::Active {
                 lease.last_activity_at = Instant::now();
@@ -914,7 +962,8 @@ impl XcodeMcpBridgePool {
             .get("method")
             .and_then(|method| method.as_str())
             .map(str::to_string);
-        let response = if method.as_deref() == Some("initialize") {
+        let response = if method.as_deref() == Some("initialize") && self.headless_runtime.is_none()
+        {
             self.forward_initialize_json_rpc_request(backend, context, request)
                 .await?
         } else {
@@ -1149,6 +1198,35 @@ impl XcodeMcpBridgePool {
     }
 
     pub async fn warm_up_brokered_xcode_leases(&self, lease_ids: &[String]) -> Result<()> {
+        if let Some(runtime) = &self.headless_runtime {
+            for lease_id in lease_ids {
+                let (invocation, digest) = {
+                    let state = self.state.lock().await;
+                    let lease = state
+                        .leases
+                        .get(lease_id)
+                        .ok_or_else(|| anyhow::anyhow!("headless_lease_unavailable"))?;
+                    let binding = lease
+                        .headless_binding
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("headless_binding_required"))?;
+                    (
+                        lease
+                            .agent_execution_id
+                            .ok_or_else(|| anyhow::anyhow!("headless_invocation_required"))?,
+                        binding.digest.clone(),
+                    )
+                };
+                anyhow::ensure!(
+                    runtime.binding_digest_for(invocation)? == digest,
+                    "headless_binding_mismatch"
+                );
+                runtime.revalidate(invocation).await?;
+                self.refresh_reserved_first_connect_deadline(lease_id)
+                    .await?;
+            }
+            return Ok(());
+        }
         for lease_id in lease_ids {
             self.forward_json_rpc_request(
                 lease_id,
@@ -1319,6 +1397,9 @@ impl XcodeMcpBridgePool {
     }
 
     pub async fn cleanup_pid_drift(&self) -> Result<Vec<String>> {
+        if self.headless_runtime.is_some() {
+            return Ok(Vec::new());
+        }
         let host = {
             let state = self.state.lock().await;
             state.target_probe_context.clone()
@@ -1807,7 +1888,23 @@ impl XcodeBrokerLeaseAttacher for XcodeMcpBridgePool {
             );
         }
 
-        let target_snapshots = match self.resolve_target_snapshots(req, &requested).await {
+        let binding_digest = match &self.headless_runtime {
+            Some(runtime) => {
+                runtime.validate_committed(req)?;
+                Some(
+                    runtime.binding_digest_for(
+                        req.agent_execution_id
+                            .ok_or_else(|| anyhow::anyhow!("headless_invocation_required"))?,
+                    )?,
+                )
+            }
+            None => None,
+        };
+        let target_snapshots = match if self.headless_runtime.is_some() {
+            Ok(vec![None; requested_count])
+        } else {
+            self.resolve_target_snapshots(req, &requested).await
+        } {
             Ok(target_snapshots) => target_snapshots,
             Err(err) => {
                 let failure_class = target_resolver_failure_class(&err);
@@ -1831,6 +1928,10 @@ impl XcodeBrokerLeaseAttacher for XcodeMcpBridgePool {
         loop {
             let capacity_available = self.queue_notify.notified();
             let mut state = self.state.lock().await;
+            // A queue wait must not turn an expired or dropped ticket into a lease.
+            if let Some(runtime) = &self.headless_runtime {
+                runtime.validate_committed(req)?;
+            }
             let active = state.leases.len();
             if active + requested_count > self.config.max_active_leases {
                 drop(state);
@@ -1935,6 +2036,13 @@ impl XcodeBrokerLeaseAttacher for XcodeMcpBridgePool {
                             &self.config.tool_allowlists_by_hash,
                         ),
                         target_snapshot: target_snapshot.clone(),
+                        headless_binding: binding_digest.as_ref().map(|digest| {
+                            HeadlessLeaseBinding {
+                                digest: digest.clone(),
+                                session_generation_id: req.session_generation_id.clone(),
+                                runtime_id: intent.runtime_id.clone(),
+                            }
+                        }),
                     },
                 );
                 let sibling_leases = state.leases.len().saturating_sub(1) as i64;
@@ -2037,6 +2145,84 @@ impl XcodeBrokerLeaseAttacher for XcodeMcpBridgePool {
 
     async fn warm_up_brokered_xcode_leases(&self, lease_ids: &[String]) -> Result<()> {
         XcodeMcpBridgePool::warm_up_brokered_xcode_leases(self, lease_ids).await
+    }
+
+    async fn rebind_brokered_xcode_leases(
+        &self,
+        lease_ids: &[String],
+        req: &ExecutionRequest,
+    ) -> Result<()> {
+        if lease_ids.is_empty() {
+            return Ok(());
+        }
+        // Legacy constructors are retained for fixtures; only the native runtime
+        // constructor admits production headless leases.
+        let Some(runtime) = &self.headless_runtime else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            !self.broker_disabled(),
+            "xcode_mcp_broker_disabled: broker is disabled"
+        );
+        runtime.validate_committed(req)?;
+        let invocation = req
+            .agent_execution_id
+            .ok_or_else(|| anyhow::anyhow!("headless_invocation_required"))?;
+        runtime.revalidate(invocation).await?;
+        let digest = runtime.binding_digest_for(invocation)?;
+        let generation = req
+            .session_generation_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("headless_generation_required"))?;
+        let requested = req.brokered_xcode_intents();
+        let mut policies: HashMap<_, _> = requested
+            .iter()
+            .map(|intent| {
+                (
+                    intent.runtime_id.as_str(),
+                    BrokerMcpPolicy::from_intent(intent, &self.config.tool_allowlists_by_hash),
+                )
+            })
+            .collect();
+        anyhow::ensure!(
+            policies.len() == requested.len()
+                && policies.len() == lease_ids.len()
+                && lease_ids.iter().collect::<BTreeSet<_>>().len() == lease_ids.len(),
+            "headless_lease_scope_mismatch"
+        );
+        let mut state = self.state.lock().await;
+        runtime.validate_committed(req)?;
+        // Consume each runtime scope once and validate the entire set before
+        // changing any owner. The existing endpoint and bearer hash stay intact.
+        for lease_id in lease_ids {
+            let lease = state
+                .leases
+                .get(lease_id)
+                .ok_or_else(|| anyhow::anyhow!("headless_lease_unavailable"))?;
+            let binding = lease
+                .headless_binding
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("headless_binding_required"))?;
+            anyhow::ensure!(
+                lease.state != XcodeMcpLeaseState::Closing
+                    && lease.run_id == req.run_id
+                    && binding.digest == digest
+                    && binding.session_generation_id.as_deref() == Some(generation)
+                    && policies.remove(binding.runtime_id.as_str()).as_ref()
+                        == Some(&lease.mcp_policy),
+                "headless_lease_binding_mismatch"
+            );
+        }
+        for lease_id in lease_ids {
+            let lease = state
+                .leases
+                .get_mut(lease_id)
+                .expect("validated lease under the same lock");
+            lease.agent_execution_id = Some(invocation);
+            lease.last_activity_at = Instant::now();
+        }
+        Ok(())
     }
 }
 
@@ -2326,9 +2512,557 @@ fn hash_secret(secret: &str) -> String {
 }
 
 #[cfg(test)]
+pub(crate) mod headless_fixture {
+    use super::*;
+    use crate::{
+        execution_root::resolve_execution_root,
+        xcode_coordinator::{
+            CoordinatorError, CoordinatorLimits, FixtureJournalAuthority, ProjectHoldCheck,
+            WorkspaceAccessCoordinator,
+        },
+        xcode_headless::{HeadlessPeer, HeadlessPeerFactory, HeadlessWorkspaceController},
+        xcode_headless_host::{
+            HeadlessHostInspector, HostSnapshot, ServiceGeneration, TrustedProject,
+        },
+        xcode_headless_runtime::{
+            HeadlessPreparationInput, HeadlessProjectTrust, HeadlessRuntime,
+            PreparedXcodeInvocation,
+        },
+        XcodeDispatchDecision, XcodeEffectJournal, XcodeJournalError, XcodeJournalResult,
+    };
+    use domain::xcode_effect::{
+        AttemptRevision, AttemptState, Completion, HistoricalResult, NormalizedIntent, ProjectKey,
+        StoredAttempt,
+    };
+    use serde_json::{json, Value};
+
+    #[derive(Default)]
+    pub(crate) struct Journal(Mutex<HashMap<Uuid, StoredAttempt>>);
+
+    #[async_trait]
+    impl XcodeEffectJournal for Journal {
+        async fn prepare(&self, intent: &NormalizedIntent) -> XcodeJournalResult<StoredAttempt> {
+            intent.validate().map_err(XcodeJournalError::InvalidInput)?;
+            let mut rows = self.0.lock().await;
+            let row = StoredAttempt {
+                sequence: rows.len() as i64 + 1,
+                attempt_id: Uuid::new_v4(),
+                nonce: Uuid::new_v4(),
+                intent: intent.clone(),
+                state: AttemptState::Prepared,
+                revision: 1,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                dispatched_at: None,
+                completed_at: None,
+                outcome: None,
+                result_digest: None,
+                uncertainty_reason: None,
+                settlement_proof: None,
+                reconciliation: None,
+                reconciliation_evidence_ref: None,
+            };
+            rows.insert(row.attempt_id, row.clone());
+            Ok(row)
+        }
+        async fn dispatch(
+            &self,
+            nonce: Uuid,
+            digest: &str,
+            revision: i64,
+        ) -> XcodeJournalResult<XcodeDispatchDecision> {
+            let mut rows = self.0.lock().await;
+            let row = rows
+                .values_mut()
+                .find(|row| row.nonce == nonce)
+                .ok_or(XcodeJournalError::NotFound)?;
+            if row.revision != revision
+                || row.intent.request_digest != digest
+                || row.state != AttemptState::Prepared
+            {
+                return Err(XcodeJournalError::RevisionConflict);
+            }
+            row.state = AttemptState::Dispatched;
+            row.revision += 1;
+            row.dispatched_at = Some(Utc::now());
+            Ok(XcodeDispatchDecision::Dispatch(row.clone()))
+        }
+        async fn complete(
+            &self,
+            attempt: AttemptRevision,
+            completion: &Completion,
+        ) -> XcodeJournalResult<StoredAttempt> {
+            let mut rows = self.0.lock().await;
+            let row = rows
+                .get_mut(&attempt.attempt_id)
+                .ok_or(XcodeJournalError::NotFound)?;
+            if row.revision != attempt.revision || row.state != AttemptState::Dispatched {
+                return Err(XcodeJournalError::RevisionConflict);
+            }
+            match completion {
+                Completion::Succeeded { outcome, proof }
+                | Completion::Failed { outcome, proof } => {
+                    row.state = if matches!(completion, Completion::Succeeded { .. }) {
+                        AttemptState::Succeeded
+                    } else {
+                        AttemptState::Failed
+                    };
+                    row.outcome = Some(outcome.clone());
+                    row.result_digest = Some(outcome.result_digest.clone());
+                    row.settlement_proof = Some(proof.clone());
+                }
+                Completion::Unknown { reason } => {
+                    row.state = AttemptState::Unknown;
+                    row.uncertainty_reason = Some(*reason);
+                }
+            }
+            row.revision += 1;
+            row.completed_at = Some(Utc::now());
+            Ok(row.clone())
+        }
+        async fn cancel(
+            &self,
+            _: AttemptRevision,
+            _: &HistoricalResult,
+        ) -> XcodeJournalResult<StoredAttempt> {
+            Err(XcodeJournalError::InvalidTransition)
+        }
+        async fn get(&self, id: Uuid) -> XcodeJournalResult<Option<StoredAttempt>> {
+            Ok(self.0.lock().await.get(&id).cloned())
+        }
+    }
+
+    struct Holds;
+    #[async_trait]
+    impl ProjectHoldCheck for Holds {
+        async fn is_held(&self, _: &ProjectKey) -> Result<bool, CoordinatorError> {
+            Ok(false)
+        }
+    }
+    struct Trust;
+    #[async_trait]
+    impl HeadlessProjectTrust for Trust {
+        async fn check(&self, _: &TrustedProject) -> Result<String> {
+            Ok("a".repeat(64))
+        }
+    }
+
+    pub(crate) struct Host {
+        pub(crate) snapshot: Mutex<HostSnapshot>,
+        pub(crate) opens: AtomicUsize,
+    }
+    #[async_trait]
+    impl HeadlessHostInspector for Host {
+        async fn inspect(&self) -> Result<HostSnapshot> {
+            Ok(self.snapshot.lock().await.clone())
+        }
+    }
+    struct Peers(Arc<Host>);
+    struct Peer(Arc<Host>);
+    #[async_trait]
+    impl HeadlessPeerFactory for Peers {
+        async fn connect(
+            &self,
+            _: &HostSnapshot,
+            _: tokio::time::Instant,
+        ) -> Result<Box<dyn HeadlessPeer>> {
+            Ok(Box::new(Peer(self.0.clone())))
+        }
+    }
+    #[async_trait]
+    impl HeadlessPeer for Peer {
+        async fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn open(&mut self, path: &str) -> Result<Value> {
+            self.0.opens.fetch_add(1, Ordering::SeqCst);
+            self.0.snapshot.lock().await.open_projects = vec![path.into()];
+            Ok(
+                json!({"isError":false,"structuredContent":{"workspaceIdentifier":"fixture-workspace","workspacePath":path}}),
+            )
+        }
+        async fn read(&mut self, args: Value) -> Result<Value> {
+            Ok(
+                json!({"isError":false,"structuredContent":{"content":"1\tknown","filePath":args["filePath"],"fileSize":5,"totalLines":1,"linesRead":1,"startLine":1}}),
+            )
+        }
+    }
+
+    pub(crate) struct Fixture {
+        pub(crate) runtime: Arc<HeadlessRuntime>,
+        pub(crate) journal: Arc<Journal>,
+        pub(crate) host: Arc<Host>,
+        pub(crate) root: domain::execution_root::ResolvedExecutionRoot,
+        _dir: tempfile::TempDir,
+    }
+    impl Fixture {
+        pub(crate) fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().canonicalize().unwrap();
+            let package = base.join("repo/Fixture.xcodeproj");
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(package.join("project.pbxproj"), "// fixture").unwrap();
+            let database = base.join("journal-identity");
+            std::fs::write(&database, "disposable identity fixture, not a database").unwrap();
+            let authority =
+                FixtureJournalAuthority::open(&base.join("authority"), &database).unwrap();
+            let coordinator = WorkspaceAccessCoordinator::new(
+                CoordinatorLimits {
+                    queue_capacity: 2,
+                    queue_timeout: Duration::from_millis(100),
+                },
+                Arc::new(Holds),
+            )
+            .unwrap();
+            let root =
+                resolve_execution_root(base.join("repo").to_str().unwrap(), None, false, None)
+                    .unwrap();
+            let host = Arc::new(Host {
+                snapshot: Mutex::new(HostSnapshot {
+                    generation: ServiceGeneration {
+                        uid: unsafe { libc::geteuid() },
+                        pid: 42,
+                        start_sec: 10,
+                        start_usec: 1,
+                        boot_id: "fixture-boot".into(),
+                        developer_dir: "/fixture/Developer".into(),
+                        executable: "/fixture/service".into(),
+                        bundle_id: "com.apple.dt.mcp-server".into(),
+                        build: "fixture".into(),
+                        xcode_build: "27A266a".into(),
+                    },
+                    operator_home: "/fixture/home".into(),
+                    account_name: "fixture".into(),
+                    darwin_tmpdir: "/fixture/tmp".into(),
+                    open_projects: vec![],
+                }),
+                opens: AtomicUsize::new(0),
+            });
+            let controller = Arc::new(HeadlessWorkspaceController::new(
+                host.clone(),
+                Arc::new(Peers(host.clone())),
+            ));
+            Self {
+                runtime: HeadlessRuntime::new_fixture(
+                    controller,
+                    coordinator,
+                    Arc::new(Trust),
+                    authority,
+                ),
+                journal: Arc::new(Journal::default()),
+                host,
+                root,
+                _dir: dir,
+            }
+        }
+        pub(crate) fn input(&self, req: &ExecutionRequest) -> HeadlessPreparationInput {
+            HeadlessPreparationInput {
+                run_id: req.run_id,
+                invocation_id: req.agent_execution_id.unwrap(),
+                owner_lineage: req.owner_id.clone().unwrap(),
+                root: self.root.clone(),
+                project_selector: None,
+                permission_policy: json!({"xcode_headless":{"read":true,"gates":[]}}),
+                timeout: Duration::from_secs(10),
+            }
+        }
+        pub(crate) async fn prepare(&self, req: &ExecutionRequest) -> PreparedXcodeInvocation {
+            let prepared = self
+                .runtime
+                .prepare(self.input(req), self.journal.clone())
+                .await
+                .unwrap();
+            self.runtime.commit(&prepared, req).unwrap();
+            prepared
+        }
+        pub(crate) fn request(&self) -> ExecutionRequest {
+            let mut req: ExecutionRequest = serde_json::from_value(json!({
+                "run_id":RunId::new(), "stage_id":"fixture", "attempt_number":1, "agent_id":"fixture", "provider":"fixture",
+                "workspace_root":self.root.effective, "prompt":"fixture", "owner_kind":"stage_execution", "owner_id":"fixture-owner"
+            })).unwrap();
+            req.agent_execution_id = Some(AgentExecutionId::new());
+            req.session_generation_id = Some("fixture-generation".into());
+            req.mcp_servers = vec![AcpMcpServerPayload {
+                id: "fixture".into(),
+                extension_id: "xcode".into(),
+                transport: ResolvedMcpServerTransport::XcodeBrokerIntent {
+                    intent: BrokeredXcodeMcpIntent {
+                        extension_id: "xcode".into(),
+                        runtime_id: "fixture".into(),
+                        server_id: "xcode".into(),
+                        workspace_root: Some(req.workspace_root.clone()),
+                        xcode_pid_selector: None,
+                        runtime_profile_id: None,
+                        permission_profile_id: None,
+                        resolved_tool_allowlist_hash: None,
+                        provider_http_required: true,
+                    },
+                },
+            }];
+            req
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::xcode_target::XcodeProcessCandidate;
+
+    fn auth_fixture_lease() -> LeaseRecord {
+        LeaseRecord {
+            run_id: RunId::new(),
+            agent_execution_id: Some(AgentExecutionId::new()),
+            endpoint: "http://127.0.0.1:0/xcode-mcp/fixture".into(),
+            authorization_hash: hash_secret("fixture-token"),
+            state: XcodeMcpLeaseState::Reserved,
+            last_activity_at: Instant::now(),
+            first_connect_deadline: Instant::now() + Duration::from_secs(60),
+            mcp_policy: BrokerMcpPolicy::allow_all(),
+            target_snapshot: None,
+            headless_binding: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_auth_verifies_lease_before_disclosing_disabled_state() {
+        let pool = XcodeMcpBridgePool::new(XcodeMcpBridgePoolConfig {
+            broker_disabled: true,
+            ..Default::default()
+        });
+        pool.state
+            .lock()
+            .await
+            .leases
+            .insert("fixture".into(), auth_fixture_lease());
+        for (lease, bearer) in [
+            ("fixture", None),
+            ("fixture", Some("Bearer incorrect")),
+            ("unowned", Some("Bearer fixture-token")),
+        ] {
+            let error = pool
+                .authorize_and_mark_lease_active(lease, bearer)
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "xcode_mcp_unauthorized: unauthorized");
+        }
+        let error = pool
+            .authorize_and_mark_lease_active("fixture", Some("Bearer fixture-token"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().starts_with("xcode_mcp_broker_disabled:"));
+        assert_eq!(
+            pool.lease_state("fixture").await,
+            Some(XcodeMcpLeaseState::Reserved)
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_auth_closing_and_unknown_leases_have_identical_denials() {
+        let pool = XcodeMcpBridgePool::new(XcodeMcpBridgePoolConfig::default());
+        let mut lease = auth_fixture_lease();
+        lease.state = XcodeMcpLeaseState::Closing;
+        pool.state
+            .lock()
+            .await
+            .leases
+            .insert("fixture".into(), lease);
+        for lease in ["fixture", "unowned"] {
+            let error = pool
+                .authorize_and_mark_lease_active(lease, Some("Bearer fixture-token"))
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "xcode_mcp_unauthorized: unauthorized");
+        }
+    }
+
+    fn headless_pool(fixture: &headless_fixture::Fixture) -> XcodeMcpBridgePool {
+        XcodeMcpBridgePool::new_with_headless_runtime(
+            XcodeMcpBridgePoolConfig {
+                target_probe_context: Some(host(vec![])),
+                ..Default::default()
+            },
+            Arc::new(NoopXcodeRuntimeObservationSink),
+            fixture.runtime.clone(),
+        )
+    }
+
+    #[tokio::test]
+    async fn headless_pool_requires_committed_ticket_before_exposing_lease() {
+        let fixture = headless_fixture::Fixture::new();
+        let pool = headless_pool(&fixture);
+        let req = fixture.request();
+        assert!(pool.attach_brokered_xcode_leases(&req).await.is_err());
+        assert_eq!(pool.active_lease_count().await, 0);
+        let prepared = fixture
+            .runtime
+            .prepare(fixture.input(&req), fixture.journal.clone())
+            .await
+            .unwrap();
+        assert!(pool.attach_brokered_xcode_leases(&req).await.is_err());
+        assert_eq!(pool.active_lease_count().await, 0);
+        fixture.runtime.commit(&prepared, &req).unwrap();
+        let attachment = pool.attach_brokered_xcode_leases(&req).await.unwrap();
+        assert_eq!(attachment.lease_ids.len(), 1);
+        assert!(pool
+            .lease_target_snapshot(&attachment.lease_ids[0])
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn headless_pool_warmup_only_revalidates_committed_binding() {
+        let fixture = headless_fixture::Fixture::new();
+        let req = fixture.request();
+        let prepared = fixture.prepare(&req).await;
+        let pool = headless_pool(&fixture);
+        let attached = pool.attach_brokered_xcode_leases(&req).await.unwrap();
+        pool.warm_up_brokered_xcode_leases(&attached.lease_ids)
+            .await
+            .unwrap();
+        assert_eq!(fixture.host.opens.load(Ordering::SeqCst), 1);
+        assert!(pool
+            .forward_json_rpc_request(
+                &attached.lease_ids[0],
+                serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"})
+            )
+            .await
+            .is_err());
+        fixture.host.snapshot.lock().await.generation.start_usec += 1;
+        assert!(pool
+            .warm_up_brokered_xcode_leases(&attached.lease_ids)
+            .await
+            .is_err());
+        drop(prepared);
+    }
+
+    #[tokio::test]
+    async fn headless_pool_rebind_preserves_endpoint_and_token_for_exact_generation() {
+        let fixture = headless_fixture::Fixture::new();
+        let mut req = fixture.request();
+        let prepared = fixture.prepare(&req).await;
+        let digest = prepared.binding_digest().to_owned();
+        let pool = headless_pool(&fixture);
+        let active = fixture.runtime.begin_prompt(&req).unwrap();
+        let attachment = pool.attach_brokered_xcode_leases(&req).await.unwrap();
+        let lease_id = &attachment.lease_ids[0];
+        let original = pool.state.lock().await.leases[lease_id].clone();
+        let ping = serde_json::json!({"jsonrpc":"2.0","id":"kept","method":"ping"});
+        assert_eq!(
+            pool.forward_json_rpc_request(lease_id, ping.clone())
+                .await
+                .unwrap()["id"],
+            "kept"
+        );
+        drop(active);
+        drop(prepared);
+        req.agent_execution_id = Some(AgentExecutionId::new());
+        req.reuse_existing_session = true;
+        let prepared = fixture.prepare(&req).await;
+        assert_eq!(prepared.binding_digest(), digest);
+        let active = fixture.runtime.begin_prompt(&req).unwrap();
+        pool.rebind_brokered_xcode_leases(&attachment.lease_ids, &req)
+            .await
+            .unwrap();
+        let rebound = pool.state.lock().await.leases[lease_id].clone();
+        assert_eq!(rebound.agent_execution_id, req.agent_execution_id);
+        assert_eq!(rebound.endpoint, original.endpoint);
+        assert_eq!(rebound.authorization_hash, original.authorization_hash);
+        assert_eq!(fixture.host.opens.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            pool.forward_json_rpc_request(lease_id, ping.clone())
+                .await
+                .unwrap()["id"],
+            "kept"
+        );
+        drop(active);
+        assert!(pool.forward_json_rpc_request(lease_id, ping).await.is_err());
+        drop(prepared);
+    }
+
+    #[tokio::test]
+    async fn headless_pool_rebind_rejects_changed_binding_or_generation_without_mutation() {
+        for change_policy in [false, true] {
+            let fixture = headless_fixture::Fixture::new();
+            let mut req = fixture.request();
+            let prepared = fixture.prepare(&req).await;
+            let pool = headless_pool(&fixture);
+            let attached = pool.attach_brokered_xcode_leases(&req).await.unwrap();
+            let before = pool.state.lock().await.leases[&attached.lease_ids[0]].clone();
+            drop(prepared);
+            req.agent_execution_id = Some(AgentExecutionId::new());
+            req.reuse_existing_session = true;
+            let mut input = fixture.input(&req);
+            if change_policy {
+                input.permission_policy =
+                    serde_json::json!({"xcode_headless":{"read":true,"gates":["build"]}});
+            } else {
+                req.session_generation_id = Some("foreign-generation".into());
+            }
+            let prepared = fixture
+                .runtime
+                .prepare(input, fixture.journal.clone())
+                .await
+                .unwrap();
+            fixture.runtime.commit(&prepared, &req).unwrap();
+            assert!(pool
+                .rebind_brokered_xcode_leases(&attached.lease_ids, &req)
+                .await
+                .is_err());
+            let after = pool.state.lock().await.leases[&attached.lease_ids[0]].clone();
+            assert_eq!(after.agent_execution_id, before.agent_execution_id);
+            assert_eq!(after.authorization_hash, before.authorization_hash);
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_pool_rebind_requires_one_to_one_runtime_scope() {
+        let fixture = headless_fixture::Fixture::new();
+        let mut req = fixture.request();
+        req.mcp_servers.push(req.mcp_servers[0].clone());
+        let prepared = fixture.prepare(&req).await;
+        let pool = headless_pool(&fixture);
+        let attached = pool.attach_brokered_xcode_leases(&req).await.unwrap();
+        let old_invocation = req.agent_execution_id;
+        drop(prepared);
+        req.agent_execution_id = Some(AgentExecutionId::new());
+        req.reuse_existing_session = true;
+        let ResolvedMcpServerTransport::XcodeBrokerIntent { intent } =
+            &mut req.mcp_servers[1].transport
+        else {
+            panic!("fixture broker intent expected");
+        };
+        intent.runtime_id = "second-runtime".into();
+        let _prepared = fixture.prepare(&req).await;
+        assert!(pool
+            .rebind_brokered_xcode_leases(&attached.lease_ids, &req)
+            .await
+            .is_err());
+        let state = pool.state.lock().await;
+        for lease_id in &attached.lease_ids {
+            assert_eq!(state.leases[lease_id].agent_execution_id, old_invocation);
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_pool_cleanup_ignores_legacy_ide_pid_snapshots() {
+        let fixture = headless_fixture::Fixture::new();
+        let req = fixture.request();
+        let _prepared = fixture.prepare(&req).await;
+        let pool = headless_pool(&fixture);
+        let attachment = pool.attach_brokered_xcode_leases(&req).await.unwrap();
+        pool.state
+            .lock()
+            .await
+            .leases
+            .get_mut(&attachment.lease_ids[0])
+            .unwrap()
+            .target_snapshot = Some(target_snapshot(XcodeTargetSelectionConfidence::ExplicitPid));
+        pool.replace_target_probe_context(Some(host(vec![]))).await;
+        assert!(pool.cleanup_pid_drift().await.unwrap().is_empty());
+        assert_eq!(pool.active_lease_count().await, 1);
+        assert_eq!(pool.health_snapshot().await.active_lease_count, 1);
+    }
 
     struct FailingObservationSink;
 
@@ -2537,6 +3271,7 @@ mod tests {
                 first_connect_deadline: now + Duration::from_secs(60),
                 mcp_policy: BrokerMcpPolicy::allow_all(),
                 target_snapshot: None,
+                headless_binding: None,
             },
         );
 
@@ -2574,6 +3309,7 @@ mod tests {
                 first_connect_deadline: now + Duration::from_secs(60),
                 mcp_policy: BrokerMcpPolicy::allow_all(),
                 target_snapshot: None,
+                headless_binding: None,
             },
         );
 

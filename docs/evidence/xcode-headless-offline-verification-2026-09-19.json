@@ -1,0 +1,298 @@
+{
+  "version": 1,
+  "date": "2026-09-19",
+  "source_head": "a096b8831f0db7f17d1ffe426851c49a65b8b000",
+  "source_manifest": "docs/evidence/xcode-headless-offline-source-2026-09-19.json",
+  "source_manifest_sha256": "0a07bfadfc1f48335d3d8891852bbed90570596bca9565f22a64761ea7ab9a8e",
+  "scope": "Offline component verification, not a full workspace test pass, production admission or release receipt. Uncommitted worktree; no live Apple/provider/service/deployment action.",
+  "baseline_archive": "/private/tmp/cw-headless-baseline-TXiXVF",
+  "reviewer": "01a0bb09-d0a6-7550-8c75-74dc61120f0f",
+  "review_verdict": "No actionable blocking offline-component finding. Added root runtime test was run by parent after review.",
+  "logs": [
+    {
+      "log": ".superpowers/sdd/2026-09-19-xcode-headless-offline/acp-final-managed.log",
+      "sha256": "9c65c14adb911ba061a926426c551144ff63f4bd257d69eab24f4aa5905fb280",
+      "exit_code": 0,
+      "boundary": "Final complete ACP library, tests and I1 example; serial; live smoke unset; isolated managed target with normal cache settings.",
+      "test_summaries": [
+        {
+          "result": "ok",
+          "passed": 200,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        },
+        {
+          "result": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        },
+        {
+          "result": "ok",
+          "passed": 15,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        },
+        {
+          "result": "ok",
+          "passed": 76,
+          "failed": 0,
+          "ignored": 1,
+          "measured": 0,
+          "filtered_out": 0
+        },
+        {
+          "result": "ok",
+          "passed": 27,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        },
+        {
+          "result": "ok",
+          "passed": 37,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        }
+      ]
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-19-xcode-headless-offline/domain.log",
+      "sha256": "cc67912cff1395c8abc878e26fcd78b6f72574a86053d2f1b837166438ecf668",
+      "exit_code": 0,
+      "boundary": "Complete domain suite; domain source unchanged since this run.",
+      "test_summaries": [
+        {
+          "result": "ok",
+          "passed": 300,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        },
+        {
+          "result": "ok",
+          "passed": 19,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        },
+        {
+          "result": "ok",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        },
+        {
+          "result": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        },
+        {
+          "result": "ok",
+          "passed": 7,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        },
+        {
+          "result": "ok",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        },
+        {
+          "result": "ok",
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        },
+        {
+          "result": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        },
+        {
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        }
+      ]
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-19-xcode-headless-offline/journal.log",
+      "sha256": "da806547610316aaf24f1c80e4c984e1c71c521ed0fce0fb1178dadb9f2a7ebc",
+      "exit_code": 0,
+      "boundary": "Parent journal integration rerun; journal source unchanged since this run.",
+      "test_summaries": [
+        {
+          "result": "ok",
+          "passed": 26,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        }
+      ]
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-19-xcode-headless-offline/db-lib.log",
+      "sha256": "fad426a8bd4b0b179c6ce9a28897d0c9254ba2b290c2e86c0dac23c7f6500f04",
+      "exit_code": 101,
+      "boundary": "Full DB library regression: two failures.",
+      "test_summaries": [
+        {
+          "result": "FAILED",
+          "passed": 441,
+          "failed": 2,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        }
+      ]
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-19-xcode-headless-offline/db-baseline.log",
+      "sha256": "48b229bc2b6f09e168d5a567f877ebec2af930910f706e6e385269dca2d67dec",
+      "exit_code": 101,
+      "boundary": "Exact clean HEAD: both failing DB tests reproduce; targeted baseline, not full DB suite.",
+      "test_summaries": [
+        {
+          "result": "FAILED",
+          "passed": 0,
+          "failed": 2,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 441
+        }
+      ]
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-19-xcode-headless-offline/engine-final-isolated.log",
+      "sha256": "bac8af74df9d7314ab315cf93bf292fd37924139852d43a9fd2c745f03fb3941",
+      "exit_code": 101,
+      "boundary": "Final complete engine library: same four baseline failures; isolated managed target, sccache disabled.",
+      "test_summaries": [
+        {
+          "result": "FAILED",
+          "passed": 568,
+          "failed": 4,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        }
+      ]
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-19-xcode-headless-offline/engine-baseline.log",
+      "sha256": "d56bd5a942985c8c9ccd6241078ae20cfb74423ab806670c66c81f6888213236",
+      "exit_code": 101,
+      "boundary": "Complete clean exact-HEAD engine baseline.",
+      "test_summaries": [
+        {
+          "result": "FAILED",
+          "passed": 568,
+          "failed": 4,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        }
+      ]
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-19-xcode-headless-offline/engine-mcp.log",
+      "sha256": "85a4c54a710d49fbdadf4b3b77cd8e4d6f0e40ec95cb1570f6086535f41654eb",
+      "exit_code": 0,
+      "boundary": "Focused engine MCP module regression.",
+      "test_summaries": [
+        {
+          "result": "ok",
+          "passed": 11,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 561
+        }
+      ]
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-19-xcode-headless-offline/root-runtime.log",
+      "sha256": "1cd6c141176e9146a549c5e9a714c8902a50df5f6eb2d5e0a9ca1c47483dfc1c",
+      "exit_code": 0,
+      "boundary": "Synthetic provider root/reuse/resurrection test; repeated in final ACP suite after formatting.",
+      "test_summaries": [
+        {
+          "result": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        }
+      ]
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-19-xcode-headless-offline/check-final.log",
+      "sha256": "2db0eb21c052e3adc5c34ec41f6d6938b24d2c37792564240c7625b93f478d23",
+      "exit_code": 0,
+      "boundary": "Final workspace check; isolated managed target, sccache disabled.",
+      "test_summaries": []
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-19-xcode-headless-offline/fmt-final.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "exit_code": 0,
+      "boundary": "Final workspace formatting check.",
+      "test_summaries": []
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-19-xcode-headless-offline/engine-final.log",
+      "sha256": "f8e88f46dc0380f66b8bb10fc8547a14b06747896e067fa89948570ba5d3ae11",
+      "exit_code": 101,
+      "boundary": "Earlier shared-target compilation failed with missing domain exports; source exports present; isolated compilation succeeds.",
+      "test_summaries": []
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-19-xcode-headless-offline/acp-final-isolated.log",
+      "sha256": "cd141a958e87eae3c18933b09b0ccf2abb7757b3031248cffc4d50dc44de62e9",
+      "exit_code": 101,
+      "boundary": "Diagnostic disabled-cache environment conflicts with two existing cache-enabled assertions; later normal managed run passes.",
+      "test_summaries": [
+        {
+          "result": "FAILED",
+          "passed": 198,
+          "failed": 2,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 0
+        }
+      ]
+    }
+  ]
+}

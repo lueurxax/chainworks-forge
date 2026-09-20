@@ -1,0 +1,1621 @@
+{
+  "format": "cw.xcode.research.schema-index.v1",
+  "authority": "research_inventory_not_admitted_tool_policy",
+  "xcode": {
+    "version": "27.0",
+    "build": "27A266a"
+  },
+  "server": {
+    "name": "xcode-tools",
+    "version": "25317"
+  },
+  "sources": [
+    {
+      "path": "mcp-2025-06-18.json",
+      "sha256": "e00d534d7dbbc705ecc2211da80759281d8f42f423c408f67529a535723ab020",
+      "captured_at": "2026-09-19T13:56:06.208068+00:00",
+      "offered_protocol": "2025-11-25",
+      "negotiated_protocol": "2025-06-18",
+      "methods": [
+        "initialize",
+        "notifications/initialized",
+        "tools/list"
+      ],
+      "own_bridge_exit": 1
+    },
+    {
+      "path": "mcp-2024-11-05.json",
+      "sha256": "8f6c31fbccae1cac96e10f6018724bf57534b4cbae7226fcc9c7e0d5302981a0",
+      "captured_at": "2026-09-19T13:59:10.868017+00:00",
+      "offered_protocol": "2024-11-05",
+      "negotiated_protocol": "2024-11-05",
+      "methods": [
+        "initialize",
+        "notifications/initialized",
+        "tools/list"
+      ],
+      "own_bridge_exit": 1
+    }
+  ],
+  "same_tool_definitions_across_protocols": true,
+  "totals": {
+    "tools": 54,
+    "input_schemas": 54,
+    "output_schemas": 54,
+    "workspace_optional": 45,
+    "workspace_required": 1,
+    "workspace_absent": 8,
+    "annotations": 0,
+    "closed_input_roots": 0,
+    "closed_output_roots": 0
+  },
+  "tools": [
+    {
+      "name": "AddEntitlement",
+      "source_pointer": "/tools_list_responses/0/result/tools/0",
+      "input_required": [
+        "targetName",
+        "entitlementKey",
+        "entitlementValueType"
+      ],
+      "input_fields": [
+        "entitlementDictionaryItems",
+        "entitlementKey",
+        "entitlementValue",
+        "entitlementValueItems",
+        "entitlementValueType",
+        "projectPath",
+        "targetName",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "result"
+      ],
+      "output_fields": [
+        "errorDescription",
+        "result"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "AddInfoPlist",
+      "source_pointer": "/tools_list_responses/0/result/tools/1",
+      "input_required": [
+        "targetName",
+        "infoPlistKey",
+        "infoPlistValueType"
+      ],
+      "input_fields": [
+        "infoPlistDictionaryItems",
+        "infoPlistKey",
+        "infoPlistValue",
+        "infoPlistValueItems",
+        "infoPlistValueType",
+        "projectPath",
+        "targetName",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "result"
+      ],
+      "output_fields": [
+        "errorDescription",
+        "result"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "BuildProject",
+      "source_pointer": "/tools_list_responses/0/result/tools/2",
+      "input_required": [],
+      "input_fields": [
+        "buildForTesting",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "buildResult",
+        "errors",
+        "fullLogPath"
+      ],
+      "output_fields": [
+        "buildResult",
+        "elapsedTime",
+        "errors",
+        "fullLogPath"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "DeviceInteractionEndSession",
+      "source_pointer": "/tools_list_responses/0/result/tools/3",
+      "input_required": [
+        "interactionSessionKey"
+      ],
+      "input_fields": [
+        "interactionSessionKey"
+      ],
+      "output_required": [
+        "userMessage"
+      ],
+      "output_fields": [
+        "userMessage"
+      ],
+      "workspace_selector": "absent",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "DeviceInteractionInstallAndRun",
+      "source_pointer": "/tools_list_responses/0/result/tools/4",
+      "input_required": [
+        "interactionSessionKey"
+      ],
+      "input_fields": [
+        "commandLineArguments",
+        "environmentVariables",
+        "interactionSessionKey",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "userMessage"
+      ],
+      "output_fields": [
+        "userMessage"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "DeviceInteractionStartSession",
+      "source_pointer": "/tools_list_responses/0/result/tools/5",
+      "input_required": [
+        "deviceIdentifier",
+        "sessionIdentifier"
+      ],
+      "input_fields": [
+        "deviceIdentifier",
+        "sessionIdentifier"
+      ],
+      "output_required": [
+        "summary",
+        "skillToTrigger",
+        "interactionSessionKey",
+        "deviceUUID",
+        "deviceIsSimulator"
+      ],
+      "output_fields": [
+        "deviceIsSimulator",
+        "deviceUUID",
+        "interactionSessionKey",
+        "skillToTrigger",
+        "summary"
+      ],
+      "workspace_selector": "absent",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "DeviceInteractionStartWorkspaceSession",
+      "source_pointer": "/tools_list_responses/0/result/tools/6",
+      "input_required": [
+        "sessionIdentifier"
+      ],
+      "input_fields": [
+        "deviceIdentifier",
+        "sessionIdentifier",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "summary",
+        "skillToTrigger",
+        "interactionSessionKey",
+        "deviceUUID",
+        "deviceIsSimulator"
+      ],
+      "output_fields": [
+        "deviceIsSimulator",
+        "deviceUUID",
+        "interactionSessionKey",
+        "skillToTrigger",
+        "summary"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "DeviceInteractionSynthesize",
+      "source_pointer": "/tools_list_responses/0/result/tools/7",
+      "input_required": [
+        "interactSessionKey"
+      ],
+      "input_fields": [
+        "activationBundleId",
+        "interactSessionKey",
+        "interactionCommand"
+      ],
+      "output_required": [
+        "thumbnailScreenshotPath",
+        "screenshotPath",
+        "hierarchyPath",
+        "logsPath",
+        "applicationState"
+      ],
+      "output_fields": [
+        "applicationState",
+        "hierarchyPath",
+        "logsPath",
+        "screenshotPath",
+        "thumbnailScreenshotPath"
+      ],
+      "workspace_selector": "absent",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "DocumentationSearch",
+      "source_pointer": "/tools_list_responses/0/result/tools/8",
+      "input_required": [
+        "query"
+      ],
+      "input_fields": [
+        "frameworks",
+        "query"
+      ],
+      "output_required": [
+        "documents"
+      ],
+      "output_fields": [
+        "documents"
+      ],
+      "workspace_selector": "absent",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "GetBuildLog",
+      "source_pointer": "/tools_list_responses/0/result/tools/9",
+      "input_required": [],
+      "input_fields": [
+        "glob",
+        "pattern",
+        "severity",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "buildResult",
+        "buildLogEntries",
+        "buildIsRunning",
+        "truncated",
+        "totalFound",
+        "fullLogPath"
+      ],
+      "output_fields": [
+        "buildIsRunning",
+        "buildLogEntries",
+        "buildResult",
+        "fullLogPath",
+        "message",
+        "totalFound",
+        "truncated"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "GetConsoleOutput",
+      "source_pointer": "/tools_list_responses/0/result/tools/10",
+      "input_required": [],
+      "input_fields": [
+        "contextLines",
+        "includeMetadata",
+        "launchSessionReference",
+        "oslogSeverity",
+        "outputType",
+        "pattern",
+        "tailLimit",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "units",
+        "totalCount",
+        "truncated",
+        "launchSessionInfo"
+      ],
+      "output_fields": [
+        "launchSessionInfo",
+        "totalCount",
+        "truncated",
+        "units"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "GetCrashIssueLogs",
+      "source_pointer": "/tools_list_responses/0/result/tools/11",
+      "input_required": [
+        "signature_name"
+      ],
+      "input_fields": [
+        "app_version",
+        "bundle_id",
+        "is_beta",
+        "platform",
+        "signature_name",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "success",
+        "data",
+        "message",
+        "bundleId",
+        "signatureName"
+      ],
+      "output_fields": [
+        "appVersion",
+        "bundleId",
+        "data",
+        "message",
+        "signatureName",
+        "success"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "GetFieldPerformanceIssueLogs",
+      "source_pointer": "/tools_list_responses/0/result/tools/12",
+      "input_required": [
+        "app_version",
+        "signature_name",
+        "diagnostic_type"
+      ],
+      "input_fields": [
+        "app_version",
+        "bundle_id",
+        "diagnostic_type",
+        "is_beta",
+        "platform",
+        "signature_name",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "success",
+        "data",
+        "message",
+        "bundleId",
+        "appVersion",
+        "signatureName",
+        "diagnosticType"
+      ],
+      "output_fields": [
+        "appVersion",
+        "bundleId",
+        "data",
+        "diagnosticType",
+        "message",
+        "signatureName",
+        "success"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "GetFileCompilerFlags",
+      "source_pointer": "/tools_list_responses/0/result/tools/13",
+      "input_required": [
+        "targetName",
+        "filePath"
+      ],
+      "input_fields": [
+        "filePath",
+        "projectPath",
+        "targetName",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "targetName",
+        "filePath",
+        "compilerFlags"
+      ],
+      "output_fields": [
+        "compilerFlags",
+        "filePath",
+        "guidance",
+        "targetName",
+        "warning"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "GetTargetBuildSettings",
+      "source_pointer": "/tools_list_responses/0/result/tools/14",
+      "input_required": [
+        "targetName"
+      ],
+      "input_fields": [
+        "projectPath",
+        "targetName",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "targetName",
+        "buildSettings"
+      ],
+      "output_fields": [
+        "buildSettings",
+        "targetName"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "GetTestList",
+      "source_pointer": "/tools_list_responses/0/result/tools/15",
+      "input_required": [],
+      "input_fields": [
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "tests",
+        "schemeName",
+        "summary",
+        "counts",
+        "truncated",
+        "totalTests",
+        "fullTestListPath"
+      ],
+      "output_fields": [
+        "activeTestPlanName",
+        "counts",
+        "fullTestListPath",
+        "schemeName",
+        "summary",
+        "tests",
+        "totalTests",
+        "truncated"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "GetTopCrashIssues",
+      "source_pointer": "/tools_list_responses/0/result/tools/16",
+      "input_required": [],
+      "input_fields": [
+        "app_version",
+        "bundle_id",
+        "count",
+        "is_beta",
+        "platform",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "success",
+        "data",
+        "message",
+        "bundleId"
+      ],
+      "output_fields": [
+        "appVersion",
+        "bundleId",
+        "data",
+        "message",
+        "success"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "GetTopFieldPerformanceIssues",
+      "source_pointer": "/tools_list_responses/0/result/tools/17",
+      "input_required": [
+        "diagnostic_type"
+      ],
+      "input_fields": [
+        "app_version",
+        "bundle_id",
+        "diagnostic_type",
+        "is_beta",
+        "platform",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "success",
+        "data",
+        "message",
+        "bundleId",
+        "diagnosticType"
+      ],
+      "output_fields": [
+        "appVersion",
+        "availableVersions",
+        "bundleId",
+        "data",
+        "diagnosticType",
+        "message",
+        "success"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "InvokeDebuggerCommand",
+      "source_pointer": "/tools_list_responses/0/result/tools/18",
+      "input_required": [
+        "command"
+      ],
+      "input_fields": [
+        "command",
+        "timeout",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "output",
+        "debugSessionActive",
+        "isWaitingForMore"
+      ],
+      "output_fields": [
+        "debugSessionActive",
+        "isWaitingForMore",
+        "output",
+        "processIdentifier"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "LocalizationPlanner",
+      "source_pointer": "/tools_list_responses/0/result/tools/19",
+      "input_required": [
+        "targetLocaleIdentifier"
+      ],
+      "input_fields": [
+        "targetLocaleIdentifier",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "nextStep"
+      ],
+      "output_fields": [
+        "changesMade",
+        "nextStep",
+        "stepsFailed",
+        "suggestions"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "RenderPreview",
+      "source_pointer": "/tools_list_responses/0/result/tools/20",
+      "input_required": [
+        "sourceFilePath"
+      ],
+      "input_fields": [
+        "previewCanvasControlOverrides",
+        "previewDefinitionIndexInFile",
+        "previewLocalizationOverride",
+        "previewVariantOverrides",
+        "sourceFilePath",
+        "timeout",
+        "workspaceIdentifier"
+      ],
+      "output_required": [],
+      "output_fields": [
+        "displayName",
+        "errors",
+        "previewSnapshotPath",
+        "renderedDestination",
+        "sourceLineNumber",
+        "supportedCanvasControlOverrides",
+        "supportedLocalizations",
+        "supportedPreviewVariantOverrides"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "RunAllTests",
+      "source_pointer": "/tools_list_responses/0/result/tools/21",
+      "input_required": [],
+      "input_fields": [
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "summary",
+        "counts",
+        "results",
+        "schemeName",
+        "truncated",
+        "totalResults",
+        "fullSummaryPath"
+      ],
+      "output_fields": [
+        "activeTestPlanName",
+        "counts",
+        "fullConsoleLogsPath",
+        "fullSummaryPath",
+        "message",
+        "results",
+        "schemeName",
+        "summary",
+        "totalResults",
+        "truncated",
+        "xcresultBundlePath"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "RunCodeSnippet",
+      "source_pointer": "/tools_list_responses/0/result/tools/22",
+      "input_required": [
+        "codeSnippet",
+        "sourceFilePath",
+        "purpose"
+      ],
+      "input_fields": [
+        "codeSnippet",
+        "purpose",
+        "sourceFilePath",
+        "timeout",
+        "workspaceIdentifier"
+      ],
+      "output_required": [],
+      "output_fields": [
+        "error",
+        "executionResults"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "RunProject",
+      "source_pointer": "/tools_list_responses/0/result/tools/23",
+      "input_required": [],
+      "input_fields": [
+        "attachDebugger",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "runResult",
+        "buildErrors",
+        "fullLogPath"
+      ],
+      "output_fields": [
+        "buildErrors",
+        "elapsedTime",
+        "fullLogPath",
+        "launchSessionReference",
+        "processIdentifier",
+        "runResult"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "RunSomeTests",
+      "source_pointer": "/tools_list_responses/0/result/tools/24",
+      "input_required": [
+        "tests"
+      ],
+      "input_fields": [
+        "tests",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "summary",
+        "counts",
+        "results",
+        "schemeName",
+        "truncated",
+        "totalResults",
+        "fullSummaryPath"
+      ],
+      "output_fields": [
+        "activeTestPlanName",
+        "counts",
+        "fullConsoleLogsPath",
+        "fullSummaryPath",
+        "message",
+        "results",
+        "schemeName",
+        "summary",
+        "totalResults",
+        "truncated",
+        "xcresultBundlePath"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "StopProject",
+      "source_pointer": "/tools_list_responses/0/result/tools/25",
+      "input_required": [],
+      "input_fields": [
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "stopResult"
+      ],
+      "output_fields": [
+        "processIdentifier",
+        "stopResult"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "StringCatalogContext",
+      "source_pointer": "/tools_list_responses/0/result/tools/26",
+      "input_required": [
+        "filePath",
+        "stringKey",
+        "targetLocaleIdentifier"
+      ],
+      "input_fields": [
+        "filePath",
+        "stringKey",
+        "targetLocaleIdentifier",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "sourceValues",
+        "shouldTranslate",
+        "translations",
+        "usageLocations",
+        "similarStrings",
+        "nextSteps"
+      ],
+      "output_fields": [
+        "appearances",
+        "comment",
+        "isStringSet",
+        "nextSteps",
+        "relevantPluralCases",
+        "shouldTranslate",
+        "similarStrings",
+        "sourcePluralCasesToAdd",
+        "sourceValues",
+        "supportedDevices",
+        "translations",
+        "usageDataUnavailable",
+        "usageLocations"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "StringCatalogEdit",
+      "source_pointer": "/tools_list_responses/0/result/tools/27",
+      "input_required": [
+        "filePath",
+        "stringKey",
+        "targetLocaleIdentifier"
+      ],
+      "input_fields": [
+        "filePath",
+        "stringKey",
+        "stringSetTranslation",
+        "targetLocaleIdentifier",
+        "templateTranslation",
+        "translation",
+        "variationTranslation",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "success",
+        "message"
+      ],
+      "output_fields": [
+        "message",
+        "success"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "StringCatalogRead",
+      "source_pointer": "/tools_list_responses/0/result/tools/28",
+      "input_required": [
+        "filePath",
+        "targetLocaleIdentifier"
+      ],
+      "input_fields": [
+        "filePath",
+        "keyLimit",
+        "offset",
+        "requestedState",
+        "targetLocaleIdentifier",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "newCount",
+        "needsReviewCount",
+        "translatedCount",
+        "machineTranslatedCount",
+        "nextStep"
+      ],
+      "output_fields": [
+        "keys",
+        "machineTranslatedCount",
+        "needsReviewCount",
+        "newCount",
+        "nextStep",
+        "requestedState",
+        "returnedCount",
+        "totalForRequestedState",
+        "translatedCount"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "UpdateFileCompilerFlags",
+      "source_pointer": "/tools_list_responses/0/result/tools/29",
+      "input_required": [
+        "targetName",
+        "filePath"
+      ],
+      "input_fields": [
+        "appendValue",
+        "compilerFlags",
+        "filePath",
+        "projectPath",
+        "targetName",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "targetName",
+        "filePath",
+        "compilerFlags",
+        "previousFlags"
+      ],
+      "output_fields": [
+        "compilerFlags",
+        "filePath",
+        "guidance",
+        "previousFlags",
+        "targetName",
+        "warning"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "UpdateTargetBuildSetting",
+      "source_pointer": "/tools_list_responses/0/result/tools/30",
+      "input_required": [
+        "targetName",
+        "buildSettingName"
+      ],
+      "input_fields": [
+        "appendValue",
+        "buildSettingName",
+        "buildSettingValue",
+        "projectPath",
+        "targetName",
+        "workspaceIdentifier"
+      ],
+      "output_required": [],
+      "output_fields": [],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeCloseWorkspace",
+      "source_pointer": "/tools_list_responses/0/result/tools/31",
+      "input_required": [
+        "workspaceIdentifier"
+      ],
+      "input_fields": [
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "message"
+      ],
+      "output_fields": [
+        "message"
+      ],
+      "workspace_selector": "required",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeGlob",
+      "source_pointer": "/tools_list_responses/0/result/tools/32",
+      "input_required": [],
+      "input_fields": [
+        "path",
+        "pattern",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "matches",
+        "pattern",
+        "searchPath",
+        "truncated",
+        "totalFound"
+      ],
+      "output_fields": [
+        "matches",
+        "message",
+        "packageDependencies",
+        "pattern",
+        "searchPath",
+        "totalFound",
+        "truncated"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeGrep",
+      "source_pointer": "/tools_list_responses/0/result/tools/33",
+      "input_required": [
+        "pattern"
+      ],
+      "input_fields": [
+        "glob",
+        "headLimit",
+        "ignoreCase",
+        "linesAfter",
+        "linesBefore",
+        "linesContext",
+        "multiline",
+        "outputMode",
+        "path",
+        "pattern",
+        "showLineNumbers",
+        "type",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "results",
+        "pattern",
+        "searchPath",
+        "matchCount",
+        "truncated"
+      ],
+      "output_fields": [
+        "matchCount",
+        "message",
+        "packageDependencies",
+        "pattern",
+        "results",
+        "searchPath",
+        "truncated"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeLS",
+      "source_pointer": "/tools_list_responses/0/result/tools/34",
+      "input_required": [
+        "path"
+      ],
+      "input_fields": [
+        "ignore",
+        "path",
+        "recursive",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "items",
+        "path"
+      ],
+      "output_fields": [
+        "items",
+        "message",
+        "packageDependencies",
+        "path"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeListRunDestinations",
+      "source_pointer": "/tools_list_responses/0/result/tools/35",
+      "input_required": [],
+      "input_fields": [
+        "includeIncompatible",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "destinations",
+        "groups",
+        "truncated",
+        "totalDestinations",
+        "fullRunDestinationListPath"
+      ],
+      "output_fields": [
+        "activeDestinationDisplayTitle",
+        "activeSchemeName",
+        "destinations",
+        "fullRunDestinationListPath",
+        "groups",
+        "message",
+        "totalDestinations",
+        "truncated"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeListSchemes",
+      "source_pointer": "/tools_list_responses/0/result/tools/36",
+      "input_required": [],
+      "input_fields": [
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "schemes",
+        "truncated",
+        "totalSchemes",
+        "fullSchemeListPath"
+      ],
+      "output_fields": [
+        "activeSchemeName",
+        "fullSchemeListPath",
+        "message",
+        "schemes",
+        "totalSchemes",
+        "truncated"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeListTargets",
+      "source_pointer": "/tools_list_responses/0/result/tools/37",
+      "input_required": [],
+      "input_fields": [
+        "productTypeFilter",
+        "projectPath",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "targets",
+        "totalTargets",
+        "truncated",
+        "fullTargetListPath"
+      ],
+      "output_fields": [
+        "fullTargetListPath",
+        "message",
+        "targets",
+        "totalTargets",
+        "truncated"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeListTemplates",
+      "source_pointer": "/tools_list_responses/0/result/tools/38",
+      "input_required": [],
+      "input_fields": [
+        "categoryFilter",
+        "kind",
+        "nameFilter",
+        "platformFilter",
+        "templateIdentifier"
+      ],
+      "output_required": [
+        "templates",
+        "totalTemplates",
+        "truncated",
+        "fullTemplateListPath"
+      ],
+      "output_fields": [
+        "fullTemplateListPath",
+        "message",
+        "templates",
+        "totalTemplates",
+        "truncated"
+      ],
+      "workspace_selector": "absent",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeListTestPlans",
+      "source_pointer": "/tools_list_responses/0/result/tools/39",
+      "input_required": [],
+      "input_fields": [
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "testPlans",
+        "usesTestPlans",
+        "schemeName",
+        "truncated",
+        "totalTestPlans",
+        "fullTestPlanListPath",
+        "message"
+      ],
+      "output_fields": [
+        "activeTestPlanName",
+        "fullTestPlanListPath",
+        "message",
+        "schemeName",
+        "testPlans",
+        "totalTestPlans",
+        "truncated",
+        "usesTestPlans"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeListWorkspaces",
+      "source_pointer": "/tools_list_responses/0/result/tools/40",
+      "input_required": [],
+      "input_fields": [],
+      "output_required": [
+        "message"
+      ],
+      "output_fields": [
+        "message"
+      ],
+      "workspace_selector": "absent",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeMV",
+      "source_pointer": "/tools_list_responses/0/result/tools/41",
+      "input_required": [
+        "sourcePath",
+        "destinationPath"
+      ],
+      "input_fields": [
+        "destinationPath",
+        "operation",
+        "overwriteExisting",
+        "sourcePath",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "success",
+        "operation",
+        "message"
+      ],
+      "output_fields": [
+        "destinationFinalPath",
+        "message",
+        "operation",
+        "sourceOriginalPath",
+        "success"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeMakeDir",
+      "source_pointer": "/tools_list_responses/0/result/tools/42",
+      "input_required": [
+        "directoryPath"
+      ],
+      "input_fields": [
+        "directoryPath",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "success",
+        "message"
+      ],
+      "output_fields": [
+        "createdPath",
+        "message",
+        "success"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeNewProject",
+      "source_pointer": "/tools_list_responses/0/result/tools/43",
+      "input_required": [
+        "templateIdentifier",
+        "productName",
+        "destinationPath"
+      ],
+      "input_fields": [
+        "destinationPath",
+        "options",
+        "organizationIdentifier",
+        "productName",
+        "teamIdentifier",
+        "templateIdentifier"
+      ],
+      "output_required": [
+        "projectPath",
+        "createdTargets"
+      ],
+      "output_fields": [
+        "createdTargets",
+        "projectPath"
+      ],
+      "workspace_selector": "absent",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeNewTarget",
+      "source_pointer": "/tools_list_responses/0/result/tools/44",
+      "input_required": [
+        "templateIdentifier",
+        "productName"
+      ],
+      "input_fields": [
+        "embedInAppNamed",
+        "options",
+        "organizationIdentifier",
+        "productName",
+        "projectPath",
+        "templateIdentifier",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "targetName",
+        "additionalTargetsCreated"
+      ],
+      "output_fields": [
+        "activeSchemeName",
+        "additionalTargetsCreated",
+        "containingProjectPath",
+        "primaryFilePath",
+        "targetGroupPath",
+        "targetName"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeOpenWorkspace",
+      "source_pointer": "/tools_list_responses/0/result/tools/45",
+      "input_required": [
+        "path"
+      ],
+      "input_fields": [
+        "path"
+      ],
+      "output_required": [
+        "workspaceIdentifier"
+      ],
+      "output_fields": [
+        "activeRunDestination",
+        "activeScheme",
+        "message",
+        "workspaceIdentifier",
+        "workspacePath"
+      ],
+      "workspace_selector": "absent",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeRM",
+      "source_pointer": "/tools_list_responses/0/result/tools/46",
+      "input_required": [
+        "path"
+      ],
+      "input_fields": [
+        "deleteFiles",
+        "path",
+        "recursive",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "removedPath",
+        "success",
+        "message"
+      ],
+      "output_fields": [
+        "message",
+        "removedPath",
+        "success"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeRead",
+      "source_pointer": "/tools_list_responses/0/result/tools/47",
+      "input_required": [
+        "filePath"
+      ],
+      "input_fields": [
+        "filePath",
+        "limit",
+        "offset",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "content",
+        "filePath",
+        "totalLines",
+        "linesRead",
+        "startLine",
+        "fileSize"
+      ],
+      "output_fields": [
+        "content",
+        "filePath",
+        "fileSize",
+        "linesRead",
+        "message",
+        "startLine",
+        "totalLines"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeRefreshCodeIssuesInFile",
+      "source_pointer": "/tools_list_responses/0/result/tools/48",
+      "input_required": [
+        "filePath"
+      ],
+      "input_fields": [
+        "filePath",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "filePath",
+        "diagnosticsCount",
+        "content",
+        "success"
+      ],
+      "output_fields": [
+        "content",
+        "diagnosticsCount",
+        "filePath",
+        "success"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeSwitchRunDestination",
+      "source_pointer": "/tools_list_responses/0/result/tools/49",
+      "input_required": [
+        "displayTitle"
+      ],
+      "input_fields": [
+        "displayTitle",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "activeDestinationDisplayTitle",
+        "activeSchemeName",
+        "message"
+      ],
+      "output_fields": [
+        "activeDestinationDisplayTitle",
+        "activeSchemeName",
+        "message"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeSwitchScheme",
+      "source_pointer": "/tools_list_responses/0/result/tools/50",
+      "input_required": [
+        "schemeName"
+      ],
+      "input_fields": [
+        "schemeName",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "activeSchemeName",
+        "message"
+      ],
+      "output_fields": [
+        "activeDestinationDisplayTitle",
+        "activeSchemeName",
+        "activeTestPlanName",
+        "message"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeSwitchTestPlan",
+      "source_pointer": "/tools_list_responses/0/result/tools/51",
+      "input_required": [
+        "testPlanName"
+      ],
+      "input_fields": [
+        "testPlanName",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "activeTestPlanName",
+        "schemeName",
+        "message"
+      ],
+      "output_fields": [
+        "activeTestPlanName",
+        "activeTestPlanPath",
+        "message",
+        "schemeName"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeUpdate",
+      "source_pointer": "/tools_list_responses/0/result/tools/52",
+      "input_required": [
+        "filePath",
+        "oldString",
+        "newString"
+      ],
+      "input_fields": [
+        "filePath",
+        "newString",
+        "oldString",
+        "replaceAll",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "filePath",
+        "editsApplied",
+        "success",
+        "originalContentLength",
+        "modifiedContentLength"
+      ],
+      "output_fields": [
+        "editsApplied",
+        "filePath",
+        "message",
+        "modifiedContentLength",
+        "originalContentLength",
+        "success"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    },
+    {
+      "name": "XcodeWrite",
+      "source_pointer": "/tools_list_responses/0/result/tools/53",
+      "input_required": [
+        "filePath",
+        "content"
+      ],
+      "input_fields": [
+        "content",
+        "filePath",
+        "workspaceIdentifier"
+      ],
+      "output_required": [
+        "success",
+        "filePath",
+        "bytesWritten",
+        "linesWritten",
+        "message",
+        "wasExistingFile"
+      ],
+      "output_fields": [
+        "absolutePath",
+        "bytesWritten",
+        "filePath",
+        "linesWritten",
+        "message",
+        "success",
+        "wasExistingFile"
+      ],
+      "workspace_selector": "optional",
+      "tool_annotations_present": false,
+      "input_additional_properties_explicitly_false": false,
+      "output_additional_properties_explicitly_false": false
+    }
+  ]
+}

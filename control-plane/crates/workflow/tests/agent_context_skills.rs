@@ -430,6 +430,28 @@ fn expected_review_skill_surface_after_model_refresh(
     migrated
 }
 
+fn expected_review_skill_surface_after_headless_gate_routing(
+    mut migrated: serde_json::Value,
+) -> serde_json::Value {
+    let profile = &mut migrated["permission_profiles"]["RO_VERIFY"];
+    let commands = profile["shell"]["allow"].as_array_mut().unwrap();
+    for (action, gate) in [("build", "build"), ("test", "fast")] {
+        let previous = serde_json::json!(format!(
+            "xcodebuild -project \"Chainworks Forge.xcodeproj\" -scheme \"Chainworks Forge\" -destination \"platform=macOS\" {action}"
+        ));
+        let command = commands
+            .iter_mut()
+            .find(|command| **command == previous)
+            .unwrap();
+        *command = serde_json::json!(format!("./scripts/test-gate.sh {gate}"));
+    }
+    profile["xcode_headless"] = serde_json::json!({
+        "read": true,
+        "gates": ["build", "fast", "full", "guardrails", "list"],
+    });
+    migrated
+}
+
 #[test]
 fn security_and_prepush_migration_preserves_complete_before_state() {
     let root = repository_root();
@@ -441,8 +463,10 @@ fn security_and_prepush_migration_preserves_complete_before_state() {
         .unwrap(),
     )
     .unwrap();
-    let expected = expected_review_skill_surface_after_model_refresh(
-        expected_review_skill_surface_after_migration(before),
+    let expected = expected_review_skill_surface_after_headless_gate_routing(
+        expected_review_skill_surface_after_model_refresh(
+            expected_review_skill_surface_after_migration(before),
+        ),
     );
     let actual = current_review_skill_surface(&root);
 
@@ -475,6 +499,8 @@ fn security_and_prepush_migration_preserves_complete_before_state() {
         "/backend_profiles/gemini_prepush_flash/runtime_profile",
         "/permission_profiles/RO_VERIFY/git/status",
         "/permission_profiles/RO_VERIFY/filesystem/write/0",
+        "/permission_profiles/RO_VERIFY/xcode_headless/read",
+        "/permission_profiles/RO_VERIFY/xcode_headless/gates/0",
         "/permission_profiles/RO_PREPUSH_VERIFY/git/status",
         "/permission_profiles/RO_PREPUSH_VERIFY/filesystem/write/0",
         "/workflow_tasks/full-mvp-live.yaml:state_9_implementation_reviewed:check_implementation_security/task",

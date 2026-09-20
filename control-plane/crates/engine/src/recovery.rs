@@ -834,6 +834,34 @@ impl RecoveryService {
             .await
     }
 
+    /// Only the closed-admission daemon startup calls this pass. Live startup
+    /// repair work items must not relabel an operation that is still executing.
+    pub async fn recover_xcode_effects_before_admission(&self) -> Result<usize> {
+        use db::repos::xcode_effect_attempts;
+
+        let mut recovered = 0usize;
+        loop {
+            let batch = xcode_effect_attempts::list_dispatched_revisions(&self.pool, 100).await?;
+            if batch.is_empty() {
+                return Ok(recovered);
+            }
+            let key = batch
+                .iter()
+                .map(|attempt| format!("{}:{}", attempt.attempt_id, attempt.revision))
+                .collect::<Vec<_>>()
+                .join("|");
+            let tx = self
+                .begin_transaction(
+                    "xcode_effect.recover_dispatched",
+                    format!("batch-v1:{:x}", Sha256::digest(key.as_bytes())),
+                )
+                .await?;
+            let committed =
+                xcode_effect_attempts::recover_dispatched(tx, &batch, Utc::now()).await?;
+            recovered += committed.len();
+        }
+    }
+
     pub async fn run_startup_repair(&self) -> Result<RecoverySummary> {
         let cancelled_terminal_invariant_repairs =
             self.repair_cancelled_run_terminal_invariants().await?;

@@ -21,3 +21,8 @@ libc = "0.2"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+
+[[example]]
+name = "xcode_headless_i1"
+path = "examples/xcode_headless_i1.rs"
+test = true

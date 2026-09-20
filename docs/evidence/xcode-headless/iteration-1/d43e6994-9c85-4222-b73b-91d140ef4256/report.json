@@ -1,0 +1,39 @@
+{
+  "added_metadata": {
+    "A/eb7dd9ebfad82aeb067fa1a4701e4fe6d61ff9e3849026a5ecf715eabc1411e5": "7f3b00b5c3fdb45242d7b87e1e5c4e25d1fa8129a16c94295ecc4e8ea2235c5f"
+  },
+  "bridge_exits": [
+    {
+      "code": 1,
+      "forced": false
+    }
+  ],
+  "cases": [
+    "NotRun",
+    "Unverified",
+    "Blocked",
+    "NotRun",
+    "NotRun",
+    "NotRun",
+    "NotRun",
+    "NotRun"
+  ],
+  "deviations": [
+    {
+      "category": "i1_tool_error",
+      "payload_sha256": "bbdf69ae24705d8dfa72cd9631e515ba12114ccd53db37f989075e29e37a6024",
+      "shape": {
+        "_field_count": 2,
+        "_type": "object",
+        "content": "array",
+        "isError": "boolean"
+      }
+    }
+  ],
+  "error": "i1_tool_error",
+  "limitation": "Fixture routing only; no service confinement or production admission proof.",
+  "observations": [],
+  "outcome": "Blocked",
+  "unresolved_open": true,
+  "version": 1
+}

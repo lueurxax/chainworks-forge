@@ -233,13 +233,8 @@ fn run_junie_p090_tool_path_preflight(
 ) -> Result<()> {
     let execution_root = if let Some(override_root) = current_dir_override {
         override_root.to_path_buf()
-    } else if req.worktree_write_enabled {
-        req.worktree_root
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(&req.workspace_root))
     } else {
-        PathBuf::from(&req.workspace_root)
+        PathBuf::from(req.execution_root()?)
     };
     if !execution_root.is_dir() {
         bail!(

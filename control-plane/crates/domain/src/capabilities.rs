@@ -85,6 +85,11 @@ pub enum CapabilityToolId {
     ProviderSessionMarkProcessAbsent,
     /// P089: read-only advisory temporary artifact inventory preview (disabled-mode readback).
     TempArtifactsInventoryPreview,
+    XcodeEffectsDiagnostics,
+    XcodeEffectsReconcile,
+    XcodeProjectTrust,
+    /// Explicit global scope marker; not a runnable tool or a class default.
+    XcodeGlobalAdmin,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]

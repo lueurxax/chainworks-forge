@@ -1256,6 +1256,250 @@ pub fn is_subscription_allowed_by_surface_policy(
 
 // ── Capability filtering ────────────────────────────────────────────────
 
+/// Dedicated Xcode administration boundary; a class label alone is insufficient.
+pub fn require_xcode_operator(
+    principal: &Principal,
+    capability: CapabilityToolId,
+    run_id: Option<uuid::Uuid>,
+) -> Result<(), &'static str> {
+    if principal.class != PrincipalClass::Operator
+        || !matches!(
+            capability,
+            CapabilityToolId::XcodeEffectsDiagnostics
+                | CapabilityToolId::XcodeEffectsReconcile
+                | CapabilityToolId::XcodeProjectTrust
+        )
+        || !principal.tool_capabilities.contains(&capability)
+    {
+        return Err("xcode_operator_required");
+    }
+    if run_id.is_some_and(|id| id.is_nil()) {
+        return Err("xcode_operator_run_scope_required");
+    }
+    let unrestricted = !principal.has_explicit_surface_policies
+        && principal.graphql_policy.is_none()
+        && principal.caller_class_override.is_none()
+        && principal.run_scope.is_none()
+        && principal.tool_capabilities == default_tool_capabilities(&PrincipalClass::Operator)
+        && principal.resource_capabilities
+            == default_resource_capabilities(&PrincipalClass::Operator);
+    if unrestricted {
+        return Ok(());
+    }
+    if !principal.has_explicit_surface_policies {
+        return Err("xcode_operator_explicit_capability_required");
+    }
+    let explicitly_global = principal.run_scope.is_none()
+        && principal
+            .tool_capabilities
+            .contains(&CapabilityToolId::XcodeGlobalAdmin);
+    // Trust records are shared by every run using the same root/project. A
+    // run-scoped caller must never mutate them, even for its own valid run.
+    if capability == CapabilityToolId::XcodeProjectTrust {
+        return if explicitly_global {
+            Ok(())
+        } else {
+            Err("xcode_operator_global_scope_required")
+        };
+    }
+    let run = run_id
+        .ok_or("xcode_operator_run_scope_required")?
+        .to_string();
+    if explicitly_global
+        || principal
+            .run_scope
+            .as_ref()
+            .is_some_and(|scope| scope.contains(&run))
+    {
+        Ok(())
+    } else {
+        Err("xcode_operator_run_scope_required")
+    }
+}
+
+#[cfg(test)]
+mod xcode_operator_tests {
+    use super::*;
+
+    fn loaded_v3_operator(tools: &[&str], scope: Option<Vec<String>>) -> Principal {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("principals.json");
+        let token = "fixture-xcode-global-operator-token";
+        let record = serde_json::json!({"schema_version": 3, "principals": [{
+            "id": "explicit-xcode-operator", "class": "operator", "token": token,
+            "surface_policies": {"mcp": {"allowed_tools": tools}}, "run_scope": scope
+        }]});
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let table = PrincipalTable::load_or_bootstrap(&path).unwrap();
+        resolve_bearer(token, &table).unwrap()
+    }
+
+    #[test]
+    fn loaded_v3_explicit_global_xcode_admin_can_authorize_bootstrap() {
+        let principal = loaded_v3_operator(&["xcode.global_admin", "xcode.project_trust"], None);
+        assert!(principal.has_explicit_surface_policies);
+        assert!(principal
+            .tool_capabilities
+            .contains(&CapabilityToolId::XcodeGlobalAdmin));
+        require_xcode_operator(&principal, CapabilityToolId::XcodeProjectTrust, None).unwrap();
+        require_xcode_operator(
+            &principal,
+            CapabilityToolId::XcodeProjectTrust,
+            Some(uuid::Uuid::new_v4()),
+        )
+        .unwrap();
+        let marker_only = loaded_v3_operator(&["xcode.global_admin"], None);
+        assert!(
+            require_xcode_operator(&marker_only, CapabilityToolId::XcodeProjectTrust, None)
+                .is_err()
+        );
+        let specific_only = loaded_v3_operator(&["xcode.project_trust"], None);
+        assert!(
+            require_xcode_operator(&specific_only, CapabilityToolId::XcodeProjectTrust, None)
+                .is_err()
+        );
+        assert!(!Principal::new("legacy", PrincipalClass::Operator)
+            .tool_capabilities
+            .contains(&CapabilityToolId::XcodeGlobalAdmin));
+        let ui = Principal::from_entry(&default_operator_entry("fixture-ui-token".into()));
+        assert!(!ui
+            .tool_capabilities
+            .contains(&CapabilityToolId::XcodeGlobalAdmin));
+        assert!(require_xcode_operator(&ui, CapabilityToolId::XcodeProjectTrust, None).is_err());
+    }
+
+    #[test]
+    fn loaded_v3_run_scoped_operator_cannot_mutate_global_project_trust() {
+        let run = uuid::Uuid::new_v4();
+        for tools in [
+            vec!["xcode.project_trust"],
+            vec!["xcode.global_admin", "xcode.project_trust"],
+        ] {
+            let principal = loaded_v3_operator(&tools, Some(vec![run.to_string()]));
+            assert!(require_xcode_operator(
+                &principal,
+                CapabilityToolId::XcodeProjectTrust,
+                Some(run)
+            )
+            .is_err());
+            assert!(
+                require_xcode_operator(&principal, CapabilityToolId::XcodeProjectTrust, None)
+                    .is_err()
+            );
+        }
+        let diagnostic = loaded_v3_operator(&["xcode.effects.get"], Some(vec![run.to_string()]));
+        require_xcode_operator(
+            &diagnostic,
+            CapabilityToolId::XcodeEffectsDiagnostics,
+            Some(run),
+        )
+        .unwrap();
+        assert!(require_xcode_operator(
+            &diagnostic,
+            CapabilityToolId::XcodeEffectsDiagnostics,
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn full_operator_has_distinct_xcode_administration_capabilities() {
+        let operator = Principal::new("operator", PrincipalClass::Operator);
+        for capability in [
+            CapabilityToolId::XcodeEffectsDiagnostics,
+            CapabilityToolId::XcodeEffectsReconcile,
+            CapabilityToolId::XcodeProjectTrust,
+        ] {
+            require_xcode_operator(&operator, capability, None).unwrap();
+        }
+        assert!(is_tool_allowed(&operator, "xcode.effects.list"));
+        assert!(is_tool_allowed(&operator, "xcode.effects.get"));
+        assert!(is_tool_allowed(&operator, "xcode.effects.reconcile"));
+        assert!(is_tool_allowed(&operator, "xcode.project_trust"));
+    }
+
+    #[test]
+    fn restricted_operator_requires_specific_capability_and_explicit_matching_run() {
+        let run = uuid::Uuid::new_v4();
+        let mut operator = Principal::new("restricted", PrincipalClass::Operator);
+        operator.has_explicit_surface_policies = true;
+        operator.tool_capabilities = BTreeSet::from([CapabilityToolId::XcodeEffectsDiagnostics]);
+        assert!(require_xcode_operator(
+            &operator,
+            CapabilityToolId::XcodeEffectsDiagnostics,
+            Some(run)
+        )
+        .is_err());
+        operator.run_scope = Some(vec![run.to_string()]);
+        require_xcode_operator(
+            &operator,
+            CapabilityToolId::XcodeEffectsDiagnostics,
+            Some(run),
+        )
+        .unwrap();
+        assert!(
+            require_xcode_operator(&operator, CapabilityToolId::XcodeEffectsDiagnostics, None)
+                .is_err()
+        );
+        assert!(require_xcode_operator(
+            &operator,
+            CapabilityToolId::XcodeEffectsDiagnostics,
+            Some(uuid::Uuid::new_v4())
+        )
+        .is_err());
+        assert!(require_xcode_operator(
+            &operator,
+            CapabilityToolId::XcodeEffectsReconcile,
+            Some(run)
+        )
+        .is_err());
+        assert!(
+            require_xcode_operator(&operator, CapabilityToolId::XcodeProjectTrust, Some(run))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn non_operator_cannot_gain_xcode_administration_from_capability_bits() {
+        for class in [
+            PrincipalClass::Agent,
+            PrincipalClass::Observer,
+            PrincipalClass::ReadOnlyOperator,
+        ] {
+            let run = uuid::Uuid::new_v4();
+            let mut principal = Principal::new("not-operator", class);
+            principal.run_scope = Some(vec![run.to_string()]);
+            principal
+                .tool_capabilities
+                .insert(CapabilityToolId::XcodeEffectsReconcile);
+            assert!(require_xcode_operator(
+                &principal,
+                CapabilityToolId::XcodeEffectsReconcile,
+                Some(run)
+            )
+            .is_err());
+            assert!(!is_tool_allowed(&principal, "xcode.effects.reconcile"));
+        }
+    }
+
+    #[test]
+    fn run_scope_alone_does_not_implicitly_grant_operator_admin_capabilities() {
+        let run = uuid::Uuid::new_v4();
+        let mut principal = Principal::new("scoped-only", PrincipalClass::Operator);
+        principal.run_scope = Some(vec![run.to_string()]);
+        for capability in [
+            CapabilityToolId::XcodeEffectsDiagnostics,
+            CapabilityToolId::XcodeEffectsReconcile,
+            CapabilityToolId::XcodeProjectTrust,
+        ] {
+            assert!(require_xcode_operator(&principal, capability, Some(run)).is_err());
+        }
+    }
+}
+
 pub fn filter_tools(principal: &Principal, ids: &[CapabilityToolId]) -> Vec<CapabilityToolId> {
     ids.iter()
         .copied()
@@ -1290,11 +1534,13 @@ pub fn is_tool_allowed(principal: &Principal, tool_name: &str) -> bool {
 fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolId> {
     all_tool_capabilities()
         .into_iter()
-        .filter(|id| tool_allowed_for_class(class, *id))
+        .filter(|id| {
+            *id != CapabilityToolId::XcodeGlobalAdmin && tool_allowed_for_class(class, *id)
+        })
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 57] {
+fn all_tool_capabilities() -> [CapabilityToolId; 61] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -1357,11 +1603,19 @@ fn all_tool_capabilities() -> [CapabilityToolId; 57] {
         CapabilityToolId::SideEffectsForceReconcile,
         // P089: read-only advisory temporary artifact inventory preview.
         CapabilityToolId::TempArtifactsInventoryPreview,
+        CapabilityToolId::XcodeEffectsDiagnostics,
+        CapabilityToolId::XcodeEffectsReconcile,
+        CapabilityToolId::XcodeProjectTrust,
+        CapabilityToolId::XcodeGlobalAdmin,
     ]
 }
 
 fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool {
     match id {
+        CapabilityToolId::XcodeEffectsDiagnostics
+        | CapabilityToolId::XcodeEffectsReconcile
+        | CapabilityToolId::XcodeProjectTrust
+        | CapabilityToolId::XcodeGlobalAdmin => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::IdeasCreate => {
             matches!(class, PrincipalClass::Operator | PrincipalClass::Agent)
         }
@@ -1597,6 +1851,12 @@ where
 
 fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
     match name {
+        "xcode.effects.list" | "xcode.effects.get" => {
+            Some(CapabilityToolId::XcodeEffectsDiagnostics)
+        }
+        "xcode.effects.reconcile" => Some(CapabilityToolId::XcodeEffectsReconcile),
+        "xcode.project_trust" => Some(CapabilityToolId::XcodeProjectTrust),
+        "xcode.global_admin" => Some(CapabilityToolId::XcodeGlobalAdmin),
         "ideas.create" => Some(CapabilityToolId::IdeasCreate),
         "ideas.list" => Some(CapabilityToolId::IdeasList),
         "runs.start" => Some(CapabilityToolId::RunsStart),

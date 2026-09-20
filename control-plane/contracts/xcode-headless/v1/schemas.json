@@ -1,0 +1,594 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "x-maxUtf8Bytes": 256,
+      "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$"
+    },
+    "absolutePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "x-maxUtf8Bytes": 2048,
+      "pattern": "^/[^\\u0000-\\u001f\\u007f-\\u009f]*$"
+    },
+    "organizationPath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "x-maxUtf8Bytes": 2048,
+      "pattern": "^(?!/)(?![\\s\\S]*//)(?![\\s\\S]*(?:^|/)\\.{1,2}(?:/|$))(?![\\s\\S]*/$)[^\\u0000-\\u001f\\u007f-\\u009f\\\\:]+$"
+    },
+    "message": {
+      "type": "string",
+      "minLength": 0,
+      "maxLength": 4096,
+      "x-maxUtf8Bytes": 4096
+    },
+    "initialize": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocolVersion": {
+          "const": "2025-06-18"
+        },
+        "serverInfo": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "const": "xcode-tools"
+            },
+            "version": {
+              "const": "25317"
+            }
+          },
+          "required": [
+            "name",
+            "version"
+          ]
+        },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "tools": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "listChanged": {
+                  "type": "boolean"
+                }
+              },
+              "required": []
+            }
+          },
+          "required": [
+            "tools"
+          ]
+        },
+        "instructions": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 4096,
+          "x-maxUtf8Bytes": 4096
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "serverInfo",
+        "capabilities"
+      ]
+    },
+    "openArguments": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/absolutePath"
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "openResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workspaceIdentifier": {
+          "$ref": "#/$defs/identifier"
+        },
+        "workspacePath": {
+          "$ref": "#/$defs/absolutePath"
+        }
+      },
+      "required": [
+        "workspaceIdentifier",
+        "workspacePath"
+      ]
+    },
+    "openPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workspaceIdentifier": {
+          "$ref": "#/$defs/identifier"
+        },
+        "workspacePath": {
+          "$ref": "#/$defs/absolutePath"
+        },
+        "activeScheme": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 256,
+          "x-maxUtf8Bytes": 256
+        },
+        "activeRunDestination": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2048,
+          "x-maxUtf8Bytes": 2048
+        },
+        "message": {
+          "$ref": "#/$defs/message"
+        }
+      },
+      "required": [
+        "workspaceIdentifier",
+        "workspacePath"
+      ]
+    },
+    "readArguments": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "filePath": {
+          "$ref": "#/$defs/organizationPath"
+        },
+        "workspaceIdentifier": {
+          "$ref": "#/$defs/identifier"
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "default": 1
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600,
+          "default": 600
+        }
+      },
+      "required": [
+        "filePath"
+      ],
+      "x-runtime-constraints": [
+        "workspaceIdentifier, if present, equals the supplied validated binding alias; omission injects that alias",
+        "filePath is an Xcode project organization path, not a filesystem confinement claim"
+      ]
+    },
+    "readPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 262144,
+          "x-maxUtf8Bytes": 262144
+        },
+        "filePath": {
+          "$ref": "#/$defs/organizationPath"
+        },
+        "fileSize": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "totalLines": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "linesRead": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 600
+        },
+        "startLine": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "message": {
+          "$ref": "#/$defs/message"
+        }
+      },
+      "required": [
+        "content",
+        "filePath",
+        "fileSize",
+        "totalLines",
+        "linesRead",
+        "startLine"
+      ],
+      "x-runtime-constraints": [
+        "filePath equals requested filePath",
+        "startLine equals requested offset",
+        "linesRead <= requested limit",
+        "linesRead <= totalLines",
+        "if linesRead > 0: startLine <= totalLines and linesRead <= totalLines - startLine + 1"
+      ]
+    },
+    "readResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "content": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 262144,
+          "x-maxUtf8Bytes": 262144
+        },
+        "filePath": {
+          "$ref": "#/$defs/organizationPath"
+        },
+        "fileSize": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "totalLines": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "linesRead": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 600
+        },
+        "startLine": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "schema_version",
+        "content",
+        "filePath",
+        "fileSize",
+        "totalLines",
+        "linesRead",
+        "startLine"
+      ],
+      "x-runtime-constraints": [
+        "filePath equals requested filePath",
+        "startLine equals requested offset",
+        "linesRead <= requested limit",
+        "linesRead <= totalLines",
+        "if linesRead > 0: startLine <= totalLines and linesRead <= totalLines - startLine + 1"
+      ]
+    },
+    "textItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "text"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 1048576,
+          "x-maxUtf8Bytes": 1048576
+        }
+      },
+      "required": [
+        "type",
+        "text"
+      ]
+    },
+    "errorResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "error": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "input_too_large"
+                },
+                "message": {
+                  "const": "JSON input exceeds the contract bound."
+                },
+                "retry": {
+                  "const": "never"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retry"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "invalid_json"
+                },
+                "message": {
+                  "const": "JSON input is invalid."
+                },
+                "retry": {
+                  "const": "never"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retry"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "duplicate_key"
+                },
+                "message": {
+                  "const": "JSON contains a duplicate object key."
+                },
+                "retry": {
+                  "const": "never"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retry"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "unsafe_number"
+                },
+                "message": {
+                  "const": "JSON number is outside the safe integer range."
+                },
+                "retry": {
+                  "const": "never"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retry"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "invalid_domain"
+                },
+                "message": {
+                  "const": "Digest domain is invalid."
+                },
+                "retry": {
+                  "const": "never"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retry"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "schema_drift"
+                },
+                "message": {
+                  "const": "The upstream contract is not supported."
+                },
+                "retry": {
+                  "const": "never"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retry"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "invalid_arguments"
+                },
+                "message": {
+                  "const": "Tool arguments do not match the contract."
+                },
+                "retry": {
+                  "const": "never"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retry"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "invalid_envelope"
+                },
+                "message": {
+                  "const": "Tool response envelope does not match the contract."
+                },
+                "retry": {
+                  "const": "never"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retry"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "upstream_error"
+                },
+                "message": {
+                  "const": "The upstream tool reported an error."
+                },
+                "retry": {
+                  "const": "never"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retry"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "invalid_result"
+                },
+                "message": {
+                  "const": "Tool result does not match the contract."
+                },
+                "retry": {
+                  "const": "never"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retry"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "invalid_bundle"
+                },
+                "message": {
+                  "const": "The embedded contract bundle is invalid."
+                },
+                "retry": {
+                  "const": "never"
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retry"
+              ]
+            }
+          ]
+        }
+      },
+      "required": [
+        "schema_version",
+        "error"
+      ]
+    },
+    "openEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "structuredContent": {
+          "$ref": "#/$defs/openPayload"
+        },
+        "isError": {
+          "const": false
+        },
+        "content": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "$ref": "#/$defs/textItem"
+          }
+        }
+      },
+      "required": [
+        "structuredContent"
+      ],
+      "x-runtime-constraints": [
+        "content[0].text, if present, parses as duplicate-free bounded JSON and equals structuredContent",
+        "isError=true is always rejected as upstream_error; error payloads are not forwarded"
+      ]
+    },
+    "readEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "structuredContent": {
+          "$ref": "#/$defs/readPayload"
+        },
+        "isError": {
+          "const": false
+        },
+        "content": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "$ref": "#/$defs/textItem"
+          }
+        }
+      },
+      "required": [
+        "structuredContent"
+      ],
+      "x-runtime-constraints": [
+        "content[0].text, if present, parses as duplicate-free bounded JSON and equals structuredContent",
+        "isError=true is always rejected as upstream_error; error payloads are not forwarded"
+      ]
+    }
+  }
+}

@@ -14,6 +14,7 @@ pub mod discovery;
 pub mod error_sanitizer;
 pub mod escalation;
 pub mod events;
+pub mod execution_root;
 pub mod idea;
 pub mod ids;
 pub mod lifecycle;
@@ -40,6 +41,9 @@ pub mod toolchain;
 pub mod toolchain_diagnostics;
 pub mod validation;
 pub mod workflow_conflict;
+pub mod xcode_contract;
+pub mod xcode_effect;
+pub mod xcode_release;
 pub mod xcode_runtime;
 
 // P029: PrincipalClass is canonically defined in domain::commands.

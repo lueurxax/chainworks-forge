@@ -1,0 +1,48 @@
+{
+  "added_metadata": {
+    "A/eb7dd9ebfad82aeb067fa1a4701e4fe6d61ff9e3849026a5ecf715eabc1411e5": "7f3b00b5c3fdb45242d7b87e1e5c4e25d1fa8129a16c94295ecc4e8ea2235c5f",
+    "B/eb7dd9ebfad82aeb067fa1a4701e4fe6d61ff9e3849026a5ecf715eabc1411e5": "7f3b00b5c3fdb45242d7b87e1e5c4e25d1fa8129a16c94295ecc4e8ea2235c5f"
+  },
+  "bridge_exits": [
+    {
+      "code": 1,
+      "forced": false
+    },
+    {
+      "code": 1,
+      "forced": false
+    }
+  ],
+  "cases": [
+    "NotRun",
+    "Pass",
+    "Pass",
+    "Pass",
+    "Pass",
+    "Pass",
+    "NotRun",
+    "Pass"
+  ],
+  "deviations": [],
+  "error": null,
+  "limitation": "Fixture routing only; no service confinement or production admission proof.",
+  "observations": [
+    {
+      "fixture": "A",
+      "generation_sha256": "b27b2b7abb9c88362af1315fb6f6d8ffcd3f76945a89c5a83e1ad0e678f963a7",
+      "mapping": "Observed",
+      "verified_reads": 4,
+      "workspace_alias": "workspace-1"
+    },
+    {
+      "fixture": "B",
+      "generation_sha256": "b27b2b7abb9c88362af1315fb6f6d8ffcd3f76945a89c5a83e1ad0e678f963a7",
+      "mapping": "Observed",
+      "verified_reads": 2,
+      "workspace_alias": "workspace-2"
+    }
+  ],
+  "outcome": "Partial",
+  "unresolved_open": false,
+  "version": 1
+}

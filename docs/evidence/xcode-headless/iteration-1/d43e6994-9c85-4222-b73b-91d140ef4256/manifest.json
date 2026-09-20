@@ -1,0 +1,12 @@
+{
+  "fixture_seeds": {
+    "A/Fixture.xcodeproj/project.pbxproj": "3003967e959b6af8f20b06d20a80231d436937e09aafc3a074fd30e858234cdc",
+    "A/Sources/Sentinel.txt": "9acb805642e89fe23f2a22b6ab4c4e12935ed47955221179e16aff754794e6b2",
+    "B/Fixture.xcodeproj/project.pbxproj": "3003967e959b6af8f20b06d20a80231d436937e09aafc3a074fd30e858234cdc",
+    "B/Sources/Sentinel.txt": "4cdd0bbfd94bd90bfac7379b8235a6f9e153e18852c89d2e02342e40fd69aff8"
+  },
+  "inspection_sha256": "722084d44dbeadf11afb71851a9f7d178ae2a00f5000e39ae92bc0261b7b663e",
+  "report.json": "c7cc9998868bcc691f0b39099b0f1964a058592e2e669312f9e8025074639884",
+  "source_sha256": "e3485682a0939b61f4354a89d1f58f76cad4fe99b048dbb24bf208cc56c8f80e",
+  "version": 1
+}

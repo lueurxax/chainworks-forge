@@ -1,0 +1,16 @@
+{
+  "fixture_seeds": {
+    "A/Fixture.xcodeproj/project.pbxproj": "308252c2fe45d58831a2ba243f3f5e87b54482b1fa1b9eea2669fa8baf55a762",
+    "A/Fixture.xcodeproj/xcshareddata/xcschemes/Fixture.xcscheme": "b3baf0fdabe39adc62ff43ff1908bbd48b5ca008d617db885428ea46e6c20396",
+    "A/Sources/Sentinel.txt": "9acb805642e89fe23f2a22b6ab4c4e12935ed47955221179e16aff754794e6b2",
+    "A/Sources/main.c": "2ad75d95660563887d8d3f1d0ae1dcf18c2379cbd83a5c72f5ab276351ee6949",
+    "B/Fixture.xcodeproj/project.pbxproj": "308252c2fe45d58831a2ba243f3f5e87b54482b1fa1b9eea2669fa8baf55a762",
+    "B/Fixture.xcodeproj/xcshareddata/xcschemes/Fixture.xcscheme": "b3baf0fdabe39adc62ff43ff1908bbd48b5ca008d617db885428ea46e6c20396",
+    "B/Sources/Sentinel.txt": "4cdd0bbfd94bd90bfac7379b8235a6f9e153e18852c89d2e02342e40fd69aff8",
+    "B/Sources/main.c": "2ad75d95660563887d8d3f1d0ae1dcf18c2379cbd83a5c72f5ab276351ee6949"
+  },
+  "inspection_sha256": "58b529f37da4f574abd8c859e75d3358e77e606f50229fc258d10b82f76be4ec",
+  "report.json": "d8c0978a907991328ca45050630151a9eaa56acfe1b33389d9cd24e913dd002c",
+  "source_sha256": "05dce156a417de8e8b9b86c077611e2815f34a396aed6d771502676501fd8785",
+  "version": 1
+}

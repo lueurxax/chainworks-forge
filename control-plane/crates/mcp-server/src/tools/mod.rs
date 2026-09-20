@@ -238,6 +238,12 @@ pub fn codex_compatible_tool(mut tool: McpTool) -> McpTool {
 
 pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
     match id {
+        // These capabilities govern the authenticated offline operator CLI.
+        // They are deliberately absent from all_capability_tool_ids and the MCP registry.
+        CapabilityToolId::XcodeEffectsDiagnostics
+        | CapabilityToolId::XcodeEffectsReconcile
+        | CapabilityToolId::XcodeProjectTrust
+        | CapabilityToolId::XcodeGlobalAdmin => panic!("operator-only capability has no MCP tool"),
         CapabilityToolId::IdeasCreate => tool_spec_by_name(ideas::tool_specs(), "ideas.create"),
         CapabilityToolId::IdeasList => tool_spec_by_name(ideas::tool_specs(), "ideas.list"),
         CapabilityToolId::RunsStart => tool_spec_by_name(runs::tool_specs(), "runs.start"),
@@ -424,6 +430,28 @@ fn tool_spec_by_name(specs: Vec<McpTool>, name: &str) -> McpTool {
 #[cfg(test)]
 mod tests {
     use domain::CapabilityToolId;
+
+    #[test]
+    fn xcode_operator_capabilities_are_not_advertised_or_routed_over_mcp() {
+        for id in [
+            CapabilityToolId::XcodeEffectsDiagnostics,
+            CapabilityToolId::XcodeEffectsReconcile,
+            CapabilityToolId::XcodeProjectTrust,
+            CapabilityToolId::XcodeGlobalAdmin,
+        ] {
+            assert!(!super::all_capability_tool_ids().contains(&id));
+        }
+        for name in [
+            "xcode.effects.list",
+            "xcode.effects.get",
+            "xcode.effects.reconcile",
+            "xcode.project_trust",
+            "xcode.global_admin",
+        ] {
+            assert!(super::capability_id_for(name).is_none());
+            assert!(!super::all_tool_specs().iter().any(|tool| tool.name == name));
+        }
+    }
 
     #[test]
     fn mcp_tool_converter_covers_registered_tools() {

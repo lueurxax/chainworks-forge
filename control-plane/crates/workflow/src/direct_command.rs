@@ -428,11 +428,14 @@ struct CommandClassification {
 
 fn classify_command(raw: &str) -> CommandClassification {
     let argv_tokens = tokenize_shell_words(raw);
-    let matched_xcode_tool =
-        matched_xcode_tool_from_tokens(&argv_tokens).or_else(|| matched_xcode_tool(raw));
+    let matched_xcode_tool = if is_canonical_gate_invocation(&argv_tokens) {
+        Some("chainworks-test-gate".to_string())
+    } else {
+        matched_xcode_tool_from_tokens(&argv_tokens).or_else(|| matched_xcode_tool(raw))
+    };
     let contributes_to_xcode_shim_injection_signal = matches!(
         matched_xcode_tool.as_deref(),
-        Some("xcodebuild" | "simctl" | "xcrun")
+        Some("xcodebuild" | "simctl" | "xcrun" | "chainworks-test-gate")
     );
     let error_code = hard_fail_code(raw, &argv_tokens);
 
@@ -442,6 +445,17 @@ fn classify_command(raw: &str) -> CommandClassification {
         contributes_to_xcode_shim_injection_signal,
         error_code,
     }
+}
+
+fn is_canonical_gate_invocation(argv: &[String]) -> bool {
+    let script = match argv.first().map(String::as_str) {
+        Some("bash" | "/bin/bash") => argv.get(1).map(String::as_str),
+        command => command,
+    };
+    matches!(
+        script,
+        Some("./scripts/test-gate.sh" | "scripts/test-gate.sh")
+    )
 }
 
 fn hard_fail_code(raw: &str, argv_tokens: &[String]) -> Option<String> {
@@ -563,6 +577,7 @@ fn matched_xcode_tool_from_tokens(argv_tokens: &[String]) -> Option<String> {
 
 fn mentions_xcode_tool_or_path(raw: &str) -> bool {
     matched_xcode_tool(raw).is_some()
+        || is_canonical_gate_invocation(&tokenize_shell_words(raw))
         || raw.contains("/Applications/Xcode")
         || raw.contains("/Contents/Developer/")
         || raw.contains("DEVELOPER_DIR=")
@@ -683,6 +698,40 @@ fn compact_value(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_test_gate_declarations_signal_shim_injection_without_granting_authority() {
+        for command in [
+            "./scripts/test-gate.sh build",
+            "scripts/test-gate.sh fast",
+            "bash ./scripts/test-gate.sh guardrails",
+            "/bin/bash scripts/test-gate.sh list",
+        ] {
+            let classified = classify_command(command);
+            assert_eq!(
+                classified.matched_xcode_tool.as_deref(),
+                Some("chainworks-test-gate"),
+                "{command}"
+            );
+            assert!(
+                classified.contributes_to_xcode_shim_injection_signal,
+                "{command}"
+            );
+            assert!(classified.error_code.is_none(), "{command}");
+        }
+        for command in [
+            "echo ./scripts/test-gate.sh build",
+            "cat scripts/test-gate.sh",
+            "other/test-gate.sh build",
+            "scripts/test-gate.sh.bak build",
+            "printf 'scripts/test-gate.sh build'",
+        ] {
+            assert!(
+                !classify_command(command).contributes_to_xcode_shim_injection_signal,
+                "{command}"
+            );
+        }
+    }
 
     #[test]
     fn classifies_path_based_xcodebuild_as_shimmed_command() {

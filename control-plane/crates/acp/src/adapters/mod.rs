@@ -1054,10 +1054,10 @@ pub trait AcpAdapter: Send + Sync {
             )
             .await?;
         }
-        let execution_root = launch_spec
-            .current_dir_override
-            .clone()
-            .unwrap_or_else(|| provider_execution_root(req));
+        let execution_root = match launch_spec.current_dir_override.as_ref() {
+            Some(path) => path.clone(),
+            None => provider_execution_root(req)?,
+        };
         ensure_provider_execution_root(&execution_root)?;
         launch_spec.verify_capability_fingerprint()?;
         command
@@ -1323,15 +1323,8 @@ fn reject_path_symlink_components(path: &Path, field: &str) -> Result<()> {
     Ok(())
 }
 
-fn provider_execution_root(req: &ExecutionRequest) -> PathBuf {
-    if req.worktree_write_enabled {
-        req.worktree_root
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(&req.workspace_root))
-    } else {
-        PathBuf::from(&req.workspace_root)
-    }
+fn provider_execution_root(req: &ExecutionRequest) -> Result<PathBuf> {
+    Ok(PathBuf::from(req.execution_root()?))
 }
 
 fn ensure_provider_execution_root(path: &Path) -> Result<()> {
@@ -2042,10 +2035,14 @@ mod tests {
             toolchain_go_scope_enabled: false,
         };
 
-        assert_eq!(provider_execution_root(&req), worktree);
+        assert_eq!(provider_execution_root(&req).unwrap(), worktree);
 
         req.worktree_write_enabled = false;
-        assert_eq!(provider_execution_root(&req), workspace);
+        assert_eq!(provider_execution_root(&req).unwrap(), workspace);
+        req.worktree_strategy = Some("shared_implementation_worktree".into());
+        assert_eq!(provider_execution_root(&req).unwrap(), worktree);
+        req.worktree_root = None;
+        assert!(provider_execution_root(&req).is_err());
     }
 
     #[cfg(unix)]

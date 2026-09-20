@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Route before cache/bootstrap work. Authentication and authority live on the socket server.
+if [[ -n "${CHAINWORKS_XCODE_SHIM_SOCKET:-}" || -n "${CHAINWORKS_XCODE_SHIM_TOKEN_ID:-}" || -n "${CHAINWORKS_XCODE_SHIM_TOKEN:-}" ]]; then
+  if [[ -z "${CHAINWORKS_XCODE_SHIM_SOCKET:-}" || -z "${CHAINWORKS_XCODE_SHIM_TOKEN_ID:-}" || -z "${CHAINWORKS_XCODE_SHIM_TOKEN:-}" || "${CHAINWORKS_XCODE_SHIM_DIR:-}" != /* || ! -x "${CHAINWORKS_XCODE_SHIM_DIR:-}/chainworks-test-gate" ]]; then
+    printf '%s\n' 'xcode_gate_shim_credentials_or_executable_missing' >&2
+    exit 126
+  fi
+  exec "$CHAINWORKS_XCODE_SHIM_DIR/chainworks-test-gate" "$@"
+fi
+
 DEFAULT_ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ -n "${CHAINWORKS_TEST_GATE_ROOT_DIR:-}" ]]; then
   ROOT_DIR="$(cd "$CHAINWORKS_TEST_GATE_ROOT_DIR" && pwd)"
@@ -2709,6 +2718,10 @@ Available gates:
   agent-context-skills  Provider-free mission context, frozen Agent Skills, and source-inventory gate
   codex-planned-variant-slice
                   Pinned Codex model/effort admission, ACP, readback, and SwiftUI label gate
+  xcode-headless-shim  Offline canonical shim route, socket authority, and temp-process fixtures
+  xcode-headless-catalog  Canonical catalog permissions and direct-command scanner fixtures
+  xcode-headless-project-trust  Offline project-trust admission fixtures
+  xcode-headless-host-startup  Offline opt-in service-startup policy fixtures
   proposal-094|p094  Proposal 094 workflow-owned blocker-boundary contract/readback gate
   proposal-096|p096  Proposal 096 bounded tool output and safe-search guard retained alias gate
   proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
@@ -2741,6 +2754,52 @@ if should_wrap_gate_in_terminal_gui_session "$GATE"; then
 fi
 
 case "$GATE" in
+  xcode-headless-host-startup)
+    log "Headless host startup gate: offline policy fixtures only"
+    export CHAINWORKS_AUTO_CACHE_CLEANUP=0
+    export CARGO_TARGET_DIR
+    CARGO_TARGET_DIR="$(chainworks_test_gate_cargo_target_dir "${CHAINWORKS_XCODE_CARGO_TARGET_DIR:-target/xcode-headless-host-startup}")"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test --locked --offline -p acp --lib xcode_headless_host::tests::startup_
+    )
+    ;;
+  xcode-headless-project-trust)
+    log "Headless project trust gate: offline admission fixtures"
+    export CHAINWORKS_AUTO_CACHE_CLEANUP=0
+    export CARGO_TARGET_DIR
+    CARGO_TARGET_DIR="$(chainworks_test_gate_cargo_target_dir "${CHAINWORKS_XCODE_CARGO_TARGET_DIR:-target/xcode-headless-project-trust}")"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test --locked --offline -p acp --test xcode_project_trust
+    )
+    ;;
+  xcode-headless-catalog)
+    log "Headless catalog gate: frozen permissions and canonical command signals"
+    export CHAINWORKS_AUTO_CACHE_CLEANUP=0
+    export CARGO_TARGET_DIR
+    CARGO_TARGET_DIR="$(chainworks_test_gate_cargo_target_dir "${CHAINWORKS_XCODE_CARGO_TARGET_DIR:-target/xcode-headless-catalog}")"
+    (
+      cd "$ROOT_DIR/control-plane"
+      status=0
+      cargo test --locked --offline -p workflow --test xcode_headless_catalog || status=$?
+      cargo test --locked --offline -p workflow --lib direct_command::tests || status=$?
+      cargo test --locked --offline -p workflow --test agent_context_skills security_and_prepush_migration_preserves_complete_before_state || status=$?
+      exit "$status"
+    )
+    ;;
+  xcode-headless-shim)
+    log "Headless shim gate: offline fixtures only; no Apple tools or IDE"
+    export CHAINWORKS_AUTO_CACHE_CLEANUP=0
+    export CARGO_TARGET_DIR
+    CARGO_TARGET_DIR="$(chainworks_test_gate_cargo_target_dir "${CHAINWORKS_XCODE_CARGO_TARGET_DIR:-target/xcode-headless-shim}")"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test --locked --offline -p acp --test xcode_headless_gate
+      cargo test --locked --offline -p acp --lib xcode_shim::tests
+      cargo test --locked --offline -p daemon xcode_shim_socket::tests
+    )
+    ;;
   list|-h|--help)
     print_usage
     ;;

@@ -32,9 +32,8 @@ pub fn attach_xcode_broker_execution_context(
         else {
             continue;
         };
-        if intent.workspace_root.is_none() {
-            intent.workspace_root = Some(workspace_root.to_string());
-        }
+        // Registry hints cannot replace the engine's effective checkout authority.
+        intent.workspace_root = Some(workspace_root.to_string());
         if intent.permission_profile_id.is_none() {
             intent.permission_profile_id = permission_profile_id.map(ToOwned::to_owned);
         }
@@ -748,11 +747,6 @@ mcp:
             "/workspace/other",
             Some("workspace_write"),
         );
-        if let ResolvedMcpServerTransport::XcodeBrokerIntent { intent } =
-            &mut changed_resolution.payloads[0].transport
-        {
-            intent.workspace_root = Some("/workspace/other".to_string());
-        }
         let changed_hash = xcode_broker_contract_hash(&changed_resolution.payloads)
             .expect("xcode broker payload should produce a contract hash");
 

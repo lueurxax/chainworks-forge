@@ -44,6 +44,10 @@ At the current baseline, the product includes:
 - P080 stale-execution reconciliation phase-scoped detection/readback in the Rust daemon: durable rollout-control seeding with a live-disable gate, a bounded running-execution classifier into `p080_readback_heartbeats_v1`, live-loop auto-repair for promoted `acp_startup_stale` and `scheduler_ownership_drift` stale candidates, diagnose-only readback/events for unpromoted stale candidates when `detection_only` is enabled, read-only GraphQL `p080Diagnostics` plus live polling `p080DiagnosticsUpdates` readback, and MCP `p080.diagnostics.get.v1` plus phase-gated `p080.reconcile.request.v1`/`p080.clear_permanent_hold.v1` surfaces. Operator MCP `repair_if_safe` can requeue `acp_startup_stale` in Phase 2+ and `scheduler_ownership_drift` in Phase 3+ using durable dedup fences and ownership-witness predicate hashes; helper reap, side-effect-adjacent repair, manual hold, and permanent-hold clear remain disabled in the current P080 closeout because their owning safety contracts are not present in mainline,
 - bounded artifact discovery and engine-owned settlement pipeline,
 - provider toolchain cache mapping for isolated Xcode and Go build roots,
+- [headless Xcode runtime](xcode-headless-runtime.md): prepare-before-policy
+  invocation bindings, closed MCP reads, journalled canonical gates, common
+  project coordination, explicit trust and operator reconciliation; no IDE
+  fallback. Packaged consent and production cutover are separate live evidence,
 - per-agent MCP policy resolution with persisted requested/predicted/actual/denied truth,
 - canonical execution-truth, recovery, and report-read behavior for settled attempts,
 - provider settings, diagnostics, and frozen provider bindings,

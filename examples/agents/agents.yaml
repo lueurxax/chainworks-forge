@@ -892,6 +892,7 @@ permission_profiles:
       legacy_allow: []
       runtime_authority: false
   RO_REVIEW:
+    xcode_headless: {read: true, gates: []}
     filesystem:
       read:
         - ${CHAINWORKS_REPO_ROOT:-.}/**
@@ -930,6 +931,7 @@ permission_profiles:
       legacy_allow: []
       runtime_authority: false
   RO_VERIFY:
+    xcode_headless: {read: true, gates: [build, fast, full, guardrails, list]}
     filesystem:
       read:
         - ${CHAINWORKS_REPO_ROOT:-.}/**
@@ -962,8 +964,8 @@ permission_profiles:
         - cargo clippy
         - swift build
         - swift test
-        - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" build
-        - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" test
+        - ./scripts/test-gate.sh build
+        - ./scripts/test-gate.sh fast
         - npm test
         - pnpm test
         - yarn test
@@ -979,6 +981,7 @@ permission_profiles:
       legacy_allow: []
       runtime_authority: false
   PROPOSAL_WRITE:
+    xcode_headless: {read: true, gates: []}
     filesystem:
       read:
         - ${CHAINWORKS_META_ROOT:-.chainworks}/**
@@ -1014,6 +1017,7 @@ permission_profiles:
       legacy_allow: []
       runtime_authority: false
   CODE_WRITE:
+    xcode_headless: {read: true, gates: [build, fast, full, guardrails, list]}
     filesystem:
       read:
         - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**
@@ -1064,8 +1068,8 @@ permission_profiles:
         - cargo clippy
         - swift build
         - swift test
-        - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" build
-        - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" test
+        - ./scripts/test-gate.sh build
+        - ./scripts/test-gate.sh fast
         - npm test
         - pnpm test
         - yarn test
@@ -1083,6 +1087,7 @@ permission_profiles:
       legacy_allow: []
       runtime_authority: false
   DOC_WRITE:
+    xcode_headless: {read: true, gates: []}
     filesystem:
       read:
         - ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}/**
@@ -2022,8 +2027,8 @@ agents:
       - cargo test
       - swift build
       - swift test
-      - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" build
-      - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" test
+      - ./scripts/test-gate.sh build
+      - ./scripts/test-gate.sh fast
     requires_xcode_host_execution: true
     inputs:
       - approved_proposal
@@ -2125,8 +2130,8 @@ agents:
       - go test ./...
       - cargo test
       - swift test
-      - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" build
-      - xcodebuild -project "Chainworks Forge.xcodeproj" -scheme "Chainworks Forge" -destination "platform=macOS" test
+      - ./scripts/test-gate.sh build
+      - ./scripts/test-gate.sh fast
     requires_xcode_host_execution: true
     inputs:
       - approved_proposal

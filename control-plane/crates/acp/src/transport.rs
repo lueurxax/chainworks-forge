@@ -164,16 +164,7 @@ pub fn build_session_new_params(
     req: &ExecutionRequest,
     config: &AcpSessionConfig<'_>,
 ) -> Result<Value> {
-    let uses_worktree_cwd = req.worktree_write_enabled
-        || matches!(
-            req.worktree_strategy.as_deref(),
-            Some("dedicated") | Some("shared_implementation_worktree")
-        );
-    let effective_cwd = if uses_worktree_cwd {
-        req.worktree_root.as_deref().unwrap_or(&req.workspace_root)
-    } else {
-        &req.workspace_root
-    };
+    let effective_cwd = req.execution_root()?;
     let mut sn_params = serde_json::json!({
         "mcpServers": mcp_servers_wire_value(&req.mcp_servers)
             .context("ACP: serialize resolved MCP server payloads")?,
@@ -477,7 +468,7 @@ impl ClaudeLocalActivityMonitor {
             return None;
         }
         let projects_root = claude_projects_root()?;
-        let cwd = effective_claude_cwd(req);
+        let cwd = req.execution_root().ok()?;
         let project_key = claude_project_key(cwd);
         let transcript_path = projects_root
             .join(project_key)
@@ -749,19 +740,6 @@ fn claude_projects_root() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join(".claude").join("projects"))
-}
-
-fn effective_claude_cwd(req: &ExecutionRequest) -> &str {
-    let uses_worktree_cwd = req.worktree_write_enabled
-        || matches!(
-            req.worktree_strategy.as_deref(),
-            Some("dedicated") | Some("shared_implementation_worktree")
-        );
-    if uses_worktree_cwd {
-        req.worktree_root.as_deref().unwrap_or(&req.workspace_root)
-    } else {
-        &req.workspace_root
-    }
 }
 
 fn claude_project_key(cwd: &str) -> String {

@@ -1,14 +1,21 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
+use acp::xcode_shim::XcodeShimDispatchAuthority;
 use acp::{
     handle_xcode_shim_unix_stream_with_grant_resolver, XcodeHostExecutorProcessConfig,
     XcodeRuntimeObservationSink, XcodeShimDispatchOutcome, XcodeShimGrantRecord,
     XcodeShimGrantResolver, XcodeShimGrantStore, XcodeShimProcessInspector,
     XcodeShimResolvedDispatch,
 };
+use acp::{
+    XcodeShimCommandPolicy, XcodeShimDispatchAuthorization, XcodeShimDispatchRequest,
+    XcodeShimRouteDecision,
+};
 use anyhow::Context;
+use domain::ids::AgentExecutionId;
+use uuid::Uuid;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -19,30 +26,47 @@ use tracing::warn;
 
 #[derive(Default)]
 pub struct XcodeShimGrantRegistry {
-    grants: RwLock<HashMap<String, XcodeShimGrantRecord>>,
+    state: RwLock<XcodeShimGrantState>,
+    authority: Option<Arc<dyn XcodeShimDispatchAuthority>>,
+}
+
+#[derive(Default)]
+struct XcodeShimGrantState {
+    grants: HashMap<String, XcodeShimGrantRecord>,
+    invocations: HashMap<String, AgentExecutionId>,
 }
 
 impl XcodeShimGrantRegistry {
+    pub fn with_headless_authority(authority: Arc<dyn XcodeShimDispatchAuthority>) -> Self {
+        Self {
+            state: RwLock::default(),
+            authority: Some(authority),
+        }
+    }
+
     pub fn insert(&self, record: XcodeShimGrantRecord) {
-        self.grants
+        self.state
             .write()
             .expect("xcode shim grant registry lock poisoned")
+            .grants
             .insert(record.grant.token_id.clone(), record);
     }
 
     pub fn remove(&self, token_id: &str) -> Option<XcodeShimGrantRecord> {
-        self.grants
+        let mut state = self
+            .state
             .write()
-            .expect("xcode shim grant registry lock poisoned")
-            .remove(token_id)
+            .expect("xcode shim grant registry lock poisoned");
+        state.invocations.remove(token_id);
+        state.grants.remove(token_id)
     }
 
     pub fn set_active_prompt(&self, token_id: &str, active_prompt: bool) -> bool {
-        let mut grants = self
-            .grants
+        let mut state = self
+            .state
             .write()
             .expect("xcode shim grant registry lock poisoned");
-        let Some(record) = grants.get_mut(token_id) else {
+        let Some(record) = state.grants.get_mut(token_id) else {
             return false;
         };
         record.active_prompt = active_prompt;
@@ -59,6 +83,14 @@ impl XcodeShimGrantRegistry {
 }
 
 impl XcodeShimGrantStore for XcodeShimGrantRegistry {
+    fn bind_xcode_shim_invocation(&self, token_id: &str, invocation_id: AgentExecutionId) {
+        self.state
+            .write()
+            .expect("xcode shim grant registry lock poisoned")
+            .invocations
+            .insert(token_id.to_owned(), invocation_id);
+    }
+
     fn insert_xcode_shim_grant(&self, record: XcodeShimGrantRecord) {
         self.insert(record);
     }
@@ -77,7 +109,13 @@ pub fn ensure_xcode_shim_dir(app_support_dir: &Path) -> anyhow::Result<PathBuf> 
     let shim_dir = XcodeShimGrantRegistry::shim_dir(app_support_dir);
     std::fs::create_dir_all(&shim_dir)
         .with_context(|| format!("create xcode shim dir {}", shim_dir.display()))?;
-    for tool in ["xcodebuild", "simctl", "mcpbridge", "xcrun"] {
+    for tool in [
+        "xcodebuild",
+        "simctl",
+        "mcpbridge",
+        "xcrun",
+        "chainworks-test-gate",
+    ] {
         let path = shim_dir.join(tool);
         std::fs::write(&path, shim_script(tool))
             .with_context(|| format!("write xcode shim executable {}", path.display()))?;
@@ -91,7 +129,7 @@ pub fn ensure_xcode_shim_dir(app_support_dir: &Path) -> anyhow::Result<PathBuf> 
 fn shim_script(tool: &str) -> String {
     format!(
         r#"#!/usr/bin/env python3
-import json, os, socket, sys, time
+import json, os, socket, sys, time, uuid
 
 tool = {tool:?}
 socket_path = os.environ.get("CHAINWORKS_XCODE_SHIM_SOCKET")
@@ -102,6 +140,7 @@ if not socket_path or not token_id or not token_secret:
     sys.stderr.write("p051_xcode_shim_credentials_missing\n")
     sys.exit(126)
 request = {{
+    "operation_key": str(uuid.uuid4()),
     "agent_execution_id": os.environ.get("CHAINWORKS_XCODE_SHIM_AGENT_EXECUTION_ID"),
     "token_id": token_id,
     "token_secret": token_secret,
@@ -116,20 +155,36 @@ request = {{
     }},
 }}
 try:
+    payload = (json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(payload) > 1048576:
+        raise ValueError("xcode_shim_socket_request_too_large")
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(86410)
     client.connect(socket_path)
-    client.sendall((json.dumps(request) + "\n").encode("utf-8"))
+    client.sendall(payload)
     chunks = []
+    size = 0
     while True:
         chunk = client.recv(65536)
         if not chunk:
             break
         chunks.append(chunk)
+        size += len(chunk)
+        if size > 1048576:
+            raise ValueError("xcode_shim_socket_response_too_large")
         if b"\n" in chunk:
             break
-    response = json.loads(b"".join(chunks).decode("utf-8").splitlines()[0])
+    def unique_object(pairs):
+        result = {{}}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("xcode_shim_duplicate_response_key")
+            result[key] = value
+        return result
+    response = json.loads(b"".join(chunks).decode("utf-8").splitlines()[0], object_pairs_hook=unique_object)
+    client.close()
 except Exception as exc:
-    sys.stderr.write("p051_xcode_shim_dispatch_failed: %s\n" % exc)
+    sys.stderr.write("p051_xcode_shim_dispatch_failed\n")
     sys.exit(126)
 process_output = response.get("process_output") or {{}}
 if process_output.get("stdout"):
@@ -148,9 +203,10 @@ sys.exit(int(response.get("exit_status", 126)))
 impl XcodeShimGrantResolver for XcodeShimGrantRegistry {
     async fn resolve_grant(&self, token_id: &str) -> anyhow::Result<XcodeShimResolvedDispatch> {
         let record = self
-            .grants
+            .state
             .read()
             .expect("xcode shim grant registry lock poisoned")
+            .grants
             .get(token_id)
             .cloned()
             .with_context(|| format!("xcode_shim_unknown_token_id: {token_id}"))?;
@@ -158,6 +214,80 @@ impl XcodeShimGrantResolver for XcodeShimGrantRegistry {
             grant: record.grant,
             active_prompt: record.active_prompt,
         })
+    }
+
+    fn requires_headless_authority(&self) -> bool {
+        true
+    }
+
+    async fn dispatch_authorized(
+        &self,
+        operation_key: Option<Uuid>,
+        mut request: XcodeShimDispatchRequest,
+        config: &XcodeHostExecutorProcessConfig,
+        observation_sink: &dyn XcodeRuntimeObservationSink,
+    ) -> anyhow::Result<XcodeShimDispatchOutcome> {
+        let denied = |request: &XcodeShimDispatchRequest, reason: &str| XcodeShimDispatchOutcome {
+            authorization: XcodeShimDispatchAuthorization {
+                allowed: false,
+                reason_code: Some(reason.into()),
+            },
+            policy: XcodeShimCommandPolicy {
+                invoked_tool: request.plan_input.invoked_tool.clone(),
+                args: request.plan_input.args.clone(),
+                decision: XcodeShimRouteDecision::Reject,
+                reason_code: Some(reason.into()),
+            },
+            plan: None,
+            process_output: None,
+            exit_status: 126,
+            reason_code: Some(reason.into()),
+        };
+        let Some(authority) = &self.authority else {
+            return Ok(denied(
+                &request,
+                "xcode_shim_headless_authority_unavailable",
+            ));
+        };
+        let Some(operation_key) = operation_key.filter(|key| !key.is_nil()) else {
+            return Ok(denied(&request, "xcode_shim_operation_key_required"));
+        };
+        let (record, invocation) = {
+            let state = self
+                .state
+                .read()
+                .expect("xcode shim grant registry lock poisoned");
+            (
+                state.grants.get(&request.attempt.token_id).cloned(),
+                state.invocations.get(&request.attempt.token_id).copied(),
+            )
+        };
+        let Some(invocation) = invocation else {
+            return Ok(denied(&request, "xcode_shim_invocation_binding_required"));
+        };
+        let Some(record) = record else {
+            return Ok(denied(&request, "xcode_shim_grant_revoked"));
+        };
+        request.grant = record.grant;
+        request.attempt.active_prompt = record.active_prompt;
+        request.attempt.now_epoch_ms = chrono::Utc::now().timestamp_millis();
+        let authorization = request.grant.authorize(&request.attempt);
+        if !authorization.allowed || !record.active_prompt {
+            return Ok(denied(
+                &request,
+                authorization
+                    .reason_code
+                    .as_deref()
+                    .unwrap_or("p051_shim_no_active_prompt"),
+            ));
+        }
+        if request.plan_input.invoked_tool != "chainworks-test-gate" {
+            return Ok(denied(&request, "xcode_shim_use_canonical_gate"));
+        }
+        request.agent_execution_id = Some(invocation);
+        authority
+            .dispatch(invocation, operation_key, request, config, observation_sink)
+            .await
     }
 }
 
@@ -340,6 +470,7 @@ mod tests {
         let registry = Arc::new(XcodeShimGrantRegistry::default());
         let sink = Arc::new(CapturingObservationSink::default());
         let request = XcodeShimSocketDispatchRequest {
+            operation_key: None,
             agent_execution_id: Some(AgentExecutionId::new()),
             token_id: "token-live".to_string(),
             token_secret: "secret-live".to_string(),
@@ -357,8 +488,8 @@ mod tests {
                 "secret-live",
                 "lease-live",
                 peer_process.clone(),
-                1_000,
-                2_000,
+                chrono::Utc::now().timestamp_millis() - 1_000,
+                chrono::Utc::now().timestamp_millis() + 60_000,
             ),
             active_prompt: false,
         });
@@ -448,10 +579,14 @@ mod tests {
         let shim_dir = ensure_xcode_shim_dir(tempdir.path()).expect("shim dir");
         let socket_path = XcodeShimGrantRegistry::socket_path(tempdir.path());
         let listener = bind_xcode_shim_listener(&socket_path).expect("bind listener");
-        let registry = Arc::new(XcodeShimGrantRegistry::default());
+        let authority = Arc::new(RecordingAuthority::default());
+        let registry = Arc::new(XcodeShimGrantRegistry::with_headless_authority(
+            authority.clone(),
+        ));
         let sink = Arc::new(CapturingObservationSink::default());
         let token_id = "token-script";
         let token_secret = "secret-script";
+        registry.bind_xcode_shim_invocation(token_id, AgentExecutionId::new());
         let now_epoch_ms = chrono::Utc::now().timestamp_millis();
         registry.insert(XcodeShimGrantRecord {
             grant: XcodeShimDispatchGrant::new(
@@ -495,8 +630,303 @@ mod tests {
 
         assert_eq!(output.status.code(), Some(126));
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("p051_shim_mcpbridge_broker_only"));
+        assert!(stderr.contains("xcode_shim_use_canonical_gate"));
         assert!(!stderr.contains("p051_shim_peer_pid_mismatch"));
         assert!(!stderr.contains("p051_shim_no_active_prompt"));
+        assert!(authority.calls.lock().unwrap().is_empty());
+    }
+
+    #[derive(Default)]
+    struct RecordingAuthority {
+        calls: Mutex<Vec<(AgentExecutionId, Uuid)>>,
+    }
+
+    #[async_trait]
+    impl XcodeShimDispatchAuthority for RecordingAuthority {
+        async fn dispatch(
+            &self,
+            invocation_id: AgentExecutionId,
+            operation_key: Uuid,
+            request: XcodeShimDispatchRequest,
+            _config: &XcodeHostExecutorProcessConfig,
+            _sink: &dyn XcodeRuntimeObservationSink,
+        ) -> anyhow::Result<XcodeShimDispatchOutcome> {
+            assert_eq!(request.agent_execution_id, Some(invocation_id));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((invocation_id, operation_key));
+            Ok(XcodeShimDispatchOutcome {
+                authorization: XcodeShimDispatchAuthorization {
+                    allowed: true,
+                    reason_code: None,
+                },
+                policy: XcodeShimCommandPolicy {
+                    invoked_tool: request.plan_input.invoked_tool,
+                    args: request.plan_input.args,
+                    decision: XcodeShimRouteDecision::HostExecutor,
+                    reason_code: None,
+                },
+                plan: None,
+                process_output: None,
+                exit_status: 0,
+                reason_code: None,
+            })
+        }
+    }
+
+    fn wire_request() -> serde_json::Value {
+        serde_json::json!({
+            "operation_key": Uuid::new_v4(), "agent_execution_id": AgentExecutionId::new(),
+            "token_id":"token", "token_secret":"secret", "now_epoch_ms":0, "active_prompt":true,
+            "plan_input": {"invoked_tool":"chainworks-test-gate", "args":["build"],
+                "cwd":"/untrusted", "workspace_root":"/untrusted", "provider_env":{}}
+        })
+    }
+
+    async fn socket_fixture(
+        registry: &XcodeShimGrantRegistry,
+        payload: Vec<u8>,
+        active_prompt: bool,
+    ) -> anyhow::Result<XcodeShimDispatchOutcome> {
+        let (mut client, server) = UnixStream::pair()?;
+        let credentials = xcode_shim_peer_credentials(&server)?;
+        let process = provider_process(credentials.pid, credentials.uid);
+        let now = chrono::Utc::now().timestamp_millis();
+        registry.insert(XcodeShimGrantRecord {
+            grant: acp::XcodeShimDispatchGrant::new(
+                "token",
+                "secret",
+                "lease",
+                process.clone(),
+                now - 1000,
+                now + 60000,
+            ),
+            active_prompt,
+        });
+        let inspector = StaticPeerInspector {
+            expected_credentials: credentials,
+            peer_process: process,
+        };
+        let exchange = async {
+            let _ = client.write_all(&payload).await;
+            let _ = client.write_all(b"\n").await;
+            let _ = client.shutdown().await;
+            let mut response = Vec::new();
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut client, &mut response).await;
+            response
+        };
+        let config = process_config("/bin/false");
+        let sink = CapturingObservationSink::default();
+        let (response, result) = tokio::join!(
+            exchange,
+            handle_xcode_shim_connection(server, registry, &config, &sink, &inspector)
+        );
+        if let Ok(outcome) = &result {
+            assert_eq!(
+                *outcome,
+                serde_json::from_slice::<XcodeShimDispatchOutcome>(&response)?
+            );
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn headless_socket_requires_server_mapping_key_active_prompt_and_authentication() {
+        let authority = Arc::new(RecordingAuthority::default());
+        let registry = XcodeShimGrantRegistry::with_headless_authority(authority.clone());
+        let invocation = AgentExecutionId::new();
+        registry.bind_xcode_shim_invocation("token", invocation);
+        let request = wire_request();
+        let key = Uuid::parse_str(request["operation_key"].as_str().unwrap()).unwrap();
+        let outcome = socket_fixture(&registry, serde_json::to_vec(&request).unwrap(), true)
+            .await
+            .unwrap();
+        assert_eq!(outcome.exit_status, 0);
+        assert_eq!(*authority.calls.lock().unwrap(), vec![(invocation, key)]);
+        authority.calls.lock().unwrap().clear();
+        for (field, value, active) in [
+            ("operation_key", serde_json::Value::Null, true),
+            ("token_secret", serde_json::json!("wrong"), true),
+            ("active_prompt", serde_json::json!(true), false),
+        ] {
+            let mut invalid = request.clone();
+            invalid[field] = value;
+            assert_eq!(
+                socket_fixture(&registry, serde_json::to_vec(&invalid).unwrap(), active)
+                    .await
+                    .unwrap()
+                    .exit_status,
+                126
+            );
+        }
+        registry.remove("token");
+        assert_eq!(
+            socket_fixture(&registry, serde_json::to_vec(&request).unwrap(), true)
+                .await
+                .unwrap()
+                .reason_code
+                .as_deref(),
+            Some("xcode_shim_invocation_binding_required")
+        );
+        assert!(authority.calls.lock().unwrap().is_empty());
+        let missing_authority = XcodeShimGrantRegistry::default();
+        missing_authority.bind_xcode_shim_invocation("token", invocation);
+        assert_eq!(
+            socket_fixture(
+                &missing_authority,
+                serde_json::to_vec(&request).unwrap(),
+                true
+            )
+            .await
+            .unwrap()
+            .reason_code
+            .as_deref(),
+            Some("xcode_shim_headless_authority_unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_socket_rejects_duplicate_keys_and_oversize_before_hook() {
+        let authority = Arc::new(RecordingAuthority::default());
+        let registry = XcodeShimGrantRegistry::with_headless_authority(authority.clone());
+        registry.bind_xcode_shim_invocation("token", AgentExecutionId::new());
+        let duplicate = serde_json::to_string(&wire_request()).unwrap().replacen(
+            "\"token_id\":",
+            "\"token_id\":\"duplicate\",\"token_id\":",
+            1,
+        );
+        assert!(socket_fixture(&registry, duplicate.into_bytes(), true)
+            .await
+            .is_err());
+        assert!(socket_fixture(&registry, vec![b'x'; 1024 * 1024 + 1], true)
+            .await
+            .is_err());
+        assert!(authority.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn canonical_script_and_installed_shim_execute_only_the_authority_pinned_root() {
+        struct FixtureGateAuthority {
+            root: PathBuf,
+            invocation: AgentExecutionId,
+            calls: Mutex<Vec<Uuid>>,
+        }
+        #[async_trait]
+        impl XcodeShimDispatchAuthority for FixtureGateAuthority {
+            async fn dispatch(
+                &self,
+                invocation: AgentExecutionId,
+                operation: Uuid,
+                mut request: XcodeShimDispatchRequest,
+                config: &XcodeHostExecutorProcessConfig,
+                sink: &dyn XcodeRuntimeObservationSink,
+            ) -> anyhow::Result<XcodeShimDispatchOutcome> {
+                assert_eq!(invocation, self.invocation);
+                assert_eq!(request.plan_input.workspace_root, "/untrusted-client-root");
+                request.plan_input.workspace_root = self.root.to_string_lossy().into_owned();
+                request.plan_input.cwd = request.plan_input.workspace_root.clone();
+                request.plan_input.provider_env =
+                    BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]);
+                let identity = acp::xcode_shim::pin_headless_canonical_gate(
+                    &self.root,
+                    &request.plan_input.args,
+                )?;
+                self.calls.lock().unwrap().push(operation);
+                // Fixture-only authority. Production parent supplies the journal fence here.
+                let outcome = acp::xcode_shim::dispatch_headless_canonical_gate(
+                    request, &identity, config, sink,
+                )
+                .await?;
+                assert!(
+                    outcome
+                        .process_output
+                        .as_ref()
+                        .unwrap()
+                        .process_group_settled
+                );
+                Ok(outcome)
+            }
+        }
+        let tempdir = short_tempdir();
+        let root = tempdir.path().join("approved");
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::fs::write(root.join("scripts/test-gate.sh"), "#!/bin/bash\nset -e\ntest -z \"${CHAINWORKS_XCODE_SHIM_TOKEN:-}\"\nprintf 'gate-fixture %s\\n' \"$1\"\ntouch ran\nexit 4\n").unwrap();
+        let shim_dir = ensure_xcode_shim_dir(tempdir.path()).unwrap();
+        let socket_path = XcodeShimGrantRegistry::socket_path(tempdir.path());
+        let listener = bind_xcode_shim_listener(&socket_path).unwrap();
+        let invocation = AgentExecutionId::new();
+        let authority = Arc::new(FixtureGateAuthority {
+            root: root.clone(),
+            invocation,
+            calls: Mutex::new(vec![]),
+        });
+        let registry = Arc::new(XcodeShimGrantRegistry::with_headless_authority(
+            authority.clone(),
+        ));
+        registry.bind_xcode_shim_invocation("fixture-token", invocation);
+        let now = chrono::Utc::now().timestamp_millis();
+        registry.insert(XcodeShimGrantRecord {
+            grant: XcodeShimDispatchGrant::new(
+                "fixture-token",
+                "fixture-secret",
+                "lease",
+                XcodeShimProcessBinding {
+                    pid: std::process::id(),
+                    uid: current_process_uid(),
+                    parent_pid: None,
+                    ancestor_pids: vec![],
+                    start_time_fingerprint: None,
+                    executable_fingerprint: None,
+                },
+                now - 1000,
+                now + 60000,
+            ),
+            active_prompt: true,
+        });
+        let service = spawn_xcode_shim_socket_service(
+            listener,
+            registry,
+            Arc::new(process_config("/bin/false")),
+            Arc::new(CapturingObservationSink::default()),
+            Arc::new(DefaultXcodeShimProcessInspector),
+        );
+        let canonical = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../scripts/test-gate.sh");
+        let output = tokio::process::Command::new("/bin/bash")
+            .arg(canonical)
+            .arg("build")
+            .current_dir(tempdir.path())
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("CHAINWORKS_XCODE_SHIM_DIR", shim_dir)
+            .env("CHAINWORKS_XCODE_SHIM_SOCKET", socket_path)
+            .env("CHAINWORKS_XCODE_SHIM_TOKEN_ID", "fixture-token")
+            .env("CHAINWORKS_XCODE_SHIM_TOKEN", "fixture-secret")
+            .env(
+                "CHAINWORKS_XCODE_SHIM_WORKSPACE_ROOT",
+                "/untrusted-client-root",
+            )
+            .env(
+                "CHAINWORKS_XCODE_SHIM_AGENT_EXECUTION_ID",
+                AgentExecutionId::new().to_string(),
+            )
+            .output()
+            .await
+            .unwrap();
+        service.abort();
+        let _ = service.await;
+        assert_eq!(
+            output.status.code(),
+            Some(4),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "gate-fixture build\n"
+        );
+        assert!(root.join("ran").exists());
+        assert!(!tempdir.path().join("ran").exists());
+        assert_eq!(authority.calls.lock().unwrap().len(), 1);
     }
 }

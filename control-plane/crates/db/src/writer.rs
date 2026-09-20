@@ -637,6 +637,9 @@ pub const SHUTDOWN_ADMITTED_OPERATIONS: &[&str] = &[
     "operator_command_complete",
     // Projection invalidation triggered by a terminal canonical change.
     "projection_invalidation_terminal",
+    // Persist Xcode terminal/uncertain outcomes or cancellation before dispatch.
+    "xcode_effect.complete",
+    "xcode_effect.cancel",
 ];
 
 // ---------------------------------------------------------------------------
@@ -2698,6 +2701,60 @@ mod tests {
             "expected rejection after shutdown, got {:?}",
             result
         );
+    }
+
+    #[tokio::test]
+    async fn xcode_effect_drain_admission_commits_only_settlement() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE fixture_drain_commits (operation TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let writer = DbWriter::new(pool.clone());
+        // Exercise actual transaction admission while the writer can still drain.
+        writer.shutdown_in_progress.store(true, Ordering::Relaxed);
+        for name in [
+            "xcode_effect.prepare",
+            "xcode_effect.dispatch",
+            "xcode_effect.recover_dispatched",
+            "xcode_effect.reconcile",
+        ] {
+            let result = writer
+                .begin_immediate_transaction(
+                    class_a_operation(name, WriteLane::CriticalBarrier, name),
+                    name,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(ref e) if e.to_string().contains("shutdown_admission_denied")),
+                "unexpected admission for {name}"
+            );
+        }
+        for name in ["xcode_effect.complete", "xcode_effect.cancel"] {
+            let mut tx = writer
+                .begin_immediate_transaction(
+                    class_a_operation(name, WriteLane::CriticalBarrier, name),
+                    name,
+                )
+                .await
+                .expect("settlement must remain admitted during drain");
+            sqlx::query("INSERT INTO fixture_drain_commits (operation) VALUES (?)")
+                .bind(name)
+                .execute(&mut **tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let committed: Vec<String> =
+            sqlx::query_scalar("SELECT operation FROM fixture_drain_commits ORDER BY operation")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            committed,
+            vec!["xcode_effect.cancel", "xcode_effect.complete"]
+        );
+        writer.shutdown().await;
     }
 
     // -----------------------------------------------------------------------

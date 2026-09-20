@@ -27,9 +27,13 @@ use crate::adapters::{
 use crate::session::{
     AcpSessionCloseBehavior, AcpSessionHandle, ProviderSessionStoreArchiveContext,
 };
+use crate::xcode_headless_runtime::{
+    HeadlessPreparationInput, HeadlessRuntime, PreparedXcodeInvocation,
+};
 use crate::{
     AcpPromptProgressSink, ExecutionRequest, ExecutionResult, NoopAcpPromptProgressSink,
-    NoopXcodeRuntimeObservationSink, XcodeRuntimeObservationSink, XcodeShimGrantStore,
+    NoopXcodeRuntimeObservationSink, XcodeEffectJournal, XcodeRuntimeObservationSink,
+    XcodeShimGrantStore,
 };
 
 #[derive(Debug)]
@@ -59,6 +63,17 @@ pub trait XcodeBrokerLeaseAttacher: Send + Sync {
     }
 
     async fn release_brokered_xcode_leases(&self, _lease_ids: &[String]) -> Result<()> {
+        Ok(())
+    }
+
+    async fn rebind_brokered_xcode_leases(
+        &self,
+        lease_ids: &[String],
+        _req: &ExecutionRequest,
+    ) -> Result<()> {
+        if !lease_ids.is_empty() {
+            bail!("headless_lease_rebind_unsupported");
+        }
         Ok(())
     }
 }
@@ -98,6 +113,7 @@ pub struct AcpRuntimeManager {
     xcode_runtime_observation_sink: RwLock<Arc<dyn XcodeRuntimeObservationSink>>,
     xcode_broker_lease_attacher: RwLock<Arc<dyn XcodeBrokerLeaseAttacher>>,
     xcode_shim_runtime: RwLock<Option<XcodeShimRuntimeConfig>>,
+    headless_xcode_runtime: RwLock<Option<Arc<HeadlessRuntime>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,6 +200,7 @@ impl AcpRuntimeManager {
             xcode_runtime_observation_sink: RwLock::new(Arc::new(NoopXcodeRuntimeObservationSink)),
             xcode_broker_lease_attacher: RwLock::new(Arc::new(NoopXcodeBrokerLeaseAttacher)),
             xcode_shim_runtime: RwLock::new(None),
+            headless_xcode_runtime: RwLock::new(None),
         }
     }
 
@@ -244,6 +261,46 @@ impl AcpRuntimeManager {
             .write()
             .expect("xcode broker lease attacher lock poisoned");
         *guard = attacher;
+    }
+
+    pub fn set_headless_xcode_runtime(&self, runtime: Arc<HeadlessRuntime>) {
+        *self
+            .headless_xcode_runtime
+            .write()
+            .expect("headless runtime lock poisoned") = Some(runtime);
+    }
+
+    pub fn headless_xcode_enabled(&self) -> bool {
+        self.headless_xcode_runtime().is_some()
+    }
+
+    fn headless_xcode_runtime(&self) -> Option<Arc<HeadlessRuntime>> {
+        self.headless_xcode_runtime
+            .read()
+            .expect("headless runtime lock poisoned")
+            .clone()
+    }
+
+    pub async fn prepare_headless_xcode(
+        &self,
+        input: HeadlessPreparationInput,
+        journal: Arc<dyn XcodeEffectJournal>,
+    ) -> Result<PreparedXcodeInvocation> {
+        ensure_xcode_admission_enabled()?;
+        self.headless_xcode_runtime()
+            .ok_or_else(|| anyhow::anyhow!("headless_runtime_unavailable"))?
+            .prepare(input, journal)
+            .await
+    }
+
+    pub fn commit_headless_xcode(
+        &self,
+        prepared: &PreparedXcodeInvocation,
+        req: &ExecutionRequest,
+    ) -> Result<()> {
+        self.headless_xcode_runtime()
+            .ok_or_else(|| anyhow::anyhow!("headless_runtime_unavailable"))?
+            .commit(prepared, req)
     }
 
     pub fn set_xcode_shim_runtime(
@@ -335,6 +392,8 @@ impl AcpRuntimeManager {
 
     /// Start a fresh ACP session and keep it alive if requested.
     pub async fn start_session(&self, mut req: ExecutionRequest) -> Result<ExecutionResult> {
+        ensure_request_xcode_admission_enabled(&req)?;
+        req.execution_root()?;
         crate::input_context::bind_request_manifest(&mut req)?;
         req.provider = canonical_acp_provider(&req.provider);
         let provider = req.provider.clone();
@@ -507,6 +566,8 @@ impl AcpRuntimeManager {
         mut req: ExecutionRequest,
         launch_observer: Option<Arc<dyn AcpLaunchObserver>>,
     ) -> Result<ProviderSessionResurrectionAttachResult> {
+        ensure_request_xcode_admission_enabled(&req)?;
+        req.execution_root()?;
         crate::input_context::bind_request_manifest(&mut req)?;
         req.provider = canonical_acp_provider(&req.provider);
         let provider = req.provider.clone();
@@ -732,12 +793,10 @@ impl AcpRuntimeManager {
         req: &ExecutionRequest,
         launch_spec: &mut crate::adapters::AcpLaunchSpec,
     ) -> Result<()> {
-        if env_flag_enabled("CHAINWORKS_XCODE_BROKER_DISABLED") {
-            return Ok(());
-        }
         if !req.xcode_shim_injection_signal && !req.requires_xcode_host_execution {
             return Ok(());
         }
+        ensure_xcode_admission_enabled()?;
         let config = self
             .xcode_shim_runtime
             .read()
@@ -751,13 +810,18 @@ impl AcpRuntimeManager {
         let token_id = uuid::Uuid::new_v4().to_string();
         let token_secret = uuid::Uuid::new_v4().to_string();
         let lease_id = format!("xcode-shim-{token_id}");
+        if let Some(invocation_id) = req.agent_execution_id {
+            config
+                .store
+                .bind_xcode_shim_invocation(&token_id, invocation_id);
+        }
         launch_spec.attach_xcode_shim_runtime(XcodeShimLaunchRuntime {
             token_id: token_id.clone(),
             token_secret,
             lease_id: lease_id.clone(),
             socket_path: config.socket_path,
             shim_dir: config.shim_dir,
-            workspace_root: req.workspace_root.clone(),
+            workspace_root: req.execution_root()?.to_owned(),
             agent_execution_id: req.agent_execution_id,
             store: config.store,
         });
@@ -813,6 +877,12 @@ impl AcpRuntimeManager {
         session_generation_id: &str,
         mut req: ExecutionRequest,
     ) -> Result<ExecutionResult> {
+        ensure_request_xcode_admission_enabled(&req)?;
+        // Host execution tokens are invocation-scoped; keep canonical gate sessions fresh.
+        if req.xcode_shim_injection_signal || req.requires_xcode_host_execution {
+            bail!("headless_shim_reuse_requires_fresh_session");
+        }
+        req.execution_root()?;
         crate::input_context::bind_request_manifest(&mut req)?;
         let session = self.live_session(session_generation_id).await?;
         if let Some(expected_provider_session_id) = req.provider_session_id.as_deref() {
@@ -828,6 +898,25 @@ impl AcpRuntimeManager {
                     session_generation_id
                 ));
             }
+        }
+        let lease_cleanup = self
+            .live_xcode_leases
+            .lock()
+            .await
+            .get(session_generation_id)
+            .cloned();
+        if self.headless_xcode_enabled()
+            && req.session_generation_id.as_deref() != Some(session_generation_id)
+        {
+            bail!("headless_generation_mismatch");
+        }
+        if let Some(cleanup) = lease_cleanup {
+            cleanup
+                .attacher
+                .rebind_brokered_xcode_leases(&cleanup.lease_ids, &req)
+                .await?;
+        } else if self.headless_xcode_enabled() && !req.brokered_xcode_intents().is_empty() {
+            bail!("headless_reuse_lease_missing");
         }
         info!(
             provider = %req.provider,
@@ -966,8 +1055,20 @@ impl AcpRuntimeManager {
 
     /// Route an execution request to the matching adapter or live session.
     pub async fn execute(&self, mut req: ExecutionRequest) -> Result<ExecutionResult> {
+        ensure_request_xcode_admission_enabled(&req)?;
+        req.execution_root()?;
         crate::input_context::bind_request_manifest(&mut req)?;
         req.provider = canonical_acp_provider(&req.provider);
+        let runtime = self.headless_xcode_runtime();
+        let needs_headless = !req.brokered_xcode_intents().is_empty()
+            || req.xcode_shim_injection_signal
+            || req.requires_xcode_host_execution;
+        // This scope ends on success, error, or future cancellation; live sessions
+        // may remain reusable, but their invocation authority must not remain active.
+        let _active_prompt = match runtime.as_ref().filter(|_| needs_headless) {
+            Some(runtime) => Some(runtime.begin_prompt(&req)?),
+            None => None,
+        };
         let result = if req.reuse_existing_session {
             let session_generation_id = req.session_generation_id.clone().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -1097,8 +1198,26 @@ impl AcpRuntimeManager {
             xcode_runtime_observation_sink: RwLock::new(Arc::new(NoopXcodeRuntimeObservationSink)),
             xcode_broker_lease_attacher: RwLock::new(Arc::new(NoopXcodeBrokerLeaseAttacher)),
             xcode_shim_runtime: RwLock::new(None),
+            headless_xcode_runtime: RwLock::new(None),
         }
     }
+}
+
+fn ensure_xcode_admission_enabled() -> Result<()> {
+    if env_flag_enabled("CHAINWORKS_XCODE_BROKER_DISABLED") {
+        bail!("xcode_mcp_broker_disabled: headless Xcode admission is disabled");
+    }
+    Ok(())
+}
+
+fn ensure_request_xcode_admission_enabled(req: &ExecutionRequest) -> Result<()> {
+    if req.xcode_shim_injection_signal
+        || req.requires_xcode_host_execution
+        || !req.brokered_xcode_intents().is_empty()
+    {
+        ensure_xcode_admission_enabled()?;
+    }
+    Ok(())
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -1189,6 +1308,25 @@ mod tests {
 
     static XCODE_BROKER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    struct DisabledXcodeEnv(Option<std::ffi::OsString>);
+
+    impl DisabledXcodeEnv {
+        fn set() -> Self {
+            let previous = std::env::var_os("CHAINWORKS_XCODE_BROKER_DISABLED");
+            std::env::set_var("CHAINWORKS_XCODE_BROKER_DISABLED", "1");
+            Self(previous)
+        }
+    }
+
+    impl Drop for DisabledXcodeEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("CHAINWORKS_XCODE_BROKER_DISABLED", value),
+                None => std::env::remove_var("CHAINWORKS_XCODE_BROKER_DISABLED"),
+            }
+        }
+    }
+
     struct FixtureObservationSink;
 
     #[async_trait::async_trait]
@@ -1235,6 +1373,286 @@ mod tests {
 
         fn remove_xcode_shim_grant(&self, _token_id: &str) -> Option<crate::XcodeShimGrantRecord> {
             None
+        }
+    }
+
+    #[derive(Default)]
+    struct InvocationBindingStore {
+        bindings: std::sync::Mutex<Vec<(String, AgentExecutionId)>>,
+    }
+
+    impl XcodeShimGrantStore for InvocationBindingStore {
+        fn bind_xcode_shim_invocation(&self, token_id: &str, invocation_id: AgentExecutionId) {
+            self.bindings
+                .lock()
+                .unwrap()
+                .push((token_id.to_owned(), invocation_id));
+        }
+
+        fn insert_xcode_shim_grant(&self, _record: crate::XcodeShimGrantRecord) {}
+
+        fn set_xcode_shim_grant_active_prompt(
+            &self,
+            _token_id: &str,
+            _active_prompt: bool,
+        ) -> bool {
+            false
+        }
+
+        fn remove_xcode_shim_grant(&self, _token_id: &str) -> Option<crate::XcodeShimGrantRecord> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_shim_binds_invocation_before_exposing_launch_runtime() {
+        let _guard = XCODE_BROKER_ENV_LOCK.lock().unwrap();
+        let manager = AcpRuntimeManager::new_with_adapters(Vec::new());
+        let store = Arc::new(InvocationBindingStore::default());
+        manager.set_xcode_shim_runtime(
+            store.clone(),
+            "/tmp/fixture-shim.sock",
+            "/tmp/fixture-shims",
+        );
+        let mut req = request_with_go_toolchain_scope();
+        req.agent_execution_id = Some(AgentExecutionId::new());
+        req.requires_xcode_host_execution = true;
+        let mut launch_spec = AcpLaunchSpec::new("fixture-not-launched");
+        manager
+            .attach_xcode_shim_runtime_if_needed(&req, &mut launch_spec)
+            .await
+            .unwrap();
+        let runtime = launch_spec.xcode_shim_runtime.unwrap();
+        assert_eq!(
+            store.bindings.lock().unwrap().as_slice(),
+            &[(runtime.token_id, req.agent_execution_id.unwrap())]
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_shim_reuse_is_rejected_before_live_session_lookup() {
+        let manager = AcpRuntimeManager::new_with_adapters(Vec::new());
+        for (injection, host_execution) in [(true, false), (false, true)] {
+            let mut req = request_with_go_toolchain_scope();
+            req.xcode_shim_injection_signal = injection;
+            req.requires_xcode_host_execution = host_execution;
+            let error = manager.prompt_session("not-live", req).await.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "headless_shim_reuse_requires_fresh_session"
+            );
+        }
+    }
+
+    struct ActiveProbeAdapter {
+        runtime: Arc<HeadlessRuntime>,
+        calls: std::sync::atomic::AtomicUsize,
+        entered: tokio::sync::Notify,
+        wait: bool,
+    }
+
+    async fn disabled_preparation_result(invalid_selector: bool) -> (bool, Option<String>, usize) {
+        let fixture = crate::xcode_broker::headless_fixture::Fixture::new();
+        let manager = AcpRuntimeManager::new_with_adapters(Vec::new());
+        manager.set_headless_xcode_runtime(fixture.runtime.clone());
+        let req = fixture.request();
+        let mut input = fixture.input(&req);
+        if invalid_selector {
+            input.project_selector = Some("missing-project.xcodeproj".into());
+        }
+        let result = {
+            let _lock = XCODE_BROKER_ENV_LOCK.lock().unwrap();
+            let _disabled = DisabledXcodeEnv::set();
+            manager
+                .prepare_headless_xcode(input, fixture.journal.clone())
+                .await
+                .err()
+                .map(|error| error.to_string())
+        };
+        (
+            manager.headless_xcode_enabled(),
+            result,
+            fixture.host.opens.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    #[tokio::test]
+    async fn headless_kill_switch_rejects_before_project_resolution() {
+        let (enabled, error, opens) = disabled_preparation_result(true).await;
+        assert!(
+            enabled,
+            "disabled production must not become fixture fallback"
+        );
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("xcode_mcp_broker_disabled:")),
+            "unexpected result: {error:?}"
+        );
+        assert_eq!(opens, 0);
+    }
+
+    #[tokio::test]
+    async fn headless_kill_switch_performs_no_preparation_effects() {
+        let (enabled, error, opens) = disabled_preparation_result(false).await;
+        assert!(
+            enabled,
+            "disabled production must not become fixture fallback"
+        );
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("xcode_mcp_broker_disabled:")),
+            "unexpected result: {error:?}"
+        );
+        assert_eq!(opens, 0);
+    }
+
+    #[tokio::test]
+    async fn headless_kill_switch_denies_launch_paths_and_shim_attachment() {
+        for configured in [false, true] {
+            for (injection, host_execution) in [(true, false), (false, true)] {
+                let fixture = crate::xcode_broker::headless_fixture::Fixture::new();
+                let adapter = Arc::new(ActiveProbeAdapter {
+                    runtime: fixture.runtime.clone(),
+                    calls: 0.into(),
+                    entered: tokio::sync::Notify::new(),
+                    wait: false,
+                });
+                let manager = AcpRuntimeManager::new_with_adapters(vec![adapter.clone()]);
+                if configured {
+                    manager.set_headless_xcode_runtime(fixture.runtime.clone());
+                }
+                let store = Arc::new(InvocationBindingStore::default());
+                manager.set_xcode_shim_runtime(
+                    store.clone(),
+                    "/tmp/fixture-shim.sock",
+                    "/tmp/fixture-shims",
+                );
+                let mut req = fixture.request();
+                req.mcp_servers.clear();
+                req.xcode_shim_injection_signal = injection;
+                req.requires_xcode_host_execution = host_execution;
+                let mut spec = AcpLaunchSpec::new("fixture-never-launched");
+                let errors = {
+                    let _lock = XCODE_BROKER_ENV_LOCK.lock().unwrap();
+                    let _disabled = DisabledXcodeEnv::set();
+                    [
+                        manager.execute(req.clone()).await.map(|_| ()),
+                        manager.start_session(req.clone()).await.map(|_| ()),
+                        manager
+                            .prompt_session("not-live", req.clone())
+                            .await
+                            .map(|_| ()),
+                        manager
+                            .attach_provider_session_for_resurrection(req.clone())
+                            .await
+                            .map(|_| ()),
+                        manager
+                            .attach_xcode_shim_runtime_if_needed(&req, &mut spec)
+                            .await,
+                    ]
+                    .map(|result| result.err().map(|error| error.to_string()))
+                };
+                for error in errors {
+                    assert!(
+                        error
+                            .as_deref()
+                            .is_some_and(|error| error.starts_with("xcode_mcp_broker_disabled:")),
+                        "configured={configured}, injection={injection}: {error:?}"
+                    );
+                }
+                assert_eq!(adapter.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert!(spec.xcode_shim_runtime.is_none());
+                assert!(store.bindings.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AcpAdapter for ActiveProbeAdapter {
+        fn provider_name(&self) -> &str {
+            "fixture"
+        }
+        async fn execute(&self, req: ExecutionRequest) -> Result<ExecutionResult> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.runtime
+                .forward(
+                    req.agent_execution_id.unwrap(),
+                    serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+                )
+                .await?;
+            self.entered.notify_one();
+            if self.wait {
+                std::future::pending::<()>().await;
+            }
+            bail!("fixture_prompt_finished")
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_execute_checks_commit_before_adapter_execution() {
+        let fixture = crate::xcode_broker::headless_fixture::Fixture::new();
+        let adapter = Arc::new(ActiveProbeAdapter {
+            runtime: fixture.runtime.clone(),
+            calls: 0.into(),
+            entered: tokio::sync::Notify::new(),
+            wait: false,
+        });
+        let manager = AcpRuntimeManager::new_with_adapters(vec![adapter.clone()]);
+        manager.set_headless_xcode_runtime(fixture.runtime.clone());
+        let mut req = fixture.request();
+        req.mcp_servers.clear();
+        req.requires_xcode_host_execution = true;
+        assert!(manager.execute(req).await.is_err());
+        assert_eq!(adapter.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn headless_execute_keeps_active_guard_until_error_or_cancellation() {
+        for wait in [false, true] {
+            let fixture = crate::xcode_broker::headless_fixture::Fixture::new();
+            let adapter = Arc::new(ActiveProbeAdapter {
+                runtime: fixture.runtime.clone(),
+                calls: 0.into(),
+                entered: tokio::sync::Notify::new(),
+                wait,
+            });
+            let manager = AcpRuntimeManager::new_with_adapters(vec![adapter.clone()]);
+            manager.set_headless_xcode_runtime(fixture.runtime.clone());
+            let mut req = fixture.request();
+            req.mcp_servers.clear();
+            req.requires_xcode_host_execution = true;
+            let prepared = manager
+                .prepare_headless_xcode(fixture.input(&req), fixture.journal.clone())
+                .await
+                .unwrap();
+            manager.commit_headless_xcode(&prepared, &req).unwrap();
+            if wait {
+                let mut execute = Box::pin(manager.execute(req.clone()));
+                tokio::select! {
+                    _ = adapter.entered.notified() => {},
+                    result = &mut execute => panic!("prompt stopped before cancellation: {result:?}"),
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => panic!("fixture prompt did not start"),
+                }
+                drop(execute);
+            } else {
+                assert_eq!(
+                    manager.execute(req.clone()).await.unwrap_err().to_string(),
+                    "fixture_prompt_finished"
+                );
+            }
+            assert_eq!(adapter.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(fixture
+                .runtime
+                .forward(
+                    req.agent_execution_id.unwrap(),
+                    serde_json::json!({"jsonrpc":"2.0","id":2,"method":"ping"})
+                )
+                .await
+                .is_err());
+            assert!(fixture.runtime.validate_committed(&req).is_err());
+            drop(prepared);
         }
     }
 
@@ -1384,6 +1802,29 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn required_worktree_fails_before_new_reuse_or_resurrection() {
+        let manager = AcpRuntimeManager::new_with_adapters(Vec::new());
+        let mut req = request_with_go_toolchain_scope();
+        req.worktree_strategy = Some("shared_implementation_worktree".into());
+        for result in [
+            manager.start_session(req.clone()).await.map(|_| ()),
+            manager
+                .prompt_session("nonexistent", req.clone())
+                .await
+                .map(|_| ()),
+            manager
+                .attach_provider_session_for_resurrection(req)
+                .await
+                .map(|_| ()),
+        ] {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("missing_required_worktree"));
+        }
+    }
+
     #[cfg(unix)]
     fn spawn_marker_script(tmp: &tempfile::TempDir, marker: &Path) -> String {
         use std::os::unix::fs::PermissionsExt;
@@ -1490,10 +1931,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broker_disabled_env_suppresses_xcode_shim_injection() {
+    async fn broker_disabled_env_rejects_required_xcode_shim_injection() {
         let _guard = XCODE_BROKER_ENV_LOCK.lock().expect("env lock poisoned");
-        let previous = std::env::var("CHAINWORKS_XCODE_BROKER_DISABLED").ok();
-        std::env::set_var("CHAINWORKS_XCODE_BROKER_DISABLED", "1");
+        let disabled = DisabledXcodeEnv::set();
 
         let manager = AcpRuntimeManager::new_with_adapters(Vec::new());
         let mut launch_spec = crate::adapters::AcpLaunchSpec::new("/bin/sh");
@@ -1536,21 +1976,21 @@ mod tests {
             input_manifest: None,
         };
 
-        manager
+        let result = manager
             .attach_xcode_shim_runtime_if_needed(&req, &mut launch_spec)
-            .await
-            .unwrap();
+            .await;
+        drop(disabled);
+        drop(_guard);
 
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .starts_with("xcode_mcp_broker_disabled:"));
         assert!(launch_spec.xcode_shim_runtime.is_none());
         assert!(launch_spec
             .env
             .iter()
             .all(|(name, _)| !name.starts_with("CHAINWORKS_XCODE_SHIM_")));
-
-        match previous {
-            Some(value) => std::env::set_var("CHAINWORKS_XCODE_BROKER_DISABLED", value),
-            None => std::env::remove_var("CHAINWORKS_XCODE_BROKER_DISABLED"),
-        }
     }
 
     #[tokio::test]
@@ -1569,7 +2009,7 @@ mod tests {
         );
 
         let agent_execution_id = AgentExecutionId::new();
-        let req = ExecutionRequest {
+        let mut req = ExecutionRequest {
             agent_execution_id: Some(agent_execution_id),
             run_id: domain::ids::RunId::new(),
             stage_execution_id: None,
@@ -1607,6 +2047,8 @@ mod tests {
             p079_repair_canonical_paths: None,
             input_manifest: None,
         };
+        req.worktree_root = Some("/tmp/read-only-worktree".into());
+        req.worktree_strategy = Some("shared_implementation_worktree".into());
         let mut launch_spec = crate::adapters::AcpLaunchSpec::new("/bin/sh");
 
         manager
@@ -1627,6 +2069,15 @@ mod tests {
             )) => {
                 assert_eq!(event.source, "xcode_shim_runtime");
                 assert_eq!(event.reason, "requires_xcode_host_execution");
+                assert_eq!(event.workspace_root, "/tmp/read-only-worktree");
+                assert_eq!(
+                    launch_spec
+                        .xcode_shim_runtime
+                        .as_ref()
+                        .unwrap()
+                        .workspace_root,
+                    "/tmp/read-only-worktree"
+                );
                 assert_eq!(
                     event.lease_id,
                     launch_spec.xcode_shim_runtime.as_ref().unwrap().lease_id

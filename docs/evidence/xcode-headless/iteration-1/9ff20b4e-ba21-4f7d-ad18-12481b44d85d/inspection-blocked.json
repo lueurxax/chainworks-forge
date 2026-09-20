@@ -1,0 +1,7 @@
+{
+  "error_sha256": "eeb3793faf9e82ca28131b6a96d13f5d4c54d0692a85a19a1bc1a2011717520d",
+  "reason": "i1_stopped",
+  "status": "Blocked",
+  "tools_calls": 0,
+  "version": 1
+}

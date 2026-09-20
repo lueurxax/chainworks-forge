@@ -323,10 +323,23 @@ broker or registry is unavailable, the invocation fails closed before the agent
 is launched.
 
 Runtime provider subprocesses start with cwd set to the active execution root:
-the run worktree for write-enabled implementation work, otherwise
-`workspace_root`. This keeps terminal commands, provider-local project context,
-and MCP-backed tool resolution aligned with the same tree the orchestrator
-expects the agent to operate on.
+the run worktree for explicit `dedicated` or `shared_implementation_worktree`
+strategies, including read-only work. A missing required worktree is an error
+before a new, reused or resurrected provider session is admitted. Legacy
+write-enabled requests without an explicit required strategy use the worktree
+when present and retain the repository fallback when it is absent; other
+legacy read-only requests use `workspace_root`.
+
+The domain root selector is shared by engine session policy, provider process
+and `session/new` setup, Junie preflight, Claude transcript lookup, and the
+Xcode shim grant. Engine Xcode MCP context uses that effective root and cannot
+retain a stale registry root instead. Explicit internal provider launch-directory
+overrides retain their existing semantics. The headless Xcode route additionally
+pins root/project filesystem identities, prepares before session-policy reuse,
+and commits an invocation-scoped binding before provider startup. It requires
+separate project trust and explicit frozen read/gate capabilities. This is
+routing and cooperative authority for trusted projects, not filesystem
+confinement. See [headless runtime](xcode-headless-runtime.md).
 
 ### Provider session-store capture
 

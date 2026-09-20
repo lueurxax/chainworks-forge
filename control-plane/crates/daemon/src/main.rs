@@ -150,6 +150,14 @@ async fn stop_startup_probe_server(server: StartupProbeServer) -> tokio::net::Tc
 }
 
 fn main() -> Result<()> {
+    if std::env::args().any(|arg| arg == "--xcode-admin") {
+        return tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_stack_size(DAEMON_WORKER_STACK_BYTES)
+            .build()
+            .context("build runtime for Xcode operator command")?
+            .block_on(run_xcode_admin());
+    }
     // P080: --p080-rollout-control-seed is a one-shot admin subcommand.
     // It seeds the rollout-control matrix (rejected if already seeded) and exits.
     // This implements the Phase0/1 explicit operator seed path from proposal §Feature Flags.
@@ -168,6 +176,75 @@ fn main() -> Result<()> {
         .build()
         .context("build daemon tokio runtime")?
         .block_on(run_daemon())
+}
+
+async fn run_xcode_admin() -> Result<()> {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let command = daemon::xcode_admin::parse_cli(&args)?.context("xcode_admin_action_required")?;
+    let mode = packaging::DaemonMode::from_env_var(
+        &std::env::var("MODE").unwrap_or_else(|_| "dev".into()),
+    );
+    let paths = packaging::resolve_paths(mode)?;
+    anyhow::ensure!(
+        paths.principals_path.is_file(),
+        "xcode_admin_existing_principals_required"
+    );
+    let principals = auth::PrincipalTable::load_or_bootstrap(&paths.principals_path)?;
+    let token = std::env::var("CHAINWORKS_MCP_TOKEN")
+        .map_err(|_| anyhow::anyhow!("xcode_admin_authentication_required"))?;
+    let principal = auth::resolve_bearer(&token, &principals)
+        .map_err(|_| anyhow::anyhow!("xcode_admin_authentication_failed"))?;
+    drop(token);
+    let readonly = !matches!(
+        &command,
+        daemon::xcode_admin::XcodeAdminCommand::EffectsReconcile { .. }
+    );
+    // Operator readback never creates a database or applies migrations.
+    let options: sqlx::sqlite::SqliteConnectOptions = paths.database_url.parse()?;
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            options
+                .create_if_missing(false)
+                .read_only(readonly)
+                .foreign_keys(true),
+        )
+        .await?;
+    if matches!(
+        &command,
+        daemon::xcode_admin::XcodeAdminCommand::BootstrapAuthority { .. }
+    ) {
+        let result = daemon::xcode_admin::bootstrap_authority(&command, &principal, &pool).await;
+        pool.close().await;
+        println!("{}", serde_json::to_string(&result?)?);
+        return Ok(());
+    }
+    let _authority = if readonly {
+        None
+    } else {
+        let path: String =
+            sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
+                .fetch_one(&pool)
+                .await?;
+        Some(acp::xcode_coordinator::JournalAuthority::open(
+            std::path::Path::new(&path),
+        )?)
+    };
+    let writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
+    let effects = engine::xcode_effect_admin::XcodeEffectAdmin::new(pool.clone(), writer.clone());
+    let result = daemon::xcode_admin::execute(
+        command,
+        &principal,
+        &acp::xcode_project_trust::ProjectTrustStore::new(
+            paths.app_support_dir.join("xcode-project-trust"),
+        ),
+        &effects,
+    )
+    .await;
+    writer.shutdown().await;
+    pool.close().await;
+    println!("{}", serde_json::to_string(&result?)?);
+    Ok(())
 }
 
 /// One-shot P080 rollout-control seeding subcommand.
@@ -769,8 +846,31 @@ async fn run_daemon() -> Result<()> {
         db_writer.clone(),
     );
     reporter.set_startup_phase("startup_recovery");
+    let xcode_database: String =
+        sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
+            .fetch_one(&pool)
+            .await
+            .context("resolve canonical Xcode journal database")?;
+    let xcode_authority = match acp::xcode_coordinator::JournalAuthority::open(
+        std::path::Path::new(&xcode_database),
+    ) {
+        Ok(authority) => Some(authority),
+        Err(reason) => {
+            warn!(reason = %reason,"Headless Xcode admission held; operator bootstrap or reconciliation required");
+            None
+        }
+    };
+    let xcode_effects_recovered = if xcode_authority.is_some() {
+        recovery
+            .recover_xcode_effects_before_admission()
+            .await
+            .context("headless Xcode effect recovery failed before admission")?
+    } else {
+        0
+    };
     let summary = recovery.run_startup_repair().await?;
     info!(
+        xcode_effects_recovered,
         runs_inspected = summary.runs_inspected,
         runs_repaired = summary.runs_repaired,
         work_items_requeued = summary.work_items_requeued,
@@ -990,8 +1090,26 @@ async fn run_daemon() -> Result<()> {
             };
             info!(port, "bound HTTP listener; handing off to graphql-server");
 
-            let xcode_broker_pool =
-                new_daemon_xcode_broker_pool(port, acp.xcode_runtime_observation_sink());
+            let headless_runtime = xcode_authority.clone().map(|authority| -> Result<_> {
+                let coordinator = acp::xcode_coordinator::WorkspaceAccessCoordinator::new(
+                    acp::xcode_coordinator::CoordinatorLimits { queue_capacity:16,queue_timeout:std::time::Duration::from_secs(45) },
+                    Arc::new(engine::xcode_effect_journal::DbXcodeProjectHoldCheck(pool.clone())),
+                )?;
+                let controller = Arc::new(acp::xcode_headless::HeadlessWorkspaceController::new(
+                    Arc::new(acp::xcode_headless_host::LocalHeadlessHostInspector::with_startup_on_absence()),
+                    Arc::new(acp::xcode_headless_transport::ProcessHeadlessPeerFactory),
+                ));
+                Ok(acp::xcode_headless_runtime::HeadlessRuntime::new(controller,coordinator,
+                    Arc::new(acp::xcode_project_trust::ProjectTrustStore::new(paths.app_support_dir.join("xcode-project-trust"))),authority))
+            }).transpose()?;
+            if let Some(runtime) = &headless_runtime {
+                acp.set_headless_xcode_runtime(runtime.clone());
+            }
+            let xcode_broker_pool = new_daemon_xcode_broker_pool(
+                port,
+                acp.xcode_runtime_observation_sink(),
+                headless_runtime.clone(),
+            );
             acp.set_xcode_broker_lease_attacher(xcode_broker_pool.clone());
             reporter.set_xcode_broker_health(xcode_broker_health_for_lifecycle(
                 xcode_broker_pool.health_snapshot().await,
@@ -1000,7 +1118,12 @@ async fn run_daemon() -> Result<()> {
 
             #[cfg(unix)]
             let xcode_shim_socket_service = {
-                let shim_registry = Arc::new(XcodeShimGrantRegistry::default());
+                let shim_registry = Arc::new(match &headless_runtime {
+                    Some(runtime) => {
+                        XcodeShimGrantRegistry::with_headless_authority(runtime.clone())
+                    }
+                    None => XcodeShimGrantRegistry::default(),
+                });
                 let shim_socket_path = XcodeShimGrantRegistry::socket_path(&paths.app_support_dir);
                 let shim_dir = ensure_xcode_shim_dir(&paths.app_support_dir)?;
                 let listener = bind_xcode_shim_listener(&shim_socket_path)?;
@@ -1281,9 +1404,9 @@ fn spawn_storage_write_pressure_rollup(
 fn new_daemon_xcode_broker_pool(
     port: u16,
     observation_sink: Arc<dyn XcodeRuntimeObservationSink>,
+    runtime: Option<Arc<acp::xcode_headless_runtime::HeadlessRuntime>>,
 ) -> Arc<XcodeMcpBridgePool> {
-    Arc::new(XcodeMcpBridgePool::new_with_sink_and_process_backend(
-        XcodeMcpBridgePoolConfig {
+    let config = XcodeMcpBridgePoolConfig {
             base_url: format!("http://127.0.0.1:{port}/xcode-mcp"),
             broker_disabled: std::env::var("CHAINWORKS_XCODE_BROKER_DISABLED")
                 .map(|value| value == "1")
@@ -1293,11 +1416,21 @@ fn new_daemon_xcode_broker_pool(
                     warn!(error = %err, "Failed to load Xcode broker tool allowlists from MCP registry");
                     Default::default()
                 }),
-            use_local_host_probe: true,
+            use_local_host_probe: false,
             ..Default::default()
-        },
-        observation_sink,
-    ))
+        };
+    Arc::new(match runtime {
+        Some(runtime) => {
+            XcodeMcpBridgePool::new_with_headless_runtime(config, observation_sink, runtime)
+        }
+        None => XcodeMcpBridgePool::new_with_sink(
+            XcodeMcpBridgePoolConfig {
+                broker_disabled: true,
+                ..config
+            },
+            observation_sink,
+        ),
+    })
 }
 
 fn xcode_broker_health_for_lifecycle(
@@ -1927,11 +2060,14 @@ mod tests {
     }
 
     #[test]
-    fn daemon_xcode_broker_pool_has_process_backend() {
-        let pool =
-            new_daemon_xcode_broker_pool(41234, Arc::new(acp::NoopXcodeRuntimeObservationSink));
+    fn daemon_xcode_broker_pool_without_authority_has_no_ide_fallback() {
+        let pool = new_daemon_xcode_broker_pool(
+            41234,
+            Arc::new(acp::NoopXcodeRuntimeObservationSink),
+            None,
+        );
 
-        assert!(pool.has_backend());
+        assert!(!pool.has_backend());
     }
 
     #[test]
@@ -1963,8 +2099,11 @@ mcp:
             .next()
             .expect("fixture registry should produce a tool allowlist")
             .clone();
-        let pool =
-            new_daemon_xcode_broker_pool(41234, Arc::new(acp::NoopXcodeRuntimeObservationSink));
+        let pool = new_daemon_xcode_broker_pool(
+            41234,
+            Arc::new(acp::NoopXcodeRuntimeObservationSink),
+            None,
+        );
 
         assert!(pool.has_tool_allowlist_hash(&hash));
 

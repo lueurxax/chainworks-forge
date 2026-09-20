@@ -51,3 +51,4 @@ pub mod toolchain_cache_housekeeping;
 pub mod validation;
 pub mod work_items;
 pub mod workflow_conflicts;
+pub mod xcode_effect_attempts;

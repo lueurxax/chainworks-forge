@@ -6,6 +6,13 @@ pub mod toolchain_lease;
 pub mod toolchain_mapper;
 pub mod transport;
 pub mod xcode_broker;
+pub mod xcode_coordinator;
+pub mod xcode_effect_journal;
+pub mod xcode_headless;
+pub mod xcode_headless_host;
+pub mod xcode_headless_runtime;
+pub mod xcode_headless_transport;
+pub mod xcode_project_trust;
 pub mod xcode_shim;
 pub mod xcode_target;
 
@@ -20,27 +27,34 @@ pub use xcode_broker::{
     XcodeMcpBridgePoolConfig, XcodeMcpLeaseState, XcodeMcpProcessBackend,
     XcodeMcpProcessBackendConfig,
 };
+pub use xcode_effect_journal::{
+    XcodeDispatchDecision, XcodeEffectJournal, XcodeJournalError, XcodeJournalResult,
+};
 #[cfg(unix)]
 pub use xcode_shim::{
-    current_process_uid, handle_xcode_shim_unix_stream,
+    current_process_uid, dispatch_headless_canonical_gate, handle_xcode_shim_unix_stream,
     handle_xcode_shim_unix_stream_with_grant_resolver,
     handle_xcode_shim_unix_stream_with_peer_credentials, inspect_xcode_shim_process_binding,
-    xcode_shim_peer_credentials, DefaultXcodeShimProcessInspector, XcodeShimGrantResolver,
-    XcodeShimPeerCredentials, XcodeShimProcessInspector, XcodeShimResolvedDispatch,
+    pin_headless_canonical_gate, xcode_shim_peer_credentials, DefaultXcodeShimProcessInspector,
+    XcodeCanonicalGateIdentity, XcodeShimGrantResolver, XcodeShimPeerCredentials,
+    XcodeShimProcessInspector, XcodeShimResolvedDispatch,
 };
 pub use xcode_shim::{
     dispatch_xcode_shim_request, dispatch_xcode_shim_socket_request, XcodeHostExecutorPlan,
     XcodeHostExecutorPlanError, XcodeHostExecutorPlanInput, XcodeHostExecutorProcessConfig,
     XcodeHostExecutorProcessOutput, XcodeHostExecutorSimulatorCandidate, XcodeShimCommandPolicy,
-    XcodeShimDispatchAttempt, XcodeShimDispatchAuthorization, XcodeShimDispatchGrant,
-    XcodeShimDispatchOutcome, XcodeShimDispatchRequest, XcodeShimGrantRecord, XcodeShimGrantStore,
-    XcodeShimProcessBinding, XcodeShimRouteDecision, XcodeShimSocketDispatchRequest,
+    XcodeShimDispatchAttempt, XcodeShimDispatchAuthority, XcodeShimDispatchAuthorization,
+    XcodeShimDispatchGrant, XcodeShimDispatchOutcome, XcodeShimDispatchRequest,
+    XcodeShimGrantRecord, XcodeShimGrantStore, XcodeShimProcessBinding, XcodeShimRouteDecision,
+    XcodeShimSocketDispatchRequest,
 };
 pub use xcode_target::{
     probe_local_xcode_host, target_resolver_failure_class, HostProbeContext,
     LocalXcodeHostProbeConfig, XcodeProcessCandidate, XcodeTargetResolver,
     XcodeTargetSelectionConfidence, XcodeTargetSelectionInput, XcodeTargetSnapshot,
 };
+
+pub mod execution_root;
 
 use std::collections::BTreeMap;
 
@@ -80,8 +94,8 @@ pub struct ExecutionRequest {
     /// Lossless input binding retained when repair/continuation replaces prompt text.
     #[serde(default)]
     pub input_manifest: Option<input_context::InputManifest>,
-    /// Provisioned worktree root path (Proposal 007). When set and
-    /// `worktree_write_enabled` is true, the ACP session uses this as cwd.
+    /// Provisioned worktree root. Used by write-enabled legacy requests and
+    /// explicit dedicated/shared-worktree strategies, including read-only work.
     #[serde(default)]
     pub worktree_root: Option<String>,
     /// Whether the agent has write access to the worktree.
@@ -187,6 +201,15 @@ fn default_attempt_number() -> u32 {
 }
 
 impl ExecutionRequest {
+    pub fn execution_root(&self) -> Result<&str> {
+        Ok(domain::execution_root::select_execution_root(
+            &self.workspace_root,
+            self.worktree_root.as_deref(),
+            self.worktree_write_enabled,
+            self.worktree_strategy.as_deref(),
+        )?)
+    }
+
     pub fn brokered_xcode_intents(&self) -> Vec<&BrokeredXcodeMcpIntent> {
         self.mcp_servers
             .iter()

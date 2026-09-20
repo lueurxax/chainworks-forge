@@ -1,0 +1,1107 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-20",
+  "recorded_at": "2026-09-20T07:25:55.620Z",
+  "source_head": "a096b8831f0db7f17d1ffe426851c49a65b8b000",
+  "scope": "Offline trusted-runtime component and read-only native host inspection; not full migration, production admission, all-green suite or release receipt.",
+  "managed_target": "/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920",
+  "auto_cache_cleanup": "disabled with supported CHAINWORKS_AUTO_CACHE_CLEANUP=0 for final verification commands; no global configuration or manual cache deletion",
+  "normal_sccache": true,
+  "live_junie_smoke": "unset",
+  "node_version": "v26.3.1",
+  "node_requirement": "Installed node on PATH for actual ECMAScript schema parity; no npm/network",
+  "broad_source": {
+    "path": "docs/evidence/xcode-headless-trusted-runtime-source-2026-09-20.json",
+    "sha256": "dcbe32116310e308fb150df5db7ede455b0512a53305652f93dc2a0a69d50353"
+  },
+  "final_source": {
+    "path": "docs/evidence/xcode-headless-trusted-runtime-final-source-2026-09-20.json",
+    "sha256": "b3683c9d03263b24e2aa045d4354c587ed0fdb61ca02669a9eeb3c722256a3fc",
+    "files": 55,
+    "current_mismatches": []
+  },
+  "changed_after_broad": [
+    {
+      "path": "control-plane/crates/acp/src/xcode_headless.rs",
+      "sha256": "3463b62c8e25f786c3e655708350e3a30759d867eab220705ec7529f808597a3",
+      "broad_sha256": "ae856f3c8ee45f42d36b8865548dd7b91c56d2d72a53f3d4243ce56f031f969c"
+    },
+    {
+      "path": "control-plane/crates/engine/tests/xcode_headless_preparation.rs",
+      "sha256": "3a298e50d3b55b240fccf11677425b6146f80ab9b3a4cca3698707dfc8a4cebd",
+      "broad_sha256": "96dda514900d56a96c21b7ff630143a980bebce04bc86d4510e87f2a620f8e9a"
+    }
+  ],
+  "broad_totals": {
+    "passed": 2692,
+    "failed": 65,
+    "ignored": 3
+  },
+  "broad_targets": 67,
+  "baseline": {
+    "path": "docs/evidence/xcode-headless-journal-verification-2026-09-20.json",
+    "sha256": "f45f8fc944167ab6dbbbead70b3b519e028208ba307a5e493046774c2a6969c6",
+    "unmatched_failures": [],
+    "missing_baseline_failures": []
+  },
+  "verification_limit": "Broad run predates final internal-controller journal-acknowledgement revocation fix; final 20-case controller suite, workspace compilation/formatting and read-only native probe verify final source. Broad suite not repeated after that two-file fix.",
+  "native_observation": {
+    "effects_sent": 0,
+    "generation_digest": "86b629c28b7d6220b9dfa6f7384267bf3d9576aedf6cce03fb758cf2d66851d4",
+    "host_kind": "headless",
+    "open_project_count": 4,
+    "pid": 29224,
+    "schema_version": 1,
+    "service_build": "1.0/25317000000000000",
+    "xcode_build": "27A266a",
+    "ide_process_check": {
+      "command": "pgrep -x Xcode",
+      "exit_code": 1,
+      "stdout": "",
+      "boundary": "read-only host process query with sandbox permission"
+    }
+  },
+  "reviews": [
+    {
+      "agent": "01a0bd73-f958-7952-95b2-1a57c550a7bb",
+      "scope": "Host/controller/bridge and subsequent journal-revocation fix",
+      "verdict": "No remaining actionable findings in scope; verified original55 hashes, then exact2 changed/53unchanged; source review only"
+    },
+    {
+      "agent": "01a0bd75-a284-7513-b332-488781549b78",
+      "scope": "Canonical encoding, closed contract, trust-policy bundle, schema parity",
+      "verdict": "No remaining code findings; Node prerequisite/version follow-up documented"
+    }
+  ],
+  "document_sha256": {
+    "docs/superpowers/specs/2026-09-19-xcode-headless-mcp-design.md": "97b8328544025a556b08c17b52a47ad8cbf3bc8db7876190d32291dcf81e4295",
+    "docs/superpowers/specs/2026-09-19-xcode-headless-runtime-contract.md": "f6807728ae815cedbd7c4f8713e3707437d78572d0ffdaba07665da7f7fca532",
+    "docs/superpowers/specs/2026-09-19-xcode-headless-wire-contract.md": "9437b189c8e8368945be0c31b548999dab36ec303097a55731df726d14a723c2",
+    "docs/superpowers/specs/2026-09-19-xcode-headless-release-contract.md": "52ada036c804b50e427b2aeb95a5478522b4b9947d759fb5d325171cde2cc6b6",
+    "docs/superpowers/plans/2026-09-20-xcode-headless-trusted-runtime.md": "cfb16c492433c0cbb56c84c8bbccdf8e608b3f55fc96298dc43307e53356ae0c",
+    "docs/evidence/xcode-headless-trusted-runtime-2026-09-20.md": "e87e714a4fdae76d0a458cd163d8edf862702825cb614d38627d42d241b7d335"
+  },
+  "logs": [
+    {
+      "path": ".superpowers/sdd/2026-09-20-xcode-headless-trusted-runtime/controller-green.log",
+      "classification": "Initial 13-case controller verification",
+      "exit_code": 0,
+      "sha256": "d0999ac1618925d55f82340b4f34071a23fa32618201b0bf64641d0b90de30db",
+      "test_results": [
+        {
+          "target": "tests/xcode_headless_preparation.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/xcode_headless_preparation-0deadec573ceeb11)",
+          "result": "ok",
+          "passed": 13,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [],
+      "compilation_or_launch_errors": []
+    },
+    {
+      "path": ".superpowers/sdd/2026-09-20-xcode-headless-trusted-runtime/controller-review-red.log",
+      "classification": "Three expected review regression failures before fixes",
+      "exit_code": 101,
+      "sha256": "f573bd546d3fd6993bda760b848d9915b6709109ca5979958f7d87cdc6f62da2",
+      "test_results": [
+        {
+          "target": "tests/xcode_headless_preparation.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/xcode_headless_preparation-0deadec573ceeb11)",
+          "result": "FAILED",
+          "passed": 13,
+          "failed": 3,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [
+        "conflicting_id_with_failed_post_open_status_still_revokes_old_binding",
+        "observed_close_revokes_every_binding_even_after_same_generation_reopen",
+        "preparation_capacity_rejects_excess_waiters_immediately"
+      ],
+      "compilation_or_launch_errors": []
+    },
+    {
+      "path": ".superpowers/sdd/2026-09-20-xcode-headless-trusted-runtime/transport-deadline-red.log",
+      "classification": "Expected premature 60-second deadline failure",
+      "exit_code": 101,
+      "sha256": "8b97e725dc7a320800dedd9b605a9691b7db7916235da7e9f8831c340cf4bc14",
+      "test_results": [
+        {
+          "target": "unittests src/lib.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/acp-471a8bb7346cdbda)",
+          "result": "FAILED",
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [
+        "xcode_headless_transport::tests::open_can_wait_beyond_sixty_seconds_within_its_inherited_deadline"
+      ],
+      "compilation_or_launch_errors": []
+    },
+    {
+      "path": ".superpowers/sdd/2026-09-20-xcode-headless-trusted-runtime/cancellation-review-red.log",
+      "classification": "Diagnostic run with stale fixture notification; not final sequencing proof",
+      "exit_code": 101,
+      "sha256": "f5fd3696947e29e280b1066ba0fb30ff0c7251439d767d1c1528f4ca0fbbaba5",
+      "test_results": [
+        {
+          "target": "tests/xcode_headless_preparation.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/xcode_headless_preparation-0deadec573ceeb11)",
+          "result": "FAILED",
+          "passed": 1,
+          "failed": 1,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [
+        "cancelling_queued_read_poisons_only_that_binding_without_losing_mapping"
+      ],
+      "compilation_or_launch_errors": []
+    },
+    {
+      "path": ".superpowers/sdd/2026-09-20-xcode-headless-trusted-runtime/cancellation-review-sequenced-red.log",
+      "classification": "Sequenced queued-cancellation behavioral RED",
+      "exit_code": 101,
+      "sha256": "f117827ff0e0087a2faef1ea81e823348cf2707da25642805360e50a5bc706bd",
+      "test_results": [
+        {
+          "target": "tests/xcode_headless_preparation.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/xcode_headless_preparation-0deadec573ceeb11)",
+          "result": "FAILED",
+          "passed": 1,
+          "failed": 1,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [
+        "cancelling_queued_read_poisons_only_that_binding_without_losing_mapping"
+      ],
+      "compilation_or_launch_errors": []
+    },
+    {
+      "path": ".superpowers/sdd/2026-09-20-xcode-headless-trusted-runtime/controller-review-green.log",
+      "classification": "18-case controller verification before final journal fix",
+      "exit_code": 0,
+      "sha256": "76e04b286dbc56451374aa5a43b4163e6f0c69bfaaaacdd44786b9f1eb858356",
+      "test_results": [
+        {
+          "target": "tests/xcode_headless_preparation.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/xcode_headless_preparation-0deadec573ceeb11)",
+          "result": "ok",
+          "passed": 18,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [],
+      "compilation_or_launch_errors": []
+    },
+    {
+      "path": ".superpowers/sdd/2026-09-20-xcode-headless-trusted-runtime/transport-review-green.log",
+      "classification": "Final nine transport tests",
+      "exit_code": 0,
+      "sha256": "1dc7152ba2a5e6860232204b491dacd0e4644934d3f4212c4da315f3a021c0f3",
+      "test_results": [
+        {
+          "target": "unittests src/lib.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/acp-471a8bb7346cdbda)",
+          "result": "ok",
+          "passed": 9,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [],
+      "compilation_or_launch_errors": []
+    },
+    {
+      "path": ".superpowers/sdd/2026-09-20-xcode-headless-trusted-runtime/affected-full.log",
+      "classification": "INCONCLUSIVE artifact-loss run; later targets unexecuted, not regression evidence",
+      "exit_code": 101,
+      "sha256": "7dc448e621938aa73d95649ac27b5949cea0061cf10964524117982e6ac4094f",
+      "test_results": [
+        {
+          "target": "unittests src/lib.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/acp-93b710c9119e1c5d)",
+          "result": "ok",
+          "passed": 220,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/execution_root_runtime.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/execution_root_runtime-1502f3f0b7a4577c)",
+          "result": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/input_pressure.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/input_pressure-fca83dc5b53409ef)",
+          "result": "ok",
+          "passed": 15,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/integration.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/integration-4c31a85007a0fd17)",
+          "result": "ok",
+          "passed": 76,
+          "failed": 0,
+          "ignored": 1
+        },
+        {
+          "target": "tests/proposal_066_toolchain_mapper.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_066_toolchain_mapper-6ad8db47827687d5)",
+          "result": "ok",
+          "passed": 27,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/xcode_headless_host.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/xcode_headless_host-27fbb11c25b7fa22)",
+          "result": "ok",
+          "passed": 7,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "unittests examples/xcode_headless_i1.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/examples/xcode_headless_i1-ba9621b1eb5a3ba4)",
+          "result": "ok",
+          "passed": 37,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "unittests src/lib.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/daemon-1a2780e49bbdf9d1)",
+          "result": "ok",
+          "passed": 97,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "unittests src/main.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/control_plane-8fc97e67fae86b0a)",
+          "result": "ok",
+          "passed": 17,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/dogfood_config.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/dogfood_config-4f9f04c649ef91e7)",
+          "result": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/lifecycle_failure_round_trip.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/lifecycle_failure_round_trip-3b34e9a2c6b322d8)",
+          "result": "ok",
+          "passed": 5,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/mcp_stdio.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/mcp_stdio-0269f560700cfbf1)",
+          "result": "ok",
+          "passed": 9,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_086_mcp_continuation_live_reuse.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_086_mcp_continuation_live_reuse-1e293a198e87d1b4)",
+          "result": "ok",
+          "passed": 7,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/steward_runtime_bootstrap_tests.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/steward_runtime_bootstrap_tests-63f4dae9441e58b4)",
+          "result": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "unittests src/lib.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/db-12f0cf97d0034d6a)",
+          "result": "FAILED",
+          "passed": 442,
+          "failed": 2,
+          "ignored": 0
+        },
+        {
+          "target": "unittests src/bin/p054_v1_retirement_check.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/p054_v1_retirement_check-df1e8d5e9cf9d4f1)",
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/integration.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/integration-4db80961bd20bf55)",
+          "result": "ok",
+          "passed": 27,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_017_workflow_conflict_persistence.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_017_workflow_conflict_persistence-10c8903e77c69b6e)",
+          "result": "ok",
+          "passed": 23,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_053_discovery_diagnostics.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_053_discovery_diagnostics-a9a9a5467a16e4a8)",
+          "result": "ok",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_057_contracts.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_057_contracts-647e0697825f0c05)",
+          "result": "ok",
+          "passed": 19,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [
+        "repos::work_items::tests::p091_claim_next_quarantines_malformed_typed_advance_and_claims_next",
+        "repos::work_items::tests::p091_claim_next_quarantines_source_work_item_only_retry_advance"
+      ],
+      "compilation_or_launch_errors": []
+    },
+    {
+      "path": ".superpowers/sdd/2026-09-20-xcode-headless-trusted-runtime/affected-final.log",
+      "classification": "Complete broad run before final two-file journal revocation correction",
+      "exit_code": 101,
+      "sha256": "6f35e7355920acd7a7a5b1d2ba3152ce1c01950e7893f6640cb958bc8c0d1073",
+      "test_results": [
+        {
+          "target": "unittests src/lib.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/acp-93b710c9119e1c5d)",
+          "result": "ok",
+          "passed": 222,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/execution_root_runtime.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/execution_root_runtime-1502f3f0b7a4577c)",
+          "result": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/input_pressure.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/input_pressure-fca83dc5b53409ef)",
+          "result": "ok",
+          "passed": 15,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/integration.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/integration-4c31a85007a0fd17)",
+          "result": "ok",
+          "passed": 76,
+          "failed": 0,
+          "ignored": 1
+        },
+        {
+          "target": "tests/proposal_066_toolchain_mapper.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_066_toolchain_mapper-6ad8db47827687d5)",
+          "result": "ok",
+          "passed": 27,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/xcode_headless_host.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/xcode_headless_host-27fbb11c25b7fa22)",
+          "result": "ok",
+          "passed": 8,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "unittests examples/xcode_headless_i1.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/examples/xcode_headless_i1-ba9621b1eb5a3ba4)",
+          "result": "ok",
+          "passed": 37,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "unittests src/lib.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/daemon-1a2780e49bbdf9d1)",
+          "result": "ok",
+          "passed": 97,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "unittests src/main.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/control_plane-8fc97e67fae86b0a)",
+          "result": "ok",
+          "passed": 17,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/dogfood_config.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/dogfood_config-4f9f04c649ef91e7)",
+          "result": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/lifecycle_failure_round_trip.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/lifecycle_failure_round_trip-3b34e9a2c6b322d8)",
+          "result": "ok",
+          "passed": 5,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/mcp_stdio.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/mcp_stdio-0269f560700cfbf1)",
+          "result": "ok",
+          "passed": 9,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_086_mcp_continuation_live_reuse.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_086_mcp_continuation_live_reuse-1e293a198e87d1b4)",
+          "result": "ok",
+          "passed": 7,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/steward_runtime_bootstrap_tests.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/steward_runtime_bootstrap_tests-63f4dae9441e58b4)",
+          "result": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "unittests src/lib.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/db-12f0cf97d0034d6a)",
+          "result": "FAILED",
+          "passed": 442,
+          "failed": 2,
+          "ignored": 0
+        },
+        {
+          "target": "unittests src/bin/p054_v1_retirement_check.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/p054_v1_retirement_check-df1e8d5e9cf9d4f1)",
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/integration.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/integration-4db80961bd20bf55)",
+          "result": "ok",
+          "passed": 27,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_017_workflow_conflict_persistence.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_017_workflow_conflict_persistence-10c8903e77c69b6e)",
+          "result": "ok",
+          "passed": 23,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_053_discovery_diagnostics.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_053_discovery_diagnostics-a9a9a5467a16e4a8)",
+          "result": "ok",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_057_contracts.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_057_contracts-647e0697825f0c05)",
+          "result": "ok",
+          "passed": 19,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_058_claim_start.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_058_claim_start-118da6f4c572c13c)",
+          "result": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_058_runtime_facts.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_058_runtime_facts-10d83168bd73716d)",
+          "result": "ok",
+          "passed": 11,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_066_toolchain_cache_mapping.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_066_toolchain_cache_mapping-a4c817c7c347f534)",
+          "result": "ok",
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_075_dbwriter.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_075_dbwriter-3c2960f09147666e)",
+          "result": "ok",
+          "passed": 30,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_078_side_effects.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_078_side_effects-abaaedb8eea61f60)",
+          "result": "ok",
+          "passed": 18,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_079_output_contract_repair.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_079_output_contract_repair-b5eefd85c4962c0b)",
+          "result": "ok",
+          "passed": 6,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_082_recovery_retry_matrix.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_082_recovery_retry_matrix-9d2eefe5278229c2)",
+          "result": "ok",
+          "passed": 87,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_083_migrations.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_083_migrations-28cad14fc07fa8f8)",
+          "result": "ok",
+          "passed": 60,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_086_continuation_lifecycle.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_086_continuation_lifecycle-14bb533850bb714a)",
+          "result": "ok",
+          "passed": 11,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_088_persistence.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_088_persistence-4ee92943199d7527)",
+          "result": "ok",
+          "passed": 9,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_091_retry_authority.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_091_retry_authority-6a3cc0822656ecea)",
+          "result": "ok",
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_092_retry_payload_recovery.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_092_retry_payload_recovery-762834b6ddffd332)",
+          "result": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/xcode_effect_attempts.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/xcode_effect_attempts-eb8e0365365954c7)",
+          "result": "ok",
+          "passed": 28,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "unittests src/lib.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/domain-46b88eecc69a0649)",
+          "result": "ok",
+          "passed": 300,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/artifact_contracts.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/artifact_contracts-9ce5f710812a34b5)",
+          "result": "ok",
+          "passed": 19,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/codex_model_variant_policy.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/codex_model_variant_policy-eff664df8850b965)",
+          "result": "ok",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/execution_root.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/execution_root-585dbd7117a4aaa5)",
+          "result": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_017_workflow_conflict.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_017_workflow_conflict-e90bf19582845a40)",
+          "result": "ok",
+          "passed": 7,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_057_contracts.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_057_contracts-d527187894df67a4)",
+          "result": "ok",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_058_runtime_facts.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_058_runtime_facts-10f55074c209766c)",
+          "result": "ok",
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/xcode_contract.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/xcode_contract-d37b37e0d3a02f42)",
+          "result": "ok",
+          "passed": 19,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/xcode_runtime.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/xcode_runtime-211805a6b16bc3b3)",
+          "result": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "unittests src/lib.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/engine-e715edd601ec7b22)",
+          "result": "FAILED",
+          "passed": 568,
+          "failed": 4,
+          "ignored": 0
+        },
+        {
+          "target": "tests/agent_context_skills.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/agent_context_skills-2bcffe62ccd6c2ee)",
+          "result": "ok",
+          "passed": 26,
+          "failed": 0,
+          "ignored": 1
+        },
+        {
+          "target": "tests/command_journal_audit.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/command_journal_audit-4e6a6c353e53fe37)",
+          "result": "ok",
+          "passed": 7,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/cross_surface_parity.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/cross_surface_parity-4efd4d4db046bc4e)",
+          "result": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/integration.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/integration-c0f62e149f8560b0)",
+          "result": "FAILED",
+          "passed": 165,
+          "failed": 48,
+          "ignored": 0
+        },
+        {
+          "target": "tests/p077_closeout_loop_budget.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/p077_closeout_loop_budget-b5808ecbe8b9ecf0)",
+          "result": "ok",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/p077_proof_gate.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/p077_proof_gate-53e3e6d642dad28a)",
+          "result": "ok",
+          "passed": 10,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_041_parity.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_041_parity-d22b008ab581a508)",
+          "result": "FAILED",
+          "passed": 18,
+          "failed": 3,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_058_claim_start.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_058_claim_start-4512334a088aa029)",
+          "result": "ok",
+          "passed": 22,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_058_deadline_resume.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_058_deadline_resume-e365eb0b4c326557)",
+          "result": "ok",
+          "passed": 10,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_058_escalation_schema.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_058_escalation_schema-30a8f286f7743a9a)",
+          "result": "ok",
+          "passed": 60,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_061_backpressure.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_061_backpressure-ee3d082d230d7167)",
+          "result": "ok",
+          "passed": 28,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_065_operator_retry_instruction.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_065_operator_retry_instruction-4581f41361568163)",
+          "result": "ok",
+          "passed": 13,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_066_toolchain_housekeeping.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_066_toolchain_housekeeping-0782486b3d0e52ba)",
+          "result": "ok",
+          "passed": 5,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_066_toolchain_recovery.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_066_toolchain_recovery-cf805d0b7ec426c6)",
+          "result": "ok",
+          "passed": 7,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_082_recovery_retry_matrix.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_082_recovery_retry_matrix-d11b615f9c2054b1)",
+          "result": "ok",
+          "passed": 36,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/release.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/release-3932268ca5f5838a)",
+          "result": "FAILED",
+          "passed": 4,
+          "failed": 8,
+          "ignored": 0
+        },
+        {
+          "target": "tests/xcode_effect_journal.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/xcode_effect_journal-0fccd1f9866ddceb)",
+          "result": "ok",
+          "passed": 14,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/xcode_effect_recovery.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/xcode_effect_recovery-630dc8bd56a84fb8)",
+          "result": "ok",
+          "passed": 6,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/xcode_headless_preparation.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/xcode_headless_preparation-60ba850c7b87b0f2)",
+          "result": "ok",
+          "passed": 18,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "Doc-tests acp",
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "Doc-tests daemon",
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 1
+        },
+        {
+          "target": "Doc-tests db",
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "Doc-tests domain",
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "Doc-tests engine",
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [
+        "advance_run_backfills_delivery_receipt_when_terminal_release_lineage_exists",
+        "advance_run_does_not_backfill_delivery_receipt_without_release_lineage",
+        "auto_contract_retry_authority_gap_recovery_completes_valid_legacy_invoke",
+        "background_executor_fails_closed_without_delivery_configuration_json_and_writes_no_receipt",
+        "background_executor_persists_delivery_receipt_on_git_failure",
+        "background_executor_persists_delivery_receipt_on_publish_failure",
+        "background_executor_preserves_existing_delivery_receipt_without_overwrite",
+        "background_executor_release_uses_provisioned_run_branch_over_stale_delivery_config",
+        "background_executor_routes_release_agents_natively",
+        "blocked_implementation_assessment_routes_back_to_refinement",
+        "executor::tests::proposal_053_settlement_boundary_records_idempotency_key",
+        "executor::tests::provider_quota_runtime_receipt_preserves_explicit_claude_reset_time",
+        "executor::tests::targeted_p058_retry_refreshes_stale_tier_from_the_durable_ledger",
+        "governed_catalog_snapshot_retrofit_updates_blocked_run_escalation_policy_only",
+        "implementation_review_needs_code_fixes_blocks_manual_release_even_when_self_assessment_has_no_code_tasks",
+        "invoke_agent_repairs_missing_required_output_in_same_live_session",
+        "mcp_resolution_persistence_tests",
+        "orchestrator::tests::persisted_dynamic_health_fallback_payload_uses_frozen_target_profile_authority",
+        "p091_post_invoke_completion_failure_settle_exact_retry_target_end_to_end",
+        "p092_live_helper_honors_configured_batch_limit",
+        "p092_live_helper_promotes_existing_diagnostic_row_idempotently",
+        "p092_startup_diagnostic_records_stranded_retry_and_skips_generic_requeue",
+        "p092_startup_enforce_completes_stranded_retry_and_enqueues_targeted_advance",
+        "proposal_041_handoff_artifact_contract_is_ready",
+        "proposal_041_offline_replay_emits_behavioral_diff_reports",
+        "proposal_041_shadow_side_effect_policy_is_fail_closed",
+        "proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_policy",
+        "proposal_057_invoke_agent_imports_declared_contract_output_into_active_index",
+        "proposal_087_projection_cache_rebuilds_after_restart",
+        "repos::work_items::tests::p091_claim_next_quarantines_malformed_typed_advance_and_claims_next",
+        "repos::work_items::tests::p091_claim_next_quarantines_source_work_item_only_retry_advance",
+        "startup_recovery_completes_normal_invoke_blocked_by_stale_targeted_authority",
+        "steward_executor_tests_work_item_runs_active_catalog_agents_through_acp",
+        "steward_trigger_tests_completed_run_consumes_config_change_pending_first",
+        "steward_trigger_tests_manual_command_enqueues_shared_work_item",
+        "steward_trigger_tests_post_run_hook_honors_interval",
+        "targeted_blocked_review_synthesis_reuses_retry_stage",
+        "test_advance_run_rebuilds_projection_after_blocking_run",
+        "test_cancel_run_finalize_closes_live_session_via_runtime_manager",
+        "test_invoke_agent_end_to_end_with_fixture_binary",
+        "test_invoke_agent_imports_implementation_self_assessment_summary",
+        "test_invoke_agent_missing_live_handle_falls_back_to_fresh_generation",
+        "test_invoke_agent_persists_budget_snapshot_and_next_policy_uses_it",
+        "test_invoke_agent_persists_declared_machine_artifact_under_normalized_name",
+        "test_invoke_agent_persists_runtime_cost_and_next_policy_invalidates_on_cost_budget",
+        "test_invoke_agent_persists_undeclared_envelope_output_as_generic_artifact",
+        "test_invoke_agent_rehydrates_from_checkpointed_generation_and_persists_checkpoint_artifact",
+        "test_invoke_agent_reuses_live_session_generation_end_to_end",
+        "test_invoke_agent_startup_error_marks_agent_execution_failed",
+        "test_junie_post_preflight_capacity_requeues_without_failing_stage",
+        "test_n_phase_does_not_advance_after_failed_agent_execution",
+        "test_n_phase_sequence_ordering",
+        "test_retry_stage_on_blocked_implementation_review_targets_single_failed_agent_by_default",
+        "test_retry_stage_on_blocked_review_stage_retries_only_failed_reviewer",
+        "test_state_11_to_state_12_happy_path",
+        "test_targeted_retry_falls_back_from_claude_quota_proposal_aggregation_backend",
+        "test_targeted_retry_falls_back_from_claude_quota_proposal_reviewer_backend",
+        "test_targeted_retry_falls_back_from_claude_security_checker_backend",
+        "test_targeted_retry_falls_back_from_codex_timeout_proposal_reviewer_backend",
+        "test_targeted_retry_falls_back_from_codex_timeout_proposal_writer_backend",
+        "test_targeted_retry_falls_back_from_gemini_docs_guardian_backend",
+        "test_targeted_retry_falls_back_from_gemini_proposal_reviewer_backend",
+        "test_targeted_retry_falls_back_from_junie_code_writer_quota_to_sonnet",
+        "test_targeted_retry_uses_current_catalog_binding_when_agent_profile_changed",
+        "xcode_broker_fail_closed_observation_is_persisted_from_acp_sink"
+      ],
+      "compilation_or_launch_errors": []
+    },
+    {
+      "path": ".superpowers/sdd/2026-09-20-xcode-headless-trusted-runtime/journal-binding-red.log",
+      "classification": "Two expected old-binding reads despite durable holds",
+      "exit_code": 101,
+      "sha256": "fcd052c20c73b36e225a8fe60bf3b5f20b5324969a6d01b3901b6b33c89f47e9",
+      "test_results": [
+        {
+          "target": "tests/xcode_headless_preparation.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/xcode_headless_preparation-0deadec573ceeb11)",
+          "result": "FAILED",
+          "passed": 0,
+          "failed": 2,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [
+        "lost_dispatch_ack_revokes_preexisting_bindings_without_sending_open",
+        "outcome_commit_failure_revokes_preexisting_bindings_before_releasing_access"
+      ],
+      "compilation_or_launch_errors": []
+    },
+    {
+      "path": ".superpowers/sdd/2026-09-20-xcode-headless-trusted-runtime/controller-settlement-green.log",
+      "classification": "Final complete 20-case controller verification",
+      "exit_code": 0,
+      "sha256": "f7476e50eb35bf74199e7c7544a28c961e09d5bd9c431e42a87737098536f453",
+      "test_results": [
+        {
+          "target": "tests/xcode_headless_preparation.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/xcode_headless_preparation-0deadec573ceeb11)",
+          "result": "ok",
+          "passed": 20,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [],
+      "compilation_or_launch_errors": []
+    },
+    {
+      "path": ".superpowers/sdd/2026-09-20-xcode-headless-trusted-runtime/workspace-check.log",
+      "classification": "Final managed locked/offline workspace compilation",
+      "exit_code": 0,
+      "sha256": "598954473026ec30cd52a3c41feb22574cbaa97b7f7384edd0a27e03af0ee82d",
+      "test_results": [],
+      "failed_tests": [],
+      "compilation_or_launch_errors": []
+    },
+    {
+      "path": ".superpowers/sdd/2026-09-20-xcode-headless-trusted-runtime/format-final.log",
+      "classification": "Final managed workspace formatting check",
+      "exit_code": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "test_results": [],
+      "failed_tests": [],
+      "compilation_or_launch_errors": []
+    },
+    {
+      "path": ".superpowers/sdd/2026-09-20-xcode-headless-trusted-runtime/native-inspect.log",
+      "classification": "Earlier read-only native probe",
+      "exit_code": 0,
+      "sha256": "9b67056ab92d1792f37cc680c40753076f702242d2c417e8e5fe18a8c39ab619",
+      "test_results": [],
+      "failed_tests": [],
+      "compilation_or_launch_errors": []
+    },
+    {
+      "path": ".superpowers/sdd/2026-09-20-xcode-headless-trusted-runtime/native-inspect-final.log",
+      "classification": "Final-source read-only native probe; zero effects",
+      "exit_code": 0,
+      "sha256": "68529221836b96adc5605693af06d230f92fcbb0ee7f205d122dd9f9c64c3c01",
+      "test_results": [],
+      "failed_tests": [],
+      "compilation_or_launch_errors": []
+    },
+    {
+      "path": "/private/tmp/cw-xcode-contract-20260920.XQ7oUq/later-mutation-check.log",
+      "classification": "Later duplicate/number/traversal mutation check, not retroactive TDD",
+      "exit_code": 101,
+      "sha256": "ce1024ec6ff81ad35be51564671ccfd35492b91cf8272f108e60a9dd84cc860e",
+      "test_results": [
+        {
+          "target": "tests/xcode_contract.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/xcode_contract-7f5306eadf401b0a)",
+          "result": "FAILED",
+          "passed": 13,
+          "failed": 3,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [
+        "jcs_uses_utf16_property_order_ecmascript_numbers_and_control_escaping",
+        "read_arguments_inject_alias_and_never_forward_it_to_apple",
+        "unique_json_rejects_duplicate_keys_at_every_depth_and_invalid_encoding"
+      ],
+      "compilation_or_launch_errors": []
+    },
+    {
+      "path": "/private/tmp/cw-xcode-contract-review-fixes-20260920.0tP0YP/behavior-red.log",
+      "classification": "Policy-definition and ECMAScript schema parity behavioral RED",
+      "exit_code": 101,
+      "sha256": "7d3a3e152bbec8caebccc39e6ef358ac6ad1da3d0dbcebeb0716de724a22a6d0",
+      "test_results": [
+        {
+          "target": "tests/xcode_contract.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/xcode_contract-7f5306eadf401b0a)",
+          "result": "FAILED",
+          "passed": 16,
+          "failed": 2,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [
+        "manifest_identity_binds_the_trusted_policy_definition_and_entry_pins",
+        "organization_path_ecmascript_schema_matches_runtime_for_unicode_separators"
+      ],
+      "compilation_or_launch_errors": []
+    },
+    {
+      "path": "/private/tmp/cw-xcode-contract-review-fixes-20260920.0tP0YP/domain-final-green.log",
+      "classification": "Final complete 360-case domain suite",
+      "exit_code": 0,
+      "sha256": "774c0f40c43bc979ed399dbd7642a2681748d64e7e635157c65488a6007351ff",
+      "test_results": [
+        {
+          "target": "unittests src/lib.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/domain-446f91a285e57bcd)",
+          "result": "ok",
+          "passed": 300,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/artifact_contracts.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/artifact_contracts-949dbb1257b833ef)",
+          "result": "ok",
+          "passed": 19,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/codex_model_variant_policy.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/codex_model_variant_policy-2e5f33d15e05c1c9)",
+          "result": "ok",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/execution_root.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/execution_root-02c8853e5041082d)",
+          "result": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_017_workflow_conflict.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_017_workflow_conflict-6c689c220db396b0)",
+          "result": "ok",
+          "passed": 7,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_057_contracts.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_057_contracts-b510b3f141b60096)",
+          "result": "ok",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_058_runtime_facts.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/proposal_058_runtime_facts-2b1840242a12f496)",
+          "result": "ok",
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/xcode_contract.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/xcode_contract-7f5306eadf401b0a)",
+          "result": "ok",
+          "passed": 19,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/xcode_runtime.rs (/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920/debug/deps/xcode_runtime-0dfcb82ee9982620)",
+          "result": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "Doc-tests domain",
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [],
+      "compilation_or_launch_errors": []
+    }
+  ]
+}

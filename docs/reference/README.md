@@ -28,6 +28,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [context-strategy-and-experiment-framework.md](context-strategy-and-experiment-framework.md) — Frozen strategy profiles, handoff compilation, lazy evidence, normalized strategy telemetry, and shell-owned recommendation output
 - [proposal-loop-feedback-fidelity-and-rereview.md](proposal-loop-feedback-fidelity-and-rereview.md) — Review-corpus bundle ownership, score-lift backlog, writer coverage, targeted rereview, and proposal-growth discipline for the live proposal loop
 - [xcode-mcp-bridge-pool.md](xcode-mcp-bridge-pool.md) — Brokered Xcode MCP leases, host-user Xcode boundary, shim dispatch, runtime observations, broker health, and retained bridge-pool gate aliases
+- [xcode-headless-runtime.md](xcode-headless-runtime.md) - Headless authority, project trust, canonical gates and operator transition procedures
 
 ## Control Plane
 

@@ -19,6 +19,41 @@
 # Phase 1: seed entries only.  Phase 2 adds the first routed producer entries.
 
 [[operations]]
+operation_name = "xcode_effect.prepare"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "run_id/owner_lineage/project_key_hash/operation_key; repository guards the frozen intent"
+duplicate_application_test_path = "crates/engine/tests/xcode_effect_journal.rs::prepare_duplicate_preserves_original_invocation_and_nonce"
+
+[[operations]]
+operation_name = "xcode_effect.dispatch"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "run_id/owner_lineage/attempt_id/expected_revision; committed fence returns Existing on repeat"
+duplicate_application_test_path = "crates/engine/tests/xcode_effect_journal.rs::concurrent_same_nonce_dispatch_returns_exactly_one_dispatch"
+
+[[operations]]
+operation_name = "xcode_effect.complete"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "run_id/owner_lineage/attempt_id/expected_revision; revision-checked settlement"
+duplicate_application_test_path = "crates/engine/tests/xcode_effect_journal.rs::complete_duplicate_cannot_resettle_or_authorize_resend"
+
+[[operations]]
+operation_name = "xcode_effect.cancel"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "run_id/owner_lineage/attempt_id/expected_revision; revision-checked cancellation before dispatch"
+duplicate_application_test_path = "crates/engine/tests/xcode_effect_journal.rs::cancel_duplicate_cannot_resettle_or_authorize_dispatch"
+
+[[operations]]
+operation_name = "xcode_effect.recover_dispatched"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "batch-v1:{sha256(ordered attempt-id:revision pairs joined by |)}; bounded revision-checked restart recovery retains holds"
+duplicate_application_test_path = "crates/engine/tests/xcode_effect_recovery.rs::startup_xcode_recovery_batches_101_attempts_and_preserves_holds"
+
+[[operations]]
 operation_name = "p075_evidence_spool_ref_insert"
 class = "C"
 replay_policy = "checksum_idempotent"

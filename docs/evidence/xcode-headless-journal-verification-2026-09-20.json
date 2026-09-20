@@ -1,0 +1,983 @@
+{
+  "version": 1,
+  "date": "2026-09-20",
+  "source_head": "a096b8831f0db7f17d1ffe426851c49a65b8b000",
+  "scope": "Uncommitted persistence integration and separately scoped native compatibility observation; not a full migration, all-green suite or release receipt.",
+  "source_manifest": "docs/evidence/xcode-headless-journal-source-2026-09-20.json",
+  "source_manifest_sha256": "e9ac795cf654d2fef01b01af9abbe55430aa725262c67b666c12a983122ae815",
+  "managed_target": "/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-journal-20260920",
+  "baseline_managed_target": "/Users/user/Library/Caches/Chainworks Forge/cargo-target/gates/xcode-headless-baseline-20260920",
+  "normal_sccache_policy": true,
+  "live_junie_smoke": "unset",
+  "baseline": {
+    "archive": "/private/tmp/cw-headless-baseline-TXiXVF",
+    "tracked_blob_matches_before_and_after": 1810,
+    "mismatches": 0,
+    "newly_compared_failure_names": [
+      "auto_contract_retry_authority_gap_recovery_completes_valid_legacy_invoke",
+      "blocked_implementation_assessment_routes_back_to_refinement",
+      "governed_catalog_snapshot_retrofit_updates_blocked_run_escalation_policy_only",
+      "implementation_review_needs_code_fixes_blocks_manual_release_even_when_self_assessment_has_no_code_tasks",
+      "invoke_agent_repairs_missing_required_output_in_same_live_session",
+      "mcp_resolution_persistence_tests",
+      "p091_post_invoke_completion_failure_settle_exact_retry_target_end_to_end",
+      "p092_live_helper_honors_configured_batch_limit",
+      "p092_live_helper_promotes_existing_diagnostic_row_idempotently",
+      "p092_startup_diagnostic_records_stranded_retry_and_skips_generic_requeue",
+      "p092_startup_enforce_completes_stranded_retry_and_enqueues_targeted_advance",
+      "proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_policy",
+      "proposal_057_invoke_agent_imports_declared_contract_output_into_active_index",
+      "proposal_087_projection_cache_rebuilds_after_restart",
+      "startup_recovery_completes_normal_invoke_blocked_by_stale_targeted_authority",
+      "steward_executor_tests_work_item_runs_active_catalog_agents_through_acp",
+      "steward_trigger_tests_completed_run_consumes_config_change_pending_first",
+      "steward_trigger_tests_manual_command_enqueues_shared_work_item",
+      "steward_trigger_tests_post_run_hook_honors_interval",
+      "targeted_blocked_review_synthesis_reuses_retry_stage",
+      "test_advance_run_rebuilds_projection_after_blocking_run",
+      "test_cancel_run_finalize_closes_live_session_via_runtime_manager",
+      "test_invoke_agent_end_to_end_with_fixture_binary",
+      "test_invoke_agent_imports_implementation_self_assessment_summary",
+      "test_invoke_agent_missing_live_handle_falls_back_to_fresh_generation",
+      "test_invoke_agent_persists_budget_snapshot_and_next_policy_uses_it",
+      "test_invoke_agent_persists_declared_machine_artifact_under_normalized_name",
+      "test_invoke_agent_persists_runtime_cost_and_next_policy_invalidates_on_cost_budget",
+      "test_invoke_agent_persists_undeclared_envelope_output_as_generic_artifact",
+      "test_invoke_agent_rehydrates_from_checkpointed_generation_and_persists_checkpoint_artifact",
+      "test_invoke_agent_reuses_live_session_generation_end_to_end",
+      "test_invoke_agent_startup_error_marks_agent_execution_failed",
+      "test_junie_post_preflight_capacity_requeues_without_failing_stage",
+      "test_n_phase_does_not_advance_after_failed_agent_execution",
+      "test_n_phase_sequence_ordering",
+      "test_retry_stage_on_blocked_implementation_review_targets_single_failed_agent_by_default",
+      "test_retry_stage_on_blocked_review_stage_retries_only_failed_reviewer",
+      "test_state_11_to_state_12_happy_path",
+      "test_targeted_retry_falls_back_from_claude_quota_proposal_aggregation_backend",
+      "test_targeted_retry_falls_back_from_claude_quota_proposal_reviewer_backend",
+      "test_targeted_retry_falls_back_from_claude_security_checker_backend",
+      "test_targeted_retry_falls_back_from_codex_timeout_proposal_reviewer_backend",
+      "test_targeted_retry_falls_back_from_codex_timeout_proposal_writer_backend",
+      "test_targeted_retry_falls_back_from_gemini_docs_guardian_backend",
+      "test_targeted_retry_falls_back_from_gemini_proposal_reviewer_backend",
+      "test_targeted_retry_falls_back_from_junie_code_writer_quota_to_sonnet",
+      "test_targeted_retry_uses_current_catalog_binding_when_agent_profile_changed",
+      "xcode_broker_fail_closed_observation_is_persisted_from_acp_sink",
+      "proposal_041_handoff_artifact_contract_is_ready",
+      "proposal_041_offline_replay_emits_behavioral_diff_reports",
+      "proposal_041_shadow_side_effect_policy_is_fail_closed",
+      "advance_run_backfills_delivery_receipt_when_terminal_release_lineage_exists",
+      "advance_run_does_not_backfill_delivery_receipt_without_release_lineage",
+      "background_executor_fails_closed_without_delivery_configuration_json_and_writes_no_receipt",
+      "background_executor_persists_delivery_receipt_on_git_failure",
+      "background_executor_persists_delivery_receipt_on_publish_failure",
+      "background_executor_preserves_existing_delivery_receipt_without_overwrite",
+      "background_executor_release_uses_provisioned_run_branch_over_stale_delivery_config",
+      "background_executor_routes_release_agents_natively"
+    ],
+    "previously_reproduced_library_failures": [
+      "repos::work_items::tests::p091_claim_next_quarantines_malformed_typed_advance_and_claims_next",
+      "repos::work_items::tests::p091_claim_next_quarantines_source_work_item_only_retry_advance",
+      "executor::tests::proposal_053_settlement_boundary_records_idempotency_key",
+      "executor::tests::provider_quota_runtime_receipt_preserves_explicit_claude_reset_time",
+      "executor::tests::targeted_p058_retry_refreshes_stale_tier_from_the_durable_ledger",
+      "orchestrator::tests::persisted_dynamic_health_fallback_payload_uses_frozen_target_profile_authority"
+    ],
+    "prior_verification": "docs/evidence/xcode-headless-offline-verification-2026-09-19.json",
+    "prior_verification_sha256": "9d880046a6cb817bb23856deabe8a4cbc186c441d6953125edee5c0d5a65a3f7",
+    "unmatched_current_failures": []
+  },
+  "broad_totals": {
+    "passed": 2623,
+    "failed": 65,
+    "ignored": 3
+  },
+  "review": {
+    "agent": "01a0bd2a-778a-7993-a149-58db33abac31",
+    "scope": "Journal integration and subsequent two test additions; source only",
+    "verdict": "No actionable correctness defect; approval limited to component, with combined lifecycle test gaps retained"
+  },
+  "native_observation": {
+    "trace": "/private/tmp/cw-headless-20260920.IgV3gq/native-tool-trace.json",
+    "sha256": "e7e28d28ba6de2e156ab88852ddd652c9544935c897ebff369a6accb5486a565",
+    "scope": "Seven native tool argument/result records, not raw JSON-RPC; signed Codex approved by operator; A/B reads via explicit IDs succeed; two path-selector reads fail; open response remained pending and was not retried; no reconnect today",
+    "fixture_seed_hashes_matched": 8,
+    "unsafe_allow_all": false,
+    "ide_observed": false
+  },
+  "document_sha256": {
+    "docs/superpowers/specs/2026-09-19-xcode-headless-mcp-design.md": "e2c313ae97ad051c48ea8df9f953b911f4c84a6efc2191584432a6c6999d727a",
+    "docs/superpowers/specs/2026-09-19-xcode-headless-runtime-contract.md": "8f2e5a0d915db7e64d3ac364ef8764de086b9d552e15503c0ce5507fba749a5f",
+    "docs/superpowers/specs/2026-09-19-xcode-headless-wire-contract.md": "f0bd17b9a3c86da0e208b0ce7c2b38b534b0b586ea2ad91a9bf779664f1ecd48",
+    "docs/superpowers/specs/2026-09-19-xcode-headless-release-contract.md": "90ede76bf7e2a7a513780ef65f0461f210f78cc21ea8b807be7c2ea248dad81a",
+    "docs/superpowers/plans/2026-09-20-xcode-headless-journal-integration.md": "f2141d785b29b28d5da85368979015ab28c36de35c5a6303a70ef48d389ab1fb",
+    "docs/evidence/xcode-headless-journal-integration-2026-09-20.md": "ab5c50d7fc9bb9230025fd1e2c97218368e79c6ee5073225448962d531bab13b",
+    "docs/evidence/xcode-headless-journal-review-2026-09-20.md": "8df761a750d667dfacdf2b6ccef9c19a6d21ce1f2603bda671d3deae94a7952c"
+  },
+  "parent_revision": 7,
+  "parent_md5": "d2661e65aa77dea59fdd1a25070d7a96",
+  "logs": [
+    {
+      "log": ".superpowers/sdd/2026-09-20-xcode-headless-journal-integration/db-recovery-red.log",
+      "sha256": "5cbcc2547bd3e3624ca32b8a019bbb977bb652e6b23f6172191be57be326c57d",
+      "exit_code": 101,
+      "boundary": "Missing bounded candidate API (RED)",
+      "test_summaries": [],
+      "failed_tests": []
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-20-xcode-headless-journal-integration/engine-recovery-red.log",
+      "sha256": "c44587c85a893be9cdb175bd306e508a7d200fb204fdbbddb699b568e04ffb9d",
+      "exit_code": 101,
+      "boundary": "Missing startup recovery API (RED)",
+      "test_summaries": [],
+      "failed_tests": []
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-20-xcode-headless-journal-integration/engine-recovery-final.log",
+      "sha256": "23b97638b43c5e4dd1b973314f37348980ead4de68569904a6276832cce5de38",
+      "exit_code": 101,
+      "boundary": "101-row batch exceeded existing writer key bound (RED)",
+      "test_summaries": [
+        {
+          "target": "tests/xcode_effect_recovery.rs [xcode_effect_recovery-e0b4107611162497]",
+          "result": "FAILED",
+          "passed": 2,
+          "failed": 1,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [
+        "startup_xcode_recovery_batches_101_attempts_and_preserves_holds"
+      ]
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-20-xcode-headless-journal-integration/engine-recovery-bounded-key.log",
+      "sha256": "8ce0fa14baeed518d429d005ec88b523851531bd06384f84fc2de3e16b2794ce",
+      "exit_code": 0,
+      "boundary": "Hashed bookkeeping key; three recovery tests",
+      "test_summaries": [
+        {
+          "target": "tests/xcode_effect_recovery.rs [xcode_effect_recovery-e0b4107611162497]",
+          "result": "ok",
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": []
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-20-xcode-headless-journal-integration/engine-recovery-complete.log",
+      "sha256": "0884e49e13c84965f6e8833b8a605f65de4e60db98ebe07c6964a649a4a71da1",
+      "exit_code": 0,
+      "boundary": "Four recovery tests including closed writer",
+      "test_summaries": [
+        {
+          "target": "tests/xcode_effect_recovery.rs [xcode_effect_recovery-e0b4107611162497]",
+          "result": "ok",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": []
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-20-xcode-headless-journal-integration/task1-red-missing-api.XXXXXX.log",
+      "sha256": "a4995ea16b75ca1ebc3856bfa2d51fba5e0b1716a0c95facc10f546e1d03b1bd",
+      "exit_code": 101,
+      "boundary": "Missing journal adapter API (RED)",
+      "test_summaries": [],
+      "failed_tests": []
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-20-xcode-headless-journal-integration/task1-red-behavior.ZGoXP7",
+      "sha256": "772bd15c687ae77910a5ec4ca0229b7d42f377349b839488a9c767e8b3f3aecd",
+      "exit_code": 101,
+      "boundary": "Fourteen adapter cases fail against skeleton (RED)",
+      "test_summaries": [
+        {
+          "target": "tests/xcode_effect_journal.rs [xcode_effect_journal-dd3459c41b3ee0bd]",
+          "result": "FAILED",
+          "passed": 0,
+          "failed": 14,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [
+        "cancel_duplicate_cannot_resettle_or_authorize_dispatch",
+        "complete_duplicate_cannot_resettle_or_authorize_resend",
+        "completion_storage_failure_retains_dispatch_fence_and_hold",
+        "concurrent_same_nonce_dispatch_returns_exactly_one_dispatch",
+        "corrupt_stored_intent_is_not_treated_as_missing_or_dispatchable",
+        "foreign_run_or_owner_cannot_read_dispatch_cancel_or_complete_attempt",
+        "hold_digest_revision_and_transition_errors_remain_distinct",
+        "invalid_input_is_typed_and_does_not_write",
+        "missing_attempt_is_none_for_get_and_not_found_for_mutations",
+        "prepare_dispatch_unknown_keeps_durable_hold_and_readback",
+        "prepare_duplicate_preserves_original_invocation_and_nonce",
+        "prepare_rejects_intents_outside_fixed_run_or_owner_before_writing",
+        "prepare_same_owner_key_in_other_run_does_not_return_foreign_attempt",
+        "stopped_writer_denies_new_intent_and_dispatch_without_pool_fallback"
+      ]
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-20-xcode-headless-journal-integration/task1-red-drain.cH17CW",
+      "sha256": "082cfcd6d7fcc998275dca422cca5857039b57df0816e14e56941500417cba0b",
+      "exit_code": 101,
+      "boundary": "Settlement rejected without drain allowlist entry (RED)",
+      "test_summaries": [
+        {
+          "target": "unittests src/lib.rs [db-44dbdb2649d465af]",
+          "result": "FAILED",
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [
+        "writer::tests::xcode_effect_drain_admission_commits_only_settlement"
+      ]
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-20-xcode-headless-journal-integration/task1-green-writer.Oyl9ne",
+      "sha256": "fc79b7e3633ff7e834bf2e47a6bc57606c17281544c483924e18aecaf8778438",
+      "exit_code": 0,
+      "boundary": "Complete DB writer unit tests",
+      "test_summaries": [
+        {
+          "target": "unittests src/lib.rs [db-44dbdb2649d465af]",
+          "result": "ok",
+          "passed": 24,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": []
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-20-xcode-headless-journal-integration/task1-final-registry.q4oDIr",
+      "sha256": "74a71dd3d9a7792147bc87efa1ad6554ed508d15eefdae5a14878adf54b9e197",
+      "exit_code": 0,
+      "boundary": "Operation registry tests after final key description",
+      "test_summaries": [
+        {
+          "target": "unittests src/lib.rs [db-44dbdb2649d465af]",
+          "result": "ok",
+          "passed": 14,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": []
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-20-xcode-headless-journal-integration/task1-green-repository.j94W04",
+      "sha256": "e093d9861d07ddaf37978ec338bbbab2bd79831455ecd39c527001edc4337396",
+      "exit_code": 0,
+      "boundary": "Journal repository tests",
+      "test_summaries": [
+        {
+          "target": "tests/xcode_effect_attempts.rs [xcode_effect_attempts-8bff68ba0adae348]",
+          "result": "ok",
+          "passed": 28,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": []
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-20-xcode-headless-journal-integration/task-1-tests.log",
+      "sha256": "2ae2c384fa851c2eb14e07179d131c9254dec3c86567b7e08aecf1f36256fe22",
+      "exit_code": 0,
+      "boundary": "Task 1 final adapter tests",
+      "test_summaries": [
+        {
+          "target": "tests/xcode_effect_journal.rs [xcode_effect_journal-dd3459c41b3ee0bd]",
+          "result": "ok",
+          "passed": 14,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": []
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-20-xcode-headless-journal-integration/affected-full.log",
+      "sha256": "8c7ffe0c7443fdaf26c8c506db56933fc5d8cde72c2f2e600186e649bc4ff209",
+      "exit_code": 101,
+      "boundary": "Complete ACP/domain/DB/engine/daemon tests; serial; compiled before two recovery test additions",
+      "test_summaries": [
+        {
+          "target": "unittests src/lib.rs [acp-5b4dec6796031b04]",
+          "result": "ok",
+          "passed": 200,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/execution_root_runtime.rs [execution_root_runtime-5bc4c346fd143af0]",
+          "result": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/input_pressure.rs [input_pressure-624e882abcd33ea3]",
+          "result": "ok",
+          "passed": 15,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/integration.rs [integration-12ffe7d1a44552cc]",
+          "result": "ok",
+          "passed": 76,
+          "failed": 0,
+          "ignored": 1
+        },
+        {
+          "target": "tests/proposal_066_toolchain_mapper.rs [proposal_066_toolchain_mapper-38cc04de93842f66]",
+          "result": "ok",
+          "passed": 27,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "unittests examples/xcode_headless_i1.rs [xcode_headless_i1-e7372fd0b611a2a0]",
+          "result": "ok",
+          "passed": 37,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "unittests src/lib.rs [daemon-b5132d5d450a7c47]",
+          "result": "ok",
+          "passed": 97,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "unittests src/main.rs [control_plane-53b24279c974d82f]",
+          "result": "ok",
+          "passed": 17,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/dogfood_config.rs [dogfood_config-693fc1d1c9150b8d]",
+          "result": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/lifecycle_failure_round_trip.rs [lifecycle_failure_round_trip-c02620e37cab387a]",
+          "result": "ok",
+          "passed": 5,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/mcp_stdio.rs [mcp_stdio-6b326b6b318dac80]",
+          "result": "ok",
+          "passed": 9,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_086_mcp_continuation_live_reuse.rs [proposal_086_mcp_continuation_live_reuse-f1c7626671185a5e]",
+          "result": "ok",
+          "passed": 7,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/steward_runtime_bootstrap_tests.rs [steward_runtime_bootstrap_tests-9d6b9e4face3d4c9]",
+          "result": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "unittests src/lib.rs [db-baf04edbd4ba79c9]",
+          "result": "FAILED",
+          "passed": 442,
+          "failed": 2,
+          "ignored": 0
+        },
+        {
+          "target": "unittests src/bin/p054_v1_retirement_check.rs [p054_v1_retirement_check-cb879bc5e14b41ff]",
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/integration.rs [integration-a4e8c9cc7d0ee88e]",
+          "result": "ok",
+          "passed": 27,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_017_workflow_conflict_persistence.rs [proposal_017_workflow_conflict_persistence-d59f051e2264cc8b]",
+          "result": "ok",
+          "passed": 23,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_053_discovery_diagnostics.rs [proposal_053_discovery_diagnostics-a572289cb9786694]",
+          "result": "ok",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_057_contracts.rs [proposal_057_contracts-0597a98bd15ed8aa]",
+          "result": "ok",
+          "passed": 19,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_058_claim_start.rs [proposal_058_claim_start-496d0005b0306901]",
+          "result": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_058_runtime_facts.rs [proposal_058_runtime_facts-190bc15be0fe1246]",
+          "result": "ok",
+          "passed": 11,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_066_toolchain_cache_mapping.rs [proposal_066_toolchain_cache_mapping-36faece8578740d2]",
+          "result": "ok",
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_075_dbwriter.rs [proposal_075_dbwriter-71717ca2f6743fcd]",
+          "result": "ok",
+          "passed": 30,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_078_side_effects.rs [proposal_078_side_effects-176f2cdef763eddc]",
+          "result": "ok",
+          "passed": 18,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_079_output_contract_repair.rs [proposal_079_output_contract_repair-128f5deafdb2a29b]",
+          "result": "ok",
+          "passed": 6,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_082_recovery_retry_matrix.rs [proposal_082_recovery_retry_matrix-48947b546c4f9aa4]",
+          "result": "ok",
+          "passed": 87,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_083_migrations.rs [proposal_083_migrations-25e36fbc6158f392]",
+          "result": "ok",
+          "passed": 60,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_086_continuation_lifecycle.rs [proposal_086_continuation_lifecycle-1689a539949f9277]",
+          "result": "ok",
+          "passed": 11,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_088_persistence.rs [proposal_088_persistence-1a67084c46c59868]",
+          "result": "ok",
+          "passed": 9,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_091_retry_authority.rs [proposal_091_retry_authority-4d1465724b76db9c]",
+          "result": "ok",
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_092_retry_payload_recovery.rs [proposal_092_retry_payload_recovery-b7221490fd727357]",
+          "result": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/xcode_effect_attempts.rs [xcode_effect_attempts-ad128a9e16d7b117]",
+          "result": "ok",
+          "passed": 28,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "unittests src/lib.rs [domain-8f2abd64bc616fd1]",
+          "result": "ok",
+          "passed": 300,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/artifact_contracts.rs [artifact_contracts-0cb0cf4b2d63446e]",
+          "result": "ok",
+          "passed": 19,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/codex_model_variant_policy.rs [codex_model_variant_policy-fdff0b7ac476d69c]",
+          "result": "ok",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/execution_root.rs [execution_root-046e22ab90ca6a68]",
+          "result": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_017_workflow_conflict.rs [proposal_017_workflow_conflict-69989d59d0f184b7]",
+          "result": "ok",
+          "passed": 7,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_057_contracts.rs [proposal_057_contracts-4452ad028dc192b3]",
+          "result": "ok",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_058_runtime_facts.rs [proposal_058_runtime_facts-93d04172ed6abcbb]",
+          "result": "ok",
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/xcode_runtime.rs [xcode_runtime-35cda9735d1f7e81]",
+          "result": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "unittests src/lib.rs [engine-331f739071618ba3]",
+          "result": "FAILED",
+          "passed": 568,
+          "failed": 4,
+          "ignored": 0
+        },
+        {
+          "target": "tests/agent_context_skills.rs [agent_context_skills-95221452981fa695]",
+          "result": "ok",
+          "passed": 26,
+          "failed": 0,
+          "ignored": 1
+        },
+        {
+          "target": "tests/command_journal_audit.rs [command_journal_audit-23eff4a6e9481c07]",
+          "result": "ok",
+          "passed": 7,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/cross_surface_parity.rs [cross_surface_parity-12a5fdd9e3d211c7]",
+          "result": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/integration.rs [integration-45e0acb4567bac30]",
+          "result": "FAILED",
+          "passed": 165,
+          "failed": 48,
+          "ignored": 0
+        },
+        {
+          "target": "tests/p077_closeout_loop_budget.rs [p077_closeout_loop_budget-1746d698f8ee4915]",
+          "result": "ok",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/p077_proof_gate.rs [p077_proof_gate-24c7068daf1642dd]",
+          "result": "ok",
+          "passed": 10,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_041_parity.rs [proposal_041_parity-eb0e51bd980d82d2]",
+          "result": "FAILED",
+          "passed": 18,
+          "failed": 3,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_058_claim_start.rs [proposal_058_claim_start-bff33a7a7b6defb9]",
+          "result": "ok",
+          "passed": 22,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_058_deadline_resume.rs [proposal_058_deadline_resume-c130d612fc8a0f46]",
+          "result": "ok",
+          "passed": 10,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_058_escalation_schema.rs [proposal_058_escalation_schema-05aa371671b15551]",
+          "result": "ok",
+          "passed": 60,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_061_backpressure.rs [proposal_061_backpressure-2e55ca1e48ff3aef]",
+          "result": "ok",
+          "passed": 28,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_065_operator_retry_instruction.rs [proposal_065_operator_retry_instruction-f6cdaa77fa569ac3]",
+          "result": "ok",
+          "passed": 13,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_066_toolchain_housekeeping.rs [proposal_066_toolchain_housekeeping-8742a4e0cfcdcd8d]",
+          "result": "ok",
+          "passed": 5,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_066_toolchain_recovery.rs [proposal_066_toolchain_recovery-5fe7ec516628c940]",
+          "result": "ok",
+          "passed": 7,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/proposal_082_recovery_retry_matrix.rs [proposal_082_recovery_retry_matrix-739ca0b7c0c98a70]",
+          "result": "ok",
+          "passed": 36,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/release.rs [release-2839f67bcc10b35b]",
+          "result": "FAILED",
+          "passed": 4,
+          "failed": 8,
+          "ignored": 0
+        },
+        {
+          "target": "tests/xcode_effect_journal.rs [xcode_effect_journal-04a7cce6879fbee1]",
+          "result": "ok",
+          "passed": 14,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/xcode_effect_recovery.rs [xcode_effect_recovery-fb6f5ffe38f53467]",
+          "result": "ok",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "Doc-tests acp",
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "Doc-tests daemon",
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 1
+        },
+        {
+          "target": "Doc-tests db",
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "Doc-tests domain",
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "Doc-tests engine",
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [
+        "repos::work_items::tests::p091_claim_next_quarantines_malformed_typed_advance_and_claims_next",
+        "repos::work_items::tests::p091_claim_next_quarantines_source_work_item_only_retry_advance",
+        "executor::tests::proposal_053_settlement_boundary_records_idempotency_key",
+        "executor::tests::provider_quota_runtime_receipt_preserves_explicit_claude_reset_time",
+        "executor::tests::targeted_p058_retry_refreshes_stale_tier_from_the_durable_ledger",
+        "orchestrator::tests::persisted_dynamic_health_fallback_payload_uses_frozen_target_profile_authority",
+        "auto_contract_retry_authority_gap_recovery_completes_valid_legacy_invoke",
+        "blocked_implementation_assessment_routes_back_to_refinement",
+        "governed_catalog_snapshot_retrofit_updates_blocked_run_escalation_policy_only",
+        "implementation_review_needs_code_fixes_blocks_manual_release_even_when_self_assessment_has_no_code_tasks",
+        "invoke_agent_repairs_missing_required_output_in_same_live_session",
+        "mcp_resolution_persistence_tests",
+        "p091_post_invoke_completion_failure_settle_exact_retry_target_end_to_end",
+        "p092_live_helper_honors_configured_batch_limit",
+        "p092_live_helper_promotes_existing_diagnostic_row_idempotently",
+        "p092_startup_diagnostic_records_stranded_retry_and_skips_generic_requeue",
+        "p092_startup_enforce_completes_stranded_retry_and_enqueues_targeted_advance",
+        "proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_policy",
+        "proposal_057_invoke_agent_imports_declared_contract_output_into_active_index",
+        "proposal_087_projection_cache_rebuilds_after_restart",
+        "startup_recovery_completes_normal_invoke_blocked_by_stale_targeted_authority",
+        "steward_executor_tests_work_item_runs_active_catalog_agents_through_acp",
+        "steward_trigger_tests_completed_run_consumes_config_change_pending_first",
+        "steward_trigger_tests_manual_command_enqueues_shared_work_item",
+        "steward_trigger_tests_post_run_hook_honors_interval",
+        "targeted_blocked_review_synthesis_reuses_retry_stage",
+        "test_advance_run_rebuilds_projection_after_blocking_run",
+        "test_cancel_run_finalize_closes_live_session_via_runtime_manager",
+        "test_invoke_agent_end_to_end_with_fixture_binary",
+        "test_invoke_agent_imports_implementation_self_assessment_summary",
+        "test_invoke_agent_missing_live_handle_falls_back_to_fresh_generation",
+        "test_invoke_agent_persists_budget_snapshot_and_next_policy_uses_it",
+        "test_invoke_agent_persists_declared_machine_artifact_under_normalized_name",
+        "test_invoke_agent_persists_runtime_cost_and_next_policy_invalidates_on_cost_budget",
+        "test_invoke_agent_persists_undeclared_envelope_output_as_generic_artifact",
+        "test_invoke_agent_rehydrates_from_checkpointed_generation_and_persists_checkpoint_artifact",
+        "test_invoke_agent_reuses_live_session_generation_end_to_end",
+        "test_invoke_agent_startup_error_marks_agent_execution_failed",
+        "test_junie_post_preflight_capacity_requeues_without_failing_stage",
+        "test_n_phase_does_not_advance_after_failed_agent_execution",
+        "test_n_phase_sequence_ordering",
+        "test_retry_stage_on_blocked_implementation_review_targets_single_failed_agent_by_default",
+        "test_retry_stage_on_blocked_review_stage_retries_only_failed_reviewer",
+        "test_state_11_to_state_12_happy_path",
+        "test_targeted_retry_falls_back_from_claude_quota_proposal_aggregation_backend",
+        "test_targeted_retry_falls_back_from_claude_quota_proposal_reviewer_backend",
+        "test_targeted_retry_falls_back_from_claude_security_checker_backend",
+        "test_targeted_retry_falls_back_from_codex_timeout_proposal_reviewer_backend",
+        "test_targeted_retry_falls_back_from_codex_timeout_proposal_writer_backend",
+        "test_targeted_retry_falls_back_from_gemini_docs_guardian_backend",
+        "test_targeted_retry_falls_back_from_gemini_proposal_reviewer_backend",
+        "test_targeted_retry_falls_back_from_junie_code_writer_quota_to_sonnet",
+        "test_targeted_retry_uses_current_catalog_binding_when_agent_profile_changed",
+        "xcode_broker_fail_closed_observation_is_persisted_from_acp_sink",
+        "proposal_041_handoff_artifact_contract_is_ready",
+        "proposal_041_offline_replay_emits_behavioral_diff_reports",
+        "proposal_041_shadow_side_effect_policy_is_fail_closed",
+        "advance_run_backfills_delivery_receipt_when_terminal_release_lineage_exists",
+        "advance_run_does_not_backfill_delivery_receipt_without_release_lineage",
+        "background_executor_fails_closed_without_delivery_configuration_json_and_writes_no_receipt",
+        "background_executor_persists_delivery_receipt_on_git_failure",
+        "background_executor_persists_delivery_receipt_on_publish_failure",
+        "background_executor_preserves_existing_delivery_receipt_without_overwrite",
+        "background_executor_release_uses_provisioned_run_branch_over_stale_delivery_config",
+        "background_executor_routes_release_agents_natively"
+      ]
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-20-xcode-headless-journal-integration/journal-review-tests.log",
+      "sha256": "8cba146b00527eca79870f6b2c4a6a756d342c300ddb6dd5c54fbfdcc3068b80",
+      "exit_code": 0,
+      "boundary": "Final adapter and six recovery tests after review additions",
+      "test_summaries": [
+        {
+          "target": "tests/xcode_effect_journal.rs [xcode_effect_journal-dd3459c41b3ee0bd]",
+          "result": "ok",
+          "passed": 14,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "tests/xcode_effect_recovery.rs [xcode_effect_recovery-e0b4107611162497]",
+          "result": "ok",
+          "passed": 6,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": []
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-20-xcode-headless-journal-integration/baseline-engine-integration.log",
+      "sha256": "02a776c285f51139a10f1d13da16093048fd94dc38ac7784b1e45637d08ae1f7",
+      "exit_code": 101,
+      "boundary": "Exact-HEAD engine integration comparison",
+      "test_summaries": [
+        {
+          "target": "tests/integration.rs [integration-8c857cdb9234d8b4]",
+          "result": "FAILED",
+          "passed": 165,
+          "failed": 48,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [
+        "auto_contract_retry_authority_gap_recovery_completes_valid_legacy_invoke",
+        "blocked_implementation_assessment_routes_back_to_refinement",
+        "governed_catalog_snapshot_retrofit_updates_blocked_run_escalation_policy_only",
+        "implementation_review_needs_code_fixes_blocks_manual_release_even_when_self_assessment_has_no_code_tasks",
+        "invoke_agent_repairs_missing_required_output_in_same_live_session",
+        "mcp_resolution_persistence_tests",
+        "p091_post_invoke_completion_failure_settle_exact_retry_target_end_to_end",
+        "p092_live_helper_honors_configured_batch_limit",
+        "p092_live_helper_promotes_existing_diagnostic_row_idempotently",
+        "p092_startup_diagnostic_records_stranded_retry_and_skips_generic_requeue",
+        "p092_startup_enforce_completes_stranded_retry_and_enqueues_targeted_advance",
+        "proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_policy",
+        "proposal_057_invoke_agent_imports_declared_contract_output_into_active_index",
+        "proposal_087_projection_cache_rebuilds_after_restart",
+        "startup_recovery_completes_normal_invoke_blocked_by_stale_targeted_authority",
+        "steward_executor_tests_work_item_runs_active_catalog_agents_through_acp",
+        "steward_trigger_tests_completed_run_consumes_config_change_pending_first",
+        "steward_trigger_tests_manual_command_enqueues_shared_work_item",
+        "steward_trigger_tests_post_run_hook_honors_interval",
+        "targeted_blocked_review_synthesis_reuses_retry_stage",
+        "test_advance_run_rebuilds_projection_after_blocking_run",
+        "test_cancel_run_finalize_closes_live_session_via_runtime_manager",
+        "test_invoke_agent_end_to_end_with_fixture_binary",
+        "test_invoke_agent_imports_implementation_self_assessment_summary",
+        "test_invoke_agent_missing_live_handle_falls_back_to_fresh_generation",
+        "test_invoke_agent_persists_budget_snapshot_and_next_policy_uses_it",
+        "test_invoke_agent_persists_declared_machine_artifact_under_normalized_name",
+        "test_invoke_agent_persists_runtime_cost_and_next_policy_invalidates_on_cost_budget",
+        "test_invoke_agent_persists_undeclared_envelope_output_as_generic_artifact",
+        "test_invoke_agent_rehydrates_from_checkpointed_generation_and_persists_checkpoint_artifact",
+        "test_invoke_agent_reuses_live_session_generation_end_to_end",
+        "test_invoke_agent_startup_error_marks_agent_execution_failed",
+        "test_junie_post_preflight_capacity_requeues_without_failing_stage",
+        "test_n_phase_does_not_advance_after_failed_agent_execution",
+        "test_n_phase_sequence_ordering",
+        "test_retry_stage_on_blocked_implementation_review_targets_single_failed_agent_by_default",
+        "test_retry_stage_on_blocked_review_stage_retries_only_failed_reviewer",
+        "test_state_11_to_state_12_happy_path",
+        "test_targeted_retry_falls_back_from_claude_quota_proposal_aggregation_backend",
+        "test_targeted_retry_falls_back_from_claude_quota_proposal_reviewer_backend",
+        "test_targeted_retry_falls_back_from_claude_security_checker_backend",
+        "test_targeted_retry_falls_back_from_codex_timeout_proposal_reviewer_backend",
+        "test_targeted_retry_falls_back_from_codex_timeout_proposal_writer_backend",
+        "test_targeted_retry_falls_back_from_gemini_docs_guardian_backend",
+        "test_targeted_retry_falls_back_from_gemini_proposal_reviewer_backend",
+        "test_targeted_retry_falls_back_from_junie_code_writer_quota_to_sonnet",
+        "test_targeted_retry_uses_current_catalog_binding_when_agent_profile_changed",
+        "xcode_broker_fail_closed_observation_is_persisted_from_acp_sink"
+      ]
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-20-xcode-headless-journal-integration/baseline-engine-parity.log",
+      "sha256": "1e58762c7d3d9f770154d8cf5f237080e6e55553ca424dbe00a19dcef0552505",
+      "exit_code": 101,
+      "boundary": "Exact-HEAD P041 parity comparison",
+      "test_summaries": [
+        {
+          "target": "tests/proposal_041_parity.rs [proposal_041_parity-30960c6244068407]",
+          "result": "FAILED",
+          "passed": 18,
+          "failed": 3,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [
+        "proposal_041_handoff_artifact_contract_is_ready",
+        "proposal_041_offline_replay_emits_behavioral_diff_reports",
+        "proposal_041_shadow_side_effect_policy_is_fail_closed"
+      ]
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-20-xcode-headless-journal-integration/baseline-engine-release.log",
+      "sha256": "3d1bddde6fe844625c8c16b315240e76b116f1651242741aae0613035cfac3c5",
+      "exit_code": 101,
+      "boundary": "Exact-HEAD release comparison",
+      "test_summaries": [
+        {
+          "target": "tests/release.rs [release-4209c3d45a54dc34]",
+          "result": "FAILED",
+          "passed": 4,
+          "failed": 8,
+          "ignored": 0
+        }
+      ],
+      "failed_tests": [
+        "advance_run_backfills_delivery_receipt_when_terminal_release_lineage_exists",
+        "advance_run_does_not_backfill_delivery_receipt_without_release_lineage",
+        "background_executor_fails_closed_without_delivery_configuration_json_and_writes_no_receipt",
+        "background_executor_persists_delivery_receipt_on_git_failure",
+        "background_executor_persists_delivery_receipt_on_publish_failure",
+        "background_executor_preserves_existing_delivery_receipt_without_overwrite",
+        "background_executor_release_uses_provisioned_run_branch_over_stale_delivery_config",
+        "background_executor_routes_release_agents_natively"
+      ]
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-20-xcode-headless-journal-integration/workspace-check.log",
+      "sha256": "673c59f96e4c1eb9e7011c149d82e7923b413f58567dc99b395dffc3384f2fee",
+      "exit_code": 0,
+      "boundary": "Managed locked/offline workspace check",
+      "test_summaries": [],
+      "failed_tests": []
+    },
+    {
+      "log": ".superpowers/sdd/2026-09-20-xcode-headless-journal-integration/format-final.log",
+      "sha256": "62c75c6f601197de048c49670e6ad086f62e7a8c576bde08e56e26924777c3fa",
+      "exit_code": 0,
+      "boundary": "Final managed workspace formatting check",
+      "test_summaries": [],
+      "failed_tests": []
+    }
+  ],
+  "broad_compile_source_overrides": {
+    "control-plane/crates/engine/tests/xcode_effect_recovery.rs": "b3e8a6a02138f187185f10919ecfd16f44e6e455de7b037bd298bfe3a99d9df8"
+  },
+  "broad_compile_note": "Only the recovery test file changed after broad compilation. Its four-test binary passed in the broad run; the current six-test file passed in the separate final focused run. All production inputs remained identical."
+}

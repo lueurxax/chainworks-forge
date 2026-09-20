@@ -36,3 +36,5 @@ pub mod synthesizers;
 pub mod work_queue;
 pub mod worktree;
 pub mod worktree_fingerprint;
+pub mod xcode_effect_admin;
+pub mod xcode_effect_journal;

@@ -1,0 +1,107 @@
+// !$*UTF8*$!
+{
+ archiveVersion = 1;
+ classes = {};
+ objectVersion = 56;
+ objects = {
+  000000000000000000000001 = {
+   isa = PBXProject;
+   buildConfigurationList = 000000000000000000000004;
+   compatibilityVersion = "Xcode 14.0";
+   developmentRegion = en;
+   hasScannedForEncodings = 0;
+   knownRegions = (en, Base);
+   mainGroup = 000000000000000000000002;
+   projectDirPath = "";
+   projectRoot = "";
+   productRefGroup = 000000000000000000000008;
+   targets = (000000000000000000000007);
+  };
+  000000000000000000000002 = {
+   isa = PBXGroup;
+   children = (000000000000000000000003, 000000000000000000000008);
+   sourceTree = "<group>";
+  };
+  000000000000000000000003 = {
+   isa = PBXGroup;
+   children = (000000000000000000000006, 000000000000000000000009);
+   path = Sources;
+   sourceTree = "<group>";
+  };
+  000000000000000000000004 = {
+   isa = XCConfigurationList;
+   buildConfigurations = (000000000000000000000005);
+   defaultConfigurationIsVisible = 0;
+   defaultConfigurationName = Debug;
+  };
+  000000000000000000000005 = {
+   isa = XCBuildConfiguration;
+   buildSettings = {};
+   name = Debug;
+  };
+  000000000000000000000006 = {
+   isa = PBXFileReference;
+   lastKnownFileType = text;
+   path = Sentinel.txt;
+   sourceTree = "<group>";
+  };
+  000000000000000000000007 = {
+   isa = PBXNativeTarget;
+   buildConfigurationList = 00000000000000000000000A;
+   buildPhases = (00000000000000000000000C);
+   buildRules = ();
+   dependencies = ();
+   name = Fixture;
+   productName = Fixture;
+   productReference = 00000000000000000000000D;
+   productType = "com.apple.product-type.tool";
+  };
+  000000000000000000000008 = {
+   isa = PBXGroup;
+   children = (00000000000000000000000D);
+   name = Products;
+   sourceTree = "<group>";
+  };
+  000000000000000000000009 = {
+   isa = PBXFileReference;
+   lastKnownFileType = sourcecode.c.c;
+   path = main.c;
+   sourceTree = "<group>";
+  };
+  00000000000000000000000A = {
+   isa = XCConfigurationList;
+   buildConfigurations = (00000000000000000000000B);
+   defaultConfigurationIsVisible = 0;
+   defaultConfigurationName = Debug;
+  };
+  00000000000000000000000B = {
+   isa = XCBuildConfiguration;
+   buildSettings = {
+    CODE_SIGNING_ALLOWED = NO;
+    MACOSX_DEPLOYMENT_TARGET = 26.2;
+    PRODUCT_NAME = Fixture;
+    SDKROOT = macosx;
+    SUPPORTED_PLATFORMS = macosx;
+   };
+   name = Debug;
+  };
+  00000000000000000000000C = {
+   isa = PBXSourcesBuildPhase;
+   buildActionMask = 2147483647;
+   files = (00000000000000000000000E);
+   runOnlyForDeploymentPostprocessing = 0;
+  };
+  00000000000000000000000D = {
+   isa = PBXFileReference;
+   explicitFileType = "compiled.mach-o.executable";
+   includeInIndex = 0;
+   path = Fixture;
+   sourceTree = BUILT_PRODUCTS_DIR;
+  };
+  00000000000000000000000E = {
+   isa = PBXBuildFile;
+   fileRef = 000000000000000000000009;
+  };
+ };
+ rootObject = 000000000000000000000001;
+}

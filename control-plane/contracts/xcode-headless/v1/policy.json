@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "trust_policy_id": "trusted_local_project_v1",
+  "scope": {
+    "project_model": "explicitly_operator_trusted_local_project",
+    "operator_admission": "exact_pinned_execution_root_project_and_uid",
+    "operations": ["workspace_open", "XcodeRead"],
+    "file_references": "xcode_project_organization_may_resolve_outside_checkout"
+  },
+  "assumptions": [
+    "project_metadata_and_referenced_local_content_are_operator_trusted",
+    "same_uid_external_clients_are_cooperative_not_isolated"
+  ],
+  "required_controls": [
+    "explicit_operator_admission_reference_separate_from_policy_digest",
+    "pinned_execution_root_project_uid_installation_and_service_generation",
+    "current_evaluated_invocation_permissions_and_effective_tool_allowlist",
+    "initial_structured_workspace_id_and_exact_canonical_requested_path",
+    "fresh_structured_exact_open_path_status_before_each_scoped_dispatch",
+    "explicit_bound_workspace_id_for_every_scoped_upstream_call",
+    "current_trust_permission_tool_manifest_and_trust_policy_digest_checks",
+    "durable_dispatch_fence_and_outcome_for_workspace_open",
+    "unknown_effects_remain_held_without_automatic_replay",
+    "invalidate_and_readmit_after_identity_mapping_trust_or_policy_drift"
+  ],
+  "excluded_guarantees": [
+    "apple_sandbox_or_checkout_only_filesystem_confinement",
+    "atomic_workspace_lifetime_or_execution_time_isolation",
+    "status_revalidation_of_workspace_id_to_path_mapping",
+    "operator_trust_decision_or_permission_grant_from_policy_digest"
+  ],
+  "prohibitions": [
+    "automatic_apple_permission_grants_or_permission_allowlist_bypass",
+    "admitting_build_test_execution_or_other_tools_from_project_trust_alone",
+    "close_reopen_as_validation_or_recovery",
+    "relabeling_existing_bindings_or_historical_observations_after_policy_change"
+  ]
+}

@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:chainworks:xcode-headless:release-v1",
+  "$ref": "#/$defs/receipt",
+  "$comment": "R4 release-only supplement. Does not alter the immutable v1 wire manifest, adapters or historical evidence. Enforced by domain::xcode_release; no host attestation or release authorization is conferred.",
+  "x-runtime-constraints": [
+    "Unique object keys at every depth; receipt <= 262144 bytes; evidence <= 128 files, 262144 bytes per file, 4194304 total bytes.",
+    "Receipt digest is cw.xcode.receipt.v1 JCS digest excluding receipt_digest; manifest hashes are SHA256 of the exact evidence bytes.",
+    "UTC timestamps only; evidence observation <= check observation <= receipt generation. Source identity is cw.xcode.release-source.v1 over the independently supplied identity and frozen required_capabilities.",
+    "All identities and artifact digests must match independently verified candidate values. Journal count must match independent durable readback; pass requires both counts zero.",
+    "Mandatory identity labels reject placeholders, mutable latest labels and credential patterns. Details are restricted redacted prose, never paths, URLs, commands, tokens or payloads. Arbitrary collector honesty is outside this validator.",
+    "Evidence paths are receipt-folder-relative, nonempty bounded ASCII label components without dot segments, backslashes, URLs, encoding or absolute roots. The filesystem-free validator never follows links; any loader must reject symlink escapes before supplying bytes.",
+    "Checks must have exact R4 names. Passing checks require referenced digest-matching evidence with the same source identity, required evidence kind and all closed proof assertions defined by domain::xcode_release::CHECKS.",
+    "Installed host evidence is required for IDE absence, packaged launch, consent, cold start, warm attach and project binding. Canonical gate evidence is repository_gate; the remaining check proofs are fixture evidence.",
+    "Initial structured ID and exact path, fresh path presence, pinned generation and explicit-ID broker read are distinct project_binding proofs. No sandbox claim is required or inferred.",
+    "Capabilities must uniquely cover the independently supplied (capability, required_by) pairs, use an independently admitted route, and reference matching passing capability evidence. headless_mcp and existing_filesystem require installed_host evidence; canonical_gate requires repository_gate evidence.",
+    "Duplicate capability pairs, assertion strings, routes or evidence references are rejected. At most 128 capability rows and 32 references per row.",
+    "Missing evidence, stale identities, unsupported routes, incomplete or failed checks, non-approved consent, development launch or unresolved effects compute hold. Any declared verdict inconsistent with the computed result is rejected, never rewritten into a pass."
+  ],
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "commit": {"type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"},
+    "label": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
+    "positiveDecimal": {"type": "string", "pattern": "^[1-9][0-9]{0,9}$", "x-runtime-constraints": ["Must parse as u32."]},
+    "timestamp": {"type": "string", "format": "date-time", "maxLength": 35, "pattern": "T.*(Z|\\+00:00)$"},
+    "path": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$", "x-runtime-constraints": ["Each component is at most 128 bytes and follows the identity label redaction rules."]},
+    "refs": {"type": "array", "maxItems": 32, "uniqueItems": true, "items": {"$ref": "#/$defs/path"}},
+    "status": {"enum": ["pass", "fail", "unknown", "not_run"]},
+    "route": {"enum": ["headless_mcp", "canonical_gate", "existing_filesystem"]},
+    "app": {
+      "type": "object", "additionalProperties": false,
+      "required": ["version", "build", "bundle_id", "signing_team", "designated_requirement_digest", "artifact_digest"],
+      "properties": {
+        "version": {"$ref": "#/$defs/label"}, "build": {"$ref": "#/$defs/label"},
+        "bundle_id": {"$ref": "#/$defs/label"}, "signing_team": {"$ref": "#/$defs/label"},
+        "designated_requirement_digest": {"$ref": "#/$defs/digest"}, "artifact_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "daemon": {
+      "type": "object", "additionalProperties": false,
+      "required": ["version", "build_sha", "artifact_digest", "signing_requirement_digest", "db_schema_version"],
+      "properties": {
+        "version": {"$ref": "#/$defs/label"}, "build_sha": {"$ref": "#/$defs/commit"},
+        "artifact_digest": {"$ref": "#/$defs/digest"}, "signing_requirement_digest": {"$ref": "#/$defs/digest"},
+        "db_schema_version": {"$ref": "#/$defs/positiveDecimal"}
+      }
+    },
+    "xcode": {
+      "type": "object", "additionalProperties": false,
+      "required": ["version", "build", "toolchain_identity_digest", "service_bundle_id", "service_build"],
+      "properties": {
+        "version": {"$ref": "#/$defs/label"}, "build": {"$ref": "#/$defs/label"},
+        "toolchain_identity_digest": {"$ref": "#/$defs/digest"},
+        "service_bundle_id": {"$ref": "#/$defs/label"}, "service_build": {"$ref": "#/$defs/label"}
+      }
+    },
+    "launchIdentity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["mode", "uid_pseudonym", "daemon_executable_digest", "bridge_executable_digest", "daemon_signing_requirement_digest", "bridge_signing_requirement_digest"],
+      "properties": {
+        "mode": {"enum": ["packaged", "development"]}, "uid_pseudonym": {"$ref": "#/$defs/label"},
+        "daemon_executable_digest": {"$ref": "#/$defs/digest"}, "bridge_executable_digest": {"$ref": "#/$defs/digest"},
+        "daemon_signing_requirement_digest": {"$ref": "#/$defs/digest"}, "bridge_signing_requirement_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "serviceGeneration": {
+      "type": "object", "additionalProperties": false,
+      "required": ["boot_identity", "start_identity", "pid", "bundle_identity_digest", "executable_identity_digest"],
+      "properties": {
+        "boot_identity": {"$ref": "#/$defs/label"}, "start_identity": {"$ref": "#/$defs/label"},
+        "pid": {"$ref": "#/$defs/positiveDecimal"}, "bundle_identity_digest": {"$ref": "#/$defs/digest"},
+        "executable_identity_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "contract": {
+      "type": "object", "additionalProperties": false,
+      "required": ["manifest_digest", "schema_bundle_digest", "effective_policy_digest", "binding_digest", "trust_policy_id", "trust_policy_digest"],
+      "properties": {
+        "manifest_digest": {"$ref": "#/$defs/digest"}, "schema_bundle_digest": {"$ref": "#/$defs/digest"},
+        "effective_policy_digest": {"$ref": "#/$defs/digest"}, "binding_digest": {"$ref": "#/$defs/digest"},
+        "trust_policy_id": {"const": "trusted_local_project_v1"},
+        "trust_policy_digest": {"const": "d172d6beb3acfa3e063f28588a856dda4079ba7f841de3e3e47fb81182eaa907"}
+      }
+    },
+    "consent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "principal_digest", "folder_scope_digest", "evidence_ref"],
+      "properties": {
+        "status": {"enum": ["approved", "denied", "unknown"]}, "principal_digest": {"$ref": "#/$defs/digest"},
+        "folder_scope_digest": {"$ref": "#/$defs/digest"}, "evidence_ref": {"$ref": "#/$defs/path"}
+      }
+    },
+    "check": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "observed_at", "evidence_refs", "details", "source_identity_digest"],
+      "properties": {
+        "status": {"$ref": "#/$defs/status"}, "observed_at": {"$ref": "#/$defs/timestamp"},
+        "evidence_refs": {"$ref": "#/$defs/refs"}, "source_identity_digest": {"$ref": "#/$defs/digest"},
+        "details": {"type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[A-Za-z0-9 .,_()'-]+$", "x-runtime-constraints": ["No credential patterns or whitespace-delimited words longer than 64 bytes."]}
+      }
+    },
+    "checks": {
+      "type": "object", "additionalProperties": false,
+      "required": ["ide_absent", "packaged_launch_identity", "consent_scope", "cold_start", "warm_attach", "project_binding", "foreign_project_rejection", "trusted_project_admission", "scope_controls", "reuse_revalidation", "broker_shim_exclusion", "restart_recovery", "effect_dedupe", "public_redaction", "mixed_versions", "canonical_gates", "required_capabilities"],
+      "properties": {
+        "ide_absent": {"$ref": "#/$defs/check"}, "packaged_launch_identity": {"$ref": "#/$defs/check"},
+        "consent_scope": {"$ref": "#/$defs/check"}, "cold_start": {"$ref": "#/$defs/check"},
+        "warm_attach": {"$ref": "#/$defs/check"}, "project_binding": {"$ref": "#/$defs/check"},
+        "foreign_project_rejection": {"$ref": "#/$defs/check"}, "trusted_project_admission": {"$ref": "#/$defs/check"},
+        "scope_controls": {"$ref": "#/$defs/check"}, "reuse_revalidation": {"$ref": "#/$defs/check"},
+        "broker_shim_exclusion": {"$ref": "#/$defs/check"}, "restart_recovery": {"$ref": "#/$defs/check"},
+        "effect_dedupe": {"$ref": "#/$defs/check"}, "public_redaction": {"$ref": "#/$defs/check"},
+        "mixed_versions": {"$ref": "#/$defs/check"}, "canonical_gates": {"$ref": "#/$defs/check"},
+        "required_capabilities": {"$ref": "#/$defs/check"}
+      }
+    },
+    "capability": {
+      "type": "object", "additionalProperties": false,
+      "required": ["capability", "required_by", "route", "status", "evidence_refs"],
+      "properties": {
+        "capability": {"$ref": "#/$defs/label"}, "required_by": {"$ref": "#/$defs/label"},
+        "route": {"$ref": "#/$defs/route"}, "status": {"$ref": "#/$defs/status"}, "evidence_refs": {"$ref": "#/$defs/refs"}
+      }
+    },
+    "receipt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "release_id", "source_commit", "source_content_digest", "generated_at", "app", "daemon", "xcode", "launch_identity", "service_generation", "contract", "consent", "capabilities", "checks", "unresolved_attempt_count", "evidence_manifest", "verdict", "receipt_digest"],
+      "properties": {
+        "schema_version": {"type": "integer", "const": 1}, "release_id": {"$ref": "#/$defs/label"},
+        "source_commit": {"$ref": "#/$defs/commit"}, "source_content_digest": {"$ref": "#/$defs/digest"},
+        "generated_at": {"$ref": "#/$defs/timestamp"}, "app": {"$ref": "#/$defs/app"},
+        "daemon": {"$ref": "#/$defs/daemon"}, "xcode": {"$ref": "#/$defs/xcode"},
+        "launch_identity": {"$ref": "#/$defs/launchIdentity"}, "service_generation": {"$ref": "#/$defs/serviceGeneration"},
+        "contract": {"$ref": "#/$defs/contract"}, "consent": {"$ref": "#/$defs/consent"},
+        "checks": {"$ref": "#/$defs/checks"},
+        "capabilities": {"type": "array", "maxItems": 128, "items": {"$ref": "#/$defs/capability"}},
+        "unresolved_attempt_count": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "evidence_manifest": {"type": "object", "maxProperties": 128, "propertyNames": {"$ref": "#/$defs/path"}, "additionalProperties": {"$ref": "#/$defs/digest"}},
+        "verdict": {"enum": ["pass", "hold"]}, "receipt_digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "evidenceCheck": {
+      "type": "object", "additionalProperties": false, "required": ["status", "assertions"],
+      "properties": {
+        "status": {"$ref": "#/$defs/status"},
+        "assertions": {"type": "array", "maxItems": 5, "uniqueItems": true, "items": {"$ref": "#/$defs/label"}}
+      },
+      "x-runtime-constraints": ["Assertion vocabulary and maximum assertion count are closed per named check in domain::xcode_release::CHECKS; unknown assertions are rejected. Missing assertions hold."]
+    },
+    "evidenceCapability": {
+      "type": "object", "additionalProperties": false, "required": ["capability", "required_by", "route", "status"],
+      "properties": {
+        "capability": {"$ref": "#/$defs/label"}, "required_by": {"$ref": "#/$defs/label"},
+        "route": {"$ref": "#/$defs/route"}, "status": {"$ref": "#/$defs/status"}
+      }
+    },
+    "evidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "contract_revision", "source_identity_digest", "observed_at", "kind", "checks", "capabilities"],
+      "properties": {
+        "schema_version": {"type": "integer", "const": 1}, "contract_revision": {"type": "integer", "const": 4},
+        "source_identity_digest": {"$ref": "#/$defs/digest"}, "observed_at": {"$ref": "#/$defs/timestamp"},
+        "kind": {"enum": ["fixture", "installed_host", "repository_gate"]},
+        "checks": {
+          "type": "object", "maxProperties": 17,
+          "propertyNames": {"enum": ["ide_absent", "packaged_launch_identity", "consent_scope", "cold_start", "warm_attach", "project_binding", "foreign_project_rejection", "trusted_project_admission", "scope_controls", "reuse_revalidation", "broker_shim_exclusion", "restart_recovery", "effect_dedupe", "public_redaction", "mixed_versions", "canonical_gates", "required_capabilities"]},
+          "additionalProperties": {"$ref": "#/$defs/evidenceCheck"}
+        },
+        "capabilities": {"type": "array", "maxItems": 128, "items": {"$ref": "#/$defs/evidenceCapability"}}
+      }
+    }
+  }
+}

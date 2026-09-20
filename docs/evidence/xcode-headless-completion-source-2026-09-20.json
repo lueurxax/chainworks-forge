@@ -1,0 +1,324 @@
+{
+  "schema_version": 1,
+  "source_head": "a096b8831f0db7f17d1ffe426851c49a65b8b000",
+  "dirty": true,
+  "scope": "Integrated headless candidate; not installed or released",
+  "files": [
+    {
+      "path": "control-plane/Cargo.lock",
+      "sha256": "a5f06098ca6b293b2d133b8689622b4afce1d30d9af37b08eb8701bb842f383f"
+    },
+    {
+      "path": "control-plane/contracts/xcode-headless/release-v1/schemas.json",
+      "sha256": "e39332109b3d381d6a9b6608e2ca39acfc0020fcdb2930cbeef3725ccc941591"
+    },
+    {
+      "path": "control-plane/contracts/xcode-headless/v1/manifest.json",
+      "sha256": "a60c33395248b223c53b52a4292b42307e0d55121c707a060a0c3947f7453fd4"
+    },
+    {
+      "path": "control-plane/contracts/xcode-headless/v1/policy.json",
+      "sha256": "bf158c71cbb5197ba4ad52c57713a7d5074da731bf830b52de1daaa44e2b73a1"
+    },
+    {
+      "path": "control-plane/contracts/xcode-headless/v1/schemas.json",
+      "sha256": "835cd06ecb9a3f666c4344a2be787d85c7fe27f2f69fb809f45031688bd621bb"
+    },
+    {
+      "path": "control-plane/contracts/xcode-headless/v1/upstream-capture.json",
+      "sha256": "697d27000ac8d865a05714c3291d8381636b5f432e7f04e20b2e1665832da76f"
+    },
+    {
+      "path": "control-plane/crates/acp/Cargo.toml",
+      "sha256": "316124c0de4adadd526756ddee568f650c92add5cbf8c66c9a1816e3d76a8b79"
+    },
+    {
+      "path": "control-plane/crates/acp/examples/xcode_headless_i1.rs",
+      "sha256": "1874c5fcb0262ac55980e77bac163f9c24948f713eb5081782cbc7ced3990142"
+    },
+    {
+      "path": "control-plane/crates/acp/examples/xcode_headless_i1/cli.rs",
+      "sha256": "7fd9ddd7f890a120c00545735dee1d8beb4b99101a988c35c1d914cba05f49ca"
+    },
+    {
+      "path": "control-plane/crates/acp/examples/xcode_headless_i1/controller.rs",
+      "sha256": "a3ff82a5082d85963938ed44da3b76d4a2afe23063450df03446dcdeb98590e8"
+    },
+    {
+      "path": "control-plane/crates/acp/examples/xcode_headless_i1/evidence.rs",
+      "sha256": "4ecb964111cdc11290ddb1ef874bc357111900f4013c4649d73130e9cdf6da61"
+    },
+    {
+      "path": "control-plane/crates/acp/examples/xcode_headless_i1/host.rs",
+      "sha256": "86f34050b79f2adae88bdb2cecd5b871fca6e3d2d5010635902a77286ada1816"
+    },
+    {
+      "path": "control-plane/crates/acp/examples/xcode_headless_i1/mod.rs",
+      "sha256": "38a8288d5bd343583eb23aef2119b6b8b45c0d3efa8d505191c39909cbb71ffd"
+    },
+    {
+      "path": "control-plane/crates/acp/examples/xcode_headless_i1/project.rs",
+      "sha256": "39dcaec96e55c4f5bfc55256996802e5de1baf9ae221e5ef11744ad64bcf6533"
+    },
+    {
+      "path": "control-plane/crates/acp/examples/xcode_headless_i1/protocol.rs",
+      "sha256": "a2bc53cb52ed688789c206be7174025b0d4f402062506df8fd2c4cb596277925"
+    },
+    {
+      "path": "control-plane/crates/acp/examples/xcode_headless_i1/tools.rs",
+      "sha256": "428440f592fb0d6e774094d98e931d0710c20c63987dc6fb9802b0a6bfbd44fb"
+    },
+    {
+      "path": "control-plane/crates/acp/examples/xcode_headless_inspect.rs",
+      "sha256": "0480014e9e3ed9d7d5dfae4986587d0a5db3324108864ff9c2fadb59e852ef48"
+    },
+    {
+      "path": "control-plane/crates/acp/src/adapters/junie.rs",
+      "sha256": "85b88571cd23e6467c0f33cdc15478e60508b437b799c4ca19db2275e45fcc18"
+    },
+    {
+      "path": "control-plane/crates/acp/src/adapters/mod.rs",
+      "sha256": "9f2f487d5c3a46db3c4236d4246ff6dd3a6302000a9bbf9f04b1accd2b6c50f7"
+    },
+    {
+      "path": "control-plane/crates/acp/src/execution_root.rs",
+      "sha256": "1ab2fe7a676f6e36fbbe09ee01aec1d6a8793ae189af69aafdfbbfeff40b39d3"
+    },
+    {
+      "path": "control-plane/crates/acp/src/lib.rs",
+      "sha256": "27cc19c737da4bc790a57d31e081983bd428eacf86c50e8841a4bbb7d8cd848f"
+    },
+    {
+      "path": "control-plane/crates/acp/src/manager.rs",
+      "sha256": "36a580916120040cbf4835094fe4e95d7b52aea686df0e2efa8e03606d738a2c"
+    },
+    {
+      "path": "control-plane/crates/acp/src/transport.rs",
+      "sha256": "0e6c78e70e5d380eae313abb4bef5b832c80dc028fc931cfddff689013ecb87c"
+    },
+    {
+      "path": "control-plane/crates/acp/src/xcode_broker.rs",
+      "sha256": "e24c69f93706d7d778026f704e4cc434f1dc6ff4318a9d96ae04925889a74d70"
+    },
+    {
+      "path": "control-plane/crates/acp/src/xcode_coordinator.rs",
+      "sha256": "cd9d4c7b17d8e59f172bed20faa68eacbbdccfc87685658b88aceb212a72493c"
+    },
+    {
+      "path": "control-plane/crates/acp/src/xcode_effect_journal.rs",
+      "sha256": "3e2486ed5b1f9ff17bf21d8560e221263a325d77d2230f504018667082d09e3a"
+    },
+    {
+      "path": "control-plane/crates/acp/src/xcode_headless.rs",
+      "sha256": "58ecfb618e99c6f9bf7bf3c19ad050b8ebcb065570446bbc1599755eb6ef9000"
+    },
+    {
+      "path": "control-plane/crates/acp/src/xcode_headless_host.rs",
+      "sha256": "0e8aba42d324caaa5749bc27af66d3e5b307ffcf2b1611aff7038f4d052c50a7"
+    },
+    {
+      "path": "control-plane/crates/acp/src/xcode_headless_runtime.rs",
+      "sha256": "a1b014e5f6e806212986655ceafd71d201006601d882cc063ca8652509276d16"
+    },
+    {
+      "path": "control-plane/crates/acp/src/xcode_headless_transport.rs",
+      "sha256": "ca4cf022ba78bc8a718d03c8cb7b2a80c6ea29d83f3f38b263fed6ac35985554"
+    },
+    {
+      "path": "control-plane/crates/acp/src/xcode_project_trust.rs",
+      "sha256": "9de28b048a84c7ac192c2fd9b5649b9eb00aa8e7b761da13302dc5e9278ee165"
+    },
+    {
+      "path": "control-plane/crates/acp/src/xcode_shim.rs",
+      "sha256": "6bace62680ea399322261f5c12eeaea2f03c6b7a84e5cdf37fbb5cdcb926bcff"
+    },
+    {
+      "path": "control-plane/crates/acp/tests/execution_root_runtime.rs",
+      "sha256": "3e9af04799310b72586b41379278eb64c8162f0f1c05455f0aac0504078c9ec7"
+    },
+    {
+      "path": "control-plane/crates/acp/tests/fixtures/xcode_headless_i1/Fixture.xcscheme",
+      "sha256": "b3baf0fdabe39adc62ff43ff1908bbd48b5ca008d617db885428ea46e6c20396"
+    },
+    {
+      "path": "control-plane/crates/acp/tests/fixtures/xcode_headless_i1/apple-contract.json",
+      "sha256": "697d27000ac8d865a05714c3291d8381636b5f432e7f04e20b2e1665832da76f"
+    },
+    {
+      "path": "control-plane/crates/acp/tests/fixtures/xcode_headless_i1/fake_mcpbridge.py",
+      "sha256": "574a935e351ac25a42bc631ea76de73ed276d325572a3264622de78b09b9f513"
+    },
+    {
+      "path": "control-plane/crates/acp/tests/fixtures/xcode_headless_i1/main.c",
+      "sha256": "2ad75d95660563887d8d3f1d0ae1dcf18c2379cbd83a5c72f5ab276351ee6949"
+    },
+    {
+      "path": "control-plane/crates/acp/tests/fixtures/xcode_headless_i1/project.pbxproj",
+      "sha256": "308252c2fe45d58831a2ba243f3f5e87b54482b1fa1b9eea2669fa8baf55a762"
+    },
+    {
+      "path": "control-plane/crates/acp/tests/xcode_coordinator.rs",
+      "sha256": "93d06fdf8130f9bf46f2795f3a4e1cc0de7b2896b848c843c803765093541431"
+    },
+    {
+      "path": "control-plane/crates/acp/tests/xcode_headless_gate.rs",
+      "sha256": "0c743f42fd0cfdec6f3d0eac1c4f6d5d77ee8a39548766438b05512f050fa27b"
+    },
+    {
+      "path": "control-plane/crates/acp/tests/xcode_headless_host.rs",
+      "sha256": "399808f9b04c431b2b67531130594c415518c2854a9c7e61bb8d3da9e39866c7"
+    },
+    {
+      "path": "control-plane/crates/acp/tests/xcode_project_trust.rs",
+      "sha256": "e271d3eb9e35cc80c4fa133d187133f6937bf4eba6b491c79d2dfcde156edbb0"
+    },
+    {
+      "path": "control-plane/crates/auth/src/lib.rs",
+      "sha256": "b36e8c58231600036741701e941b5e39399c87f9a558a55e04328178d4f4c855"
+    },
+    {
+      "path": "control-plane/crates/daemon/src/lib.rs",
+      "sha256": "a0a12247edcf24ed24790f03738ac92f08ba3ca987fad6d2ec37363d987905b4"
+    },
+    {
+      "path": "control-plane/crates/daemon/src/main.rs",
+      "sha256": "6ca8fb78d84e29dc49b1cb3e122b6aa9c19683f40fd308f2b3eed507b53a0d1f"
+    },
+    {
+      "path": "control-plane/crates/daemon/src/xcode_admin.rs",
+      "sha256": "21ef6fd867058c2658233f20aa0ddac3cb796150871e129ac1035a5977f75651"
+    },
+    {
+      "path": "control-plane/crates/daemon/src/xcode_broker_http.rs",
+      "sha256": "5bf8dfb775f6ad841d963f438a7e3793dab9ebafbadfa7074223d6fed9fc0c5d"
+    },
+    {
+      "path": "control-plane/crates/daemon/src/xcode_shim_socket.rs",
+      "sha256": "2f14811b6833a18531adefc807e1579e320b0351c7dffef5ac73329da3c4e13b"
+    },
+    {
+      "path": "control-plane/crates/db/migrations/100_xcode_effect_attempts.sql",
+      "sha256": "cd985a8fefdccaf82d7a0f5ac82d1f447abc2944d4004a41ff84f9b6d569f4f9"
+    },
+    {
+      "path": "control-plane/crates/db/src/repos/mod.rs",
+      "sha256": "15fe5ece244f9f3e2017226d2b56376c9cea136b0d5f75ef9b85f5a6b0f873a6"
+    },
+    {
+      "path": "control-plane/crates/db/src/repos/xcode_effect_attempts.rs",
+      "sha256": "49d24f6d0d048110cabea20caad31512e9e8fcdddab0c0b902338d81592563d8"
+    },
+    {
+      "path": "control-plane/crates/db/src/writer.rs",
+      "sha256": "66e4c7eb2406b6618b21e18c201104ce1132fd963d08c6a628d728e7ddd91f90"
+    },
+    {
+      "path": "control-plane/crates/db/tests/xcode_effect_attempts.rs",
+      "sha256": "59b06a123e9ed8b9ff7ae3944f4190f7a29a584eee54cb1b0accac9464c3d891"
+    },
+    {
+      "path": "control-plane/crates/db/write-operation-registry.toml",
+      "sha256": "865bc20d019f53a8498b679b59eae94acb6f826e3b9e7e840755ead2f6d16325"
+    },
+    {
+      "path": "control-plane/crates/domain/Cargo.toml",
+      "sha256": "fda4f8fd7c703bff49d846599110a3238ee444a9ad70cdd79adc52de6ed183bb"
+    },
+    {
+      "path": "control-plane/crates/domain/src/capabilities.rs",
+      "sha256": "806afd3230a1fdd1942b35d0a2444d25f665cfe1727d0195076825dbea4de90a"
+    },
+    {
+      "path": "control-plane/crates/domain/src/execution_root.rs",
+      "sha256": "546ba0b276a4e8d67ce02fc3d795ca5349d95bbde3b0bc93fa3d0e3b52593667"
+    },
+    {
+      "path": "control-plane/crates/domain/src/lib.rs",
+      "sha256": "8f957c05e21996242ff4f1e12bd876d51d1e0d2a90de9eda2f3c247cfaa6eab0"
+    },
+    {
+      "path": "control-plane/crates/domain/src/xcode_contract.rs",
+      "sha256": "40abe32aaf1b3a007a8aa38c476c33b60fb535d3aebe8e682c14701df7a3c4a2"
+    },
+    {
+      "path": "control-plane/crates/domain/src/xcode_effect.rs",
+      "sha256": "bbc1f099a9f4b8932d2a7d7b9b59f029e5e60a570de65e995b1d17a5bcd76b64"
+    },
+    {
+      "path": "control-plane/crates/domain/src/xcode_release.rs",
+      "sha256": "284cc83bb33d9f66beb9fda4d244ec05d2bfc980fec01cd0a92daa627712f0d0"
+    },
+    {
+      "path": "control-plane/crates/domain/tests/execution_root.rs",
+      "sha256": "d952044a83978c5b09bc1680b102ed56ce2f3fbd80bdefcaf6a65967a36796b7"
+    },
+    {
+      "path": "control-plane/crates/domain/tests/xcode_contract.rs",
+      "sha256": "923037f81a1d8a7f18c980436d5d18fdea6e76d5d8614939482c8f514b9543a7"
+    },
+    {
+      "path": "control-plane/crates/domain/tests/xcode_release.rs",
+      "sha256": "817e6b7aea8e81a67967d8ff19d4cadbf3b6612066a0a9e4df834c8dd53f6de0"
+    },
+    {
+      "path": "control-plane/crates/engine/src/executor.rs",
+      "sha256": "ccc3a296ab24db987d0aeaba7681ea24a2884f54b0c529200319d5edcd99c8fd"
+    },
+    {
+      "path": "control-plane/crates/engine/src/lib.rs",
+      "sha256": "6e8663c4c5083e06837d99868c35138694aac9ab32b9e7995add71da51edce68"
+    },
+    {
+      "path": "control-plane/crates/engine/src/mcp.rs",
+      "sha256": "681c673c08977bf63d980645cb4a8b9e691957147f32f12d7aab79ba75b96e70"
+    },
+    {
+      "path": "control-plane/crates/engine/src/recovery.rs",
+      "sha256": "cfe2203712554712c84d13d9077023c163da74385509efc324fdfc42719d913b"
+    },
+    {
+      "path": "control-plane/crates/engine/src/xcode_effect_admin.rs",
+      "sha256": "4e53d8e46a3bd7e6db5b017213f457340fd5d11a59fb500a8e3b56e7016e11fa"
+    },
+    {
+      "path": "control-plane/crates/engine/src/xcode_effect_journal.rs",
+      "sha256": "8c5db21231e19ddb7e5c114ca02b2c6c7ea652391d5724019c990f01f192408d"
+    },
+    {
+      "path": "control-plane/crates/engine/tests/xcode_effect_journal.rs",
+      "sha256": "eddaea95bbe0bf40f9acab6b2f149eeceec587124870a732bc7ccefb63b7c815"
+    },
+    {
+      "path": "control-plane/crates/engine/tests/xcode_effect_recovery.rs",
+      "sha256": "280ec3212e9b03d572b395e050e10338f6b42c9a2a098662ed1b66819891db47"
+    },
+    {
+      "path": "control-plane/crates/engine/tests/xcode_headless_preparation.rs",
+      "sha256": "45dc5788950c6105d768787a59dfaac1a69f1332b56e4b47d22664e67e065cb7"
+    },
+    {
+      "path": "control-plane/crates/mcp-server/src/tools/mod.rs",
+      "sha256": "1db3fc6794939d820be6de5e0073d0b05c53b0862cfccdce3d29db7030e3d398"
+    },
+    {
+      "path": "control-plane/crates/workflow/src/direct_command.rs",
+      "sha256": "afca823e1b5dabaab498806cc1f9784afb845582f7ebb283f537f55e22afd11f"
+    },
+    {
+      "path": "control-plane/crates/workflow/tests/agent_context_skills.rs",
+      "sha256": "7c998e19bc91e9f36e46ac936a8de334918f67af4a9dc86c06e69afb225f0ee9"
+    },
+    {
+      "path": "control-plane/crates/workflow/tests/xcode_headless_catalog.rs",
+      "sha256": "eadacab14bfa5e3c5c5e0cfec4e66c7591b64bc185ac34d13fec507d88be7b5d"
+    },
+    {
+      "path": "examples/agents/agents.yaml",
+      "sha256": "0ccfe97cecdd7a547b1149b2e2f9b7bfd59fad88ab8865171e16a21f6747110b"
+    },
+    {
+      "path": "scripts/test-gate.sh",
+      "sha256": "6340af5e669d1016bc2c84c74f15541a7cf1b2b277d7ceea30b70d3edf9db821"
+    }
+  ]
+}
