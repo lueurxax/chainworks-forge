@@ -322,7 +322,9 @@ fn verify_legacy_process_inventory(inventory: &str, uid: u32, self_pid: u32) -> 
             .parse()
             .map_err(|_| anyhow::anyhow!("legacy_transition_unproven"))?;
         let owner: u32 = owner
-            .parse()
+            .parse::<u32>()
+            // macOS ps can print system uid_t values as signed integers (e.g. -2).
+            .or_else(|_| owner.parse::<i32>().map(|value| value as u32))
             .map_err(|_| anyhow::anyhow!("legacy_transition_unproven"))?;
         ensure!(
             pid != 0 && seen.insert(pid) && !executable.trim().is_empty(),
@@ -557,6 +559,22 @@ mod tests {
         let error =
             parse_cli(&["--xcode-admin".into(), "--token".into(), secret.into()]).unwrap_err();
         assert!(!format!("{error:#}").contains(secret));
+    }
+
+    #[test]
+    fn legacy_stop_proof_accepts_signed_system_uid_without_weakening_owner_checks() {
+        let inventory =
+            "1 0 /sbin/launchd\n42942 -2 /usr/libexec/dhcp6d\n42 501 /fixture/control-plane\n";
+        verify_legacy_process_inventory(inventory, 501, 42).unwrap();
+        let legacy = format!("{inventory}43 501 /other-db/chainworks-forge-daemon\n");
+        assert!(verify_legacy_process_inventory(&legacy, 501, 42).is_err());
+        for invalid in ["-4294966795", "4294967296", "unknown"] {
+            let invalid = format!("42 501 /fixture/control-plane\n43 {invalid} /system/helper\n");
+            assert!(verify_legacy_process_inventory(&invalid, 501, 42).is_err());
+        }
+        assert!(
+            verify_legacy_process_inventory("42 -2 /fixture/control-plane\n", 501, 42).is_err()
+        );
     }
 
     #[test]
