@@ -557,7 +557,7 @@ fn expected_output_spec(
     chainworks_meta_root: Option<&str>,
     worktree_write_enabled: bool,
 ) -> ExpectedOutputSpec {
-    ExpectedOutputSpec {
+    let mut spec = ExpectedOutputSpec {
         output_name: output_name.to_string(),
         output_role,
         target_path: target_path.to_string(),
@@ -580,7 +580,27 @@ fn expected_output_spec(
         } else {
             SourceGenerationOwner::Agent
         },
+    };
+    if is_control_plane_run_state_spec(&spec) {
+        spec.source_generation_owner = SourceGenerationOwner::ControlPlane;
     }
+    spec
+}
+
+/// Runtime ownership of the canonical DB projection is independent of legacy
+/// frozen task assignments, which may still list `run_state` as a provider output.
+pub(crate) fn is_control_plane_run_state_spec(spec: &ExpectedOutputSpec) -> bool {
+    spec.output_role == ExpectedOutputRole::Machine
+        && spec.output_name == "run_state"
+        && spec
+            .contract_id
+            .as_deref()
+            .is_none_or(|contract| contract == "run_state_projection_v1")
+        && spec.authorized_roots.iter().any(|root| {
+            root.root_class == OutputRootClass::ChainworksMetaRoot
+                && Path::new(&spec.target_path)
+                    == Path::new(&root.root_path).join("state/run-state.json")
+        })
 }
 
 fn authorized_root_for_output(
@@ -924,6 +944,131 @@ mod tests {
             specs[0].source_generation_owner,
             SourceGenerationOwner::ControlPlane
         );
+    }
+
+    #[test]
+    fn expected_output_specs_recognize_frozen_run_state_without_schema() {
+        let declared = DeclaredOutput {
+            output_name: "run_state".into(),
+            target_path: "/workspace/.chainworks/runs/run-1/state/run-state.json".into(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let before = serde_json::to_value(&declared).unwrap();
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            "/workspace",
+            None,
+            Some(".chainworks/runs/run-1"),
+            false,
+        );
+
+        assert!(is_control_plane_run_state_spec(&specs[0]));
+        assert_eq!(
+            specs[0].source_generation_owner,
+            SourceGenerationOwner::ControlPlane
+        );
+        assert_eq!(specs[0].reuse_policy, OutputReusePolicy::MustProduce);
+        assert_eq!(specs[0].contract_id, None);
+        assert_eq!(serde_json::to_value(declared).unwrap(), before);
+    }
+
+    #[test]
+    fn expected_output_specs_recognize_explicit_run_state_projection_schema() {
+        let mut schema = structured_schema();
+        schema.contract_id = "run_state_projection_v1".into();
+        let declared = DeclaredOutput {
+            output_name: "run_state".into(),
+            target_path: "/workspace/.chainworks/runs/run-1/state/run-state.json".into(),
+            schema: Some(schema),
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let specs = build_expected_output_specs(
+            &[declared],
+            "/workspace",
+            None,
+            Some("/workspace/.chainworks/runs/run-1"),
+            false,
+        );
+
+        assert!(is_control_plane_run_state_spec(&specs[0]));
+        assert_eq!(
+            specs[0].source_generation_owner,
+            SourceGenerationOwner::ControlPlane
+        );
+    }
+
+    #[test]
+    fn expected_output_specs_do_not_promote_other_run_state_paths_or_contracts() {
+        for (target_path, schema, meta_root) in [
+            (
+                "/workspace/.chainworks/runs/run-2/state/run-state.json",
+                None,
+                Some(".chainworks/runs/run-1"),
+            ),
+            (
+                "/workspace/.chainworks/runs/run-1/custom/run-state.json",
+                None,
+                Some(".chainworks/runs/run-1"),
+            ),
+            (
+                "/workspace/.chainworks/runs/run-1/state/run-state.json",
+                Some(structured_schema()),
+                Some(".chainworks/runs/run-1"),
+            ),
+            (
+                "/workspace/.chainworks/runs/run-1/state/run-state.json",
+                None,
+                None,
+            ),
+        ] {
+            let declared = DeclaredOutput {
+                output_name: "run_state".into(),
+                target_path: target_path.into(),
+                schema,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            };
+            let specs =
+                build_expected_output_specs(&[declared], "/workspace", None, meta_root, false);
+
+            assert!(!is_control_plane_run_state_spec(&specs[0]), "{target_path}");
+            assert_eq!(
+                specs[0].source_generation_owner,
+                SourceGenerationOwner::Agent
+            );
+        }
+    }
+
+    #[test]
+    fn expected_output_specs_do_not_promote_run_state_companion_or_alias() {
+        let path = "/workspace/.chainworks/runs/run-1/state/run-state.json";
+        let declared = DeclaredOutput {
+            output_name: "other_output".into(),
+            target_path: path.into(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: Some("run_state".into()),
+            companion_path: Some(path.into()),
+        };
+        let specs = build_expected_output_specs(
+            &[declared],
+            "/workspace",
+            None,
+            Some(".chainworks/runs/run-1"),
+            false,
+        );
+
+        assert_eq!(specs.len(), 2);
+        for spec in specs {
+            assert!(!is_control_plane_run_state_spec(&spec));
+            assert_eq!(spec.source_generation_owner, SourceGenerationOwner::Agent);
+        }
     }
 
     #[test]

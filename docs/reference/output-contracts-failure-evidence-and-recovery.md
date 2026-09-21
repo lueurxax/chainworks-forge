@@ -513,9 +513,39 @@ use exported JSON to drive transition truth.
 stage/approval state, active artifact contracts, override truth, partial-output warnings,
 and available loop/recovery context.
 
-If a legacy agent writes `state/run-state.json`, the daemon imports or records it as
-advisory/superseded evidence. It must not overwrite the DB-owned run-state projection
-and must not poison GraphQL/MCP readback.
+Legacy frozen tasks may still declare `run_state` as a provider output, including
+declarations without a schema. At runtime, only the machine output named
+`run_state` at the current run meta root's exact `state/run-state.json` path, with
+no schema or `run_state_projection_v1`, is treated as control-plane owned. The
+frozen mission and its output lists remain unchanged. The final invocation
+instruction makes that file read-only for the provider.
+
+Before output acceptance, the executor rebuilds the projection from SQLite and
+captures its bytes under the current run identity. A missing or modified export
+is restored through the protected output writer. Provider envelopes, direct-file
+manifests and filesystem bytes cannot replace this captured projection, including
+during transcript recovery or repair of another output. Identical projection
+bytes across attempts are valid; no nonce or cosmetic edit is required. The
+decision is `control_plane_generated`, subject to output and aggregate size
+limits, and is not imported as an agent-authored artifact generation.
+An unavailable generated projection is an engine persistence failure with
+`control_plane_run_state_unavailable` supervision and an inspect-logs action.
+It cannot trigger provider repair, health fallback or escalation, even if a
+historical escalation ledger already contains a retry trigger. P090 repair
+staging likewise excludes this output from agent generation publication.
+
+For agent-owned `direct_file_ref` outputs, `MustProduce` still rejects unchanged
+pre-prompt content. Explicit `allow_unchanged_existing` also applies to a direct-file
+manifest, after its path, digest and size checks pass. Rejected manifests persist
+a specific `direct_file_ref_rejection` diagnostic distinguishing malformed
+identity, target-path mismatch, unauthorized/wrong-run roots, symlink escape,
+non-regular or unreadable files, size limits, digest/size mismatch, missing
+baseline and unchanged baseline content.
+
+Legacy provider evidence about `state/run-state.json` remains advisory/superseded;
+the recognized canonical declaration above is excluded from agent-artifact import.
+Neither may overwrite the DB-owned run-state projection or poison GraphQL/MCP
+readback.
 
 ### Typed operator overrides
 

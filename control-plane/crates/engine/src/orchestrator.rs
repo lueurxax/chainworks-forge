@@ -1088,18 +1088,7 @@ impl Orchestrator {
                                 "All tasks finished — settling stage"
                             );
                             if kind == domain::stage::StageSettlementKind::Failed {
-                                if self
-                                    .schedule_p058_escalation_retry_for_stage(run_id, run, stage)
-                                    .await?
-                                {
-                                    return Ok(());
-                                }
-                                if self
-                                    .schedule_auto_contract_output_retry_for_stage(
-                                        run_id, run, stage,
-                                    )
-                                    .await?
-                                {
+                                if self.schedule_failed_stage_retry(run_id, run, stage).await? {
                                     return Ok(());
                                 }
                                 crate::recovery::persist_failed_stage_recovery_snapshot(
@@ -3206,6 +3195,87 @@ impl Orchestrator {
         })))
     }
 
+    /// Contract failures must stop the failed stage durably. They must never leave
+    /// an exhausted AdvanceRun queue advertising a running stage with no work.
+    async fn schedule_failed_stage_retry(
+        &self,
+        run_id: RunId,
+        run: &domain::run::Run,
+        stage: &StageExecution,
+    ) -> Result<bool> {
+        let result = async {
+            if self
+                .schedule_p058_escalation_retry_for_stage(run_id, run, stage)
+                .await?
+            {
+                return Ok(true);
+            }
+            self.schedule_auto_contract_output_retry_for_stage(run_id, run, stage)
+                .await
+        }
+        .await;
+        match result {
+            Err(error)
+                if format!("{error:#}").contains("frozen_snapshot_contract_incompatible:") =>
+            {
+                let failure = serde_json::json!({
+                    "schema_version": "agent_mission_context_failure_v1",
+                    "failure_kind": "retry_payload_authority_invalid",
+                    "dispatch_shape": "failed_stage_retry",
+                    "stage_id": stage.stage_id,
+                    "stage_execution_id": stage.id.to_string(),
+                    "error": format!("{error:#}"),
+                    "retryable": false,
+                    "operator_action_hint": "Inspect frozen retry authority and source execution lineage before retrying.",
+                });
+                let now = Utc::now();
+                let authority =
+                    retry_stage_execution_authorities::find_active_by_target(&self.pool, stage.id)
+                        .await?;
+                let mut tx = self
+                    .begin_orchestrator_transaction(
+                        "orchestrator.RetryPayloadAuthorityFailure",
+                        format!("orchestrator.RetryPayloadAuthorityFailure:{}", stage.id),
+                    )
+                    .await?;
+                // The scheduler's read snapshot can lose to cancellation, a completed
+                // stage, or a superseding retry. Preserve that newer durable outcome.
+                let retained = sqlx::query(
+                    "UPDATE stage_executions SET validation_failure_json = ?1 WHERE id = ?2 AND status = 'running' AND EXISTS (SELECT 1 FROM runs WHERE id = ?3 AND status = 'running' AND current_state = ?4 AND cancellation_requested_at IS NULL) AND NOT EXISTS (SELECT 1 FROM stage_executions newer WHERE newer.run_id = ?3 AND newer.stage_id = ?4 AND (newer.started_at > stage_executions.started_at)) AND NOT EXISTS (SELECT 1 FROM retry_stage_execution_authorities authority WHERE authority.run_id = ?3 AND authority.stage_id = ?4 AND authority.authority_state = 'active' AND authority.target_stage_execution_id <> ?2)",
+                ).bind(failure.to_string()).bind(stage.id.to_string()).bind(run_id.to_string())
+                    .bind(&stage.stage_id).execute(&mut **tx).await?.rows_affected();
+                if retained == 0 {
+                    tx.rollback().await?;
+                    return Ok(true);
+                }
+                stages::settle_tx(&mut tx, stage.id, StageSettlementKind::Failed, now).await?;
+                runs::update_status_tx(&mut tx, run_id, RunStatus::Blocked).await?;
+                if let Some(authority) = authority {
+                    retry_stage_execution_authorities::mark_terminalized_tx(
+                        &mut tx,
+                        &authority.id,
+                        now,
+                        "retry_payload_authority_invalid",
+                    )
+                    .await?;
+                }
+                tx.commit().await?;
+                let _ = self.events.send(DomainEvent::StageStatusChanged {
+                    run_id,
+                    stage_execution_id: stage.id,
+                    status: StageStatus::Failed,
+                });
+                let _ = self.events.send(DomainEvent::RunStatusChanged {
+                    run_id,
+                    status: RunStatus::Blocked,
+                });
+                projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                Ok(true)
+            }
+            result => result,
+        }
+    }
+
     async fn schedule_auto_contract_output_retry_for_stage(
         &self,
         run_id: RunId,
@@ -3222,6 +3292,7 @@ impl Orchestrator {
             execution.status == AgentStatus::Failed
                 && facts_by_execution.get(&execution.id).is_some_and(|facts| {
                     crate::shadow_escalation::is_headless_prelaunch_failure(facts)
+                        || crate::executor::is_control_plane_run_state_failure(facts)
                 })
         }) {
             return Ok(false);
@@ -3463,11 +3534,15 @@ impl Orchestrator {
                     .cloned()
                     .unwrap_or(serde_json::Value::Null),
             );
-            if let Some(effort) = fallback_profile.profile.get("effort").cloned() {
-                object.insert("effort".into(), effort);
-            }
-            if let Some(max_turns) = fallback_profile.profile.get("max_turns").cloned() {
-                object.insert("max_turns".into(), max_turns);
+            for field in ["effort", "max_turns"] {
+                object.insert(
+                    field.into(),
+                    fallback_profile
+                        .profile
+                        .get(field)
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                );
             }
             let mut targeted_retry = serde_json::json!({
                 "source_stage_execution_id": stage.id.to_string(),
@@ -3582,7 +3657,10 @@ impl Orchestrator {
             if agent_execution_runtime_facts::find_by_execution_id(&self.pool, execution.id)
                 .await?
                 .as_ref()
-                .is_some_and(crate::shadow_escalation::is_headless_prelaunch_failure)
+                .is_some_and(|facts| {
+                    crate::shadow_escalation::is_headless_prelaunch_failure(facts)
+                        || crate::executor::is_control_plane_run_state_failure(facts)
+                })
             {
                 return Ok(false);
             }
@@ -4034,15 +4112,12 @@ impl Orchestrator {
             if let Some(prompt) = fallback.prompt.clone() {
                 object.insert("prompt".into(), serde_json::json!(prompt));
             }
-            if let Some(effort) = fallback.effort.clone() {
-                object.insert("effort".into(), serde_json::json!(effort));
-            }
-            if let Some(max_turns) = fallback.max_turns {
-                object.insert("max_turns".into(), serde_json::json!(max_turns));
-            }
-            if let Some(temperature) = fallback.temperature {
-                object.insert("temperature".into(), serde_json::json!(temperature));
-            }
+            object.insert("effort".into(), serde_json::json!(fallback.effort));
+            object.insert("max_turns".into(), serde_json::json!(fallback.max_turns));
+            object.insert(
+                "temperature".into(),
+                serde_json::json!(fallback.temperature),
+            );
             if let Some(lead) = lead_authority.as_ref() {
                 replace_p058_lead_invoke_payload_authority(object, lead, &ledger.id);
             }
@@ -4071,6 +4146,12 @@ impl Orchestrator {
                     }
                 }),
             );
+            // Validate the emitted provider binding before making the retry durable,
+            // including nullable fields that differ from the source profile.
+            crate::agent_mission_context::validate_persisted_v1_payload_prompt(
+                &plan,
+                &retry_payload,
+            )?;
             if lead_authority.is_some() {
                 let idea = ideas::find_by_id(&self.pool, run.idea_id)
                     .await?
@@ -17160,5 +17241,534 @@ permission_profiles:
             matched.source_artifact_ids,
             vec!["proposal_review_summary".to_string()]
         );
+    }
+    #[tokio::test]
+    async fn p058_v1_retry_claim_escalation_and_settlement_preserve_frozen_authority() {
+        check_p058_v1_retry_settlement(None).await;
+    }
+
+    #[tokio::test]
+    async fn p058_v1_generated_run_state_failure_vetoes_historical_retry_trigger() {
+        check_p058_v1_retry_settlement(Some("generated_run_state_failure")).await;
+    }
+
+    #[tokio::test]
+    async fn p058_v1_tampered_profile_settles_failed_instead_of_stranding_running() {
+        check_p058_v1_retry_settlement(Some("backend_profile_id")).await;
+    }
+
+    #[tokio::test]
+    async fn p058_v1_unanchored_source_settles_failed_instead_of_stranding_running() {
+        check_p058_v1_retry_settlement(Some("source_agent_execution_id")).await;
+    }
+
+    #[tokio::test]
+    async fn p058_v1_ledger_policy_drift_settles_failed_instead_of_stranding_running() {
+        check_p058_v1_retry_settlement(Some("policy_hash")).await;
+    }
+
+    #[tokio::test]
+    async fn p058_v1_invalid_retry_does_not_overwrite_cancelled_stage() {
+        check_p058_v1_retry_settlement(Some("cancelled")).await;
+    }
+
+    #[tokio::test]
+    async fn p058_v1_invalid_retry_does_not_overwrite_completed_stage() {
+        check_p058_v1_retry_settlement(Some("completed")).await;
+    }
+
+    #[tokio::test]
+    async fn p058_v1_invalid_retry_settlement_rolls_back_atomically() {
+        check_p058_v1_retry_settlement(Some("write_failure")).await;
+    }
+
+    #[tokio::test]
+    async fn p058_v1_stale_retry_failure_preserves_newer_active_retry() {
+        check_p058_v1_retry_settlement(Some("superseded")).await;
+    }
+
+    #[tokio::test]
+    async fn p058_v1_older_iteration_with_higher_attempt_does_not_mask_failed_settlement() {
+        check_p058_v1_retry_settlement(Some("older_iteration")).await;
+    }
+
+    // The real state-7 task, frozen catalog, V1 prompt, claim-time provider alias
+    // canonicalization, source-generation claim, execution metadata and tier
+    // selector reproduce the live Codex -> Claude -> Astra failure sequence.
+    async fn check_p058_v1_retry_settlement(tamper: Option<&str>) {
+        let pool = test_pool().await;
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            crate::event_bus::new_bus(64),
+            WorkQueue::new(pool.clone()),
+        );
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let plan = workflow::compiler::compile(
+            root.join("examples/workflows/full-mvp-live.yaml")
+                .to_str()
+                .unwrap(),
+            root.join("examples/agents/agents.yaml").to_str().unwrap(),
+        )
+        .unwrap();
+        let state = &plan.states["state_7_implementation_started"];
+        let task = &state.tasks[0];
+        let tmp = tempfile::tempdir().unwrap();
+        let mut run = test_run(RunId::new());
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.artifact_root = tmp.path().join("artifacts").to_string_lossy().into_owned();
+        run.current_state = Some(state.id.clone());
+        run.workflow_family = plan.workflow_family.clone();
+        run.workflow_yaml_path = Some(
+            root.join("examples/workflows/full-mvp-live.yaml")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        run.agent_catalog_yaml_path = Some(
+            root.join("examples/agents/agents.yaml")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        set_snapshot_quartet(
+            &mut run,
+            &plan.workflow_snapshot_json,
+            &plan.catalog_snapshot_json,
+        );
+        let idea = test_idea(run.idea_id);
+        ideas::insert(&pool, &idea).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id: run.id,
+            stage_id: state.id.clone(),
+            label: state.label.clone(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 2,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        stages::insert(&pool, &stage).await.unwrap();
+        let prompt = crate::agent_mission_context::finalize_task_prompt_v1(
+            &plan,
+            &run,
+            state,
+            task,
+            &idea,
+            "Produce the plan, backlog and run state.",
+        )
+        .unwrap();
+        let mut payload = serde_json::json!({
+            "run_id": run.id.to_string(), "stage_id": stage.stage_id, "stage_execution_id": stage.id.to_string(),
+            "task_name": task.task_name, "task_outputs": task.outputs, "task_index": 0, "total_tasks": state.tasks.len(),
+            "output_contract": task.agent.output_contract, "prompt": prompt, "provider_health_fallback": null,
+        });
+        replace_invoke_payload_agent_authority(payload.as_object_mut().unwrap(), &task.agent);
+        payload["worktree_strategy"] =
+            serde_json::json!(crate::worktree::effective_worktree_strategy_for_task(task));
+        crate::agent_mission_context::validate_persisted_v1_payload_prompt_with_truth(
+            &plan, &run, &idea, &payload,
+        )
+        .unwrap();
+        work_items::enqueue(
+            &pool,
+            &WorkItem {
+                id: format!("p058-invoke:{}:0", stage.id),
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: payload.to_string(),
+                status: WorkItemStatus::Pending,
+                run_id: Some(run.id),
+                stage_id: Some(state.id.clone()),
+                created_at: Utc::now(),
+                scheduled_at: Utc::now(),
+                attempt_count: 0,
+                last_error: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        for (index, expected_profile) in [
+            "codex_orchestrator_high",
+            "claude_orchestrator_high",
+            "astra_orchestrator_critical",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Advance the fixture's due time past the indexed whole-second cutoff.
+            sqlx::query("UPDATE work_items SET scheduled_at = ? WHERE run_id = ? AND status = 'pending' AND kind = 'invoke_agent'")
+                .bind((Utc::now() - chrono::Duration::seconds(3)).to_rfc3339())
+                .bind(run.id.to_string()).execute(&pool).await.unwrap();
+            let claimed = crate::executor::claim_next_invoke_agent_with_start(&pool)
+                .await
+                .unwrap();
+            if claimed.is_none() {
+                let stage_states: Vec<_> = stages::list_by_run(&pool, run.id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|stage| {
+                        (
+                            stage.attempt_number,
+                            stage.status,
+                            stage.validation_failure_json,
+                        )
+                    })
+                    .collect();
+                let queue: Vec<_> = work_items::list_by_run(&pool, run.id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|item| (item.kind, item.status, item.last_error))
+                    .collect();
+                panic!(
+                    "tier {index} must be dispatchable; stages={stage_states:?}; queue={queue:?}"
+                );
+            }
+            let claimed = claimed.unwrap();
+            let execution = agent_executions::find_by_id(&pool, claimed.agent_execution_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                execution.backend_profile_id.as_deref(),
+                Some(expected_profile)
+            );
+            let mut item = work_items::find_by_id(&pool, &claimed.work_item_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut payload: serde_json::Value = serde_json::from_str(&item.payload_json).unwrap();
+            if index == 1 {
+                assert_eq!(
+                    payload["provider"], "claude",
+                    "actual claim canonicalizes the catalog's claude_acp alias"
+                );
+                assert!(
+                    payload.get("effort").is_none(),
+                    "absent profile values must not inherit prior Codex effort"
+                );
+                assert_eq!(
+                    payload
+                        .pointer("/targeted_retry/escalation/tier_id")
+                        .and_then(serde_json::Value::as_str),
+                    Some("tier_1_claude_orchestrator_high")
+                );
+                match tamper {
+                    Some(
+                        "backend_profile_id" | "cancelled" | "completed" | "write_failure"
+                        | "superseded" | "older_iteration",
+                    ) => {
+                        payload["backend_profile_id"] = serde_json::json!("codex_orchestrator_high")
+                    }
+                    Some("source_agent_execution_id") => {
+                        payload["targeted_retry"]["source_agent_execution_id"] =
+                            serde_json::json!(AgentExecutionId::new().to_string())
+                    }
+                    _ => (),
+                }
+                item.payload_json = payload.to_string();
+                sqlx::query("UPDATE work_items SET payload_json = ? WHERE id = ?")
+                    .bind(&item.payload_json)
+                    .bind(&item.id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            if index == 1 && tamper == Some("older_iteration") {
+                let mut historical = stage.clone();
+                historical.id = StageExecutionId::new();
+                historical.iteration = 0;
+                historical.attempt_number = 999;
+                historical.started_at -= chrono::Duration::seconds(20);
+                historical.status = StageStatus::Failed;
+                historical.settlement_kind = Some(StageSettlementKind::Failed);
+                stages::insert(&pool, &historical).await.unwrap();
+            }
+            agent_executions::update_completed(
+                &pool,
+                execution.id,
+                AgentStatus::Failed,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+            let mut facts = AgentExecutionRuntimeFacts::defaults_for(execution.id, Utc::now());
+            facts.failure_kind = Some(AgentFailureKind::MissingRequiredOutputs);
+            facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
+            agent_execution_runtime_facts::upsert(&pool, &facts)
+                .await
+                .unwrap();
+            crate::shadow_escalation::try_write_shadow_escalation_from_runtime_facts(
+                &pool,
+                execution.id,
+                &facts,
+                Utc::now(),
+            )
+            .await;
+            let ledger_id = execution.escalation_ledger_id.as_deref().unwrap();
+            let ledger = escalation::find_ledger_by_id(&pool, ledger_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if index == 1 {
+                assert_eq!(
+                    ledger.current_tier_id.as_deref(),
+                    Some("tier_2_astra_orchestrator_critical"),
+                    "settlement moves the ledger before retry-copy validation"
+                );
+                if tamper == Some("policy_hash") {
+                    sqlx::query("UPDATE escalation_ledger SET policy_hash = ? WHERE id = ?")
+                        .bind(format!("sha256:{}", "f".repeat(64)))
+                        .bind(ledger_id)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                }
+            }
+            work_items::fail(&pool, &item.id, "missing_required_outputs")
+                .await
+                .unwrap();
+            if index == 1 && tamper == Some("generated_run_state_failure") {
+                // Even a ledger already advanced by a historical provider failure
+                // must not rotate providers for a current engine projection failure.
+                facts.failure_kind = Some(AgentFailureKind::Unknown);
+                facts.operator_action_hint = Some(domain::agent::OperatorActionHint::InspectLogs);
+                facts.supervision_classification =
+                    Some("control_plane_run_state_unavailable".into());
+                agent_execution_runtime_facts::upsert(&pool, &facts)
+                    .await
+                    .unwrap();
+                let current_stage = stages::find_by_id(&pool, claimed.stage_execution_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(!orchestrator
+                    .schedule_p058_escalation_retry_for_stage(run.id, &run, &current_stage)
+                    .await
+                    .unwrap());
+                assert!(!orchestrator
+                    .schedule_auto_contract_output_retry_for_stage(run.id, &run, &current_stage)
+                    .await
+                    .unwrap());
+                assert_eq!(stages::list_by_run(&pool, run.id).await.unwrap().len(), 2);
+                return;
+            }
+            if index == 1
+                && matches!(
+                    tamper,
+                    Some("cancelled" | "completed" | "write_failure" | "superseded")
+                )
+            {
+                let stale_stage = stages::find_by_id(&pool, claimed.stage_execution_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if tamper == Some("superseded") {
+                    let mut newer = stale_stage.clone();
+                    newer.id = StageExecutionId::new();
+                    newer.attempt_number += 1;
+                    newer.started_at += chrono::Duration::seconds(1);
+                    stages::insert(&pool, &newer).await.unwrap();
+                    let mut tx = pool.begin().await.unwrap();
+                    retry_stage_execution_authorities::create_active_targeted_agent_retry_tx(
+                        &mut tx,
+                        run.id,
+                        &state.id,
+                        newer.id,
+                        None,
+                        None,
+                        "new-retry-invoke".into(),
+                        Some(execution.id.to_string()),
+                        Utc::now(),
+                    )
+                    .await
+                    .unwrap();
+                    tx.commit().await.unwrap();
+                    assert!(orchestrator
+                        .schedule_failed_stage_retry(run.id, &run, &stale_stage)
+                        .await
+                        .unwrap());
+                    for id in [stale_stage.id, newer.id] {
+                        let untouched = stages::find_by_id(&pool, id).await.unwrap().unwrap();
+                        assert_eq!(untouched.status, StageStatus::Running);
+                        assert!(untouched.validation_failure_json.is_none());
+                    }
+                    assert_eq!(
+                        runs::find_by_id(&pool, run.id)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .status,
+                        RunStatus::Running
+                    );
+                    assert!(retry_stage_execution_authorities::find_active_by_target(
+                        &pool, newer.id
+                    )
+                    .await
+                    .unwrap()
+                    .is_some());
+                    return;
+                } else if tamper == Some("write_failure") {
+                    sqlx::query("CREATE TRIGGER retry_settlement_failpoint BEFORE UPDATE OF status ON runs WHEN NEW.status = 'blocked' BEGIN SELECT RAISE(ABORT, 'retry settlement failpoint'); END").execute(&pool).await.unwrap();
+                    let error = orchestrator
+                        .schedule_failed_stage_retry(run.id, &run, &stale_stage)
+                        .await
+                        .unwrap_err();
+                    assert!(format!("{error:#}").contains("retry settlement failpoint"));
+                    let untouched = stages::find_by_id(&pool, stale_stage.id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(untouched.status, StageStatus::Running);
+                    assert!(untouched.validation_failure_json.is_none());
+                    assert!(retry_stage_execution_authorities::find_active_by_target(
+                        &pool,
+                        stale_stage.id
+                    )
+                    .await
+                    .unwrap()
+                    .is_some());
+                    assert_eq!(
+                        runs::find_by_id(&pool, run.id)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .status,
+                        RunStatus::Running
+                    );
+                    sqlx::query("DROP TRIGGER retry_settlement_failpoint")
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                } else {
+                    let stage_status = if tamper == Some("cancelled") {
+                        StageStatus::Skipped
+                    } else {
+                        StageStatus::Completed
+                    };
+                    let run_status = if tamper == Some("cancelled") {
+                        RunStatus::Cancelled
+                    } else {
+                        RunStatus::Completed
+                    };
+                    stages::update_status(&pool, stale_stage.id, stage_status.clone())
+                        .await
+                        .unwrap();
+                    runs::update_status(&pool, run.id, run_status.clone())
+                        .await
+                        .unwrap();
+                    assert!(orchestrator
+                        .schedule_failed_stage_retry(run.id, &run, &stale_stage)
+                        .await
+                        .unwrap());
+                    let preserved = stages::find_by_id(&pool, stale_stage.id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(preserved.status, stage_status);
+                    assert!(preserved.validation_failure_json.is_none());
+                    assert_eq!(
+                        runs::find_by_id(&pool, run.id)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .status,
+                        run_status
+                    );
+                    return;
+                }
+            }
+            let advances: Vec<_> = work_items::list_by_run(&pool, run.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|work| {
+                    work.kind == WorkItemKind::AdvanceRun && work.status == WorkItemStatus::Pending
+                })
+                .collect();
+            if advances.is_empty() {
+                orchestrator.advance_run(run.id).await.unwrap();
+            } else {
+                for advance in advances {
+                    let advance_payload: domain::retry_authority::AdvanceRunPayloadV1 =
+                        serde_json::from_str(&advance.payload_json).unwrap();
+                    orchestrator
+                        .advance_run_from_payload(&advance_payload)
+                        .await
+                        .expect("settlement must not escape with frozen-contract error");
+                    work_items::complete(&pool, &advance.id).await.unwrap();
+                }
+            }
+            if index == 1 && tamper.is_some() {
+                let failed_stage = stages::find_by_id(&pool, claimed.stage_execution_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(failed_stage.status, StageStatus::Failed);
+                assert_eq!(
+                    failed_stage.settlement_kind,
+                    Some(StageSettlementKind::Failed)
+                );
+                let diagnostic: serde_json::Value =
+                    serde_json::from_str(failed_stage.validation_failure_json.as_deref().unwrap())
+                        .unwrap();
+                assert_eq!(
+                    diagnostic["failure_kind"],
+                    "retry_payload_authority_invalid"
+                );
+                assert!(diagnostic["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("frozen_snapshot_contract_incompatible"));
+                let authority = retry_stage_execution_authorities::find_by_id(
+                    &pool,
+                    payload["retry_authority_id"].as_str().unwrap(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    authority.authority_state,
+                    domain::retry_authority::RetryAuthorityState::Terminalized
+                );
+                break;
+            }
+        }
+        assert_eq!(
+            runs::find_by_id(&pool, run.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RunStatus::Blocked
+        );
+        assert!(!stages::list_by_run(&pool, run.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|stage| stage.status == StageStatus::Running));
+        assert!(
+            !work_items::list_by_run(&pool, run.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|work| matches!(
+                    work.status,
+                    WorkItemStatus::Pending | WorkItemStatus::Running
+                )),
+            "settled chain must have no invisible queued work"
+        );
+        let executions = agent_executions::list_by_run(&pool, run.id).await.unwrap();
+        assert_eq!(executions.len(), if tamper.is_some() { 2 } else { 3 });
     }
 }

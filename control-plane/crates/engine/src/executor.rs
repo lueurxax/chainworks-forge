@@ -3009,6 +3009,71 @@ struct P090StagedRepairCommit {
     canonical_path: String,
 }
 
+/// Invocation-local bytes generated from SQLite truth, never from a provider file.
+/// The frozen mission still contains legacy `run_state` output declarations.
+struct GeneratedRunStateOutput {
+    target_path: String,
+    bytes: Result<Vec<u8>>,
+}
+
+async fn generate_declared_run_state_output(
+    pool: &SqlitePool,
+    run: &domain::run::Run,
+    expected_outputs: &[ExpectedOutputSpec],
+) -> Option<GeneratedRunStateOutput> {
+    let spec = expected_outputs
+        .iter()
+        .find(|spec| crate::contracts::is_control_plane_run_state_spec(spec))?;
+    let bytes = async {
+        // Rebuild from canonical rows, without trusting or importing the exported
+        // file. No timestamp or nonce is added to manufacture a new content hash.
+        let mut tx = db::writer::begin_repository_transaction(
+            pool,
+            "executor.generate_declared_run_state_output",
+        )
+        .await?;
+        artifact_contracts::rebuild_run_state_projection_tx(&mut tx, run.id).await?;
+        tx.commit().await?;
+        let row = artifact_contracts::find_run_state_projection(pool, run.id)
+            .await?
+            .context("run_state projection missing after rebuild")?;
+        let exported_path = row.exported_run_state_path.as_deref().map(|path| {
+            let path = Path::new(path);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                Path::new(&run.workspace_root).join(path)
+            }
+        });
+        anyhow::ensure!(
+            row.run_id == run.id
+                && exported_path.as_deref() == Some(Path::new(&spec.target_path))
+                && row.run_state_json["run_id"].as_str() == Some(run.id.to_string().as_str())
+                && row.run_state_json["schema_version"] == "run-state-projection.v1"
+                && row.run_state_json["active_index_owner"] == "sqlite",
+            "run_state projection identity differs from the current run"
+        );
+        let bytes = serde_json::to_vec_pretty(&row.run_state_json)?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= spec.max_bytes,
+            "run_state projection exceeds output limit"
+        );
+        // Repair a missing or agent-modified export using the existing protected
+        // output writer; acceptance below uses these DB bytes, not a reread.
+        write_discovered_output(
+            &spec.target_path,
+            &bytes,
+            Some(&trusted_output_root_for_run(run)),
+        )?;
+        Ok(bytes)
+    }
+    .await;
+    Some(GeneratedRunStateOutput {
+        target_path: spec.target_path.clone(),
+        bytes,
+    })
+}
+
 fn build_declared_output_discovery_settlement(
     expected_outputs: &[ExpectedOutputSpec],
     discovered_artifacts: &[acp::DiscoveredArtifact],
@@ -3029,13 +3094,31 @@ fn build_declared_output_discovery_settlement_with_filesystem(
     pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
     filesystem: &dyn DiscoveryFilesystem,
 ) -> DeclaredOutputDiscoverySettlement {
+    build_declared_output_discovery_settlement_with_generated_run_state(
+        expected_outputs,
+        discovered_artifacts,
+        pre_prompt_expected_outputs,
+        filesystem,
+        None,
+    )
+}
+
+fn build_declared_output_discovery_settlement_with_generated_run_state(
+    expected_outputs: &[ExpectedOutputSpec],
+    discovered_artifacts: &[acp::DiscoveredArtifact],
+    pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
+    filesystem: &dyn DiscoveryFilesystem,
+    generated_run_state: Option<&GeneratedRunStateOutput>,
+) -> DeclaredOutputDiscoverySettlement {
     let mut decisions = Vec::with_capacity(expected_outputs.len());
     let mut accepted_payloads = HashMap::new();
     let mut accepted_aggregate_bytes = 0u64;
     let mut aggregate_cap_hit = false;
 
     for spec in expected_outputs {
-        if spec_is_directory_target(spec, filesystem) {
+        if spec.source_generation_owner == SourceGenerationOwner::Agent
+            && spec_is_directory_target(spec, filesystem)
+        {
             if let Some(directory_candidate) =
                 read_changed_directory_output(spec, pre_prompt_expected_outputs, filesystem)
             {
@@ -3119,6 +3202,35 @@ fn build_declared_output_discovery_settlement_with_filesystem(
         }
 
         if spec.source_generation_owner == SourceGenerationOwner::ControlPlane {
+            let generated_run_state_bytes =
+                if crate::contracts::is_control_plane_run_state_spec(spec) {
+                    let bytes = generated_run_state
+                        .filter(|output| output.target_path == spec.target_path)
+                        .and_then(|output| output.bytes.as_ref().ok());
+                    if bytes.is_none() {
+                        let mut decision = rejected_output_decision(
+                            spec,
+                            OutputDiscoveryReason::ReadError,
+                            Some(OutputDiscoveryProvenance::ControlPlaneGenerated),
+                            Some(spec.target_path.clone()),
+                            None,
+                            None,
+                            Some(spec.max_bytes),
+                            None,
+                            filesystem,
+                        );
+                        decision.generated_by = Some("control_plane".to_string());
+                        decision.diagnostics.insert(
+                            "control_plane_rejection".to_string(),
+                            "run_state_projection_unavailable_or_invalid".to_string(),
+                        );
+                        decisions.push(decision);
+                        continue;
+                    }
+                    bytes
+                } else {
+                    None
+                };
             if let Some((
                 reason,
                 provenance,
@@ -3127,8 +3239,22 @@ fn build_declared_output_discovery_settlement_with_filesystem(
                 bytes,
                 source_path,
                 baseline_status,
-            )) = read_control_plane_generated_output(spec, filesystem)
+            )) = read_control_plane_generated_output(spec, filesystem, generated_run_state_bytes)
             {
+                if bytes.len() as u64 > spec.max_bytes {
+                    decisions.push(rejected_output_decision(
+                        spec,
+                        OutputDiscoveryReason::Oversized,
+                        Some(provenance),
+                        source_path,
+                        baseline_status,
+                        Some(bytes.len() as u64),
+                        Some(spec.max_bytes),
+                        Some(accepted_aggregate_bytes),
+                        filesystem,
+                    ));
+                    continue;
+                }
                 let aggregate_after = accepted_aggregate_bytes.saturating_add(bytes.len() as u64);
                 if aggregate_after > spec.aggregate_acceptance_cap_bytes {
                     aggregate_cap_hit = true;
@@ -3193,22 +3319,19 @@ fn build_declared_output_discovery_settlement_with_filesystem(
 
         let envelope = find_provider_envelope_for_spec(discovered_artifacts, spec);
         let exact_path = find_exact_path_artifact_for_spec(discovered_artifacts, spec);
-        let direct_file_ref = envelope.and_then(|artifact| {
-            read_direct_file_ref_output(spec, artifact, pre_prompt_expected_outputs, filesystem)
-        });
-        let invalid_direct_file_ref = envelope.is_some_and(|artifact| {
-            looks_like_direct_file_ref_manifest(&artifact.content) && direct_file_ref.is_none()
-        });
-        let candidate = if let Some(candidate) = direct_file_ref {
-            Some(candidate)
-        } else if let Some(artifact) = envelope.filter(|_| invalid_direct_file_ref) {
+        let direct_file_ref = envelope
+            .filter(|artifact| looks_like_direct_file_ref_manifest(&artifact.content))
+            .map(|artifact| {
+                read_direct_file_ref_output(spec, artifact, pre_prompt_expected_outputs, filesystem)
+            });
+        let candidate = if let Some(Err(rejection)) = direct_file_ref.as_ref() {
             let mut decision = rejected_output_decision(
                 spec,
                 OutputDiscoveryReason::ContractInvalid,
                 Some(OutputDiscoveryProvenance::ProviderEnvelope),
                 None,
                 None,
-                Some(artifact.content.len() as u64),
+                envelope.map(|artifact| artifact.content.len() as u64),
                 Some(spec.max_bytes),
                 None,
                 filesystem,
@@ -3218,10 +3341,12 @@ fn build_declared_output_discovery_settlement_with_filesystem(
                 .insert("output_mode".to_string(), "direct_file_ref".to_string());
             decision.diagnostics.insert(
                 "direct_file_ref_rejection".to_string(),
-                "manifest_did_not_resolve_to_fresh_canonical_file".to_string(),
+                (*rejection).to_string(),
             );
             decisions.push(decision);
             continue;
+        } else if let Some(Ok(candidate)) = direct_file_ref {
+            Some(candidate)
         } else if let Some(artifact) = envelope {
             Some((
                 OutputDiscoveryReason::ProviderEnvelope,
@@ -3326,7 +3451,11 @@ fn build_declared_output_discovery_settlement_with_filesystem(
         if let Some(source_kind) = source_kind {
             diagnostics.insert("source_kind".to_string(), enum_snake_value(source_kind));
             if source_kind == acp::DiscoveredArtifactSourceKind::ChainworksOutput
-                && provenance == OutputDiscoveryProvenance::ExactPath
+                && matches!(
+                    provenance,
+                    OutputDiscoveryProvenance::ExactPath
+                        | OutputDiscoveryProvenance::DeclaredReusePolicy
+                )
             {
                 diagnostics.insert("output_mode".to_string(), "direct_file_ref".to_string());
             }
@@ -3437,6 +3566,49 @@ fn enforce_changed_files_manifest_evidence_status(
                 validation_error: Some(message),
                 raw_payload_size: 0,
             });
+    }
+}
+
+fn generated_run_state_failed(settlement: &DeclaredOutputDiscoverySettlement) -> bool {
+    settlement.decisions.iter().any(|decision| {
+        decision.output_name == "run_state"
+            && decision.generated_by.as_deref() == Some("control_plane")
+            && !decision.is_accepted()
+    })
+}
+
+const CONTROL_PLANE_RUN_STATE_UNAVAILABLE: &str = "control_plane_run_state_unavailable";
+
+pub(crate) fn is_control_plane_run_state_failure(facts: &AgentExecutionRuntimeFacts) -> bool {
+    facts.failure_kind == Some(AgentFailureKind::Unknown)
+        && facts.operator_action_hint == Some(OperatorActionHint::InspectLogs)
+        && facts.supervision_classification.as_deref() == Some(CONTROL_PLANE_RUN_STATE_UNAVAILABLE)
+}
+
+fn enforce_generated_run_state_status(
+    summary: &mut TaskValidationSummary,
+    settlement: &DeclaredOutputDiscoverySettlement,
+) {
+    for result in &mut summary.output_results {
+        if result.output_name == "run_state"
+            && result.status == domain::validation::ValidationStatus::NoContractDeclared
+            && settlement.decisions.iter().any(|decision| {
+                decision.output_name == result.output_name
+                    && decision.generated_by.as_deref() == Some("control_plane")
+                    && decision.is_accepted()
+            })
+        {
+            // Legacy schema-less declarations are validated by the DB projection
+            // identity check. Do not include them in provider repair allowlists.
+            result.status = domain::validation::ValidationStatus::Passed;
+        }
+    }
+    if generated_run_state_failed(settlement) {
+        summary.failure_class =
+            Some(domain::validation::ValidationFailureClass::PersistenceFailure);
+        summary.failure_summary = Some(
+            "control_plane_run_state_unavailable: inspect projection generation, export safety and output limits; provider repair cannot regenerate this output".to_string(),
+        );
     }
 }
 
@@ -3633,13 +3805,21 @@ fn stage_p090_repair_materialization(
                         .clone()
                         .unwrap_or_else(|| decision.target_path.clone())
                 });
-            let canonical_before_sha256 = file_sha256_if_exists(&canonical_path)?;
+            let generated_projection = decision.output_name == "run_state"
+                && decision.generated_by.as_deref() == Some("control_plane");
+            let canonical_before_sha256 = if generated_projection {
+                None
+            } else {
+                file_sha256_if_exists(&canonical_path)?
+            };
             let output_is_directory = decision
                 .diagnostics
                 .get("output_kind")
                 .is_some_and(|kind| kind == "directory_manifest")
                 || path_looks_like_directory_target(&canonical_path);
-            let staging_path = if let Some(bytes) = payload.filter(|_| !output_is_directory) {
+            let staging_path = if let Some(bytes) =
+                payload.filter(|_| !output_is_directory && !generated_projection)
+            {
                 let path = p090_repair_staging_path(
                     artifact_root,
                     agent_execution_id,
@@ -4106,6 +4286,7 @@ fn find_exact_path_artifact_for_spec<'a>(
 fn read_control_plane_generated_output(
     spec: &ExpectedOutputSpec,
     filesystem: &dyn DiscoveryFilesystem,
+    generated_run_state_bytes: Option<&Vec<u8>>,
 ) -> Option<(
     OutputDiscoveryReason,
     OutputDiscoveryProvenance,
@@ -4116,11 +4297,15 @@ fn read_control_plane_generated_output(
     Option<ExpectedPathBaselineStatus>,
 )> {
     let recorder = NoopDiscoveryOperationRecorder;
-    let bytes = filesystem.read_file_with_cap_and_recorder(
-        Path::new(&spec.target_path),
-        spec.max_bytes,
-        &recorder,
-    )?;
+    let bytes = if crate::contracts::is_control_plane_run_state_spec(spec) {
+        generated_run_state_bytes?.clone()
+    } else {
+        filesystem.read_file_with_cap_and_recorder(
+            Path::new(&spec.target_path),
+            spec.max_bytes,
+            &recorder,
+        )?
+    };
     Some((
         OutputDiscoveryReason::ControlPlaneGenerated,
         OutputDiscoveryProvenance::ControlPlaneGenerated,
@@ -4137,31 +4322,44 @@ fn read_direct_file_ref_output(
     artifact: &acp::DiscoveredArtifact,
     pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
     filesystem: &dyn DiscoveryFilesystem,
-) -> Option<(
-    OutputDiscoveryReason,
-    OutputDiscoveryProvenance,
-    Option<acp::DiscoveredArtifactSourceKind>,
-    String,
-    Vec<u8>,
-    Option<String>,
-    Option<ExpectedPathBaselineStatus>,
-)> {
-    let manifest = direct_file_ref_manifest(&artifact.content, &spec.output_name)?;
+) -> Result<
+    (
+        OutputDiscoveryReason,
+        OutputDiscoveryProvenance,
+        Option<acp::DiscoveredArtifactSourceKind>,
+        String,
+        Vec<u8>,
+        Option<String>,
+        Option<ExpectedPathBaselineStatus>,
+    ),
+    &'static str,
+> {
+    let manifest = direct_file_ref_manifest(&artifact.content, &spec.output_name)
+        .ok_or("invalid_manifest_or_output_identity")?;
     if manifest.path != spec.target_path {
-        return None;
+        return Err("manifest_path_differs_from_declared_target");
     }
-    if exact_path_rejection_for_spec(spec, Some(&manifest.path), filesystem).is_some() {
-        return None;
+    if let Some((reason, _)) = exact_path_rejection_for_spec(spec, Some(&manifest.path), filesystem)
+    {
+        return Err(match reason {
+            OutputDiscoveryReason::UnauthorizedRoot => "canonical_file_unauthorized_root",
+            OutputDiscoveryReason::WrongRunMetaRoot => "canonical_file_wrong_run_meta_root",
+            OutputDiscoveryReason::SymlinkEscape => "canonical_file_symlink_escape",
+            OutputDiscoveryReason::NotRegularFile => "canonical_file_not_regular",
+            _ => "canonical_file_unreadable",
+        });
     }
 
     let recorder = NoopDiscoveryOperationRecorder;
-    let bytes = filesystem.read_file_with_cap_and_recorder(
-        Path::new(&manifest.path),
-        spec.max_bytes.saturating_add(1),
-        &recorder,
-    )?;
+    let bytes = filesystem
+        .read_file_with_cap_and_recorder(
+            Path::new(&manifest.path),
+            spec.max_bytes.saturating_add(1),
+            &recorder,
+        )
+        .ok_or("canonical_file_read_failed")?;
     if bytes.len() as u64 > spec.max_bytes {
-        return None;
+        return Err("canonical_file_exceeds_output_limit");
     }
 
     let digest = sha256_digest(&bytes);
@@ -4172,34 +4370,53 @@ fn read_direct_file_ref_output(
     if manifest.digest.as_deref().is_some_and(|expected| {
         !direct_file_ref_placeholder_digest(expected) && normalize_sha256_digest(expected) != digest
     }) {
-        return None;
+        return Err("manifest_digest_differs_from_canonical_file");
     }
     if manifest.size_bytes.is_some_and(|expected| {
         !direct_file_ref_placeholder_size(expected, bytes.len(), digest_is_placeholder)
             && expected != bytes.len() as u64
     }) {
-        return None;
+        return Err("manifest_size_differs_from_canonical_file");
     }
 
-    let previous = pre_prompt_expected_outputs.iter().find(|metadata| {
-        metadata.output_name == spec.output_name && metadata.target_path == spec.target_path
-    })?;
+    let previous = pre_prompt_expected_outputs
+        .iter()
+        .find(|metadata| {
+            metadata.output_name == spec.output_name && metadata.target_path == spec.target_path
+        })
+        .ok_or("pre_prompt_baseline_missing")?;
     let reason = match previous.baseline_status {
         ExpectedPathBaselineStatus::Absent => OutputDiscoveryReason::ExactPathNew,
         ExpectedPathBaselineStatus::RegularContentCaptured => {
             if previous.content_digest.as_deref() == Some(digest.as_str()) {
-                return None;
+                if spec.reuse_policy == OutputReusePolicy::AllowUnchangedExisting {
+                    OutputDiscoveryReason::DeclaredReusePolicy
+                } else {
+                    return Err("canonical_file_unchanged_from_pre_prompt_baseline");
+                }
+            } else {
+                OutputDiscoveryReason::ExactPathChanged
             }
-            OutputDiscoveryReason::ExactPathChanged
         }
         _ => OutputDiscoveryReason::ExactPathChanged,
     };
 
-    Some((
+    let (provenance, payload_ref) = if reason == OutputDiscoveryReason::DeclaredReusePolicy {
+        (
+            OutputDiscoveryProvenance::DeclaredReusePolicy,
+            declared_reuse_policy_payload_ref(&spec.output_name),
+        )
+    } else {
+        (
+            OutputDiscoveryProvenance::ExactPath,
+            exact_path_payload_ref(&spec.output_name),
+        )
+    };
+    Ok((
         reason,
-        OutputDiscoveryProvenance::ExactPath,
+        provenance,
         Some(artifact.source_kind),
-        exact_path_payload_ref(&spec.output_name),
+        payload_ref,
         bytes,
         Some(manifest.path),
         Some(previous.baseline_status),
@@ -4552,7 +4769,8 @@ fn rejected_output_decision(
         aggregate_bytes_after_acceptance,
         accepted_payload_ref: None,
         accepted_bytes_sha256: None,
-        generated_by: None,
+        generated_by: (spec.source_generation_owner == SourceGenerationOwner::ControlPlane)
+            .then_some("control_plane".to_string()),
         diagnostics: Default::default(),
         decision_at: chrono::Utc::now(),
     }
@@ -5348,6 +5566,34 @@ fn runtime_facts_for_execution_result(
         enrich_runtime_facts_with_receipt(&mut facts, receipt);
     }
     p090_enrich_runtime_facts_with_preflight_json(&mut facts, runtime_tool_path_preflight_json);
+    if let Some(summary) = validation_summary.filter(|summary| {
+        summary.failure_class
+            == Some(domain::validation::ValidationFailureClass::PersistenceFailure)
+            && summary.failure_summary.as_deref().is_some_and(|message| {
+                message
+                    .strip_prefix(CONTROL_PLANE_RUN_STATE_UNAVAILABLE)
+                    .is_some_and(|detail| detail.starts_with(':'))
+            })
+            && summary.output_results.iter().any(|result| {
+                result.output_name == "run_state"
+                    && result.status == domain::validation::ValidationStatus::Failed
+            })
+    }) {
+        // The projection failed after provider execution. Preserve receipt/exit
+        // evidence, but do not let a close diagnostic reclassify this engine-owned
+        // failure as a reason to launch another provider.
+        facts.failure_kind = Some(AgentFailureKind::Unknown);
+        facts.operator_action_hint = Some(OperatorActionHint::InspectLogs);
+        facts.supervision_classification = Some(CONTROL_PLANE_RUN_STATE_UNAVAILABLE.into());
+        facts.failure_message_redacted = summary
+            .failure_summary
+            .as_deref()
+            .map(redact_runtime_message);
+        facts.retry_after = None;
+        facts.transport_error_code = None;
+        facts.valid_required_outputs = false;
+        facts.output_settlement = AgentOutputSettlement::InvalidRequiredOutputs;
+    }
     facts
 }
 
@@ -12874,6 +13120,12 @@ impl BackgroundExecutor {
                                 },
                             ),
                             declared_outputs: &declared_outputs,
+                            generated_run_state_path: expected_outputs
+                                .iter()
+                                .find(|spec| {
+                                    crate::contracts::is_control_plane_run_state_spec(spec)
+                                })
+                                .map(|spec| spec.target_path.as_str()),
                         },
                     )
                 } else {
@@ -13675,6 +13927,8 @@ impl BackgroundExecutor {
                     } else {
                         None
                     };
+                let generated_run_state =
+                    generate_declared_run_state_output(&self.pool, &run, &expected_outputs).await;
                 let mut declared_output_settlement = if !declared_outputs.is_empty() {
                     let manifest_started = Instant::now();
                     match generate_changed_files_manifest_if_declared(
@@ -13720,12 +13974,14 @@ impl BackgroundExecutor {
                         "P053 control-plane manifest generation measured"
                     );
                     let exact_output_acceptance_started = Instant::now();
-                    let settlement = settle_agent_outputs_from_discovery_decisions(
-                        &declared_outputs,
-                        &expected_outputs,
-                        &result.discovered_artifacts,
-                        &result.pre_prompt_expected_outputs,
-                    )?;
+                    let settlement =
+                        build_declared_output_discovery_settlement_with_generated_run_state(
+                            &expected_outputs,
+                            &result.discovered_artifacts,
+                            &result.pre_prompt_expected_outputs,
+                            &StdDiscoveryFilesystem,
+                            generated_run_state.as_ref(),
+                        );
                     let found_count = settlement
                         .decisions
                         .iter()
@@ -13808,12 +14064,15 @@ impl BackgroundExecutor {
                         &settlement.decisions,
                         &settlement.accepted_payloads,
                     );
-                    let validation = self
+                    let mut validation = self
                         .validate_task_outputs_with_conflict_resolution_context(
                             run_id, &stage_id, &agent_id, &captured,
                         )
                         .await?;
-                    if validation_summary_requires_output_contract_repair(&validation) {
+                    enforce_generated_run_state_status(&mut validation, settlement);
+                    if validation_summary_requires_output_contract_repair(&validation)
+                        && !generated_run_state_failed(settlement)
+                    {
                         if let Some(skip_classification) =
                             output_contract_repair_skip_classification(
                                 &result.status,
@@ -13967,10 +14226,11 @@ impl BackgroundExecutor {
                                     // with the ACP envelope parser, then route candidates through the
                                     // same settlement and validation path as normal provider output.
                                     let mut p079_transcript_recovery_obj =
-                                        p079_attempt_transcript_recovery(
+                                        p079_attempt_transcript_recovery_with_generated_run_state(
                                             result.transcript_text.as_deref(),
                                             &expected_outputs,
                                             &result.pre_prompt_expected_outputs,
+                                            generated_run_state.as_ref(),
                                         );
                                     let mut p079_transcript_recovery_settlement: Option<
                                         DeclaredOutputDiscoverySettlement,
@@ -15101,10 +15361,12 @@ impl BackgroundExecutor {
                                                         }
                                                     } else {
                                                         match Ok::<_, anyhow::Error>(
-                                                    build_declared_output_discovery_settlement(
+                                                    build_declared_output_discovery_settlement_with_generated_run_state(
                                                         &expected_outputs,
                                                         &repair_result.discovered_artifacts,
                                                         &repair_result.pre_prompt_expected_outputs,
+                                                        &StdDiscoveryFilesystem,
+                                                        generated_run_state.as_ref(),
                                                     ),
                                                 ) {
                                                     Ok(repair_settlement) => {
@@ -16282,6 +16544,9 @@ impl BackgroundExecutor {
                         summary,
                         changed_files_manifest_status.as_ref(),
                     );
+                    if let Some(settlement) = declared_output_settlement.as_ref() {
+                        enforce_generated_run_state_status(summary, settlement);
+                    }
                 }
                 if let (Some(settlement), Some(validation_summary)) = (
                     declared_output_settlement.as_ref(),
@@ -16345,7 +16610,11 @@ impl BackgroundExecutor {
                     .iter()
                     .chain(supplemental_meta_root_artifact_paths.artifact_paths.iter())
                 {
-                    if persisted_paths.contains(path) {
+                    if persisted_paths.contains(path)
+                        || std::fs::canonicalize(path).ok().is_some_and(|canonical| {
+                            persisted_paths.contains(canonical.to_string_lossy().as_ref())
+                        })
+                    {
                         continue;
                     }
                     if let Some(artifact) = self
@@ -18146,6 +18415,22 @@ impl BackgroundExecutor {
     ) -> Result<Vec<domain::artifact::Artifact>> {
         let mut artifacts_out = Vec::new();
         for declared in declared_outputs {
+            if discovery_decisions.is_some_and(|decisions| {
+                decisions.iter().any(|decision| {
+                    decision.output_name == "run_state"
+                        && decision.output_name == declared.output_name
+                        && decision.target_path == declared.target_path
+                        && decision.generated_by.as_deref() == Some("control_plane")
+                })
+            }) {
+                // It is an exported DB projection, not an agent-authored artifact
+                // generation. Also exclude it from supplemental filesystem import.
+                persisted_paths.insert(declared.target_path.clone());
+                if let Ok(canonical) = std::fs::canonicalize(&declared.target_path) {
+                    persisted_paths.insert(canonical.to_string_lossy().into_owned());
+                }
+                continue;
+            }
             let default_contract_id = format!("{}.output", provider);
             if declared_output_has_accepted_discovery_decision(
                 discovery_decisions,
@@ -20360,6 +20645,7 @@ struct RuntimeInvocationContractInput<'a> {
     session_generation_id: Option<String>,
     session_reuse_disposition: Option<String>,
     declared_outputs: &'a [DeclaredOutput],
+    generated_run_state_path: Option<&'a str>,
 }
 
 /// Budget a rehydrated retry before committing its attempt. Use the same late
@@ -20396,13 +20682,34 @@ pub(crate) fn validate_rehydrated_retry_prompt_budget(
             session_generation_id: Some(uuid::Uuid::nil().to_string()),
             session_reuse_disposition: Some("x".repeat(128)),
             declared_outputs: &outputs,
+            generated_run_state_path: None,
         },
     );
+    // Retry-budget validation does not load the run's trusted meta root. Reserve
+    // the entire ownership directive for any potential run_state projection;
+    // dispatch may remove its provider instructions but cannot add more than this.
+    let ownership_directive_reserve = outputs
+        .iter()
+        .filter(|output| output.output_name == "run_state")
+        .map(|output| run_state_projection_ownership_directive(&output.target_path).len())
+        .max()
+        .unwrap_or(0);
+    let prompt_bytes = prompt.len().saturating_add(ownership_directive_reserve);
     anyhow::ensure!(
-        prompt.len() <= acp::input_context::MAX_PROMPT_BYTES,
+        prompt_bytes <= acp::input_context::MAX_PROMPT_BYTES,
         "input_context_retry_final_prompt_too_large"
     );
-    Ok(prompt.len())
+    Ok(prompt_bytes)
+}
+
+fn run_state_projection_ownership_directive(target_path: &str) -> String {
+    format!(
+        "\nThe canonical `run_state` at `{target_path}` is generated from SQLite by the control plane \
+         and is read-only for this invocation. Do not edit it or return its contents or a \
+         manifest through `CHAINWORKS_OUTPUT`. An unchanged digest is valid for this \
+         DB projection. This runtime ownership supersedes earlier instructions to update \
+         or return `run_state`; the frozen task assignment remains unchanged.\n"
+    )
 }
 
 fn prompt_with_runtime_invocation_contract(
@@ -20439,8 +20746,47 @@ fn prompt_with_runtime_invocation_contract(
         return prompt;
     }
 
+    let generated_run_state = input.declared_outputs.iter().find(|output| {
+        output.output_name == "run_state"
+            && input.generated_run_state_path == Some(output.target_path.as_str())
+    });
+    if let Some(output) = generated_run_state {
+        prompt.push_str(&run_state_projection_ownership_directive(
+            &output.target_path,
+        ));
+    }
+    let provider_outputs: Vec<DeclaredOutput> = input
+        .declared_outputs
+        .iter()
+        .filter_map(|output| {
+            if generated_run_state.is_some_and(|generated| {
+                output.output_name == generated.output_name
+                    && output.target_path == generated.target_path
+            }) {
+                output
+                    .companion_output_name
+                    .as_ref()
+                    .zip(output.companion_path.as_ref())
+                    .map(|(name, path)| DeclaredOutput {
+                        output_name: name.clone(),
+                        target_path: path.clone(),
+                        schema: None,
+                        reuse_policy: output.reuse_policy,
+                        companion_output_name: None,
+                        companion_path: None,
+                    })
+            } else {
+                Some(output.clone())
+            }
+        })
+        .collect();
+    if provider_outputs.is_empty() {
+        prompt.push_str("- Required provider outputs: none.\n");
+        return prompt;
+    }
+
     prompt.push_str("\nRequired outputs for this turn:\n");
-    for output in input.declared_outputs {
+    for output in &provider_outputs {
         prompt.push_str(&format!(
             "- `{}` -> `{}`\n",
             output.output_name, output.target_path
@@ -20465,7 +20811,7 @@ fn prompt_with_runtime_invocation_contract(
             }
         }
     }
-    let has_returnable_outputs = input.declared_outputs.iter().any(|output| {
+    let has_returnable_outputs = provider_outputs.iter().any(|output| {
         !path_looks_like_directory_target(&output.target_path)
             || output
                 .companion_path
@@ -20473,7 +20819,7 @@ fn prompt_with_runtime_invocation_contract(
                 .is_some_and(|path| !path_looks_like_directory_target(path))
     });
     prompt.push_str(
-        "\nOutputs from prior stage executions, prior work items, or prior prompt turns are stale \
+        "\nAgent-owned outputs from prior stage executions, prior work items, or prior prompt turns are stale \
          unless they are explicitly accepted by the current output contract. ",
     );
     if has_returnable_outputs {
@@ -20485,7 +20831,7 @@ fn prompt_with_runtime_invocation_contract(
              \"<name>\", \"path\": \"<canonical path>\", \"digest\": \"sha256:<digest>\", \
              \"size_bytes\": <bytes> }`. You must not finish this turn without either full \
              `CHAINWORKS_OUTPUT` content or a valid direct-file manifest for every required \
-             file/json output.\n\
+             provider file/json output.\n\
              Tool stdout is not an output channel. Only the final assistant message is settled for \
              `CHAINWORKS_OUTPUT`. Do not call shell `echo` or `printf` to return \
              `CHAINWORKS_OUTPUT`; write only the actual large output file itself when using \
@@ -20497,9 +20843,9 @@ fn prompt_with_runtime_invocation_contract(
              directories; `CHAINWORKS_OUTPUT` is not required for directory content.\n",
         );
     }
-    append_chainworks_output_contract_example(&mut prompt, input.declared_outputs);
-    append_proposal_current_freeze_readiness_guidance(&mut prompt, input.declared_outputs);
-    append_docs_noop_contract_guidance(&mut prompt, input.declared_outputs);
+    append_chainworks_output_contract_example(&mut prompt, &provider_outputs);
+    append_proposal_current_freeze_readiness_guidance(&mut prompt, &provider_outputs);
+    append_docs_noop_contract_guidance(&mut prompt, &provider_outputs);
     prompt
 }
 
@@ -23925,12 +24271,26 @@ struct P079TranscriptRecoveryAttempt {
     settlement: Option<DeclaredOutputDiscoverySettlement>,
 }
 
+#[cfg(test)]
 fn p079_attempt_transcript_recovery(
     transcript_text: Option<&str>,
     expected_outputs: &[ExpectedOutputSpec],
     pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
 ) -> P079TranscriptRecoveryAttempt {
-    let _ = pre_prompt_expected_outputs;
+    p079_attempt_transcript_recovery_with_generated_run_state(
+        transcript_text,
+        expected_outputs,
+        pre_prompt_expected_outputs,
+        None,
+    )
+}
+
+fn p079_attempt_transcript_recovery_with_generated_run_state(
+    transcript_text: Option<&str>,
+    expected_outputs: &[ExpectedOutputSpec],
+    pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
+    generated_run_state: Option<&GeneratedRunStateOutput>,
+) -> P079TranscriptRecoveryAttempt {
     let max_bytes = p079_read_transcript_recovery_max_bytes();
     const MAX_DEPTH: u32 = 32;
     const MAX_CHUNKS: u32 = 64;
@@ -24019,11 +24379,15 @@ fn p079_attempt_transcript_recovery(
             bytes_examined: Some(bytes_examined),
             ..base
         },
-        settlement: Some(build_declared_output_discovery_settlement(
-            expected_outputs,
-            &artifacts,
-            pre_prompt_expected_outputs,
-        )),
+        settlement: Some(
+            build_declared_output_discovery_settlement_with_generated_run_state(
+                expected_outputs,
+                &artifacts,
+                pre_prompt_expected_outputs,
+                &StdDiscoveryFilesystem,
+                generated_run_state,
+            ),
+        ),
     }
 }
 
@@ -24269,6 +24633,14 @@ fn merge_contract_repair_result(initial: &mut acp::ExecutionResult, repair: acp:
 #[cfg(test)]
 #[path = "executor_p039_readback_tests.rs"]
 mod p039_readback_tests;
+
+#[cfg(test)]
+#[path = "executor_direct_file_ref_tests.rs"]
+mod direct_file_ref_tests;
+
+#[cfg(test)]
+#[path = "executor_run_state_tests.rs"]
+mod run_state_output_tests;
 
 #[cfg(test)]
 mod tests {
@@ -25579,6 +25951,7 @@ plain progress line without gate evidence";
                 session_generation_id: Some("generation-1".to_string()),
                 session_reuse_disposition: Some("reused".to_string()),
                 declared_outputs: &declared_outputs,
+                generated_run_state_path: None,
             },
         );
 
@@ -25612,6 +25985,167 @@ plain progress line without gate evidence";
     }
 
     #[test]
+    fn runtime_invocation_contract_keeps_canonical_run_state_read_only_on_reused_turn() {
+        let declared_outputs = vec![
+            DeclaredOutput {
+                output_name: "implementation_plan".into(),
+                target_path: "/workspace/.chainworks/runs/run-1/implementation/plan.md".into(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "implementation_backlog".into(),
+                target_path: "/workspace/.chainworks/runs/run-1/implementation/backlog.yaml".into(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "run_state".into(),
+                target_path: "/workspace/.chainworks/runs/run-1/state/run-state.json".into(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+        ];
+        let before = serde_json::to_value(&declared_outputs).unwrap();
+        let specs = build_expected_output_specs(
+            &declared_outputs,
+            "/workspace",
+            None,
+            Some(".chainworks/runs/run-1"),
+            false,
+        );
+        let prompt = prompt_with_runtime_invocation_contract(
+            "Legacy frozen assignment: return implementation_plan, implementation_backlog and run_state.".into(),
+            RuntimeInvocationContractInput {
+                run_id: "run-1".into(),
+                stage_id: "state_7_implementation_started".into(),
+                stage_execution_id: "retry-stage".into(),
+                agent_execution_id: "retry-agent".into(),
+                work_item_id: "retry-work".into(),
+                session_generation_id: Some("reused-generation".into()),
+                session_reuse_disposition: Some("reused".into()),
+                declared_outputs: &declared_outputs,
+                generated_run_state_path: specs
+                    .iter()
+                    .find(|spec| crate::contracts::is_control_plane_run_state_spec(spec))
+                    .map(|spec| spec.target_path.as_str()),
+            },
+        );
+        let runtime = prompt
+            .split("### Runtime Invocation Contract")
+            .last()
+            .unwrap();
+        assert!(runtime.contains("generated from SQLite"));
+        assert!(runtime.contains("read-only for this invocation"));
+        assert!(runtime.contains("An unchanged digest is valid"));
+        assert!(runtime.contains("supersedes earlier instructions"));
+        assert!(runtime.contains("- `implementation_plan` ->"));
+        assert!(runtime.contains("- `implementation_backlog` ->"));
+        assert!(!runtime.contains("- `run_state` ->"));
+        let envelope = runtime
+            .lines()
+            .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .unwrap();
+        let outputs = envelope["CHAINWORKS_OUTPUT"].as_object().unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs.contains_key(&declared_outputs[0].target_path));
+        assert!(outputs.contains_key(&declared_outputs[1].target_path));
+        assert!(!outputs.contains_key(&declared_outputs[2].target_path));
+        assert_eq!(serde_json::to_value(&declared_outputs).unwrap(), before);
+        let budget = validate_rehydrated_retry_prompt_budget(
+            &serde_json::json!({
+                "run_id": "run-1",
+                "stage_id": "state_7_implementation_started",
+                "stage_execution_id": "retry-stage",
+                "prompt": "Legacy frozen assignment: return implementation_plan, implementation_backlog and run_state.",
+                "declared_outputs": declared_outputs,
+            }),
+            None,
+            "retry-work",
+        ).unwrap();
+        assert!(
+            budget >= prompt.len(),
+            "retry budget must cover runtime ownership guidance"
+        );
+    }
+
+    #[test]
+    fn runtime_invocation_contract_only_run_state_requires_no_provider_output() {
+        let declared_outputs = vec![DeclaredOutput {
+            output_name: "run_state".into(),
+            target_path: "/workspace/.chainworks/runs/run-1/state/run-state.json".into(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        }];
+        let prompt = prompt_with_runtime_invocation_contract(
+            String::new(),
+            RuntimeInvocationContractInput {
+                run_id: "run-1".into(),
+                stage_id: "stage".into(),
+                stage_execution_id: "stage-exec".into(),
+                agent_execution_id: "agent-exec".into(),
+                work_item_id: "work".into(),
+                session_generation_id: None,
+                session_reuse_disposition: None,
+                declared_outputs: &declared_outputs,
+                generated_run_state_path: Some(&declared_outputs[0].target_path),
+            },
+        );
+        assert!(prompt.contains("Required provider outputs: none"));
+        assert!(!prompt.contains("Return a fresh `CHAINWORKS_OUTPUT`"));
+        assert!(!prompt.contains("Example `CHAINWORKS_OUTPUT` skeleton"));
+        assert!(!prompt.contains("All required outputs are directories"));
+    }
+
+    #[test]
+    fn runtime_invocation_contract_does_not_exempt_noncanonical_run_state() {
+        let declared_outputs = vec![DeclaredOutput {
+            output_name: "run_state".into(),
+            target_path: "/workspace/custom/run-state.json".into(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        }];
+        let specs = build_expected_output_specs(
+            &declared_outputs,
+            "/workspace",
+            None,
+            Some(".chainworks/runs/run-1"),
+            false,
+        );
+        let prompt = prompt_with_runtime_invocation_contract(
+            String::new(),
+            RuntimeInvocationContractInput {
+                run_id: "run-1".into(),
+                stage_id: "stage".into(),
+                stage_execution_id: "stage-exec".into(),
+                agent_execution_id: "agent-exec".into(),
+                work_item_id: "work".into(),
+                session_generation_id: None,
+                session_reuse_disposition: None,
+                declared_outputs: &declared_outputs,
+                generated_run_state_path: specs
+                    .iter()
+                    .find(|spec| crate::contracts::is_control_plane_run_state_spec(spec))
+                    .map(|spec| spec.target_path.as_str()),
+            },
+        );
+        assert!(!prompt.contains("generated from SQLite"));
+        assert!(prompt.contains("- `run_state` -> `/workspace/custom/run-state.json`"));
+        assert!(prompt.contains("Return a fresh `CHAINWORKS_OUTPUT`"));
+        assert!(prompt.contains("\"/workspace/custom/run-state.json\":\"<run_state content>\""));
+    }
+
+    #[test]
     fn runtime_invocation_contract_lists_rollout_nested_schema_rules() {
         let declared_outputs = vec![DeclaredOutput {
             output_name: "proposal_current".to_string(),
@@ -25633,6 +26167,7 @@ plain progress line without gate evidence";
                 session_generation_id: None,
                 session_reuse_disposition: None,
                 declared_outputs: &declared_outputs,
+                generated_run_state_path: None,
             },
         );
 
@@ -25666,6 +26201,7 @@ plain progress line without gate evidence";
                 session_generation_id: None,
                 session_reuse_disposition: None,
                 declared_outputs: &declared_outputs,
+                generated_run_state_path: None,
             },
         );
 
@@ -25707,6 +26243,7 @@ plain progress line without gate evidence";
                 session_generation_id: None,
                 session_reuse_disposition: None,
                 declared_outputs: &declared_outputs,
+                generated_run_state_path: None,
             },
         );
 
@@ -25756,6 +26293,7 @@ plain progress line without gate evidence";
                 session_generation_id: None,
                 session_reuse_disposition: None,
                 declared_outputs: &declared_outputs,
+                generated_run_state_path: None,
             },
         );
 
@@ -27022,6 +27560,7 @@ plain progress line without gate evidence";
                 session_generation_id: Some("generation-1".to_string()),
                 session_reuse_disposition: Some("reused".to_string()),
                 declared_outputs: &declared_outputs,
+                generated_run_state_path: None,
             },
         );
 
@@ -27119,6 +27658,7 @@ plain progress line without gate evidence";
                 session_generation_id: None,
                 session_reuse_disposition: None,
                 declared_outputs: &declared_outputs,
+                generated_run_state_path: None,
             },
         );
 
@@ -30436,7 +30976,7 @@ plain progress line without gate evidence";
         }];
 
         let settlement = settle_agent_outputs_from_discovery_decisions(
-            &[declared],
+            std::slice::from_ref(&declared),
             &specs,
             &discovered,
             &pre_prompt_metadata,
@@ -30451,6 +30991,24 @@ plain progress line without gate evidence";
             settlement.decisions[0].status,
             OutputDiscoveryStatus::Accepted
         );
+        assert!(
+            !machine_path.exists(),
+            "discovery settlement must not publish output before validation"
+        );
+        let captured = build_captured_outputs_from_discovery_decisions(
+            std::slice::from_ref(&declared),
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+        let validation = validate_task_outputs(&captured);
+        assert!(validation.failure_class.is_none());
+        materialize_validated_discovery_decisions(
+            std::slice::from_ref(&declared),
+            &settlement,
+            &validation,
+            Some(tmp.path()),
+        )
+        .expect("validated accepted output should be materialized");
         assert_eq!(
             std::fs::read_to_string(machine_path).unwrap(),
             r#"{"status":"green"}"#

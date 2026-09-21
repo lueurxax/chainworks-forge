@@ -5575,6 +5575,9 @@ PY
       cargo test -p acp test_claude_adapter_keeps_legacy_broad_discovery_disabled_by_default --test integration -- --nocapture &&
       cargo test -p acp test_claude_adapter_executes_subprocess_and_returns_artifacts --test integration -- --nocapture &&
       cargo test -p engine expected_output_specs -- --nocapture &&
+      cargo test -p engine direct_file_ref_tests --lib -- --nocapture &&
+      cargo test -p engine run_state_output_tests --lib -- --nocapture &&
+      cargo test -p engine runtime_invocation_contract_ --lib -- --nocapture &&
       cargo test -p engine proposal_053_must_produce_does_not_accept_unchanged_existing_output --lib -- --nocapture &&
       cargo test -p engine proposal_053_bounded_meta_root_artifact_paths_are_supplemental_only --lib -- --nocapture &&
       cargo test -p engine proposal_053_engine_settlement_uses_discovery_filesystem_fake_for_exact_path --lib -- --nocapture &&
@@ -5595,6 +5598,7 @@ PY
       cd "$ROOT_DIR/control-plane"
       cargo test -p domain --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
       cargo test -p engine proposal_058 --lib -- --test-threads=1 --nocapture &&
+      cargo test -p engine p058_v1_ --lib -- --test-threads=1 --nocapture &&
       cargo test -p db --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
       cargo test -p db --test proposal_058_claim_start -- --test-threads=1 --nocapture &&
       cargo test -p engine --test proposal_058_claim_start -- --test-threads=1 --nocapture &&
@@ -12868,6 +12872,7 @@ PY
       CARGO_TARGET_DIR="$agent_context_cargo_target" cargo test -p engine agent_context_ --lib -- --nocapture
       CARGO_TARGET_DIR="$agent_context_cargo_target" cargo test -p engine proposal_058_lead_mediation_replaces_complete_source_agent_authority --lib -- --nocapture
       CARGO_TARGET_DIR="$agent_context_cargo_target" cargo test -p engine p058_escalation_retry_uses_durable_current_backend_profile_tier --lib -- --nocapture
+      CARGO_TARGET_DIR="$agent_context_cargo_target" cargo test -p engine p058_v1_ --lib -- --nocapture
     )
     log "Agent context and skills gate passed"
     ;;

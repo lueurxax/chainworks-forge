@@ -164,6 +164,18 @@ cancels the run, but some workflows define explicit loopback transitions for
 
 **Cancellation**: Sets `isCancelled`, updates run status, stops the loop.
 
+**Retry profile authority (Rust control plane)**: V1 copied invocation payloads
+retain their frozen mission, permissions and output contract. A sanctioned
+`targeted_retry.provider_fallback` may select a different backend profile only
+when it matches the frozen catalog and escalation tier/fallback route, durable
+retry authority, source work item and source execution. P058 validation uses the
+immutable tier recorded for the execution, because the mutable ledger may already
+point to the next tier when failure settlement runs. Provider aliases are
+normalized; omitted nullable profile settings clear the prior profile's values.
+An incompatible retry payload at failed-stage scheduling is persisted as
+`retry_payload_authority_invalid` and settles the stage failed/run blocked
+atomically, rather than leaving a running stage with an exhausted queue.
+
 ### Agent Executor Protocol (`AgentExecutor.swift`)
 
 ```swift
