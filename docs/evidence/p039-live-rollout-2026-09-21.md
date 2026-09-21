@@ -3,6 +3,12 @@
 Date: 2026-09-21. Status: published and deployed; P095 preview held before
 reservation. Full migration and proposal retirement remain incomplete.
 
+Later the same day, the operator separately authorized and completed the
+[legacy lifecycle correction](p095-legacy-reconciliation-2026-09-21.md).
+That follow-up supersedes the `source_busy` prerequisite below: the new preview
+holds on `continuation_budget_exceeded`. This initial rollout record remains
+the evidence for the earlier cutoff, not the current lifecycle-row status.
+
 ## Authorized Scope
 
 The operator authorized merge to main, GitHub push, a compatible daemon update

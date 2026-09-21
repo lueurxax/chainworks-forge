@@ -102,7 +102,8 @@ cwd/workspace, arbitrary path, environment grant or serialized authority is allo
 - [x] Run focused gate, broad workspace regressions, all-targets compilation and formatting/diff checks; distinguish baseline failures with exact evidence. Broad: 4011/81/3 ignored; 80 failures reproduce on baseline and the introduced inventory failure is fixed. Daemon units: 137/137. Host-global daemon startup and app-blocked guardrails remain excluded, not passed.
 - [x] Independent whole-feature offline execution-truth synthesis accepts candidate 3 with no scoped P039 finding open. Important findings and the final inventory regression have recorded fixes and verification; this is not full-migration or release readiness.
 - [x] Obtain exact I4 scope, merge/push the accepted source, deploy the signed daemon and verify schema-100 backup/restore and schema-101 readiness. The narrow temporary operator was separately authorized and removed after readback.
-- [ ] Complete live P095 acceptance. Its first preview returned `source_busy`: 272 legacy provider records lack process identities and 159 historical escalation ledgers remain active. No continuation was reserved; see [live evidence](../../evidence/p039-live-rollout-2026-09-21.md). Do not infer process absence, provider/Apple consent or permission for bulk reconciliation.
+- [x] After separate operator authorization, reconcile exactly 272 legacy provider records and 159 terminal-stage escalation ledgers, with verified backup, process evidence, transactional comparison and audit. No rows deleted; protected source state unchanged. See [correction evidence](../../evidence/p095-legacy-reconciliation-2026-09-21.md).
+- [ ] Complete live P095 acceptance. The new preview returns `continuation_budget_exceeded`: 215 mandatory historical references exceed the 128 bound. No continuation was reserved. Resolve bounded history representation without deleting findings; later provenance and fresh approval remain unproved.
 - [ ] Only after implementation acceptance: use proposal-implementation-closeout inventory, promote implemented truth, repair references, retire proposal-only artifacts, run doc/link checks and retained gate aliases.
 
 ## Completion Accounting
@@ -112,5 +113,6 @@ open only for the separately authorized live lane and subsequent retirement.
 Broad failure accounting is complete, not green. Stable reference/index and P070
 dependency updates are prepared without retiring the proposal. Offline success
 is not live canary success. Source `366643e2244f4e8820f16a8a5279eb2b9de018a2`
-is merged, pushed and deployed. The actual P095 preview exposed legacy
-quiescence prerequisites; preparation, activation and retirement remain open.
+is merged, pushed and deployed. The initial legacy quiescence prerequisite was
+corrected with separate authorization; the new historical-reference budget hold
+leaves preparation, activation and retirement open.

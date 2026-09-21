@@ -9,7 +9,10 @@ Admission is disabled by default. This document describes implemented behavior;
 deployment and live acceptance are separate from the
 [offline integration evidence](../evidence/p039-durable-integration.md).
 The [live rollout record](../evidence/p039-live-rollout-2026-09-21.md) distinguishes
-deployed capability from a completed transfer.
+deployed capability from a completed transfer. The subsequent
+[authorized lifecycle correction](../evidence/p095-legacy-reconciliation-2026-09-21.md)
+records a manual one-run repair and the remaining historical-reference budget
+hold; it does not establish a general cleanup API.
 
 ## Eligibility And Source Protection
 

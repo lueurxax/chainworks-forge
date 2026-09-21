@@ -15,9 +15,10 @@ Broad regressions are fully classified: 80 failures reproduce on baseline; the
 one introduced producer-inventory regression is corrected and independently
 verified. Independent final synthesis accepts the candidate within this offline
 scope, with no scoped P039 finding left open. The full workspace is not green.
-The compatible deployment is now verified, but live P095 preview holds before
-reservation on legacy source ownership records. Full closeout and proposal
-retirement are not claimed.
+The compatible deployment is now verified. The separately authorized
+[legacy correction](../evidence/p095-legacy-reconciliation-2026-09-21.md) removed
+the measured quiescence hold; P095 now exceeds the historical-reference budget
+before reservation. Full closeout and proposal retirement are not claimed.
 
 The implementation now includes durable reservation, preparation, activation,
 input/readback and approval integration. This supersedes R1's statement that
@@ -44,7 +45,7 @@ otherwise; a protocol fixture is not an actual provider or Apple observation.
 | Final API and policy proofs | ET01 real-service post-commit lost-ack/reopen replay, ET04 GraphQL post-abort readback, ET02 structured carried-reference/reopen/current-declaration removal and ET03 missing-headless denial independently accepted by source/assertion inspection. MCP24, GraphQL3 and policy3 tests passed in owner runs. General removed-tool compatibility is not claimed. |
 | Combined gate and execution truth | Final candidate-3 gate passed: 348 selected Rust tests, zero failed/ignored; checker 3/3; 29 cases, 164 distinct mapped successes; rollout lint PASS. All 1003 frozen-file checksums matched after execution. Workspace/all-targets compilation, formatting and changed-document links pass. Independent final offline synthesis: ACCEPTED, no open scoped finding. |
 | Broad regression accounting | Candidate 2: 4011 passed, 81 failed, three ignored, 131 selections. All 80 pre-existing failures have baseline reproduction; the introduced inventory failure has an independent candidate-3 GREEN and is now required by the gate. Separate daemon unit lane: 137/137. No green full-workspace claim; host-global daemon startup and guardrails remain excluded. |
-| P095 live acceptance | Authorized preview held on legacy `source_busy`; zero reservations/fences/successors. Exact live provenance and retained findings have not reached evaluation. Preparation, fresh approval and headless acceptance remain unproved. |
+| P095 live acceptance | Authorized legacy correction completed; new preview holds on `continuation_budget_exceeded`, with 215 mandatory references versus the 128 bound. Zero reservations/fences/successors. Later provenance and finding retention are unproved, as are preparation, fresh approval and headless acceptance. |
 
 The detailed evidence records broad-suite failures and baseline reproductions.
 Those reproductions are not a blanket regression waiver or a green-workspace
@@ -66,16 +67,19 @@ deployment/live acceptance. No proposal-side artifact has been deleted.
 
 ## Remaining Order
 
-1. Resolve the measured legacy quiescence prerequisite through evidence-backed
-   lifecycle reconciliation, not a blanket guard bypass or direct status rewrite.
+1. Resolve the measured historical-reference budget mismatch with a bounded
+   representation that preserves all mandatory history. The separately authorized
+   lifecycle correction is complete; further history deletion is not a remedy.
 2. Re-preview P095 before preparation/activation; observe fresh review, approval
    and separately approved headless execution rather than infer them.
 3. Only after live acceptance, finalize the prepared stable documentation and
    retire proposal-side artifacts with link and retained-gate verification.
 
 Closeout disposition: **DOCS UPDATED; RETIREMENT BLOCKED by the measured P095
-source_busy hold**, not by an unapproved deployment or unresolved offline finding.
+continuation budget hold**, not by an unapproved deployment or a remaining legacy
+quiescence correction. This live limitation is separate from the offline verdict.
 
 The original offline audit does not stand in for operational evidence. The
 linked live record establishes merge/push/deployment and backup verification;
-source cancellation, cleanup, successor activation and native consent did not occur.
+source cancellation, successor activation and native consent did not occur.
+Only the separately authorized lifecycle metadata correction occurred afterward.
