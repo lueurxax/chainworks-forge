@@ -18,6 +18,13 @@ use domain::ids::AgentExecutionId;
 use sqlx::SqlitePool;
 use tracing::warn;
 
+/// A host-side admission refusal cannot be recovered by changing providers.
+/// Require both typed supervision and launch evidence, preserving legacy facts.
+pub(crate) fn is_headless_prelaunch_failure(facts: &AgentExecutionRuntimeFacts) -> bool {
+    facts.runtime_preflight_provider_launched == Some(false)
+        && facts.supervision_classification.as_deref() == Some("xcode_headless_prelaunch_failed")
+}
+
 /// Classify an escalation trigger from an agent execution's failure kind.
 ///
 /// Maps `AgentFailureKind` to the P058 trigger vocabulary.  Returns `None` for
@@ -60,6 +67,9 @@ pub fn classify_trigger_from_failure_kind(
 pub fn classify_trigger_from_runtime_facts(
     facts: &AgentExecutionRuntimeFacts,
 ) -> Option<&'static str> {
+    if is_headless_prelaunch_failure(facts) {
+        return None;
+    }
     if matches!(
         facts.failure_kind.as_ref(),
         Some(AgentFailureKind::McpStartupTimeout)
@@ -126,6 +136,9 @@ pub async fn try_write_shadow_escalation_from_runtime_facts(
     facts: &AgentExecutionRuntimeFacts,
     completed_at: DateTime<Utc>,
 ) {
+    if is_headless_prelaunch_failure(facts) {
+        return;
+    }
     let trigger_raw = classify_trigger_from_runtime_facts(facts);
     if let Err(e) = write_shadow_escalation_inner(
         pool,
@@ -393,6 +406,33 @@ mod tests {
                 "Expected stale_no_output for {kind:?}"
             );
         }
+    }
+
+    #[test]
+    fn xcode_headless_prelaunch_failure_never_selects_provider_escalation() {
+        let mut facts =
+            AgentExecutionRuntimeFacts::defaults_for(AgentExecutionId::new(), Utc::now());
+        facts.failure_kind = Some(AgentFailureKind::XcodeHostEnvironmentError);
+        facts.supervision_classification = Some("xcode_headless_prelaunch_failed".into());
+        facts.runtime_preflight_provider_launched = Some(false);
+        assert_eq!(classify_trigger_from_runtime_facts(&facts), None);
+
+        // A transport detail from preparation is not provider launch authority.
+        facts.transport_error_code = Some("project_trust_required".into());
+        assert_eq!(classify_trigger_from_runtime_facts(&facts), None);
+
+        // Preserve classification of actual or unproven provider failures.
+        facts.runtime_preflight_provider_launched = Some(true);
+        assert_eq!(
+            classify_trigger_from_runtime_facts(&facts),
+            Some("transport_failure")
+        );
+        facts.runtime_preflight_provider_launched = None;
+        facts.transport_error_code = None;
+        assert_eq!(
+            classify_trigger_from_runtime_facts(&facts),
+            Some("stale_no_output")
+        );
     }
 
     #[test]

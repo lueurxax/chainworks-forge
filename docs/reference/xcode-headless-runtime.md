@@ -1,7 +1,7 @@
 # Headless Xcode Runtime
 
 This guide describes the implemented daemon, invocation, shim, and operator CLI
-paths as of 2026-09-20. Offline fixtures cover their admission and failure
+paths as of 2026-09-21. Offline fixtures cover their admission and failure
 behavior. **Live acceptance of this combined runtime, including native cold
 startup, has not yet been executed.** Historical Apple schema captures are
 contract inputs, not evidence that the current deployment has passed acceptance.
@@ -168,6 +168,38 @@ Apple stopped working. Recovery turns unfinished dispatched attempts into
 unknown attempts before new Xcode admission. Repeating an operation key does not
 send the operation again; a changed request under the same identity is rejected.
 
+### Project Trust Admission Failures
+
+A missing `xcode-project-trust` directory or absent project grant produces
+`project_trust_required`. This is separate from the journal authority in
+`xcode-runtime`: a valid authority record and coordinator lock do not grant
+project trust. Do not bootstrap or replace journal authority to address a missing
+project grant.
+
+| Preparation reason | Operator disposition |
+| --- | --- |
+| `project_trust_required` | Review and explicitly admit the exact resolved project/root before retry. |
+| `project_trust_revoked` | Review the revocation; any regrant is a new explicit operator decision. |
+| `project_trust_unavailable` | Inspect the underlying store, identity, lock, or timeout failure before retry. |
+
+`HeadlessRuntime::prepare` attaches a typed `ProjectTrustAdmissionFailure`
+containing the resolved execution root, project key, and bounded reason code.
+The underlying error is preserved. Unsafe links, ownership or mode violations,
+damaged records, missing lock files, lock contention, and identity changes remain
+fail-closed; they are not repaired by lookup or treated as an absent grant.
+
+A trust-admission preparation failure records `failed_no_launch`,
+`provider_launched: false`, and an operator disposition in execution runtime
+facts. Operator readback includes
+the exact root/project identity; callers without operator access receive the
+bounded summary without the path-bearing details. Admission failure occurs
+before provider/session launch, Xcode service startup, or workspace opening.
+It does not consume provider retry/escalation as if a provider had failed.
+Operator GraphQL/MCP diagnostics carry the existing CLI guidance. UI Retry
+retains its MCP-command guidance; neither surface creates grants. Existing
+historical failures without these facts are not
+retroactively repaired or reclassified.
+
 ## Operator CLI Setup
 
 The installed daemon binary accepts this exact one-shot interface:
@@ -312,8 +344,10 @@ for an already selected canonical root, this macOS command is read-only:
 /usr/bin/stat -f '%d %i' "$EFFECTIVE_ROOT"
 ```
 
-Repository-root example `trust.json` (a worktree request instead needs its exact
-`effective`, `kind: "worktree"`, and matching strategy):
+Dedicated-worktree example `trust.json`. Use the canonical repository and exact
+persisted worktree; a repository grant does not cover a dedicated worktree.
+For a repository-root request, `effective` instead equals `repository`, `kind`
+is `repository`, and `strategy` is `null`.
 
 ```json
 {
@@ -321,11 +355,11 @@ Repository-root example `trust.json` (a worktree request instead needs its exact
   "root": {
     "version": 1,
     "repository": "/canonical/path/to/repository",
-    "effective": "/canonical/path/to/repository",
+    "effective": "/canonical/path/to/exact-dedicated-worktree",
     "device": "<effective-directory-device>",
     "inode": "<effective-directory-inode>",
-    "strategy": null,
-    "kind": "repository"
+    "strategy": "dedicated",
+    "kind": "worktree"
   },
   "selector": "App.xcodeproj"
 }
@@ -345,6 +379,46 @@ The store is `xcode-project-trust` under the selected mode's app-support directo
 Directories/files are private, owner-checked, and reject inappropriate links or
 modes. Runtime lookup never creates a missing store or grants trust implicitly.
 Root/project replacement, revocation, and policy drift require fresh admission.
+
+### Review, Grant, Then Retry
+
+1. Read the failed execution and persisted run through the existing operator
+   diagnostics. Match its `run_id`, repository, effective worktree, strategy,
+   project selector, UID, device, and inode. Recheck the current directory
+   identities; an old failure record alone is not current trust authority.
+2. Review the private request file against those identities and obtain an
+   explicit operator decision for that exact project/root. The selector is
+   relative to the effective root. Use the same deployed binary, `MODE`, database,
+   host account, and principal table as the daemon. Packaged modes ignore
+   `DATABASE_URL`; development mode needs the daemon's explicit database URL
+   and retains its separate development trust store.
+3. With the existing authorized token supplied privately in the environment,
+   run this template once after approval. `DAEMON_MODE` and `TRUST_REQUEST`
+   denote the verified mode and private request-file path; no token belongs in
+   either value or the request:
+
+   ```bash
+   MODE="$DAEMON_MODE" "$CONTROL_PLANE" --xcode-admin trust-grant "$TRUST_REQUEST"
+   ```
+
+4. Check the successful JSON result: `granted: true` and a 64-character
+   `trust_digest`. The store rereads the written record and verifies its digest
+   before returning success. There is no separate `trust-inspect` CLI action or
+   MCP grant-write API. A successful grant is not proof of provider execution.
+5. Separately request the supported `stages.retry` operation for the exact failed
+   `stage_execution_id`, using a fresh lowercase UUIDv4 `caller_request_id`.
+   Reuse that ID if resubmitting the same command after an uncertain response.
+   Include `agent_execution_id` when a single-execution retry is intended. Read
+   back the new execution's admission facts and actual provider/session start;
+   command acceptance alone does not prove recovery.
+
+The grant is shared by all invocations of that exact identity, not run-local.
+Retry still enforces frozen permissions, provider selection, project holds, and
+all other admission requirements. The separate A/B/D quota-escalation versus
+frozen-profile validation defect recorded on 2026-09-21 can still prevent
+recovery. A grant does not repair that contract, settle historical running
+states, or authorize changes to frozen snapshots. See the
+[local fix evidence](../evidence/project-trust-admission-fix-2026-09-21.md).
 
 ## Inspect and Reconcile Effects
 

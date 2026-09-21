@@ -52,19 +52,37 @@ impl Fixture {
 
 #[tokio::test]
 async fn lookup_never_bootstraps_or_implicitly_grants_project_trust() {
-    let f = Fixture::new();
-    assert!(f.store().check(&f.project).await.is_err());
-    assert!(!f.directory.exists());
+    for missing_parent in [false, true] {
+        let f = Fixture::new();
+        let directory = if missing_parent {
+            f.root.join("absent-parent").join("trust")
+        } else {
+            f.directory.clone()
+        };
+        let store = ProjectTrustStore::new(directory.clone());
+        let error = store.check(&f.project).await.unwrap_err();
+        assert_eq!(error.to_string(), "project_trust_required");
+        assert!(!directory.exists());
+        assert!(!f.root.join("absent-parent").exists());
+        assert_eq!(fs::read_dir(&f.root).unwrap().count(), 1);
+    }
 }
 
 #[tokio::test]
 async fn explicit_grant_is_durable_exact_and_revocation_invalidates_its_digest() {
     let f = Fixture::new();
+    assert_eq!(
+        f.store().check(&f.project).await.unwrap_err().to_string(),
+        "project_trust_required"
+    );
     let digest = f.store().grant(&f.project, "operator-a").unwrap();
     assert_eq!(digest.len(), 64);
     assert_eq!(f.store().check(&f.project).await.unwrap(), digest);
     f.store().revoke(&f.project, "operator-b").unwrap();
-    assert!(f.store().check(&f.project).await.is_err());
+    assert_eq!(
+        f.store().check(&f.project).await.unwrap_err().to_string(),
+        "project_trust_revoked"
+    );
     let renewed = f.store().grant(&f.project, "operator-a").unwrap();
     assert_ne!(renewed, digest);
     assert_eq!(f.store().check(&f.project).await.unwrap(), renewed);
@@ -101,7 +119,26 @@ async fn same_project_under_another_execution_root_is_not_trusted() {
     let other =
         TrustedProject::resolve(root, Some("checkout/App.xcodeproj"), f.project.key().uid).unwrap();
     assert_eq!(other.key(), f.project.key());
-    assert!(f.store().check(&other).await.is_err());
+    assert_eq!(
+        f.store().check(&other).await.unwrap_err().to_string(),
+        "project_trust_required"
+    );
+}
+
+#[tokio::test]
+async fn equivalent_project_in_another_checkout_requires_its_own_grant() {
+    let f = Fixture::new();
+    let other = Fixture::new();
+    let digest = f.store().grant(&f.project, "operator").unwrap();
+    assert_eq!(
+        f.store()
+            .check(&other.project)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "project_trust_required"
+    );
+    assert_eq!(f.store().check(&f.project).await.unwrap(), digest);
 }
 
 #[tokio::test]
@@ -185,7 +222,10 @@ async fn stable_kernel_lock_serializes_grant_revoke_and_lookup() {
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0
     );
-    assert!(f.store().check(&f.project).await.is_err());
+    assert_eq!(
+        f.store().check(&f.project).await.unwrap_err().to_string(),
+        "project_trust_busy"
+    );
     assert!(f.store().grant(&f.project, "operator").is_err());
     assert!(f.store().revoke(&f.project, "operator").is_err());
     drop(lock);
@@ -209,6 +249,48 @@ fn missing_revoke_and_symlinked_parent_never_create_a_trust_store() {
 }
 
 #[tokio::test]
+async fn unsafe_store_paths_are_not_classified_as_missing_trust() {
+    for kind in [
+        "symlinked-parent",
+        "dangling-symlink",
+        "file",
+        "permissions",
+    ] {
+        let f = Fixture::new();
+        let directory = match kind {
+            "symlinked-parent" => {
+                let actual = f.root.join("actual");
+                fs::create_dir(&actual).unwrap();
+                let alias = f.root.join("alias");
+                symlink(&actual, &alias).unwrap();
+                alias.join("trust")
+            }
+            "dangling-symlink" => {
+                symlink(f.root.join("missing-target"), &f.directory).unwrap();
+                f.directory.clone()
+            }
+            "file" => {
+                fs::write(&f.directory, b"not a directory").unwrap();
+                f.directory.clone()
+            }
+            "permissions" => {
+                f.store().grant(&f.project, "operator").unwrap();
+                fs::set_permissions(&f.directory, fs::Permissions::from_mode(0o755)).unwrap();
+                f.directory.clone()
+            }
+            _ => unreachable!(),
+        };
+        let error = ProjectTrustStore::new(directory)
+            .check(&f.project)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "insecure_authority", "{kind}");
+        assert!(!f.root.join("actual/trust").exists());
+        assert!(!f.root.join("missing-target").exists());
+    }
+}
+
+#[tokio::test]
 async fn missing_or_hardlinked_trust_lock_is_not_repaired() {
     for hardlink in [false, true] {
         let f = Fixture::new();
@@ -219,7 +301,8 @@ async fn missing_or_hardlinked_trust_lock_is_not_repaired() {
         } else {
             fs::remove_file(&path).unwrap();
         }
-        assert!(f.store().check(&f.project).await.is_err());
+        let error = f.store().check(&f.project).await.unwrap_err();
+        assert_ne!(error.to_string(), "project_trust_required");
         assert!(f.store().grant(&f.project, "operator").is_err());
         assert_eq!(path.exists(), hardlink);
     }

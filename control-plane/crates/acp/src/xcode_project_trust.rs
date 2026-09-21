@@ -96,7 +96,12 @@ impl ProjectTrustStore {
     }
 
     fn open_inner(&self, fresh: bool, write: bool) -> Result<LockedStore> {
-        no_symlink_directories(&self.directory)?;
+        // Only an absent store path means trust has not been admitted. Missing
+        // files inside an existing store must still fail closed as store damage.
+        no_symlink_directories(&self.directory).map_err(|error| match error {
+            CoordinatorError::AuthorityMissing => anyhow::anyhow!("project_trust_required"),
+            error => error.into(),
+        })?;
         let directory = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)

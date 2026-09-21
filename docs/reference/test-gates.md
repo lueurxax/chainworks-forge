@@ -1440,7 +1440,9 @@ granting permissions, opening projects, or running local UI tests:
 - `xcode-headless-catalog`: explicit frozen read/gate capabilities, canonical
   command detection, and preservation of unrelated catalog behavior.
 - `xcode-headless-project-trust`: durable private project admission, revocation,
-  identity replacement and filesystem/lock validation.
+  identity replacement and filesystem/lock validation; executor no-launch
+  persistence and explicit fixture grant recovery; automatic retry exclusion,
+  recovery disposition, and operator-only identity readback through GraphQL/MCP.
 - `xcode-headless-host-startup`: opt-in one-shot startup policy and readiness
   fixtures; this is not live cold-start evidence.
 

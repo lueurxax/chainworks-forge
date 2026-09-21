@@ -4786,6 +4786,73 @@ async fn input_manifest_for_continuation(
         .map_err(|_| anyhow::anyhow!("input_context_continuation_manifest_invalid"))
 }
 
+fn runtime_facts_for_headless_preparation_error(
+    agent_exec_id: domain::ids::AgentExecutionId,
+    error: &Error,
+    project_selector: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> AgentExecutionRuntimeFacts {
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, now);
+    let trust = error.downcast_ref::<acp::xcode_headless_runtime::ProjectTrustAdmissionFailure>();
+    let message = error.to_string();
+    let code = trust
+        .map(|failure| failure.reason_code.as_str())
+        .unwrap_or_else(|| {
+            if !message.is_empty()
+                && message.len() <= 80
+                && message
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            {
+                &message
+            } else {
+                "headless_preparation_failed"
+            }
+        });
+    let review_trust = trust.is_some_and(|failure| {
+        matches!(
+            failure.reason_code.as_str(),
+            "project_trust_required" | "project_trust_revoked"
+        )
+    });
+    let (disposition, recovery, operator_message) = if review_trust {
+        (
+            "review_exact_project_trust",
+            "explicit_trust_decision_then_stage_retry",
+            "Review project trust for this run's exact execution root and Xcode project in the operator diagnostics. Use the authenticated xcode-admin trust-grant procedure only after an explicit operator decision and a valid trust store; then explicitly retry the failed stage. Provider permissions do not grant project trust.",
+        )
+    } else {
+        (
+            "inspect_headless_runtime",
+            "resolve_headless_prerequisite_then_stage_retry",
+            "Inspect the headless Xcode preparation failure in the operator diagnostics, resolve the reported prerequisite, then explicitly retry the failed stage. The provider was not launched.",
+        )
+    };
+    facts.failure_kind = Some(AgentFailureKind::XcodeHostEnvironmentError);
+    facts.failure_kind_raw_debug = Some(redact_runtime_message(&format!("{error:#}")));
+    facts.failure_message_redacted = Some(format!("{code}: {operator_message}"));
+    facts.operator_action_hint = Some(OperatorActionHint::InspectLogs);
+    facts.supervision_classification = Some("xcode_headless_prelaunch_failed".into());
+    facts.runtime_preflight_phase = Some("failed_no_launch".into());
+    facts.runtime_preflight_attempt_count = Some(1);
+    facts.runtime_preflight_provider_launched = Some(false);
+    facts.runtime_preflight_remediation = Some(disposition.into());
+    facts.runtime_preflight_json = Some(serde_json::json!({
+        "schema_version": 1,
+        "boundary": if trust.is_some() { "xcode_project_trust" } else { "xcode_headless_preparation" },
+        "error_code": code,
+        "root": trust.map(|failure| &failure.root),
+        "project_key": trust.map(|failure| &failure.project_key),
+        "project_selector": project_selector,
+        "provider_launched": false,
+        "automatic_retry_allowed": false,
+        "operator_disposition": disposition,
+        "recovery": recovery,
+        "operator_message": operator_message,
+    }).to_string());
+    facts
+}
+
 fn runtime_facts_for_acp_error(
     agent_exec_id: domain::ids::AgentExecutionId,
     error: &Error,
@@ -12062,6 +12129,8 @@ impl BackgroundExecutor {
                         })?
                         .to_string()
                 };
+                let mut headless_preparation_error = None;
+                let mut headless_project_selector = None;
                 let headless_preparation = if self.acp.headless_xcode_enabled()
                     && (xcode_broker_required
                         || xcode_shim_required
@@ -12077,47 +12146,62 @@ impl BackgroundExecutor {
                             _ => None,
                         })
                         .collect::<Vec<_>>();
-                    anyhow::ensure!(
-                        selectors.windows(2).all(|pair| pair[0] == pair[1]),
-                        "headless_project_selector_conflict"
-                    );
-                    let journal = Arc::new(crate::xcode_effect_journal::DbXcodeEffectJournal::new(
-                        self.pool.clone(),
-                        self.db_writer.clone(),
-                        run_id.inner(),
-                        owner_execution_lineage_id.clone(),
-                    ));
-                    let prepared = self
-                        .acp
-                        .prepare_headless_xcode(
-                            acp::xcode_headless_runtime::HeadlessPreparationInput {
-                                run_id,
-                                invocation_id: agent_exec_id,
-                                owner_lineage: owner_execution_lineage_id.clone(),
-                                root: acp::execution_root::resolve_execution_root(
-                                    &run.workspace_root,
-                                    run.worktree_root.as_deref(),
-                                    worktree_write_enabled,
-                                    worktree_strategy.as_deref(),
-                                )?,
-                                project_selector: selectors.into_iter().next().flatten(),
-                                permission_policy:
-                                    crate::xcode_effect_journal::frozen_xcode_permission_policy(
-                                        run.catalog_snapshot_json.as_deref(),
-                                        permission_profile.as_deref(),
+                    let project_selector = selectors.first().cloned().flatten();
+                    headless_project_selector = project_selector.clone();
+                    let preparation_result = async {
+                        anyhow::ensure!(
+                            selectors.windows(2).all(|pair| pair[0] == pair[1]),
+                            "headless_project_selector_conflict"
+                        );
+                        let journal =
+                            Arc::new(crate::xcode_effect_journal::DbXcodeEffectJournal::new(
+                                self.pool.clone(),
+                                self.db_writer.clone(),
+                                run_id.inner(),
+                                owner_execution_lineage_id.clone(),
+                            ));
+                        self.acp
+                            .prepare_headless_xcode(
+                                acp::xcode_headless_runtime::HeadlessPreparationInput {
+                                    run_id,
+                                    invocation_id: agent_exec_id,
+                                    owner_lineage: owner_execution_lineage_id.clone(),
+                                    root: acp::execution_root::resolve_execution_root(
+                                        &run.workspace_root,
+                                        run.worktree_root.as_deref(),
+                                        worktree_write_enabled,
+                                        worktree_strategy.as_deref(),
                                     )?,
-                                timeout: std::time::Duration::from_secs(24 * 60 * 60),
-                            },
-                            journal,
-                        )
-                        .await?;
-                    xcode_broker_contract_hash = Some(domain::xcode_contract::canonical_digest(
-                        "cw.xcode.session.v1",
-                        &serde_json::json!({
-                            "broker_contract":xcode_broker_contract_hash,"headless_binding":prepared.binding_digest(),
-                        }),
-                    )?);
-                    Some(prepared)
+                                    project_selector: project_selector.clone(),
+                                    permission_policy:
+                                        crate::xcode_effect_journal::frozen_xcode_permission_policy(
+                                            run.catalog_snapshot_json.as_deref(),
+                                            permission_profile.as_deref(),
+                                        )?,
+                                    timeout: std::time::Duration::from_secs(24 * 60 * 60),
+                                },
+                                journal,
+                            )
+                            .await
+                    }
+                    .await;
+                    match preparation_result {
+                        Ok(prepared) => {
+                            xcode_broker_contract_hash = Some(
+                                domain::xcode_contract::canonical_digest(
+                                    "cw.xcode.session.v1",
+                                    &serde_json::json!({
+                                        "broker_contract":xcode_broker_contract_hash,"headless_binding":prepared.binding_digest(),
+                                    }),
+                                )?,
+                            );
+                            Some(prepared)
+                        }
+                        Err(error) => {
+                            headless_preparation_error = Some(error);
+                            None
+                        }
+                    }
                 } else {
                     None
                 };
@@ -12168,8 +12252,8 @@ impl BackgroundExecutor {
                     }),
                 };
 
-                let invocation_generation_required =
-                    session_reuse_scope.is_some() || !declared_outputs.is_empty();
+                let invocation_generation_required = headless_preparation_error.is_none()
+                    && (session_reuse_scope.is_some() || !declared_outputs.is_empty());
                 let mut policy_decision: Option<SessionPolicyDecision> =
                     if invocation_generation_required {
                         let d = ensure_policy(&self.pool, policy_input.clone()).await?;
@@ -12430,6 +12514,53 @@ impl BackgroundExecutor {
                         escalation_ledger_id: None,
                     };
                     agent_executions::insert(&self.pool, &agent_exec).await?;
+                }
+
+                if let Some(error) = headless_preparation_error {
+                    let failed_at = chrono::Utc::now();
+                    let facts = runtime_facts_for_headless_preparation_error(
+                        agent_exec_id,
+                        &error,
+                        headless_project_selector.as_deref(),
+                        failed_at,
+                    );
+                    let mut tx = self
+                        .begin_executor_transaction(
+                            "executor.headless_prelaunch_failed",
+                            format!("headless_prelaunch_failed:{agent_exec_id}"),
+                        )
+                        .await?;
+                    let still_running = agent_executions::find_by_id_tx(&mut tx, agent_exec_id)
+                        .await?
+                        .is_some_and(|execution| execution.status == AgentStatus::Running);
+                    let current_attempt = preclaimed_start.is_none()
+                        || work_items::is_current_invoke_agent_attempt_tx(
+                            &mut tx,
+                            &item.id,
+                            agent_exec_id,
+                        )
+                        .await?;
+                    if still_running
+                        && current_attempt
+                        && !work_items::host_interruption_cleanup_holds_attempt_tx(
+                            &mut tx,
+                            agent_exec_id,
+                        )
+                        .await?
+                    {
+                        agent_execution_runtime_facts::upsert_tx(&mut tx, &facts).await?;
+                        agent_executions::update_completed_tx(
+                            &mut tx,
+                            agent_exec_id,
+                            AgentStatus::Failed,
+                            failed_at,
+                        )
+                        .await?;
+                    }
+                    tx.commit().await?;
+                    // Existing work failure schedules stage settlement; no provider or
+                    // session policy was started for this rejected preparation.
+                    return Err(error);
                 }
 
                 // Reconcile pre-claimed agent execution with freshly evaluated session policy.
@@ -27632,6 +27763,80 @@ plain progress line without gate evidence";
                 assert_eq!(result.unwrap(), None);
             }
         }
+    }
+
+    #[test]
+    fn xcode_headless_prelaunch_unavailable_trust_requires_inspection_not_a_grant() {
+        let error = anyhow::anyhow!("project_trust_busy").context(
+            acp::xcode_headless_runtime::ProjectTrustAdmissionFailure {
+                root: domain::execution_root::ResolvedExecutionRoot {
+                    version: 1,
+                    repository: "/repository".into(),
+                    effective: "/worktree".into(),
+                    device: "1".into(),
+                    inode: "2".into(),
+                    strategy: Some("dedicated".into()),
+                    kind: domain::execution_root::ExecutionRootKind::Worktree,
+                },
+                project_key: domain::xcode_effect::ProjectKey {
+                    version: 1,
+                    uid: 501,
+                    canonical_path: "/worktree/App.xcodeproj".into(),
+                    device: "1".into(),
+                    inode: "3".into(),
+                },
+                reason_code: "project_trust_unavailable".into(),
+            },
+        );
+        let facts = runtime_facts_for_headless_preparation_error(
+            domain::ids::AgentExecutionId::new(),
+            &error,
+            Some("App.xcodeproj"),
+            chrono::Utc::now(),
+        );
+        assert_eq!(
+            facts.runtime_preflight_remediation.as_deref(),
+            Some("inspect_headless_runtime")
+        );
+        assert!(!facts
+            .failure_message_redacted
+            .as_deref()
+            .unwrap()
+            .contains("trust-grant"));
+        let details: serde_json::Value =
+            serde_json::from_str(facts.runtime_preflight_json.as_deref().unwrap()).unwrap();
+        assert_eq!(details["boundary"], "xcode_project_trust");
+        assert_eq!(details["error_code"], "project_trust_unavailable");
+        assert_eq!(details["root"]["effective"], "/worktree");
+        assert_eq!(
+            details["project_key"]["canonical_path"],
+            "/worktree/App.xcodeproj"
+        );
+        assert_eq!(details["automatic_retry_allowed"], false);
+    }
+
+    #[test]
+    fn xcode_headless_prelaunch_journal_failure_is_distinct_from_project_trust() {
+        let facts = runtime_facts_for_headless_preparation_error(
+            domain::ids::AgentExecutionId::new(),
+            &anyhow::anyhow!("headless_journal_authority_unavailable"),
+            None,
+            chrono::Utc::now(),
+        );
+        assert_eq!(facts.runtime_preflight_provider_launched, Some(false));
+        assert_eq!(
+            facts.runtime_preflight_remediation.as_deref(),
+            Some("inspect_headless_runtime")
+        );
+        let details: serde_json::Value =
+            serde_json::from_str(facts.runtime_preflight_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            details["error_code"],
+            "headless_journal_authority_unavailable"
+        );
+        assert_eq!(details["boundary"], "xcode_headless_preparation");
+        assert!(details["root"].is_null());
+        assert!(details["project_key"].is_null());
     }
 
     #[test]
