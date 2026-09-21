@@ -1153,6 +1153,7 @@ fn health_fallback_provider_authority(
 /// A retry chooses a profile from the frozen catalog, without changing the agent's
 /// mission, permissions, tool access or output contract. The asynchronous copy
 /// boundary additionally anchors this declaration to the persisted execution.
+// boundary-no-op: Internal retry validation preserves MCP/GraphQL caller classes, capabilities and authorization rules.
 fn targeted_retry_provider_authority(
     plan: &RunPlan,
     payload: &serde_json::Map<String, serde_json::Value>,
