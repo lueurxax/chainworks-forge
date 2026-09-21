@@ -44,6 +44,23 @@ impl std::fmt::Display for HeadlessRuntimeError {
 }
 impl std::error::Error for HeadlessRuntimeError {}
 
+/// Trust admission failed for this exact resolved checkout and project identity.
+/// The underlying error remains available through the anyhow error chain.
+#[derive(Clone, Debug)]
+pub struct ProjectTrustAdmissionFailure {
+    pub root: ResolvedExecutionRoot,
+    pub project_key: domain::xcode_effect::ProjectKey,
+    pub reason_code: String,
+}
+
+impl std::fmt::Display for ProjectTrustAdmissionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason_code)
+    }
+}
+
+impl std::error::Error for ProjectTrustAdmissionFailure {}
+
 fn coordinator_error(error: crate::xcode_coordinator::CoordinatorError) -> anyhow::Error {
     match error {
         crate::xcode_coordinator::CoordinatorError::ProjectHeld => {
@@ -247,7 +264,20 @@ impl HeadlessRuntime {
         );
         let trust_digest = timeout_at(preparation_deadline, self.trust.check(&project))
             .await
-            .map_err(|_| anyhow::anyhow!("headless_trust_timeout"))??;
+            .map_err(|error| anyhow::Error::new(error).context("headless_trust_timeout"))
+            .and_then(|result| result)
+            .map_err(|error| {
+                let reason_code = match error.to_string().as_str() {
+                    "project_trust_required" => "project_trust_required",
+                    "project_trust_revoked" => "project_trust_revoked",
+                    _ => "project_trust_unavailable",
+                };
+                error.context(ProjectTrustAdmissionFailure {
+                    root: project.root().clone(),
+                    project_key: project.key().clone(),
+                    reason_code: reason_code.to_owned(),
+                })
+            })?;
         domain::xcode_effect::validate_digest("trust_record", &trust_digest)?;
         let owner = self.coordinator.new_owner(deadline);
         // Hold one exclusive owner across the whole invocation. Reentrant gates

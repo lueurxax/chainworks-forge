@@ -648,6 +648,10 @@ async fn mediation_execution_attempts_json(
                     "late_output_count": f.late_output_count,
                     "ignored_late_output_count": f.ignored_late_output_count,
                     "operator_action_hint": f.operator_action_hint.as_ref().map(|h| format!("{:?}", h).to_lowercase()),
+                    "runtime_preflight_phase": f.runtime_preflight_phase,
+                    "runtime_preflight_attempt_count": f.runtime_preflight_attempt_count,
+                    "runtime_preflight_remediation": f.runtime_preflight_remediation,
+                    "runtime_preflight_provider_launched": f.runtime_preflight_provider_launched,
                 })
             })
             .unwrap_or(serde_json::Value::Null);
@@ -1229,6 +1233,13 @@ async fn runtime_facts_json(
         "provider_exit_status": facts.provider_exit_status,
         "transport_error_code": facts.transport_error_code.clone(),
         "supervision_classification": facts.supervision_classification.clone(),
+        "runtime_preflight_phase": facts.runtime_preflight_phase.clone(),
+        "runtime_preflight_attempt_count": facts.runtime_preflight_attempt_count,
+        "runtime_preflight_remediation": facts.runtime_preflight_remediation.clone(),
+        "runtime_preflight_provider_launched": facts.runtime_preflight_provider_launched,
+        // Preflight JSON includes exact project/root identities; retain the
+        // existing operator-debug boundary for those local paths.
+        "runtime_preflight_json": if include_operator_debug { facts.runtime_preflight_json.clone() } else { None },
         "output_settlement": facts.output_settlement.to_string(),
         "valid_required_outputs": facts.valid_required_outputs,
         "late_output_count": facts.late_output_count,
@@ -2219,6 +2230,47 @@ mod tests {
             .await
             .expect("register shared DbWriter for test pool");
         pool
+    }
+
+    #[tokio::test]
+    async fn xcode_headless_preflight_readback_preserves_operator_details_and_hides_paths_from_other_callers(
+    ) {
+        let pool = test_pool().await;
+        let execution: AgentExecution = serde_json::from_value(serde_json::json!({
+            "id": domain::ids::AgentExecutionId::new(), "agent_id": "reviewer",
+            "provider": "codex_acp", "started_at": Utc::now(), "status": "failed"
+        }))
+        .unwrap();
+        let mut facts = AgentExecutionRuntimeFacts::defaults_for(execution.id, Utc::now());
+        facts.runtime_preflight_phase = Some("failed_no_launch".into());
+        facts.runtime_preflight_attempt_count = Some(1);
+        facts.runtime_preflight_remediation = Some("review_exact_project_trust".into());
+        facts.runtime_preflight_provider_launched = Some(false);
+        let details = serde_json::json!({
+            "schema_version": 1, "boundary": "xcode_project_trust",
+            "root": {"effective": "/private/operator/project"},
+            "operator_disposition": "review_exact_project_trust", "provider_launched": false
+        })
+        .to_string();
+        facts.runtime_preflight_json = Some(details.clone());
+        for operator in [true, false] {
+            let readback = runtime_facts_json(&pool, &execution, &facts, None, operator)
+                .await
+                .unwrap();
+            assert_eq!(readback["runtime_preflight_phase"], "failed_no_launch");
+            assert_eq!(readback["runtime_preflight_attempt_count"], 1);
+            assert_eq!(
+                readback["runtime_preflight_remediation"],
+                "review_exact_project_trust"
+            );
+            assert_eq!(readback["runtime_preflight_provider_launched"], false);
+            if operator {
+                assert_eq!(readback["runtime_preflight_json"], details);
+            } else {
+                assert!(readback["runtime_preflight_json"].is_null());
+                assert!(!readback.to_string().contains("/private/operator/project"));
+            }
+        }
     }
 
     async fn seed_validation_attempt(

@@ -2765,13 +2765,18 @@ case "$GATE" in
     )
     ;;
   xcode-headless-project-trust)
-    log "Headless project trust gate: offline admission fixtures"
+    log "Headless project trust gate: offline admission, recovery, and readback fixtures"
     export CHAINWORKS_AUTO_CACHE_CLEANUP=0
     export CARGO_TARGET_DIR
     CARGO_TARGET_DIR="$(chainworks_test_gate_cargo_target_dir "${CHAINWORKS_XCODE_CARGO_TARGET_DIR:-target/xcode-headless-project-trust}")"
     (
       cd "$ROOT_DIR/control-plane"
-      cargo test --locked --offline -p acp --test xcode_project_trust
+      status=0
+      cargo test --locked --offline -p acp --test xcode_project_trust || status=$?
+      cargo test --locked --offline -p engine --test xcode_project_trust_admission || status=$?
+      cargo test --locked --offline -p engine --lib prelaunch || status=$?
+      cargo test --locked --offline -p graphql-server -p mcp-server --lib --no-fail-fast xcode_headless_preflight_readback || status=$?
+      exit "$status"
     )
     ;;
   xcode-headless-catalog)

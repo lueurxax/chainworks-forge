@@ -156,6 +156,12 @@ pub struct GqlAgentExecutionRuntimeFacts {
     pub provider_exit_status: Option<i64>,
     pub transport_error_code: Option<String>,
     pub supervision_classification: Option<String>,
+    pub runtime_preflight_phase: Option<String>,
+    pub runtime_preflight_attempt_count: Option<i64>,
+    pub runtime_preflight_remediation: Option<String>,
+    pub runtime_preflight_provider_launched: Option<bool>,
+    /// Exact root and admission details are available only to operator debug readers.
+    pub runtime_preflight_json: Option<String>,
     pub output_settlement: AgentOutputSettlement,
     pub valid_required_outputs: bool,
     pub late_output_count: i64,
@@ -1797,6 +1803,13 @@ impl GqlAgentExecutionRuntimeFacts {
             provider_exit_status: facts.provider_exit_status,
             transport_error_code: facts.transport_error_code,
             supervision_classification: facts.supervision_classification,
+            runtime_preflight_phase: facts.runtime_preflight_phase,
+            runtime_preflight_attempt_count: facts.runtime_preflight_attempt_count,
+            runtime_preflight_remediation: facts.runtime_preflight_remediation,
+            runtime_preflight_provider_launched: facts.runtime_preflight_provider_launched,
+            runtime_preflight_json: include_operator_debug
+                .then(|| facts.runtime_preflight_json)
+                .flatten(),
             output_settlement: match facts.output_settlement {
                 domain::agent::AgentOutputSettlement::None => AgentOutputSettlement::None,
                 domain::agent::AgentOutputSettlement::MissingRequiredOutputs => {
@@ -1935,6 +1948,70 @@ mod tests {
     use chrono::Utc;
     use domain::agent::{AgentExecution, AgentStatus};
     use domain::ids::{AgentExecutionId, StageExecutionId};
+
+    #[tokio::test]
+    async fn xcode_headless_preflight_readback_preserves_operator_details_and_hides_paths_from_other_callers(
+    ) {
+        #[derive(async_graphql::SimpleObject)]
+        struct RuntimePreflightQuery {
+            facts: GqlAgentExecutionRuntimeFacts,
+        }
+        let execution: AgentExecution = serde_json::from_value(serde_json::json!({
+            "id": AgentExecutionId::new(), "agent_id": "reviewer", "provider": "codex_acp",
+            "stage_execution_id": StageExecutionId::new(),
+            "started_at": Utc::now(), "status": "failed"
+        }))
+        .unwrap();
+        let mut facts =
+            domain::agent::AgentExecutionRuntimeFacts::defaults_for(execution.id, Utc::now());
+        facts.runtime_preflight_phase = Some("failed_no_launch".into());
+        facts.runtime_preflight_attempt_count = Some(1);
+        facts.runtime_preflight_remediation = Some("review_exact_project_trust".into());
+        facts.runtime_preflight_provider_launched = Some(false);
+        let details = serde_json::json!({
+            "schema_version": 1, "boundary": "xcode_project_trust",
+            "root": {"effective": "/private/operator/project"},
+            "operator_disposition": "review_exact_project_trust", "provider_launched": false
+        })
+        .to_string();
+        facts.runtime_preflight_json = Some(details.clone());
+        let gql_execution = GqlAgentExecution::from(execution);
+        for operator in [true, false] {
+            let schema = async_graphql::Schema::build(
+                RuntimePreflightQuery {
+                    facts: GqlAgentExecutionRuntimeFacts::from_facts_and_execution(
+                        facts.clone(),
+                        &gql_execution,
+                        None,
+                        None,
+                        operator,
+                    ),
+                },
+                async_graphql::EmptyMutation,
+                async_graphql::EmptySubscription,
+            )
+            .finish();
+            let result = schema.execute("{ facts { runtimePreflightPhase runtimePreflightAttemptCount runtimePreflightRemediation runtimePreflightProviderLaunched runtimePreflightJson } }").await;
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            let readback = result.data.into_json().unwrap();
+            assert_eq!(
+                readback["facts"]["runtimePreflightPhase"],
+                "failed_no_launch"
+            );
+            assert_eq!(readback["facts"]["runtimePreflightAttemptCount"], 1);
+            assert_eq!(
+                readback["facts"]["runtimePreflightRemediation"],
+                "review_exact_project_trust"
+            );
+            assert_eq!(readback["facts"]["runtimePreflightProviderLaunched"], false);
+            if operator {
+                assert_eq!(readback["facts"]["runtimePreflightJson"], details);
+            } else {
+                assert!(readback["facts"]["runtimePreflightJson"].is_null());
+                assert!(!readback.to_string().contains("/private/operator/project"));
+            }
+        }
+    }
 
     #[test]
     fn gql_agent_execution_redacts_raw_stored_xcode_runtime_observation() {

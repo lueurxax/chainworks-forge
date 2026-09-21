@@ -3130,13 +3130,21 @@ impl Orchestrator {
         run: &domain::run::Run,
         stage: &StageExecution,
     ) -> Result<bool> {
-        let frozen_plan = crate::command_handler::compile_run_plan_from_snapshot(run)?;
         let executions = agent_executions::find_by_stage(&self.pool, stage.id).await?;
         let runtime_facts = agent_execution_runtime_facts::list_by_run(&self.pool, run_id).await?;
         let facts_by_execution: std::collections::HashMap<_, _> = runtime_facts
             .iter()
             .map(|facts| (facts.agent_execution_id, facts))
             .collect();
+        if executions.iter().any(|execution| {
+            execution.status == AgentStatus::Failed
+                && facts_by_execution.get(&execution.id).is_some_and(|facts| {
+                    crate::shadow_escalation::is_headless_prelaunch_failure(facts)
+                })
+        }) {
+            return Ok(false);
+        }
+        let frozen_plan = crate::command_handler::compile_run_plan_from_snapshot(run)?;
         if executions.iter().any(|execution| {
             execution.status == AgentStatus::Failed
                 && facts_by_execution.get(&execution.id).is_some_and(|facts| {
@@ -3482,6 +3490,21 @@ impl Orchestrator {
         run: &domain::run::Run,
         stage: &StageExecution,
     ) -> Result<bool> {
+        let executions = agent_executions::find_by_stage(&self.pool, stage.id).await?;
+        // Preserve the operator admission boundary even when a historical
+        // escalation snapshot is incompatible. No provider was launched.
+        for execution in executions
+            .iter()
+            .filter(|execution| execution.status == AgentStatus::Failed)
+        {
+            if agent_execution_runtime_facts::find_by_execution_id(&self.pool, execution.id)
+                .await?
+                .as_ref()
+                .is_some_and(crate::shadow_escalation::is_headless_prelaunch_failure)
+            {
+                return Ok(false);
+            }
+        }
         let Some(plan) = crate::command_handler::compile_run_plan_from_snapshot(run)? else {
             return Ok(false);
         };
@@ -3489,7 +3512,6 @@ impl Orchestrator {
             return Ok(false);
         }
 
-        let executions = agent_executions::find_by_stage(&self.pool, stage.id).await?;
         let work_items_for_run = work_items::list_by_run(&self.pool, run_id).await?;
         let matching_stages = stages::list_by_run(&self.pool, run_id).await?;
 
@@ -11743,6 +11765,95 @@ mod tests {
     #[tokio::test]
     async fn p058_escalation_retry_uses_durable_current_backend_profile_tier() {
         check_p058_durable_tier_retry(false).await;
+    }
+
+    #[tokio::test]
+    async fn xcode_headless_prelaunch_failure_preserves_admission_boundary_before_retry_compilation(
+    ) {
+        let pool = test_pool().await;
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            crate::event_bus::new_bus(64),
+            WorkQueue::new(pool.clone()),
+        );
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        // Deliberately incompatible historical snapshots must not hide a typed
+        // no-launch admission failure behind an escalation validation error.
+        set_snapshot_quartet(&mut run, "{}", "{}");
+        assert!(crate::command_handler::compile_run_plan_from_snapshot(&run).is_err());
+        ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "review".into(),
+            label: "Review".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        stages::insert(&pool, &stage).await.unwrap();
+        let execution_id = AgentExecutionId::new();
+        sqlx::query(
+            "INSERT INTO agent_executions (id, stage_execution_id, agent_id, provider, provider_family, status, started_at, completed_at) VALUES (?, ?, 'reviewer', 'codex_acp', 'codex', 'failed', ?, ?)",
+        )
+        .bind(execution_id.to_string()).bind(stage.id.to_string())
+        .bind(Utc::now().to_rfc3339()).bind(Utc::now().to_rfc3339())
+        .execute(&pool).await.unwrap();
+        let mut facts = AgentExecutionRuntimeFacts::defaults_for(execution_id, Utc::now());
+        facts.failure_kind = Some(AgentFailureKind::XcodeHostEnvironmentError);
+        facts.supervision_classification = Some("xcode_headless_prelaunch_failed".into());
+        facts.runtime_preflight_provider_launched = Some(false);
+        agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .unwrap();
+
+        assert!(!orchestrator
+            .schedule_p058_escalation_retry_for_stage(run_id, &run, &stage)
+            .await
+            .unwrap());
+        assert!(!orchestrator
+            .schedule_auto_contract_output_retry_for_stage(run_id, &run, &stage)
+            .await
+            .unwrap());
+        assert_eq!(stages::list_by_run(&pool, run_id).await.unwrap().len(), 1);
+        assert!(work_items::list_by_run(&pool, run_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            stages::find_by_id(&pool, stage.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            StageStatus::Running
+        );
+
+        facts.runtime_preflight_provider_launched = Some(true);
+        agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .unwrap();
+        assert!(orchestrator
+            .schedule_p058_escalation_retry_for_stage(run_id, &run, &stage)
+            .await
+            .is_err());
+        assert!(orchestrator
+            .schedule_auto_contract_output_retry_for_stage(run_id, &run, &stage)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

@@ -427,6 +427,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn project_trust_prelaunch_recovery_requires_an_explicit_operator_decision() {
+        let mut facts = domain::agent::AgentExecutionRuntimeFacts::defaults_for(
+            domain::ids::AgentExecutionId::new(),
+            Utc::now(),
+        );
+        facts.failure_kind = Some(AgentFailureKind::XcodeHostEnvironmentError);
+        facts.supervision_classification = Some("xcode_headless_prelaunch_failed".into());
+        facts.runtime_preflight_provider_launched = Some(false);
+        facts.runtime_preflight_remediation = Some("review_exact_project_trust".into());
+        assert_eq!(
+            recovery_action_from_runtime_facts(Some(&facts)),
+            (
+                "review_exact_project_trust_then_retry",
+                "xcode_project_trust_admission"
+            )
+        );
+        facts.runtime_preflight_remediation = Some("inspect_headless_runtime".into());
+        assert_eq!(
+            recovery_action_from_runtime_facts(Some(&facts)),
+            (
+                "inspect_xcode_then_retry",
+                "xcode_headless_prelaunch_failed"
+            )
+        );
+        facts.runtime_preflight_provider_launched = Some(true);
+        assert_eq!(
+            recovery_action_from_runtime_facts(Some(&facts)),
+            ("retry_stage", "runtime_failure")
+        );
+    }
+
     #[tokio::test]
     async fn p086_reap_registered_provider_process_group_kills_test_process_group() {
         let mut child = std::process::Command::new("sleep")
@@ -552,6 +584,21 @@ fn recovery_action_from_runtime_facts(
     let Some(facts) = facts else {
         return ("retry_stage", "stage_settled_failed");
     };
+    if crate::shadow_escalation::is_headless_prelaunch_failure(facts) {
+        return if facts.runtime_preflight_remediation.as_deref()
+            == Some("review_exact_project_trust")
+        {
+            (
+                "review_exact_project_trust_then_retry",
+                "xcode_project_trust_admission",
+            )
+        } else {
+            (
+                "inspect_xcode_then_retry",
+                "xcode_headless_prelaunch_failed",
+            )
+        };
+    }
     if matches!(
         facts.failure_kind.as_ref(),
         Some(AgentFailureKind::McpStartupTimeout)
