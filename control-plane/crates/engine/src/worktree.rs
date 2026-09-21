@@ -22,6 +22,14 @@ pub(crate) fn effective_worktree_strategy_for_task(
 }
 
 pub(crate) fn task_reads_implementation_worktree(task: &workflow::plan::CompiledTask) -> bool {
+    if !task.agent.worktree_write_enabled
+        && matches!(
+            task.agent.worktree_strategy.as_deref(),
+            Some("dedicated" | "shared_implementation_worktree")
+        )
+    {
+        return true;
+    }
     if task.agent.worktree_write_enabled || task.agent.worktree_strategy.is_some() {
         return false;
     }
@@ -196,20 +204,40 @@ pub struct SourceContext {
 pub async fn build_source_context(worktree_root: &str, base_branch: &str) -> Result<SourceContext> {
     let wt = Path::new(worktree_root);
 
-    let changed_files_output = run_git(&["diff", "--name-only", base_branch], wt)
-        .await
-        .unwrap_or_default();
+    let changed_files_output = run_git(
+        &[
+            "--no-optional-locks",
+            "-c",
+            "diff.autoRefreshIndex=false",
+            "diff",
+            "--name-only",
+            base_branch,
+        ],
+        wt,
+    )
+    .await
+    .unwrap_or_default();
     let changed_files: Vec<String> = changed_files_output
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| l.to_string())
         .collect();
 
-    let diff_summary = run_git(&["diff", "--stat", base_branch], wt)
-        .await
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let diff_summary = run_git(
+        &[
+            "--no-optional-locks",
+            "-c",
+            "diff.autoRefreshIndex=false",
+            "diff",
+            "--stat",
+            base_branch,
+        ],
+        wt,
+    )
+    .await
+    .unwrap_or_default()
+    .trim()
+    .to_string();
 
     Ok(SourceContext {
         changed_files,

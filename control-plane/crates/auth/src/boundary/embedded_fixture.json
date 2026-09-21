@@ -340,6 +340,8 @@
         "boundary.runtime.get",
         "runs.list",
         "runs.get",
+        "runs.continuation_preview",
+        "runs.continuation_get",
         "approvals.list",
         "approvals.get",
         "stages.list",

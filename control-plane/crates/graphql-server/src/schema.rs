@@ -258,9 +258,31 @@ pub fn build_schema_with_storage_writer_boundary_policy_and_handle(
     storage_writer_heartbeat: Arc<DbWriterHeartbeat>,
     boundary_policy: Arc<auth::boundary::BoundaryPolicy>,
 ) -> (AppSchema, P046LivePrincipalHandle) {
+    build_schema_with_continuation_readback(
+        pool,
+        cmd_handler,
+        events,
+        principal_table,
+        reporter,
+        storage_writer_heartbeat,
+        boundary_policy,
+        Default::default(),
+    )
+}
+
+pub fn build_schema_with_continuation_readback(
+    pool: SqlitePool,
+    cmd_handler: Arc<CommandHandler>,
+    events: EventSender,
+    principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
+    storage_writer_heartbeat: Arc<DbWriterHeartbeat>,
+    boundary_policy: Arc<auth::boundary::BoundaryPolicy>,
+    continuation_readback: engine::run_carry_forward::readback::ReadbackConfig,
+) -> (AppSchema, P046LivePrincipalHandle) {
     let p046 = default_p046_config();
     let live_handle = P046LivePrincipalHandle::new(principal_table.clone());
-    let schema = build_schema_inner_with_p046_and_handle(
+    let schema = build_schema_inner_with_readback_config(
         pool,
         cmd_handler,
         events,
@@ -270,6 +292,7 @@ pub fn build_schema_with_storage_writer_boundary_policy_and_handle(
         Some(boundary_policy),
         p046,
         live_handle.clone(),
+        continuation_readback,
     );
     (schema, live_handle)
 }
@@ -338,6 +361,32 @@ fn build_schema_inner_with_p046_and_handle(
     p046: P046Config,
     live_handle: P046LivePrincipalHandle,
 ) -> AppSchema {
+    build_schema_inner_with_readback_config(
+        pool,
+        cmd_handler,
+        events,
+        principal_table,
+        reporter,
+        storage_writer_heartbeat,
+        boundary_policy,
+        p046,
+        live_handle,
+        Default::default(),
+    )
+}
+
+fn build_schema_inner_with_readback_config(
+    pool: SqlitePool,
+    cmd_handler: Arc<CommandHandler>,
+    events: EventSender,
+    principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
+    storage_writer_heartbeat: Option<Arc<DbWriterHeartbeat>>,
+    boundary_policy: Option<Arc<auth::boundary::BoundaryPolicy>>,
+    p046: P046Config,
+    live_handle: P046LivePrincipalHandle,
+    continuation_readback: engine::run_carry_forward::readback::ReadbackConfig,
+) -> AppSchema {
     // P046 reset mutation guard: record that the schema was built without any
     // resetSession/equivalent mutation. This counter is incremented once per schema
     // construction to prove the guard is active. It must remain zero for "fail" labels.
@@ -354,7 +403,8 @@ fn build_schema_inner_with_p046_and_handle(
         .data(principal_table)
         .data(live_handle)
         .data(reporter)
-        .data(p046);
+        .data(p046)
+        .data(continuation_readback);
     if let Some(heartbeat) = storage_writer_heartbeat {
         builder = builder.data(heartbeat);
     }

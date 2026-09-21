@@ -8,6 +8,7 @@ Related stable docs:
 
 - [rust-control-plane.md](rust-control-plane.md)
 - [run-control.md](run-control.md)
+- [blocked-run-carry-forward.md](blocked-run-carry-forward.md)
 - [failed-stage-evidence-delivery-preflight-and-mcp-resolution.md](failed-stage-evidence-delivery-preflight-and-mcp-resolution.md)
 - [steward-analysis-system.md](steward-analysis-system.md)
 - [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md)
@@ -23,7 +24,7 @@ The Rust control-plane daemon exposes two northbound surfaces on a single port (
 
 MCP is the external control plane for operational commands. The governed macOS UI remains a GraphQL read/subscription surface plus the approval-only human-gate mutation path; it does not route execution-truth lifecycle mutations. Most non-approval operational commands such as run start, cancellation, stage retry, session reset, compaction, recovery, cloning, and experiment control are MCP-only. The governed UI action boundary is summarized in [ui-action-boundary.md](ui-action-boundary.md).
 
-Both surfaces are authenticated with bearer tokens and filter their visible surface area by the caller's principal class. MCP command tools, approval-gate GraphQL mutations, and operator GraphQL lifecycle mutations converge on a single `engine::command_handler::CommandHandler` for command execution. Every command execution writes an auditable row to `command_journal` tagged with the caller's surface, principal id, principal class, and tool/mutation name.
+Both surfaces are authenticated with bearer tokens and filter their visible surface area by the caller's principal class. Ordinary command tools and GraphQL command mutations use `engine::command_handler::CommandHandler`; its executions write an auditable row to `command_journal` tagged with the caller's surface, principal id, principal class, and tool/mutation name. The six blocked-run carry-forward tools use the canonical `CarryForwardService`, with separate durable request/result binding and freshly authorized replay. A denied preparation can retain its audit receipt without creating a successor or ordinary dispatch. See [blocked-run-carry-forward.md](blocked-run-carry-forward.md#mcp-and-readback).
 
 P081 adds the boundary-first authorization contract that supersedes static-only
 principal-class filtering. The matrix, executable fixture, validator, audit-log
@@ -89,6 +90,12 @@ Implementation: `control-plane/crates/domain/src/commands.rs` (`PrincipalClass`,
 | `RunsList` | `runs.list` | no (direct) |
 | `RunsGet` | `runs.get` | no (direct) |
 | `RunsCancel` | `runs.cancel` | yes |
+| `RunsContinuationPreview` | `runs.continuation_preview` | no (canonical service read) |
+| `RunsContinueBlocked` | `runs.continue_blocked` | yes (canonical carry-forward service) |
+| `RunsContinuationGet` | `runs.continuation_get` | no (canonical service read) |
+| `RunsContinuationActivate` | `runs.continuation_activate` | yes (canonical carry-forward service) |
+| `RunsContinuationReconcile` | `runs.continuation_reconcile` | yes (canonical carry-forward service) |
+| `RunsContinuationAbort` | `runs.continuation_abort` | yes (canonical carry-forward service) |
 | `ApprovalsList` | `approvals.list` | no (direct) |
 | `ApprovalsResolve` | `approvals.resolve` | yes |
 | `StagesRetry` | `stages.retry` | yes |

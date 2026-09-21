@@ -1,353 +1,250 @@
 # Proposal 039: Blocked Run Fork and Canonical Carry-Forward
 
 | Field | Value |
-|---|---|
-| Date | 2026-04-12 |
-| Status | Draft |
-| Author | Engineer (single-engineer project) |
-| Depends on | Current execution truth, recovery truth, artifact hierarchy, session-lineage truth, Proposal 038 |
-| Goal | Introduce a server-owned continuation command for blocked runs that creates a new run from selected canonical carry-forward inputs instead of resuming the degraded blocked run directly. |
-
-## 1. Why this proposal exists
-
-Blocked runs often contain real work plus a degraded operational tail.
-
-In practice that tail can include:
-
-- repeated stalled or timed-out agent turns,
-- loop counters that no longer represent useful progress,
-- stale runtime session lineage,
-- noisy repeated receipts and partial outputs,
-- contradictory UI/report truth about whether the run is still active,
-- and too much baggage for a clean continuation.
-
-The current options are both poor:
-
-- resume the blocked run and keep accumulating noise,
-- or start a completely manual new run and lose canonical continuity.
-
-This proposal creates a third option:
-
-- preserve the blocked run as historical truth,
-- fork a new run server-side,
-- and carry forward only the selected canonical inputs that should seed the next attempt.
-
-## 2. Outcome
-
-After Proposal 039:
-
-- a blocked run can be continued through a server-owned fork command,
-- the old run remains immutable historical truth,
-- the new run starts with a clean operational lineage,
-- only selected carry-forward inputs cross the boundary,
-- the relationship between the blocked run and the continuation run is explicit and queryable,
-- operators no longer need to choose between stale continuation and manual reassembly.
-
-## 3. Scope
-
-This proposal includes:
-
-- a blocked-run-only continuation command
-- deterministic carry-forward planning
-- explicit old/new run linkage
-- carry-forward provenance artifacts
-- UI, GraphQL, and MCP surfaces for the continuation command
-- protection rules for what may and may not cross into the new run
-
-This proposal does **not** include:
-
-- continuing `running` runs
-- mutating the blocked run's execution history
-- reusing stale runtime session lineage
-- carrying forward loop counters or retry debt
-- replacing Proposal 038 compaction
-- automatic continuation of every blocked run
-
-## 4. Core product questions
-
-The system must be able to answer:
-
-1. Can a blocked run be continued without resuming its degraded execution tail?
-2. Is the new run seeded only from approved canonical carry-forward inputs?
-3. Can operators see exactly what was carried forward and what was intentionally dropped?
-4. Does the old blocked run remain intact for audit and forensic review?
-5. Can the UI and reports show that the new run is a continuation of the old one?
-
-## 5. Eligibility
-
-Proposal 039 applies only to runs in:
-
-- `blocked`
-
-It is not allowed for:
-
-- `running`
-- `ready`
-- `waitingApproval`
-- `pending`
-- `completed`
-- `failed`
-- `cancelled`
-
-### Why blocked-only
-
-The command is meant to repair operational continuity after a run has already stopped making healthy progress.
-
-If the run is still live, continuation is the wrong model.
-If the run is terminal for a non-blocked reason, other workflows should handle it.
-
-Blocked is the one state where:
-
-- preserving history matters,
-- resuming stale execution is risky,
-- and a clean next attempt has real product value.
-
-## 6. Core command
-
-The system introduces one server-owned command:
-
-## `Continue Blocked Run`
-
-This command performs all of the following:
-
-1. validates that the source run is currently `blocked`,
-2. computes a deterministic carry-forward plan,
-3. freezes the source run as immutable historical truth,
-4. creates a new run with a new run ID and fresh execution lineage,
-5. attaches selected carry-forward inputs to the new run,
-6. records bidirectional relationship metadata between the source and continuation runs,
-7. emits a continuation plan and continuation report artifact,
-8. leaves the source run eligible for later Proposal 038 compaction.
-
-There is no in-place continuation in this proposal.
-
-## 7. Carry-forward contract
-
-### 7.1 Carry forward only canonical inputs
-
-The new run may carry forward:
-
-- the latest meaningful workflow snapshot
-- the latest meaningful agent catalog snapshot
-- the latest valid proposal artifact
-- the latest valid review corpus for the meaningful blocked frontier
-- promoted or pinned artifacts that still represent live operator intent
-- unresolved backlog / recovery context that still matters
-- selected implementation handoff artifacts
-- selected project/worktree reference metadata
-- explicit operator notes added during continuation setup
-
-### 7.2 Must not carry forward degraded operational state
-
-The new run must not inherit:
-
-- runtime session IDs
-- active session lineage generations
-- loop counters
-- retry counters or retry debt
-- stale transient runtime receipts
-- incomplete partial outputs from failed attempts unless explicitly promoted as handoff evidence
-- contradictory presentation status from the blocked run
-- terminal failure metadata as if it belonged to the new run
-
-### 7.3 Carry-forward is selective, not wholesale
-
-The blocked run's artifact graph is not cloned blindly.
-
-The continuation plan must explicitly decide:
-
-- what becomes an input to the new run,
-- what remains historical-only on the old run,
-- what is excluded as degraded noise.
-
-## 8. Provenance and ownership
-
-### 8.1 The old run remains immutable
-
-After continuation:
-
-- the blocked run remains the source historical record,
-- its artifacts and reports remain audit-visible,
-- its status does not revert to `running`,
-- and its execution lineage is never rewritten to pretend it was healthy.
-
-### 8.2 The new run owns all new behavior
-
-The new run becomes the only owner of:
-
-- new stage transitions
-- new approvals
-- new runtime sessions
-- new retries
-- new reports
-- new recovery suggestions
-
-Carry-forward artifacts are inputs, not inherited execution history.
-
-### 8.3 Bidirectional lineage
-
-The system records:
-
-- source run `continued_as -> newRunID`
-- continuation run `continued_from -> oldRunID`
-
-This linkage must be queryable in:
-
-- run detail surfaces
-- reports
-- GraphQL
-- MCP
-
-## 9. Operator flow
-
-The operator initiates continuation from a blocked run.
-
-The system shows a deterministic carry-forward preview with:
-
-- source run ID
-- blocked frontier / last meaningful stage
-- candidate carry-forward artifacts
-- excluded degraded categories
-- optional worktree/project reference
-- warnings about anything unresolved or ambiguous
-
-The operator then confirms continuation.
-
-After confirmation:
-
-- the new run is created,
-- the carry-forward plan is persisted,
-- the old run displays a visible `continued as` link,
-- the new run displays a visible `continued from` link.
-
-## 10. UI / GraphQL / MCP
-
-### 10.1 UI
-
-The UI should expose:
-
-- `Continue Blocked Run` action on blocked run surfaces
-- carry-forward preview/review sheet
-- old/new continuation linkage banners
-- clear distinction between historical source evidence and new-run execution truth
-
-### 10.2 GraphQL
-
-Add a mutation:
-
-- `continueBlockedRun(runId: ID!, input: ContinueBlockedRunInput!): ContinueBlockedRunResult!`
-
-Suggested result shape:
-
-- `sourceRunId`
-- `continuationRunId`
-- `status`
-- `planArtifactId`
-- `reportArtifactId`
-- `carriedArtifactIds`
-- `excludedArtifactSummary`
-- `warnings`
-
-### 10.3 MCP
-
-Add a northbound MCP tool:
-
-- `runs.continue_blocked`
-
-The tool should return:
-
-- source run ID
-- continuation run ID
-- carry-forward summary
-- warnings
-- report references
-
-## 11. Relationship to Proposal 038
-
-Proposal 038 and Proposal 039 solve different problems.
-
-Proposal 038:
-
-- compacts noisy blocked or terminal runs for better inspection,
-- but does not create new execution truth.
-
-Proposal 039:
-
-- creates fresh execution truth from a blocked run,
-- but does not compact the old run by itself.
-
-The intended operator sequence may be:
-
-1. continue blocked run under Proposal 039,
-2. later compact the old blocked run under Proposal 038.
-
-Proposal 038 is related, but not a prerequisite for continuation.
-
-## 12. Risks
-
-### 12.1 Too much carry-forward
-
-Risk:
-the continuation run inherits degraded baggage and recreates the same failure pattern.
-
-Mitigation:
-
-- explicit exclusion rules
-- plan preview before execution
-- fresh runtime/session lineage only
-
-### 12.2 Too little carry-forward
-
-Risk:
-the new run loses useful operator context and repeats old work.
-
-Mitigation:
-
-- deterministic candidate set
-- explicit operator-visible carry-forward plan
-- promoted artifacts and meaningful handoff evidence remain eligible
-
-### 12.3 Run lineage confusion
-
-Risk:
-operators cannot tell which run is historical and which run is active.
-
-Mitigation:
-
-- bidirectional linkage
-- visible continuation badges/banners
-- reports and UI show source vs continuation roles explicitly
-
-### 12.4 Hidden state mutation
-
-Risk:
-the system silently rewrites blocked-run truth instead of creating a fresh continuation.
-
-Mitigation:
-
-- blocked run remains immutable
-- new run gets a new ID and new execution lineage
-- carry-forward is recorded as input provenance only
-
-## 13. Acceptance criteria
-
-Proposal 039 is complete when:
-
-1. a `blocked` run can be continued by one server-owned command;
-2. the command creates a new run ID rather than resuming the blocked run in place;
-3. the new run carries forward only the approved canonical inputs;
-4. stale runtime session lineage, loop counters, and retry debt do not cross into the new run;
-5. the old and new runs are explicitly linked in both directions;
-6. UI, GraphQL, and MCP can surface continuation provenance and carry-forward details;
-7. the old blocked run remains intact and eligible for later Proposal 038 compaction.
-
-## 14. Final recommendation
-
-Proposal 039 should be treated as a continuation-quality feature, not a cosmetic convenience.
-
-When a run is blocked, the product should not force the operator to choose between:
-
-- resuming degraded truth,
-- or rebuilding context manually.
-
-The system should provide a clean, explicit, auditable way to start the next attempt from the right inputs and nothing else.
+| --- | --- |
+| Created / revised | 2026-04-12 / 2026-09-20 |
+| Revision | `p039-r2` |
+| Status | In progress: I1 delivered; I2/I3 integrated in substantial part, review corrections and source fences incomplete; production admission not ready |
+| Implementation | Partial: see [current audit R2](039-blocked-run-fork-and-canonical-carry-forward_IMPLEMENTATION_AUDIT_R2.md) and [integration evidence](../evidence/p039-durable-integration.md). [Audit R1](039-blocked-run-fork-and-canonical-carry-forward_IMPLEMENTATION_AUDIT_R1.md) retains the earlier I1 scope. No production admission or live migration |
+| Owner | Rust control plane; SwiftUI is a read/approval client |
+| First supported case | P095-like blocked implementation run, same repository and idea |
+| Decision | New run with verified inputs, current compiled definitions, fresh review and approval |
+
+## 1. Intent And Evidence
+
+Continue useful work from a blocked run without losing source files or reusing
+obsolete execution permissions, sessions, retries or approvals. Success is a
+linked successor that safely proceeds under the current runtime, not merely a
+second run ID or a copied directory.
+
+The immediate case is P095, source run
+`bd83a310-360f-4d45-b4c6-a94873de3733`. The 2026-09-20 preflight observed
+`blocked / state_7_implementation_started`, no pending/running work items, no
+unresolved release effects, and a clean worktree at
+`82b1d72581e6503e5e19a40e5a1164b2b9f2ae3b`. Its frozen `CODE_WRITE` policy
+has no `xcode_headless` grant although `code_writer` requires Xcode execution.
+These are historical observations, not current eligibility authority.
+
+The approved proposal was preserved with SHA-256
+`04ecdd50e44cbcae1d0f1ce1dab6cc31280cce615551cda0dd61c25ba4523d44`.
+The private preservation includes worktree/run/artifact files, historical
+approvals and command records. It is not an importable execution snapshot.
+See [integration context](039-blocked-run-fork-and-canonical-carry-forward.review/integration-context.md).
+
+### Changes From The April Draft
+
+| Old assumption | Current decision |
+| --- | --- |
+| UI button and GraphQL continuation mutation | MCP-only commands; GraphQL/SwiftUI readback and existing approval actions only |
+| Carry the latest meaningful workflow/catalog | Freeze explicitly selected current compiler output; old snapshots are historical evidence |
+| Resume at an unspecified frontier | Closed `implementation_restart_v1` entry: fresh proposal review, then fresh implementation approval |
+| Blocked status is sufficient | Verify quiescence, output-repair ownership and ordinary/headless effects; acquire a durable execution fence |
+| Source becomes immutable by declaration | Enforced source fence and lineage across command, queue, dispatch and settlement boundaries |
+| P038 is a prerequisite | No dependency on compaction, deletion, UI cleanup or DB-size reduction |
+| P064 barrier is assumed available | Schema/readback alone is not proof of an enforced execution fence |
+
+## 2. Scope And Alternatives
+
+1. In-place catalog rewrite is rejected: existing retrofit permits only
+   escalation/backend changes; a permissions rewrite would alter frozen truth.
+2. Normal StartRun plus manual output copies is rejected: it provides no typed
+   lineage, preservation proof or race protection, and files can accidentally
+   satisfy transitions.
+3. Journalled preparation followed by atomic successor activation is selected:
+   verified independent inputs, explicit ownership transfer and fresh authority.
+
+V1 is same-repository, same-idea continuation using `implementation_restart_v1`.
+A source must be blocked in the implementation preparation/loop/review region of
+an explicitly supported `proposal_to_release` workflow, with a recorded
+historical implementation approval and a selectable proposal. That old approval
+is context, never new-run authority.
+
+Excluded: proposal-only, active or terminal sources; cross-repository/idea forks;
+release/publish/upload/push frontiers; arbitrary state jumps; multiple successors
+per source; session resurrection; automatic approval; full Git-history copying;
+merge/rebase; destructive cleanup; in-place permission upgrades.
+
+Dirty work is preserved, not discarded for eligibility. Unmerged indexes,
+submodules, unavailable LFS content, special files and unsupported external
+source links hold executable materialization in v1. No automatic stash, commit,
+reset, source edit or cleanup is allowed.
+
+## 3. Document Ownership
+
+This parent owns scope, invariants, workflow semantics and readiness. Normative
+children share revision `p039-r2` and do not authorize deployment independently:
+
+- [Runtime and wire](039/runtime-and-wire-contract.md): admission, APIs, schemas,
+  persistence, materialization, fences, replay and recovery.
+- [Verification and rollout](039/verification-and-rollout.md): implementation
+  slices, acceptance matrix, migration, gates and separate live P095 proof.
+- [Rollout declaration](../evidence/rollout-contract/p039-rollout-contract.json):
+  machine-readable design intent; future gates are not existing proof.
+
+Implemented references supersede older proposals:
+[UI boundary](../reference/ui-action-boundary.md),
+[API/auth](../reference/boundary-first-api-auth-contract.md),
+[execution truth](../reference/execution-truth-and-recovery.md),
+[per-run isolation](../reference/per-run-workspace-isolation.md),
+[headless runtime](../reference/xcode-headless-runtime.md),
+[rollout template](../reference/executable-rollout-gate-template.md).
+
+## 4. Invariants
+
+1. Source frozen snapshots, stages, agents, approval decisions and output
+   provenance are never rewritten. Source remains `blocked`; lineage/fence
+   records its historical role separately from RunStatus.
+2. Preserve and verify source work before activation. During preparation retain
+   an explicit hold. No P039 path calls CancelRun, worktree cleanup or reset.
+3. Successor owns new run/stage/agent/session/generation/approval identities, a
+   distinct worktree and metadata/output roots, with no source-path fallback.
+4. Old results are input evidence. Tests, scores, accepted risks, rollout passes
+   and approvals never become current transition authority. Future gates run.
+5. Freeze current compiler output: permission profiles, provider bindings, skills
+   and effective worktree strategy. Copied old task payloads cannot authorize work.
+6. At most one successor activates per source, despite retry, crash, timeout,
+   concurrent operators or expired transport-idempotency retention.
+7. Filesystem/Git work occurs outside SQLite writer transactions. Activation is
+   one bounded metadata transaction after verified materialization.
+8. Unknown effects hold. Startup reconciles evidence but never automatically
+   repeats an uncertain Git operation or activates a successor.
+9. No implicit project-trust, Apple-consent, provider-access or capability grant.
+10. Successor failure/cancellation, disabling P039 or rollback never automatically
+    makes the historical source runnable again.
+
+## 5. Inputs And Preservation
+
+Preview partitions candidates into `execution_seed`, `reference_only`,
+`preserve_only` or `excluded`, each with provenance and a reason. A filename or
+pin alone is insufficient evidence of canonical identity or validity.
+
+| Material | Successor treatment |
+| --- | --- |
+| Selected approved/current proposal verified against source metadata | New `proposal_current` input with original artifact identity/hash/role and observed historical approval relation |
+| Idea brief | Input bound to source idea/run and idea digest |
+| Reviews, unresolved findings, plan/backlog, handoff | Isolated read-only reference bundle, required reviewer/planner input when present, never current gate outputs |
+| Committed and dirty/untracked source | New checkout at pinned source HEAD plus verified overlay; original index semantics preserved in archive only |
+| Old tests/audits/self-assessment/release receipts | Historical evidence, no successful stage/active output/risk waiver |
+| Old YAML/catalog/approval/journal records | Preserve-only audit evidence |
+| Run-state, active index, counters, sessions/tokens, locks | Never execution seeds; runtime state remains source-local/private historical preservation only |
+| Caches, builds and external machine configuration | Explicit exclusions; no dereference or executable carry-forward |
+
+Metadata/checksum mismatch holds. If an old approval lacks a cryptographic
+proposal binding, report `historical_binding_unproven`, not an invented binding.
+A verified operator-selected proposal may still enter fresh review without any
+exemption from new approval.
+
+Mandatory unresolved findings include human decisions and scope/decomposition
+blockers. Their presence reaches new reviewers/planner; a fork does not resolve
+or waive them. New review explicitly dispositions them under the current target.
+
+Preservation is a private checksummed copy on this host, not an offsite backup.
+Its receipt identifies roots, retention pin, source Git ref/HEAD/tree, index and
+patches, untracked/deleted inventory, exclusions and limits. Existing manual P095
+preservation is supporting evidence; implementation must make current checks.
+
+## 6. Fresh Workflow Entry
+
+Add optional compiler metadata; workflows without it remain unchanged and are
+not eligible targets. V1 accepts one closed profile, not an arbitrary state:
+
+```yaml
+blocked_run_continuation:
+  schema_version: blocked_run_continuation_profile_v1
+  profile: implementation_restart_v1
+  review_state: state_4_proposal_reviewed
+  approval_state: state_6_implementation_approval
+  preparation_state: state_7_implementation_started
+  proposal_input: proposal_current
+  preparation_task: freeze_approved_proposal_and_prepare_worktree
+```
+
+The compiler verifies actual proposal routing/review, success through the required
+manual gate, rejection/refinement through review, and gate dominance over every
+write-enabled implementation/release task. Reject ambiguous topology, writable
+review agents, dynamic bypasses and incompatible required artifact contracts.
+Compile all target states and delivery/release preflight, not just the first task.
+
+Freeze `shared_implementation_worktree` read strategy for continuation review and
+refinement tasks in the compiled plan, including dynamically selected reviewers.
+Their source context, read-path expansion, cwd and Xcode binding must resolve to
+the successor checkout, not the repository/main checkout. They may write only
+their new-run metadata outputs, not product code. Current definition/skill loading
+is a separate trusted input. Persist this derived root mapping in the snapshot;
+do not reconstruct it from an old task payload at dispatch.
+
+Activation enters the declared review state and queues one AdvanceRun. There are
+no fake successful earlier stages: the entry record explicitly says
+`entry_reason=verified_carry_forward`. Omitting drafting is authorized by the
+closed compiled profile, not by a supplied current_state or old approvals.
+
+Fresh review may refine the proposal before the ordinary new implementation gate.
+Its approval payload binds manifest digest, source/new IDs, proposal hash, code
+snapshot digest, target workflow/catalog hashes, capability delta and unresolved
+findings. Grant binds that tuple; changed material makes it non-actionable and
+requires new review/approval. Existing `granted`/`rejected` vocabulary remains.
+The runtime child defines the durable approval binding and supersession record;
+an old grant for the same logical state is not sufficient.
+
+After grant, ordinary preparation produces fresh approved proposal, plan and
+backlog using the reference bundle. Existing code is preserved; previously
+implemented items require new proof, not copied completed-task flags. No active
+approved-proposal output is imported before preparation, so this path does not
+need the P095 legacy duplicate-output workaround.
+
+The checkout starts at the source HEAD, not silently at current main. Current
+runtime/catalog and source revision are separate dimensions. Record both; no
+automatic main-sync during preparation. Later sync remains workflow-owned.
+
+## 7. Operator And Trust Boundary
+
+Commands are MCP-only; no new GraphQL mutation or UI-controlled workflow. Existing
+UI reads lineage, phase, verification/holds and ordinary approval via GraphQL.
+Detailed manifests are privileged and paginated. Restricted/wrong-run callers
+receive no private paths, contents, approval comments or hidden operation result.
+Operator class alone is insufficient without the exact capability.
+
+Target headless policy must be explicit for all required tasks. Compiler/policy
+preflight does not open Apple workspaces. Preparation/activation call neither
+Xcode nor providers. Later review/implementation can need native consent and must
+hold at that boundary. Project trust is not cloned from the old checkout; missing
+trust is visible before dispatch. No IDE fallback or unsafe allow-all.
+
+## 8. Hypothesis And Acceptance
+
+**H1:** two disposable repositories demonstrate that a blocked implementation
+source with staged/unstaged/untracked work and an obsolete catalog produces one
+independent successor with current definitions; source hashes remain unchanged;
+fresh review and human approval precede implementation.
+
+First proof is provider-free Rust integration against isolated temporary DBs and
+repositories. No real P095, production DB, Apple service, provider or remote host.
+The [verification contract](039/verification-and-rollout.md) owns the full matrix.
+
+Minimum implementation acceptance:
+
+- deterministic bounded preview and verified independent preservation;
+- exactly-one activation and same-idea execution ownership;
+- source guards across every command/dispatch/recovery/settlement path;
+- new compiler/permissions/skills with no inherited execution authority;
+- fresh review/approval and explicit artifact input origin;
+- unknown effects hold both source and candidate;
+- auth, stale-projection behavior and four-lane readback parity;
+- additive migration, compatible rollback and no implicit cleanup;
+- provider-free gate plus separately authorized P095 live acceptance.
+
+A specification update/review is not implementation, deployment, Apple consent,
+P095 implementation approval or authorization to delete the source.
+
+## 9. Readiness
+
+Five independent specialists reviewed the candidate; targeted rechecks closed
+all their findings at specification level. See the
+[readiness review](039-blocked-run-fork-and-canonical-carry-forward.review/proposal-readiness-review.md)
+for dispositions, final fingerprints and the reviewer-cap coverage gap.
+
+Proceed with an I1 task-level plan, then I2/I3 integration against its measured
+results. I4 remains gated on offline implementation proof, compatible deployment
+and exact live scope. The separate execution-truth review omitted by the
+five-reviewer cap is required before production admission. This does not block
+the provider-free first experiment. None of these gates is claimed completed.

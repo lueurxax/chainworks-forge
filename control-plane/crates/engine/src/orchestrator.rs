@@ -249,6 +249,7 @@ impl Orchestrator {
     }
 
     pub async fn advance_run(&self, run_id: RunId) -> Result<()> {
+        db::repos::run_continuations::check_source_guard(&self.pool, &run_id.to_string()).await?;
         let run = match runs::find_by_id(&self.pool, run_id).await? {
             Some(r) => r,
             None => {
@@ -272,6 +273,8 @@ impl Orchestrator {
     }
 
     pub async fn advance_run_from_payload(&self, payload: &AdvanceRunPayloadV1) -> Result<()> {
+        db::repos::run_continuations::check_source_guard(&self.pool, &payload.run_id.to_string())
+            .await?;
         if payload.target_mode() == AdvanceRunTargetMode::LegacyRunScoped {
             return self.advance_run(payload.run_id).await;
         }
@@ -637,8 +640,9 @@ impl Orchestrator {
                         })
                     }
                 } else {
-                    // WaitingApproval — always skip (waiting for operator).
-                    true
+                    // P039 may need to repair the atomic approval-publication
+                    // gap before resuming the ordinary operator wait below.
+                    false
                 };
 
                 if should_skip {
@@ -837,14 +841,18 @@ impl Orchestrator {
                                 {
                                     return Ok(());
                                 }
-                                let prompt = match build_task_prompt(
+                                let prompt = match build_task_prompt_for_runtime(
+                                    &self.pool,
                                     task,
                                     &plan,
                                     run,
                                     idea_opt.as_ref(),
                                     None,
                                     approval_rejection_context.as_deref(),
-                                ) {
+                                    false,
+                                )
+                                .await
+                                {
                                     Ok(prompt) => prompt,
                                     Err(error) => {
                                         self.block_prompt_finalization_failure(
@@ -991,14 +999,18 @@ impl Orchestrator {
                                             {
                                                 return Ok(());
                                             }
-                                            let mut prompt = match build_task_prompt(
+                                            let mut prompt = match build_task_prompt_for_runtime(
+                                                &self.pool,
                                                 task,
                                                 &plan,
                                                 run,
                                                 idea_opt.as_ref(),
                                                 None,
                                                 approval_rejection_context.as_deref(),
-                                            ) {
+                                                false,
+                                            )
+                                            .await
+                                            {
                                                 Ok(prompt) => prompt,
                                                 Err(error) => {
                                                     self.block_prompt_finalization_failure(
@@ -1163,6 +1175,29 @@ impl Orchestrator {
                         return Ok(());
                     }
                     StageStatus::WaitingApproval => {
+                        if let Some(approval) =
+                            crate::run_carry_forward::approval::repair_missing(&self.pool, stage)
+                                .await?
+                        {
+                            self.link_p094_boundary_approval_request(&approval, stage.id)
+                                .await?;
+                            let _ = self.events.send(DomainEvent::ApprovalRequested {
+                                run_id,
+                                approval_id: approval.id,
+                                stage_id: current_state_id.clone(),
+                            });
+                            if run.status != RunStatus::WaitingApproval {
+                                runs::update_status(&self.pool, run_id, RunStatus::WaitingApproval)
+                                    .await?;
+                                let _ = self.events.send(DomainEvent::RunStatusChanged {
+                                    run_id,
+                                    status: RunStatus::WaitingApproval,
+                                });
+                            }
+                            projections::rebuild_run_summary(&self.pool, run_id).await?;
+                            projections::rebuild_stage_summaries(&self.pool, run_id).await?;
+                            projections::rebuild_approval_inbox(&self.pool, run_id).await?;
+                        }
                         return Ok(()); // wait for approval
                     }
                     StageStatus::Completed => {
@@ -1251,7 +1286,10 @@ impl Orchestrator {
                                 comment: None,
                                 expires_at: None,
                             };
-                            approvals::insert(&self.pool, &approval).await?;
+                            crate::run_carry_forward::approval::create(
+                                &self.pool, &approval, stage.id,
+                            )
+                            .await?;
                             self.link_p094_boundary_approval_request(&approval, stage.id)
                                 .await?;
 
@@ -1345,7 +1383,7 @@ impl Orchestrator {
                 comment: None,
                 expires_at: None,
             };
-            approvals::insert(&self.pool, &approval).await?;
+            crate::run_carry_forward::approval::create(&self.pool, &approval, stage.id).await?;
             self.link_p094_boundary_approval_request(&approval, stage.id)
                 .await?;
 
@@ -1464,6 +1502,7 @@ impl Orchestrator {
         };
 
         if let Some(task) = implementation_run_start_task {
+            crate::run_carry_forward::approval::authorize_snapshot(&self.pool, &stage).await?;
             if self
                 .block_implementation_run_start_if_rollout_contract_hold(
                     run_id,
@@ -1736,14 +1775,18 @@ impl Orchestrator {
                 {
                     return Ok(());
                 }
-                let prompt = match build_task_prompt(
+                let prompt = match build_task_prompt_for_runtime(
+                    &self.pool,
                     task,
                     &plan,
                     &run,
                     idea_opt.as_ref(),
                     source_ctx.as_ref(),
                     approval_rejection_context.as_deref(),
-                ) {
+                    false,
+                )
+                .await
+                {
                     Ok(prompt) => prompt,
                     Err(error) => {
                         self.block_prompt_finalization_failure(run_id, &stage, "task", &error)
@@ -2370,6 +2413,27 @@ impl Orchestrator {
         stage: &StageExecution,
         persisted_artifacts: &[Artifact],
     ) -> Result<(bool, Option<Artifact>)> {
+        use crate::run_carry_forward::inputs::{self, OutputResolution};
+        match inputs::output_for_predicate(&self.pool, run, plan, artifact_name).await? {
+            OutputResolution::OrdinaryRun => {}
+            OutputResolution::Output(output) => {
+                let id = output
+                    .artifact_id
+                    .context("artifact_provenance_invalid: output identity")?;
+                let artifact = artifacts::find_by_id(&self.pool, id)
+                    .await?
+                    .context("artifact_provenance_invalid: output disappeared")?;
+                return Ok((true, Some(artifact)));
+            }
+            OutputResolution::Missing => {
+                let artifact = if artifact_name == "approved_proposal" {
+                    inputs::ensure_approved_snapshot(&self.pool, run, plan, stage).await?
+                } else {
+                    None
+                };
+                return Ok((artifact.is_some(), artifact));
+            }
+        }
         if let Some(artifact) = persisted_artifacts
             .iter()
             .rev()
@@ -2429,6 +2493,21 @@ impl Orchestrator {
         stage: &StageExecution,
         persisted_artifacts: &[Artifact],
     ) -> Result<Option<Artifact>> {
+        if !matches!(
+            crate::run_carry_forward::inputs::output_for_predicate(
+                &self.pool,
+                run,
+                plan,
+                "approved_proposal"
+            )
+            .await?,
+            crate::run_carry_forward::inputs::OutputResolution::OrdinaryRun
+        ) {
+            return crate::run_carry_forward::inputs::ensure_approved_snapshot(
+                &self.pool, run, plan, stage,
+            )
+            .await;
+        }
         let Some(path_template) = plan.artifact_paths.get("approved_proposal") else {
             return Ok(None);
         };
@@ -2730,7 +2809,8 @@ impl Orchestrator {
         let rejection = self
             .approval_rejection_context_for_state(run.id, &source_stage.stage_id)
             .await?;
-        let mut prompt = build_task_prompt_with_required_inputs(
+        let mut prompt = build_task_prompt_for_runtime(
+            &self.pool,
             task,
             plan,
             &stage_run,
@@ -2738,7 +2818,8 @@ impl Orchestrator {
             None,
             rejection.as_deref(),
             true,
-        )?;
+        )
+        .await?;
         if let Some(conflict) = self
             .workflow_conflict_resolution_context_for_proposal_writer(run.id, source_stage, task)
             .await?
@@ -2914,6 +2995,7 @@ impl Orchestrator {
             )
             .await?;
         let work_item_id = format!("p058-invoke:{}:{}", stage.id, task_index);
+        crate::run_carry_forward::approval::before_dispatch(&self.pool, stage).await?;
         self.work_queue
             .enqueue_with_id(
                 work_item_id,
@@ -5539,7 +5621,11 @@ impl Orchestrator {
                 .await?;
 
             // Build prompt for this reviewer.
-            let prompt = match build_task_prompt(&task, plan, run, idea_opt, None, None) {
+            let prompt = match build_task_prompt_for_runtime(
+                &self.pool, &task, plan, run, idea_opt, None, None, false,
+            )
+            .await
+            {
                 Ok(prompt) => prompt,
                 Err(error) => {
                     self.block_dynamic_prompt_finalization_failure(run_id, stage, &error)
@@ -6054,6 +6140,13 @@ impl Orchestrator {
             let transition = &state.transitions[transition_index];
             let selected_transition_id =
                 transition_id_for(current_state_id, &transition.to, transition_index);
+            crate::run_carry_forward::approval::validate_transition(
+                &self.pool,
+                run_id,
+                current_state_id,
+                &transition.to,
+            )
+            .await?;
             info!(
                 run_id = %run_id,
                 from = current_state_id,
@@ -7047,6 +7140,24 @@ impl Orchestrator {
         }
 
         if trimmed == "approval.granted == true" {
+            match crate::run_carry_forward::approval::authorizes(
+                &self.pool,
+                run.id,
+                current_state_id,
+                ApprovalDecision::Granted,
+            )
+            .await
+            {
+                Ok(Some(true)) => return ClassifiedConditionEvaluation::matched(),
+                Ok(Some(false)) => return ClassifiedConditionEvaluation::not_matched(),
+                Err(_) => {
+                    return ClassifiedConditionEvaluation::new(
+                        CandidateTransitionResult::EvaluationError,
+                        Some("stale_approval_binding".into()),
+                    )
+                }
+                Ok(None) => {}
+            }
             let approvals = approvals::list_by_run(&self.pool, run.id)
                 .await
                 .unwrap_or_default();
@@ -7060,6 +7171,24 @@ impl Orchestrator {
             };
         }
         if trimmed == "approval.rejected == true" {
+            match crate::run_carry_forward::approval::authorizes(
+                &self.pool,
+                run.id,
+                current_state_id,
+                ApprovalDecision::Rejected,
+            )
+            .await
+            {
+                Ok(Some(true)) => return ClassifiedConditionEvaluation::matched(),
+                Ok(Some(false)) => return ClassifiedConditionEvaluation::not_matched(),
+                Err(_) => {
+                    return ClassifiedConditionEvaluation::new(
+                        CandidateTransitionResult::EvaluationError,
+                        Some("stale_approval_binding".into()),
+                    )
+                }
+                Ok(None) => {}
+            }
             let approvals = approvals::list_by_run(&self.pool, run.id)
                 .await
                 .unwrap_or_default();
@@ -7152,6 +7281,28 @@ impl Orchestrator {
             }
         }
 
+        match crate::run_carry_forward::inputs::output_for_predicate(
+            &self.pool,
+            run,
+            plan,
+            artifact_name,
+        )
+        .await
+        {
+            Ok(crate::run_carry_forward::inputs::OutputResolution::OrdinaryRun) => {}
+            Ok(crate::run_carry_forward::inputs::OutputResolution::Output(_)) => {
+                return ClassifiedConditionEvaluation::matched()
+                    .with_required_artifact(artifact_name)
+                    .with_source_artifact(artifact_name);
+            }
+            Ok(crate::run_carry_forward::inputs::OutputResolution::Missing) | Err(_) => {
+                return ClassifiedConditionEvaluation::missing_input(format!(
+                    "Artifact {artifact_name} has no verified current provider output"
+                ))
+                .with_required_artifact(artifact_name)
+                .with_missing_artifact(artifact_name);
+            }
+        }
         let Some(path_template) = plan.artifact_paths.get(artifact_name) else {
             return ClassifiedConditionEvaluation::invalid_expression(format!(
                 "Artifact {artifact_name} is not declared by the workflow/catalog contract"
@@ -7438,6 +7589,24 @@ impl Orchestrator {
                 .await;
         }
 
+        match crate::run_carry_forward::inputs::output_for_predicate(
+            &self.pool,
+            run,
+            plan,
+            artifact_name,
+        )
+        .await
+        {
+            Ok(crate::run_carry_forward::inputs::OutputResolution::OrdinaryRun) => {}
+            Ok(crate::run_carry_forward::inputs::OutputResolution::Output(input)) => {
+                return extract_json_field(
+                    &serde_json::from_str::<serde_json::Value>(&input.content).ok()?,
+                    field_name,
+                );
+            }
+            _ => return None,
+        }
+
         // Find the artifact file path
         let path = if let Some(template) = plan.artifact_paths.get(artifact_name) {
             let resolved = resolve_path_template(
@@ -7482,6 +7651,20 @@ impl Orchestrator {
         run: &domain::run::Run,
         plan: &workflow::plan::RunPlan,
     ) -> Option<serde_json::Value> {
+        match crate::run_carry_forward::inputs::output_for_predicate(
+            &self.pool,
+            run,
+            plan,
+            artifact_name,
+        )
+        .await
+        {
+            Ok(crate::run_carry_forward::inputs::OutputResolution::OrdinaryRun) => {}
+            Ok(crate::run_carry_forward::inputs::OutputResolution::Output(input)) => {
+                return serde_json::from_str(&input.content).ok();
+            }
+            _ => return None,
+        }
         let path = if let Some(template) = plan.artifact_paths.get(artifact_name) {
             let resolved = resolve_path_template(
                 template,
@@ -8108,7 +8291,7 @@ fn is_code_writer_implementation_task(task: &workflow::plan::CompiledTask) -> bo
         )
 }
 
-fn is_health_fallback_eligible_task(
+pub(crate) fn is_health_fallback_eligible_task(
     agent_id: &str,
     task_outputs: &[String],
     output_contract: Option<&str>,
@@ -8128,7 +8311,7 @@ fn is_health_fallback_eligible_task(
         || is_code_writer_implementation_output_task(agent_id, task_outputs, output_contract)
 }
 
-fn is_health_fallback_source_provider(provider: &str) -> bool {
+pub(crate) fn is_health_fallback_source_provider(provider: &str) -> bool {
     matches!(
         provider,
         "claude"
@@ -8142,7 +8325,7 @@ fn is_health_fallback_source_provider(provider: &str) -> bool {
     )
 }
 
-fn same_provider_family_for_health_fallback(left: &str, right: &str) -> bool {
+pub(crate) fn same_provider_family_for_health_fallback(left: &str, right: &str) -> bool {
     matches!(
         (left, right),
         ("claude", "claude")
@@ -8591,7 +8774,9 @@ fn is_code_writer_implementation_output_task(
             }))
 }
 
-fn provider_health_fallback_failure(facts: &domain::agent::AgentExecutionRuntimeFacts) -> bool {
+pub(crate) fn provider_health_fallback_failure(
+    facts: &domain::agent::AgentExecutionRuntimeFacts,
+) -> bool {
     matches!(
         facts.failure_kind.as_ref(),
         Some(AgentFailureKind::ProviderQuota)
@@ -8624,7 +8809,7 @@ fn p058_requires_provider_force_detach(
     )
 }
 
-fn run_local_health_fallback_profile_candidates(
+pub(crate) fn run_local_health_fallback_profile_candidates(
     agent_id: &str,
     task_outputs: &[String],
     output_contract: Option<&str>,
@@ -8980,7 +9165,7 @@ fn dynamic_materialization_epoch(stage: &StageExecution) -> i64 {
         .saturating_add(stage.attempt_number)
 }
 
-fn p060_dynamic_review_output_name(agent_id: &str) -> String {
+pub(crate) fn p060_dynamic_review_output_name(agent_id: &str) -> String {
     let suffix = agent_id
         .strip_prefix("proposal_reviewer_")
         .unwrap_or(agent_id)
@@ -8988,7 +9173,7 @@ fn p060_dynamic_review_output_name(agent_id: &str) -> String {
     format!("proposal_review_{suffix}")
 }
 
-fn p060_dynamic_review_output_schema(contract_id: &str) -> workflow::plan::OutputSchema {
+pub(crate) fn p060_dynamic_review_output_schema(contract_id: &str) -> workflow::plan::OutputSchema {
     workflow::plan::OutputSchema {
         contract_id: contract_id.to_string(),
         format: "json".to_string(),
@@ -9013,7 +9198,7 @@ fn p060_dynamic_review_output_schema(contract_id: &str) -> workflow::plan::Outpu
     }
 }
 
-fn p060_dynamic_review_target_path(
+pub(crate) fn p060_dynamic_review_target_path(
     output_name: &str,
     schema: Option<&workflow::plan::OutputSchema>,
     plan: &workflow::plan::RunPlan,
@@ -9081,7 +9266,7 @@ fn normalize_resolved_artifact_path_for_task(
         &resolved,
         &run.workspace_root,
         run.worktree_root.as_deref(),
-        task.agent.worktree_write_enabled,
+        task.agent.worktree_write_enabled || task_reads_implementation_worktree(task),
         meta_abs.as_deref(),
     )
 }
@@ -9119,6 +9304,7 @@ fn rebase_safe_legacy_artifact_path_for_post_isolation_run(
     meta_root.join(relative).to_string_lossy().into_owned()
 }
 
+#[cfg(test)]
 fn build_task_prompt(
     task: &workflow::plan::CompiledTask,
     plan: &workflow::plan::RunPlan,
@@ -9138,6 +9324,7 @@ fn build_task_prompt(
     )
 }
 
+#[cfg(test)]
 fn build_task_prompt_with_required_inputs(
     task: &workflow::plan::CompiledTask,
     plan: &workflow::plan::RunPlan,
@@ -9147,9 +9334,67 @@ fn build_task_prompt_with_required_inputs(
     approval_rejection_context: Option<&str>,
     require_inputs: bool,
 ) -> Result<String> {
+    build_task_prompt_with_verified_inputs(
+        task,
+        plan,
+        run,
+        idea,
+        source_ctx,
+        approval_rejection_context,
+        require_inputs,
+        None,
+    )
+}
+
+/// Resolve installed inputs asynchronously before the bounded snapshot prompt builder.
+pub async fn build_task_prompt_for_runtime(
+    pool: &sqlx::SqlitePool,
+    task: &workflow::plan::CompiledTask,
+    plan: &workflow::plan::RunPlan,
+    run: &domain::run::Run,
+    idea: Option<&domain::idea::Idea>,
+    source_ctx: Option<&crate::worktree::SourceContext>,
+    approval_rejection_context: Option<&str>,
+    require_inputs: bool,
+) -> Result<String> {
+    let inputs =
+        crate::run_carry_forward::inputs::resolve_task_inputs(pool, run, plan, task).await?;
+    build_task_prompt_with_verified_inputs(
+        task,
+        plan,
+        run,
+        idea,
+        source_ctx,
+        approval_rejection_context,
+        require_inputs,
+        inputs.as_ref(),
+    )
+}
+
+fn build_task_prompt_with_verified_inputs(
+    task: &workflow::plan::CompiledTask,
+    plan: &workflow::plan::RunPlan,
+    run: &domain::run::Run,
+    idea: Option<&domain::idea::Idea>,
+    source_ctx: Option<&crate::worktree::SourceContext>,
+    approval_rejection_context: Option<&str>,
+    require_inputs: bool,
+    installed: Option<&crate::run_carry_forward::inputs::TaskInputs>,
+) -> Result<String> {
     let mut parts: Vec<String> = Vec::new();
 
     parts.push(format!("## Task: {}", task.task_name));
+    if installed.is_some()
+        || (!task.agent.worktree_write_enabled
+            && task.agent.worktree_strategy.as_deref() == Some("shared_implementation_worktree"))
+    {
+        domain::execution_root::select_execution_root(
+            &run.workspace_root,
+            run.worktree_root.as_deref(),
+            task.agent.worktree_write_enabled,
+            task.agent.worktree_strategy.as_deref(),
+        )?;
+    }
     // P050: make the per-run meta root explicit because read-only worktree
     // agents otherwise tend to resolve `.chainworks/runs/...` relative to the
     // implementation worktree.
@@ -9209,7 +9454,7 @@ fn build_task_prompt_with_required_inputs(
 
     // Input artifacts with resolved paths.
     // Proposal 007: normalize paths to worktree for write-enabled agents.
-    let wt_enabled = task.agent.worktree_write_enabled;
+    let wt_enabled = task.agent.worktree_write_enabled || task_reads_implementation_worktree(task);
     let wt_root = run.worktree_root.as_deref();
     let mut proposal_writer_backlog_context: Option<String> = None;
     let mut input_sources = Vec::new();
@@ -9217,6 +9462,25 @@ fn build_task_prompt_with_required_inputs(
     if !task.inputs.is_empty() {
         parts.push(String::from("\n### Input Artifacts"));
         for input_name in &task.inputs {
+            if let Some(resolved) = installed.and_then(|context| context.inputs.get(input_name)) {
+                if let Some(input) = resolved {
+                    parts.push(format!("- `{input_name}` -> `{}`", input.display_path));
+                    captured_input_bytes += input.content.len();
+                    anyhow::ensure!(
+                        captured_input_bytes <= 64 * 1024 * 1024,
+                        "input_context_sources_too_large"
+                    );
+                    input_sources.push((
+                        input_name.clone(),
+                        input.content.clone(),
+                        input.display_path.clone(),
+                    ));
+                } else {
+                    anyhow::ensure!(!require_inputs, "input_context_retry_source_missing");
+                    parts.push(format!("- `{input_name}` (no current provider output; historical references are separate)"));
+                }
+                continue;
+            }
             if let Some(template) = plan.artifact_paths.get(input_name) {
                 let resolved = resolve_path_template(
                     template,
@@ -9231,7 +9495,7 @@ fn build_task_prompt_with_required_inputs(
                     meta_root_abs.as_deref(),
                 );
                 parts.push(format!("- `{input_name}` → `{normalized}`"));
-                let artifact_path = workspace_absolute_path(&resolved, &run.workspace_root);
+                let artifact_path = workspace_absolute_path(&normalized, &run.workspace_root);
                 let display_path = workspace_absolute_path(&normalized, &run.workspace_root);
                 let content =
                     acp::input_context::read_source(std::path::Path::new(&artifact_path))?;
@@ -9267,6 +9531,25 @@ fn build_task_prompt_with_required_inputs(
         }
     }
 
+    if let Some(installed) = installed {
+        parts.push(String::from("\n### Carry-Forward Context\nThe proposal execution seed is input context only. Historical references are not approval, waiver, gate evidence, or a current provider output. Preserve unresolved human findings; evaluate them again under the current task contract. Paths inside historical text are historical locators, not writable destinations."));
+        for reference in &installed.references {
+            captured_input_bytes += reference.content.len();
+            anyhow::ensure!(
+                captured_input_bytes <= 64 * 1024 * 1024,
+                "input_context_sources_too_large"
+            );
+            parts.push(format!(
+                "- `{}` -> `{}` (reference only)",
+                reference.name, reference.display_path
+            ));
+            input_sources.push((
+                reference.name.clone(),
+                reference.content.clone(),
+                reference.display_path.clone(),
+            ));
+        }
+    }
     let input_context_position = parts.len();
 
     if let Some(context) = proposal_writer_backlog_context {
@@ -9599,10 +9882,25 @@ fn build_task_prompt_for_owner(
     idea: Option<&domain::idea::Idea>,
 ) -> Result<String> {
     let mut parts: Vec<String> = Vec::new();
+    let owner_uses_worktree = state.owner.worktree_write_enabled
+        || matches!(
+            state.owner.worktree_strategy.as_deref(),
+            Some("dedicated" | "shared_implementation_worktree")
+        );
+    if !state.owner.worktree_write_enabled
+        && state.owner.worktree_strategy.as_deref() == Some("shared_implementation_worktree")
+    {
+        domain::execution_root::select_execution_root(
+            &run.workspace_root,
+            run.worktree_root.as_deref(),
+            state.owner.worktree_write_enabled,
+            state.owner.worktree_strategy.as_deref(),
+        )?;
+    }
 
     parts.push(format!("## State: {} — {}", state.id, state.label));
     // Proposal 007: write-enabled owner agents see worktree root.
-    if state.owner.worktree_write_enabled {
+    if owner_uses_worktree {
         if let Some(ref wt) = run.worktree_root {
             parts.push(format!("Worktree root: {}", wt));
             parts.push(format!(
@@ -9632,7 +9930,7 @@ fn build_task_prompt_for_owner(
     }
 
     if !plan.artifact_paths.is_empty() {
-        let owner_wt_enabled = state.owner.worktree_write_enabled;
+        let owner_wt_enabled = owner_uses_worktree;
         let owner_wt_root = run.worktree_root.as_deref();
         let owner_meta_abs = run.chainworks_meta_root.as_ref().map(|mr| {
             if mr.starts_with('/') {
@@ -14136,6 +14434,56 @@ mod tests {
     }
 
     #[test]
+    fn p039_readonly_shared_review_reads_successor_bytes_and_keeps_metadata_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let checkout = temp.path().join("checkout");
+        let metadata = temp.path().join("meta");
+        for path in [&repo, &checkout, &metadata] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(repo.join("source.txt"), "MAIN_MUST_NOT_BE_REVIEWED").unwrap();
+        std::fs::write(checkout.join("source.txt"), "SUCCESSOR_MUST_BE_REVIEWED").unwrap();
+        std::fs::write(metadata.join("proposal.md"), "NEW_REVIEW_PROPOSAL").unwrap();
+        let mut run = test_run(RunId::new());
+        run.workspace_root = repo.to_str().unwrap().into();
+        run.worktree_root = Some(checkout.to_str().unwrap().into());
+        run.chainworks_meta_root = Some(metadata.to_str().unwrap().into());
+        let mut task = reviewer_task();
+        task.agent.worktree_write_enabled = false;
+        task.agent.worktree_strategy = Some("shared_implementation_worktree".into());
+        task.inputs = vec!["source".into(), "proposal_current".into()];
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "source".into(),
+            repo.join("source.txt").to_str().unwrap().into(),
+        );
+        plan.artifact_paths.insert(
+            "proposal_current".into(),
+            metadata.join("proposal.md").to_str().unwrap().into(),
+        );
+        let prompt = build_task_prompt(&task, &plan, &run, None, None, None).unwrap();
+        assert!(prompt.contains("SUCCESSOR_MUST_BE_REVIEWED"));
+        assert!(!prompt.contains("MAIN_MUST_NOT_BE_REVIEWED"));
+        assert!(prompt.contains("NEW_REVIEW_PROPOSAL"));
+        assert!(prompt.contains(&format!(
+            "Implementation worktree root: {}",
+            checkout.display()
+        )));
+        assert!(prompt.contains("Read source from the implementation worktree"));
+        assert_eq!(
+            normalize_resolved_artifact_path_for_task(
+                repo.join("source.txt").to_str().unwrap(),
+                &run,
+                &task
+            ),
+            checkout.join("source.txt").to_str().unwrap()
+        );
+        run.worktree_root = None;
+        assert!(build_task_prompt(&task, &plan, &run, None, None, None).is_err());
+    }
+
+    #[test]
     fn p049_large_input_preserves_bytes_without_oversized_flat_prompt() {
         let tmp = tempfile::tempdir().unwrap();
         let mut run = test_run(RunId::new());
@@ -15109,6 +15457,79 @@ mod tests {
             .resolve_value("prepush_review_report.status", &run, &plan)
             .await;
         assert_eq!(canonical, serde_json::json!("pass"));
+    }
+
+    #[tokio::test]
+    async fn p039_seed_files_do_not_satisfy_exists_or_output_fields() {
+        let pool = test_pool().await;
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            crate::event_bus::new_bus(16),
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let mut run = test_run(RunId::new());
+        run.workspace_root = root.to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(run.workspace_root.clone());
+        db::repos::ideas::insert(
+            &pool,
+            &domain::idea::Idea {
+                id: run.idea_id,
+                title: "Fixture".into(),
+                body: "Fixture".into(),
+                workspace_root_path: None,
+                project_key: None,
+                status: domain::idea::IdeaStatus::Active,
+                created_at: Utc::now(),
+                archived_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut source = run.clone();
+        source.id = RunId::new();
+        source.status = RunStatus::Cancelled;
+        db::repos::runs::insert(&pool, &source).await.unwrap();
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+        let op = uuid::Uuid::new_v4().to_string();
+        let journal = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO command_journal(id,command_type,payload_json,run_id,created_at) VALUES (?,'ContinueBlocked','{}',?,'2026-09-20')")
+            .bind(&journal).bind(source.id.to_string()).execute(&pool).await.unwrap();
+        // This test exercises only output fallbacks; no installed-input reader or
+        // activation authorization is inferred from this minimal bookkeeping row.
+        sqlx::query("INSERT INTO run_continuations(operation_id,source_run_id,idea_id,reserved_successor_run_id,successor_run_id,caller_fingerprint,caller_request_id,intent_sha256,profile,phase,plan_ref,plan_sha256,target_ref,source_witness_sha256,manifest_ref,manifest_sha256,journal_id,created_at,updated_at,deadline_at) VALUES (?,?,?,?,?,'fixture',?,?,'implementation_restart_v1','activated','plan',?,'target',?,'manifest',?,?,'2026-09-20','2026-09-20','2026-09-21')")
+            .bind(op).bind(source.id.to_string()).bind(run.idea_id.to_string()).bind(run.id.to_string()).bind(run.id.to_string())
+            .bind(uuid::Uuid::new_v4().to_string()).bind("a".repeat(64)).bind("b".repeat(64)).bind("c".repeat(64)).bind("d".repeat(64)).bind(journal)
+            .execute(&pool).await.unwrap();
+        let mut plan = test_plan();
+        for name in [
+            "proposal_current",
+            "approved_proposal",
+            "historical_reference",
+        ] {
+            plan.artifact_paths.insert(
+                name.into(),
+                format!("${{CHAINWORKS_META_ROOT:-.chainworks}}/{name}.json"),
+            );
+            std::fs::write(
+                root.join(format!("{name}.json")),
+                r#"{"status":"approved"}"#,
+            )
+            .unwrap();
+            let condition = orchestrator
+                .evaluate_artifact_exists_classified(name, &run, &plan)
+                .await;
+            assert_eq!(condition.result, CandidateTransitionResult::MissingInput);
+            assert!(orchestrator
+                .read_artifact_field(name, "status", &run, &plan)
+                .await
+                .is_none());
+            assert!(orchestrator
+                .read_artifact_json(name, &run, &plan)
+                .await
+                .is_none());
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

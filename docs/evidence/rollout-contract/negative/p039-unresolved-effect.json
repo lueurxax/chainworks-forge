@@ -1,0 +1,10 @@
+{
+  "schema_version": "p039_negative_case_v1",
+  "fixture_kind": "design_expectation",
+  "case_id": "CF-08",
+  "condition": "headless_workspace_open_outcome_unknown",
+  "expected_decision": "hold",
+  "expected_reason": "headless_effect_unresolved",
+  "expected_successor_count": 0,
+  "replay_permitted": false
+}

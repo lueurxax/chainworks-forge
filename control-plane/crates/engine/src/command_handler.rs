@@ -2838,8 +2838,15 @@ impl CommandHandler {
             anyhow::bail!("forbidden: P083 lifecycle commands require operator principal");
         }
 
+        if let Command::StartRun(ref start) = cmd {
+            runs::check_continuation_start_guard(&self.pool, start.idea_id).await?;
+        }
+
         // ── Command journal: record before execution (proposal §6.4) ────────
         let journal = CommandJournalEntry::new(&cmd, &caller);
+        if let Some(run_id) = journal.run_id.as_deref() {
+            db::repos::run_continuations::check_source_guard(&self.pool, run_id).await?;
+        }
         if !journal.is_recorded_in_command_transaction() {
             // INSERT is mandatory — fail closed (P029 §P2-005)
             command_journal::record(
@@ -3623,6 +3630,12 @@ impl CommandHandler {
             )),
 
             Command::ApproveStage(c) => {
+                let p039 = crate::run_carry_forward::approval::resolution_evidence(
+                    &self.pool,
+                    c.run_id,
+                    &c.stage_id,
+                )
+                .await?;
                 let now = Utc::now();
                 let has_post_tasks = self
                     .check_has_post_approval_tasks(c.run_id, &c.stage_id)
@@ -3635,6 +3648,7 @@ impl CommandHandler {
                 let pending = approvals::list_by_run_tx(&mut tx, c.run_id).await?;
                 let approval = if let Some(approval) = pending.into_iter().find(|a| {
                     a.stage_id == c.stage_id
+                        && p039.as_ref().is_none_or(|fresh| fresh.approval_id == a.id)
                         && matches!(
                             a.decision,
                             ApprovalDecision::Pending | ApprovalDecision::Requested
@@ -3655,6 +3669,15 @@ impl CommandHandler {
                     return Err(error);
                 };
 
+                if let Some(ref p039) = p039 {
+                    db::repos::run_continuation_approvals::validate_resolution_tx(
+                        &mut tx,
+                        approval.id,
+                        p039.stage,
+                        &p039.evidence,
+                    )
+                    .await?;
+                }
                 approvals::resolve_tx(
                     &mut tx,
                     approval.id,
@@ -3666,10 +3689,11 @@ impl CommandHandler {
 
                 let mut stage_status_event = None;
                 let run_stages = stages::list_by_run_tx(&mut tx, c.run_id).await?;
-                if let Some(stage) = run_stages
-                    .iter()
-                    .find(|s| s.stage_id == c.stage_id && s.status == StageStatus::WaitingApproval)
-                {
+                if let Some(stage) = run_stages.iter().find(|s| {
+                    s.stage_id == c.stage_id
+                        && s.status == StageStatus::WaitingApproval
+                        && p039.as_ref().is_none_or(|fresh| fresh.stage == s.id)
+                }) {
                     if stage.stage_type.as_deref() == Some("manual_gate") {
                         // P044 §3d: If post-approval tasks exist, set stage to Running
                         // so the orchestrator can enqueue them. Otherwise settle as Completed.
@@ -3742,6 +3766,12 @@ impl CommandHandler {
             }
 
             Command::RejectStage(c) => {
+                let p039 = crate::run_carry_forward::approval::resolution_evidence(
+                    &self.pool,
+                    c.run_id,
+                    &c.stage_id,
+                )
+                .await?;
                 let now = Utc::now();
                 let tx_started = Instant::now();
                 let mut tx = self
@@ -3751,6 +3781,7 @@ impl CommandHandler {
                 let pending = approvals::list_by_run_tx(&mut tx, c.run_id).await?;
                 let approval = if let Some(approval) = pending.into_iter().find(|a| {
                     a.stage_id == c.stage_id
+                        && p039.as_ref().is_none_or(|fresh| fresh.approval_id == a.id)
                         && matches!(
                             a.decision,
                             ApprovalDecision::Pending | ApprovalDecision::Requested
@@ -3771,6 +3802,15 @@ impl CommandHandler {
                     return Err(error);
                 };
 
+                if let Some(ref p039) = p039 {
+                    db::repos::run_continuation_approvals::validate_resolution_tx(
+                        &mut tx,
+                        approval.id,
+                        p039.stage,
+                        &p039.evidence,
+                    )
+                    .await?;
+                }
                 approvals::resolve_tx(
                     &mut tx,
                     approval.id,
@@ -3786,10 +3826,11 @@ impl CommandHandler {
                 // the state machine can route normal loopbacks such as state_6 -> state_5.
                 // Non-manual stages retain the existing rejection-as-blocked behavior.
                 let run_stages = stages::list_by_run_tx(&mut tx, c.run_id).await?;
-                if let Some(stage) = run_stages
-                    .iter()
-                    .find(|s| s.stage_id == c.stage_id && s.status == StageStatus::WaitingApproval)
-                {
+                if let Some(stage) = run_stages.iter().find(|s| {
+                    s.stage_id == c.stage_id
+                        && s.status == StageStatus::WaitingApproval
+                        && p039.as_ref().is_none_or(|fresh| fresh.stage == s.id)
+                }) {
                     if stage.stage_type.as_deref() == Some("manual_gate") {
                         stages::settle_tx(&mut tx, stage.id, StageSettlementKind::Completed, now)
                             .await?;
@@ -6052,6 +6093,12 @@ impl CommandHandler {
                 };
                 let mut p083_active_gen = p083_generation;
 
+                let p039 = crate::run_carry_forward::approval::resolution_evidence(
+                    &self.pool,
+                    c.run_id,
+                    &c.stage_id,
+                )
+                .await?;
                 let has_post_tasks = if decision == ApprovalDecision::Granted {
                     self.check_has_post_approval_tasks(c.run_id, &c.stage_id)
                         .await
@@ -6254,6 +6301,15 @@ impl CommandHandler {
                 let authoritative_stage_id = approval.stage_id.clone();
 
                 // Approval is actionable: record in command_journal inside the transaction.
+                if let Some(ref p039) = p039 {
+                    db::repos::run_continuation_approvals::validate_resolution_tx(
+                        &mut tx,
+                        approval.id,
+                        p039.stage,
+                        &p039.evidence,
+                    )
+                    .await?;
+                }
                 record_command_journal_tx(&mut tx, journal).await?;
 
                 approvals::resolve_tx(&mut tx, approval.id, decision.clone(), now, c.rationale)
@@ -6267,6 +6323,7 @@ impl CommandHandler {
                     if let Some(stage) = run_stages.iter().find(|s| {
                         s.stage_id == authoritative_stage_id
                             && s.status == StageStatus::WaitingApproval
+                            && p039.as_ref().is_none_or(|fresh| fresh.stage == s.id)
                     }) {
                         if stage.stage_type.as_deref() == Some("manual_gate") {
                             if has_post_tasks {
@@ -6294,6 +6351,7 @@ impl CommandHandler {
                     if let Some(stage) = run_stages.iter().find(|s| {
                         s.stage_id == authoritative_stage_id
                             && s.status == StageStatus::WaitingApproval
+                            && p039.as_ref().is_none_or(|fresh| fresh.stage == s.id)
                     }) {
                         if stage.stage_type.as_deref() == Some("manual_gate") {
                             stages::settle_tx(

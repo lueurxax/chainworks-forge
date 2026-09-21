@@ -29,6 +29,7 @@ pub struct McpServer {
     storage_writer_heartbeat: Option<Arc<DbWriterHeartbeat>>,
     // P081 Phase 3: shared immutable boundary policy service injected at daemon startup.
     boundary_policy: Option<Arc<auth::boundary::BoundaryPolicy>>,
+    continuation_service: Option<Arc<dyn tools::run_continuations::ContinuationService>>,
 }
 
 fn embedded_shadow_boundary_policy() -> Arc<auth::boundary::BoundaryPolicy> {
@@ -154,6 +155,16 @@ async fn rollout_contract_readback_lanes_json(
 }
 
 impl McpServer {
+    fn continuation_readback_config(&self) -> engine::run_carry_forward::readback::ReadbackConfig {
+        engine::run_carry_forward::readback::ReadbackConfig {
+            enabled: self
+                .continuation_service
+                .as_ref()
+                .is_some_and(|service| service.admission_enabled()),
+            reconcile_available: self.continuation_service.is_some(),
+        }
+    }
+
     pub fn new(
         pool: SqlitePool,
         cmd_handler: Arc<CommandHandler>,
@@ -168,6 +179,7 @@ impl McpServer {
             events: None,
             storage_writer_heartbeat: None,
             boundary_policy: Some(embedded_shadow_boundary_policy()),
+            continuation_service: None,
         }
     }
 
@@ -186,6 +198,7 @@ impl McpServer {
             events: None,
             storage_writer_heartbeat: Some(storage_writer_heartbeat),
             boundary_policy: Some(embedded_shadow_boundary_policy()),
+            continuation_service: None,
         }
     }
 
@@ -205,6 +218,7 @@ impl McpServer {
             events: None,
             storage_writer_heartbeat: Some(storage_writer_heartbeat),
             boundary_policy: Some(boundary_policy),
+            continuation_service: None,
         }
     }
 
@@ -223,6 +237,7 @@ impl McpServer {
             events: Some(events),
             storage_writer_heartbeat: None,
             boundary_policy: Some(embedded_shadow_boundary_policy()),
+            continuation_service: None,
         }
     }
 
@@ -230,6 +245,14 @@ impl McpServer {
     /// Call this after construction; the daemon chains it on the existing constructor.
     pub fn with_boundary_policy(mut self, policy: Arc<auth::boundary::BoundaryPolicy>) -> Self {
         self.boundary_policy = Some(policy);
+        self
+    }
+
+    pub fn with_continuation_service(
+        mut self,
+        service: Arc<dyn tools::run_continuations::ContinuationService>,
+    ) -> Self {
+        self.continuation_service = Some(service);
         self
     }
 
@@ -274,18 +297,7 @@ impl McpServer {
                         "p080_mcp_parser_rejected_total",
                         "stdio_line_too_long",
                     );
-                    let resp = JsonRpcResponse {
-                        jsonrpc: "2.0".to_string(),
-                        id: None,
-                        result: Some(serde_json::json!({
-                            "schema_version": "p080_error_response_v1",
-                            "code": "request_too_large",
-                            "message": "stdio line exceeds 256 KiB limit; request rejected",
-                            "retry_after": null,
-                            "readback": null,
-                        })),
-                        error: None,
-                    };
+                    let resp = stdio_line_error_response(&e);
                     write_json_line(&stdout, &resp).await;
                     continue;
                 }
@@ -297,10 +309,21 @@ impl McpServer {
                 continue;
             }
 
+            let raw = match stdio_request_check(&line) {
+                Ok(raw) => raw,
+                Err(response) => {
+                    write_json_line(&stdout, &response).await;
+                    continue;
+                }
+            };
             // SEC-P080-HIGH-001: duplicate-key rejection at the raw-parse boundary for ALL
             // JSON-RPC requests (mirrors HTTP transport). Runs before typed extraction so
             // unicode-escaped method/name values cannot bypass last-value-wins rejection.
-            if let Some(dup_key) = crate::http::find_duplicate_json_object_key(trimmed) {
+            if let Some(dup_key) = raw.duplicate_key.or_else(|| {
+                (!raw.is_continuation)
+                    .then(|| crate::http::find_duplicate_json_object_key(trimmed))
+                    .flatten()
+            }) {
                 if dup_key == "__budget_exceeded__" {
                     db::metrics::increment_counter_with_label(
                         "p080_mcp_canonicalization_budget_exceeded_total",
@@ -462,21 +485,24 @@ impl McpServer {
                 {
                     Ok(current) => current,
                     Err(_) => {
-                        let resp = JsonRpcResponse::error(
+                        let resp = crate::protocol::authentication_denial(
                             request.id.clone(),
-                            -32000,
-                            "unauthorized".to_string(),
+                            raw.is_continuation,
                         );
                         write_json_line(&stdout, &resp).await;
                         break;
                     }
                 },
                 _ => {
-                    let resp = JsonRpcResponse::error(
-                        request.id.clone(),
-                        -32002,
-                        "server not initialized".to_string(),
-                    );
+                    let resp = if raw.is_continuation {
+                        crate::protocol::authentication_denial(request.id.clone(), true)
+                    } else {
+                        JsonRpcResponse::error(
+                            request.id.clone(),
+                            -32002,
+                            "server not initialized".into(),
+                        )
+                    };
                     write_json_line(&stdout, &resp).await;
                     break;
                 }
@@ -728,11 +754,15 @@ impl McpServer {
                         }
                     })
                     .map(|t| {
-                        serde_json::json!({
+                        let mut value = serde_json::json!({
                             "name": t.name,
                             "description": t.description,
                             "inputSchema": t.input_schema
-                        })
+                        });
+                        if tools::run_continuations::is_tool(&t.name) {
+                            value["outputSchema"] = t.output_schema.expect("P039 output schema");
+                        }
+                        value
                     })
                     .collect();
 
@@ -757,6 +787,20 @@ impl McpServer {
                     );
                 };
                 let canonical_tool_name = tools::canonical_tool_name(&tool_name);
+
+                // P039 owns caller_request_id UUIDv4 and its typed result. Do not
+                // enter the generic UUIDv7 precheck or journal-result wrapper.
+                if tools::run_continuations::is_tool(canonical_tool_name) {
+                    return self
+                        .handle_continuation_call(
+                            id,
+                            &req.jsonrpc,
+                            canonical_tool_name,
+                            params,
+                            principal,
+                        )
+                        .await;
+                }
 
                 if !tools::p064_operator_tool_enabled(canonical_tool_name) {
                     // Tool exists but is disabled by P064 feature gate → -32601 (same as unknown).
@@ -1393,6 +1437,15 @@ impl McpServer {
             .into_iter()
             .filter(|id| tools::p064_operator_tool_enabled(&tools::mcp_tool_for(*id).name))
             .map(tools::mcp_tool_for)
+            .filter(|tool| {
+                !tools::run_continuations::is_tool(&tool.name)
+                    || tools::run_continuations::authorize(
+                        &tool.name,
+                        principal,
+                        self.boundary_policy.as_deref(),
+                    )
+                    .is_ok()
+            })
             .map(tools::codex_compatible_tool)
             .chain(
                 principal
@@ -1453,6 +1506,55 @@ impl McpServer {
     }
 
     async fn read_resource_for_principal(
+        &self,
+        uri: &str,
+        principal: &auth::Principal,
+    ) -> anyhow::Result<serde_json::Value> {
+        let mut value = self.read_resource_inner(uri, principal).await?;
+        let resource_run = uri
+            .strip_prefix("run://")
+            .or_else(|| uri.strip_prefix("report://"))
+            .or_else(|| uri.strip_prefix("chainworks://runs/"))
+            .and_then(|id| id.parse::<domain::ids::RunId>().ok());
+        let rows = if uri == "chainworks://runs" {
+            value
+                .as_array_mut()
+                .expect("run resource collection")
+                .as_mut_slice()
+        } else if resource_run.is_some() {
+            std::slice::from_mut(&mut value)
+        } else {
+            return Ok(value);
+        };
+        for row in rows {
+            let run_id = resource_run.or_else(|| row["id"].as_str().and_then(|id| id.parse().ok()));
+            if let Some(run_id) = run_id {
+                let fields = tools::run_continuations::compact_fields(
+                    &self.pool,
+                    run_id,
+                    principal,
+                    self.continuation_readback_config(),
+                )
+                .await?;
+                let fields = fields.as_object().expect("compact fields");
+                if uri.starts_with("report://") {
+                    if let Some(artifacts) = row["artifacts"].as_array_mut() {
+                        for artifact in artifacts {
+                            if let Some(object) = artifact.as_object_mut() {
+                                object.extend(fields.clone());
+                            }
+                        }
+                    }
+                }
+                if let Some(object) = row.as_object_mut() {
+                    object.extend(fields.clone());
+                }
+            }
+        }
+        Ok(value)
+    }
+
+    async fn read_resource_inner(
         &self,
         uri: &str,
         principal: &auth::Principal,
@@ -1793,6 +1895,73 @@ impl McpServer {
         Ok(value)
     }
 
+    async fn handle_continuation_call(
+        &self,
+        id: Option<serde_json::Value>,
+        jsonrpc: &str,
+        tool: &str,
+        params: serde_json::Value,
+        principal: &auth::Principal,
+    ) -> JsonRpcResponse {
+        use tools::run_continuations::{self, ContinuationServiceError};
+        let row = match run_continuations::authorize(
+            tool,
+            principal,
+            self.boundary_policy.as_deref(),
+        ) {
+            Ok(row) => row,
+            Err(error) => {
+                // Denial auditing is not continuation admission or a replay lookup.
+                if let Err(e) = write_mcp_deny_audit(
+                    &self.pool,
+                    self.boundary_policy.as_deref(),
+                    principal,
+                    "mcp_tools_call",
+                    tool,
+                    "CAPABILITY_OUT_OF_SCOPE",
+                    None,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "P039 denial audit unavailable; access remains denied");
+                }
+                return run_continuations::error_response(id, principal, &error.into());
+            }
+        };
+        if jsonrpc != "2.0"
+            || params.as_object().is_none_or(|map| {
+                map.keys()
+                    .any(|key| !matches!(key.as_str(), "name" | "arguments"))
+            })
+        {
+            return run_continuations::error_response(
+                id,
+                principal,
+                &ContinuationServiceError::InvalidParams.into(),
+            );
+        }
+        let result = crate::request_context::scope_boundary_row_id(
+            row,
+            run_continuations::execute(
+                tool,
+                params["arguments"].clone(),
+                &self.pool,
+                principal,
+                self.continuation_service.as_deref(),
+            ),
+        )
+        .await;
+        match result {
+            Ok(result) => JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "content":[{"type":"text","text":result.to_string()}]
+                }),
+            ),
+            Err(error) => run_continuations::error_response(id, principal, &error),
+        }
+    }
+
     async fn dispatch_tool(
         &self,
         tool_name: &str,
@@ -1805,7 +1974,15 @@ impl McpServer {
         if tool_name.starts_with("ideas.") {
             tools::ideas::execute(tool_name, params, pool, cmd, principal).await
         } else if tool_name.starts_with("runs.") {
-            tools::runs::execute(tool_name, params, pool, cmd, principal).await
+            tools::runs::execute_with_readback_config(
+                tool_name,
+                params,
+                pool,
+                cmd,
+                principal,
+                self.continuation_readback_config(),
+            )
+            .await
         } else if tool_name.starts_with("approvals.") {
             tools::approvals::execute(tool_name, params, pool, cmd, principal).await
         } else if tool_name.starts_with("stages.")
@@ -1815,7 +1992,15 @@ impl McpServer {
         {
             tools::stages::execute(tool_name, params, pool, cmd, principal).await
         } else if tool_name.starts_with("reports.") {
-            tools::reports::execute(tool_name, params, pool, cmd, principal).await
+            tools::reports::execute_with_readback_config(
+                tool_name,
+                params,
+                pool,
+                cmd,
+                principal,
+                self.continuation_readback_config(),
+            )
+            .await
         } else if tool_name.starts_with("artifacts.") {
             tools::artifacts::execute(tool_name, params, pool, cmd, principal).await
         } else if tool_name.starts_with("steward.") {
@@ -1889,9 +2074,69 @@ impl McpServer {
 
 // ── SEC-MED-001: stdio line size cap ─────────────────────────────────────────
 
-/// Hard per-line byte cap for MCP stdio transport. Matches HTTP body limit so
-/// both transports enforce the same maximum request size. (SEC-MED-001)
-pub(crate) const MCP_STDIO_LINE_LIMIT_BYTES: usize = 256 * 1024;
+/// Payload cap plus CRLF framing; the shared raw check enforces 1 MiB of JSON.
+pub(crate) const MCP_STDIO_LINE_LIMIT_BYTES: usize = 1024 * 1024 + 2;
+
+fn stdio_payload(line: &str) -> &str {
+    match line.strip_suffix('\n') {
+        Some(payload) => payload.strip_suffix('\r').unwrap_or(payload),
+        None => line,
+    }
+}
+
+fn stdio_request_check(line: &str) -> Result<crate::protocol::RawRequestCheck, JsonRpcResponse> {
+    if line.len() > 256 * 1024 && is_complete_legacy_request(line.as_bytes()) {
+        return Err(legacy_stdio_capacity_response());
+    }
+    let raw = crate::protocol::check_raw_request(stdio_payload(line).as_bytes())?;
+    Ok(raw)
+}
+
+fn is_complete_legacy_request(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let payload = text.trim_matches([' ', '\t', '\r', '\n']);
+    crate::protocol::check_raw_request(payload.as_bytes()).is_ok_and(|raw| !raw.is_continuation)
+}
+
+fn legacy_stdio_capacity_response() -> JsonRpcResponse {
+    JsonRpcResponse::success(
+        None,
+        serde_json::json!({
+            "schema_version": "p080_error_response_v1",
+            "code": "request_too_large",
+            "message": "stdio line exceeds 256 KiB limit; request rejected",
+            "retry_after": null,
+            "readback": null
+        }),
+    )
+}
+
+#[derive(Debug)]
+struct LegacyStdioCapacity;
+
+impl std::fmt::Display for LegacyStdioCapacity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("legacy stdio request exceeds 256 KiB")
+    }
+}
+
+impl std::error::Error for LegacyStdioCapacity {}
+
+fn stdio_line_error_response(error: &std::io::Error) -> JsonRpcResponse {
+    if error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<LegacyStdioCapacity>())
+    {
+        return legacy_stdio_capacity_response();
+    }
+    JsonRpcResponse::error(
+        None,
+        -32602,
+        "stdio request exceeds 1 MiB or contains invalid UTF-8".into(),
+    )
+}
 
 /// Read one newline-terminated line from `reader` into `buf`, capped at `limit` bytes.
 ///
@@ -1902,8 +2147,8 @@ pub(crate) const MCP_STDIO_LINE_LIMIT_BYTES: usize = 256 * 1024;
 ///   continue reading subsequent lines. `buf` is cleared before returning.
 /// - `Err(e)` (any other kind): underlying I/O error; caller should propagate or close.
 ///
-/// Unlike `AsyncBufReadExt::read_line`, this function never allocates more than
-/// `limit + chunk` bytes, preventing memory exhaustion from unterminated oversized lines.
+/// Unlike `AsyncBufReadExt::read_line`, this function retains only a bounded prefix
+/// and drains oversized input without accumulating the full line.
 async fn stdio_read_line_limited<R>(
     reader: &mut R,
     buf: &mut String,
@@ -1915,18 +2160,25 @@ where
     use tokio::io::AsyncBufReadExt as _;
     buf.clear();
     let mut total: usize = 0;
+    let mut bytes = Vec::new();
 
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
-            return Ok(total); // EOF
+            break;
         }
 
         let newline_pos = available.iter().position(|&b| b == b'\n');
         let chunk_end = newline_pos.map_or(available.len(), |p| p + 1);
 
         if total + chunk_end > limit {
-            // Over limit: drain to the end of this line without appending to buf.
+            // Retain only the bounded prefix. Legacy classification is conclusive
+            // only if that prefix is a complete request and the tail is whitespace.
+            let retained = limit - total;
+            bytes.extend_from_slice(&available[..retained]);
+            let mut whitespace_tail = available[retained..chunk_end]
+                .iter()
+                .all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
             let drain = chunk_end;
             reader.consume(drain);
             if newline_pos.is_none() {
@@ -1938,6 +2190,9 @@ where
                     }
                     let nl = a.iter().position(|&b| b == b'\n');
                     let d = nl.map_or(a.len(), |p| p + 1);
+                    whitespace_tail &= a[..d]
+                        .iter()
+                        .all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
                     reader.consume(d);
                     if nl.is_some() {
                         break;
@@ -1945,27 +2200,175 @@ where
                 }
             }
             buf.clear();
+            if whitespace_tail && is_complete_legacy_request(&bytes) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    LegacyStdioCapacity,
+                ));
+            }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("stdio line exceeds {limit} byte limit"),
             ));
         }
 
-        // Safe to append: lossy UTF-8 so malformed bytes don't abort valid requests.
-        match std::str::from_utf8(&available[..chunk_end]) {
-            Ok(s) => buf.push_str(s),
-            Err(_) => buf.push_str(&String::from_utf8_lossy(&available[..chunk_end])),
-        }
+        // Decode once: UTF-8 codepoints can span reader chunks. Lossy decoding
+        // would alter caller intent and could disguise duplicate Unicode keys.
+        bytes.extend_from_slice(&available[..chunk_end]);
         total += chunk_end;
         reader.consume(chunk_end);
 
         if newline_pos.is_some() {
-            return Ok(total); // Complete line
+            break;
         }
     }
+    *buf = String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid UTF-8 in stdio request",
+        )
+    })?;
+    Ok(total)
 }
 
 // ── P081 AC-13: MCP command idempotency helpers ──────────────────────────────
+
+#[cfg(test)]
+mod p039_stdio_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn p039_stdio_preserves_legacy_capacity_envelope_without_relaxing_p039() {
+        for bytes in [256 * 1024 + 1, 1024 * 1024 + 100] {
+            for (name, legacy) in [("runs.get", true), ("runs.continuation_get", false)] {
+                let mut payload = serde_json::json!({"jsonrpc":"2.0","id":39,"method":"tools/call",
+                    "params":{"name":name,"arguments":{}}})
+                .to_string();
+                payload.push_str(&" ".repeat(bytes - payload.len()));
+                let framed = format!("{payload}\n{{}}\n");
+                let mut reader = BufReader::with_capacity(17, framed.as_bytes());
+                let mut line = String::new();
+                let response = match stdio_read_line_limited(
+                    &mut reader,
+                    &mut line,
+                    MCP_STDIO_LINE_LIMIT_BYTES,
+                )
+                .await
+                {
+                    Ok(_) => stdio_request_check(&line).err(),
+                    Err(error) => Some(stdio_line_error_response(&error)),
+                };
+                if legacy {
+                    let response = response.expect("legacy ceiling is still 256 KiB");
+                    assert!(response.error.is_none(), "{response:?}");
+                    let result = response.result.unwrap();
+                    assert_eq!(result["schema_version"], "p080_error_response_v1");
+                    assert_eq!(result["code"], "request_too_large");
+                    assert_eq!(result.get("retry_after"), Some(&serde_json::Value::Null));
+                    assert_eq!(result.get("readback"), Some(&serde_json::Value::Null));
+                } else if bytes <= 1024 * 1024 {
+                    assert!(response.is_none());
+                } else {
+                    let response = response.unwrap();
+                    assert_eq!(response.error.unwrap().code, -32602);
+                    assert!(response.result.is_none());
+                }
+                stdio_read_line_limited(&mut reader, &mut line, MCP_STDIO_LINE_LIMIT_BYTES)
+                    .await
+                    .unwrap();
+                assert_eq!(line, "{}\n");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn p039_stdio_raw_guard_runs_on_exact_utf8_across_single_byte_chunks() {
+        let raw = "{\"params\":{\"name\":\"runs.continuation_get\",\"arguments\":{\"é\":0,\"\\u00e9\":1}}}\n";
+        let mut reader = BufReader::with_capacity(1, raw.as_bytes());
+        let mut line = String::new();
+        stdio_read_line_limited(&mut reader, &mut line, MCP_STDIO_LINE_LIMIT_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(line, raw);
+        assert_eq!(
+            crate::protocol::check_raw_request(line.trim_end().as_bytes())
+                .err()
+                .unwrap()
+                .error
+                .unwrap()
+                .code,
+            -32602
+        );
+        let mut reader = BufReader::with_capacity(1, &b"\xff\n{}\n"[..]);
+        assert_eq!(
+            stdio_read_line_limited(&mut reader, &mut line, 1024)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(line.is_empty());
+        stdio_read_line_limited(&mut reader, &mut line, 1024)
+            .await
+            .unwrap();
+        assert_eq!(line, "{}\n");
+    }
+
+    #[tokio::test]
+    async fn p039_stdio_unclassified_overflow_never_uses_legacy_envelope() {
+        let prefix = r#"{"params":{"name":"runs.get"}}"#;
+        for suffix in [r#"{"params":{"name":"runs.continuation_get"}}"#, "\u{00a0}"] {
+            let framed = format!(
+                "{prefix}{}{suffix}\n{{}}\n",
+                " ".repeat(MCP_STDIO_LINE_LIMIT_BYTES)
+            );
+            let mut reader = BufReader::with_capacity(17, framed.as_bytes());
+            let mut line = String::new();
+            let error = stdio_read_line_limited(&mut reader, &mut line, MCP_STDIO_LINE_LIMIT_BYTES)
+                .await
+                .unwrap_err();
+            let response = stdio_line_error_response(&error);
+            assert_eq!(response.error.unwrap().code, -32602);
+            assert!(response.result.is_none());
+            stdio_read_line_limited(&mut reader, &mut line, MCP_STDIO_LINE_LIMIT_BYTES)
+                .await
+                .unwrap();
+            assert_eq!(line, "{}\n");
+        }
+    }
+
+    #[tokio::test]
+    async fn p039_stdio_budget_drains_and_permits_exact_one_mib_plus_framing() {
+        let mut raw = "{\"params\":{\"name\":\"runs.continuation_get\"}}".to_string();
+        raw.push_str(&" ".repeat(1024 * 1024 - raw.len()));
+        let framed = format!("{raw}\r\n");
+        let mut reader = BufReader::with_capacity(17, framed.as_bytes());
+        let mut line = String::new();
+        stdio_read_line_limited(&mut reader, &mut line, MCP_STDIO_LINE_LIMIT_BYTES)
+            .await
+            .unwrap();
+        assert!(crate::protocol::check_raw_request(stdio_payload(&line).as_bytes()).is_ok());
+        assert!(crate::protocol::check_raw_request(
+            stdio_payload(&format!("{raw}\r\r\n")).as_bytes()
+        )
+        .is_err());
+        assert!(
+            crate::protocol::check_raw_request(stdio_payload(&format!("{raw}\r")).as_bytes())
+                .is_err()
+        );
+        let too_large = format!("{raw}xx\r\n{{}}\n");
+        let mut reader = BufReader::new(too_large.as_bytes());
+        assert!(
+            stdio_read_line_limited(&mut reader, &mut line, MCP_STDIO_LINE_LIMIT_BYTES)
+                .await
+                .is_err()
+        );
+        stdio_read_line_limited(&mut reader, &mut line, MCP_STDIO_LINE_LIMIT_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(line, "{}\n");
+    }
+}
 
 /// Returns true if this tool is state-changing and requires an idempotency key.
 /// P081 AC-13: all tools that perform durable DB or filesystem writes must be
@@ -2571,6 +2974,12 @@ async fn write_mcp_deny_audit(
 }
 
 fn resource_template_id_for_uri(uri: &str) -> Option<ResourceTemplateId> {
+    if uri
+        .strip_prefix("chainworks://runs/")
+        .is_some_and(|id| id.parse::<domain::ids::RunId>().is_ok())
+    {
+        return Some(ResourceTemplateId::RunEntity);
+    }
     auth::all_resource_templates()
         .into_iter()
         .find(|id| uri_matches_template(uri, resource_template_uri(*id)))

@@ -10,6 +10,9 @@ pub use domain::{CapabilityToolId, PrincipalClass, ResourceTemplateId};
 /// P081 Phase 1: boundary matrix fixture loading and validation.
 pub mod boundary;
 
+#[cfg(test)]
+mod p039_tests;
+
 // ── P081 Phase 2: CallerClass and CallerContext ──────────────────────────
 
 /// P081 Phase 2: Request-scoped caller classification derived from principal,
@@ -1500,12 +1503,53 @@ mod xcode_operator_tests {
     }
 }
 
+fn is_p039_mutation(id: CapabilityToolId) -> bool {
+    matches!(
+        id,
+        CapabilityToolId::RunsContinueBlocked
+            | CapabilityToolId::RunsContinuationActivate
+            | CapabilityToolId::RunsContinuationReconcile
+            | CapabilityToolId::RunsContinuationAbort
+    )
+}
+
+fn is_p039_capability(id: CapabilityToolId) -> bool {
+    is_p039_mutation(id)
+        || matches!(
+            id,
+            CapabilityToolId::RunsContinuationPreview | CapabilityToolId::RunsContinuationGet
+        )
+}
+
+/// P039 mutation eligibility for an already freshly authenticated principal.
+/// Call on every request/replay; a cached Principal cannot prove non-revocation.
+/// BoundaryPolicy and canonical source admission remain service responsibilities.
+/// MCP Operators normally derive AgentOperator; that is not a provider Agent.
+pub fn require_p039_mutation(
+    principal: &Principal,
+    capability: CapabilityToolId,
+) -> Result<(), &'static str> {
+    if !is_p039_mutation(capability)
+        || principal.class != PrincipalClass::Operator
+        || principal.run_scope.is_some()
+        || !principal.tool_capabilities.contains(&capability)
+        || !matches!(
+            derive_caller_class_for_mcp(principal),
+            CallerClass::UiOperator | CallerClass::AgentOperator
+        )
+    {
+        return Err("p039_mutation_not_authorized");
+    }
+    Ok(())
+}
+
 pub fn filter_tools(principal: &Principal, ids: &[CapabilityToolId]) -> Vec<CapabilityToolId> {
     ids.iter()
         .copied()
         .filter(|id| {
             tool_allowed_for_class(&principal.class, *id)
                 && principal.tool_capabilities.contains(id)
+                && (!is_p039_mutation(*id) || require_p039_mutation(principal, *id).is_ok())
         })
         .collect()
 }
@@ -1535,18 +1579,26 @@ fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolI
     all_tool_capabilities()
         .into_iter()
         .filter(|id| {
-            *id != CapabilityToolId::XcodeGlobalAdmin && tool_allowed_for_class(class, *id)
+            *id != CapabilityToolId::XcodeGlobalAdmin
+                && !is_p039_capability(*id)
+                && tool_allowed_for_class(class, *id)
         })
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 61] {
+fn all_tool_capabilities() -> [CapabilityToolId; 67] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
         CapabilityToolId::RunsStart,
         CapabilityToolId::RunsList,
         CapabilityToolId::RunsGet,
+        CapabilityToolId::RunsContinuationPreview,
+        CapabilityToolId::RunsContinueBlocked,
+        CapabilityToolId::RunsContinuationGet,
+        CapabilityToolId::RunsContinuationActivate,
+        CapabilityToolId::RunsContinuationReconcile,
+        CapabilityToolId::RunsContinuationAbort,
         CapabilityToolId::RunsMainSyncRequest,
         CapabilityToolId::RunsMainSyncRetry,
         CapabilityToolId::RunsMainSyncSetOverride,
@@ -1612,6 +1664,19 @@ fn all_tool_capabilities() -> [CapabilityToolId; 61] {
 
 fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool {
     match id {
+        CapabilityToolId::RunsContinuationPreview | CapabilityToolId::RunsContinuationGet => {
+            matches!(
+                class,
+                PrincipalClass::Operator
+                    | PrincipalClass::ReadOnlyOperator
+                    | PrincipalClass::Agent
+                    | PrincipalClass::Observer
+            )
+        }
+        CapabilityToolId::RunsContinueBlocked
+        | CapabilityToolId::RunsContinuationActivate
+        | CapabilityToolId::RunsContinuationReconcile
+        | CapabilityToolId::RunsContinuationAbort => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::XcodeEffectsDiagnostics
         | CapabilityToolId::XcodeEffectsReconcile
         | CapabilityToolId::XcodeProjectTrust
@@ -1862,6 +1927,12 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
         "runs.start" => Some(CapabilityToolId::RunsStart),
         "runs.list" => Some(CapabilityToolId::RunsList),
         "runs.get" => Some(CapabilityToolId::RunsGet),
+        "runs.continuation_preview" => Some(CapabilityToolId::RunsContinuationPreview),
+        "runs.continue_blocked" => Some(CapabilityToolId::RunsContinueBlocked),
+        "runs.continuation_get" => Some(CapabilityToolId::RunsContinuationGet),
+        "runs.continuation_activate" => Some(CapabilityToolId::RunsContinuationActivate),
+        "runs.continuation_reconcile" => Some(CapabilityToolId::RunsContinuationReconcile),
+        "runs.continuation_abort" => Some(CapabilityToolId::RunsContinuationAbort),
         "runs.main_sync.request" => Some(CapabilityToolId::RunsMainSyncRequest),
         "runs.main_sync.retry" => Some(CapabilityToolId::RunsMainSyncRetry),
         "runs.main_sync.set_override" => Some(CapabilityToolId::RunsMainSyncSetOverride),

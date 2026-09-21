@@ -843,6 +843,7 @@ async fn p086_mcp_continue_work_reuses_live_acp_session_and_materializes_termina
             toolchain_home: None,
             toolchain_go_scope_enabled: false,
 
+            approved_metadata_root: None,
             p079_repair_canonical_paths: None,
             input_manifest: None,
         })

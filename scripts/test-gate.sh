@@ -2660,6 +2660,8 @@ Available gates:
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
   proposal-033    Proposal 033 ACP-only runtime architecture gate
   proposal-037    Proposal 037 ACP execution supervision and idle watchdog gate
+  proposal-039-i1,p039-i1  Provider-free carry-forward core experiment (not production migration)
+  proposal-039,p039       Full offline carry-forward integration gate (no live admission)
   proposal-041    Proposal 041 server parity harness and behavioral diff gate
   proposal-042    Proposal 042 daemon lifecycle / supervision / packaging gate (Rust)
   proposal-042-swift  Proposal 042 Swift-side gate (DaemonLifecycleClient + DiagnosticsBundle + PackagedBinary)
@@ -2754,6 +2756,49 @@ if should_wrap_gate_in_terminal_gui_session "$GATE"; then
 fi
 
 case "$GATE" in
+  proposal-039|p039)
+    log "P039: isolated provider-free integration; no live daemon, production DB or Apple calls"
+    export RUST_MIN_STACK=8388608
+    python3 -B "$ROOT_DIR/scripts/test-p039-coverage.py"
+    p039_log="$(mktemp "${TMPDIR:-/tmp}/p039-test-results.XXXXXX")"
+    log "P039 test events: $p039_log"
+    export CHAINWORKS_AUTO_CACHE_CLEANUP=0
+    export CARGO_TARGET_DIR
+    CARGO_TARGET_DIR="$(chainworks_test_gate_cargo_target_dir "${CHAINWORKS_XCODE_CARGO_TARGET_DIR:-target/p039-integration}")"
+    (
+      cd "$ROOT_DIR/control-plane"
+      unset CHAINWORKS_TOOLCHAIN_HOME
+      cargo test --locked --offline -p domain --test proposal_039_contracts --test proposal_039_wire --test proposal_039_preview_hold
+      cargo test --locked --offline -p workflow --test proposal_039_profile
+      cargo test --locked --offline -p acp --lib adapters::p039_metadata_tests::
+      cargo test --locked --offline -p db --test proposal_039_migration_backup --test proposal_039_storage --test proposal_039_fence_coverage --test proposal_039_checked --test proposal_039_inputs --test proposal_039_approval_bindings --test proposal_039_atomicity --test proposal_039_metrics --test proposal_039_queue_progress
+      cargo test --locked --offline -p db --lib operation_registry::
+      cargo test --locked --offline -p engine --test proposal_039_inventory --test proposal_039_materialize --test proposal_039_experiment --test proposal_039_preview --test proposal_039_worker --test proposal_039_finalize --test proposal_039_service --test proposal_039_fences --test proposal_039_readback --test proposal_039_runtime_inputs --test proposal_039_approval_runtime --test proposal_039_headless_admission --test proposal_039_launch --test proposal_039_policy
+      cargo test --locked --offline -p engine --lib run_carry_forward::
+      cargo test --locked --offline -p engine --lib p039_
+      cargo test --locked --offline -p engine --test agent_context_skills invoke_agent_producer_manifest_is_closed_and_each_guard_is_mutation_sensitive -- --exact
+      cargo test --locked --offline -p auth --lib p039_
+      cargo test --locked --offline -p mcp-server --lib p039_
+      cargo test --locked --offline -p mcp-server --test proposal_039_mcp
+      cargo test --locked --offline -p graphql-server --test proposal_039_readback
+      cargo test --locked --offline -p daemon --bin control-plane p039_
+    ) 2>&1 | tee "$p039_log"
+    python3 -B "$ROOT_DIR/scripts/check-p039-coverage.py" "$p039_log"
+    "$ROOT_DIR/scripts/lint-rollout-contract" "$ROOT_DIR/docs/evidence/rollout-contract/p039-rollout-contract.json"
+    ;;
+  proposal-039-i1|p039-i1)
+    log "P039 I1: disposable repositories and SQLite only; no production admission"
+    export CHAINWORKS_AUTO_CACHE_CLEANUP=0
+    export CARGO_TARGET_DIR
+    CARGO_TARGET_DIR="$(chainworks_test_gate_cargo_target_dir "${CHAINWORKS_XCODE_CARGO_TARGET_DIR:-target/p039-i1}")"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test --locked --offline -p domain --test proposal_039_contracts
+      cargo test --locked --offline -p workflow --test proposal_039_profile
+      cargo test --locked --offline -p engine --lib run_carry_forward::
+      cargo test --locked --offline -p engine --test proposal_039_inventory --test proposal_039_materialize --test proposal_039_experiment
+    )
+    ;;
   xcode-headless-host-startup)
     log "Headless host startup gate: offline policy fixtures only"
     export CHAINWORKS_AUTO_CACHE_CLEANUP=0

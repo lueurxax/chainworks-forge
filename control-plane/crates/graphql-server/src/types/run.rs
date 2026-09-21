@@ -21,6 +21,7 @@ use domain::workflow_conflict::{
 use crate::types::p031::{freshness_from_projection_lag, GqlFreshnessState};
 
 #[derive(SimpleObject, Clone, Debug)]
+#[graphql(complex)]
 pub struct GqlRun {
     pub id: ID,
     pub idea_id: ID,
@@ -150,6 +151,32 @@ impl From<Run> for GqlRun {
 }
 
 impl GqlRun {
+    async fn continuation_links(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<domain::run_carry_forward_api::RunCarryForwardLinksV1>> {
+        use engine::run_carry_forward::readback;
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| Error::new("unauthorized"))?;
+        if !readback::can_read_run(principal, self.id.as_str()) {
+            return Ok(None);
+        }
+        let id = self
+            .id
+            .parse()
+            .map_err(|_| Error::new("invalid run identity"))?;
+        let config = ctx
+            .data_opt::<readback::ReadbackConfig>()
+            .copied()
+            .unwrap_or_default();
+        let links =
+            readback::authorized_links(ctx.data::<sqlx::SqlitePool>()?, id, principal, config)
+                .await
+                .map_err(|_| Error::new("carry-forward readback unavailable"))?;
+        Ok((links.incoming.is_some() || links.outgoing.is_some()).then_some(links))
+    }
+
     pub fn from_projection_and_run(projection: RunProjectionRow, run: Run) -> Self {
         let mut gql = GqlRun::from(run);
         gql.status = projection.status;
@@ -164,6 +191,35 @@ impl GqlRun {
         gql.projection_lag = projection.projection_lag;
         gql.freshness_state = freshness_from_projection_lag(gql.projection_lag);
         gql
+    }
+}
+
+#[ComplexObject]
+impl GqlRun {
+    async fn continued_from_run_id(&self, ctx: &Context<'_>) -> Result<Option<ID>> {
+        Ok(self
+            .continuation_links(ctx)
+            .await?
+            .and_then(|links| links.incoming)
+            .filter(|op| op.phase.as_str() == "activated")
+            .map(|op| ID(op.source_run_id.as_uuid().to_string())))
+    }
+
+    async fn continued_as_run_id(&self, ctx: &Context<'_>) -> Result<Option<ID>> {
+        Ok(self
+            .continuation_links(ctx)
+            .await?
+            .and_then(|links| links.outgoing)
+            .filter(|op| op.phase.as_str() == "activated")
+            .and_then(|op| op.successor_run_id)
+            .map(|id| ID(id.as_uuid().to_string())))
+    }
+
+    async fn carry_forward_readback(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<Json<domain::run_carry_forward_api::RunCarryForwardLinksV1>>> {
+        Ok(self.continuation_links(ctx).await?.map(Json))
     }
 }
 

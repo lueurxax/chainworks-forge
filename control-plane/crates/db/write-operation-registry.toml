@@ -1004,3 +1004,104 @@ class = "A"
 replay_policy = "caller_guarded"
 idempotency_key_kind = "repository operation natural key; queued transaction admission is caller guarded"
 duplicate_application_test_path = "docs/evidence/p075/operation-duplicate-application-matrix.md#workflow-conflicts-upsert-implementation-handoff-status"
+[[operations]]
+operation_name = "run_continuations.reserve"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "(caller_fingerprint, caller_request_id, intent_sha256)"
+duplicate_application_test_path = "crates/db/tests/proposal_039_storage.rs::reservation_is_atomic_replays_original_identity_and_never_creates_a_run"
+[[operations]]
+operation_name = "run_continuations.claim"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "(operation_id, generation, version, step_key)"
+duplicate_application_test_path = "crates/db/tests/proposal_039_storage.rs::preparation_claim_is_single_flight_and_restart_never_repeats_dispatched_step"
+
+[[operations]]
+operation_name = "run_continuations.step"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "(operation_id, generation, version, step_key)"
+duplicate_application_test_path = "crates/db/tests/proposal_039_storage.rs::preparation_claim_is_single_flight_and_restart_never_repeats_dispatched_step"
+
+[[operations]]
+operation_name = "run_continuations.recover"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "(operation_id, generation, version, step_key)"
+duplicate_application_test_path = "crates/db/tests/proposal_039_storage.rs::preparation_claim_is_single_flight_and_restart_never_repeats_dispatched_step"
+
+[[operations]]
+operation_name = "run_continuations.abort"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "(operation_id, generation, version, step_key)"
+duplicate_application_test_path = "crates/db/tests/proposal_039_storage.rs::preparation_claim_is_single_flight_and_restart_never_repeats_dispatched_step"
+
+[[operations]]
+operation_name = "run_continuations.settle_worker"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "(operation_id, generation, version, step_key)"
+duplicate_application_test_path = "crates/db/tests/proposal_039_storage.rs::preparation_claim_is_single_flight_and_restart_never_repeats_dispatched_step"
+[[operations]]
+operation_name = "run_continuations.prepared"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "(operation_id, generation, version, manifest_sha256)"
+duplicate_application_test_path = "crates/db/tests/proposal_039_storage.rs::activation_creates_exactly_one_successor_and_advance_with_historical_source"
+
+[[operations]]
+operation_name = "run_continuations.activate"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "(operation_id, generation, version, manifest_sha256)"
+duplicate_application_test_path = "crates/db/tests/proposal_039_storage.rs::activation_creates_exactly_one_successor_and_advance_with_historical_source"
+[[operations]]
+operation_name = "run_continuation_approvals.create"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "(approval_id, stage_execution_id, evidence_sha256, transition_id)"
+duplicate_application_test_path = "crates/db/tests/proposal_039_approval_bindings.rs::exact_binding_resolution_and_single_dispatch_consumption"
+
+[[operations]]
+operation_name = "run_continuation_approvals.consume"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "(approval_id, stage_execution_id, evidence_sha256, transition_id)"
+duplicate_application_test_path = "crates/db/tests/proposal_039_approval_bindings.rs::exact_binding_resolution_and_single_dispatch_consumption"
+
+[[operations]]
+operation_name = "run_continuation_approvals.pin_snapshot"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "(approval_id, consumed_transition_id, snapshot_artifact_id)"
+duplicate_application_test_path = "crates/db/tests/proposal_039_approval_bindings.rs::snapshot_admission_and_prompt_sent_cas_replay_keep_exact_identity"
+
+[[operations]]
+operation_name = "run_continuation_approvals.admit_execution"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "(approval_id, consumed_transition_id, snapshot_artifact_id, first_execution_id)"
+duplicate_application_test_path = "crates/db/tests/proposal_039_approval_bindings.rs::snapshot_admission_and_prompt_sent_cas_replay_keep_exact_identity"
+
+[[operations]]
+operation_name = "run_continuation_approvals.prompt_sent"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "(approval_id, consumed_transition_id, snapshot_artifact_id, first_execution_id)"
+duplicate_application_test_path = "crates/db/tests/proposal_039_approval_bindings.rs::snapshot_admission_and_prompt_sent_cas_replay_keep_exact_identity"
+
+[[operations]]
+operation_name = "run_continuation_commands.deny"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "(caller_fingerprint, caller_request_id, command, intent_sha256)"
+duplicate_application_test_path = "crates/db/tests/proposal_039_checked.rs::reservation_checks_source_witness_in_its_writer_transaction"
+
+[[operations]]
+operation_name = "run_continuations.reconcile"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "(caller_fingerprint, caller_request_id, command, intent_sha256)"
+duplicate_application_test_path = "crates/db/tests/proposal_039_storage.rs::explicit_reconciliation_records_a_hold_without_retry_or_releasing_unknown_owner"

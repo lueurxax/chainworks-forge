@@ -12,6 +12,8 @@ If you need a current-head orientation first, start with [current-system-baselin
 
 ## Execution Engine
 
+- [blocked-run-carry-forward.md](blocked-run-carry-forward.md) - Fenced historical sources, independent successors, preserved inputs, fresh approval and default-disabled admission
+
 - [workflow-execution-engine.md](workflow-execution-engine.md) — RunPlan compiler, Workflow Orchestrator, Agent Executor protocol, Artifact Manager, Transition Evaluator, Resume Manager, Execution Service, **durable side effects**, **quality-gate blocker boundary routing**, and **lead conflict mediation**
 - [artifact-discovery-and-settlement-optimization.md](artifact-discovery-and-settlement-optimization.md) — Bounded discovery, settlement pipeline, and pre-prompt metadata
 - [runtime-contract.md](runtime-contract.md) — Frozen run snapshots, state machines, artifact model, storage boundaries, resume/retry rules, and **mediation-owned execution identity**

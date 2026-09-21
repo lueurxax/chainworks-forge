@@ -4,6 +4,9 @@ pub mod codex;
 pub mod gemini;
 pub mod junie;
 
+#[cfg(all(test, unix))]
+mod p039_metadata_tests;
+
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
@@ -1246,6 +1249,9 @@ fn chainworks_meta_root_env_value(req: &ExecutionRequest) -> Option<String> {
 }
 
 fn ensure_chainworks_meta_root_launch_dir(req: &ExecutionRequest) -> Result<()> {
+    if let Some(approved) = &req.approved_metadata_root {
+        return approved.prepare_launch(req);
+    }
     let Some(meta_root) = chainworks_meta_root_env_value(req) else {
         return Ok(());
     };
@@ -1274,6 +1280,172 @@ fn ensure_chainworks_meta_root_launch_dir(req: &ExecutionRequest) -> Result<()> 
         create_dir_all_no_symlink_under(&path, &canonical_workspace, "CHAINWORKS_META_ROOT")?;
     }
     Ok(())
+}
+
+impl crate::ApprovedMetadataRoot {
+    /// The engine must first verify canonical activated lineage and hash-pinned
+    /// manifest roots. Opened handles must match the immutable manifest identities,
+    /// not new observations taken after verification. No path alone grants authority.
+    pub fn from_engine_verified_roots(
+        run_id: domain::ids::RunId,
+        agent_execution_id: domain::ids::AgentExecutionId,
+        workspace_root: &Path,
+        worktree_root: &Path,
+        metadata_root: &Path,
+        worktree_identity: (u64, u64),
+        metadata_identity: (u64, u64),
+    ) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            let directories = [
+                Arc::new(open_existing_directory_no_symlink(workspace_root)?),
+                Arc::new(open_existing_directory_no_symlink(worktree_root)?),
+                Arc::new(open_existing_directory_no_symlink(metadata_root)?),
+            ];
+            use std::os::unix::fs::MetadataExt;
+            for (directory, expected) in directories[1..]
+                .iter()
+                .zip([worktree_identity, metadata_identity])
+            {
+                let actual = directory.metadata()?;
+                anyhow::ensure!(
+                    (actual.dev(), actual.ino()) == expected && actual.mode() & 0o777 == 0o700,
+                    "approved metadata root: manifest directory identity or privacy changed"
+                );
+            }
+            Ok(Self {
+                run_id,
+                agent_execution_id,
+                workspace_root: workspace_root.into(),
+                worktree_root: worktree_root.into(),
+                metadata_root: metadata_root.into(),
+                directories,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (
+                run_id,
+                agent_execution_id,
+                workspace_root,
+                worktree_root,
+                metadata_root,
+                worktree_identity,
+                metadata_identity,
+            );
+            bail!("approved metadata root requires no-follow directory handles")
+        }
+    }
+
+    fn prepare_launch(&self, req: &ExecutionRequest) -> Result<()> {
+        anyhow::ensure!(
+            req.run_id == self.run_id
+                && req.agent_execution_id == Some(self.agent_execution_id)
+                && Some(req.workspace_root.as_str()) == self.workspace_root.to_str()
+                && req.worktree_root.as_deref() == self.worktree_root.to_str()
+                && req.chainworks_meta_root.as_deref() == self.metadata_root.to_str(),
+            "approved metadata root: request identity or roots changed"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let verify = || -> Result<()> {
+                for (path, pinned) in [
+                    &self.workspace_root,
+                    &self.worktree_root,
+                    &self.metadata_root,
+                ]
+                .into_iter()
+                .zip(&self.directories)
+                {
+                    let current = open_existing_directory_no_symlink(path)?.metadata()?;
+                    let pinned = pinned.metadata()?;
+                    anyhow::ensure!(
+                        (current.dev(), current.ino()) == (pinned.dev(), pinned.ino()),
+                        "approved metadata root: directory identity changed"
+                    );
+                }
+                Ok(())
+            };
+            verify()?;
+            let root = &self.directories[2];
+            let children = ["artifacts", "context", "state", "summaries"];
+            // Reject preexisting redirects before any directory creation.
+            for child in children {
+                match open_directory_at(root, child) {
+                    Ok(_) => (),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(error) => return Err(error).context("approved metadata child"),
+                }
+            }
+            for child in children {
+                verify()?;
+                use std::os::fd::AsRawFd;
+                let name = std::ffi::CString::new(child)?;
+                // Effects are relative to the pinned exact root, never a fresh
+                // path lookup that could follow a substituted ancestor.
+                let result = unsafe { libc::mkdirat(root.as_raw_fd(), name.as_ptr(), 0o700) };
+                if result != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(error).context("create approved metadata child");
+                    }
+                }
+                open_directory_at(root, child).context("verify approved metadata child")?;
+            }
+            verify()
+        }
+        #[cfg(not(unix))]
+        bail!("approved metadata root requires no-follow directory handles")
+    }
+}
+
+#[cfg(unix)]
+fn open_directory_at(parent: &fs::File, name: &str) -> std::io::Result<fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let name = std::ffi::CString::new(name)?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn open_existing_directory_no_symlink(path: &Path) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    anyhow::ensure!(
+        path.is_absolute(),
+        "approved metadata root: absolute path required"
+    );
+    let mut current = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")?;
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => (),
+            std::path::Component::Normal(name) => {
+                current = open_directory_at(
+                    &current,
+                    name.to_str()
+                        .context("approved metadata root: non-UTF8 path")?,
+                )?;
+            }
+            _ => bail!("approved metadata root: non-canonical path"),
+        }
+    }
+    anyhow::ensure!(
+        fs::canonicalize(path)?.as_os_str() == path.as_os_str(),
+        "approved metadata root: non-canonical path"
+    );
+    Ok(current)
 }
 
 fn create_dir_all_no_symlink_under(path: &Path, canonical_root: &Path, field: &str) -> Result<()> {
@@ -1754,6 +1926,7 @@ mod tests {
             session_generation_id: None,
             provider_session_id: None,
             provider_runtime_home: None,
+            approved_metadata_root: None,
             p079_repair_canonical_paths: None,
             input_manifest: None,
             mcp_servers: Vec::new(),
@@ -1903,6 +2076,7 @@ mod tests {
             session_generation_id: None,
             provider_session_id: None,
             provider_runtime_home: None,
+            approved_metadata_root: None,
             p079_repair_canonical_paths: None,
             input_manifest: None,
             mcp_servers: Vec::new(),
@@ -1969,6 +2143,7 @@ mod tests {
             session_generation_id: None,
             provider_session_id: None,
             provider_runtime_home: None,
+            approved_metadata_root: None,
             p079_repair_canonical_paths: None,
             input_manifest: None,
             mcp_servers: Vec::new(),
@@ -2019,6 +2194,7 @@ mod tests {
             session_generation_id: None,
             provider_session_id: None,
             provider_runtime_home: None,
+            approved_metadata_root: None,
             p079_repair_canonical_paths: None,
             input_manifest: None,
             mcp_servers: Vec::new(),

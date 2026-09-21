@@ -1,0 +1,225 @@
+{
+  "schema_version": "operator_readback_v1",
+  "status": "fail",
+  "backend_decision": "hold",
+  "failure_reasons": [
+    "p039_not_implemented"
+  ],
+  "waiver_state": "none",
+  "waiver_expires_at": null,
+  "waiver": null,
+  "enforcement_mode": "enforce",
+  "enforcement_mode_reason": "admission_disabled_until_provider_free_proof",
+  "hold_conditions": [
+    "p039_offline_proof_missing"
+  ],
+  "rollback_disposition": {
+    "mode": "disable_admission_keep_compatible_fences_and_readers",
+    "data_loss_risk": "low",
+    "steps": [
+      "Disable new continuation preparation and activation.",
+      "Keep source fences, lineage, input readers, files and Git refs intact.",
+      "Reconcile in-flight operations without automatic Git replay or source reactivation.",
+      "Deploy only a build compatible with the P039 schema; no destructive down migration."
+    ]
+  },
+  "source_lane": "run_report",
+  "enabled_state": "enabled",
+  "disabled_reason_code": null,
+  "action_id": "p039-design-fixture",
+  "operator_message": "Carry-forward admission is disabled. This is a design fixture, not a live result.",
+  "projection_integrity": "valid",
+  "cutover_policy_revision": "p039-r2",
+  "diagnostic_redaction": "partial",
+  "next_steps": [
+    "complete_provider_free_proof_and_review"
+  ],
+  "fixture_purpose": "Design-only expected four-lane HOLD readback. Not observed implementation or production evidence.",
+  "proposal_id": "proposal-039",
+  "proposal_revision_id": "p039-r2",
+  "gate": "proposal-039|p039",
+  "parity_lanes": {
+    "run_report": {
+      "schema_version": "operator_readback_v1",
+      "status": "fail",
+      "backend_decision": "hold",
+      "failure_reasons": [
+        "p039_not_implemented"
+      ],
+      "waiver_state": "none",
+      "waiver_expires_at": null,
+      "waiver": null,
+      "enforcement_mode": "enforce",
+      "enforcement_mode_reason": "admission_disabled_until_provider_free_proof",
+      "hold_conditions": [
+        "p039_offline_proof_missing"
+      ],
+      "rollback_disposition": {
+        "mode": "disable_admission_keep_compatible_fences_and_readers",
+        "data_loss_risk": "low",
+        "steps": [
+          "Disable new continuation preparation and activation.",
+          "Keep source fences, lineage, input readers, files and Git refs intact.",
+          "Reconcile in-flight operations without automatic Git replay or source reactivation.",
+          "Deploy only a build compatible with the P039 schema; no destructive down migration."
+        ]
+      },
+      "source_lane": "run_report",
+      "enabled_state": "enabled",
+      "disabled_reason_code": null,
+      "action_id": "p039-design-fixture",
+      "operator_message": "Carry-forward admission is disabled. This is a design fixture, not a live result.",
+      "projection_integrity": "valid",
+      "cutover_policy_revision": "p039-r2",
+      "diagnostic_redaction": "partial",
+      "next_steps": [
+        "complete_provider_free_proof_and_review"
+      ]
+    },
+    "mcp": {
+      "schema_version": "operator_readback_v1",
+      "status": "fail",
+      "backend_decision": "hold",
+      "failure_reasons": [
+        "p039_not_implemented"
+      ],
+      "waiver_state": "none",
+      "waiver_expires_at": null,
+      "waiver": null,
+      "enforcement_mode": "enforce",
+      "enforcement_mode_reason": "admission_disabled_until_provider_free_proof",
+      "hold_conditions": [
+        "p039_offline_proof_missing"
+      ],
+      "rollback_disposition": {
+        "mode": "disable_admission_keep_compatible_fences_and_readers",
+        "data_loss_risk": "low",
+        "steps": [
+          "Disable new continuation preparation and activation.",
+          "Keep source fences, lineage, input readers, files and Git refs intact.",
+          "Reconcile in-flight operations without automatic Git replay or source reactivation.",
+          "Deploy only a build compatible with the P039 schema; no destructive down migration."
+        ]
+      },
+      "source_lane": "mcp",
+      "enabled_state": "enabled",
+      "disabled_reason_code": null,
+      "action_id": "p039-design-fixture",
+      "operator_message": "Carry-forward admission is disabled. This is a design fixture, not a live result.",
+      "projection_integrity": "valid",
+      "cutover_policy_revision": "p039-r2",
+      "diagnostic_redaction": "partial",
+      "next_steps": [
+        "complete_provider_free_proof_and_review"
+      ]
+    },
+    "release_receipt": {
+      "schema_version": "operator_readback_v1",
+      "status": "fail",
+      "backend_decision": "hold",
+      "failure_reasons": [
+        "p039_not_implemented"
+      ],
+      "waiver_state": "none",
+      "waiver_expires_at": null,
+      "waiver": null,
+      "enforcement_mode": "enforce",
+      "enforcement_mode_reason": "admission_disabled_until_provider_free_proof",
+      "hold_conditions": [
+        "p039_offline_proof_missing"
+      ],
+      "rollback_disposition": {
+        "mode": "disable_admission_keep_compatible_fences_and_readers",
+        "data_loss_risk": "low",
+        "steps": [
+          "Disable new continuation preparation and activation.",
+          "Keep source fences, lineage, input readers, files and Git refs intact.",
+          "Reconcile in-flight operations without automatic Git replay or source reactivation.",
+          "Deploy only a build compatible with the P039 schema; no destructive down migration."
+        ]
+      },
+      "source_lane": "release_receipt",
+      "enabled_state": "enabled",
+      "disabled_reason_code": null,
+      "action_id": "p039-design-fixture",
+      "operator_message": "Carry-forward admission is disabled. This is a design fixture, not a live result.",
+      "projection_integrity": "valid",
+      "cutover_policy_revision": "p039-r2",
+      "diagnostic_redaction": "partial",
+      "next_steps": [
+        "complete_provider_free_proof_and_review"
+      ]
+    },
+    "graphql": {
+      "schemaVersion": "operator_readback_v1",
+      "status": "fail",
+      "backendDecision": "hold",
+      "failureReasons": [
+        "p039_not_implemented"
+      ],
+      "waiverState": "none",
+      "waiverExpiresAt": null,
+      "waiver": null,
+      "enforcementMode": "enforce",
+      "enforcementModeReason": "admission_disabled_until_provider_free_proof",
+      "holdConditions": [
+        "p039_offline_proof_missing"
+      ],
+      "rollbackDisposition": {
+        "mode": "disable_admission_keep_compatible_fences_and_readers",
+        "dataLossRisk": "low",
+        "steps": [
+          "Disable new continuation preparation and activation.",
+          "Keep source fences, lineage, input readers, files and Git refs intact.",
+          "Reconcile in-flight operations without automatic Git replay or source reactivation.",
+          "Deploy only a build compatible with the P039 schema; no destructive down migration."
+        ]
+      },
+      "sourceLane": "graphql",
+      "enabledState": "enabled",
+      "disabledReasonCode": null,
+      "actionId": "p039-design-fixture",
+      "operatorMessage": "Carry-forward admission is disabled. This is a design fixture, not a live result.",
+      "projectionIntegrity": "valid",
+      "cutoverPolicyRevision": "p039-r2",
+      "diagnosticRedaction": "partial",
+      "nextSteps": [
+        "complete_provider_free_proof_and_review"
+      ]
+    }
+  },
+  "continuation_admission_parity_lanes": {
+    "run_report": {
+      "schema_version": "run_continuation_admission_v1",
+      "enabled": false,
+      "reason": "p039_not_implemented",
+      "fences_enforced": true,
+      "reconcile_available": true,
+      "source_lane": "run_report"
+    },
+    "mcp": {
+      "schema_version": "run_continuation_admission_v1",
+      "enabled": false,
+      "reason": "p039_not_implemented",
+      "fences_enforced": true,
+      "reconcile_available": true,
+      "source_lane": "mcp"
+    },
+    "release_receipt": {
+      "schema_version": "run_continuation_admission_v1",
+      "enabled": false,
+      "reason": "p039_not_implemented",
+      "fences_enforced": true,
+      "reconcile_available": true,
+      "source_lane": "release_receipt"
+    },
+    "graphql": {
+      "schemaVersion": "run_continuation_admission_v1",
+      "enabled": false,
+      "reason": "p039_not_implemented",
+      "fencesEnforced": true,
+      "reconcileAvailable": true,
+      "sourceLane": "graphql"
+    }
+  }
+}

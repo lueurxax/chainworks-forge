@@ -214,7 +214,13 @@ async fn implementation_run_start_rollout_contract_preflight_inner(
         return Ok(evaluate_terminal_check(check));
     }
 
-    let current_identity = current_contract_identity(run, approved_proposal)?;
+    let verified = verified_p039_approved_proposal(pool, run, approved_proposal).await?;
+    let current_identity = match (&verified, approved_proposal) {
+        (Some((path, data)), Some(artifact)) => {
+            contract_identity_from_data(run, artifact, path, data)?
+        }
+        _ => current_contract_identity(run, approved_proposal)?,
+    };
     if let Some(check) =
         rollout_contract_checks::find_terminal_rollout_contract_check_for_run(pool, run.id.inner())
             .await?
@@ -884,10 +890,12 @@ async fn upsert_linted_contract_check(
     retry_count: i64,
 ) -> Result<Option<StoredRolloutContractCheck>> {
     let now = Utc::now();
-    let metadata = proposal_metadata_from_artifact(run, approved_proposal)?
-        .unwrap_or_else(ProposalMetadata::unknown);
-    let proposal_path = match safe_artifact_path(&approved_proposal.file_path, &run.workspace_root)
-    {
+    let verified = verified_p039_approved_proposal(pool, run, Some(approved_proposal)).await?;
+    let path_result = match &verified {
+        Some((path, _)) => Ok(path.clone()),
+        None => safe_artifact_path(&approved_proposal.file_path, &run.workspace_root),
+    };
+    let proposal_path = match path_result {
         Ok(path) => path,
         Err(error) => {
             return upsert_invalid_rollout_contract_check_from_artifact(
@@ -905,7 +913,11 @@ async fn upsert_linted_contract_check(
             .map(Some)
         }
     };
-    let data = match read_bounded_rollout_contract_input(&proposal_path) {
+    let data_result = match verified {
+        Some((_, data)) => Ok(data),
+        None => read_bounded_rollout_contract_input(&proposal_path),
+    };
+    let data = match data_result {
         Ok(data) => data,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -944,6 +956,7 @@ async fn upsert_linted_contract_check(
             .map(Some)
         }
     };
+    let metadata = proposal_metadata_from_value(approved_proposal, &proposal_value);
 
     let Some(contract_source) =
         extract_rollout_contract_source(&proposal_value, &proposal_path, &run.workspace_root)?
@@ -3215,6 +3228,15 @@ fn current_contract_identity(
         Ok(data) => data,
         Err(_) => return Ok(None),
     };
+    contract_identity_from_data(run, artifact, &path, &data)
+}
+
+fn contract_identity_from_data(
+    run: &Run,
+    artifact: &Artifact,
+    path: &std::path::Path,
+    data: &[u8],
+) -> Result<Option<CurrentContractIdentity>> {
     let value: serde_json::Value = match serde_json::from_slice(&data) {
         Ok(value) => value,
         Err(_) => return Ok(None),
@@ -3232,6 +3254,62 @@ fn current_contract_identity(
         contract_object_hash,
         content_snapshot_id: artifact.id.to_string(),
     }))
+}
+
+/// Activated P039 metadata is outside the repository by design. This is not a
+/// broader absolute-path policy: only the canonical registered engine snapshot
+/// can supply bytes, through the manifest-bound no-follow input reader.
+async fn verified_p039_approved_proposal(
+    pool: &SqlitePool,
+    run: &Run,
+    artifact: Option<&Artifact>,
+) -> Result<Option<(std::path::PathBuf, Vec<u8>)>> {
+    use crate::run_carry_forward::{inputs, read_manifest};
+    let Some(operation) = db::repos::run_continuations::links(pool, &run.id.to_string())
+        .await?
+        .incoming
+    else {
+        return Ok(None);
+    };
+    let Some(artifact) = artifact else {
+        return Ok(None);
+    };
+    let canonical = db::repos::runs::find_by_id(pool, run.id)
+        .await?
+        .context("artifact_provenance_invalid: successor missing")?;
+    let manifest = read_manifest(&operation).await?;
+    anyhow::ensure!(
+        canonical.workspace_root == run.workspace_root
+            && canonical.artifact_root == run.artifact_root
+            && canonical.worktree_root == run.worktree_root
+            && canonical.chainworks_meta_root == run.chainworks_meta_root
+            && std::path::Path::new(&canonical.artifact_root) == manifest.workspace.metadata_root,
+        "artifact_provenance_invalid: approved proposal roots"
+    );
+    let output =
+        inputs::output_for_predicate(pool, &canonical, &manifest.target.plan, "approved_proposal")
+            .await?;
+    let inputs::OutputResolution::Output(output) = output else {
+        anyhow::bail!("artifact_provenance_invalid: approved snapshot missing");
+    };
+    anyhow::ensure!(
+        output.origin == inputs::InputOrigin::ApprovalSnapshot
+            && output.artifact_id == Some(artifact.id),
+        "artifact_provenance_invalid: approved snapshot authority"
+    );
+    let stored = db::repos::artifacts::find_by_id(pool, artifact.id)
+        .await?
+        .context("artifact_provenance_invalid: approved snapshot registration")?;
+    anyhow::ensure!(
+        serde_json::to_value(&stored)? == serde_json::to_value(artifact)?
+            && stored.run_id == run.id
+            && output.content.len() as u64 <= MAX_ROLLOUT_CONTRACT_INPUT_BYTES,
+        "artifact_provenance_invalid: approved snapshot metadata"
+    );
+    Ok(Some((
+        std::path::PathBuf::from(output.display_path),
+        output.content.into_bytes(),
+    )))
 }
 
 fn proposal_metadata_from_value(

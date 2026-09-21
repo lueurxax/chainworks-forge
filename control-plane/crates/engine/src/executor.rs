@@ -383,6 +383,9 @@ impl acp::AcpPromptProgressSink for DbAcpPromptProgressSink {
         };
         sessions::touch_generation_activity(&self.pool, generation_id, chrono::Utc::now()).await?;
         persist_prompt_sent_session_binding(&self.pool, &update).await?;
+        if matches!(update.kind, acp::AcpPromptProgressKind::PromptSent) {
+            crate::run_carry_forward::approval::record_prompt_sent(&self.pool, &update).await?;
+        }
         if let Some(title) = update.title.as_deref() {
             let _ = self
                 .events
@@ -479,6 +482,71 @@ struct DbAcpProviderLaunchGate {
     capacity: domain::provider::InvokeAgentCapacityConfig,
 }
 
+#[cfg(test)]
+mod p039_launch_tests {
+    use super::*;
+    use acp::adapters::AcpProviderLaunchGate;
+
+    #[tokio::test]
+    async fn p039_all_provider_launches_refuse_a_fenced_source() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        db::writer::register_shared_writer(
+            &pool,
+            Arc::new(db::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .unwrap();
+        let run = domain::ids::RunId::new();
+        let idea = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO ideas(id,title,body,created_at) VALUES (?,'I','B','2026-09-20T00:00:00Z')",
+        )
+        .bind(&idea)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO runs(id,idea_id,status,workflow_id,workflow_title,workspace_root,artifact_root,started_at) VALUES (?,?,'blocked','w','W','/repo','/meta','2026-09-20T00:00:00Z')").bind(run.to_string()).bind(&idea).execute(&pool).await.unwrap();
+        db::repos::run_continuations::reserve(
+            &pool,
+            &db::repos::run_continuations::Reservation {
+                source_run_id: run.to_string(),
+                caller_fingerprint: "operator".into(),
+                caller_request_id: uuid::Uuid::new_v4().to_string(),
+                intent_sha256: "a".repeat(64),
+                plan_ref: "plan".into(),
+                plan_sha256: "b".repeat(64),
+                target_ref: "target".into(),
+                source_witness_sha256: "c".repeat(64),
+                reason: "test".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let gate = DbAcpProviderLaunchGate {
+            pool: pool.clone(),
+            capacity: Default::default(),
+        };
+        for provider in ["codex", "claude", "gemini", "auggie", "junie"] {
+            let req:acp::ExecutionRequest=serde_json::from_value(serde_json::json!({"run_id":run,"stage_id":"s","agent_id":"writer","provider":provider,"workspace_root":"/repo","prompt":"test"})).unwrap();
+            let error = gate
+                .before_provider_launch(&req, None)
+                .await
+                .expect_err(provider);
+            assert!(
+                error.to_string().contains("continuation_in_progress"),
+                "{provider}: {error}"
+            );
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provider_sessions")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+}
+
 #[async_trait::async_trait]
 impl acp::adapters::AcpProviderLaunchGate for DbAcpProviderLaunchGate {
     async fn before_provider_launch(
@@ -486,6 +554,8 @@ impl acp::adapters::AcpProviderLaunchGate for DbAcpProviderLaunchGate {
         req: &acp::ExecutionRequest,
         runtime_tool_path_preflight_json: Option<&str>,
     ) -> Result<()> {
+        db::repos::run_continuations::check_source_guard(&self.pool, &req.run_id.to_string())
+            .await?;
         if req.provider != "junie" {
             return Ok(());
         }
@@ -2190,6 +2260,7 @@ pub struct BackgroundExecutor {
     steward_runtime_inputs: Option<Arc<crate::steward::config::StewardRuntimeInputs>>,
     db_writer: Arc<DbWriter>,
     terminal_invoke_recovery_last_sweep: Arc<Mutex<Option<Instant>>>,
+    continuation_readback: crate::run_carry_forward::readback::ReadbackConfig,
 }
 
 struct BackgroundStewardAgentExecutor {
@@ -2295,6 +2366,7 @@ impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExe
                 mediation_record_id: None,
                 toolchain_home: None,
                 toolchain_go_scope_enabled: false,
+                approved_metadata_root: None,
                 p079_repair_canonical_paths: None,
                 input_manifest: None,
             })
@@ -2858,6 +2930,70 @@ struct DeclaredOutputDiscoverySettlement {
     idempotency_key: Option<String>,
     accepted_aggregate_bytes: u64,
     aggregate_cap_hit: bool,
+}
+
+fn stamp_carry_forward_report(
+    settlement: &mut DeclaredOutputDiscoverySettlement,
+    fields: &crate::run_carry_forward::readback::ReportFields,
+    specs: &[domain::discovery::ExpectedOutputSpec],
+) -> Result<()> {
+    for decision in &mut settlement.decisions {
+        if decision.output_name != "run_report"
+            || !decision.is_accepted()
+            || decision.output_role != domain::discovery::ExpectedOutputRole::Machine
+        {
+            continue;
+        }
+        let Some(reference) = &decision.accepted_payload_ref else {
+            continue;
+        };
+        let Some(bytes) = settlement.accepted_payloads.get_mut(reference) else {
+            continue;
+        };
+        let spec = specs
+            .iter()
+            .find(|spec| {
+                spec.output_name == decision.output_name && spec.output_role == decision.output_role
+            })
+            .context("run report output budget missing")?;
+        // Malformed provider output stays on its existing validation/repair path.
+        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+            continue;
+        };
+        let Some(object) = value.as_object_mut() else {
+            continue;
+        };
+        let original_digest = sha256_digest(bytes);
+        object.extend(
+            serde_json::to_value(fields)?
+                .as_object()
+                .context("report fields")?
+                .clone(),
+        );
+        let stamped = serde_json::to_vec(&value)?;
+        anyhow::ensure!(
+            stamped.len() as u64 <= spec.max_bytes,
+            "carry-forward report exceeds output bound"
+        );
+        let aggregate = settlement
+            .accepted_aggregate_bytes
+            .saturating_sub(bytes.len() as u64)
+            + stamped.len() as u64;
+        anyhow::ensure!(
+            aggregate <= spec.aggregate_acceptance_cap_bytes,
+            "carry-forward report exceeds aggregate bound"
+        );
+        decision
+            .diagnostics
+            .insert("p039_original_report_sha256".into(), original_digest);
+        decision.size_bytes = Some(stamped.len() as u64);
+        decision.content_digest = Some(sha256_digest(&stamped));
+        decision.accepted_bytes_sha256 = decision.content_digest.clone();
+        decision.aggregate_bytes_after_acceptance = Some(aggregate);
+        settlement.accepted_aggregate_bytes = aggregate;
+        *bytes = stamped;
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -3686,6 +3822,48 @@ fn file_sha256_if_exists(path: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     Ok(Some(sha256_digest(&std::fs::read(path)?)))
+}
+
+fn declared_artifact_digest(path: &Path) -> Result<(String, i64)> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let before = file.metadata()?;
+    anyhow::ensure!(before.is_file(), "declared output is not a regular file");
+    let size = i64::try_from(before.len()).context("declared output exceeds metadata size")?;
+    let mut reader = (&file).take(before.len().saturating_add(1));
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut read = 0_u64;
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        read += count as u64;
+        digest.update(&buffer[..count]);
+    }
+    let identity = |m: &std::fs::Metadata| {
+        (
+            m.dev(),
+            m.ino(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        )
+    };
+    anyhow::ensure!(
+        read == before.len()
+            && identity(&before) == identity(&file.metadata()?)
+            && identity(&before) == identity(&std::fs::symlink_metadata(path)?),
+        "declared output changed while hashing"
+    );
+    Ok((format!("{:x}", digest.finalize()), size))
 }
 
 pub async fn run_production_declared_output_settlement_for_canary(
@@ -6077,6 +6255,13 @@ fn build_steward_agent_prompt(
 }
 
 impl BackgroundExecutor {
+    pub fn with_continuation_readback(
+        mut self,
+        config: crate::run_carry_forward::readback::ReadbackConfig,
+    ) -> Self {
+        self.continuation_readback = config;
+        self
+    }
     async fn begin_executor_transaction(
         &self,
         operation_name: &'static str,
@@ -6119,6 +6304,7 @@ impl BackgroundExecutor {
             steward_runtime_inputs: None,
             db_writer,
             terminal_invoke_recovery_last_sweep: Arc::new(Mutex::new(None)),
+            continuation_readback: Default::default(),
         }
     }
 
@@ -6172,6 +6358,7 @@ impl BackgroundExecutor {
             steward_runtime_inputs: Some(steward_runtime_inputs),
             db_writer,
             terminal_invoke_recovery_last_sweep: Arc::new(Mutex::new(None)),
+            continuation_readback: Default::default(),
         }
     }
 
@@ -9373,6 +9560,7 @@ impl BackgroundExecutor {
                 mediation_record_id: None,
                 toolchain_home: None,
                 toolchain_go_scope_enabled: false,
+                approved_metadata_root: None,
                 p079_repair_canonical_paths: None,
                 input_manifest: input_manifest.clone(),
             };
@@ -9942,6 +10130,7 @@ impl BackgroundExecutor {
                     mediation_record_id: None,
                     toolchain_home: None,
                     toolchain_go_scope_enabled: false,
+                    approved_metadata_root: None,
                     p079_repair_canonical_paths: None,
                     input_manifest: input_manifest.clone(),
                 })
@@ -10445,6 +10634,7 @@ impl BackgroundExecutor {
                 mediation_record_id: None,
                 toolchain_home: None,
                 toolchain_go_scope_enabled: false,
+                approved_metadata_root: None,
                 p079_repair_canonical_paths: None,
                 input_manifest: input_manifest.clone(),
             })
@@ -12487,13 +12677,25 @@ impl BackgroundExecutor {
                     .await?
                     .iter()
                     .any(|artifact| artifact.name == APPROVED_PROPOSAL_OUTPUT_NAME);
-                let suppressed_approved_proposal = suppress_duplicate_approved_proposal_output(
-                    &mut declared_outputs,
-                    &mut prompt,
-                    &stage_id,
-                    &task_name,
-                    has_existing_approved_proposal,
-                );
+                let p039_owned_snapshot =
+                    crate::run_carry_forward::approval::owns_preparation_snapshot(
+                        &self.pool, run_id, &stage_id, &task_name,
+                    )
+                    .await?;
+                let suppressed_approved_proposal = if p039_owned_snapshot {
+                    suppress_engine_owned_approved_proposal_output(
+                        &mut declared_outputs,
+                        &mut prompt,
+                    )
+                } else {
+                    suppress_duplicate_approved_proposal_output(
+                        &mut declared_outputs,
+                        &mut prompt,
+                        &stage_id,
+                        &task_name,
+                        has_existing_approved_proposal,
+                    )
+                };
                 if suppressed_approved_proposal {
                     warn!(
                         run_id = %run_id,
@@ -12612,6 +12814,7 @@ impl BackgroundExecutor {
                     mediation_record_id: mediation_record_id.clone(),
                     toolchain_home: None,
                     toolchain_go_scope_enabled: false,
+                    approved_metadata_root: None,
                     p079_repair_canonical_paths: None,
                     input_manifest: None,
                 };
@@ -12668,7 +12871,14 @@ impl BackgroundExecutor {
                 } else {
                     None
                 };
-                let admission = acp::input_context::bind_request_manifest(&mut req);
+                let admission = match crate::run_carry_forward::launch::approve_metadata_root(
+                    &self.pool, &mut req,
+                )
+                .await
+                {
+                    Ok(()) => acp::input_context::bind_request_manifest(&mut req),
+                    Err(error) => Err(error),
+                };
                 if admission.is_ok() {
                     let _ = self
                         .events
@@ -12696,7 +12906,14 @@ impl BackgroundExecutor {
                 }
 
                 let execution_result = match admission {
-                    Ok(()) => self.acp.execute(req.clone()).await,
+                    Ok(()) => {
+                        match crate::run_carry_forward::approval::before_execution(&self.pool, &req)
+                            .await
+                        {
+                            Ok(()) => self.acp.execute(req.clone()).await,
+                            Err(error) => Err(error),
+                        }
+                    }
                     Err(error) => Err(error),
                 };
                 let mut result = match execution_result {
@@ -15886,6 +16103,19 @@ impl BackgroundExecutor {
                     persisted_artifacts.push(artifact.clone());
                 }
 
+                if let Some(settlement) = declared_output_settlement.as_mut() {
+                    if settlement.decisions.iter().any(|decision| {
+                        decision.output_name == "run_report" && decision.is_accepted()
+                    }) {
+                        let fields = crate::run_carry_forward::readback::report_fields(
+                            &self.pool,
+                            run_id,
+                            self.continuation_readback,
+                        )
+                        .await?;
+                        stamp_carry_forward_report(settlement, &fields, &expected_outputs)?;
+                    }
+                }
                 let captured_declared_outputs = declared_output_settlement
                     .as_ref()
                     .map(|settlement| {
@@ -16530,6 +16760,9 @@ impl BackgroundExecutor {
                 .await?;
             }
 
+            WorkItemKind::PrepareRunContinuation => {
+                anyhow::bail!("run continuation preparation requires its dedicated lane");
+            }
             WorkItemKind::ProcessContinuation => {
                 let continuation_id = {
                     let payload: serde_json::Value =
@@ -17863,7 +18096,7 @@ impl BackgroundExecutor {
         completed_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()> {
         let mut persisted_paths = std::collections::HashSet::new();
-        let declared_artifacts = self.prepare_declared_output_artifacts(
+        let mut declared_artifacts = self.prepare_declared_output_artifacts(
             declared_outputs,
             None,
             workspace_root,
@@ -17875,6 +18108,9 @@ impl BackgroundExecutor {
             completed_at,
             &mut persisted_paths,
         )?;
+        for artifact in &mut declared_artifacts {
+            artifact.agent_execution_id = Some(agent_exec_id.to_string());
+        }
 
         self.import_declared_contract_outputs(
             declared_outputs,
@@ -18905,7 +19141,7 @@ impl BackgroundExecutor {
         if !artifact_path.is_file() {
             return Ok(None);
         }
-        let size_bytes = artifact_path.metadata().ok().map(|meta| meta.len() as i64);
+        let (checksum_sha256, size_bytes) = declared_artifact_digest(artifact_path)?;
         let artifact = domain::artifact::Artifact {
             id: domain::ids::ArtifactId::new(),
             run_id,
@@ -18915,8 +19151,8 @@ impl BackgroundExecutor {
             contract_id: contract_id.to_string(),
             format,
             file_path: stored_artifact_file_path(name, path, workspace_root),
-            checksum_sha256: None,
-            size_bytes,
+            checksum_sha256: Some(checksum_sha256),
+            size_bytes: Some(size_bytes),
             provider: provider.to_string(),
             model,
             created_at,
@@ -19584,7 +19820,7 @@ impl BackgroundExecutor {
                 None => None,
             }
         };
-        let receipt = match DeliveryReceiptBuilder::build_receipt(
+        let receipt = match DeliveryReceiptBuilder::build_receipt_with_carry_forward(
             run,
             delivery_config,
             Some(release_result),
@@ -19592,6 +19828,12 @@ impl BackgroundExecutor {
             p080_reconciliation_section,
             idea_title,
             review_status,
+            crate::run_carry_forward::readback::report_fields(
+                &self.pool,
+                run.id,
+                self.continuation_readback,
+            )
+            .await?,
         ) {
             Some(receipt) => receipt,
             None => return Ok(None),
@@ -19600,7 +19842,7 @@ impl BackgroundExecutor {
         if std::path::Path::new(&path).exists() {
             return Ok(None);
         }
-        self.prepare_release_json_artifact(
+        let mut artifact = self.prepare_release_json_artifact(
             run,
             stage_id,
             "system_delivery",
@@ -19608,8 +19850,11 @@ impl BackgroundExecutor {
             model,
             "delivery_receipt",
             &receipt,
-        )
-        .map(Some)
+        )?;
+        let (checksum, size_bytes) = declared_artifact_digest(std::path::Path::new(&path))?;
+        artifact.checksum_sha256 = Some(checksum);
+        artifact.size_bytes = Some(size_bytes);
+        Ok(Some(artifact))
     }
 
     fn build_advance_run_work_item(&self, run_id: RunId) -> Result<WorkItem> {
@@ -19845,6 +20090,13 @@ fn suppress_duplicate_approved_proposal_output(
     ) {
         return false;
     }
+    suppress_engine_owned_approved_proposal_output(declared_outputs, prompt)
+}
+
+fn suppress_engine_owned_approved_proposal_output(
+    declared_outputs: &mut Vec<DeclaredOutput>,
+    prompt: &mut String,
+) -> bool {
     let original_len = declared_outputs.len();
     declared_outputs.retain(|output| {
         output.output_name != APPROVED_PROPOSAL_OUTPUT_NAME
@@ -23884,6 +24136,10 @@ fn merge_contract_repair_result(initial: &mut acp::ExecutionResult, repair: acp:
 }
 
 #[cfg(test)]
+#[path = "executor_p039_readback_tests.rs"]
+mod p039_readback_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -25039,6 +25295,28 @@ plain progress line without gate evidence";
         assert!(!suppressed);
         assert_eq!(declared_outputs.len(), 1);
         assert!(!prompt.contains("Approved Proposal Immutability"));
+    }
+
+    #[test]
+    fn p039_task_name_without_activated_profile_retains_ordinary_snapshot_output() {
+        let mut declared_outputs = vec![DeclaredOutput {
+            output_name: APPROVED_PROPOSAL_OUTPUT_NAME.to_string(),
+            target_path: "/workspace/.chainworks/proposals/approved/proposal.md".to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        }];
+        let mut prompt = "Ordinary preparation".to_string();
+        assert!(!suppress_duplicate_approved_proposal_output(
+            &mut declared_outputs,
+            &mut prompt,
+            IMPLEMENTATION_STARTED_STAGE_ID,
+            "freeze_approved_proposal_and_prepare_worktree",
+            true,
+        ));
+        assert_eq!(declared_outputs.len(), 1);
+        assert_eq!(prompt, "Ordinary preparation");
     }
 
     #[test]
@@ -27941,6 +28219,7 @@ plain progress line without gate evidence";
             toolchain_home: None,
             toolchain_go_scope_enabled: false,
 
+            approved_metadata_root: None,
             p079_repair_canonical_paths: None,
             input_manifest: None,
         };
@@ -28686,6 +28965,112 @@ plain progress line without gate evidence";
         assert!(!redacted.contains("sk-api-secret"));
         assert!(!redacted.contains("plain-secret"));
         assert!(!redacted.contains("id_rsa"));
+    }
+
+    #[test]
+    fn p039_declared_output_digest_streams_regular_bytes_and_rejects_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("output");
+        let bytes = vec![0xA5; 2 * 1024 * 1024 + 1];
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            declared_artifact_digest(&path).unwrap(),
+            (format!("{:x}", Sha256::digest(&bytes)), bytes.len() as i64)
+        );
+        std::fs::write(&path, []).unwrap();
+        assert_eq!(
+            declared_artifact_digest(&path).unwrap(),
+            (
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+                0
+            )
+        );
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(declared_artifact_digest(&link).is_err());
+        assert!(declared_artifact_digest(temp.path()).is_err());
+    }
+
+    #[test]
+    fn p039_report_writer_materializes_only_accepted_output_with_canonical_lineage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("run-report.json");
+        let declared = DeclaredOutput {
+            output_name: "run_report".into(),
+            target_path: path.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: "run_report".into(),
+            content: br#"{"summary":"actual report","continued_as_run_id":"forged"}"#.to_vec(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
+        }];
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            None,
+            false,
+        );
+        let mut settlement = settle_agent_outputs_from_discovery_decisions(
+            &[declared.clone()],
+            &specs,
+            &discovered,
+            &[],
+        )
+        .unwrap();
+        let mut bounded = settlement.clone();
+        let mut tight_specs = specs.clone();
+        tight_specs[0].aggregate_acceptance_cap_bytes = bounded.accepted_aggregate_bytes;
+        assert!(
+            stamp_carry_forward_report(&mut bounded, &Default::default(), &tight_specs).is_err()
+        );
+        assert_eq!(bounded.accepted_payloads, settlement.accepted_payloads);
+        stamp_carry_forward_report(
+            &mut settlement,
+            &crate::run_carry_forward::readback::ReportFields::default(),
+            &specs,
+        )
+        .unwrap();
+        let bytes = settlement.accepted_payloads.values().next().unwrap();
+        assert_eq!(
+            settlement.decisions[0].accepted_bytes_sha256.as_deref(),
+            Some(sha256_digest(bytes).as_str())
+        );
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &[declared.clone()],
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+        let validation = validate_task_outputs(&captured);
+        materialize_validated_discovery_decisions(
+            &[declared],
+            &settlement,
+            &validation,
+            Some(tmp.path()),
+        )
+        .unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(report["summary"], "actual report");
+        assert!(report["continued_as_run_id"].is_null());
+        assert!(report["carry_forward_readback"].is_null());
+        assert!(settlement.decisions[0]
+            .diagnostics
+            .contains_key("p039_original_report_sha256"));
+        let mut empty = DeclaredOutputDiscoverySettlement {
+            decisions: Vec::new(),
+            accepted_payloads: HashMap::new(),
+            idempotency_key: None,
+            accepted_aggregate_bytes: 0,
+            aggregate_cap_hit: false,
+        };
+        stamp_carry_forward_report(&mut empty, &Default::default(), &[]).unwrap();
+        assert!(empty.accepted_payloads.is_empty());
     }
 
     #[test]

@@ -60,9 +60,106 @@ struct SystemMetrics {
     mcp_hot_read_error_total_by_code: HashMap<String, u64>,
     p046_query_duration_ms: HashMap<String, Histogram>,
     p046_emit_lag_ms: Histogram,
+    run_continuation_phase_duration_ms: HashMap<String, Histogram>,
 }
 
 static METRICS: OnceLock<Mutex<SystemMetrics>> = OnceLock::new();
+
+pub const P039_REQUIRED_METRICS: &[&str] = &[
+    "run_continuation_admission_total",
+    "run_continuation_phase_duration_ms",
+    "run_continuation_hold_total",
+    "run_continuation_source_guard_denied_total",
+    "run_continuation_preserved_bytes_total",
+    "run_continuation_activation_total",
+];
+
+pub fn record_continuation_command(
+    activation: bool,
+    result: &str,
+    reason: Option<domain::run_carry_forward_api::ContinuationReasonCode>,
+) {
+    let result = match result {
+        "accepted" | "denied" | "replayed" | "unauthorized" | "invalid_params"
+        | "outcome_unknown" => result,
+        _ => "internal_error",
+    };
+    let reason = reason.map(|r| serde_json::to_value(r).expect("closed reason enum"));
+    let reason = reason
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("none");
+    increment_counter("run_continuation_admission_total");
+    increment_counter_with_label(
+        "run_continuation_admission_total",
+        &format!("result={result},reason={reason}"),
+    );
+    if activation {
+        increment_counter("run_continuation_activation_total");
+        increment_counter_with_label(
+            "run_continuation_activation_total",
+            &format!("result={result}"),
+        );
+    }
+    if result == "denied" && reason != "none" {
+        increment_counter("run_continuation_hold_total");
+        increment_counter_with_label("run_continuation_hold_total", &format!("reason={reason}"));
+    }
+}
+
+pub fn record_continuation_guard_denied() {
+    increment_counter("run_continuation_source_guard_denied_total");
+    increment_counter_with_label(
+        "run_continuation_source_guard_denied_total",
+        "surface=canonical_guard",
+    );
+}
+
+pub fn record_continuation_phase_duration(
+    phase: domain::run_carry_forward_api::ContinuationPhase,
+    duration: Duration,
+) {
+    let phase: domain::run_carry_forward_api::ReadbackPhase = phase.into();
+    let mut m = metrics().lock().unwrap();
+    m.run_continuation_phase_duration_ms
+        .entry(phase.as_str().into())
+        .or_default()
+        .record(duration.as_millis().min(u64::MAX as u128) as u64);
+}
+
+pub fn record_continuation_preserved_bytes(bytes: u64) {
+    let mut m = metrics().lock().unwrap();
+    let value = m
+        .counters
+        .entry("run_continuation_preserved_bytes_total".into())
+        .or_default();
+    *value = value.saturating_add(bytes);
+}
+
+pub fn p039_rollout_metric_values_json() -> serde_json::Value {
+    let m = metrics().lock().unwrap();
+    let mut values = serde_json::Map::new();
+    for name in P039_REQUIRED_METRICS {
+        if *name != "run_continuation_phase_duration_ms" {
+            values.insert(
+                (*name).into(),
+                serde_json::json!(m.counters.get(*name).copied().unwrap_or(0)),
+            );
+        }
+    }
+    values.insert(
+        "run_continuation_phase_duration_ms".into(),
+        serde_json::json!(m
+            .run_continuation_phase_duration_ms
+            .iter()
+            .map(|(phase, samples)| (
+                phase,
+                serde_json::json!({"sample_count": samples.sample_count(), "p95": samples.p95()})
+            ))
+            .collect::<std::collections::BTreeMap<_, _>>()),
+    );
+    serde_json::Value::Object(values)
+}
 
 /// P046 bounded-label metric names required by rollout_contract_v1.
 /// Used by gate inventory checks to verify metric emissions are present.

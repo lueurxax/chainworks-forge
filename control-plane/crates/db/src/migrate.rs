@@ -621,8 +621,8 @@ async fn table_contains_columns(
         .all(|column| columns.contains(*column)))
 }
 
-/// Copy the DB file to a timestamped backup and verify the copy is
-/// complete. Returns the absolute path of the written backup.
+/// Snapshot through SQLite so committed WAL pages are included. Publish only a
+/// separately reopened, integrity-checked, fsynced database, never its sidecars.
 async fn write_backup(
     database_url: &str,
     old_max: i64,
@@ -639,17 +639,20 @@ async fn write_backup(
         .unwrap_or(0);
 
     let filename = format!(
-        "{}.backup-{}-v{}-to-v{}.sqlite",
+        "{}.backup-{}-v{}-to-v{}-{}.sqlite",
         src.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("control-plane.db"),
         ts,
         old_max,
-        new_max
+        new_max,
+        uuid::Uuid::new_v4()
     );
 
     let parent = backup_dir.map(|p| p.to_path_buf()).unwrap_or_else(|| {
         src.parent()
+            // A filename-only path has an empty parent, which cannot be fsynced.
+            .filter(|parent| !parent.as_os_str().is_empty())
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."))
     });
@@ -664,24 +667,88 @@ async fn write_backup(
 
     let dst = parent.join(filename);
 
-    let src_bytes = std::fs::metadata(&src)
-        .map_err(|e| MigrationError::BackupFailed(format!("stat src {}: {e}", src.display())))?
-        .len();
+    use std::os::unix::fs::OpenOptionsExt;
+    let pending = parent.join(format!(".backup-{}.pending", uuid::Uuid::new_v4()));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&pending)
+        .map_err(|e| MigrationError::BackupFailed(format!("create pending snapshot: {e}")))?;
+    let result = async {
+        let source = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&src)
+                    .read_only(true)
+                    .busy_timeout(crate::pool::SQLITE_BUSY_TIMEOUT),
+            )
+            .await
+            .map_err(|e| MigrationError::BackupFailed(format!("open snapshot source: {e}")))?;
+        let snapshot = sqlx::query("VACUUM INTO ?1")
+            .bind(
+                pending
+                    .to_str()
+                    .ok_or_else(|| MigrationError::BackupFailed("non-UTF8 backup path".into()))?,
+            )
+            .execute(&source)
+            .await;
+        source.close().await;
+        snapshot.map_err(|e| MigrationError::BackupFailed(format!("SQLite snapshot: {e}")))?;
 
-    std::fs::copy(&src, &dst).map_err(|e| MigrationError::BackupFailed(format!("copy: {e}")))?;
-
-    let dst_bytes = std::fs::metadata(&dst)
-        .map_err(|e| MigrationError::BackupFailed(format!("stat dst: {e}")))?
-        .len();
-
-    if src_bytes != dst_bytes {
-        let _ = std::fs::remove_file(&dst);
-        return Err(MigrationError::BackupFailed(format!(
-            "size mismatch: src={src_bytes} dst={dst_bytes}"
-        )));
+        let restored = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&pending)
+                    .read_only(true),
+            )
+            .await
+            .map_err(|e| MigrationError::BackupFailed(format!("restore verification open: {e}")))?;
+        let integrity: Result<Vec<String>, _> = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_all(&restored)
+            .await;
+        restored.close().await;
+        let integrity = integrity
+            .map_err(|e| MigrationError::BackupFailed(format!("restore integrity: {e}")))?;
+        if integrity != ["ok"] {
+            return Err(MigrationError::BackupFailed(
+                "snapshot integrity check failed".into(),
+            ));
+        }
+        file.sync_all()
+            .map_err(|e| MigrationError::BackupFailed(format!("sync snapshot: {e}")))?;
+        publish_snapshot(&pending, &dst, &parent)?;
+        Ok::<(), MigrationError>(())
     }
+    .await;
+    drop(file);
+    // On interruption the private pending file is retained; it is never admitted
+    // as a completed backup and is not an automatic retry destination.
+    if result.is_ok() {
+        std::fs::remove_file(&pending)
+            .map_err(|e| MigrationError::BackupFailed(format!("unlink pending snapshot: {e}")))?;
+        std::fs::File::open(&parent)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| MigrationError::BackupFailed(format!("sync backup publication: {e}")))?;
+    }
+    result?;
 
     Ok(dst.canonicalize().unwrap_or(dst))
+}
+
+fn publish_snapshot(
+    pending: &Path,
+    destination: &Path,
+    parent: &Path,
+) -> Result<(), MigrationError> {
+    // Unlike rename, hard_link cannot replace an existing backup (or symlink).
+    std::fs::hard_link(pending, destination)
+        .map_err(|e| MigrationError::BackupFailed(format!("publish snapshot: {e}")))?;
+    std::fs::File::open(parent)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| MigrationError::BackupFailed(format!("sync backup directory: {e}")))
 }
 
 /// Retention: remove backups older than 30 days in the same directory as
@@ -740,6 +807,117 @@ mod tests {
         let path = dir.path().join("test.db");
         let url = format!("sqlite://{}?mode=rwc", path.display());
         (dir, path, url)
+    }
+
+    #[tokio::test]
+    async fn p039_backup_restores_committed_wal_without_sidecars() {
+        let (dir, path, url) = new_tmp_db().await;
+        let pool = open_pool(&url).await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query("PRAGMA wal_autocheckpoint=0")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE preservation (value TEXT NOT NULL)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO preservation VALUES ('committed-only-in-wal')")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        assert!(
+            std::fs::metadata(path.with_extension("db-wal"))
+                .unwrap()
+                .len()
+                > 0
+        );
+
+        let backup = write_backup(&url, 100, 101, Some(dir.path()))
+            .await
+            .unwrap();
+        let restored = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&backup)
+                    .read_only(true),
+            )
+            .await
+            .unwrap();
+        let value: Option<String> = sqlx::query_scalar("SELECT value FROM preservation")
+            .fetch_optional(&restored)
+            .await
+            .unwrap();
+        assert_eq!(value.as_deref(), Some("committed-only-in-wal"));
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&restored)
+            .await
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        restored.close().await;
+        drop(conn);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn p039_backup_collision_never_overwrites_existing_snapshot_or_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let (dir, _path, url) = new_tmp_db().await;
+        let pool = open_pool(&url).await.unwrap();
+        sqlx::query("CREATE TABLE preservation (value TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO preservation VALUES ('first snapshot')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let first = write_backup(&url, 100, 101, Some(dir.path()))
+            .await
+            .unwrap();
+        let first_bytes = std::fs::read(&first).unwrap();
+        sqlx::query("INSERT INTO preservation VALUES ('second snapshot')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let second = write_backup(&url, 100, 101, Some(dir.path()))
+            .await
+            .unwrap();
+        assert_ne!(
+            first, second,
+            "repeated backups must allocate distinct destinations"
+        );
+        assert_eq!(std::fs::read(&first).unwrap(), first_bytes);
+        let second_bytes = std::fs::read(&second).unwrap();
+        assert_ne!(first_bytes, second_bytes);
+
+        let pending = dir.path().join(".collision.pending");
+        std::fs::hard_link(&second, &pending).unwrap();
+        let link = dir.path().join("existing-snapshot-link.sqlite");
+        symlink(&first, &link).unwrap();
+        for destination in [&first, &link] {
+            let error = publish_snapshot(&pending, destination, dir.path()).unwrap_err();
+            assert!(matches!(error, MigrationError::BackupFailed(_)));
+            assert_eq!(std::fs::read(&first).unwrap(), first_bytes);
+            assert_eq!(std::fs::read(&second).unwrap(), second_bytes);
+            assert_eq!(std::fs::read(&pending).unwrap(), second_bytes);
+            assert_eq!(
+                std::fs::metadata(&pending).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_link(&link).unwrap(), first);
+        pool.close().await;
     }
 
     #[tokio::test]
@@ -915,33 +1093,10 @@ mod tests {
 
     #[tokio::test]
     async fn run_preflight_subset_classifies_correctly_and_writes_backup() {
-        // Classification-only test for the subset branch. We deliberately
-        // do NOT test full re-apply because undoing a real migration's
-        // schema effects in SQLite to re-run it is a fixture-fidelity
-        // problem, not a correctness guarantee of `run_preflight` —
-        // production subset scenarios have a real schema gap, which test
-        // data cannot faithfully reproduce with the live `MIGRATOR`.
-        //
-        // What this test DOES prove:
-        // 1. `classify_db_state` correctly returns `Tracked { applied ⊂ binary }`.
-        // 2. `write_backup` is called on that branch.
-        // 3. The backup file lands with the expected filename shape.
-        //
-        // What it does NOT prove (covered by integration/gate tests on
-        // a real pre-existing DB file fixture):
-        // 4. `sqlx::migrate!` re-applies the missing versions cleanly.
         let (dir, _path, url) = new_tmp_db().await;
-        run_preflight(&url, None).await.unwrap();
         let pool = open_pool(&url).await.unwrap();
-        let max_v: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = ?")
-            .bind(max_v)
-            .execute(&pool)
-            .await
-            .unwrap();
+        let max_v = i64::from(binary_schema_version());
+        MIGRATOR.run_to(max_v - 1, &pool).await.unwrap();
         pool.close().await;
 
         // Classification check.
@@ -962,11 +1117,11 @@ mod tests {
             _ => panic!("expected Tracked, got {state:?}"),
         }
 
-        // Backup write check — call directly rather than through the full
-        // run_preflight pipeline which would try to re-apply migration 13.
-        let backup_path = write_backup(&url, max_v - 1, max_v, Some(dir.path()))
-            .await
-            .unwrap();
+        let outcome = run_preflight(&url, Some(dir.path())).await.unwrap();
+        assert_eq!(outcome.classified_as, DbStateKind::TrackedSubset);
+        assert!(outcome.applied_migrations);
+        assert_eq!(outcome.schema_version, max_v as u32);
+        let backup_path = outcome.backup_path.unwrap();
         assert!(backup_path.exists());
         assert!(
             backup_path

@@ -27,6 +27,7 @@ pub mod quality_gate_boundary;
 pub mod recovery;
 pub mod release;
 pub mod rollout_contract_preflight;
+pub mod run_carry_forward;
 pub mod session;
 pub mod shadow_escalation;
 pub mod shutdown_service;

@@ -80,6 +80,72 @@ use sqlx::SqlitePool;
 const EX_TEMPFAIL: i32 = 75;
 const DAEMON_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
 
+fn continuation_config(
+    setting: Option<&str>,
+    owned_parent: std::path::PathBuf,
+) -> Result<engine::run_carry_forward::ServiceConfig> {
+    let enabled = match setting {
+        None | Some("false" | "0") => false,
+        Some("true" | "1") => true,
+        _ => anyhow::bail!("CHAINWORKS_RUN_CARRY_FORWARD_ENABLED must be true or false"),
+    };
+    // Disabled installations need not provision storage. An existing root still
+    // must be safe; neither startup configuration nor preview creates it.
+    if enabled || owned_parent.try_exists()? || std::fs::symlink_metadata(&owned_parent).is_ok() {
+        validate_continuation_parent(&owned_parent)?;
+    }
+    Ok(engine::run_carry_forward::ServiceConfig {
+        enabled,
+        owned_parent,
+    })
+}
+
+#[cfg(unix)]
+fn validate_continuation_parent(path: &std::path::Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+    use std::path::Component;
+    anyhow::ensure!(
+        path.is_absolute(),
+        "continuation storage parent must be absolute"
+    );
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // Walk descriptors, never canonicalize a symlink into a trusted root.
+    let root = unsafe { libc::open(c"/".as_ptr(), flags) };
+    anyhow::ensure!(root >= 0, "cannot open continuation storage root");
+    let mut directory = unsafe { OwnedFd::from_raw_fd(root) };
+    for component in path.components() {
+        let name = match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => CString::new(name.as_bytes())?,
+            _ => anyhow::bail!("invalid continuation storage path component"),
+        };
+        let next = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        anyhow::ensure!(
+            next >= 0,
+            "continuation storage parent must exist without symlinks"
+        );
+        directory = unsafe { OwnedFd::from_raw_fd(next) };
+    }
+    let file = std::fs::File::from(directory);
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.uid() == unsafe { libc::geteuid() },
+        "continuation storage owner mismatch"
+    );
+    anyhow::ensure!(
+        metadata.mode() & 0o7777 == 0o700,
+        "continuation storage parent must have mode 0700"
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_continuation_parent(_: &std::path::Path) -> Result<()> {
+    anyhow::bail!("continuation storage no-follow validation is unavailable")
+}
+
 struct StartupProbeServer {
     listener: tokio::net::TcpListener,
     port: u16,
@@ -695,6 +761,28 @@ async fn run_daemon() -> Result<()> {
     let db_writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
     db::writer::register_shared_writer(&pool, db_writer.clone()).await?;
 
+    reporter.set_startup_phase("continuation_recovery");
+    db::repos::run_continuations::recover_preparations(&pool)
+        .await
+        .context("P039 recovery failed before runtime admission")?;
+    let continuation_setting = std::env::var("CHAINWORKS_RUN_CARRY_FORWARD_ENABLED")
+        .map(Some)
+        .or_else(|error| match error {
+            std::env::VarError::NotPresent => Ok(None),
+            other => Err(other),
+        })?;
+    let continuation_service = Arc::new(engine::run_carry_forward::CarryForwardService::new(
+        pool.clone(),
+        continuation_config(
+            continuation_setting.as_deref(),
+            paths.app_support_dir.join("run-carry-forward"),
+        )?,
+    ));
+    let continuation_readback = engine::run_carry_forward::readback::ReadbackConfig {
+        enabled: continuation_service.enabled(),
+        reconcile_available: true,
+    };
+
     // P080: seed rollout control matrix (first-run only, all-or-nothing).
     // Fail-closed: if seeding fails (including partial-row-set detection) the
     // daemon refuses to start so tool registration and the reconciliation loop
@@ -836,7 +924,8 @@ async fn run_daemon() -> Result<()> {
             events.clone(),
             steward_runtime_inputs.clone(),
             Some(db_writer.clone()),
-        ),
+        )
+        .with_continuation_readback(continuation_readback),
     );
     // Startup recovery: repair any run left mid-flight by a previous crash.
     let recovery = RecoveryService::new_with_db_writer(
@@ -979,7 +1068,8 @@ async fn run_daemon() -> Result<()> {
                 db_writer.heartbeat.clone(),
                 Arc::clone(&boundary_policy),
             )
-            .with_acp_runtime(Arc::clone(&acp));
+            .with_acp_runtime(Arc::clone(&acp))
+            .with_continuation_service(continuation_service.clone());
             let mcp_live_source = mcp.live_principal_source();
             let principals_reload_secs: u64 = std::env::var("CHAINWORKS_PRINCIPALS_RELOAD_SECS")
                 .ok()
@@ -1020,14 +1110,15 @@ async fn run_daemon() -> Result<()> {
                     db_writer.heartbeat.clone(),
                     Arc::clone(&boundary_policy),
                 )
-                .with_acp_runtime(Arc::clone(&acp)),
+                .with_acp_runtime(Arc::clone(&acp))
+                .with_continuation_service(continuation_service.clone()),
             );
             let mcp_live_source = mcp.live_principal_source();
             let mcp_routes = mcp_server::http::routes(mcp);
             info!("MCP HTTP transport mounted at /mcp");
 
             let (schema, p046_live_handle) =
-                graphql_server::schema::build_schema_with_storage_writer_boundary_policy_and_handle(
+                graphql_server::schema::build_schema_with_continuation_readback(
                     pool.clone(),
                     cmd_handler.clone(),
                     events.clone(),
@@ -1035,6 +1126,7 @@ async fn run_daemon() -> Result<()> {
                     reporter.clone(),
                     db_writer.heartbeat.clone(),
                     Arc::clone(&boundary_policy),
+                    continuation_readback,
                 );
             // P046: periodically reload principals.json so subscription auth rechecks
             // observe revocation promptly, without requiring a daemon restart.
@@ -2046,6 +2138,73 @@ async fn insert_durable_monotonic_clock_baseline(pool: &SqlitePool) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p039_configuration_is_default_disabled_and_never_creates_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("run-carry-forward");
+        for setting in [None, Some("false"), Some("0")] {
+            let config = continuation_config(setting, parent.clone()).unwrap();
+            assert!(!config.enabled);
+            assert!(!parent.exists());
+        }
+        assert!(continuation_config(Some("true"), parent.clone()).is_err());
+        assert!(continuation_config(Some("yes"), parent.clone()).is_err());
+        assert!(!parent.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p039_storage_parent_requires_private_owned_nofollow_directory() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let parent = root.join("run-carry-forward");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            continuation_config(Some("true"), parent.clone())
+                .unwrap()
+                .enabled
+        );
+        assert!(std::fs::read_dir(&parent).unwrap().next().is_none());
+        let alias = root.join("alias");
+        symlink(&parent, &alias).unwrap();
+        assert!(continuation_config(Some("true"), alias.clone()).is_err());
+        std::fs::create_dir(parent.join("child")).unwrap();
+        std::fs::set_permissions(parent.join("child"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        assert!(continuation_config(Some("true"), alias.join("child")).is_err());
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(continuation_config(Some("true"), parent.clone()).is_err());
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(continuation_config(Some("true"), parent.clone()).is_err());
+        assert!(continuation_config(None, parent).is_err());
+        assert!(continuation_config(Some("true"), std::path::PathBuf::from("relative")).is_err());
+    }
+
+    #[test]
+    fn p039_startup_recovers_before_runtime_and_attaches_one_service_to_both_transports() {
+        let source = include_str!("main.rs");
+        let startup = source.split("async fn run_daemon").nth(1).unwrap();
+        let startup = startup.split("#[cfg(test)]").next().unwrap();
+        let recovery = startup
+            .find("run_continuations::recover_preparations(&pool)")
+            .unwrap();
+        assert!(recovery < startup.find("bootstrap_steward_runtime(").unwrap());
+        assert!(recovery < startup.find("AcpRuntimeManager::new()").unwrap());
+        assert_eq!(startup.matches("CarryForwardService::new(").count(), 1);
+        assert_eq!(
+            startup
+                .matches(".with_continuation_service(continuation_service.clone())")
+                .count(),
+            2
+        );
+    }
 
     /// P089 §6.1: the daemon startup path must materialize the redaction key
     /// before any inventory lane can reach it lazily. This exercises the exact

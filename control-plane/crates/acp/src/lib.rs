@@ -68,6 +68,19 @@ use domain::ids::{AgentExecutionId, RunId};
 use domain::xcode_runtime::{XcodeRuntimeObservationUpdate, XcodeShimWarningEvent};
 use serde::{Deserialize, Serialize};
 
+/// In-process launch authority minted only after the engine verifies activated
+/// lineage and its immutable manifest. Never restored from serialized requests.
+#[derive(Clone, Debug)]
+pub struct ApprovedMetadataRoot {
+    run_id: RunId,
+    agent_execution_id: AgentExecutionId,
+    workspace_root: std::path::PathBuf,
+    worktree_root: std::path::PathBuf,
+    metadata_root: std::path::PathBuf,
+    #[cfg(unix)]
+    directories: [std::sync::Arc<std::fs::File>; 3],
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionRequest {
     /// Engine-persisted execution id, when this request is owned by a durable
@@ -145,6 +158,10 @@ pub struct ExecutionRequest {
     /// YAML artifact path templates resolve to the per-run directory.
     #[serde(default)]
     pub chainworks_meta_root: Option<String>,
+    /// Exact external metadata root approved by the engine for this execution.
+    /// JSON and environment variables cannot convey this authority.
+    #[serde(skip)]
+    pub approved_metadata_root: Option<ApprovedMetadataRoot>,
     /// P053 compatibility escape hatch. Broad workspace/worktree diffing is
     /// disabled unless the frozen run plan or audited retry override enables it.
     #[serde(default)]

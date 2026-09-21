@@ -133,6 +133,22 @@ pub async fn list_by_idea(pool: &SqlitePool, idea_id: IdeaId) -> Result<Vec<Run>
     rows.iter().map(|r| parse_run_row(r)).collect()
 }
 
+/// Reject known continuation reservations before StartRun probes caller paths.
+/// The insert trigger remains the authority for a reservation racing this read.
+pub async fn check_continuation_start_guard(pool: &SqlitePool, idea_id: IdeaId) -> Result<()> {
+    let reserved: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM run_continuations WHERE idea_id=? AND phase IN ('preparing','prepared','needs_reconciliation','aborting'))",
+    )
+    .bind(idea_id.to_string())
+    .fetch_one(pool)
+    .await?;
+    if reserved {
+        crate::metrics::record_continuation_guard_denied();
+        anyhow::bail!("continuation_in_progress");
+    }
+    Ok(())
+}
+
 pub async fn list_active(pool: &SqlitePool) -> Result<Vec<Run>> {
     let query = format!(
         "SELECT {SELECT_COLS} FROM runs WHERE status NOT IN ('completed', 'failed', 'cancelled') ORDER BY started_at DESC"
@@ -143,6 +159,18 @@ pub async fn list_active(pool: &SqlitePool) -> Result<Vec<Run>> {
         .context("list active runs")?;
 
     rows.iter().map(|r| parse_run_row(r)).collect()
+}
+
+/// Recovery selects execution owners, not all operator-visible blocked history.
+pub async fn list_recoverable(pool: &SqlitePool) -> Result<Vec<Run>> {
+    let query = format!(
+        "SELECT {SELECT_COLS} FROM runs WHERE status NOT IN ('completed','failed','cancelled') AND NOT EXISTS (SELECT 1 FROM run_execution_fences f WHERE f.source_run_id=runs.id) ORDER BY started_at DESC"
+    );
+    let rows = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
+        .fetch_all(pool)
+        .await
+        .context("list recoverable runs")?;
+    rows.iter().map(parse_run_row).collect()
 }
 
 pub async fn list_completed(pool: &SqlitePool, limit: i64) -> Result<Vec<Run>> {

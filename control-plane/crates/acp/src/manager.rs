@@ -1797,6 +1797,7 @@ mod tests {
             toolchain_home: Some("/tmp/toolchain-home".to_string()),
             toolchain_go_scope_enabled: true,
 
+            approved_metadata_root: None,
             p079_repair_canonical_paths: None,
             input_manifest: None,
         }
@@ -1972,6 +1973,7 @@ mod tests {
             toolchain_home: None,
             toolchain_go_scope_enabled: false,
 
+            approved_metadata_root: None,
             p079_repair_canonical_paths: None,
             input_manifest: None,
         };
@@ -2044,6 +2046,7 @@ mod tests {
             toolchain_home: None,
             toolchain_go_scope_enabled: false,
 
+            approved_metadata_root: None,
             p079_repair_canonical_paths: None,
             input_manifest: None,
         };

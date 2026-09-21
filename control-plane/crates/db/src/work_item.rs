@@ -15,6 +15,8 @@ pub enum WorkItemKind {
     StewardAnalysis,
     /// P086: claim and execute a queued agent_work_continuations row.
     ProcessContinuation,
+    /// P039: claimed only by its separate bounded preparation lane.
+    PrepareRunContinuation,
 }
 
 impl std::fmt::Display for WorkItemKind {
@@ -28,6 +30,7 @@ impl std::fmt::Display for WorkItemKind {
             WorkItemKind::TriggerNextStage => write!(f, "trigger_next_stage"),
             WorkItemKind::StewardAnalysis => write!(f, "steward_analysis"),
             WorkItemKind::ProcessContinuation => write!(f, "process_continuation"),
+            WorkItemKind::PrepareRunContinuation => write!(f, "prepare_run_continuation"),
         }
     }
 }
@@ -45,6 +48,7 @@ impl std::str::FromStr for WorkItemKind {
             "trigger_next_stage" => Ok(WorkItemKind::TriggerNextStage),
             "steward_analysis" => Ok(WorkItemKind::StewardAnalysis),
             "process_continuation" => Ok(WorkItemKind::ProcessContinuation),
+            "prepare_run_continuation" => Ok(WorkItemKind::PrepareRunContinuation),
             other => Err(format!("Unknown WorkItemKind: {other}")),
         }
     }

@@ -8,6 +8,7 @@ Related stable docs:
 
 - [operator-experience.md](operator-experience.md)
 - [runtime-contract.md](runtime-contract.md)
+- [blocked-run-carry-forward.md](blocked-run-carry-forward.md)
 - [structured-output-envelope-and-contract-validation.md](structured-output-envelope-and-contract-validation.md)
 - [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md)
 - [p041-generated-artifact-schemas.md](p041-generated-artifact-schemas.md)

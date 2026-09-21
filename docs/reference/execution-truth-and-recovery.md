@@ -2,6 +2,10 @@
 
 Stable reference for the execution-truth, settlement, and recovery contract.
 
+[Blocked-run carry-forward](blocked-run-carry-forward.md) creates a separately
+reviewed successor while preserving the source as fenced historical truth. It
+does not grant retry/resume authority to the source or inherit its approvals.
+
 P058 layers a chain-level escalation contract on top of agent-level execution truth: tier advancement, trigger classification, ledger persistence, and recovery semantics are owned by the Rust control plane. See [escalation-policies.md](escalation-policies.md) for policy schema, pause-reason catalog, and rollout phasing. The escalation-specific invariants relevant to recovery readers are pinned in *Escalation chain invariants* below.
 
 ## Purpose

@@ -871,7 +871,7 @@ impl RecoveryService {
                 "Startup recovery restored cancelled run terminal invariants"
             );
         }
-        let active_runs = runs::list_active(&self.pool).await?;
+        let active_runs = runs::list_recoverable(&self.pool).await?;
         let runs_inspected = active_runs.len();
         let mut runs_repaired = cancelled_terminal_invariant_repairs as usize;
         let mut work_items_requeued = 0usize;
@@ -1698,7 +1698,7 @@ impl RecoveryService {
     pub async fn run_p092_retry_payload_recovery_for_active_runs(&self) -> Result<usize> {
         let mut repaired = 0usize;
         let mut remaining = p092_recovery_batch_limit();
-        for run in runs::list_active(&self.pool).await? {
+        for run in runs::list_recoverable(&self.pool).await? {
             if remaining == 0 {
                 break;
             }

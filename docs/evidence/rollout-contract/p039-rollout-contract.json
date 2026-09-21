@@ -1,0 +1,103 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "applicability": "required",
+  "gate_aliases": [
+    "proposal-039",
+    "p039"
+  ],
+  "commands": {
+    "allowlist": [
+      "./scripts/lint-rollout-contract docs/evidence/rollout-contract/p039-rollout-contract.json",
+      "./scripts/test-gate.sh proposal-039",
+      "./scripts/test-gate.sh p039"
+    ],
+    "commentary": "Design declaration. P039 aliases are to be registered during implementation; no gate execution or live acceptance is claimed."
+  },
+  "migrations": {
+    "not_applicable": false,
+    "description": "Add registered p039_run_carry_forward_v1 migration for operations, step receipts, typed input provenance and source execution fences. Allocate numeric filename from implementation registry; additive only."
+  },
+  "metrics": {
+    "adoption_metric": "run_continuation_activation_total",
+    "operational_metrics": [
+      "run_continuation_admission_total{result,reason}",
+      "run_continuation_phase_duration_ms{phase}",
+      "run_continuation_hold_total{reason}",
+      "run_continuation_source_guard_denied_total{surface}",
+      "run_continuation_preserved_bytes_total"
+    ]
+  },
+  "readback_lanes": [
+    "run_report",
+    "mcp",
+    "release_receipt",
+    "graphql"
+  ],
+  "readback_fields": [
+    "rollout_contract_status",
+    "rollout_contract_decision",
+    "rollout_contract_failure_reasons",
+    "rollout_contract_waiver_state",
+    "rollout_contract_waiver_expires_at",
+    "rollout_contract_enforcement_mode",
+    "rollout_contract_enforcement_mode_reason",
+    "rollout_contract_hold_conditions",
+    "rollout_contract_rollback_disposition",
+    "rollout_contract_source_lane",
+    "rollout_contract_enabled_state",
+    "rollout_contract_disabled_reason_code",
+    "rollout_contract_action_id",
+    "rollout_contract_operator_message",
+    "rollout_contract_projection_integrity",
+    "rollout_contract_cutover_policy_revision",
+    "rollout_contract_diagnostic_redaction",
+    "rollout_contract_next_steps"
+  ],
+  "readback_fixture": "docs/evidence/rollout-contract/operator-readback/p039-full-surface.fixture.json",
+  "operator_report_fields": [
+    "rollout_contract_status",
+    "rollout_contract_decision",
+    "rollout_contract_failure_reasons",
+    "rollout_contract_waiver_state",
+    "rollout_contract_waiver_expires_at",
+    "rollout_contract_enforcement_mode",
+    "rollout_contract_enforcement_mode_reason",
+    "rollout_contract_hold_conditions",
+    "rollout_contract_rollback_disposition",
+    "rollout_contract_source_lane",
+    "rollout_contract_enabled_state",
+    "rollout_contract_disabled_reason_code",
+    "rollout_contract_action_id",
+    "rollout_contract_operator_message",
+    "rollout_contract_projection_integrity",
+    "rollout_contract_cutover_policy_revision",
+    "rollout_contract_diagnostic_redaction",
+    "rollout_contract_next_steps"
+  ],
+  "hold_conditions": [
+    "Source ownership, preservation or prepared material cannot be verified.",
+    "An ordinary or headless effect has an unknown outcome.",
+    "Source-fence owner coverage or exact-once activation proof is incomplete.",
+    "Current target policy/profile or fresh approval binding is invalid.",
+    "Schema compatibility or readback integrity cannot be established."
+  ],
+  "rollback_disposition": {
+    "mode": "disable_admission_keep_compatible_fences_and_readers",
+    "data_loss_risk": "low",
+    "steps": [
+      "Disable new continuation preparation and activation.",
+      "Keep source fences, lineage, input readers, files and Git refs intact.",
+      "Reconcile in-flight operations without automatic Git replay or source reactivation.",
+      "Deploy only a build compatible with the P039 schema; no destructive down migration."
+    ]
+  },
+  "decision_vocabulary": [
+    "pass",
+    "fail",
+    "timeout"
+  ],
+  "negative_fixtures": {
+    "source_changed": "docs/evidence/rollout-contract/negative/p039-source-changed.json",
+    "unresolved_effect": "docs/evidence/rollout-contract/negative/p039-unresolved-effect.json"
+  }
+}

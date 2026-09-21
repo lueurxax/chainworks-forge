@@ -43,6 +43,14 @@ scoring:
       - docs_report.status in ['pass', 'not_needed']
       - tests_result.status == 'green'
 initial_state: state_1_idea_received
+blocked_run_continuation:
+  schema_version: blocked_run_continuation_profile_v1
+  profile: implementation_restart_v1
+  review_state: state_4_proposal_reviewed
+  approval_state: state_6_implementation_approval
+  preparation_state: state_7_implementation_started
+  proposal_input: proposal_current
+  preparation_task: freeze_approved_proposal_and_prepare_worktree
 states:
   state_1_idea_received:
     label: Idea received

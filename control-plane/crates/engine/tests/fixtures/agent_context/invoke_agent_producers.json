@@ -18,7 +18,7 @@
     "source_file": "orchestrator.rs",
     "function": "materialize_dynamic_parallel",
     "classification": "fresh_finalized",
-    "guard": "build_task_prompt("
+    "guard": "build_task_prompt_for_runtime("
   },
   {
     "producer_id": "orchestrator.legacy_flat",

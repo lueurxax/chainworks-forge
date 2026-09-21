@@ -274,6 +274,7 @@ Start here:
 Implemented-system references:
 
 - [`docs/reference/workflow-execution-engine.md`](docs/reference/workflow-execution-engine.md)
+- [`docs/reference/blocked-run-carry-forward.md`](docs/reference/blocked-run-carry-forward.md)
 - [`docs/reference/artifact-discovery-and-settlement-optimization.md`](docs/reference/artifact-discovery-and-settlement-optimization.md)
 - [`docs/reference/runtime-contract.md`](docs/reference/runtime-contract.md)
 - [`docs/reference/execution-truth-and-recovery.md`](docs/reference/execution-truth-and-recovery.md)

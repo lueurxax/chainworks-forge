@@ -6,6 +6,8 @@ use domain::run::{DeliveryConfiguration, Run};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeliveryReceipt {
+    #[serde(default, flatten)]
+    pub carry_forward: crate::run_carry_forward::readback::ReportFields,
     pub run_id: String,
     pub workflow_id: String,
     pub idea_title: String,
@@ -37,6 +39,31 @@ pub struct ReleaseResultSummary {
 pub struct DeliveryReceiptBuilder;
 
 impl DeliveryReceiptBuilder {
+    pub fn build_receipt_with_carry_forward(
+        run: &Run,
+        delivery_config: &DeliveryConfiguration,
+        release_result: Option<&ReleaseResult>,
+        rollout_contract_readback: Option<serde_json::Value>,
+        p080_reconciliation: Option<serde_json::Value>,
+        idea_title: &str,
+        review_status: Option<&str>,
+        carry_forward: crate::run_carry_forward::readback::ReportFields,
+    ) -> Option<DeliveryReceipt> {
+        Self::build_receipt(
+            run,
+            delivery_config,
+            release_result,
+            rollout_contract_readback,
+            p080_reconciliation,
+            idea_title,
+            review_status,
+        )
+        .map(|mut receipt| {
+            receipt.carry_forward = carry_forward;
+            receipt
+        })
+    }
+
     pub fn build_receipt(
         run: &Run,
         delivery_config: &DeliveryConfiguration,
@@ -72,6 +99,7 @@ impl DeliveryReceiptBuilder {
         });
 
         Some(DeliveryReceipt {
+            carry_forward: Default::default(),
             run_id: run.id.to_string(),
             workflow_id: run.workflow_id.clone(),
             idea_title: idea_title.to_string(),

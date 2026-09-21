@@ -1,0 +1,10 @@
+{
+  "schema_version": "p039_negative_case_v1",
+  "fixture_kind": "design_expectation",
+  "case_id": "CF-09",
+  "condition": "source_digest_changed_after_prepare",
+  "expected_phase": "needs_reconciliation",
+  "expected_reason": "source_changed",
+  "expected_successor_count": 0,
+  "source_reset_permitted": false
+}

@@ -1300,6 +1300,7 @@ async fn background_executor_preserves_existing_delivery_receipt_without_overwri
         Path::new(&repo_dir).join(".chainworks/release/delivery-receipt.json");
     std::fs::create_dir_all(preexisting_receipt_path.parent().unwrap()).unwrap();
     let sentinel_receipt = engine::release::receipt::DeliveryReceipt {
+        carry_forward: Default::default(),
         run_id: run_id.to_string(),
         workflow_id: "wf-release".into(),
         idea_title: "Sentinel".into(),

@@ -207,6 +207,54 @@ pub async fn execute(
     cmd_handler: &CommandHandler,
     principal: &auth::Principal,
 ) -> Result<serde_json::Value> {
+    execute_with_readback_config(
+        tool_name,
+        params,
+        pool,
+        cmd_handler,
+        principal,
+        Default::default(),
+    )
+    .await
+}
+
+pub async fn execute_with_readback_config(
+    tool_name: &str,
+    params: serde_json::Value,
+    pool: &SqlitePool,
+    cmd_handler: &CommandHandler,
+    principal: &auth::Principal,
+    config: engine::run_carry_forward::readback::ReadbackConfig,
+) -> Result<serde_json::Value> {
+    let run_id = params["run_id"]
+        .as_str()
+        .and_then(|id| id.parse::<RunId>().ok());
+    let mut value = execute_inner(tool_name, params, pool, cmd_handler, principal).await?;
+    if let Some(run_id) = run_id {
+        let fields =
+            super::run_continuations::compact_fields(pool, run_id, principal, config).await?;
+        let fields = fields.as_object().expect("compact object");
+        if let Some(reports) = value["reports"].as_array_mut() {
+            for report in reports {
+                if let Some(object) = report.as_object_mut() {
+                    object.extend(fields.clone());
+                }
+            }
+        }
+        if let Some(object) = value.as_object_mut() {
+            object.extend(fields.clone());
+        }
+    }
+    Ok(value)
+}
+
+async fn execute_inner(
+    tool_name: &str,
+    params: serde_json::Value,
+    pool: &SqlitePool,
+    cmd_handler: &CommandHandler,
+    principal: &auth::Principal,
+) -> Result<serde_json::Value> {
     match tool_name {
         "reports.get" => {
             if !matches!(principal.class, auth::PrincipalClass::Operator) {

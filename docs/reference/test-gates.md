@@ -720,6 +720,33 @@ Important:
 - session observability GraphQL fields are enabled by default; clients still must gate documents on capability/schema discovery so explicit disabled-schema mode does not produce validation errors
 - no SQL schema migration or additive index is allowed in this slice; profiling-driven indexing requires a follow-up proposal revision
 
+### `proposal-039|p039`
+
+The complete offline integration entry point is `proposal-039|p039`; the
+implemented contract is [blocked-run-carry-forward.md](blocked-run-carry-forward.md). It runs
+dedicated domain/wire, closed-profile, migration/WAL restore, source-fence,
+command-replay, worker/materialization, installed-input, ordinary-approval,
+MCP/GraphQL/readback and daemon-composition fixtures through managed Cargo.
+All repositories and databases are disposable; it makes no live provider,
+Apple, production-database or UI calls. Missing integration targets fail the
+gate. The exact-name coverage map requires an executed pass for every mapped
+offline case; ignored, failed, filtered-out and duplicate test events do not
+satisfy it. Passing this offline gate does not establish live rollout acceptance.
+
+### `proposal-039-i1|p039-i1`
+
+Provider-free first experiment for blocked-run carry-forward. Runs the domain
+evidence/approval contracts, closed workflow profile, read-only inventory,
+independent materialization, and temporary SQLite composition tests through the
+managed Cargo environment. Uses disposable Git repositories and no production
+DB, provider, Apple service, daemon restart or UI tests.
+
+This is not the complete `proposal-039|p039` acceptance gate. It does not prove
+durable activation, source fences, background recovery, MCP authorization or a
+live P095 transfer. The full integration gate and separate live acceptance own
+those proofs. See [integration evidence](../evidence/p039-durable-integration.md)
+for measured results and explicit limitations.
+
 ### `proposal-036|p036`
 
 macOS operator navigation and read-model UX gate. The alias retains the historical proposal number; the stable behavior contract is [macos-operator-navigation.md](macos-operator-navigation.md).

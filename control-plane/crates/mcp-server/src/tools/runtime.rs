@@ -273,7 +273,11 @@ pub async fn execute(
             "maxOutputLines": DEFAULT_TOOL_OUTPUT_MAX_LINES,
             "maxCumulativeOutputBytes": DEFAULT_CUMULATIVE_TOOL_OUTPUT_MAX_BYTES
         },
-        "qualityGateBoundary": p094_quality_gate_boundary_readback()
+        "qualityGateBoundary": p094_quality_gate_boundary_readback(),
+        "runCarryForward": {
+            "metricNames": db::metrics::P039_REQUIRED_METRICS,
+            "metricValues": db::metrics::p039_rollout_metric_values_json()
+        }
     }))
 }
 

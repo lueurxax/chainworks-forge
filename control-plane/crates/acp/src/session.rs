@@ -1665,6 +1665,7 @@ mod tests {
             session_generation_id: None,
             provider_session_id: None,
             provider_runtime_home: None,
+            approved_metadata_root: None,
             p079_repair_canonical_paths: None,
             input_manifest: None,
             mcp_servers: Vec::new(),

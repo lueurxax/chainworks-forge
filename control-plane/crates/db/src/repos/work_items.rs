@@ -70,11 +70,15 @@ pub async fn enqueue_tx(tx: &mut Transaction<'_, Sqlite>, item: &WorkItem) -> Re
 }
 
 pub async fn claim_next(pool: &SqlitePool) -> Result<Option<WorkItem>> {
-    claim_next_where(pool, "1 = 1").await
+    claim_next_where(pool, "kind != 'prepare_run_continuation'").await
 }
 
 pub async fn claim_next_non_invoke(pool: &SqlitePool) -> Result<Option<WorkItem>> {
-    claim_next_where(pool, "kind != 'invoke_agent'").await
+    claim_next_where(
+        pool,
+        "kind NOT IN ('invoke_agent','prepare_run_continuation')",
+    )
+    .await
 }
 
 async fn claim_next_where(pool: &SqlitePool, kind_predicate: &str) -> Result<Option<WorkItem>> {
@@ -94,6 +98,8 @@ async fn claim_next_where(pool: &SqlitePool, kind_predicate: &str) -> Result<Opt
 
     let now = indexable_due_timestamp(Utc::now());
     let pending_status = WorkItemStatus::Pending.to_string();
+    let running_status = WorkItemStatus::Running.to_string();
+    let mut cursor: Option<(String, i64)> = None;
 
     // FIFO ordering with a deterministic tiebreaker. Without `rowid ASC`, two
     // work items enqueued within the same RFC3339 millisecond can be returned
@@ -102,9 +108,10 @@ async fn claim_next_where(pool: &SqlitePool, kind_predicate: &str) -> Result<Opt
     // publish). `rowid` is SQLite's monotonic insert sequence, guaranteeing
     // true FIFO semantics in the tiebreaker case.
     let query = format!(
-        r#"SELECT id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, attempt_count, last_error
+        r#"SELECT rowid AS queue_rowid, id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, attempt_count, last_error
            FROM work_items
            WHERE status = ?1 AND scheduled_at <= ?2 AND ({kind_predicate})
+             AND (?3 IS NULL OR (scheduled_at, rowid) > (?3, ?4))
            ORDER BY scheduled_at ASC, rowid ASC
            LIMIT 1"#
     );
@@ -112,6 +119,8 @@ async fn claim_next_where(pool: &SqlitePool, kind_predicate: &str) -> Result<Opt
         let row = sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
             .bind(&pending_status)
             .bind(&now)
+            .bind(cursor.as_ref().map(|(scheduled_at, _)| scheduled_at))
+            .bind(cursor.as_ref().map(|(_, rowid)| *rowid))
             .fetch_optional(&mut **tx)
             .await
             .context("select next work item")?;
@@ -122,40 +131,60 @@ async fn claim_next_where(pool: &SqlitePool, kind_predicate: &str) -> Result<Opt
             return Ok(None);
         };
 
+        // A fence denial aborts only its statement. Advance within this same
+        // writer transaction without changing protected history or retrying it.
+        cursor = Some((row.get("scheduled_at"), row.get("queue_rowid")));
+        let item_id: String = row.get("id");
         let kind: String = row.get("kind");
         let payload_json: String = row.get("payload_json");
         if kind == WorkItemKind::AdvanceRun.to_string() {
             match classify_advance_payload_scope(&payload_json) {
                 AdvancePayloadScope::Malformed(code) => {
-                    let item_id: String = row.get("id");
-                    quarantine_advance_work_item_tx(&mut tx, &item_id, code).await?;
+                    if let Err(error) =
+                        quarantine_advance_work_item_tx(&mut tx, &item_id, code).await
+                    {
+                        let Some(reason) = error
+                            .downcast_ref::<sqlx::Error>()
+                            .and_then(claim_source_fence_denial)
+                        else {
+                            return Err(error);
+                        };
+                        tracing::warn!(work_item_id = %item_id, reason, "retaining fenced malformed queue item without dispatch");
+                    }
                     continue;
                 }
                 AdvancePayloadScope::LegacyRunScoped | AdvancePayloadScope::Targeted => {}
             }
         }
-        break row;
-    };
-
-    let item_id: String = row.get("id");
-    let running_status = WorkItemStatus::Running.to_string();
-
-    let updated = sqlx::query(
-        r#"UPDATE work_items
+        let updated = sqlx::query(
+            r#"UPDATE work_items
            SET status = ?1, started_at = ?2, attempt_count = attempt_count + 1
            WHERE id = ?3 AND status = ?4"#,
-    )
-    .bind(&running_status)
-    .bind(&now)
-    .bind(&item_id)
-    .bind(&pending_status)
-    .execute(&mut **tx)
-    .await
-    .context("mark work item running")?
-    .rows_affected();
-    if updated != 1 {
-        anyhow::bail!("claim_next CAS failed for work item {item_id}");
-    }
+        )
+        .bind(&running_status)
+        .bind(&now)
+        .bind(&item_id)
+        .bind(&pending_status)
+        .execute(&mut **tx)
+        .await;
+        let updated = match updated {
+            Err(error) if claim_source_fence_denial(&error).is_some() => {
+                let quarantined = quarantine_unowned_fenced_work_item_tx(&mut tx, &item_id).await?;
+                tracing::warn!(
+                    work_item_id = %item_id,
+                    reason = claim_source_fence_denial(&error).unwrap(),
+                    quarantined,
+                    "skipping fenced queue item without dispatch"
+                );
+                continue;
+            }
+            result => result.context("mark work item running")?.rows_affected(),
+        };
+        if updated != 1 {
+            anyhow::bail!("claim_next CAS failed for work item {item_id}");
+        }
+        break row;
+    };
 
     tx.commit().await.context("commit claim_next")?;
     log_write_transaction("work_items.claim_next", tx_started);
@@ -173,6 +202,60 @@ async fn claim_next_where(pool: &SqlitePool, kind_predicate: &str) -> Result<Opt
         row.get("last_error"),
     )?;
     Ok(Some(item))
+}
+
+fn claim_source_fence_denial(error: &sqlx::Error) -> Option<&'static str> {
+    let sqlx::Error::Database(error) = error else {
+        return None;
+    };
+    // SQLITE_CONSTRAINT_TRIGGER plus the exact P039 guard reason, not an
+    // arbitrary SQL failure or a message that happens to contain that reason.
+    match (error.code().as_deref(), error.message()) {
+        (Some("1811"), "continuation_in_progress") => Some("continuation_in_progress"),
+        (Some("1811"), "source_continued") => Some("source_continued"),
+        _ => None,
+    }
+}
+
+async fn quarantine_unowned_fenced_work_item_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    item_id: &str,
+) -> Result<bool> {
+    // Absence of every recorded owner is deliberately stricter than a missing
+    // required owner. Mixed/indirect ownership stays untouched; the SQL fence
+    // remains authoritative and may reject even this nonbusiness quarantine.
+    let result = sqlx::query(
+        r#"UPDATE work_items
+           SET status = 'failed', failed_at = ?2, last_error = 'p039_queue_owner_unresolved'
+           WHERE id = ?1 AND status = 'pending'
+             AND EXISTS (SELECT 1 FROM run_execution_fences)
+             AND stage_id IS NULL
+             AND (worktree_resource_key IS NULL OR worktree_resource_key = '')
+             AND CASE WHEN json_valid(payload_json) THEN
+               NOT EXISTS (SELECT 1 FROM runs
+                   WHERE id = work_items.run_id OR id = json_extract(work_items.payload_json, '$.run_id'))
+               AND NOT EXISTS (SELECT 1 FROM stage_executions
+                   WHERE id = json_extract(work_items.payload_json, '$.stage_execution_id'))
+               AND NOT EXISTS (SELECT 1 FROM agent_executions
+                   WHERE id = json_extract(work_items.payload_json, '$.agent_execution_id'))
+               AND NOT EXISTS (SELECT 1 FROM lead_conflict_mediations
+                   WHERE id = json_extract(work_items.payload_json, '$.mediation_record_id')
+                      OR id = json_extract(work_items.payload_json, '$.lead_mediation_record_id'))
+               AND NOT EXISTS (SELECT 1 FROM agent_work_continuations
+                   WHERE id = json_extract(work_items.payload_json, '$.continuation_id'))
+             ELSE 0 END"#,
+    )
+    .bind(item_id)
+    .bind(Utc::now().to_rfc3339())
+    .execute(&mut **tx)
+    .await;
+    match result {
+        Err(error) if claim_source_fence_denial(&error).is_some() => Ok(false),
+        result => Ok(result
+            .context("quarantine unowned fenced queue item")?
+            .rows_affected()
+            == 1),
+    }
 }
 
 pub async fn select_next_pending_invoke_agent_for_start_tx(

@@ -31,6 +31,8 @@ pub mod retry_instruction;
 pub mod risk_lineage;
 pub mod routing;
 pub mod run;
+pub mod run_carry_forward;
+pub mod run_carry_forward_api;
 pub mod session;
 pub mod side_effect;
 pub mod stage;

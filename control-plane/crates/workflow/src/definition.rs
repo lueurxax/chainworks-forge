@@ -15,6 +15,9 @@ pub struct WorkflowFile {
     pub workflow: Option<WorkflowMeta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery: Option<DiscoveryDef>,
+    /// Frozen opt-in metadata; the P039 compiler entry validates its strict closed schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_run_continuation: Option<serde_json::Value>,
     pub variables: Option<HashMap<String, serde_yaml::Value>>,
     pub initial_state: String,
     pub states: HashMap<String, WorkflowState>,

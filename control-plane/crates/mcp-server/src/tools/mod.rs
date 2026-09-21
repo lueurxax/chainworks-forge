@@ -6,6 +6,7 @@ pub mod effects;
 pub mod ideas;
 pub mod p080;
 pub mod reports;
+pub mod run_continuations;
 pub mod runs;
 pub mod runtime;
 pub mod scanner;
@@ -17,13 +18,19 @@ pub mod temp_artifacts;
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
 
-pub fn all_capability_tool_ids() -> [CapabilityToolId; 57] {
+pub fn all_capability_tool_ids() -> [CapabilityToolId; 63] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
         CapabilityToolId::RunsStart,
         CapabilityToolId::RunsList,
         CapabilityToolId::RunsGet,
+        CapabilityToolId::RunsContinuationPreview,
+        CapabilityToolId::RunsContinueBlocked,
+        CapabilityToolId::RunsContinuationGet,
+        CapabilityToolId::RunsContinuationActivate,
+        CapabilityToolId::RunsContinuationReconcile,
+        CapabilityToolId::RunsContinuationAbort,
         CapabilityToolId::RunsMainSyncRequest,
         CapabilityToolId::RunsMainSyncRetry,
         CapabilityToolId::RunsMainSyncSetOverride,
@@ -100,6 +107,12 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "runs.start" => Some(CapabilityToolId::RunsStart),
         "runs.list" => Some(CapabilityToolId::RunsList),
         "runs.get" => Some(CapabilityToolId::RunsGet),
+        "runs.continuation_preview" => Some(CapabilityToolId::RunsContinuationPreview),
+        "runs.continue_blocked" => Some(CapabilityToolId::RunsContinueBlocked),
+        "runs.continuation_get" => Some(CapabilityToolId::RunsContinuationGet),
+        "runs.continuation_activate" => Some(CapabilityToolId::RunsContinuationActivate),
+        "runs.continuation_reconcile" => Some(CapabilityToolId::RunsContinuationReconcile),
+        "runs.continuation_abort" => Some(CapabilityToolId::RunsContinuationAbort),
         "runs.main_sync.request" => Some(CapabilityToolId::RunsMainSyncRequest),
         "runs.main_sync.retry" => Some(CapabilityToolId::RunsMainSyncRetry),
         "runs.main_sync.set_override" => Some(CapabilityToolId::RunsMainSyncSetOverride),
@@ -176,6 +189,12 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "runs_start" => "runs.start",
         "runs_list" => "runs.list",
         "runs_get" => "runs.get",
+        "runs_continuation_preview" => "runs.continuation_preview",
+        "runs_continue_blocked" => "runs.continue_blocked",
+        "runs_continuation_get" => "runs.continuation_get",
+        "runs_continuation_activate" => "runs.continuation_activate",
+        "runs_continuation_reconcile" => "runs.continuation_reconcile",
+        "runs_continuation_abort" => "runs.continuation_abort",
         "runs_main_sync_request" => "runs.main_sync.request",
         "runs_main_sync_retry" => "runs.main_sync.retry",
         "runs_main_sync_set_override" => "runs.main_sync.set_override",
@@ -238,6 +257,26 @@ pub fn codex_compatible_tool(mut tool: McpTool) -> McpTool {
 
 pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
     match id {
+        CapabilityToolId::RunsContinuationPreview => {
+            tool_spec_by_name(run_continuations::tool_specs(), "runs.continuation_preview")
+        }
+        CapabilityToolId::RunsContinueBlocked => {
+            tool_spec_by_name(run_continuations::tool_specs(), "runs.continue_blocked")
+        }
+        CapabilityToolId::RunsContinuationGet => {
+            tool_spec_by_name(run_continuations::tool_specs(), "runs.continuation_get")
+        }
+        CapabilityToolId::RunsContinuationActivate => tool_spec_by_name(
+            run_continuations::tool_specs(),
+            "runs.continuation_activate",
+        ),
+        CapabilityToolId::RunsContinuationReconcile => tool_spec_by_name(
+            run_continuations::tool_specs(),
+            "runs.continuation_reconcile",
+        ),
+        CapabilityToolId::RunsContinuationAbort => {
+            tool_spec_by_name(run_continuations::tool_specs(), "runs.continuation_abort")
+        }
         // These capabilities govern the authenticated offline operator CLI.
         // They are deliberately absent from all_capability_tool_ids and the MCP registry.
         CapabilityToolId::XcodeEffectsDiagnostics

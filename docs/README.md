@@ -32,6 +32,8 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 ### Execution engine
 
+- [reference/blocked-run-carry-forward.md](reference/blocked-run-carry-forward.md) - Preserved blocked-run material, independent successor review, source fences and admission boundaries
+
 - [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — RunPlan compiler, orchestrator, executors, artifact management, resume, declarative workflow authority, quality-gate blocker boundary routing, durable side-effect ledger, and conflict resolution / lead mediation
 - [reference/artifact-discovery-and-settlement-optimization.md](reference/artifact-discovery-and-settlement-optimization.md) — Bounded discovery, settlement pipeline, and pre-prompt metadata
 - [reference/runtime-contract.md](reference/runtime-contract.md) — Frozen run snapshots, state machines, artifact model

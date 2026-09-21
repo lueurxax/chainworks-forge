@@ -20,7 +20,7 @@ use crate::protocol::JsonRpcRequest;
 use crate::request_context;
 use crate::server::McpServer;
 
-pub const MCP_HTTP_BODY_LIMIT_BYTES: usize = 256 * 1024;
+pub const MCP_HTTP_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 
 /// Build the axum router for MCP HTTP transport.
 ///
@@ -59,11 +59,30 @@ async fn handle_mcp_post(
         return (StatusCode::BAD_REQUEST, "Empty body").into_response();
     }
 
+    let raw = match crate::protocol::check_raw_request(body.as_bytes()) {
+        Ok(raw) => raw,
+        Err(response) => {
+            return json_response(
+                StatusCode::OK,
+                &response.with_error_request_id(inbound_request_id.as_deref()),
+                None,
+            )
+        }
+    };
+    // Retain the pre-P039 body ceiling for existing tools.
+    if !raw.is_continuation && body.len() > 256 * 1024 {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+
     // SEC-P080-HIGH-001: duplicate-key rejection at the raw-parse boundary for ALL
     // JSON-RPC requests. Runs before auth and before serde_json typed extraction so
     // unicode-escaped method/name values cannot bypass last-value-wins rejection.
     // The body-size cap (MCP_HTTP_BODY_LIMIT_BYTES) bounds the scan work.
-    if let Some(dup_key) = find_duplicate_json_object_key(trimmed) {
+    if let Some(dup_key) = raw.duplicate_key.or_else(|| {
+        (!raw.is_continuation)
+            .then(|| find_duplicate_json_object_key(trimmed))
+            .flatten()
+    }) {
         if dup_key == "__budget_exceeded__" {
             db::metrics::increment_counter_with_label(
                 "p080_mcp_canonicalization_budget_exceeded_total",
@@ -125,32 +144,21 @@ async fn handle_mcp_post(
                         (p, Some(tid))
                     }
                     Err(_) => {
-                        let resp = crate::protocol::JsonRpcResponse::error(
-                            None,
-                            -32000,
-                            "unauthorized".to_string(),
-                        )
-                        .with_error_request_id(inbound_request_id.as_deref());
+                        let resp =
+                            crate::protocol::authentication_denial(None, raw.is_continuation)
+                                .with_error_request_id(inbound_request_id.as_deref());
                         return json_response(StatusCode::OK, &resp, None);
                     }
                 },
                 Err(_) => {
-                    let resp = crate::protocol::JsonRpcResponse::error(
-                        None,
-                        -32000,
-                        "unauthorized".to_string(),
-                    )
-                    .with_error_request_id(inbound_request_id.as_deref());
+                    let resp = crate::protocol::authentication_denial(None, raw.is_continuation)
+                        .with_error_request_id(inbound_request_id.as_deref());
                     return json_response(StatusCode::OK, &resp, None);
                 }
             },
             None => {
-                let resp = crate::protocol::JsonRpcResponse::error(
-                    None,
-                    -32000,
-                    "unauthorized".to_string(),
-                )
-                .with_error_request_id(inbound_request_id.as_deref());
+                let resp = crate::protocol::authentication_denial(None, raw.is_continuation)
+                    .with_error_request_id(inbound_request_id.as_deref());
                 return json_response(StatusCode::OK, &resp, None);
             }
         }

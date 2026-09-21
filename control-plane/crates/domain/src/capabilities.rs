@@ -7,6 +7,13 @@ pub enum CapabilityToolId {
     RunsStart,
     RunsList,
     RunsGet,
+    /// P039 explicit-only capabilities; never inherited from class defaults.
+    RunsContinuationPreview,
+    RunsContinueBlocked,
+    RunsContinuationGet,
+    RunsContinuationActivate,
+    RunsContinuationReconcile,
+    RunsContinuationAbort,
     RunsMainSyncRequest,
     RunsMainSyncRetry,
     RunsMainSyncSetOverride,
