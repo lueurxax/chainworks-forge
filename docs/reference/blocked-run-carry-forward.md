@@ -8,6 +8,8 @@ execution authority.
 Admission is disabled by default. This document describes implemented behavior;
 deployment and live acceptance are separate from the
 [offline integration evidence](../evidence/p039-durable-integration.md).
+The [live rollout record](../evidence/p039-live-rollout-2026-09-21.md) distinguishes
+deployed capability from a completed transfer.
 
 ## Eligibility And Source Protection
 
@@ -23,6 +25,12 @@ transaction. Source work, shared effective checkout resources, indirect
 stage/agent/session owners, pending approvals and unsettled provider, repair,
 release, cancellation or headless effects prevent admission. Unknown ownership
 is not absence. The same idea cannot acquire a second runnable head.
+
+Legacy provider records without a verified process fate and unsettled escalation
+ownership remain admission holds even when the live session manager is empty.
+A blocked run status or terminal stage does not by itself reconcile those
+records. Preserve the source and establish lifecycle evidence before re-preview;
+do not clear historical statuses through bulk SQL or infer missing process IDs.
 
 Persisted source fences protect ordinary command, dispatch, recovery and SQL
 write paths. Activation makes the original run historical without rewriting its

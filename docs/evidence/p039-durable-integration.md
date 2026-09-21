@@ -5,9 +5,11 @@ canonical gate passed, all broad failures are classified and no scoped P039
 finding remains open. This is not live admission,
 a P095 migration receipt, or permission to retire the proposal.
 
-Baseline: `8c40f71a03cfebff413fbad584131e0bcbe9859b`. Changes are isolated in the
-`p039-carry-forward` worktree and remain uncommitted. The main checkout's unrelated
-work is unchanged. Earlier diagnostic results retain their individual cutoffs;
+Baseline: `8c40f71a03cfebff413fbad584131e0bcbe9859b`. At this offline cutoff,
+changes were isolated and uncommitted in the `p039-carry-forward` worktree.
+Subsequent [live rollout evidence](p039-live-rollout-2026-09-21.md) records the
+published/deployed merge and P095 preview hold; it does not retroactively make
+this an acceptance receipt for a completed transfer. Earlier results retain their cutoffs;
 the final combined gate is recorded separately below.
 
 ## Final Candidate-3 Gate
@@ -416,6 +418,6 @@ change; three additional local ignored review-report locations use a file-line
 link syntax the helper does not support. They are not new canonical-doc links.
 
 This is documentation preparation, not proposal retirement. I4 permission was
-requested separately and remains unanswered at this cutoff. No production
+requested separately and remained unanswered at this historical cutoff. No production
 admission, merge, push, daemon update or P095 transfer follows from the isolated
 SQL-expansion approval. No old source is resumed, cleaned or cancelled.

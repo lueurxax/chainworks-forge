@@ -2,10 +2,10 @@
 
 | Field | Value |
 | --- | --- |
-| Created / revised | 2026-04-12 / 2026-09-20 |
+| Created / revised | 2026-04-12 / 2026-09-21 |
 | Revision | `p039-r2` |
-| Status | In progress: I1 delivered; I2/I3 integrated in substantial part, review corrections and source fences incomplete; production admission not ready |
-| Implementation | Partial: see [current audit R2](039-blocked-run-fork-and-canonical-carry-forward_IMPLEMENTATION_AUDIT_R2.md) and [integration evidence](../evidence/p039-durable-integration.md). [Audit R1](039-blocked-run-fork-and-canonical-carry-forward_IMPLEMENTATION_AUDIT_R1.md) retains the earlier I1 scope. No production admission or live migration |
+| Status | I1-I3 accepted; merged, published and deployed. I4 P095 preview holds on legacy source quiescence; migration and full closeout incomplete |
+| Implementation | See [audit R2](039-blocked-run-fork-and-canonical-carry-forward_IMPLEMENTATION_AUDIT_R2.md), [offline evidence](../evidence/p039-durable-integration.md) and [live rollout](../evidence/p039-live-rollout-2026-09-21.md). No successor was reserved or activated; proposal retirement remains pending live acceptance |
 | Owner | Rust control plane; SwiftUI is a read/approval client |
 | First supported case | P095-like blocked implementation run, same repository and idea |
 | Decision | New run with verified inputs, current compiled definitions, fresh review and approval |

@@ -101,7 +101,8 @@ cwd/workspace, arbitrary path, environment grant or serialized authority is allo
 - [x] Register `proposal-039|p039` and a CF-01..CF-29 executable test mapping; missing/ignored/filter-only executions fail the checker. The final frozen canonical run passed 348 Rust tests, three checker tests and all 164 distinct required test names across 29 cases, including the corrected producer inventory.
 - [x] Run focused gate, broad workspace regressions, all-targets compilation and formatting/diff checks; distinguish baseline failures with exact evidence. Broad: 4011/81/3 ignored; 80 failures reproduce on baseline and the introduced inventory failure is fixed. Daemon units: 137/137. Host-global daemon startup and app-blocked guardrails remain excluded, not passed.
 - [x] Independent whole-feature offline execution-truth synthesis accepts candidate 3 with no scoped P039 finding open. Important findings and the final inventory regression have recorded fixes and verification; this is not full-migration or release readiness.
-- [ ] After offline acceptance, obtain exact deployment/live-canary scope and perform readback. Never infer provider/Apple consent.
+- [x] Obtain exact I4 scope, merge/push the accepted source, deploy the signed daemon and verify schema-100 backup/restore and schema-101 readiness. The narrow temporary operator was separately authorized and removed after readback.
+- [ ] Complete live P095 acceptance. Its first preview returned `source_busy`: 272 legacy provider records lack process identities and 159 historical escalation ledgers remain active. No continuation was reserved; see [live evidence](../../evidence/p039-live-rollout-2026-09-21.md). Do not infer process absence, provider/Apple consent or permission for bulk reconciliation.
 - [ ] Only after implementation acceptance: use proposal-implementation-closeout inventory, promote implemented truth, repair references, retire proposal-only artifacts, run doc/link checks and retained gate aliases.
 
 ## Completion Accounting
@@ -110,5 +111,6 @@ Tasks 1-5 and Task 6's offline verification/review are accepted. Task 6 remains
 open only for the separately authorized live lane and subsequent retirement.
 Broad failure accounting is complete, not green. Stable reference/index and P070
 dependency updates are prepared without retiring the proposal. Offline success
-is not live canary success. Changes remain uncommitted in the isolated worktree;
-merge/push/deploy remain distinct operations pending the I4 scope response.
+is not live canary success. Source `366643e2244f4e8820f16a8a5279eb2b9de018a2`
+is merged, pushed and deployed. The actual P095 preview exposed legacy
+quiescence prerequisites; preparation, activation and retirement remain open.
