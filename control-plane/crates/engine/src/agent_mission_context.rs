@@ -306,6 +306,7 @@ pub async fn load_mediation_copy_truth_for_execution(
     if plan.mission_context_version.as_deref() != Some(MISSION_CONTEXT_VERSION) {
         return Ok(None);
     }
+    validate_targeted_provider_copy_truth(pool, plan, run, execution, payload).await?;
     let claimed_origin = payload
         .get("mediation_origin")
         .and_then(serde_json::Value::as_str);
@@ -910,7 +911,10 @@ fn validate_persisted_payload_authority(
     };
     require_payload_string(object, "agent_id", assignment_agent_id)?;
     let agent = frozen_agent(plan, assignment_agent_id)?;
-    let provider_authority = health_fallback_provider_authority(plan, object, &agent)?;
+    let provider_authority = match targeted_retry_provider_authority(plan, object, &agent)? {
+        Some(authority) => Some(authority),
+        None => health_fallback_provider_authority(plan, object, &agent)?,
+    };
     let worktree_strategy = match &context.assignment {
         PersistedAssignment::Task {
             origin,
@@ -970,7 +974,13 @@ fn validate_persisted_payload_authority(
         ("model", serde_json::json!(model)),
         ("effort", serde_json::json!(effort)),
         ("max_turns", serde_json::json!(max_turns)),
-        ("temperature", serde_json::json!(agent.temperature)),
+        (
+            "temperature",
+            serde_json::json!(provider_authority
+                .as_ref()
+                .map(|authority| authority.temperature)
+                .unwrap_or(agent.temperature)),
+        ),
         (
             "permission_profile",
             serde_json::json!(agent.permission_profile),
@@ -1011,7 +1021,11 @@ fn validate_persisted_payload_authority(
             serde_json::json!(agent.requires_xcode_host_execution),
         ),
     ] {
-        require_payload_value(object, field, &expected)?;
+        if field == "provider" && provider_authority.is_some() {
+            require_provider_alias(object, field, expected.as_str().unwrap_or_default())?;
+        } else {
+            require_payload_value(object, field, &expected)?;
+        }
     }
     if !matches!(&context.assignment, PersistedAssignment::Mediation { .. }) {
         require_payload_value(
@@ -1030,6 +1044,7 @@ struct HealthFallbackProviderAuthority {
     model: Option<String>,
     effort: Option<String>,
     max_turns: Option<u32>,
+    temperature: Option<f64>,
 }
 
 fn health_fallback_provider_authority(
@@ -1131,7 +1146,331 @@ fn health_fallback_provider_authority(
         model: profile.model.clone(),
         effort: profile.effort.clone(),
         max_turns: profile.max_turns,
+        temperature: frozen_agent.temperature,
     }))
+}
+
+/// A retry chooses a profile from the frozen catalog, without changing the agent's
+/// mission, permissions, tool access or output contract. The asynchronous copy
+/// boundary additionally anchors this declaration to the persisted execution.
+fn targeted_retry_provider_authority(
+    plan: &RunPlan,
+    payload: &serde_json::Map<String, serde_json::Value>,
+    frozen_agent: &ResolvedAgent,
+) -> Result<Option<HealthFallbackProviderAuthority>> {
+    let Some(retry) = payload
+        .get("targeted_retry")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(None);
+    };
+    let Some(fallback) = retry
+        .get("provider_fallback")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(None);
+    };
+    if !matches!(
+        fallback.get("reason").and_then(serde_json::Value::as_str),
+        Some(
+            "p058_backend_profile_tier"
+                | "p058_same_backend_retry"
+                | "source_contract_outputs_missing"
+        )
+    ) {
+        return Ok(None);
+    }
+    let field =
+        |object: &serde_json::Map<String, serde_json::Value>, name: &str| -> Result<String> {
+            object
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                "frozen_snapshot_contract_incompatible: targeted provider fallback has no {name}")
+                })
+        };
+    let target = field(fallback, "to_backend_profile_id")?;
+    let source = field(fallback, "from_backend_profile_id")?;
+    let reason = field(fallback, "reason")?;
+    let catalog: AgentCatalogFile = serde_json::from_str(&plan.catalog_snapshot_json)?;
+    let profiles = catalog.backend_profiles.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "frozen_snapshot_contract_incompatible: targeted fallback has no frozen profiles"
+        )
+    })?;
+    let profile = profiles.get(&target).ok_or_else(|| anyhow::anyhow!(
+        "frozen_snapshot_contract_incompatible: targeted fallback profile is absent from frozen catalog"))?;
+    let source_profile = profiles.get(&source).ok_or_else(|| anyhow::anyhow!(
+        "frozen_snapshot_contract_incompatible: targeted fallback source is absent from frozen catalog"))?;
+    require_provider_alias(fallback, "to_provider", &profile.provider)?;
+    require_provider_alias(fallback, "from_provider", &source_profile.provider)?;
+    match reason.as_str() {
+        "p058_backend_profile_tier" | "p058_same_backend_retry" => {
+            require_payload_string(retry, "reason", "p058_escalation_retry")?;
+            let escalation = retry
+                .get("escalation")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "frozen_snapshot_contract_incompatible: P058 retry has no tier authority"
+                    )
+                })?;
+            let policy_id = field(escalation, "policy_id")?;
+            let tier_id = field(escalation, "tier_id")?;
+            let policy = plan.escalation_policies.iter().find(|policy| policy.policy_id == policy_id)
+                .ok_or_else(|| anyhow::anyhow!("frozen_snapshot_contract_incompatible: P058 retry policy is absent from frozen plan"))?;
+            let tier = policy.tiers.iter().find(|tier| tier.tier_id == tier_id)
+                .ok_or_else(|| anyhow::anyhow!("frozen_snapshot_contract_incompatible: P058 retry tier is absent from frozen plan"))?;
+            require_payload_string(escalation, "tier_kind_raw", &tier.kind)?;
+            if (reason == "p058_backend_profile_tier"
+                && (tier.kind != "backend_profile"
+                    || tier.backend_profile_id.as_deref() != Some(target.as_str())))
+                || (reason == "p058_same_backend_retry"
+                    && (tier.kind != "same_backend_retry" || source != target))
+            {
+                anyhow::bail!("frozen_snapshot_contract_incompatible: P058 retry profile differs from frozen tier");
+            }
+        }
+        "source_contract_outputs_missing" => {
+            require_payload_string(retry, "reason", "auto_contract_output_retry")?;
+            let outputs = payload
+                .get("task_outputs")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let candidates = crate::orchestrator::run_local_health_fallback_profile_candidates(
+                &frozen_agent.agent_id,
+                &outputs,
+                frozen_agent.output_contract.as_deref(),
+                &source_profile.provider,
+            );
+            if !candidates.contains(&target.as_str())
+                || same_provider(&source_profile.provider, &profile.provider)
+            {
+                anyhow::bail!("frozen_snapshot_contract_incompatible: auto retry profile is outside the frozen task fallback route");
+            }
+        }
+        "p058_lead_mediation_tier" => return Ok(None),
+        // Other retry routes retain the primary frozen-agent checks below.
+        _ => return Ok(None),
+    }
+    Ok(Some(HealthFallbackProviderAuthority {
+        backend_profile_id: Some(target),
+        provider: profile.provider.clone(),
+        model: profile.model.clone(),
+        effort: profile.effort.clone(),
+        max_turns: profile.max_turns,
+        temperature: if reason == "source_contract_outputs_missing" {
+            frozen_agent.temperature
+        } else {
+            profile.temperature
+        },
+    }))
+}
+
+fn same_provider(left: &str, right: &str) -> bool {
+    let canonical = |value: &str| {
+        domain::provider::ProviderFamily::canonicalize_known_alias(value)
+            .unwrap_or_else(|| value.to_owned())
+    };
+    canonical(left) == canonical(right)
+}
+
+fn require_provider_alias(
+    payload: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    expected: &str,
+) -> Result<()> {
+    if !payload
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|actual| same_provider(actual, expected))
+    {
+        anyhow::bail!("frozen_snapshot_contract_incompatible: V1 retry provider field '{field}' differs from frozen authority");
+    }
+    Ok(())
+}
+
+async fn validate_targeted_provider_copy_truth(
+    pool: &SqlitePool,
+    plan: &RunPlan,
+    run: &Run,
+    execution: &AgentExecution,
+    payload: &serde_json::Value,
+) -> Result<()> {
+    let Some(retry) = payload
+        .get("targeted_retry")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(());
+    };
+    let Some(fallback) = retry
+        .get("provider_fallback")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(());
+    };
+    if !matches!(
+        fallback.get("reason").and_then(serde_json::Value::as_str),
+        Some(
+            "p058_backend_profile_tier"
+                | "p058_same_backend_retry"
+                | "source_contract_outputs_missing"
+        )
+    ) {
+        return Ok(());
+    }
+    let missing = || {
+        anyhow::anyhow!("frozen_snapshot_contract_incompatible: targeted provider retry lacks durable execution lineage")
+    };
+    let authority_id = payload
+        .get("retry_authority_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(missing)?;
+    let authority = db::repos::retry_stage_execution_authorities::find_by_id(pool, authority_id)
+        .await?
+        .ok_or_else(missing)?;
+    let source_id = retry
+        .get("source_agent_execution_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(missing)?;
+    let source =
+        db::repos::agent_executions::find_by_id(pool, source_id.parse().map_err(|_| missing())?)
+            .await?
+            .ok_or_else(missing)?;
+    let source_stage_id = source.stage_execution_id.ok_or_else(missing)?;
+    let source_stage = db::repos::stages::find_by_id(pool, source_stage_id)
+        .await?
+        .ok_or_else(missing)?;
+    let source_item_id = retry
+        .get("source_work_item_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(missing)?;
+    let source_item = db::repos::work_items::find_by_id(pool, source_item_id)
+        .await?
+        .ok_or_else(missing)?;
+    let source_payload: serde_json::Value = serde_json::from_str(&source_item.payload_json)?;
+    let stage_id = payload
+        .get("stage_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(missing)?;
+    if authority.run_id != run.id
+        || authority.stage_id != stage_id
+        || Some(authority.target_stage_execution_id) != execution.stage_execution_id
+        || authority.source_agent_execution_id.as_deref() != Some(source_id)
+        || retry
+            .get("retry_authority_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(authority_id)
+        || source_stage.run_id != run.id
+        || source_stage.stage_id != stage_id
+        || source.owner_kind.as_deref() != Some("stage_execution")
+        || source.owner_id.as_deref() != Some(source_stage_id.to_string().as_str())
+        || source_item.kind != db::work_item::WorkItemKind::InvokeAgent
+        || source_item.run_id != Some(run.id)
+        || source_item.stage_id.as_deref() != Some(stage_id)
+        || source_payload
+            .get("stage_execution_id")
+            .and_then(serde_json::Value::as_str)
+            != source
+                .stage_execution_id
+                .map(|id| id.to_string())
+                .as_deref()
+        || retry
+            .get("source_stage_execution_id")
+            .and_then(serde_json::Value::as_str)
+            != source
+                .stage_execution_id
+                .map(|id| id.to_string())
+                .as_deref()
+        || source.agent_id != execution.agent_id
+        || source.status != domain::agent::AgentStatus::Failed
+        || source_payload
+            .pointer("/p058_claimed/agent_execution_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(source_id)
+        || source_payload
+            .get("backend_profile_id")
+            .and_then(serde_json::Value::as_str)
+            != source.backend_profile_id.as_deref()
+        || payload
+            .get("backend_profile_id")
+            .and_then(serde_json::Value::as_str)
+            != execution.backend_profile_id.as_deref()
+        || payload
+            .get("stage_execution_id")
+            .and_then(serde_json::Value::as_str)
+            != execution
+                .stage_execution_id
+                .map(|id| id.to_string())
+                .as_deref()
+        || !payload
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|provider| same_provider(provider, &execution.provider))
+        || fallback.get("from_backend_profile_id") != source_payload.get("backend_profile_id")
+        || !fallback
+            .get("from_provider")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|provider| same_provider(provider, &source.provider))
+    {
+        return Err(missing());
+    }
+    if retry.get("reason").and_then(serde_json::Value::as_str) == Some("p058_escalation_retry") {
+        let meta = escalation::find_execution_metadata_for_agent(pool, &execution.id.to_string())
+            .await?
+            .ok_or_else(missing)?;
+        let ledger = escalation::find_ledger_by_id(pool, &meta.escalation_ledger_id)
+            .await?
+            .ok_or_else(missing)?;
+        let policy = plan
+            .escalation_policies
+            .iter()
+            .find(|policy| {
+                policy.policy_id == ledger.policy_id && policy.policy_hash == ledger.policy_hash
+            })
+            .ok_or_else(missing)?;
+        let tier = policy
+            .tiers
+            .iter()
+            .find(|tier| tier.tier_id == meta.tier_id && tier.kind == meta.tier_kind_raw)
+            .ok_or_else(missing)?;
+        // The ledger may already point to the next tier after this execution failed.
+        // Validate against immutable execution metadata, never the mutable current tier.
+        if ledger.run_id != run.id
+            || ledger.stage_id != stage_id
+            || ledger.agent_id != execution.agent_id
+            || execution.escalation_ledger_id.as_deref() != Some(ledger.id.as_str())
+            || execution.escalation_policy_id.as_deref() != Some(policy.policy_id.as_str())
+            || execution.escalation_policy_hash.as_deref() != Some(policy.policy_hash.as_str())
+            || execution.escalation_tier_id.as_deref() != Some(tier.tier_id.as_str())
+            || execution.escalation_tier_kind_raw.as_deref() != Some(tier.kind.as_str())
+            || payload
+                .pointer("/targeted_retry/escalation/ledger_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(ledger.id.as_str())
+            || payload
+                .pointer("/targeted_retry/escalation/policy_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(policy.policy_id.as_str())
+            || payload
+                .pointer("/targeted_retry/escalation/tier_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(tier.tier_id.as_str())
+        {
+            return Err(missing());
+        }
+    }
+    Ok(())
 }
 
 fn dynamic_review_output_name(agent_id: &str) -> String {

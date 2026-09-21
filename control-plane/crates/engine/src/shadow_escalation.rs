@@ -67,7 +67,9 @@ pub fn classify_trigger_from_failure_kind(
 pub fn classify_trigger_from_runtime_facts(
     facts: &AgentExecutionRuntimeFacts,
 ) -> Option<&'static str> {
-    if is_headless_prelaunch_failure(facts) {
+    if is_headless_prelaunch_failure(facts)
+        || crate::executor::is_control_plane_run_state_failure(facts)
+    {
         return None;
     }
     if matches!(
@@ -136,7 +138,9 @@ pub async fn try_write_shadow_escalation_from_runtime_facts(
     facts: &AgentExecutionRuntimeFacts,
     completed_at: DateTime<Utc>,
 ) {
-    if is_headless_prelaunch_failure(facts) {
+    if is_headless_prelaunch_failure(facts)
+        || crate::executor::is_control_plane_run_state_failure(facts)
+    {
         return;
     }
     let trigger_raw = classify_trigger_from_runtime_facts(facts);

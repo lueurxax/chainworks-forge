@@ -1591,6 +1591,11 @@ Important:
 
 ### `proposal-053|p053`
 
+Includes the `direct_file_ref_tests`, `run_state_output_tests` and
+`runtime_invocation_contract_` engine regressions: strict agent-output freshness,
+explicit reuse, branch-specific manifest diagnostics, and DB-owned `run_state`
+acceptance with legacy frozen declarations.
+
 Bounded ACP artifact discovery and startup latency gate.
 
 Scope:
@@ -1688,6 +1693,10 @@ Important:
 - the gate fails closed if canonical status normalization, active-index SQLite ownership, stale export rebuild, raw artifact fallback denial, degraded policy, typed overrides, or GraphQL/MCP readback parity evidence is missing
 
 ### `proposal-058|p058`
+
+Includes `p058_v1_` sequence regressions for actual invoke claiming, historical
+profile authority after tier advancement, strict tamper rejection and atomic
+failed-stage settlement. The same sequence suite is part of `agent-context-skills`.
 
 Regression gate for ACP provider failure classification, session artifact ownership, and P058 configurable escalation chain proof.
 
