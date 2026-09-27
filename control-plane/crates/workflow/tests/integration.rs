@@ -1095,7 +1095,7 @@ fn test_compile_full_mvp_live_plan() {
         s1.owner.provider, "codex",
         "lead_orchestrator uses the canonical Codex orchestration profile"
     );
-    assert_eq!(s1.owner.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(s1.owner.model.as_deref(), Some("gpt-6-sol"));
     assert_eq!(s1.owner.effort.as_deref(), Some("high"));
     assert!(
         s1.owner

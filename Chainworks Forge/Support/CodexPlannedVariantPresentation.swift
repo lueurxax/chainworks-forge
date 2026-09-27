@@ -27,8 +27,8 @@ nonisolated enum CodexModelVariantPolicyUnavailableReason: String, Equatable, Se
 nonisolated enum CodexModelVariantPolicyLoader {
     static let resourceName = "codex-model-variant-matrix.v1"
     static let resourceExtension = "json"
-    static let expectedByteCount = 1_994
-    static let expectedSHA256 = "e2e78059d4d03936d4c88e0009435b8b9540611cd2fb1c08707004bd154d26b0"
+    static let expectedByteCount = 2_269
+    static let expectedSHA256 = "954628a831f307e177be92f21970fc7b42cddded3619a5dc69cd66683a64fa5d"
 
     nonisolated static func loadBundled(
         bundle: Bundle = .main

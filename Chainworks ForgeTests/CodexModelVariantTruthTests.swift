@@ -18,10 +18,10 @@ struct CodexModelVariantTruthTests {
         )
         let data = try Data(contentsOf: url)
 
-        #expect(data.count == 1_994)
+        #expect(data.count == 2_269)
         #expect(
             SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-                == "e2e78059d4d03936d4c88e0009435b8b9540611cd2fb1c08707004bd154d26b0"
+                == "954628a831f307e177be92f21970fc7b42cddded3619a5dc69cd66683a64fa5d"
         )
         guard case .available = CodexModelVariantPolicyLoader.load(data: data) else {
             Issue.record("pinned bundled policy must load")
@@ -70,6 +70,20 @@ struct CodexModelVariantTruthTests {
     func formatterCoversKnownLegacyMissingAndUnavailableStates() throws {
         let policy = try pinnedPolicy()
 
+        for (model, token) in [("gpt-6-sol", "Sol 6"), ("gpt-6-luna", "Luna 6")] {
+            #expect(
+                CodexPlannedAssignmentFormatter.presentation(
+                    provider: "codex",
+                    model: model,
+                    effort: "high",
+                    policy: policy
+                ) == .planned(
+                    variantToken: token,
+                    visualSuffix: "\(model) · high · planned",
+                    fullAccessibilityValue: "Codex · \(token) · \(model) · high · planned"
+                )
+            )
+        }
         #expect(
             CodexPlannedAssignmentFormatter.presentation(
                 provider: "codex",
@@ -152,6 +166,8 @@ struct CodexModelVariantTruthTests {
     func formatterSurfaceTableUsesOneAccessibilityTruth() throws {
         let policy = try pinnedPolicy()
         let inputs: [(String, String?, String?)] = [
+            ("codex", "gpt-6-sol", "high"),
+            ("codex", "gpt-6-luna", "high"),
             ("codex", "gpt-5.6-sol", "max"),
             ("codex", "gpt-5.6-terra", "high"),
             ("codex", "gpt-5.6-luna", "high"),

@@ -37,31 +37,31 @@ const CATALOG: &str = r#"schema_version: 1
 backend_profiles:
   codex_orchestrator_high:
     provider: codex_acp
-    model: gpt-5.6-sol
+    model: gpt-6-sol
     effort: high
   codex_architect_high:
     provider: codex_acp
-    model: gpt-5.6-sol
+    model: gpt-6-sol
     effort: high
   codex_audit_high:
     provider: codex_acp
-    model: gpt-5.6-sol
+    model: gpt-6-sol
     effort: high
   codex_writer_high:
     provider: codex_acp
-    model: gpt-5.6-terra
+    model: gpt-6-sol
     effort: high
   codex_builder_high:
     provider: codex_acp
-    model: gpt-5.6-terra
+    model: gpt-6-sol
     effort: high
   codex_orchestrator_acp:
     provider: codex_acp
-    model: gpt-5.6-terra
+    model: gpt-6-sol
     effort: high
   codex_ops_low:
     provider: codex_acp
-    model: gpt-5.6-luna
+    model: gpt-6-luna
     effort: high
   astra_orchestrator_critical:
     provider: codex_acp
@@ -155,6 +155,55 @@ fn compile(catalog: &str) -> anyhow::Result<workflow::compiler::NewRunAdmissionV
 
 fn path(value: &Path) -> &str {
     value.to_str().unwrap()
+}
+
+#[test]
+fn canonical_catalog_uses_september_2026_models_without_changing_effort_lanes() {
+    let catalog: serde_yaml::Value = serde_yaml::from_slice(
+        &fs::read(repository_root().join("examples/agents/agents.yaml")).unwrap(),
+    )
+    .unwrap();
+    let profiles = catalog["backend_profiles"].as_mapping().unwrap();
+    let expected = [
+        ("claude_orchestrator_high", "claude-opus-5-5"),
+        ("claude_writer_high", "claude-opus-5-5"),
+        ("codex_writer_high", "gpt-6-sol"),
+        ("claude_product_high", "claude-opus-5-5"),
+        ("codex_architect_high", "gpt-6-sol"),
+        ("codex_builder_high", "gpt-6-sol"),
+        ("claude_builder_high", "claude-sonnet-5"),
+        ("codex_audit_high", "gpt-6-sol"),
+        ("claude_security_high", "claude-opus-5-5"),
+        ("claude_prepush_medium", "claude-opus-5-5"),
+        ("codex_ops_low", "gpt-6-luna"),
+        ("claude_docs_medium", "claude-sonnet-5"),
+        ("claude_steward_high", "claude-opus-5-5"),
+        ("claude_auditor_medium", "claude-opus-5-5"),
+        ("claude_retrospective_medium", "claude-sonnet-5"),
+        ("gemini_reasoning_flash", "gemini-3.8-flash"),
+        ("gemini_review_flash", "gemini-3.8-flash"),
+        ("gemini_docs_flash", "gemini-3.8-flash"),
+        ("gemini_ops_flash_lite", "gemini-3.5-flash-lite"),
+        ("codex_orchestrator_acp", "gpt-6-sol"),
+        ("codex_orchestrator_high", "gpt-6-sol"),
+        ("gemini_builder_flash", "gemini-3.8-flash"),
+        ("gemini_prepush_flash", "gemini-3.8-flash"),
+        ("astra_orchestrator_critical", "gpt-6-astra"),
+        ("astra_builder_critical", "gpt-6-astra"),
+        ("astra_audit_critical", "gpt-6-astra"),
+    ];
+    assert_eq!(profiles.len(), expected.len());
+    for (id, model) in expected {
+        let profile = &catalog["backend_profiles"][id];
+        assert_eq!(profile["model"].as_str(), Some(model), "{id}");
+        let effort = if profile["provider"] == "codex_acp" {
+            Some("high")
+        } else {
+            None
+        };
+        assert_eq!(profile["effort"].as_str(), effort, "{id}");
+        assert!(profile["temperature"].is_null(), "{id}");
+    }
 }
 
 #[test]
@@ -290,13 +339,13 @@ fn new_run_admission_freezes_all_admitted_canonical_bindings() {
     assert!(bindings
         .iter()
         .all(|(_, provider, _, _)| *provider == "codex"));
-    assert!(bindings.contains(&("codex_orchestrator_high", "codex", "gpt-5.6-sol", "high")));
-    assert!(bindings.contains(&("codex_architect_high", "codex", "gpt-5.6-sol", "high")));
-    assert!(bindings.contains(&("codex_audit_high", "codex", "gpt-5.6-sol", "high")));
-    assert!(bindings.contains(&("codex_writer_high", "codex", "gpt-5.6-terra", "high")));
-    assert!(bindings.contains(&("codex_builder_high", "codex", "gpt-5.6-terra", "high")));
-    assert!(bindings.contains(&("codex_orchestrator_acp", "codex", "gpt-5.6-terra", "high")));
-    assert!(bindings.contains(&("codex_ops_low", "codex", "gpt-5.6-luna", "high")));
+    assert!(bindings.contains(&("codex_orchestrator_high", "codex", "gpt-6-sol", "high")));
+    assert!(bindings.contains(&("codex_architect_high", "codex", "gpt-6-sol", "high")));
+    assert!(bindings.contains(&("codex_audit_high", "codex", "gpt-6-sol", "high")));
+    assert!(bindings.contains(&("codex_writer_high", "codex", "gpt-6-sol", "high")));
+    assert!(bindings.contains(&("codex_builder_high", "codex", "gpt-6-sol", "high")));
+    assert!(bindings.contains(&("codex_orchestrator_acp", "codex", "gpt-6-sol", "high")));
+    assert!(bindings.contains(&("codex_ops_low", "codex", "gpt-6-luna", "high")));
     assert!(bindings.contains(&(
         "astra_orchestrator_critical",
         "codex",
@@ -316,8 +365,8 @@ fn new_run_admission_rejects_duplicate_root_and_nested_yaml_keys() {
     assert!(error.contains("duplicate YAML mapping key"), "{error}");
 
     let duplicate_nested = CATALOG.replacen(
-        "    model: gpt-5.6-sol\n    effort: high",
-        "    model: gpt-5.6-sol\n    model: gpt-5.6-terra\n    effort: high",
+        "    model: gpt-6-sol\n    effort: high",
+        "    model: gpt-6-sol\n    model: gpt-6-luna\n    effort: high",
         1,
     );
     let error = compile(&duplicate_nested)
@@ -331,7 +380,15 @@ fn new_run_admission_rejects_every_reserved_matrix_shape_mutation() {
     let cases = [
         (
             "generic model",
-            CATALOG.replacen("model: gpt-5.6-sol", "model: gpt-5.6", 1),
+            CATALOG.replacen("model: gpt-6-sol", "model: gpt-5.6", 1),
+        ),
+        (
+            "generic GPT-6 model",
+            CATALOG.replacen("model: gpt-6-sol", "model: gpt-6", 1),
+        ),
+        (
+            "historical known model is not a current production assignment",
+            CATALOG.replacen("model: gpt-6-sol", "model: gpt-5.6-sol", 1),
         ),
         (
             "wrong effort",
@@ -344,7 +401,7 @@ fn new_run_admission_rejects_every_reserved_matrix_shape_mutation() {
         (
             "missing reserved profile",
             CATALOG.replacen(
-                "  codex_ops_low:\n    provider: codex_acp\n    model: gpt-5.6-luna\n    effort: high\n",
+                "  codex_ops_low:\n    provider: codex_acp\n    model: gpt-6-luna\n    effort: high\n",
                 "",
                 1,
             ),
@@ -353,7 +410,7 @@ fn new_run_admission_rejects_every_reserved_matrix_shape_mutation() {
             "extra Codex profile",
             CATALOG.replacen(
                 "permission_profiles:",
-                "  codex_extra:\n    provider: codex_acp\n    model: gpt-5.6-terra\n    effort: high\npermission_profiles:",
+                "  codex_extra:\n    provider: codex_acp\n    model: gpt-6-sol\n    effort: high\npermission_profiles:",
                 1,
             ),
         ),
@@ -389,17 +446,17 @@ fn new_run_admission_rejects_missing_or_mutated_policy_bytes() {
 fn verified_generic_and_custom_historical_replay_is_byte_identical() {
     let historical_catalog = CATALOG
         .replacen(
-            "model: gpt-5.6-sol\n    effort: high",
+            "model: gpt-6-sol\n    effort: high",
             "model: gpt-5.6\n    effort: max",
             1,
         )
         .replacen(
-            "model: gpt-5.6-sol\n    effort: high",
+            "model: gpt-6-sol\n    effort: high",
             "model: custom-model\n    effort: custom-effort",
             1,
         )
         .replacen(
-            "model: gpt-5.6-sol\n    effort: high",
+            "model: gpt-6-sol\n    effort: high",
             "model: gpt-5.6-sol\n    effort: ultra",
             1,
         );

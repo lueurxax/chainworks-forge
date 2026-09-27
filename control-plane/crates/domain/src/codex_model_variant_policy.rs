@@ -7,9 +7,9 @@ use thiserror::Error;
 pub const AUTHORED_CODEX_PROVIDER: &str = "codex_acp";
 pub const CANONICAL_CODEX_PROVIDER: &str = "codex";
 pub const CODEX_MODEL_VARIANT_POLICY_FILE_V1: &str = "codex-model-variant-matrix.v1.json";
-pub const CODEX_MODEL_VARIANT_POLICY_BYTES_V1: usize = 1_994;
+pub const CODEX_MODEL_VARIANT_POLICY_BYTES_V1: usize = 2_269;
 pub const CODEX_MODEL_VARIANT_POLICY_SHA256_V1: &str =
-    "e2e78059d4d03936d4c88e0009435b8b9540611cd2fb1c08707004bd154d26b0";
+    "954628a831f307e177be92f21970fc7b42cddded3619a5dc69cd66683a64fa5d";
 
 const POLICY_ID_V1: &str = "codex_model_variant_matrix_v1";
 const EFFORT_VOCABULARY: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
@@ -154,7 +154,7 @@ fn validate_policy(policy: &CodexModelVariantPolicyV1) -> Result<(), CodexModelV
                 return schema_error("variant declares a duplicate effort");
             }
         }
-        if variant.model_id == "gpt-5.6-luna"
+        if matches!(variant.model_id.as_str(), "gpt-5.6-luna" | "gpt-6-luna")
             && variant
                 .allowed_efforts
                 .iter()

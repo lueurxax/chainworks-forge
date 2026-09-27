@@ -2438,31 +2438,31 @@ contracts:
 backend_profiles:
   codex_orchestrator_high:
     provider: codex_acp
-    model: gpt-5.6-sol
+    model: gpt-6-sol
     effort: high
   codex_architect_high:
     provider: codex_acp
-    model: gpt-5.6-sol
+    model: gpt-6-sol
     effort: high
   codex_audit_high:
     provider: codex_acp
-    model: gpt-5.6-sol
+    model: gpt-6-sol
     effort: high
   codex_writer_high:
     provider: codex_acp
-    model: gpt-5.6-terra
+    model: gpt-6-sol
     effort: high
   codex_builder_high:
     provider: codex_acp
-    model: gpt-5.6-terra
+    model: gpt-6-sol
     effort: high
   codex_orchestrator_acp:
     provider: codex_acp
-    model: gpt-5.6-terra
+    model: gpt-6-sol
     effort: high
   codex_ops_low:
     provider: codex_acp
-    model: gpt-5.6-luna
+    model: gpt-6-luna
     effort: high
   astra_orchestrator_critical:
     provider: codex_acp
@@ -2557,31 +2557,31 @@ contracts:
 backend_profiles:
   codex_orchestrator_high:
     provider: codex_acp
-    model: gpt-5.6-sol
+    model: gpt-6-sol
     effort: high
   codex_architect_high:
     provider: codex_acp
-    model: gpt-5.6-sol
+    model: gpt-6-sol
     effort: high
   codex_audit_high:
     provider: codex_acp
-    model: gpt-5.6-sol
+    model: gpt-6-sol
     effort: high
   codex_writer_high:
     provider: codex_acp
-    model: gpt-5.6-terra
+    model: gpt-6-sol
     effort: high
   codex_builder_high:
     provider: codex_acp
-    model: gpt-5.6-terra
+    model: gpt-6-sol
     effort: high
   codex_orchestrator_acp:
     provider: codex_acp
-    model: gpt-5.6-terra
+    model: gpt-6-sol
     effort: high
   codex_ops_low:
     provider: codex_acp
-    model: gpt-5.6-luna
+    model: gpt-6-luna
     effort: high
   astra_orchestrator_critical:
     provider: codex_acp
@@ -2727,8 +2727,8 @@ async fn production_start_run_rejects_matrix_drift_before_any_run_stage_or_work_
         "duplicate nested key",
         |catalog| {
             catalog.replacen(
-                "    model: gpt-5.6-sol\n    effort: high",
-                "    model: gpt-5.6-sol\n    model: gpt-5.6-terra\n    effort: high",
+                "    model: gpt-6-sol\n    effort: high",
+                "    model: gpt-6-sol\n    model: gpt-6-luna\n    effort: high",
                 1,
             )
         },
@@ -3036,13 +3036,13 @@ send({{"jsonrpc":"2.0","id":message["id"],"result":{{"stopReason":"end_turn","se
         ),
         ("astra_audit_critical", "codex", "gpt-6-astra", "high"),
         ("astra_builder_critical", "codex", "gpt-6-astra", "high"),
-        ("codex_architect_high", "codex", "gpt-5.6-sol", "high"),
-        ("codex_audit_high", "codex", "gpt-5.6-sol", "high"),
-        ("codex_builder_high", "codex", "gpt-5.6-terra", "high"),
-        ("codex_ops_low", "codex", "gpt-5.6-luna", "high"),
-        ("codex_orchestrator_acp", "codex", "gpt-5.6-terra", "high"),
-        ("codex_orchestrator_high", "codex", "gpt-5.6-sol", "high"),
-        ("codex_writer_high", "codex", "gpt-5.6-terra", "high"),
+        ("codex_architect_high", "codex", "gpt-6-sol", "high"),
+        ("codex_audit_high", "codex", "gpt-6-sol", "high"),
+        ("codex_builder_high", "codex", "gpt-6-sol", "high"),
+        ("codex_ops_low", "codex", "gpt-6-luna", "high"),
+        ("codex_orchestrator_acp", "codex", "gpt-6-sol", "high"),
+        ("codex_orchestrator_high", "codex", "gpt-6-sol", "high"),
+        ("codex_writer_high", "codex", "gpt-6-sol", "high"),
     ]
     .into_iter()
     .map(|(profile, provider, model, effort)| {
@@ -3119,16 +3119,16 @@ send({{"jsonrpc":"2.0","id":message["id"],"result":{{"stopReason":"end_turn","se
         .collect::<Vec<_>>();
     observed.sort();
     let mut expected_observed = vec![
-        ("gpt-5.6-sol", "high"),
-        ("gpt-5.6-sol", "high"),
-        ("gpt-5.6-sol", "high"),
+        ("gpt-6-sol", "high"),
+        ("gpt-6-sol", "high"),
+        ("gpt-6-sol", "high"),
         ("gpt-6-astra", "high"),
         ("gpt-6-astra", "high"),
         ("gpt-6-astra", "high"),
-        ("gpt-5.6-terra", "high"),
-        ("gpt-5.6-terra", "high"),
-        ("gpt-5.6-terra", "high"),
-        ("gpt-5.6-luna", "high"),
+        ("gpt-6-sol", "high"),
+        ("gpt-6-sol", "high"),
+        ("gpt-6-sol", "high"),
+        ("gpt-6-luna", "high"),
     ]
     .into_iter()
     .map(|(model, effort)| (model.to_string(), effort.to_string()))
@@ -3267,12 +3267,12 @@ fn persisted_snapshot_quartet_replays_historical_generic_and_custom_tuples() {
     let catalog_bytes = std::fs::read_to_string(root.join("examples/agents/agents.yaml"))
         .unwrap()
         .replacen(
-            "  codex_orchestrator_high:\n    provider: codex_acp\n    model: gpt-5.6-sol\n    effort: high",
+            "  codex_orchestrator_high:\n    provider: codex_acp\n    model: gpt-6-sol\n    effort: high",
             "  codex_orchestrator_high:\n    provider: codex_acp\n    model: gpt-5.6\n    effort: custom-effort",
             1,
         )
         .replacen(
-            "  codex_audit_high:\n    provider: codex_acp\n    model: gpt-5.6-sol\n    effort: high",
+            "  codex_audit_high:\n    provider: codex_acp\n    model: gpt-6-sol\n    effort: high",
             "  codex_audit_high:\n    provider: codex_acp\n    model: custom-model\n    effort: ultra",
             1,
         );

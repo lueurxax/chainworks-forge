@@ -58,10 +58,10 @@ Run-centric surfaces must prefer this frozen snapshot over mutable current provi
 ## Codex planned-variant policy
 
 The canonical policy is
-`examples/agents/codex-model-variant-matrix.v1.json`. The reviewed 2026-09-07
+`examples/agents/codex-model-variant-matrix.v1.json`. The 2026-09-27
 content revision retains schema/policy V1 and is UTF-8 with one final LF,
-exactly 1,994 bytes, and SHA-256
-`e2e78059d4d03936d4c88e0009435b8b9540611cd2fb1c08707004bd154d26b0`.
+exactly 2,269 bytes, and SHA-256
+`954628a831f307e177be92f21970fc7b42cddded3619a5dc69cd66683a64fa5d`.
 This coordinated catalog, Rust pin, and Swift resource/pin refresh supersedes
 the original append-only-content rule. Content changes require a reviewed
 pin update and matching app/daemon rebuild; schema changes require a new
@@ -69,27 +69,34 @@ schema/policy version. There is no runtime acceptance of arbitrary file edits.
 The previous 1,479-byte digest
 `b6ad3f2047466a34da42241eae6b790f60bb835d9e6826cb77b51eb3fc558911`
 is historical release evidence, not the current new-Run admission policy.
+The 2026-09-07 revision (1,994 bytes,
+`e2e78059d4d03936d4c88e0009435b8b9540611cd2fb1c08707004bd154d26b0`)
+is also superseded for new-Run admission.
 
 The production matrix is:
 
 | Backend profile | Planned model | Effort |
 |---|---|---|
-| `codex_orchestrator_high` | `gpt-5.6-sol` | `high` |
-| `codex_architect_high` | `gpt-5.6-sol` | `high` |
-| `codex_audit_high` | `gpt-5.6-sol` | `high` |
-| `codex_writer_high` | `gpt-5.6-terra` | `high` |
-| `codex_builder_high` | `gpt-5.6-terra` | `high` |
-| `codex_orchestrator_acp` | `gpt-5.6-terra` | `high` |
-| `codex_ops_low` | `gpt-5.6-luna` | `high` |
+| `codex_orchestrator_high` | `gpt-6-sol` | `high` |
+| `codex_architect_high` | `gpt-6-sol` | `high` |
+| `codex_audit_high` | `gpt-6-sol` | `high` |
+| `codex_writer_high` | `gpt-6-sol` | `high` |
+| `codex_builder_high` | `gpt-6-sol` | `high` |
+| `codex_orchestrator_acp` | `gpt-6-sol` | `high` |
+| `codex_ops_low` | `gpt-6-luna` | `high` |
 | `astra_orchestrator_critical` | `gpt-6-astra` | `high` |
 | `astra_audit_critical` | `gpt-6-astra` | `high` |
 | `astra_builder_critical` | `gpt-6-astra` | `high` |
 
-The historical `codex_ops_low` identifier remains stable. Sol and Terra allow
-`low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; Luna and Astra allow
-the same set except `ultra`. Generic `gpt-5.6`, unknown variants, and
+The historical `codex_ops_low` identifier remains stable. Both Sol generations
+and historical Terra allow `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`;
+both Luna generations and the unchanged local Astra policy allow the same set
+except `ultra`. Generic model IDs, unknown variants, and
 Luna/Astra `ultra` are not valid production rows. These are locally admitted
 planned assignments, not evidence of provider acceptance or account access.
+GPT-5.6 Sol/Terra/Luna remain known variants for historical presentation and
+effort dispatch, but no current production profile selects them. GPT-6 Sol
+and Luna display as `Sol 6` and `Luna 6`, preserving the old labels.
 
 `domain::codex_model_variant_policy` owns the strict Rust parser and pinned
 loader. It distinguishes the authored catalog provider `codex_acp` from the
@@ -103,9 +110,44 @@ The same fixture is an explicit app resource.
 unreadable, truncated, malformed, digest-mismatched, or undecodable resource
 bytes produce unavailable presentation; Swift contains no fallback matrix.
 
-### 2026-09-07 catalog refresh
+### 2026-09-27 catalog refresh
 
-The default catalog uses Sol/high for orchestration, architecture and audit,
+Seven Codex profiles move from GPT-5.6 Sol/Terra/Luna to GPT-6 Sol/Luna;
+seven Claude profiles move from Opus 5 to `claude-opus-5-5`. The three
+critical Astra profiles, three Sonnet 5 profiles, and six Gemini profiles
+are unchanged. Profile identifiers, agent assignments, prompts, permissions,
+MCP lists, escalation order, and configured Codex `high` effort are preserved.
+
+OpenAI released GPT-6 Sol and Luna on September 22 and recommends Sol for
+complex coding and Luna for focused repeatable work. Sol replaces both
+previous general-purpose Sol and Terra allocations; critical Astra remains
+a separate tier. See the [OpenAI changelog](https://developers.openai.com/api/docs/changelog)
+and [Codex models](https://learn.chatgpt.com/docs/models).
+
+Anthropic released Opus 5.5 on September 22, including Claude Code access.
+Sonnet 5 remains current. Fable is a separate higher-cost tier, not a routine
+replacement for these profiles. See [Claude models](https://platform.claude.com/docs/en/models/overview)
+and the [Opus 5.5 release](https://www.anthropic.com/claude-opus-5-5).
+Opus 5.5 always uses adaptive thinking and defaults to medium effort. The
+Chainworks Claude adapter passes the model but does not pass effort, thinking,
+or sampling overrides; profile names ending in `high` do not enforce high
+reasoning. Compatibility of the installed external ACP/Claude SDK still needs
+provider-access testing; local gates cannot prove it. See the
+[migration guide](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide).
+
+Gemini 3.8 Flash and 3.5 Flash-Lite remain the relevant text models. September
+Live/TTS releases are not replacements for these ACP tasks. See the
+[Gemini changelog](https://ai.google.dev/gemini-api/docs/changelog).
+
+The local Codex model cache fetched on 2026-09-27 advertised both new model
+IDs and `high` effort; Luna did not advertise `ultra`. This is availability
+metadata, not an observed provider execution. Deploy the YAML, matrix, rebuilt
+daemon, and rebuilt app together: an older binary rejects the new digest.
+This source refresh does not restart services or modify any frozen Run.
+
+### Previous refresh (2026-09-07)
+
+That refresh selected Sol/high for orchestration, architecture and audit,
 Terra/high for proposal writing, Sonnet 5 for code writing, Opus 5 for selected
 deep review/security roles, and Gemini 3.8 Flash for fast review/docs work.
 Astra/high is a final critical fallback, not the default for every task.

@@ -413,7 +413,7 @@ fn expected_review_skill_surface_after_model_refresh(
             .as_object_mut()
             .unwrap();
         assert_eq!(profile["model"], "opus");
-        profile.insert("model".into(), serde_json::json!("claude-opus-5"));
+        profile.insert("model".into(), serde_json::json!("claude-opus-5-5"));
         profile.remove("effort");
         profile.remove("temperature");
     }

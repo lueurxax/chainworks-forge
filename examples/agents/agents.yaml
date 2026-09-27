@@ -1,4 +1,4 @@
-# Model refresh 2026-09-07; see docs/reference/provider-binding-truth.md.
+# Model refresh 2026-09-27; see docs/reference/provider-binding-truth.md.
 # New runs use the sibling pinned matrix; existing snapshots retain their assignments.
 # Claude/Gemini effort is omitted because current adapters do not forward it.
 schema_version: 1
@@ -592,21 +592,21 @@ runtime_profiles:
 backend_profiles:
   claude_orchestrator_high:
     provider: claude_acp
-    model: claude-opus-5
+    model: claude-opus-5-5
     max_turns: 20
     structured_output: required
     mcp: []
     runtime_profile: claude_agent_acp
   claude_writer_high:
     provider: claude_acp
-    model: claude-opus-5
+    model: claude-opus-5-5
     max_turns: 18
     structured_output: preferred
     mcp: []
     runtime_profile: claude_agent_acp
   codex_writer_high:
     provider: codex_acp
-    model: gpt-5.6-terra
+    model: gpt-6-sol
     effort: high
     max_turns: 18
     structured_output: preferred
@@ -616,7 +616,7 @@ backend_profiles:
     runtime_profile: codex_acp
   claude_product_high:
     provider: claude_acp
-    model: claude-opus-5
+    model: claude-opus-5-5
     max_turns: 14
     structured_output: required
     mcp:
@@ -624,7 +624,7 @@ backend_profiles:
     runtime_profile: claude_agent_acp
   codex_architect_high:
     provider: codex_acp
-    model: gpt-5.6-sol
+    model: gpt-6-sol
     effort: high
     max_turns: 16
     structured_output: required
@@ -634,7 +634,7 @@ backend_profiles:
     runtime_profile: codex_acp
   codex_builder_high:
     provider: codex_acp
-    model: gpt-5.6-terra
+    model: gpt-6-sol
     effort: high
     max_turns: 24
     structured_output: required
@@ -652,7 +652,7 @@ backend_profiles:
     runtime_profile: claude_agent_acp
   codex_audit_high:
     provider: codex_acp
-    model: gpt-5.6-sol
+    model: gpt-6-sol
     effort: high
     max_turns: 18
     structured_output: required
@@ -661,7 +661,7 @@ backend_profiles:
     runtime_profile: codex_acp
   claude_security_high:
     provider: claude_acp
-    model: claude-opus-5
+    model: claude-opus-5-5
     max_turns: 16
     structured_output: required
     mcp:
@@ -669,14 +669,14 @@ backend_profiles:
     runtime_profile: claude_agent_acp
   claude_prepush_medium:
     provider: claude_acp
-    model: claude-opus-5
+    model: claude-opus-5-5
     max_turns: 12
     structured_output: required
     mcp: []
     runtime_profile: claude_agent_acp
   codex_ops_low:
     provider: codex_acp
-    model: gpt-5.6-luna
+    model: gpt-6-luna
     effort: high
     max_turns: 8
     structured_output: required
@@ -692,7 +692,7 @@ backend_profiles:
     runtime_profile: claude_agent_acp
   claude_steward_high:
     provider: claude_acp
-    model: claude-opus-5
+    model: claude-opus-5-5
     max_turns: 16
     structured_output: required
     mcp:
@@ -700,7 +700,7 @@ backend_profiles:
     runtime_profile: claude_agent_acp
   claude_auditor_medium:
     provider: claude_acp
-    model: claude-opus-5
+    model: claude-opus-5-5
     max_turns: 14
     structured_output: required
     mcp:
@@ -744,7 +744,7 @@ backend_profiles:
     mcp: []
   codex_orchestrator_acp:
     provider: codex_acp
-    model: gpt-5.6-terra
+    model: gpt-6-sol
     effort: high
     max_turns: 12
     structured_output: preferred
@@ -752,7 +752,7 @@ backend_profiles:
     runtime_profile: codex_acp
   codex_orchestrator_high:
     provider: codex_acp
-    model: gpt-5.6-sol
+    model: gpt-6-sol
     effort: high
     max_turns: 16
     structured_output: required

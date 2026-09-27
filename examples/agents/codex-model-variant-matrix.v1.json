@@ -23,42 +23,52 @@
       "model_id": "gpt-6-astra",
       "display_name": "Astra",
       "allowed_efforts": ["low", "medium", "high", "xhigh", "max"]
+    },
+    {
+      "model_id": "gpt-6-sol",
+      "display_name": "Sol 6",
+      "allowed_efforts": ["low", "medium", "high", "xhigh", "max", "ultra"]
+    },
+    {
+      "model_id": "gpt-6-luna",
+      "display_name": "Luna 6",
+      "allowed_efforts": ["low", "medium", "high", "xhigh", "max"]
     }
   ],
   "production_profiles": [
     {
       "backend_profile_id": "codex_orchestrator_high",
-      "model_id": "gpt-5.6-sol",
+      "model_id": "gpt-6-sol",
       "effort": "high"
     },
     {
       "backend_profile_id": "codex_architect_high",
-      "model_id": "gpt-5.6-sol",
+      "model_id": "gpt-6-sol",
       "effort": "high"
     },
     {
       "backend_profile_id": "codex_audit_high",
-      "model_id": "gpt-5.6-sol",
+      "model_id": "gpt-6-sol",
       "effort": "high"
     },
     {
       "backend_profile_id": "codex_writer_high",
-      "model_id": "gpt-5.6-terra",
+      "model_id": "gpt-6-sol",
       "effort": "high"
     },
     {
       "backend_profile_id": "codex_builder_high",
-      "model_id": "gpt-5.6-terra",
+      "model_id": "gpt-6-sol",
       "effort": "high"
     },
     {
       "backend_profile_id": "codex_orchestrator_acp",
-      "model_id": "gpt-5.6-terra",
+      "model_id": "gpt-6-sol",
       "effort": "high"
     },
     {
       "backend_profile_id": "codex_ops_low",
-      "model_id": "gpt-5.6-luna",
+      "model_id": "gpt-6-luna",
       "effort": "high"
     },
     {
