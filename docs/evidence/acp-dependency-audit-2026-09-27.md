@@ -113,6 +113,12 @@ manager checks the returned provider session identity and rejects a mismatch;
 this does not prove successful resurrection. Existing fixture tests that accept
 the top-level field are not upstream interoperability evidence.
 
+Antigravity's separate public-source task
+`01a0e3b9-b6af-788b-b01c-8b0cff424782` completed and corroborated this comparison
+against the upstream [0.75.1 source](https://github.com/agentclientprotocol/claude-agent-acp/blob/v0.75.1/src/acp-agent.ts)
+and [0.81.2 source](https://github.com/agentclientprotocol/claude-agent-acp/blob/v0.81.2/src/acp-agent.ts).
+It is source evidence, not an authenticated resume test.
+
 This finding is not fixed in the dependency-upgrade commit. Acceptance requires
 aligning the adapter's request/capability descriptor and strict fixtures with the
 upstream field, then proving same-session attach without a prompt dispatched to
