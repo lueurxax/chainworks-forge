@@ -1,11 +1,14 @@
 # P039 Expanded Historical References
 
 Date: 2026-09-27. Base: `b07bfbf4de8d0dfce1320b3e8c630ba593c0a132`.
-Scope: isolated, uncommitted `codex/p039-carry-forward` worktree. This is a bounded
+Scope: isolated `codex/p039-carry-forward` worktree. This is a bounded
 follow-up to the [P095 reference-budget hold](p095-legacy-reconciliation-2026-09-21.md),
 not a deployment or completed P095 transfer receipt.
 
-Status: implemented and verified offline; not merged or deployed.
+Status: merged and pushed as `b33159511aa1d9fc50ca58f51b018d2bcf70a041`.
+Model-policy compatibility was integrated as
+`dc4ea294f25ed1ce9de83e63b93430877e9a1be2`. The signed bundle is staged;
+live installation and P095 transfer are not complete at the latest cutoff below.
 
 ## Change
 
@@ -80,12 +83,12 @@ post-edit content manifest on recheck. Existing compiler warnings were not chang
 Antigravity reviewed the scoped code through A2A and reported no actionable
 defects. This is code-review evidence, not independent live or provider execution.
 
-## Operational Boundary
+## Initial Verification Boundary
 
-No production rows were deleted or rewritten, no temporary principal was created,
+At the initial offline verification cutoff, no production rows were deleted or rewritten, no temporary principal was created,
 no daemon was restarted, and no new P095 preview/reservation/activation or Apple
 operation was submitted in this follow-up. Production queries were read-only.
-No merge or push has occurred. Existing unrelated model/catalog edits stay in
+No merge or push had occurred at that cutoff. Existing unrelated model/catalog edits stayed in
 the primary worktree.
 
 After deployment with the normal verified database backup, obtain a fresh P095
@@ -93,3 +96,85 @@ preview. A previous held preview is not a resumable preparation and supplies no
 new plan hash. Later provenance, missing preserved generations, approval and
 headless admission checks remain fail-closed and are not proved by these fixtures.
 Full P039 closeout and proposal retirement remain separate.
+
+## Delivery Follow-Up
+
+At 2026-09-27T16:14Z, GitHub `main` was read back at `dc4ea294...` after two
+fast-forward integrations. The dirty primary checkout was not reset or merged;
+only the 12 previously prepared model-policy files were transferred into the
+isolated delivery branch. Antigravity's source-only review found no actionable
+defects. Private SQLite state was not delegated to the A2A peer.
+
+The old 1,994-byte pinned model policy rejected the user's updated 2,269-byte
+matrix (`TargetProfileInvalid`). The synchronized Rust/Swift pins and catalog
+update resolve that compatibility mismatch without changing historical snapshots.
+
+Fresh integrated verification:
+
+- `proposal-039`: exit 0, 354 Rust tests across 39 selections, zero failed/ignored;
+  29 execution-coverage cases and 168 mapped tests; final coverage check PASS.
+- `codex-planned-variant-slice`: exit 0, 17 Swift tests and 40 Rust tests. The
+  first default-stack Rust run overflowed; the passing rerun used the established
+  `RUST_MIN_STACK=8388608` setting. This is not a full-workspace test claim.
+- `scripts/test-gate.sh build`: exit 0. A separate build bundle, without the
+  test-only XCTest plugin, was used for packaging.
+- Standalone daemon built with full `GIT_SHA=dc4ea294...` through managed Cargo.
+  App and daemon were signed with the existing Developer ID team `R859U8DTY9`;
+  `codesign --verify --deep --strict` passed for the staged installable bundle.
+  Both launch-agent plists retain carry-forward enablement and the full build SHA.
+
+| Local Evidence | SHA-256 |
+| --- | --- |
+| `/private/tmp/p039-delivery-20260927/integrated-p039-gate.log` | `49220b6d8777113684bfb76f7f17c7a72bd6e52a33606d9c9d1ddd683423e0a9` |
+| `/private/tmp/p039-delivery-20260927/model-policy-gate.log` | `c7a9e4fadafd2d421d589e70d77c960b7653c2d2fdb6c7725a1e2b0b3f850e6d` |
+| `/private/tmp/p039-delivery-20260927/app-build.log` | `8334ef6c69a133db7579451d26425ca891b4070f1104f8c05b13f19e4183a93f` |
+| Staged signed daemon | `1f5daaab9e9b2706c4835b3b31db0bf23cc4b3183e475f5f21b5e00dc2cef567` |
+
+The staged bundle is
+`/private/tmp/p039-delivery-20260927/installable-Chainworks Forge.app`.
+The previous installed bundle is preserved in the same private directory.
+No invalid/test-only staged candidate was installed.
+
+A private SQLite backup made via the backup API passed full `integrity_check`
+at schema 101. Its SHA-256 is
+`476cb3fc8037a0bf41e156e0d74a835bda7870c3403b6dba1ba5533c88405016`.
+This was a diagnostic snapshot during unrelated P070 work, not the final
+quiescent migration backup. A fresh verified backup is required before cutover.
+
+The local preview harness opened that snapshot read-only/immutable and ran the
+new engine without starting another daemon or dispatching a provider. Target
+compilation passed and preview returned `ArtifactProvenanceInvalid`, not the
+old reference-count or model-policy hold. This is **offline evidence only**.
+
+Bounded snapshot inspection found 125 `proposal_review_v1` records at six reused
+canonical paths, with no historical SHA-256 values. The 27 summary generations
+also reuse one canonical path; the available generation rows cover summaries,
+not all required historical review inputs. Implementation plan/backlog each have
+two records with different generic provider contracts. These facts are consistent
+with the existing generation/provenance checks rejecting the migration. The
+public hold code does not identify a unique first failed check. Current bytes
+must not be relabeled as the content of older versions, and historical rows must
+not be deleted merely to obtain an eligible preview.
+
+At the cutoff, MCP still reports P070 B
+`2478fbf5-3eb8-4e9d-b805-8b463edf5345` running, and its provider log is advancing.
+The old app-owned daemon remains healthy at `b07bfbf4...`, schema 101. It has not
+been interrupted. No live P095 preview, reservation, activation, approval, or
+Apple operation was performed in this delivery follow-up. A temporarily scoped
+operator was used for readback; its revocation is recorded separately below.
+
+The [ACP dependency audit](acp-dependency-audit-2026-09-27.md) records independent
+provider upgrade candidates and initialize-only checks. Neither the signed
+bundle nor those checks prove a completed P095 transfer. Proposal retirement is
+still withheld.
+
+### Temporary Access Closeout
+
+The temporary `p039-migration-operator` was removed from the auth source. The
+initial immediate check ran before the daemon's default two-second principal
+reload and still succeeded. A bounded verification then rotated the same ID to
+a fresh **read-only `runtime.health` credential**, observed that reload, removed
+it, and confirmed denial of an authenticated MCP tool call after reload. This
+also displaced the earlier write-capable credential from the loaded table.
+Only the original two principals remain; their policies were not changed.
+No credential was printed or retained in evidence.
