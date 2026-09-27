@@ -2,13 +2,14 @@
 
 Date: 2026-09-27. Base: `b07bfbf4de8d0dfce1320b3e8c630ba593c0a132`.
 Scope: isolated `codex/p039-carry-forward` worktree. This is a bounded
-follow-up to the [P095 reference-budget hold](p095-legacy-reconciliation-2026-09-21.md),
-not a deployment or completed P095 transfer receipt.
+follow-up to the [P095 reference-budget hold](p095-legacy-reconciliation-2026-09-21.md).
+It includes deployment evidence, but is not a completed P095 transfer receipt.
 
 Status: merged and pushed as `b33159511aa1d9fc50ca58f51b018d2bcf70a041`.
 Model-policy compatibility was integrated as
-`dc4ea294f25ed1ce9de83e63b93430877e9a1be2`. The signed bundle is staged;
-live installation and P095 transfer are not complete at the latest cutoff below.
+`dc4ea294f25ed1ce9de83e63b93430877e9a1be2`. The signed bundle is installed and
+running at schema 102. Live P095 preview is held on historical artifact
+provenance; the transfer is not complete. See the final cutover section below.
 
 ## Change
 
@@ -97,7 +98,7 @@ new plan hash. Later provenance, missing preserved generations, approval and
 headless admission checks remain fail-closed and are not proved by these fixtures.
 Full P039 closeout and proposal retirement remain separate.
 
-## Delivery Follow-Up
+## Pre-Cutover Verification
 
 At 2026-09-27T16:14Z, GitHub `main` was read back at `dc4ea294...` after two
 fast-forward integrations. The dirty primary checkout was not reset or merged;
@@ -130,8 +131,9 @@ Fresh integrated verification:
 | `/private/tmp/p039-delivery-20260927/app-build.log` | `8334ef6c69a133db7579451d26425ca891b4070f1104f8c05b13f19e4183a93f` |
 | Staged signed daemon | `1f5daaab9e9b2706c4835b3b31db0bf23cc4b3183e475f5f21b5e00dc2cef567` |
 
-The staged bundle is
-`/private/tmp/p039-delivery-20260927/installable-Chainworks Forge.app`.
+Before cutover, the staged bundle was
+`/private/tmp/p039-delivery-20260927/installable-Chainworks Forge.app`;
+cutover moved it to `/Applications/Chainworks Forge.app`.
 The previous installed bundle is preserved in the same private directory.
 No invalid/test-only staged candidate was installed.
 
@@ -178,3 +180,60 @@ it, and confirmed denial of an authenticated MCP tool call after reload. This
 also displaced the earlier write-capable credential from the loaded table.
 Only the original two principals remain; their policies were not changed.
 No credential was printed or retained in evidence.
+
+## Live Cutover
+
+After the earlier waiting cutoff, P070 B settled. MCP returned no active runs,
+zero active provider sessions, and zero unresolved side effects. A fresh SQLite
+backup passed `integrity_check` at schema 101:
+`/private/tmp/p039-delivery-20260927/verified-quiescent-pre-v102.sqlite`, SHA-256
+`f1b4d7feac8f44731653400cb998bb79fe4e624f6435f49e8bd992cd57de3327`.
+
+The app exited; its remaining daemon received SIGTERM and exited before install.
+The signed standalone build bundle replaced `/Applications/Chainworks Forge.app`;
+the previous original bundle remains in the private delivery directory.
+The three ACP adapter upgrades and global initialize checks are recorded in the
+[dependency audit](acp-dependency-audit-2026-09-27.md).
+
+At `2026-09-27T16:24:45.509756Z`, the app-owned daemon started successfully.
+`/ready` returned `ready`, schema/binary schema 102, exact build SHA
+`dc4ea294f25ed1ce9de83e63b93430877e9a1be2`, healthy headless Xcode broker, and
+zero active leases/backend sessions. Startup also produced its automatic
+schema-101-to-102 backup, independently opened read-only/immutable and verified
+at schema 101 with a passing full `integrity_check`. No Xcode IDE or Apple
+project operation was launched.
+The application connected and displayed its existing run list after refresh.
+
+MCP `storage.health` reported `HEALTHY`, fresh data, writer alive, queue depth 0,
+transaction p95 5 ms, and no subquery failures. The pre-existing `run_summaries`
+`projection_error` remains visible and is **not fixed** by this deployment.
+
+One fresh authorized live `runs.continuation_preview` used the original P095
+delivery identity, current canonical definitions, and the same approved proposal
+artifact. It returned `run_carry_forward_preview_hold_v1` with
+`artifact_provenance_invalid` and `next_action=resolve_hold`. Response evidence:
+`/private/tmp/p039-delivery-20260927/1790526365361604000-runs_continuation_preview-response.json`,
+SHA-256 `7dd1dc0c9d3908d51bd4e6cc3237035fc84ab1128f17489059685481f7322c5f`.
+
+Readback afterwards confirmed P095 remains blocked, with no successor or
+carry-forward operation, and unchanged frozen hashes:
+
+- Workflow: `2538c5505ea0d2385f8d34f5675a1b47ab89ec686249a1bbe11854bdd8316885`.
+- Catalog: `73c4dd59f1329505eb005a88b6bac28473ffbd33433acf3f91dbcfe27a2ebf18`.
+
+No preparation, activation, approval, historical-row deletion, checksum backfill,
+or artifact rewrite followed the hold. The expanded-history fix and model/ACP
+updates are deployed; P095 transfer and full P039 retirement remain blocked on
+independently verifiable historical preservation, not the old 128-reference cap.
+
+Further read-only inspection found preserved `undeclared_envelope_outputs` JSON
+files that may be recovery candidates. Their artifact rows have no execution ID
+or historical checksum, and envelope content is not necessarily identical to the
+canonical filesystem output. Existence alone does not establish a unique binding
+to each required historical generation. This is not evidence that all old bytes
+are lost, and no timestamp-based binding or fabricated checksum was installed.
+
+The scoped `p039-migration-operator` was recreated for this cutover/readback,
+then removed again. An authenticated call using that credential was denied after
+the principal reload interval. Only the original principals remain, with their
+policies unchanged. No temporary administrative access is left active.

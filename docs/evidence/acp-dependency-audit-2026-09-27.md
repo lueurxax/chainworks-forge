@@ -4,12 +4,16 @@ Date: 2026-09-27. Repository base: `dc4ea294f25ed1ce9de83e63b93430877e9a1be2`.
 Scope: installed provider adapters and their bundled SDKs, not a blanket Cargo
 or global npm upgrade. The user's "A2C" was interpreted as ACP in this context.
 
+Status: the three outdated adapters were upgraded after provider quiescence.
+Post-install dependency resolution and initialize-only probes passed. Full
+authenticated provider execution remains a separate acceptance check.
+
 ## Version Inventory
 
 Registry `latest` tags and the actual local executable/package locations were
 checked. Preview/nightly releases were excluded.
 
-| Component | Installed | Stable Candidate |
+| Component | Before | Installed After |
 | --- | --- | --- |
 | `@agentclientprotocol/codex-acp` | 1.10.0 | 1.13.1 |
 | `@agentclientprotocol/claude-agent-acp` | 0.75.1 | 0.81.2 |
@@ -23,7 +27,7 @@ Junie's selected native installation was separately checked as 1468.30; no
 pending-update manifest was applied. Standalone Claude/Codex CLI versions do
 not prove which runtime an ACP adapter loads.
 
-Installed Codex ACP declared `@openai/codex ^0.153.3` but resolved the global
+Before the upgrade, Codex ACP declared `@openai/codex ^0.153.3` but resolved the global
 0.157.1 package. `npm ls` reported `ELSPROBLEMS` for this incompatible 0.x minor
 range. Do not fix this by ignoring semver or forcing deduplication.
 
@@ -57,23 +61,64 @@ unexecuted. Their behavior was not covered or implicitly approved by this probe.
 | Local Evidence | SHA-256 |
 | --- | --- |
 | Candidate `package-lock.json` | `0d67ba066a14bafa5b941e3b151be9a7859e9117a5bac7c28e3af43bf85a57c6` |
-| `/private/tmp/cw-acp-probe.mjs` | `7107df6feec89aaf42186d62e39218507cfba193863b96fa5906829d990dcf23` |
+| Initial isolated harness bytes | `7107df6feec89aaf42186d62e39218507cfba193863b96fa5906829d990dcf23` |
+| Final `/private/tmp/cw-acp-probe.mjs`, also accepts actual global bin directory | `8385db200829c6c601a93d314c246a8f3a29205877fce47a47f9c65cc2cf5fde` |
 
 Per-provider request/response evidence is private under the candidate directory's
 `probes/` tree. No credentials were supplied or recorded.
 
-## Cutover Boundary
+## Cutover
 
-At this evidence cutoff, global packages are **not upgraded**. P070 B is still
-executing through the installed providers (runtime readback advanced from Claude
-to Gemini). Do not replace their module
-tree while it runs. Preserve the old package trees and links, wait for provider
-quiescence, install only the three exact stable candidates, and verify actual
-resolution plus the ACP handshake again. Keep standalone Codex 0.157.1 separate
-from the adapter's compatible 0.156.1 dependency.
+Initially cutover waited for P070 B, whose runtime advanced from Claude to Gemini.
+Fresh MCP readback subsequently showed no active runs, zero provider sessions,
+and zero unresolved effects. The app exited and its remaining daemon stopped
+with SIGTERM before package replacement. No active invocation was cancelled.
+
+The old three package trees and executable links were preserved at
+`/private/tmp/p039-delivery-20260927/previous-acp-packages.tgz`, SHA-256
+`f7bf8a190daa56e409045bd694ad84cba594fdab7bdf8233e0d18c442c4a5872`.
+After reviewing `npm install -g --dry-run`, the three exact candidates were
+installed globally. `npm ls` now succeeds: Codex ACP resolves its own compatible
+0.156.1; standalone Codex remains 0.157.1. Unrelated top-level CLI versions did
+not change. Optional install scripts remain unapproved and unexecuted.
+
+The same empty-HOME probe was rerun against `/opt/homebrew/bin/codex-acp`,
+`claude-agent-acp`, and `gemini`. All three returned protocol 1 and the expected
+new version. Post-install evidence directories end in `1790526162802`,
+`1790526165341`, and `1790526165631`, respectively. No authenticated sessions or
+prompts were sent. The updated Chainworks app/daemon was then started successfully.
 
 An authenticated controlled task and resume/cancel checks remain separate
 provider acceptance. This audit is not proof that P095 carry-forward succeeded.
+
+## Independent Review And Compatibility Gaps
+
+Antigravity was delegated public-upstream release research and a separate ACP
+SDK 1.5.0 client-contract review through A2A. Its initial protocol examples were
+not accepted verbatim: follow-up review corrected permission-response nesting,
+version negotiation, and the prohibition on replying to JSON-RPC notifications.
+The permission result is an object under `result.outcome`, not a string with a
+sibling `optionId`. Local installed SDK declarations independently confirm this.
+Research task IDs: `01a0e3ae-843a-7674-b1b0-5556a25ee068` and
+`01a0e3b0-6c23-7b89-898f-9b2fae03982e`; correction task:
+`01a0e3b5-1a57-7a6b-a223-1fb9e09778b1`.
+
+Local source comparison also found a **pre-existing Claude resurrection wire
+mismatch**, not an upgrade regression. Both the archived 0.75.1 package and
+installed 0.81.2 implement `newSession` by passing
+`params._meta?.claudeCode?.options?.resume` to `createSession`. Neither reads the
+top-level `resumeSessionId` emitted by the current Chainworks Claude adapter.
+`build_session_new_params` forwards that field without translation. The runtime
+manager checks the returned provider session identity and rejects a mismatch;
+this does not prove successful resurrection. Existing fixture tests that accept
+the top-level field are not upstream interoperability evidence.
+
+This finding is not fixed in the dependency-upgrade commit. Acceptance requires
+aligning the adapter's request/capability descriptor and strict fixtures with the
+upstream field, then proving same-session attach without a prompt dispatched to
+an unverified identity. Authenticated resume/cancel acceptance remains open.
+The removed Claude agent-picker option is not used by the current adapter;
+its raw-SDK diagnostic and debug-file options are still present upstream.
 
 ## Primary Sources
 
