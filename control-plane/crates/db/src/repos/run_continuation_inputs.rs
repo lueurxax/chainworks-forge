@@ -2,7 +2,7 @@
 use anyhow::{ensure, Result};
 use domain::{
     ids::{ArtifactId, RunId},
-    run_carry_forward::{ContentDigest, EntryRole},
+    run_carry_forward::{ContentDigest, EntryRole, MAX_CARRIED_INPUTS, MAX_REFERENCE_ARTIFACTS},
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
@@ -61,7 +61,7 @@ pub async fn insert_tx(
         "effect_outcome_unknown"
     );
     ensure!(
-        !inputs.is_empty() && inputs.len() <= 129,
+        !inputs.is_empty() && inputs.len() <= MAX_CARRIED_INPUTS,
         "artifact_provenance_invalid"
     );
     ensure!(
@@ -140,6 +140,11 @@ pub async fn execution_seed(
 }
 
 pub async fn references(pool: &SqlitePool, run: RunId) -> Result<Vec<InstalledInput>> {
-    Ok(sqlx::query_as("SELECT i.* FROM run_continuation_inputs i JOIN run_continuations c ON c.operation_id=i.operation_id WHERE i.successor_run_id=? AND i.role='reference_only' AND i.installed=1 AND c.phase='activated' ORDER BY i.ordinal LIMIT 128")
-        .bind(run.to_string()).fetch_all(pool).await?)
+    let rows = sqlx::query_as("SELECT i.* FROM run_continuation_inputs i JOIN run_continuations c ON c.operation_id=i.operation_id WHERE i.successor_run_id=? AND i.role='reference_only' AND i.installed=1 AND c.phase='activated' ORDER BY i.ordinal LIMIT ?")
+        .bind(run.to_string()).bind((MAX_REFERENCE_ARTIFACTS + 1) as i64).fetch_all(pool).await?;
+    ensure!(
+        rows.len() <= MAX_REFERENCE_ARTIFACTS,
+        "continuation_budget_exceeded: reference inputs"
+    );
+    Ok(rows)
 }

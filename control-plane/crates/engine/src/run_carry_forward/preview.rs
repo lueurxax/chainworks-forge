@@ -14,7 +14,9 @@ use anyhow::{ensure, Context};
 use domain::{
     ids::RunId,
     run::{DeliveryConfiguration, Run, RunStatus},
-    run_carry_forward::{canonical_digest, ContentDigest, EntryRole},
+    run_carry_forward::{
+        canonical_digest, ContentDigest, EntryRole, MAX_CARRIED_INPUTS, MAX_REFERENCE_ARTIFACTS,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -200,7 +202,7 @@ impl Default for PlanLimits {
             max_entries: limits.max_entries,
             max_total_bytes: limits.max_total_bytes,
             max_file_bytes: limits.max_file_bytes,
-            max_references: 128,
+            max_references: MAX_REFERENCE_ARTIFACTS,
             max_request_bytes: REQUEST_LIMIT,
             max_summary_bytes: SUMMARY_LIMIT,
             default_page: 100,

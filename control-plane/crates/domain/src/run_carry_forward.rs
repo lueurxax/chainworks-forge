@@ -6,6 +6,10 @@ use thiserror::Error;
 
 use crate::ids::{ApprovalId, RunId, StageExecutionId};
 
+/// Server-expanded history; explicit client selections have a separate 128-item bound.
+pub const MAX_REFERENCE_ARTIFACTS: usize = 512;
+pub const MAX_CARRIED_INPUTS: usize = MAX_REFERENCE_ARTIFACTS + 1;
+
 #[derive(Debug, Error)]
 pub enum CarryForwardError {
     #[error("invalid_sha256")]

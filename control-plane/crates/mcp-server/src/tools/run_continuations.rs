@@ -747,7 +747,10 @@ fn preview_schema() -> Value {
         ("max_entries", integer(50000)),
         ("max_preservation_bytes", integer(2147483648)),
         ("max_file_bytes", integer(268435456)),
-        ("max_reference_artifacts", integer(128)),
+        (
+            "max_reference_artifacts",
+            integer(domain::run_carry_forward::MAX_REFERENCE_ARTIFACTS as u64),
+        ),
         ("max_request_bytes", integer(1048576)),
         ("max_summary_bytes", integer(65536)),
         ("default_page_size", limit()),

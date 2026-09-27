@@ -98,6 +98,25 @@ generations remain a hold. Arbitrary removed-original-tool compatibility is not
 guaranteed, and legacy external skills without authenticated bytes are not
 reconstructed from present-day files.
 
+The explicit `selection.reference_inputs` request remains limited to 128. The
+server-expanded union of selected and mandatory historical references supports
+512 distinct input identities, plus one execution seed. Pagination does not
+reduce that set. Preparation, installed-input reads, report provenance and a
+subsequent fork use the same ceiling; over-limit reads fail rather than return a
+truncated prefix. Equal content does not collapse distinct historical identities.
+Other independent bounds, including the 128-ID witness lists, remain in force.
+
+The finalization intent v2 binds the complete input set by canonical SHA-256 and
+count, keeping its journal row within 64 KiB. Per-input intents and the immutable
+manifest retain the full descriptors. Existing v1 prepared manifests remain
+readable. Agent context batches historical references as lossless JSON snapshots
+(`carry_forward_reference_context_v1`), preserving each input name/identity,
+historical path, full content, size and SHA-256 with `authority: none`. The existing
+ACP snapshot sealing, read-root checks, 64 KiB prompt, 128 snapshot entries,
+16 MiB/source and 64 MiB context ceilings are not raised. Large escape-heavy
+records can use the existing individual-snapshot path; an exceeded byte budget
+still stops dispatch without dropping history.
+
 ## Fresh Review And Approval
 
 The successor uses current compiled definitions with explicit headless policy.
@@ -160,6 +179,12 @@ Migration requires a SQLite-consistent, verified backup; an older incompatible
 daemon refuses the upgraded schema. Rollback uses a compatible diagnostic build,
 not schema downgrade, source reactivation or restoring an old database over
 newer unrelated work.
+
+Migration 102 widens only the installed-input ordinal bound to 0..512. It rebuilds
+the table losslessly, retaining input identities, installation state, provenance,
+foreign keys and uniqueness constraints. Migration 101 is unchanged; a schema-101
+binary cannot serve the upgraded database. This schema change does not modify
+historical run snapshots or automatically retry any held operation.
 
 The retained `proposal-039|p039` gate covers offline integration; the narrower
 `proposal-039-i1|p039-i1` alias covers only the first provider-free experiment.

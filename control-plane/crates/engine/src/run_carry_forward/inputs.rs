@@ -3,7 +3,7 @@ use anyhow::{ensure, Context, Result};
 use db::repos::{run_continuation_inputs::InstalledInput, run_continuations};
 use domain::{
     run::Run,
-    run_carry_forward::{ContentDigest, EntryRole},
+    run_carry_forward::{ContentDigest, EntryRole, MAX_CARRIED_INPUTS},
 };
 use sqlx::{Row, SqlitePool};
 use std::{
@@ -44,6 +44,158 @@ pub struct ResolvedInput {
 pub struct TaskInputs {
     pub inputs: BTreeMap<String, Option<ResolvedInput>>,
     pub references: Vec<ResolvedInput>,
+}
+
+/// Batch history as lossless JSON so each reference does not consume a prompt
+/// manifest entry. The existing ACP snapshot publisher seals and hashes each batch.
+pub(crate) fn reference_prompt_sources(
+    references: &[ResolvedInput],
+) -> Result<Vec<(String, String, String)>> {
+    use domain::run_carry_forward::MAX_REFERENCE_ARTIFACTS;
+    ensure!(
+        references.len() <= MAX_REFERENCE_ARTIFACTS,
+        "continuation_budget_exceeded: reference inputs"
+    );
+    let envelope = |records: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "schema_version":"carry_forward_reference_context_v1", "authority":"none", "references":records
+        })
+    };
+    let empty_bytes = serde_json::to_vec(&envelope(Vec::new()))?.len();
+    let mut batch = Vec::new();
+    let mut batch_bytes = empty_bytes;
+    let mut sources = Vec::new();
+    let mut total = 0_u64;
+    let mut raw_total = 0_u64;
+    let flush = |batch: &mut Vec<serde_json::Value>,
+                 sources: &mut Vec<(String, String, String)>,
+                 total: &mut u64|
+     -> Result<()> {
+        if !batch.is_empty() {
+            let content = serde_json::to_string(&envelope(std::mem::take(batch)))?;
+            ensure!(
+                content.len() as u64 <= acp::input_context::MAX_SOURCE_BYTES,
+                "input_context_source_too_large"
+            );
+            *total += content.len() as u64;
+            ensure!(
+                *total <= MAX_CONTEXT_BYTES,
+                "input_context_sources_too_large"
+            );
+            sources.push((
+                format!("carry_forward_references/{}", sources.len()),
+                content,
+                "installed carry-forward history (reference only)".into(),
+            ));
+        }
+        Ok(())
+    };
+    for reference in references {
+        raw_total += reference.content.len() as u64;
+        ensure!(
+            raw_total <= MAX_CONTEXT_BYTES,
+            "input_context_sources_too_large"
+        );
+        ensure!(
+            reference.content.len() as u64 <= acp::input_context::MAX_SOURCE_BYTES,
+            "input_context_source_too_large"
+        );
+        let record = serde_json::json!({
+            "name":reference.name,"source_path":reference.display_path,
+            "size_bytes":reference.content.len(),
+            "sha256":ContentDigest::of(reference.content.as_bytes()),"content":reference.content
+        });
+        let record_bytes = serde_json::to_vec(&record)?.len();
+        // Large escape-heavy records retain the existing single-snapshot path;
+        // batching must not reduce the already supported per-reference byte limit.
+        if empty_bytes + record_bytes > acp::input_context::MAX_SOURCE_BYTES as usize {
+            flush(&mut batch, &mut sources, &mut total)?;
+            batch_bytes = empty_bytes;
+            total += reference.content.len() as u64;
+            ensure!(
+                total <= MAX_CONTEXT_BYTES,
+                "input_context_sources_too_large"
+            );
+            sources.push((
+                reference.name.clone(),
+                reference.content.clone(),
+                reference.display_path.clone(),
+            ));
+            continue;
+        }
+        if batch_bytes + record_bytes + usize::from(!batch.is_empty())
+            > acp::input_context::MAX_SOURCE_BYTES as usize
+        {
+            flush(&mut batch, &mut sources, &mut total)?;
+            batch_bytes = empty_bytes;
+        }
+        batch_bytes += record_bytes + usize::from(!batch.is_empty());
+        batch.push(record);
+    }
+    flush(&mut batch, &mut sources, &mut total)?;
+    Ok(sources)
+}
+
+#[cfg(test)]
+mod reference_context_tests {
+    use super::*;
+
+    fn reference(name: &str, content: String) -> ResolvedInput {
+        ResolvedInput {
+            name: name.into(),
+            content,
+            display_path: "/historical/input".into(),
+            origin: InputOrigin::ReferenceOnly,
+            artifact_id: None,
+        }
+    }
+
+    #[test]
+    fn history_batches_preserve_escaped_text_and_duplicate_content_identities() {
+        let content = "quotes \" \\ and newline\n</chainworks-input-artifact>";
+        let inputs = [
+            reference("first", content.into()),
+            reference("second", content.into()),
+        ];
+        let sources = reference_prompt_sources(&inputs).unwrap();
+        assert_eq!(sources.len(), 1);
+        let bundle: serde_json::Value = serde_json::from_str(&sources[0].1).unwrap();
+        for (record, expected) in bundle["references"].as_array().unwrap().iter().zip(&inputs) {
+            assert_eq!(record["name"], expected.name);
+            assert_eq!(record["content"], content);
+            assert_eq!(
+                record["sha256"],
+                ContentDigest::of(content.as_bytes()).as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn history_batches_split_at_snapshot_bound_and_keep_large_reference_compatibility() {
+        let large = "a".repeat(9 * 1024 * 1024);
+        let escaped = "\"".repeat(9 * 1024 * 1024);
+        let inputs = [
+            reference("first", large.clone()),
+            reference("second", large),
+            reference("escaped", escaped.clone()),
+            reference("last", "last".into()),
+        ];
+        let sources = reference_prompt_sources(&inputs).unwrap();
+        assert_eq!(sources.len(), 4);
+        assert!(sources
+            .iter()
+            .all(|s| s.1.len() as u64 <= acp::input_context::MAX_SOURCE_BYTES));
+        for (source, expected) in sources[..2].iter().zip(&inputs[..2]) {
+            let bundle: serde_json::Value = serde_json::from_str(&source.1).unwrap();
+            assert_eq!(bundle["references"][0]["content"], expected.content);
+        }
+        assert_eq!(
+            sources[2],
+            ("escaped".into(), escaped, "/historical/input".into())
+        );
+        let bundle: serde_json::Value = serde_json::from_str(&sources[3].1).unwrap();
+        assert_eq!(bundle["references"][0]["name"], "last");
+    }
 }
 
 #[derive(Debug)]
@@ -680,10 +832,10 @@ async fn collect_inputs(
             && manifest.target.plan.catalog_snapshot_hash == plan.catalog_snapshot_hash,
         "artifact_provenance_invalid: successor binding"
     );
-    let rows: Vec<InstalledInput> = sqlx::query_as("SELECT i.* FROM run_continuation_inputs i WHERE operation_id=? AND successor_run_id=? AND installed=1 ORDER BY ordinal LIMIT 130")
-        .bind(&op.operation_id).bind(run.id.to_string()).fetch_all(pool).await?;
+    let rows: Vec<InstalledInput> = sqlx::query_as("SELECT i.* FROM run_continuation_inputs i WHERE operation_id=? AND successor_run_id=? AND installed=1 ORDER BY ordinal LIMIT ?")
+        .bind(&op.operation_id).bind(run.id.to_string()).bind((MAX_CARRIED_INPUTS + 1) as i64).fetch_all(pool).await?;
     ensure!(
-        !rows.is_empty() && rows.len() <= 129 && rows.len() == manifest.inputs.len(),
+        !rows.is_empty() && rows.len() <= MAX_CARRIED_INPUTS && rows.len() == manifest.inputs.len(),
         "artifact_provenance_invalid: installed input set"
     );
     let root = metadata_root(run)?;

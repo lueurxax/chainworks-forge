@@ -139,10 +139,10 @@ pub(super) async fn resolve(
             );
         }
     }
-    let carried = sqlx::query("SELECT input_id,source_schema,target_logical_name,role FROM run_continuation_inputs WHERE successor_run_id=? AND installed=1 LIMIT 130")
-        .bind(source.id.to_string()).fetch_all(pool).await?;
+    let carried = sqlx::query("SELECT input_id,source_schema,target_logical_name,role FROM run_continuation_inputs WHERE successor_run_id=? AND installed=1 LIMIT ?")
+        .bind(source.id.to_string()).bind((MAX_CARRIED_INPUTS + 1) as i64).fetch_all(pool).await?;
     ensure!(
-        carried.len() <= 129,
+        carried.len() <= MAX_CARRIED_INPUTS,
         "continuation_budget_exceeded: carried inputs"
     );
     for row in carried {
@@ -160,7 +160,7 @@ pub(super) async fn resolve(
     }
     selected.remove(&selection.proposal_input);
     ensure!(
-        selected.len() <= 128,
+        selected.len() <= MAX_REFERENCE_ARTIFACTS,
         "continuation_budget_exceeded: mandatory references"
     );
     let ancestors = lineage(pool, source.id).await?;

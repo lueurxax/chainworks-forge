@@ -1045,7 +1045,8 @@ pub struct CarryForwardLimitsV1 {
     pub max_entries: BoundedCount<50000>,
     pub max_preservation_bytes: BoundedCount<2147483648>,
     pub max_file_bytes: BoundedCount<268435456>,
-    pub max_reference_artifacts: BoundedCount<128>,
+    pub max_reference_artifacts:
+        BoundedCount<{ crate::run_carry_forward::MAX_REFERENCE_ARTIFACTS as u64 }>,
     pub max_request_bytes: BoundedCount<1048576>,
     pub max_summary_bytes: BoundedCount<65536>,
     pub default_page_size: PageLimit,
@@ -1059,7 +1060,9 @@ impl Default for CarryForwardLimitsV1 {
             max_entries: BoundedCount(50000),
             max_preservation_bytes: BoundedCount(2147483648),
             max_file_bytes: BoundedCount(268435456),
-            max_reference_artifacts: BoundedCount(128),
+            max_reference_artifacts: BoundedCount(
+                crate::run_carry_forward::MAX_REFERENCE_ARTIFACTS as u64,
+            ),
             max_request_bytes: BoundedCount(1048576),
             max_summary_bytes: BoundedCount(65536),
             default_page_size: PageLimit(100),

@@ -185,14 +185,14 @@ async fn cf21_version_100_upgrade_restores_wal_history_without_source_sidecars()
         .unwrap();
     assert_eq!(outcome.classified_as, DbStateKind::TrackedSubset);
     assert!(outcome.applied_migrations);
-    assert_eq!(outcome.schema_version, 101);
+    assert_eq!(outcome.schema_version, 102);
     let backup = outcome.backup_path.unwrap();
     assert_eq!(
         std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
         0o600
     );
     assert_eq!(entries(&fixture.backups()), [backup.clone()]);
-    assert_schema(&fixture.pool, 101, true).await;
+    assert_schema(&fixture.pool, 102, true).await;
     assert_integrity(&fixture.pool).await;
     assert_eq!(history(&fixture.pool).await, before);
 
@@ -251,7 +251,7 @@ async fn cf21_relative_filename_upgrade_restores_wal_history_without_source_side
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_schema(&fixture.pool, 101, true).await;
+        assert_schema(&fixture.pool, 102, true).await;
         assert_integrity(&fixture.pool).await;
         assert_eq!(history(&fixture.pool).await, before);
         fixture.pool.close().await;
@@ -277,7 +277,7 @@ async fn cf21_relative_filename_upgrade_restores_wal_history_without_source_side
     let outcome = run_preflight("sqlite:historical.db", None).await.unwrap();
     assert_eq!(outcome.classified_as, DbStateKind::TrackedSubset);
     assert!(outcome.applied_migrations);
-    assert_eq!(outcome.schema_version, 101);
+    assert_eq!(outcome.schema_version, 102);
     let backup = outcome.backup_path.unwrap();
     assert_eq!(
         backup.parent().unwrap(),
@@ -290,7 +290,7 @@ async fn cf21_relative_filename_upgrade_restores_wal_history_without_source_side
     assert!(!entries(Path::new(".")).iter().any(|path| path
         .extension()
         .is_some_and(|extension| extension == "pending")));
-    assert_schema(&source, 101, true).await;
+    assert_schema(&source, 102, true).await;
     assert_integrity(&source).await;
     assert_eq!(history(&source).await, before);
     source.close().await;
@@ -349,7 +349,7 @@ async fn cf21_backup_failure_blocks_migration_and_preserves_version_100() {
     run_preflight(&fixture.url, Some(&fixture.dir.path().join("retry")))
         .await
         .unwrap();
-    assert_schema(&fixture.pool, 101, true).await;
+    assert_schema(&fixture.pool, 102, true).await;
     assert_eq!(history(&fixture.pool).await, before);
     fixture.pool.close().await;
 }
@@ -378,7 +378,7 @@ async fn cf22_version_100_migrator_refuses_actual_p039_schema_without_data_loss(
         matches!(error, MigrateError::VersionMissing(101)),
         "{error:?}"
     );
-    assert_schema(&fixture.pool, 101, true).await;
+    assert_schema(&fixture.pool, 102, true).await;
     assert_integrity(&fixture.pool).await;
     assert_eq!(history(&fixture.pool).await, before);
     assert_eq!(std::fs::read(&fixture.path).unwrap(), main_before);
@@ -502,7 +502,7 @@ async fn cf21_cancelled_snapshot_remains_private_and_is_not_reused_on_retry() {
     assert_integrity(&restored).await;
     assert_eq!(history(&restored).await, before);
     restored.close().await;
-    assert_schema(&fixture.pool, 101, true).await;
+    assert_schema(&fixture.pool, 102, true).await;
     assert_eq!(history(&fixture.pool).await, before);
     fixture.pool.close().await;
 }

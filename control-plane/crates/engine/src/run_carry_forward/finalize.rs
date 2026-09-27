@@ -6,7 +6,7 @@ use db::repos::{run_continuation_inputs::PreparedInput, run_continuations::Conti
 use domain::{
     ids::{IdeaId, RunId},
     run::{DeliveryConfiguration, Run, RunStatus},
-    run_carry_forward::{canonical_digest, ContentDigest, EntryRole},
+    run_carry_forward::{canonical_digest, ContentDigest, EntryRole, MAX_CARRIED_INPUTS},
 };
 use serde_json::{json, Value};
 use std::{
@@ -55,7 +55,7 @@ impl CarryForwardFinalizer {
         )?;
         ensure!(
             plan.entries.len() <= 50_000
-                && inputs.len() <= 129
+                && inputs.len() <= MAX_CARRIED_INPUTS
                 && inputs
                     .iter()
                     .filter(|i| i.role == EntryRole::ExecutionSeed)
@@ -105,9 +105,12 @@ impl PreparationFinalizer for CarryForwardFinalizer {
         }
         let root = SafeRoot::open(root_path)?;
         let metadata_path = root_path.join("metadata");
-        context.begin_step("finalizer_metadata", &json!({"schema_version":"run_carry_forward_finalization_intent_v1",
+        // The full descriptors remain in the per-input intents and manifest.
+        // Bind the complete set without overflowing the 64 KiB journal-row bound.
+        context.begin_step("finalizer_metadata", &json!({"schema_version":"run_carry_forward_finalization_intent_v2",
             "plan_sha256":self.plan.plan_sha256, "target_sha256":self.plan.summary.target.compiled_plan_sha256,
-            "source_inputs":self.inputs, "metadata_root":metadata_path, "files":["plan.json","target.json","workflow.snapshot.json","catalog.snapshot.json","manifest.json"]}), root_path).await?;
+            "source_inputs_sha256":canonical_digest(&self.inputs)?, "source_input_count":self.inputs.len(),
+            "metadata_root":metadata_path, "files":["plan.json","target.json","workflow.snapshot.json","catalog.snapshot.json","manifest.json"]}), root_path).await?;
         context.checkpoint("finalizer:checkout_privacy").await?;
         root.verify_path(root_path)?;
         SafeRoot::open(&receipt.checkout_root)?

@@ -2,6 +2,7 @@
 //! locations, caller identities, runtime configuration or raw effect responses.
 use anyhow::{ensure, Result};
 use db::repos::run_continuations::{self, Continuation};
+use domain::run_carry_forward::MAX_CARRIED_INPUTS;
 use domain::{ids::RunId, run_carry_forward::ContentDigest, run_carry_forward_api::*};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -186,9 +187,12 @@ pub async fn report_fields(
     let links = links_with_config(pool, run_id, config).await?;
     let mut fields: ReportFields = serde_json::from_value(public_fields(&links)?)?;
     for op in [&links.incoming, &links.outgoing].into_iter().flatten() {
-        let rows = sqlx::query("SELECT input_id,source_schema,content_sha256 FROM run_continuation_inputs WHERE operation_id=? AND installed=1 ORDER BY ordinal LIMIT 130")
-            .bind(op.operation_id.as_uuid().to_string()).fetch_all(pool).await?;
-        ensure!(rows.len() <= 129, "continuation report input bound");
+        let rows = sqlx::query("SELECT input_id,source_schema,content_sha256 FROM run_continuation_inputs WHERE operation_id=? AND installed=1 ORDER BY ordinal LIMIT ?")
+            .bind(op.operation_id.as_uuid().to_string()).bind((MAX_CARRIED_INPUTS + 1) as i64).fetch_all(pool).await?;
+        ensure!(
+            rows.len() <= MAX_CARRIED_INPUTS,
+            "continuation report input bound"
+        );
         for row in rows {
             fields
                 .carry_forward_input_provenance

@@ -2,9 +2,9 @@
 
 | Field | Value |
 | --- | --- |
-| Created / revised | 2026-04-12 / 2026-09-21 |
+| Created / revised | 2026-04-12 / 2026-09-27 |
 | Revision | `p039-r2` |
-| Status | I1-I3 accepted; merged, published and deployed. Authorized P095 lifecycle correction completed; I4 preview now holds on the historical-reference budget. Migration and full closeout incomplete |
+| Status | I1-I3 baseline accepted and deployed. Last live P095 preview holds on the historical-reference budget; the 512-reference follow-up is isolated and not deployed. Migration and full closeout incomplete |
 | Implementation | See [audit R2](039-blocked-run-fork-and-canonical-carry-forward_IMPLEMENTATION_AUDIT_R2.md), [offline evidence](../evidence/p039-durable-integration.md), [live rollout](../evidence/p039-live-rollout-2026-09-21.md) and [authorized correction](../evidence/p095-legacy-reconciliation-2026-09-21.md). No successor was reserved or activated; proposal retirement remains pending live acceptance |
 | Owner | Rust control plane; SwiftUI is a read/approval client |
 | First supported case | P095-like blocked implementation run, same repository and idea |
@@ -30,6 +30,11 @@ The approved proposal was preserved with SHA-256
 The private preservation includes worktree/run/artifact files, historical
 approvals and command records. It is not an importable execution snapshot.
 See [integration context](039-blocked-run-fork-and-canonical-carry-forward.review/integration-context.md).
+
+The [2026-09-27 follow-up](../evidence/p039-expanded-history-2026-09-27.md)
+addresses the measured 215-reference hold across storage, readback and agent
+context without deleting history. It does not establish live P095 eligibility
+after the count check or replace the required fresh preview and approval.
 
 ### Changes From The April Draft
 

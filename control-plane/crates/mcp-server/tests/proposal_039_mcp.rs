@@ -1677,6 +1677,11 @@ fn p039_schemas_match_exact_dto_field_names_nullability_and_bounds() {
         false
     );
     assert_eq!(
+        preview["oneOf"][0]["properties"]["plan_summary"]["properties"]["limits"]["properties"]
+            ["max_reference_artifacts"]["maximum"],
+        512
+    );
+    assert_eq!(
         preview["oneOf"][1]["properties"]["code"]["const"],
         "preview_stale"
     );

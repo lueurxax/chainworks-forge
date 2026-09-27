@@ -6,7 +6,7 @@ use db::repos::{run_continuation_inputs::PreparedInput, run_continuations::Conti
 use domain::{
     ids::{IdeaId, RunId},
     run::Run,
-    run_carry_forward::{canonical_digest, ContentDigest, EntryRole},
+    run_carry_forward::{canonical_digest, ContentDigest, EntryRole, MAX_CARRIED_INPUTS},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -642,7 +642,7 @@ fn validate_bindings(m: &ManifestV1, op: &Continuation) -> Result<()> {
     ensure!(
         m.inputs.len() == m.input_provenance.len()
             && !m.inputs.is_empty()
-            && m.inputs.len() <= 129
+            && m.inputs.len() <= MAX_CARRIED_INPUTS
             && m.inputs
                 .iter()
                 .filter(|i| i.role == EntryRole::ExecutionSeed)

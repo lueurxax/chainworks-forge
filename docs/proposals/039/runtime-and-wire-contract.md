@@ -457,10 +457,18 @@ interpret their paths as writable new destinations.
 ## 7. Bounds, Replay And Recovery
 
 V1 ceilings: 50,000 inventoried entries, 2 GiB preservation, 256 MiB/file,
-128 reference artifacts, 1 MiB request, 64 KiB summary, 100 default/500 maximum
+512 server-expanded reference artifacts plus one execution seed (explicit client
+`reference_inputs` remains 128), 1 MiB request, 64 KiB summary, 100 default/500 maximum
 manifest page, 1 MiB streaming buffer. Exceeding any limit holds; no silent
 truncation. Detailed inventory is spooled/paginated, not a hot-list payload.
 Preview deadline 120 s, preparation 15 min, activation verification 120 s.
+The input ordinal constraint is widened by migration 102 without removing history.
+The finalization intent v2 binds the full input set by count and canonical digest;
+per-input intents and the manifest retain the complete descriptors. Historical
+agent context uses lossless bounded JSON batches through the existing verified
+ACP snapshot handoff, without increasing its prompt or snapshot byte ceilings.
+Independent witness ID lists remain limited to 128; none are truncated to admit a
+larger reference set.
 Writer commits retain normal DbWriter deadlines. Timeout cannot release a fence
 or prove a child/process group has stopped.
 

@@ -447,6 +447,20 @@ fn preview_page() -> Value {
 fn preview_page_is_bounded_and_carries_full_plan_identity_not_page_digest() {
     round_trip::<RunCarryForwardPreviewPageV1>(preview_page());
     strict::<RunCarryForwardPreviewPageV1>(preview_page());
+    assert_eq!(
+        CarryForwardLimitsV1::default()
+            .max_reference_artifacts
+            .get(),
+        512
+    );
+    for bound in [128, 215, 512] {
+        let mut page = preview_page();
+        page["plan_summary"]["limits"]["max_reference_artifacts"] = json!(bound);
+        round_trip::<RunCarryForwardPreviewPageV1>(page);
+    }
+    let mut oversized = preview_page();
+    oversized["plan_summary"]["limits"]["max_reference_artifacts"] = json!(513);
+    reject::<RunCarryForwardPreviewPageV1>(oversized);
     let mut value = preview_page();
     value["entries"] = json!([]);
     let page: RunCarryForwardPreviewPageV1 = serde_json::from_value(value).unwrap();

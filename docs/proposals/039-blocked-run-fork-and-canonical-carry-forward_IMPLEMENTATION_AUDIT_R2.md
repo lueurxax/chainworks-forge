@@ -6,6 +6,10 @@ services were not part of the offline audit snapshot. R1 retains the I1 verdict.
 The later authorized [live rollout](../evidence/p039-live-rollout-2026-09-21.md)
 records the merge, deployment and held P095 preview separately.
 
+The [2026-09-27 expanded-history follow-up](../evidence/p039-expanded-history-2026-09-27.md)
+records the later isolated fix for the 215-reference budget hold. It does not
+supersede this audit's live-transfer cutoff or claim full closeout.
+
 ## Verdict
 
 **Offline implementation accepted; I4 and full closeout remain pending.**

@@ -62,6 +62,35 @@ pub(crate) struct Fixture {
 }
 
 impl Fixture {
+    pub(crate) async fn with_reference_count(self, count: usize) -> Self {
+        assert!(count >= 1);
+        let raw: String = sqlx::query_scalar("SELECT catalog_snapshot_json FROM runs WHERE id=?")
+            .bind(self.input.source_run_id.to_string())
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
+        let mut snapshot: Value = serde_json::from_str(&raw).unwrap();
+        let bytes = fs::read(self.metadata.join("audit/proposal-vs-implementation.json")).unwrap();
+        for index in 1..count {
+            let name = format!("historical_audit_{index}");
+            let path = format!("audit/{name}.json");
+            snapshot["artifacts"][&name] =
+                json!(format!("${{CHAINWORKS_META_ROOT:-.chainworks}}/{path}"));
+            fs::write(self.metadata.join(&path), &bytes).unwrap();
+            self.artifact(Uuid::new_v4(), &name, "audit_report_v1", &path, &bytes)
+                .await;
+        }
+        let raw = serde_json::to_string(&snapshot).unwrap();
+        sqlx::query("UPDATE runs SET catalog_snapshot_json=?,catalog_snapshot_hash=? WHERE id=?")
+            .bind(&raw)
+            .bind(hex(&ContentDigest::of(raw.as_bytes())))
+            .bind(self.input.source_run_id.to_string())
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        self
+    }
+
     pub(crate) async fn with_rollout_seed(mut self) -> Self {
         let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let contract_path = "docs/evidence/rollout-contract/p039-rollout-contract.json";

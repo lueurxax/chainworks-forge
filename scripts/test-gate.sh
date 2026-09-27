@@ -2771,9 +2771,9 @@ case "$GATE" in
       cargo test --locked --offline -p domain --test proposal_039_contracts --test proposal_039_wire --test proposal_039_preview_hold
       cargo test --locked --offline -p workflow --test proposal_039_profile
       cargo test --locked --offline -p acp --lib adapters::p039_metadata_tests::
-      cargo test --locked --offline -p db --test proposal_039_migration_backup --test proposal_039_storage --test proposal_039_fence_coverage --test proposal_039_checked --test proposal_039_inputs --test proposal_039_approval_bindings --test proposal_039_atomicity --test proposal_039_metrics --test proposal_039_queue_progress
+      cargo test --locked --offline -p db --test proposal_039_migration_backup --test proposal_039_history_migration --test proposal_039_storage --test proposal_039_fence_coverage --test proposal_039_checked --test proposal_039_inputs --test proposal_039_approval_bindings --test proposal_039_atomicity --test proposal_039_metrics --test proposal_039_queue_progress
       cargo test --locked --offline -p db --lib operation_registry::
-      cargo test --locked --offline -p engine --test proposal_039_inventory --test proposal_039_materialize --test proposal_039_experiment --test proposal_039_preview --test proposal_039_worker --test proposal_039_finalize --test proposal_039_service --test proposal_039_fences --test proposal_039_readback --test proposal_039_runtime_inputs --test proposal_039_approval_runtime --test proposal_039_headless_admission --test proposal_039_launch --test proposal_039_policy
+      cargo test --locked --offline -p engine --test proposal_039_inventory --test proposal_039_materialize --test proposal_039_experiment --test proposal_039_preview --test proposal_039_worker --test proposal_039_finalize --test proposal_039_large_history --test proposal_039_service --test proposal_039_fences --test proposal_039_readback --test proposal_039_runtime_inputs --test proposal_039_approval_runtime --test proposal_039_headless_admission --test proposal_039_launch --test proposal_039_policy
       cargo test --locked --offline -p engine --lib run_carry_forward::
       cargo test --locked --offline -p engine --lib p039_
       cargo test --locked --offline -p engine --test agent_context_skills invoke_agent_producer_manifest_is_closed_and_each_guard_is_mutation_sensitive -- --exact
