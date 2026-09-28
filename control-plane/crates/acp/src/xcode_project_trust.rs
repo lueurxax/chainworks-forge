@@ -8,7 +8,7 @@ use crate::xcode_headless_runtime::HeadlessProjectTrust;
 use anyhow::{bail, ensure, Result};
 use chrono::{DateTime, Utc};
 use domain::{
-    execution_root::ResolvedExecutionRoot,
+    execution_root::{ExecutionRootKind, ResolvedExecutionRoot},
     xcode_contract as contract,
     xcode_effect::{validate_text, ProjectKey},
 };
@@ -21,7 +21,7 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::PathBuf;
 use uuid::Uuid;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TrustRecord {
     version: u32,
@@ -49,14 +49,20 @@ impl ProjectTrustStore {
         validate_project(project)?;
         validate_text("operator_id", operator_id, 256)?;
         let store = self.open(true)?;
-        let name = record_name(project)?;
+        let version = record_version(project);
+        let name = record_name(project, version)?;
         // An explicit grant may replace a valid grant, never repair a malformed
         // or insecure record. A new grant identity invalidates earlier bindings.
         if let Some(record) = store.read(&name)? {
-            validate_record(&record, project)?;
+            validate_record(&record, project.root(), project.key(), version)?;
+        }
+        if version == 2 {
+            // Explicit regrant can supersede valid historical decisions, but
+            // cannot silently repair a malformed or insecure legacy alias.
+            legacy_worktree_records(&store, project)?;
         }
         let record = TrustRecord {
-            version: 1,
+            version,
             grant_id: Uuid::new_v4(),
             operator_id: operator_id.to_owned(),
             granted_at: Utc::now(),
@@ -76,13 +82,33 @@ impl ProjectTrustStore {
         validate_project(project)?;
         validate_text("operator_id", operator_id, 256)?;
         let store = self.open_existing(true)?;
-        let name = record_name(project)?;
-        let mut record = store
-            .read(&name)?
+        let version = record_version(project);
+        let name = record_name(project, version)?;
+        let current = store.read(&name)?;
+        if let Some(record) = &current {
+            validate_record(record, project.root(), project.key(), version)?;
+        }
+        let legacy = if version == 2 {
+            legacy_worktree_records(&store, project)?
+        } else {
+            Vec::new()
+        };
+        let mut record = current
+            .or_else(|| legacy.first().map(|(_, record)| record.clone()))
             .ok_or_else(|| anyhow::anyhow!("project_trust_required"))?;
-        validate_record(&record, project)?;
+        let revoked_at = Utc::now();
+        validate_project(project)?;
+        // Revoke existing v1 slots first so a successful operation also denies
+        // old readers. Partial failure returns an error and never grants trust.
+        // The v2 tombstone is published last and prevents legacy resurrection.
+        for (name, mut legacy_record) in legacy {
+            legacy_record.revoked_by = Some(operator_id.to_owned());
+            legacy_record.revoked_at = Some(revoked_at);
+            store.write(&name, &legacy_record)?;
+        }
+        record.version = version;
         record.revoked_by = Some(operator_id.to_owned());
-        record.revoked_at = Some(Utc::now());
+        record.revoked_at = Some(revoked_at);
         store.write(&name, &record)
     }
 
@@ -133,10 +159,26 @@ impl HeadlessProjectTrust for ProjectTrustStore {
     async fn check(&self, project: &TrustedProject) -> Result<String> {
         validate_project(project)?;
         let store = self.open_existing(false)?;
-        let record = store
-            .read(&record_name(project)?)?
-            .ok_or_else(|| anyhow::anyhow!("project_trust_required"))?;
-        validate_record(&record, project)?;
+        let version = record_version(project);
+        let record = if let Some(record) = store.read(&record_name(project, version)?)? {
+            // A v2 record is authoritative, including revocation or corruption.
+            // Never use a legacy grant to bypass a current decision.
+            validate_record(&record, project.root(), project.key(), version)?;
+            record
+        } else if version == 2 {
+            let mut legacy = legacy_worktree_records(&store, project)?;
+            ensure!(
+                legacy.iter().all(|(_, record)| record.revoked_at.is_none()),
+                "project_trust_revoked"
+            );
+            ensure!(legacy.len() <= 1, "project_trust_ambiguous");
+            legacy
+                .pop()
+                .map(|(_, record)| record)
+                .ok_or_else(|| anyhow::anyhow!("project_trust_required"))?
+        } else {
+            bail!("project_trust_required");
+        };
         ensure!(record.revoked_at.is_none(), "project_trust_revoked");
         validate_project(project)?;
         record_digest(&record)
@@ -218,26 +260,87 @@ fn validate_project(project: &TrustedProject) -> Result<()> {
     project.revalidate()
 }
 
-fn record_name(project: &TrustedProject) -> Result<String> {
+fn shared_worktree_identity(root: &ResolvedExecutionRoot) -> bool {
+    root.kind == ExecutionRootKind::Worktree
+        && matches!(
+            root.strategy.as_deref(),
+            Some("dedicated" | "shared_implementation_worktree")
+        )
+}
+
+fn record_version(project: &TrustedProject) -> u32 {
+    if shared_worktree_identity(project.root()) {
+        2
+    } else {
+        1
+    }
+}
+
+fn record_name(project: &TrustedProject, version: u32) -> Result<String> {
+    if version == 1 {
+        return legacy_record_name(project.root(), project.key());
+    }
+    // Only this trust identity excludes routing strategy. Runtime/session
+    // bindings still retain and validate the complete frozen execution root.
+    let mut root = project.root().clone();
+    root.strategy = None;
     Ok(format!(
         "{}.json",
         contract::canonical_digest(
-            "cw.xcode.project-trust-key.v1",
-            &serde_json::json!({"root": project.root(), "project_key": project.key()})
+            "cw.xcode.project-trust-key.v2",
+            &serde_json::json!({"root": root, "project_key": project.key()})
         )?
     ))
 }
 
+fn legacy_record_name(root: &ResolvedExecutionRoot, project_key: &ProjectKey) -> Result<String> {
+    Ok(format!(
+        "{}.json",
+        contract::canonical_digest(
+            "cw.xcode.project-trust-key.v1",
+            &serde_json::json!({"root": root, "project_key": project_key})
+        )?
+    ))
+}
+
+fn legacy_worktree_records(
+    store: &LockedStore,
+    project: &TrustedProject,
+) -> Result<Vec<(String, TrustRecord)>> {
+    let mut records = Vec::new();
+    // The finite aliases are derived from the exact physical identity, never
+    // discovered by scanning grants or inherited from a repository/parent root.
+    for strategy in ["dedicated", "shared_implementation_worktree"] {
+        let mut root = project.root().clone();
+        root.strategy = Some(strategy.to_owned());
+        let name = legacy_record_name(&root, project.key())?;
+        if let Some(record) = store.read(&name)? {
+            validate_record(&record, &root, project.key(), 1)?;
+            records.push((name, record));
+        }
+    }
+    Ok(records)
+}
+
 fn record_digest(record: &TrustRecord) -> Result<String> {
     Ok(contract::canonical_digest(
-        "cw.xcode.project-trust.v1",
+        if record.version == 2 {
+            "cw.xcode.project-trust.v2"
+        } else {
+            "cw.xcode.project-trust.v1"
+        },
         &serde_json::to_value(record)?,
     )?)
 }
 
-fn validate_record(record: &TrustRecord, project: &TrustedProject) -> Result<()> {
+fn validate_record(
+    record: &TrustRecord,
+    root: &ResolvedExecutionRoot,
+    project_key: &ProjectKey,
+    version: u32,
+) -> Result<()> {
     ensure!(
-        record.version == 1 && !record.grant_id.is_nil(),
+        record.version == version && !record.grant_id.is_nil(),
         "project_trust_corrupt"
     );
     validate_text("operator_id", &record.operator_id, 256)?;
@@ -248,8 +351,18 @@ fn validate_record(record: &TrustRecord, project: &TrustedProject) -> Result<()>
         record.revoked_by.is_some() == record.revoked_at.is_some(),
         "project_trust_corrupt"
     );
-    if record.root != *project.root()
-        || record.project_key != *project.key()
+    let root_matches = if version == 2 {
+        let mut admitted = record.root.clone();
+        let mut requested = root.clone();
+        let supported = shared_worktree_identity(&admitted) && shared_worktree_identity(&requested);
+        admitted.strategy = None;
+        requested.strategy = None;
+        supported && admitted == requested
+    } else {
+        record.root == *root
+    };
+    if !root_matches
+        || record.project_key != *project_key
         || record.trust_policy_id != contract::TRUST_POLICY_ID
         || record.trust_policy_digest != contract::trust_policy_digest()?
     {

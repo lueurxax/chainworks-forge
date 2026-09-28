@@ -270,6 +270,7 @@ impl HeadlessRuntime {
                 let reason_code = match error.to_string().as_str() {
                     "project_trust_required" => "project_trust_required",
                     "project_trust_revoked" => "project_trust_revoked",
+                    "project_trust_ambiguous" => "project_trust_ambiguous",
                     _ => "project_trust_unavailable",
                 };
                 error.context(ProjectTrustAdmissionFailure {

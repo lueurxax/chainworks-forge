@@ -20,6 +20,10 @@ use uuid::Uuid;
 
 #[derive(Default)]
 struct Calls {
+    failure_phase: Option<&'static str>,
+    inspections: usize,
+    connect_io_error: Option<i32>,
+    connect_untrusted_error: bool,
     cold: bool,
     startup_error: bool,
     startup_installation_drift: bool,
@@ -50,6 +54,9 @@ impl HeadlessHostInspector for Apple {
     async fn prepare_service_startup(
         &self,
     ) -> Result<Option<acp::xcode_headless_host::HeadlessServiceStartupPlan>> {
+        if self.calls.lock().await.failure_phase == Some("service_startup_plan") {
+            return Err(fixture_phase_error("headless_status_unknown"));
+        }
         Ok(if self.calls.lock().await.cold {
             Some(
                 acp::xcode_headless_host::HeadlessServiceStartupPlan::from_fixture_snapshot(
@@ -71,6 +78,11 @@ impl HeadlessHostInspector for Apple {
         anyhow::ensure!(held == 1, "fixture_start_before_fence");
         let mut calls = self.calls.lock().await;
         calls.starts += 1;
+        if calls.failure_phase == Some("service_startup") {
+            return Err(fixture_phase_error(
+                "headless_service_launch_api_unavailable",
+            ));
+        }
         anyhow::ensure!(!calls.startup_error, "fixture_start_response_lost");
         calls.cold = false;
         if calls.startup_installation_drift {
@@ -81,6 +93,18 @@ impl HeadlessHostInspector for Apple {
     }
 
     async fn inspect(&self) -> Result<HostSnapshot> {
+        {
+            let mut calls = self.calls.lock().await;
+            calls.inspections += 1;
+            if matches!(
+                (calls.failure_phase, calls.inspections),
+                (Some("host_inspection"), 1)
+                    | (Some("pre_open_validation"), 2)
+                    | (Some("post_open_validation"), 3)
+            ) {
+                return Err(fixture_phase_error("headless_service_generation_changed"));
+            }
+        }
         anyhow::ensure!(!self.calls.lock().await.cold, "fixture_service_absent");
         if self.calls.lock().await.pause_inspection {
             self.sent.notify_one();
@@ -159,7 +183,258 @@ async fn cold_start_installation_drift_never_opens_on_another_service() {
 struct Peers(Arc<Apple>);
 struct Peer(Arc<Apple>);
 
+fn fixture_phase_error(code: &'static str) -> anyhow::Error {
+    anyhow::anyhow!("Authorization: Bearer fixture-secret /private/customer/project").context(code)
+}
+
+#[tokio::test]
+async fn preparation_failures_preserve_phase_without_raw_error_and_keep_unknown_holds() {
+    for (phase, reason, source_code) in [
+        (
+            "service_startup",
+            "unavailable",
+            "headless_service_launch_api_unavailable",
+        ),
+        (
+            "service_startup_plan",
+            "unavailable",
+            "headless_status_unknown",
+        ),
+        (
+            "host_inspection",
+            "host_changed",
+            "headless_service_generation_changed",
+        ),
+        ("peer_connect", "unavailable", "headless_bridge_missing"),
+        ("peer_initialize", "unavailable", "headless_bridge_eof"),
+        (
+            "pre_open_validation",
+            "host_changed",
+            "headless_service_generation_changed",
+        ),
+        ("workspace_open", "unavailable", "headless_bridge_eof"),
+        ("response_decode", "contract_violation", "invalid_result"),
+        (
+            "workspace_mapping",
+            "mapping_mismatch",
+            "headless_workspace_mapping_mismatch",
+        ),
+        (
+            "post_open_validation",
+            "host_changed",
+            "headless_service_generation_changed",
+        ),
+    ] {
+        let f = Fixture::new().await;
+        {
+            let mut calls = f.apple.calls.lock().await;
+            calls.cold = true;
+            calls.failure_phase = Some(phase);
+        }
+        let error = f
+            .controller
+            .prepare(f.project.clone(), f.request.clone(), f.journal.clone())
+            .await
+            .err()
+            .expect("injected phase must fail");
+        let diagnostic = format!("{error:#}");
+        let failure = error
+            .downcast_ref::<acp::xcode_headless::HeadlessPreparationFailure>()
+            .expect("phase diagnostics must remain typed for persisted execution evidence");
+        let serialized = serde_json::to_string(failure).unwrap();
+        assert_eq!(failure.reason.as_str(), reason, "{phase}");
+        assert_eq!(failure.source_code, Some(source_code), "{phase}");
+        assert!(
+            serialized.len() <= 512,
+            "unbounded diagnostic: {serialized}"
+        );
+        assert!(
+            diagnostic.contains(&format!("phase={phase}")),
+            "lost {phase}: {diagnostic}"
+        );
+        assert!(
+            !diagnostic.contains("fixture-secret"),
+            "raw cause leaked: {diagnostic}"
+        );
+        assert!(
+            !diagnostic.contains("/private/customer"),
+            "raw path leaked: {diagnostic}"
+        );
+        if phase == "service_startup_plan" {
+            assert_eq!(failure.effect_attempt_id, None);
+            assert!(f.states().await.is_empty());
+            assert_eq!(f.holds().await, 0);
+        } else {
+            let recorded_attempt: String =
+                sqlx::query_scalar("SELECT attempt_id FROM xcode_effect_attempts")
+                    .fetch_one(&f.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                failure.effect_attempt_id.unwrap().to_string(),
+                recorded_attempt
+            );
+            assert!(diagnostic.starts_with("headless_open_outcome_unknown"));
+            assert_eq!(f.states().await, ["unknown"], "{phase}");
+            assert_eq!(f.holds().await, 1, "{phase}");
+        }
+        f.close().await;
+    }
+}
+
+#[tokio::test]
+async fn preparation_diagnostics_keep_typed_io_metadata_and_discard_unrecognized_error_text() {
+    for io_error in [Some(libc::EACCES), None] {
+        let f = Fixture::new().await;
+        {
+            let mut calls = f.apple.calls.lock().await;
+            calls.connect_io_error = io_error;
+            calls.connect_untrusted_error = io_error.is_none();
+        }
+        let error = f
+            .controller
+            .prepare(f.project.clone(), f.request.clone(), f.journal.clone())
+            .await
+            .err()
+            .unwrap();
+        let failure = error
+            .downcast_ref::<acp::xcode_headless::HeadlessPreparationFailure>()
+            .unwrap();
+        assert_eq!(failure.phase.as_str(), "peer_connect");
+        if io_error.is_some() {
+            assert_eq!(failure.reason.as_str(), "io");
+            assert_eq!(failure.source_code, Some("headless_bridge_spawn_failed"));
+            assert_eq!(failure.io_error_kind, Some("permission_denied"));
+            assert_eq!(failure.raw_os_error, Some(libc::EACCES));
+        } else {
+            assert_eq!(failure.reason.as_str(), "unavailable");
+            assert_eq!(failure.source_code, None);
+            assert_eq!(failure.io_error_kind, None);
+            assert_eq!(failure.raw_os_error, None);
+        }
+        let serialized = serde_json::to_string(failure).unwrap();
+        assert!(serialized.len() <= 512);
+        assert!(!serialized.contains("fixture-secret"));
+        assert!(!format!("{error:#}").contains("fixture-secret"));
+        assert!(f.states().await.is_empty());
+        f.close().await;
+    }
+}
+
+#[tokio::test]
+async fn warm_preparation_failures_have_no_effect_attempt_and_do_not_dispatch() {
+    for phase in [
+        "host_inspection",
+        "peer_connect",
+        "peer_initialize",
+        "pre_open_validation",
+    ] {
+        let f = Fixture::new().await;
+        f.apple.calls.lock().await.failure_phase = Some(phase);
+        let error = f
+            .controller
+            .prepare(f.project.clone(), f.request.clone(), f.journal.clone())
+            .await
+            .err()
+            .unwrap();
+        let failure = error
+            .downcast_ref::<acp::xcode_headless::HeadlessPreparationFailure>()
+            .unwrap();
+        assert_eq!(failure.phase.as_str(), phase);
+        assert_eq!(failure.effect_attempt_id, None);
+        assert_eq!(f.apple.calls.lock().await.opens, 0);
+        assert!(f.states().await.is_empty());
+        assert_eq!(f.holds().await, 0);
+        f.close().await;
+    }
+}
+
 struct LostDispatchAck(Arc<dyn XcodeEffectJournal>);
+
+struct LostUnknownCompletion(Arc<dyn XcodeEffectJournal>, bool);
+
+#[async_trait::async_trait]
+impl XcodeEffectJournal for LostUnknownCompletion {
+    async fn prepare(&self, intent: &NormalizedIntent) -> XcodeJournalResult<StoredAttempt> {
+        self.0.prepare(intent).await
+    }
+    async fn dispatch(
+        &self,
+        nonce: Uuid,
+        digest: &str,
+        revision: i64,
+    ) -> XcodeJournalResult<XcodeDispatchDecision> {
+        self.0.dispatch(nonce, digest, revision).await
+    }
+    async fn complete(
+        &self,
+        attempt: AttemptRevision,
+        completion: &Completion,
+    ) -> XcodeJournalResult<StoredAttempt> {
+        if self.1 {
+            self.0.complete(attempt, completion).await?;
+        }
+        Err(XcodeJournalError::StorageUnavailable)
+    }
+    async fn cancel(
+        &self,
+        attempt: AttemptRevision,
+        outcome: &HistoricalResult,
+    ) -> XcodeJournalResult<StoredAttempt> {
+        self.0.cancel(attempt, outcome).await
+    }
+    async fn get(&self, attempt_id: Uuid) -> XcodeJournalResult<Option<StoredAttempt>> {
+        self.0.get(attempt_id).await
+    }
+}
+
+#[tokio::test]
+async fn unknown_settlement_failure_retains_original_phase_and_protects_the_project() {
+    for committed in [false, true] {
+        let f = Fixture::new().await;
+        {
+            let mut calls = f.apple.calls.lock().await;
+            calls.cold = true;
+            calls.failure_phase = Some("service_startup");
+        }
+        let journal = Arc::new(LostUnknownCompletion(f.journal.clone(), committed));
+        let error = f
+            .controller
+            .prepare(f.project.clone(), f.request.clone(), journal)
+            .await
+            .err()
+            .unwrap();
+        let failure = error
+            .downcast_ref::<acp::xcode_headless::HeadlessPreparationFailure>()
+            .expect("settlement failure must not discard original phase");
+        assert_eq!(failure.phase.as_str(), "service_startup");
+        assert_eq!(
+            failure.source_code,
+            Some("headless_service_launch_api_unavailable")
+        );
+        assert!(failure.effect_attempt_id.is_some());
+        assert_eq!(
+            error.downcast_ref::<XcodeJournalError>(),
+            Some(&XcodeJournalError::StorageUnavailable)
+        );
+        assert_eq!(
+            f.states().await,
+            [if committed { "unknown" } else { "dispatched" }]
+        );
+        assert_eq!(f.holds().await, 1);
+        let mut next = f.request.clone();
+        next.operation_key = Uuid::new_v4();
+        next.invocation_id = Uuid::new_v4();
+        assert!(f
+            .controller
+            .prepare(f.project.clone(), next, f.journal.clone())
+            .await
+            .is_err());
+        assert_eq!(f.apple.calls.lock().await.starts, 1);
+        assert_eq!(f.apple.calls.lock().await.opens, 0);
+        f.close().await;
+    }
+}
 
 #[async_trait::async_trait]
 impl XcodeEffectJournal for LostDispatchAck {
@@ -201,6 +476,17 @@ impl HeadlessPeerFactory for Peers {
         _host: &HostSnapshot,
         _deadline: tokio::time::Instant,
     ) -> Result<Box<dyn HeadlessPeer>> {
+        if let Some(code) = self.0.calls.lock().await.connect_io_error {
+            return Err(anyhow::Error::from(std::io::Error::from_raw_os_error(code))
+                .context("fixture-secret path=/private/customer/project")
+                .context("headless_bridge_spawn_failed"));
+        }
+        if self.0.calls.lock().await.connect_untrusted_error {
+            return Err(anyhow::anyhow!("fixture-secret".repeat(4096)));
+        }
+        if self.0.calls.lock().await.failure_phase == Some("peer_connect") {
+            return Err(fixture_phase_error("headless_bridge_missing"));
+        }
         Ok(Box::new(Peer(self.0.clone())))
     }
 }
@@ -208,6 +494,9 @@ impl HeadlessPeerFactory for Peers {
 #[async_trait::async_trait]
 impl HeadlessPeer for Peer {
     async fn initialize(&mut self) -> Result<()> {
+        if self.0.calls.lock().await.failure_phase == Some("peer_initialize") {
+            return Err(fixture_phase_error("headless_bridge_eof"));
+        }
         anyhow::ensure!(
             !self.0.calls.lock().await.schema_error,
             "fixture_schema_drift"
@@ -233,6 +522,18 @@ impl HeadlessPeer for Peer {
         self.0.sent.notify_one();
         if pause {
             self.0.resume.notified().await;
+        }
+        match self.0.calls.lock().await.failure_phase {
+            Some("workspace_open") => return Err(fixture_phase_error("headless_bridge_eof")),
+            Some("response_decode") => {
+                return Ok(json!({"isError":false,"structuredContent":{"secret":"fixture-secret"}}))
+            }
+            Some("workspace_mapping") => {
+                return Ok(json!({"isError":false,"structuredContent":{
+                    "workspaceIdentifier":"workspace-fixture", "workspacePath":"/"
+                }}))
+            }
+            _ => {}
         }
         anyhow::ensure!(!error, "fixture_response_lost");
         if !self.0.calls.lock().await.hide_opened {
@@ -946,13 +1247,26 @@ async fn cancelled_waiter_before_dispatch_sends_no_open() {
 async fn timeout_after_dispatch_is_unknown_and_shutdown_drains_the_driver() {
     let f = Fixture::new().await;
     f.apple.calls.lock().await.pause = true;
-    let mut request = f.request.clone();
-    request.timeout = Duration::from_millis(250);
-    assert!(f
-        .controller
-        .prepare(f.project.clone(), request, f.journal.clone())
+    let controller = f.controller.clone();
+    let project = f.project.clone();
+    let request = f.request.clone();
+    let journal = f.journal.clone();
+    let waiter = tokio::spawn(async move { controller.prepare(project, request, journal).await });
+    tokio::time::timeout(Duration::from_secs(10), f.apple.sent.notified())
         .await
-        .is_err());
+        .unwrap();
+    // Expire the preparation only once the fake open has crossed its durable
+    // fence. Wall-clock contention must not turn this into a pre-dispatch test.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(11)).await;
+    tokio::time::resume();
+    let error = waiter.await.unwrap().err().unwrap();
+    let failure = error
+        .downcast_ref::<acp::xcode_headless::HeadlessPreparationFailure>()
+        .unwrap();
+    assert_eq!(failure.phase.as_str(), "workspace_open");
+    assert_eq!(failure.reason.as_str(), "timeout");
+    assert!(failure.effect_attempt_id.is_some());
     f.controller.shutdown().await;
     assert_eq!(f.apple.calls.lock().await.opens, 1);
     assert_eq!(f.states().await, ["unknown"]);

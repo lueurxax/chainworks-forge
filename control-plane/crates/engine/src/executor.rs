@@ -5012,9 +5012,23 @@ fn runtime_facts_for_headless_preparation_error(
 ) -> AgentExecutionRuntimeFacts {
     let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, now);
     let trust = error.downcast_ref::<acp::xcode_headless_runtime::ProjectTrustAdmissionFailure>();
+    let preparation = error.downcast_ref::<acp::xcode_headless::HeadlessPreparationFailure>();
+    let held = matches!(
+        error.downcast_ref::<acp::xcode_coordinator::CoordinatorError>(),
+        Some(acp::xcode_coordinator::CoordinatorError::ProjectHeld)
+    ) || matches!(
+        error.downcast_ref::<acp::XcodeJournalError>(),
+        Some(acp::XcodeJournalError::ProjectHeld)
+    ) || matches!(
+        error.downcast_ref::<acp::xcode_headless_runtime::HeadlessRuntimeError>(),
+        Some(acp::xcode_headless_runtime::HeadlessRuntimeError::ProjectHeld)
+    );
+    // boundary-no-op: extends existing operator-only preflight evidence; no API capability or caller authorization changes.
     let message = error.to_string();
     let code = trust
         .map(|failure| failure.reason_code.as_str())
+        .or_else(|| preparation.map(|failure| failure.code()))
+        .or_else(|| held.then_some("headless_project_held"))
         .unwrap_or_else(|| {
             if !message.is_empty()
                 && message.len() <= 80
@@ -5030,14 +5044,29 @@ fn runtime_facts_for_headless_preparation_error(
     let review_trust = trust.is_some_and(|failure| {
         matches!(
             failure.reason_code.as_str(),
-            "project_trust_required" | "project_trust_revoked"
+            "project_trust_required" | "project_trust_revoked" | "project_trust_ambiguous"
         )
     });
-    let (disposition, recovery, operator_message) = if review_trust {
+    let reconcile_effect = preparation.is_some_and(|failure| failure.effect_attempt_id.is_some())
+        || matches!(
+            code,
+            "headless_open_outcome_unknown"
+                | "headless_outcome_unknown"
+                | "headless_project_held"
+                | "project_held"
+                | "xcode_effect_project_held"
+        );
+    let (disposition, recovery, operator_message) = if reconcile_effect {
+        (
+            "reconcile_headless_effect",
+            "evidence_backed_effect_reconciliation_then_stage_retry",
+            "Inspect the exact headless Xcode effect and its project hold in operator diagnostics. Reconcile the outcome using evidence accepted by the effect contract before explicitly retrying the failed stage. Preserve the hold and do not replay an unknown operation. The provider was not launched.",
+        )
+    } else if review_trust {
         (
             "review_exact_project_trust",
             "explicit_trust_decision_then_stage_retry",
-            "Review project trust for this run's exact execution root and Xcode project in the operator diagnostics. Use the authenticated xcode-admin trust-grant procedure only after an explicit operator decision and a valid trust store; then explicitly retry the failed stage. Provider permissions do not grant project trust.",
+            "Review project trust and any conflicting grants for this run's exact execution root and Xcode project in the operator diagnostics. Use the authenticated xcode-admin trust-grant procedure only after an explicit operator decision and a valid trust store; then explicitly retry the failed stage. Provider permissions do not grant project trust.",
         )
     } else {
         (
@@ -5059,6 +5088,7 @@ fn runtime_facts_for_headless_preparation_error(
         "schema_version": 1,
         "boundary": if trust.is_some() { "xcode_project_trust" } else { "xcode_headless_preparation" },
         "error_code": code,
+        "headless_preparation_failure": preparation,
         "root": trust.map(|failure| &failure.root),
         "project_key": trust.map(|failure| &failure.project_key),
         "project_selector": project_selector,
@@ -28353,6 +28383,63 @@ plain progress line without gate evidence";
             "/worktree/App.xcodeproj"
         );
         assert_eq!(details["automatic_retry_allowed"], false);
+    }
+
+    #[test]
+    fn xcode_headless_prelaunch_unknown_effect_requires_reconciliation_before_retry() {
+        for code in [
+            "headless_open_outcome_unknown",
+            "headless_outcome_unknown",
+            "headless_project_held",
+            "project_held",
+            "xcode_effect_project_held",
+        ] {
+            let facts = runtime_facts_for_headless_preparation_error(
+                domain::ids::AgentExecutionId::new(),
+                &anyhow::anyhow!(code),
+                None,
+                chrono::Utc::now(),
+            );
+            let details: serde_json::Value =
+                serde_json::from_str(facts.runtime_preflight_json.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                details["operator_disposition"], "reconcile_headless_effect",
+                "{code}"
+            );
+            assert_eq!(
+                details["recovery"],
+                "evidence_backed_effect_reconciliation_then_stage_retry"
+            );
+            assert_eq!(details["automatic_retry_allowed"], false);
+            assert_eq!(facts.runtime_preflight_provider_launched, Some(false));
+            assert_eq!(
+                crate::shadow_escalation::classify_trigger_from_runtime_facts(&facts),
+                None
+            );
+            assert!(!crate::orchestrator::provider_health_fallback_failure(
+                &facts
+            ));
+        }
+    }
+
+    #[test]
+    fn xcode_headless_prelaunch_typed_holds_require_reconciliation_through_context() {
+        for error in [
+            anyhow::Error::from(acp::xcode_coordinator::CoordinatorError::ProjectHeld),
+            anyhow::Error::from(acp::XcodeJournalError::ProjectHeld),
+            anyhow::Error::from(acp::xcode_headless_runtime::HeadlessRuntimeError::ProjectHeld),
+        ] {
+            let facts = runtime_facts_for_headless_preparation_error(
+                domain::ids::AgentExecutionId::new(),
+                &error.context("headless preparation could not acquire the project"),
+                None,
+                chrono::Utc::now(),
+            );
+            assert_eq!(
+                facts.runtime_preflight_remediation.as_deref(),
+                Some("reconcile_headless_effect")
+            );
+        }
     }
 
     #[test]

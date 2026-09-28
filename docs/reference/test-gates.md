@@ -1443,6 +1443,10 @@ granting permissions, opening projects, or running local UI tests:
   identity replacement and filesystem/lock validation; executor no-launch
   persistence and explicit fixture grant recovery; automatic retry exclusion,
   recovery disposition, and operator-only identity readback through GraphQL/MCP.
+  Includes the exact writer/reviewer worktree trust transition, legacy/v2
+  ambiguity and revocation rules, sanitized phase diagnostics before and after
+  dispatch, and preservation of unknown-effect holds with reconciliation-first
+  recovery.
 - `xcode-headless-host-startup`: opt-in one-shot startup policy and readiness
   fixtures; this is not live cold-start evidence.
 

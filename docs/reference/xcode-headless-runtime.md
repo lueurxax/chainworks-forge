@@ -380,6 +380,46 @@ Directories/files are private, owner-checked, and reject inappropriate links or
 modes. Runtime lookup never creates a missing store or grants trust implicitly.
 Root/project replacement, revocation, and policy drift require fresh admission.
 
+For a `worktree` root, `dedicated` (writer) and
+`shared_implementation_worktree` (reviewer) share one v2 trust identity when every
+other root field and the full project key match. The recorded root retains the
+grant's strategy for audit; frozen request matching and invocation capabilities
+still compare/evaluate their own full inputs. Repository roots and all other
+strategies retain exact v1 identities. This does not grant additional tools or
+cover another checkout, project, UID, device, inode, root version or policy.
+
+An existing v2 record is authoritative, including a revocation or invalid record;
+runtime never falls back from it to v1. Without v2, both exact legacy strategy
+slots are validated under the same lock. One active legacy grant is accepted
+with its original digest and without writes. Revocation, corruption or two active
+legacy grants fail closed (`project_trust_ambiguous` for two active grants).
+An explicit upgraded grant may resolve valid conflicting/revoked decisions; it
+cannot repair insecure or corrupt records. Upgraded revocation first revokes
+every existing legacy slot, then publishes the v2 tombstone, so successful
+revocation also denies old runtime readers.
+
+Deploy runtime and trust-administration code together. Once v2 exists, old
+administrators must not change trust: they cannot update v2 authority. Old
+runtime readers cannot consume a new v2-only grant. No automatic store migration
+or implicit trust grant occurs on upgrade.
+
+Headless preparation failures persist bounded `headless_preparation_failure`
+diagnostics in the existing operator runtime-preflight JSON: phase, reason,
+allowlisted source code, typed I/O kind/OS error, and an effect attempt ID after
+dispatch. Phases distinguish startup planning/startup, host inspection,
+connection, initialization, pre-open validation, opening, response decoding,
+workspace mapping and post-open validation. Raw upstream messages, payloads,
+paths and credentials are excluded. The phase identifies the failing boundary,
+not the underlying cause of a historical failure.
+
+After the dispatch fence, uncertainty retains the existing unknown effect and
+project hold. Recovery says `reconcile_xcode_effect_before_retry`; provider
+launch, automatic retry and provider fallback remain forbidden. Historical
+unknown/held error codes receive the same guidance, without backfilling missing
+phase evidence. If a caller disappears before error delivery, journal safety
+still holds but execution diagnostics may remain absent; this is not a crash
+diagnostic storage migration.
+
 ### Review, Grant, Then Retry
 
 1. Read the failed execution and persisted run through the existing operator

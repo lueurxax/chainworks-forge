@@ -45,15 +45,20 @@ use tokio::sync::Mutex;
 // stage advancement, or that incorrectly reach provider/Xcode launch boundaries.
 #[tokio::test]
 async fn missing_project_trust_blocks_before_launch_and_records_exact_operator_recovery() {
-    assert_trust_admission(false).await;
+    assert_trust_admission(false, false).await;
 }
 
 #[tokio::test]
 async fn cancellation_during_project_trust_check_retains_terminal_status_and_diagnostics() {
-    assert_trust_admission(true).await;
+    assert_trust_admission(true, false).await;
 }
 
-async fn assert_trust_admission(cancel_during_check: bool) {
+#[tokio::test]
+async fn headless_open_phase_is_persisted_with_held_effect_and_no_provider_retry() {
+    assert_trust_admission(false, true).await;
+}
+
+async fn assert_trust_admission(cancel_during_check: bool, fail_open: bool) {
     let dir = tempfile::tempdir().unwrap();
     let repository = dir.path().join("repository");
     let worktree = dir.path().join("worktree");
@@ -81,6 +86,10 @@ async fn assert_trust_admission(cancel_during_check: bool) {
         .unwrap();
 
     let host = Arc::new(FixtureHost::new());
+    if fail_open {
+        trust.grant(&project, "fixture-operator").unwrap();
+        host.fail_open.store(true, Ordering::SeqCst);
+    }
     let controller = Arc::new(HeadlessWorkspaceController::new(
         host.clone(),
         Arc::new(FixturePeers(host.clone())),
@@ -150,6 +159,93 @@ async fn assert_trust_admission(cancel_during_check: bool) {
         .process_next_item()
         .await
         .expect_err("untrusted project must reject invocation");
+    if fail_open {
+        let execution = agent_executions::find_by_stage(&pool, stage_id)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(execution.status, AgentStatus::Failed);
+        let facts = agent_execution_runtime_facts::find_by_execution_id(&pool, execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let details: Value =
+            serde_json::from_str(facts.runtime_preflight_json.as_deref().unwrap()).unwrap();
+        assert_eq!(details["error_code"], "headless_open_outcome_unknown");
+        assert_eq!(
+            details["headless_preparation_failure"]["phase"],
+            "workspace_open"
+        );
+        assert_eq!(details["headless_preparation_failure"]["reason"], "io");
+        assert_eq!(details["operator_disposition"], "reconcile_headless_effect");
+        assert_eq!(details["automatic_retry_allowed"], false);
+        assert_eq!(facts.runtime_preflight_provider_launched, Some(false));
+        assert_eq!(host.opens.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_prepare_calls.load(Ordering::SeqCst), 0);
+        let effect: (String, String) =
+            sqlx::query_as("SELECT attempt_id, state FROM xcode_effect_attempts")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(effect.1, "unknown");
+        assert_eq!(
+            details["headless_preparation_failure"]["effect_attempt_id"],
+            effect.0
+        );
+        let hold_count: i64 = sqlx::query_scalar("SELECT count(*) FROM xcode_project_holds")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(hold_count, 1);
+        for observed in [
+            format!("{error:#}"),
+            facts.runtime_preflight_json.unwrap(),
+            facts.failure_kind_raw_debug.unwrap_or_default(),
+            facts.failure_message_redacted.unwrap_or_default(),
+        ] {
+            assert!(
+                !observed.contains("fixture-secret"),
+                "raw upstream error leaked"
+            );
+        }
+        make_pending_items_due(&pool, run_id).await;
+        executor.process_next_item().await.unwrap();
+        let failed_stage = stages::find_by_id(&pool, stage_id).await.unwrap().unwrap();
+        assert_eq!(failed_stage.status, StageStatus::Failed);
+        let recovery: Value =
+            serde_json::from_str(failed_stage.recovery_snapshot_json.as_deref().unwrap()).unwrap();
+        assert_eq!(recovery["action"], "reconcile_xcode_effect_before_retry");
+        assert_eq!(
+            runs::find_by_id(&pool, run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RunStatus::Blocked
+        );
+        assert_eq!(
+            work_items::list_by_run(&pool, run_id)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|item| item.kind == WorkItemKind::InvokeAgent)
+                .count(),
+            1
+        );
+        assert_eq!(provider_prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM xcode_project_holds")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        drop((executor, runtime));
+        controller.shutdown().await;
+        writer.shutdown().await;
+        pool.close().await;
+        return;
+    }
     assert!(
         format!("{error:#}").contains("project_trust_required"),
         "{error:#}"
@@ -365,12 +461,31 @@ async fn assert_trust_admission(cancel_during_check: bool) {
     assert_eq!(admission.project_key, *project.key());
     trust.grant(&project, "fixture-operator").unwrap();
     let prepared = runtime
-        .prepare(input(), journal)
+        .prepare(input(), journal.clone())
         .await
         .expect("exact identity must pass after explicit fixture trust");
     assert_eq!(host.opens.load(Ordering::SeqCst), 1);
     assert_eq!(provider_prepare_calls.load(Ordering::SeqCst), 0);
     drop(prepared);
+
+    // A read-only reviewer reuses the writer's exact physical worktree and
+    // explicit project grant, while keeping its own frozen routing strategy.
+    let mut reviewer = input();
+    reviewer.root = resolve_execution_root(
+        &root.repository,
+        Some(&root.effective),
+        false,
+        Some("shared_implementation_worktree"),
+    )
+    .unwrap();
+    assert_ne!(reviewer.root.strategy, root.strategy);
+    let reviewed = runtime
+        .prepare(reviewer, journal)
+        .await
+        .expect("writer grant must admit the same worktree for a read-only reviewer");
+    assert_eq!(host.opens.load(Ordering::SeqCst), 1);
+    assert_eq!(provider_prepare_calls.load(Ordering::SeqCst), 0);
+    drop(reviewed);
 
     // Use the supported targeted stages.retry command after explicit trust. Its
     // new attempt must reach the adapter boundary; the probe intentionally stops
@@ -587,6 +702,7 @@ struct FixtureHost {
     snapshot: Mutex<HostSnapshot>,
     opens: AtomicUsize,
     inspections: AtomicUsize,
+    fail_open: std::sync::atomic::AtomicBool,
 }
 impl FixtureHost {
     fn new() -> Self {
@@ -611,6 +727,7 @@ impl FixtureHost {
             }),
             opens: AtomicUsize::new(0),
             inspections: AtomicUsize::new(0),
+            fail_open: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -640,6 +757,13 @@ impl HeadlessPeer for FixturePeer {
     }
     async fn open(&mut self, path: &str) -> Result<Value> {
         self.0.opens.fetch_add(1, Ordering::SeqCst);
+        if self.0.fail_open.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "fixture-secret upstream /private/path",
+            )
+            .into());
+        }
         self.0.snapshot.lock().await.open_projects.push(path.into());
         Ok(
             json!({"isError": false, "structuredContent": {"workspaceIdentifier": "workspace-fixture", "workspacePath": path}}),

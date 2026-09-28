@@ -48,6 +48,323 @@ impl Fixture {
             .find(|p| p.extension().is_some_and(|e| e == "json"))
             .unwrap()
     }
+
+    fn worktree_project(&self, strategy: &str) -> TrustedProject {
+        let checkout = self.root.join("checkout");
+        let tree = self.root.join("worktree");
+        fs::create_dir_all(tree.join("App.xcodeproj")).unwrap();
+        fs::write(tree.join("App.xcodeproj/project.pbxproj"), b"fixture").unwrap();
+        let root = resolve_execution_root(
+            checkout.to_str().unwrap(),
+            Some(tree.to_str().unwrap()),
+            true,
+            Some(strategy),
+        )
+        .unwrap();
+        TrustedProject::resolve(root, Some("App.xcodeproj"), self.project.key().uid).unwrap()
+    }
+
+    // Construct the shipped v1 format directly so compatibility tests do not
+    // accidentally test new-grant behavior instead of historical grant reads.
+    fn legacy_grant(&self, project: &TrustedProject, revoked: bool) -> (PathBuf, String) {
+        if !self.directory.exists() {
+            fs::create_dir(&self.directory).unwrap();
+            fs::set_permissions(&self.directory, fs::Permissions::from_mode(0o700)).unwrap();
+            let lock = self.directory.join("trust.lock");
+            fs::write(&lock, b"").unwrap();
+            fs::set_permissions(lock, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let record = serde_json::json!({
+            "version": 1,
+            "grant_id": uuid::Uuid::new_v4(),
+            "operator_id": "legacy-operator",
+            "granted_at": "2026-09-27T10:00:00Z",
+            "root": project.root(),
+            "project_key": project.key(),
+            "trust_policy_id": "trusted_local_project_v1",
+            "trust_policy_digest": domain::xcode_contract::trust_policy_digest().unwrap(),
+            "revoked_by": revoked.then_some("legacy-operator"),
+            "revoked_at": revoked.then_some("2026-09-27T11:00:00Z"),
+        });
+        let name = domain::xcode_contract::canonical_digest(
+            "cw.xcode.project-trust-key.v1",
+            &serde_json::json!({"root": project.root(), "project_key": project.key()}),
+        )
+        .unwrap();
+        let path = self.directory.join(format!("{name}.json"));
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let digest =
+            domain::xcode_contract::canonical_digest("cw.xcode.project-trust.v1", &record).unwrap();
+        (path, digest)
+    }
+
+    fn snapshot(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files = fs::read_dir(&self.directory)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    }
+}
+
+#[tokio::test]
+async fn legacy_worktree_grant_covers_writer_and_reader_without_changing_its_digest_or_files() {
+    for strategy in ["dedicated", "shared_implementation_worktree"] {
+        let f = Fixture::new();
+        let writer = f.worktree_project("dedicated");
+        let reader = f.worktree_project("shared_implementation_worktree");
+        let granted = f.worktree_project(strategy);
+        let (_, digest) = f.legacy_grant(&granted, false);
+        let before = f.snapshot();
+        assert_eq!(f.store().check(&writer).await.unwrap(), digest);
+        assert_eq!(f.store().check(&reader).await.unwrap(), digest);
+        assert_eq!(
+            f.snapshot(),
+            before,
+            "compatibility lookup must be read-only"
+        );
+    }
+}
+
+#[tokio::test]
+async fn new_worktree_grant_and_revoke_have_one_identity_across_writer_and_reader() {
+    let f = Fixture::new();
+    let writer = f.worktree_project("dedicated");
+    let reader = f.worktree_project("shared_implementation_worktree");
+    let digest = f.store().grant(&writer, "operator").unwrap();
+    assert_eq!(f.store().check(&reader).await.unwrap(), digest);
+    f.store().revoke(&reader, "operator").unwrap();
+    for project in [&writer, &reader] {
+        assert_eq!(
+            f.store().check(project).await.unwrap_err().to_string(),
+            "project_trust_revoked"
+        );
+    }
+    let renewed = f.store().grant(&reader, "operator").unwrap();
+    assert_ne!(renewed, digest);
+    assert_eq!(f.store().check(&writer).await.unwrap(), renewed);
+    assert_eq!(
+        fs::read_dir(&f.directory).unwrap().count(),
+        2,
+        "one record plus lock"
+    );
+}
+
+#[tokio::test]
+async fn independent_legacy_grants_require_explicit_regrant_instead_of_arbitrary_selection() {
+    let f = Fixture::new();
+    let writer = f.worktree_project("dedicated");
+    let reader = f.worktree_project("shared_implementation_worktree");
+    f.legacy_grant(&writer, false);
+    f.legacy_grant(&reader, false);
+    let before = f.snapshot();
+    for project in [&writer, &reader] {
+        assert_eq!(
+            f.store().check(project).await.unwrap_err().to_string(),
+            "project_trust_ambiguous"
+        );
+    }
+    assert_eq!(f.snapshot(), before);
+    let digest = f.store().grant(&reader, "operator").unwrap();
+    assert_eq!(f.store().check(&writer).await.unwrap(), digest);
+    assert_eq!(f.store().check(&reader).await.unwrap(), digest);
+    for (path, bytes) in before {
+        assert_eq!(
+            fs::read(path).unwrap(),
+            bytes,
+            "regrant does not rewrite history"
+        );
+    }
+}
+
+#[tokio::test]
+async fn either_legacy_revocation_blocks_both_strategies_until_explicit_regrant() {
+    for revoked_strategy in ["dedicated", "shared_implementation_worktree"] {
+        let f = Fixture::new();
+        let writer = f.worktree_project("dedicated");
+        let reader = f.worktree_project("shared_implementation_worktree");
+        f.legacy_grant(&writer, revoked_strategy == "dedicated");
+        f.legacy_grant(
+            &reader,
+            revoked_strategy == "shared_implementation_worktree",
+        );
+        let before = f.snapshot();
+        for project in [&writer, &reader] {
+            assert_eq!(
+                f.store().check(project).await.unwrap_err().to_string(),
+                "project_trust_revoked"
+            );
+        }
+        assert_eq!(f.snapshot(), before);
+        let digest = f.store().grant(&reader, "operator").unwrap();
+        assert_eq!(f.store().check(&writer).await.unwrap(), digest);
+    }
+}
+
+#[tokio::test]
+async fn legacy_alias_corruption_cannot_be_ignored_or_repaired_by_grant() {
+    for damaged_strategy in ["dedicated", "shared_implementation_worktree"] {
+        let f = Fixture::new();
+        let writer = f.worktree_project("dedicated");
+        let reader = f.worktree_project("shared_implementation_worktree");
+        let (writer_path, _) = f.legacy_grant(&writer, false);
+        let (reader_path, _) = f.legacy_grant(&reader, false);
+        let damaged = if damaged_strategy == "dedicated" {
+            writer_path
+        } else {
+            reader_path
+        };
+        fs::write(damaged, b"{broken").unwrap();
+        let before = f.snapshot();
+        for project in [&writer, &reader] {
+            assert!(f.store().check(project).await.is_err());
+            assert!(f.store().grant(project, "operator").is_err());
+            assert!(f.store().revoke(project, "operator").is_err());
+        }
+        assert_eq!(f.snapshot(), before);
+    }
+}
+
+#[tokio::test]
+async fn cross_strategy_revoke_revokes_legacy_files_before_publishing_shared_tombstone() {
+    for strategy in ["dedicated", "shared_implementation_worktree"] {
+        let f = Fixture::new();
+        let writer = f.worktree_project("dedicated");
+        let reader = f.worktree_project("shared_implementation_worktree");
+        let (writer_path, _) = f.legacy_grant(&writer, false);
+        let (reader_path, _) = f.legacy_grant(&reader, false);
+        let target = f.worktree_project(strategy);
+        f.store().revoke(&target, "revoking-operator").unwrap();
+        for project in [&writer, &reader] {
+            assert_eq!(
+                f.store().check(project).await.unwrap_err().to_string(),
+                "project_trust_revoked"
+            );
+        }
+        // A v1 binary reads only its original slot and checks revoked_at.
+        for path in [writer_path, reader_path] {
+            let record: serde_json::Value =
+                serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            assert_eq!(record["version"], 1);
+            assert_eq!(record["revoked_by"], "revoking-operator");
+            assert!(
+                record["revoked_at"].is_string(),
+                "old readers must also reject"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn authoritative_worktree_record_never_falls_back_to_an_active_legacy_grant() {
+    for corrupt in [false, true] {
+        let f = Fixture::new();
+        let writer = f.worktree_project("dedicated");
+        let reader = f.worktree_project("shared_implementation_worktree");
+        let (legacy_path, _) = f.legacy_grant(&writer, false);
+        let legacy_bytes = fs::read(&legacy_path).unwrap();
+        f.store().grant(&reader, "operator").unwrap();
+        if corrupt {
+            let current = f
+                .snapshot()
+                .into_iter()
+                .find(|(path, _)| {
+                    path != &legacy_path && path.extension().is_some_and(|ext| ext == "json")
+                })
+                .unwrap()
+                .0;
+            fs::write(current, b"{broken").unwrap();
+        } else {
+            f.store().revoke(&reader, "operator").unwrap();
+        }
+        // Simulate a stale v1 writer restoring the old active slot. The v2
+        // tombstone/corrupt record remains authoritative to upgraded readers.
+        fs::write(legacy_path, legacy_bytes).unwrap();
+        for project in [&writer, &reader] {
+            assert!(f.store().check(project).await.is_err());
+        }
+    }
+}
+
+#[tokio::test]
+async fn worktree_equivalence_does_not_cover_other_strategies_or_repository_roots() {
+    let f = Fixture::new();
+    let writer = f.worktree_project("dedicated");
+    f.store().grant(&writer, "operator").unwrap();
+    for strategy in ["meta_only", "unknown", ""] {
+        let other = f.worktree_project(strategy);
+        assert_eq!(other.key(), writer.key());
+        assert_eq!(
+            f.store().check(&other).await.unwrap_err().to_string(),
+            "project_trust_required"
+        );
+    }
+    let mut root = writer.root().clone();
+    root.strategy = None;
+    let legacy = TrustedProject::resolve(root, Some("App.xcodeproj"), writer.key().uid).unwrap();
+    assert!(f.store().check(&legacy).await.is_err());
+
+    let repository = f.root.join("checkout");
+    let mut root = resolve_execution_root(repository.to_str().unwrap(), None, false, None).unwrap();
+    root.strategy = Some("dedicated".into());
+    let repository_writer =
+        TrustedProject::resolve(root.clone(), Some("App.xcodeproj"), writer.key().uid).unwrap();
+    f.store().grant(&repository_writer, "operator").unwrap();
+    root.strategy = Some("shared_implementation_worktree".into());
+    let repository_reader =
+        TrustedProject::resolve(root, Some("App.xcodeproj"), writer.key().uid).unwrap();
+    assert!(f.store().check(&repository_reader).await.is_err());
+}
+
+#[tokio::test]
+async fn shared_worktree_identity_still_pins_repository_and_root_inode() {
+    let f = Fixture::new();
+    let writer = f.worktree_project("dedicated");
+    f.store().grant(&writer, "operator").unwrap();
+    let other_repository = f.root.join("other-repository");
+    fs::create_dir(&other_repository).unwrap();
+    let root = resolve_execution_root(
+        other_repository.to_str().unwrap(),
+        Some(&writer.root().effective),
+        false,
+        Some("shared_implementation_worktree"),
+    )
+    .unwrap();
+    let other = TrustedProject::resolve(root, Some("App.xcodeproj"), writer.key().uid).unwrap();
+    assert_eq!(other.key(), writer.key());
+    assert!(f.store().check(&other).await.is_err());
+
+    let tree = PathBuf::from(&writer.root().effective);
+    let saved = f.root.join("old-worktree");
+    fs::rename(&tree, &saved).unwrap();
+    fs::create_dir(&tree).unwrap();
+    fs::rename(saved.join("App.xcodeproj"), tree.join("App.xcodeproj")).unwrap();
+    let replaced = f.worktree_project("shared_implementation_worktree");
+    assert_eq!(replaced.key(), writer.key(), "project inode was retained");
+    assert_ne!(replaced.root().inode, writer.root().inode);
+    assert!(f.store().check(&replaced).await.is_err());
+}
+
+#[tokio::test]
+async fn revoking_a_single_legacy_alias_never_synthesizes_a_peer_legacy_grant() {
+    let f = Fixture::new();
+    let writer = f.worktree_project("dedicated");
+    let reader = f.worktree_project("shared_implementation_worktree");
+    f.legacy_grant(&writer, false);
+    f.store().revoke(&reader, "operator").unwrap();
+    assert_eq!(fs::read_dir(&f.directory).unwrap().count(), 3);
+    for project in [&writer, &reader] {
+        assert_eq!(
+            f.store().check(project).await.unwrap_err().to_string(),
+            "project_trust_revoked"
+        );
+    }
 }
 
 #[tokio::test]

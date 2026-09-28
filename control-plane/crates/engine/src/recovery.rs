@@ -585,18 +585,19 @@ fn recovery_action_from_runtime_facts(
         return ("retry_stage", "stage_settled_failed");
     };
     if crate::shadow_escalation::is_headless_prelaunch_failure(facts) {
-        return if facts.runtime_preflight_remediation.as_deref()
-            == Some("review_exact_project_trust")
-        {
-            (
+        return match facts.runtime_preflight_remediation.as_deref() {
+            Some("review_exact_project_trust") => (
                 "review_exact_project_trust_then_retry",
                 "xcode_project_trust_admission",
-            )
-        } else {
-            (
+            ),
+            Some("reconcile_headless_effect") => (
+                "reconcile_xcode_effect_before_retry",
+                "xcode_headless_effect_outcome_unknown",
+            ),
+            _ => (
                 "inspect_xcode_then_retry",
                 "xcode_headless_prelaunch_failed",
-            )
+            ),
         };
     }
     if matches!(

@@ -2819,6 +2819,7 @@ case "$GATE" in
       status=0
       cargo test --locked --offline -p acp --test xcode_project_trust || status=$?
       cargo test --locked --offline -p engine --test xcode_project_trust_admission || status=$?
+      cargo test --locked --offline -p engine --test xcode_headless_preparation || status=$?
       cargo test --locked --offline -p engine --lib prelaunch || status=$?
       cargo test --locked --offline -p graphql-server -p mcp-server --lib --no-fail-fast xcode_headless_preflight_readback || status=$?
       exit "$status"

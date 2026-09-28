@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::{bail, ensure, Result};
 use domain::{xcode_contract as contract, xcode_effect::*};
+use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::{
     sync::{oneshot, Mutex, Semaphore},
@@ -52,6 +53,279 @@ pub struct WorkspaceOpenRequest {
     pub permission_policy_digest: String,
     pub trust_policy_id: String,
     pub timeout: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadlessPreparationPhase {
+    ServiceStartupPlan,
+    ServiceStartup,
+    HostInspection,
+    PeerConnect,
+    PeerInitialize,
+    PreOpenValidation,
+    WorkspaceOpen,
+    ResponseDecode,
+    WorkspaceMapping,
+    PostOpenValidation,
+}
+
+impl HeadlessPreparationPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ServiceStartupPlan => "service_startup_plan",
+            Self::ServiceStartup => "service_startup",
+            Self::HostInspection => "host_inspection",
+            Self::PeerConnect => "peer_connect",
+            Self::PeerInitialize => "peer_initialize",
+            Self::PreOpenValidation => "pre_open_validation",
+            Self::WorkspaceOpen => "workspace_open",
+            Self::ResponseDecode => "response_decode",
+            Self::WorkspaceMapping => "workspace_mapping",
+            Self::PostOpenValidation => "post_open_validation",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadlessPreparationReason {
+    Timeout,
+    Cancelled,
+    Io,
+    ContractViolation,
+    HostChanged,
+    MappingMismatch,
+    Unavailable,
+}
+
+impl HeadlessPreparationReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+            Self::Io => "io",
+            Self::ContractViolation => "contract_violation",
+            Self::HostChanged => "host_changed",
+            Self::MappingMismatch => "mapping_mismatch",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Only fixed codes and typed OS metadata cross this boundary. In particular,
+/// upstream error strings, paths, responses and credentials are never retained.
+/// An attempt ID means the dispatch fence was crossed, not that Apple opened it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct HeadlessPreparationFailure {
+    pub phase: HeadlessPreparationPhase,
+    pub reason: HeadlessPreparationReason,
+    pub source_code: Option<&'static str>,
+    pub io_error_kind: Option<&'static str>,
+    pub raw_os_error: Option<i32>,
+    pub effect_attempt_id: Option<Uuid>,
+}
+
+impl HeadlessPreparationFailure {
+    fn from_error(
+        phase: HeadlessPreparationPhase,
+        error: &anyhow::Error,
+        effect_attempt_id: Option<Uuid>,
+    ) -> Self {
+        let contract_error = error.downcast_ref::<contract::ContractError>();
+        let io_error = error.downcast_ref::<std::io::Error>();
+        let source_code = error
+            .chain()
+            .find_map(|cause| vetted_source_code(&cause.to_string()))
+            .or_else(|| contract_error.map(|error| error.code()));
+        let reason = match source_code {
+            Some(
+                "headless_preparation_timeout"
+                | "headless_open_timeout"
+                | "headless_bridge_timeout"
+                | "headless_metadata_timeout",
+            ) => HeadlessPreparationReason::Timeout,
+            Some("headless_preparation_cancelled") => HeadlessPreparationReason::Cancelled,
+            Some(
+                "headless_workspace_mapping_mismatch"
+                | "headless_workspace_identifier_reassigned"
+                | "headless_workspace_stale",
+            ) => HeadlessPreparationReason::MappingMismatch,
+            Some(
+                "headless_host_uid_changed"
+                | "headless_service_generation_changed"
+                | "headless_startup_installation_changed"
+                | "headless_project_changed"
+                | "headless_installation_changed"
+                | "headless_process_changed",
+            ) => HeadlessPreparationReason::HostChanged,
+            _ if error
+                .downcast_ref::<tokio::time::error::Elapsed>()
+                .is_some() =>
+            {
+                HeadlessPreparationReason::Timeout
+            }
+            _ if io_error.is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut) => {
+                HeadlessPreparationReason::Timeout
+            }
+            _ if io_error.is_some() => HeadlessPreparationReason::Io,
+            _ if contract_error.is_some() => HeadlessPreparationReason::ContractViolation,
+            Some(
+                "headless_rpc_envelope"
+                | "headless_rpc_notification"
+                | "headless_upstream_rpc_error"
+                | "headless_status_shape"
+                | "headless_tool_list_shape"
+                | "headless_tool_list_size"
+                | "headless_tool_list_pages"
+                | "headless_cursor_shape"
+                | "headless_cursor_cycle"
+                | "headless_line_size"
+                | "headless_response_budget"
+                | "headless_notification_limit",
+            ) => HeadlessPreparationReason::ContractViolation,
+            _ => HeadlessPreparationReason::Unavailable,
+        };
+        Self {
+            phase,
+            reason,
+            source_code,
+            io_error_kind: io_error.map(|error| match error.kind() {
+                std::io::ErrorKind::NotFound => "not_found",
+                std::io::ErrorKind::PermissionDenied => "permission_denied",
+                std::io::ErrorKind::ConnectionRefused => "connection_refused",
+                std::io::ErrorKind::ConnectionReset => "connection_reset",
+                std::io::ErrorKind::ConnectionAborted => "connection_aborted",
+                std::io::ErrorKind::NotConnected => "not_connected",
+                std::io::ErrorKind::BrokenPipe => "broken_pipe",
+                std::io::ErrorKind::TimedOut => "timed_out",
+                std::io::ErrorKind::UnexpectedEof => "unexpected_eof",
+                std::io::ErrorKind::InvalidData => "invalid_data",
+                std::io::ErrorKind::Interrupted => "interrupted",
+                _ => "other",
+            }),
+            raw_os_error: io_error.and_then(std::io::Error::raw_os_error),
+            effect_attempt_id,
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        if self.effect_attempt_id.is_some() {
+            "headless_open_outcome_unknown"
+        } else {
+            "headless_preparation_failed"
+        }
+    }
+}
+
+impl std::fmt::Display for HeadlessPreparationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: phase={} reason={}",
+            self.code(),
+            self.phase.as_str(),
+            self.reason.as_str()
+        )?;
+        if let Some(code) = self.source_code {
+            write!(f, " source_code={code}")?;
+        }
+        if let Some(id) = self.effect_attempt_id {
+            write!(f, " effect_attempt_id={id}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for HeadlessPreparationFailure {}
+
+fn vetted_source_code(message: &str) -> Option<&'static str> {
+    const CODES: &[&str] = &[
+        "headless_preparation_timeout",
+        "headless_open_timeout",
+        "headless_preparation_cancelled",
+        "headless_host_uid_changed",
+        "headless_startup_installation_changed",
+        "headless_service_generation_changed",
+        "headless_workspace_mapping_mismatch",
+        "headless_workspace_identifier_reassigned",
+        "headless_workspace_stale",
+        "headless_mapping_capacity",
+        "headless_project_changed",
+        "headless_project_missing",
+        "headless_project_malformed",
+        "headless_service_startup_disabled",
+        "headless_service_startup_consumed",
+        "headless_service_startup_plan_mismatch_or_consumed",
+        "headless_service_startup_action_required",
+        "headless_service_startup_outcome_unknown",
+        "headless_service_startup_no_longer_absent",
+        "headless_service_startup_plan_changed",
+        "headless_service_launch_api_unavailable",
+        "headless_service_launch_string",
+        "headless_service_launch_url",
+        "headless_service_bundle_path",
+        "headless_service_bundle_redirected",
+        "headless_service_executable_changed",
+        "headless_service_not_background_only",
+        "headless_bridge_missing",
+        "headless_bridge_installation_mismatch",
+        "headless_bridge_spawn_failed",
+        "headless_bridge_stdin_missing",
+        "headless_bridge_stdout_missing",
+        "headless_bridge_timeout",
+        "headless_bridge_write_failed",
+        "headless_bridge_read_failed",
+        "headless_bridge_eof",
+        "headless_transport_stopped",
+        "headless_initialize_state",
+        "headless_tool_list_shape",
+        "headless_tool_list_size",
+        "headless_tool_list_pages",
+        "headless_cursor_shape",
+        "headless_cursor_cycle",
+        "headless_rpc_envelope",
+        "headless_rpc_notification",
+        "headless_upstream_rpc_error",
+        "headless_line_size",
+        "headless_response_budget",
+        "headless_notification_limit",
+        "headless_metadata_size",
+        "headless_metadata_spawn",
+        "headless_metadata_pid",
+        "headless_metadata_stdout",
+        "headless_metadata_stderr",
+        "headless_metadata_timeout",
+        "headless_metadata_command_path",
+        "headless_status_shape",
+        "headless_status_unknown",
+        "headless_status_command_identity",
+        "headless_status_workspace_limit",
+        "headless_status_workspace_shape",
+        "headless_status_workspace_path",
+        "headless_status_workspace_ambiguous",
+        "headless_host_unsupported",
+        "headless_host_action_required",
+        "headless_service_action_required",
+        "headless_service_ambiguous",
+        "headless_service_identity_unknown",
+        "headless_unsupported_installation",
+        "headless_elevated_identity",
+        "headless_account_unknown",
+        "headless_account_home",
+        "headless_darwin_tmpdir",
+        "headless_boot_identity_unknown",
+        "headless_process_unreadable",
+        "headless_process_changed",
+        "headless_process_inventory_unknown",
+        "headless_installation_metadata_unknown",
+        "headless_developer_unknown",
+        "headless_installation_changed",
+        "headless_service_bundle_identity",
+        "headless_service_executable",
+    ];
+    let code = message.split_once(':').map_or(message, |(code, _)| code);
+    CODES.iter().copied().find(|candidate| *candidate == code)
 }
 
 const MAX_PREPARATIONS: usize = 8;
@@ -351,6 +625,7 @@ impl Driver {
             .map_err(|_| anyhow::anyhow!("headless_preparation_timeout"))?;
         self.require_active()?;
         self.project.revalidate()?;
+        let mut phase = HeadlessPreparationPhase::ServiceStartupPlan;
         let service = timeout_at(self.deadline, async {
             if let Some(plan) = self.host.prepare_service_startup().await? {
                 ensure!(
@@ -362,18 +637,23 @@ impl Driver {
                 }
                 return Ok(ServicePreparation::Cold(plan));
             }
+            phase = HeadlessPreparationPhase::HostInspection;
             let snapshot = self.host.inspect().await?;
             ensure!(
                 snapshot.generation.uid == self.project.key().uid,
                 "headless_host_uid_changed"
             );
+            phase = HeadlessPreparationPhase::PeerConnect;
             let mut peer = self.peers.connect(&snapshot, self.binding_deadline).await?;
+            phase = HeadlessPreparationPhase::PeerInitialize;
             peer.initialize().await?;
+            phase = HeadlessPreparationPhase::PreOpenValidation;
             validate_current(&*self.host, &self.project, &snapshot, false).await?;
             Ok::<_, anyhow::Error>(ServicePreparation::Warm(snapshot, peer))
         })
         .await
-        .map_err(|_| anyhow::anyhow!("headless_preparation_timeout"))??;
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("headless_preparation_timeout")))
+        .map_err(|error| HeadlessPreparationFailure::from_error(phase, &error, None))?;
         self.require_active()?;
         let installation = match &service {
             ServicePreparation::Warm(snapshot, _) => &snapshot.generation,
@@ -505,14 +785,17 @@ impl Driver {
             XcodeDispatchDecision::Dispatch(attempt) => attempt,
             XcodeDispatchDecision::Existing(_) => bail!("headless_open_already_recorded"),
         };
+        phase = HeadlessPreparationPhase::PreOpenValidation;
         let opened = timeout_at(self.deadline, async {
             self.require_active()?;
             let (snapshot, mut peer) = match service {
                 ServicePreparation::Warm(snapshot, peer) => (snapshot, peer),
                 ServicePreparation::Cold(plan) => {
                     let installation = plan.installation.clone();
+                    phase = HeadlessPreparationPhase::ServiceStartup;
                     self.host.start_service_after_fence(plan).await?;
                     self.require_active()?;
+                    phase = HeadlessPreparationPhase::HostInspection;
                     let snapshot = self.host.inspect().await?;
                     ensure!(
                         snapshot.generation.uid == self.project.key().uid,
@@ -526,7 +809,9 @@ impl Driver {
                         observed_installation == installation,
                         "headless_startup_installation_changed"
                     );
+                    phase = HeadlessPreparationPhase::PeerConnect;
                     let mut peer = self.peers.connect(&snapshot, self.binding_deadline).await?;
+                    phase = HeadlessPreparationPhase::PeerInitialize;
                     peer.initialize().await?;
                     (snapshot, peer)
                 }
@@ -535,10 +820,14 @@ impl Driver {
                 "cw.xcode.binding.v1",
                 &serde_json::to_value(&snapshot.generation)?,
             )?;
+            phase = HeadlessPreparationPhase::PreOpenValidation;
             validate_current(&*self.host, &self.project, &snapshot, false).await?;
             self.require_active()?;
+            phase = HeadlessPreparationPhase::WorkspaceOpen;
             let response = peer.open(&self.project.key().canonical_path).await?;
+            phase = HeadlessPreparationPhase::ResponseDecode;
             let opened = contract::decode_open(&response)?;
+            phase = HeadlessPreparationPhase::WorkspaceMapping;
             self.project.revalidate()?;
             ensure!(
                 Path::new(&opened.workspace_path).is_absolute(),
@@ -549,7 +838,9 @@ impl Driver {
                     == Path::new(&self.project.key().canonical_path),
                 "headless_workspace_mapping_mismatch"
             );
+            phase = HeadlessPreparationPhase::PostOpenValidation;
             validate_current(&*self.host, &self.project, &snapshot, true).await?;
+            phase = HeadlessPreparationPhase::WorkspaceMapping;
             let mut mappings = self.mappings.lock().await;
             mappings.retain(|(existing, _), mapping| {
                 if existing != &generation {
@@ -586,7 +877,12 @@ impl Driver {
         .unwrap_or_else(|_| Err(anyhow::anyhow!("headless_open_timeout")));
         let (opened, mapping_valid, snapshot, peer) = match opened {
             Ok(opened) => opened,
-            Err(_) => {
+            Err(error) => {
+                let failure = HeadlessPreparationFailure::from_error(
+                    phase,
+                    &error,
+                    Some(dispatched.attempt_id),
+                );
                 // Once an open may have reached Apple, an uncertain response can
                 // conceal reassignment of any observed identifier in this service.
                 for ((existing, _), mapping) in self.mappings.lock().await.iter() {
@@ -607,8 +903,10 @@ impl Driver {
                         .complete(revision(&dispatched), &Completion::Unknown { reason }),
                 )
                 .await
-                .map_err(|_| anyhow::anyhow!("headless_journal_timeout"))??;
-                bail!("headless_open_outcome_unknown");
+                .map_err(|_| anyhow::anyhow!("headless_journal_timeout"))
+                .and_then(|result| result.map_err(anyhow::Error::from))
+                .map_err(|error| error.context(failure.clone()))?;
+                return Err(failure.into());
             }
         };
         dispatch_revocations.push(RevokeOnDrop(Some(mapping_valid.clone())));
