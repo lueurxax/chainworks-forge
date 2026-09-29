@@ -12157,6 +12157,28 @@ impl BackgroundExecutor {
             WorkItemKind::InvokeAgent => {
                 let mut payload: serde_json::Value = serde_json::from_str(&item.payload_json)?;
                 let run_id = self.extract_run_id(&item)?;
+                let preclaimed_start = payload
+                    .get("p058_claimed")
+                    .map(|claimed| claimed_invoke_agent_start_from_payload(&item, claimed))
+                    .transpose()?;
+
+                if let Some(claimed) = preclaimed_start.as_ref() {
+                    let execution =
+                        agent_executions::find_by_id(&self.pool, claimed.agent_execution_id)
+                            .await?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("preclaimed agent execution is missing")
+                            })?;
+                    if execution.status != AgentStatus::Running {
+                        // boundary-no-op: terminal replay retains existing authorization and completion proof checks.
+                        // A persistence retry may retain a terminal preclaim. Only
+                        // finish queue settlement: complete_attempt still requires
+                        // same-owner, valid-output proof, otherwise fail_attempt
+                        // preserves the failure and schedules stage settlement.
+                        // Never re-enter session policy or the provider for it.
+                        return Ok(());
+                    }
+                }
 
                 let stage_id = payload["stage_id"]
                     .as_str()
@@ -12359,10 +12381,6 @@ impl BackgroundExecutor {
                     crate::mcp::xcode_broker_contract_hash(&mcp_resolution.payloads);
                 let resolved_model = model.clone().unwrap_or_else(|| "default".into());
                 let now = chrono::Utc::now();
-                let preclaimed_start = payload
-                    .get("p058_claimed")
-                    .map(|claimed| claimed_invoke_agent_start_from_payload(&item, claimed))
-                    .transpose()?;
                 let agent_exec_id = preclaimed_start
                     .as_ref()
                     .map(|claimed| claimed.agent_execution_id)
@@ -12689,11 +12707,13 @@ impl BackgroundExecutor {
                     )
                     .await?;
 
-                    let mut facts =
-                        domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, now);
-                    facts.session_reuse_reason =
-                        Some(session_reuse_reason_for_policy_decision(decision));
-                    agent_execution_runtime_facts::upsert(&self.pool, &facts).await?;
+                    agent_execution_runtime_facts::update_session_reuse_reason(
+                        &self.pool,
+                        agent_exec_id,
+                        &session_reuse_reason_for_policy_decision(decision),
+                        now,
+                    )
+                    .await?;
                 }
                 if let Some(decision) = policy_decision.as_ref() {
                     self.persist_session_checkpoint_artifact_if_needed(
@@ -12869,11 +12889,13 @@ impl BackgroundExecutor {
                     )
                     .await?;
 
-                    let mut facts =
-                        domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, now);
-                    facts.session_reuse_reason =
-                        Some(session_reuse_reason_for_policy_decision(decision));
-                    agent_execution_runtime_facts::upsert(&self.pool, &facts).await?;
+                    agent_execution_runtime_facts::update_session_reuse_reason(
+                        &self.pool,
+                        agent_exec_id,
+                        &session_reuse_reason_for_policy_decision(decision),
+                        now,
+                    )
+                    .await?;
                 }
 
                 if !mcp_resolution.report.blocking_issues.is_empty() {

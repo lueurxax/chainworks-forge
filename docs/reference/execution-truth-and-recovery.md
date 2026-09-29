@@ -419,6 +419,21 @@ the provider reset window or explicitly consumed normal retry budget early. Stag
 retry handling must consult this ledger before resetting execution state so operators
 cannot accidentally hide quota exhaustion as an ordinary retry.
 
+A persistence-contention requeue may retain a terminal `p058_claimed` execution.
+The executor processes that replay only through existing queue completion checks;
+it does not reopen a provider session or overwrite the execution's runtime facts.
+Completion still requires same-owner valid-output evidence. A failed attempt
+without that evidence follows normal work-item failure and stage settlement.
+Session-reuse metadata updates change only the reuse reason, preserving failure,
+quota, and output-settlement evidence.
+
+Historical records whose failure facts were already cleared remain excluded from
+automatic quota retry. An operator can request an ordinary stage retry after
+independently verifying the original provider receipt's reset time and the normal
+run/stage safety prerequisites. This creates a fresh attempt without reconstructing
+the historical facts; an elapsed fallback ledger timestamp alone is not evidence
+that the provider's actual reset has occurred.
+
 Recovery snapshots should prefer runtime facts when selecting the next action:
 
 - `provider_quota` -> wait for `retry_after` or explicitly consume budget,

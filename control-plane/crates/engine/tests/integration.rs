@@ -5182,6 +5182,276 @@ async fn test_override_legacy_discovery_policy_rolls_back_journal_on_duplicate_f
     assert_eq!(override_count, 1);
 }
 
+async fn assert_terminal_quota_preclaim_replay(valid_outputs: bool, same_owner: bool) {
+    let pool = test_pool().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_id = StageExecutionId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some("implementation".into());
+    run.workspace_root = tmp.path().to_string_lossy().into_owned();
+    run.artifact_root = run.workspace_root.clone();
+    runs::insert(&pool, &run).await.unwrap();
+    let mut stage = make_stage(stage_id, run_id, StageStatus::Running);
+    stage.stage_id = "implementation".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let queue = WorkQueue::new(pool.clone());
+    queue.enqueue(WorkItemKind::InvokeAgent, Some(run_id), Some("implementation".into()),
+        serde_json::json!({
+            "run_id": run_id.to_string(), "stage_execution_id": stage_id.to_string(),
+            "stage_id": "implementation", "agent_id": "proposal_writer", "provider": "claude",
+            "model": "sonnet", "prompt": "write proposal", "task_name": "proposal",
+            "session_reuse_scope": "same_agent_family_within_run", "session_family_id": "proposal_writer",
+            "declared_outputs": [], "requested_mcp_server_ids": [], "worktree_write_enabled": false
+        })).await.unwrap();
+    sqlx::query("UPDATE work_items SET scheduled_at = ?1 WHERE run_id = ?2")
+        .bind((Utc::now() - chrono::Duration::seconds(2)).to_rfc3339())
+        .bind(run_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+    let failed_at = Utc::now() - chrono::Duration::minutes(31);
+    let retry_after = failed_at + chrono::Duration::minutes(30);
+    agent_executions::update_completed(
+        &pool,
+        claimed.agent_execution_id,
+        AgentStatus::Failed,
+        failed_at,
+    )
+    .await
+    .unwrap();
+    let ledger = agent_retry_budget_ledger::upsert_quota_failure(
+        &pool,
+        run_id,
+        stage_id,
+        claimed.agent_execution_id,
+        Some(retry_after),
+    )
+    .await
+    .unwrap();
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(claimed.agent_execution_id, failed_at);
+    facts.failure_kind = Some(AgentFailureKind::ProviderQuota);
+    facts.retry_after = Some(retry_after);
+    facts.failure_message_redacted = Some("Provider session limit reached".into());
+    facts.operator_action_hint = Some(OperatorActionHint::WaitUntilRetryAfter);
+    facts.quota_ledger_id = Some(ledger.id.clone());
+    if valid_outputs {
+        facts.output_settlement = AgentOutputSettlement::ValidOutputsFromFailedExecution;
+        facts.valid_required_outputs = true;
+    }
+    agent_execution_runtime_facts::upsert(&pool, &facts)
+        .await
+        .unwrap();
+    // A persistence retry retains the original preclaim after terminal settlement.
+    assert!(
+        work_items::requeue_attempt_after_transient_persistence_contention(
+            &pool,
+            &claimed.work_item_id,
+            failed_at,
+            "database is locked",
+            Some(claimed.agent_execution_id)
+        )
+        .await
+        .unwrap()
+    );
+    if !same_owner {
+        sqlx::query("UPDATE artifact_source_generation_claims SET source_work_item_id = 'foreign-item' WHERE agent_execution_id = ?1")
+            .bind(claimed.agent_execution_id.to_string()).execute(&pool).await.unwrap();
+    }
+    let generations_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_generations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        queue.clone(),
+    ));
+    // No external provider can run; the regression is in executor session bookkeeping.
+    let executor = engine::executor::BackgroundExecutor::new(
+        pool.clone(),
+        queue,
+        orchestrator,
+        Arc::new(acp::AcpRuntimeManager::new_with_adapters(vec![])),
+        events,
+    );
+    let result = executor.process_next_item().await;
+    let expected_status = if valid_outputs && same_owner {
+        assert!(
+            result.is_ok(),
+            "verified terminal outputs must settle without provider replay: {result:?}"
+        );
+        WorkItemStatus::Completed
+    } else {
+        assert!(
+            result
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("do not prove the same run owner with valid required outputs"),
+            "strict completion must reject unproven output: {result:?}"
+        );
+        WorkItemStatus::Failed
+    };
+    assert_eq!(
+        work_items::find_by_id(&pool, &claimed.work_item_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        expected_status
+    );
+    let generations_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_generations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        generations_after, generations_before,
+        "terminal replay must not create a provider session generation"
+    );
+    let after =
+        agent_execution_runtime_facts::find_by_execution_id(&pool, claimed.agent_execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        after.failure_kind,
+        Some(AgentFailureKind::ProviderQuota),
+        "terminal quota evidence was erased: {result:?}"
+    );
+    assert_eq!(after.retry_after, Some(retry_after));
+    assert_eq!(
+        after.failure_message_redacted,
+        facts.failure_message_redacted
+    );
+    assert_eq!(after.operator_action_hint, facts.operator_action_hint);
+    assert_eq!(after.quota_ledger_id, Some(ledger.id));
+    assert_eq!(
+        agent_executions::find_by_stage(&pool, stage_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn quota_ledger_terminal_preclaim_replay_preserves_failure_evidence() {
+    assert_terminal_quota_preclaim_replay(false, true).await;
+}
+
+#[tokio::test]
+async fn quota_ledger_terminal_preclaim_replay_settles_verified_failed_outputs() {
+    assert_terminal_quota_preclaim_replay(true, true).await;
+}
+
+#[tokio::test]
+async fn quota_ledger_terminal_preclaim_replay_rejects_foreign_output_claim() {
+    assert_terminal_quota_preclaim_replay(true, false).await;
+}
+
+#[tokio::test]
+async fn quota_ledger_missing_facts_requires_explicit_retry_after_verified_reset() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_id = StageExecutionId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("proposal_refined".into());
+    runs::insert(&pool, &run).await.unwrap();
+    let mut stage = make_stage(stage_id, run_id, StageStatus::Failed);
+    stage.stage_id = "proposal_refined".into();
+    stage.completed_at = Some(Utc::now() - chrono::Duration::minutes(2));
+    stages::insert(&pool, &stage).await.unwrap();
+    let mut agent = make_agent_execution(stage_id, AgentStatus::Failed);
+    agent.agent_id = "proposal_writer".into();
+    agent.completed_at = stage.completed_at;
+    agent_executions::insert(&pool, &agent).await.unwrap();
+    // The operator has verified the original receipt deadline is in the past.
+    let reset = Utc::now() - chrono::Duration::minutes(1);
+    let ledger = agent_retry_budget_ledger::upsert_quota_failure(
+        &pool,
+        run_id,
+        stage_id,
+        agent.id,
+        Some(reset),
+    )
+    .await
+    .unwrap();
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent.id, Utc::now());
+    facts.quota_ledger_id = Some(ledger.id.clone());
+    agent_execution_runtime_facts::upsert(&pool, &facts)
+        .await
+        .unwrap();
+    let handler = make_command_handler(pool.clone());
+    assert_eq!(
+        handler
+            .auto_resume_elapsed_quota_ledgers(Utc::now())
+            .await
+            .unwrap(),
+        0,
+        "NULL facts must not be treated as proof of quota failure for automatic retry"
+    );
+    handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "proposal_refined".into(),
+                consume_quota_budget_now: false,
+                agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+    let stages_after = stages::list_by_run(&pool, run_id).await.unwrap();
+    assert_eq!(stages_after.len(), 2);
+    let target = stages_after
+        .iter()
+        .find(|stage| stage.attempt_number == 2)
+        .unwrap();
+    assert_eq!(target.status, StageStatus::Pending);
+    let authority = retry_stage_execution_authorities::find_active_by_run_stage(
+        &pool,
+        run_id,
+        "proposal_refined",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(authority.target_stage_execution_id, target.id);
+    let after = agent_execution_runtime_facts::find_by_execution_id(&pool, agent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.failure_kind, None,
+        "normal retry must not fabricate historical facts"
+    );
+    assert_eq!(after.retry_after, None);
+    assert_eq!(after.quota_ledger_id, Some(ledger.id.clone()));
+    let mut tx = pool.begin().await.unwrap();
+    let ledger_after = agent_retry_budget_ledger::find_by_id_tx(&mut tx, &ledger.id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(ledger_after.state, "reset_elapsed");
+    assert!(!ledger_after.normal_budget_consumed);
+}
+
 #[tokio::test]
 async fn quota_ledger_elapsed_auto_resume_schedules_stage_retry_once() {
     let pool = test_pool().await;
