@@ -2135,6 +2135,7 @@ agents:
     requires_xcode_host_execution: true
     inputs:
       - approved_proposal
+      - proposal_revision_summary
       - implementation_progress
       - changed_files_manifest
       - tests_result

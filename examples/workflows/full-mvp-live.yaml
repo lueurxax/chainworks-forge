@@ -249,7 +249,9 @@ states:
           task: check_implementation_security
           inputs:
             - approved_proposal
+            - implementation_progress
             - changed_files_manifest
+            - tests_result
           outputs:
             - security_report
         - agent: docs_guardian
@@ -265,6 +267,7 @@ states:
           task: audit_implementation_against_proposal
           inputs:
             - approved_proposal
+            - proposal_revision_summary
             - implementation_progress
             - changed_files_manifest
             - tests_result
@@ -275,7 +278,9 @@ states:
           task: prepush_review
           inputs:
             - approved_proposal
+            - implementation_progress
             - changed_files_manifest
+            - tests_result
             - audit_report
             - security_report
           outputs:

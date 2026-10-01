@@ -10,7 +10,9 @@
   "task_body": "## Pre-Push Assignment\nThe audit_report is invalid and security_report contains an unresolved blocking finding. Apply the frozen final-review contract.",
   "expected_inputs": [
     "approved_proposal",
+    "implementation_progress",
     "changed_files_manifest",
+    "tests_result",
     "audit_report",
     "security_report"
   ],
@@ -31,7 +33,7 @@
     "next_phase_consumer",
     "no_direct_git",
     "no_release_authority",
-    "no_undeclared_test_evidence",
+    "declared_test_evidence_available",
     "operator_objective",
     "output_contract",
     "permission_profile",
@@ -79,8 +81,8 @@
       "input": "approved_proposal"
     },
     {
-      "kind": "task_input_add",
-      "claim_id": "no_undeclared_test_evidence",
+      "kind": "task_input_remove",
+      "claim_id": "declared_test_evidence_available",
       "input": "tests_result"
     },
     {

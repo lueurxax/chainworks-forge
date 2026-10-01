@@ -992,7 +992,12 @@ fn active_review_tasks_cover_conditional_test_evidence_branches() {
         Case {
             workflow: "full-mvp-live.yaml",
             task: "check_implementation_security",
-            inputs: &["approved_proposal", "changed_files_manifest"],
+            inputs: &[
+                "approved_proposal",
+                "implementation_progress",
+                "changed_files_manifest",
+                "tests_result",
+            ],
             output: "security_report",
             contract: "security_report_v1",
             consumer_task: "audit_implementation_against_proposal",
@@ -1003,7 +1008,9 @@ fn active_review_tasks_cover_conditional_test_evidence_branches() {
             task: "prepush_review",
             inputs: &[
                 "approved_proposal",
+                "implementation_progress",
                 "changed_files_manifest",
+                "tests_result",
                 "audit_report",
                 "security_report",
             ],
@@ -1140,6 +1147,19 @@ fn active_review_tasks_cover_conditional_test_evidence_branches() {
             "{} test-evidence mutation must fail its branch claim",
             fixture.case_id
         );
+        if case.inputs.contains(&"tests_result") {
+            let mut undeclared_fixture = fixture;
+            undeclared_fixture
+                .expected_inputs
+                .retain(|input| input != "tests_result");
+            let undeclared = score_active_review_case(
+                &undeclared_fixture,
+                &mutated_task,
+                &mutated_prompt,
+                &mutated_mission,
+            );
+            assert!(undeclared.contains("no_undeclared_test_evidence"));
+        }
     }
 }
 

@@ -463,11 +463,31 @@ fn security_and_prepush_migration_preserves_complete_before_state() {
         .unwrap(),
     )
     .unwrap();
-    let expected = expected_review_skill_surface_after_headless_gate_routing(
+    let mut expected = expected_review_skill_surface_after_headless_gate_routing(
         expected_review_skill_surface_after_model_refresh(
             expected_review_skill_surface_after_migration(before),
         ),
     );
+    // Record the reviewed full-MVP evidence expansion while preserving the
+    // historical fixture and every other provider, permission and task field.
+    expected["workflow_tasks"]
+        ["full-mvp-live.yaml:state_9_implementation_reviewed:check_implementation_security"]
+        ["inputs"] = serde_json::json!([
+        "approved_proposal",
+        "implementation_progress",
+        "changed_files_manifest",
+        "tests_result",
+    ]);
+    expected["workflow_tasks"]
+        ["full-mvp-live.yaml:state_9_implementation_reviewed:prepush_review"]["inputs"] =
+        serde_json::json!([
+            "approved_proposal",
+            "implementation_progress",
+            "changed_files_manifest",
+            "tests_result",
+            "audit_report",
+            "security_report",
+        ]);
     let actual = current_review_skill_surface(&root);
 
     assert_review_surface_matches(&expected, &actual).unwrap();
