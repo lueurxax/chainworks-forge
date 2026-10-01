@@ -122,6 +122,7 @@ pub struct XcodeMcpBridgePool {
     backend: Option<Arc<dyn XcodeMcpBackend>>,
     observation_persistence_failures: AtomicU64,
     headless_runtime: Option<Arc<HeadlessRuntime>>,
+    journal_authority_failure: Option<crate::xcode_coordinator::CoordinatorError>,
 }
 
 struct HeadlessMcpBackend(Arc<HeadlessRuntime>);
@@ -697,7 +698,22 @@ impl XcodeMcpBridgePool {
             backend,
             observation_persistence_failures: AtomicU64::new(0),
             headless_runtime: None,
+            journal_authority_failure: None,
         }
+    }
+
+    /// A startup authority error is an admission hold, not an environment flag.
+    /// Keep the bounded typed cause; never retain raw database paths or I/O text.
+    pub fn with_journal_authority_failure(
+        mut self,
+        reason: crate::xcode_coordinator::CoordinatorError,
+    ) -> Self {
+        self.journal_authority_failure = Some(reason);
+        self
+    }
+
+    pub fn journal_authority_failure(&self) -> Option<&crate::xcode_coordinator::CoordinatorError> {
+        self.journal_authority_failure.as_ref()
     }
 
     pub fn has_backend(&self) -> bool {
@@ -791,6 +807,12 @@ impl XcodeMcpBridgePool {
             self.config.max_active_leases,
             observation_persistence_failures,
         );
+        let (reason_code, operator_message) = if self.journal_authority_failure.is_some() {
+            let (code, message) = self.disabled_reason();
+            (code.to_owned(), message)
+        } else {
+            (reason_code, operator_message)
+        };
         let can_acquire_new_xcode_leases = state == XcodeBrokerHealthState::Healthy;
 
         XcodeBrokerHealthSnapshot {
@@ -843,7 +865,7 @@ impl XcodeMcpBridgePool {
                 bail!("xcode_mcp_unauthorized: unauthorized");
             }
             if self.broker_disabled() {
-                bail!("xcode_mcp_broker_disabled: brokered Xcode MCP route is disabled");
+                bail!("xcode_mcp_broker_disabled: {}", self.disabled_reason().1);
             }
             if lease.state == XcodeMcpLeaseState::Active {
                 lease.last_activity_at = Instant::now();
@@ -1523,7 +1545,25 @@ impl XcodeMcpBridgePool {
     }
 
     fn broker_disabled(&self) -> bool {
-        self.config.broker_disabled || env_flag_enabled("CHAINWORKS_XCODE_BROKER_DISABLED")
+        self.journal_authority_failure.is_some()
+            || self.config.broker_disabled
+            || env_flag_enabled("CHAINWORKS_XCODE_BROKER_DISABLED")
+    }
+
+    fn disabled_reason(&self) -> (&'static str, String) {
+        if let Some(reason) = &self.journal_authority_failure {
+            return (
+                "xcode_journal_authority_unavailable",
+                format!("Xcode journal authority unavailable: {reason}; operator recovery required"),
+            );
+        }
+        if self.config.broker_disabled {
+            return ("xcode_mcp_broker_disabled", "Xcode broker disabled by configuration".into());
+        }
+        if env_flag_enabled("CHAINWORKS_XCODE_BROKER_DISABLED") {
+            return ("xcode_mcp_broker_disabled", "Xcode broker disabled by CHAINWORKS_XCODE_BROKER_DISABLED".into());
+        }
+        ("xcode_mcp_broker_disabled", "Xcode broker disabled".into())
     }
 
     fn try_acquire_queue_permit(&self, lease_count: usize) -> Option<QueueLeasePermit<'_>> {
@@ -1714,7 +1754,12 @@ impl XcodeMcpBridgePool {
     ) -> McpBrokerObservation {
         McpBrokerObservation {
             source: "xcode_mcp_broker".to_string(),
-            backend_start_disposition: "broker_disabled".to_string(),
+            backend_start_disposition: if self.journal_authority_failure.is_some() {
+                "journal_authority_unavailable"
+            } else {
+                "broker_disabled"
+            }
+            .to_owned(),
             pool_id: Some(self.config.pool_id.clone()),
             lease_id: None,
             xcode_pid: None,
@@ -1731,7 +1776,8 @@ impl XcodeMcpBridgePool {
             originating_execution_id: agent_execution_id.map(|id| id.to_string()),
             prompt_cycle_index: None,
             status_update: Some(format!(
-                "Rejected {requested} brokered Xcode MCP lease request(s): CHAINWORKS_XCODE_BROKER_DISABLED is enabled"
+                "Rejected {requested} brokered Xcode MCP lease request(s): {}",
+                self.disabled_reason().1
             )),
         }
     }
@@ -1883,9 +1929,9 @@ impl XcodeBrokerLeaseAttacher for XcodeMcpBridgePool {
                 self.disabled_observation(req.agent_execution_id, requested_count, active);
             self.record_observation(req.agent_execution_id, observation)
                 .await;
-            bail!(
-                "xcode_mcp_broker_disabled: brokered Xcode MCP is disabled by CHAINWORKS_XCODE_BROKER_DISABLED=1"
-            );
+            // Keep the established pre-provider failure code while preserving
+            // the actual startup cause in its bounded diagnostic and receipt.
+            bail!("xcode_mcp_broker_disabled: {}", self.disabled_reason().1);
         }
 
         let binding_digest = match &self.headless_runtime {
@@ -2822,6 +2868,77 @@ mod tests {
             target_snapshot: None,
             headless_binding: None,
         }
+    }
+
+    #[tokio::test]
+    async fn configuration_disable_does_not_claim_an_environment_kill_switch() {
+        let pool = XcodeMcpBridgePool::new(XcodeMcpBridgePoolConfig {
+            broker_disabled: true,
+            ..Default::default()
+        });
+        let fixture = headless_fixture::Fixture::new();
+        let error = pool
+            .attach_brokered_xcode_leases(&fixture.request())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().starts_with("xcode_mcp_broker_disabled:"));
+        assert!(
+            !error
+                .to_string()
+                .contains("CHAINWORKS_XCODE_BROKER_DISABLED"),
+            "{error}"
+        );
+        let observation = pool.disabled_observation(None, 1, 0);
+        assert!(!observation
+            .status_update
+            .unwrap()
+            .contains("CHAINWORKS_XCODE_BROKER_DISABLED"));
+        assert_eq!(pool.active_lease_count().await, 0);
+        assert_eq!(pool.queued_lease_count(), 0);
+        assert_eq!(fixture.host.opens.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn authority_failure_is_preserved_without_env_flag_and_never_admits_a_lease() {
+        use crate::xcode_coordinator::CoordinatorError;
+        let fixture = headless_fixture::Fixture::new();
+        for reason in [
+            CoordinatorError::AuthorityMismatch,
+            CoordinatorError::AuthorityMissing,
+            CoordinatorError::AuthorityBusy,
+            CoordinatorError::AuthorityCorrupt,
+        ] {
+            let code = reason.to_string();
+            let pool = XcodeMcpBridgePool::new(XcodeMcpBridgePoolConfig::default())
+                .with_journal_authority_failure(reason);
+            let health = pool.health_snapshot().await;
+            assert_eq!(health.state, XcodeBrokerHealthState::Disabled);
+            assert_eq!(health.reason_code, "xcode_journal_authority_unavailable");
+            assert!(health.operator_message.contains(&code));
+            assert!(!health
+                .operator_message
+                .contains("CHAINWORKS_XCODE_BROKER_DISABLED"));
+            assert!(!health.can_acquire_new_xcode_leases);
+            assert!(!health.backend_available);
+            let error = pool
+                .attach_brokered_xcode_leases(&fixture.request())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().starts_with("xcode_mcp_broker_disabled:"));
+            assert!(error.to_string().contains(&code));
+            assert!(!error
+                .to_string()
+                .contains("CHAINWORKS_XCODE_BROKER_DISABLED"));
+            let observation = pool.disabled_observation(None, 1, 0);
+            assert_eq!(
+                observation.backend_start_disposition,
+                "journal_authority_unavailable"
+            );
+            assert!(observation.status_update.unwrap().contains(&code));
+            assert_eq!(pool.active_lease_count().await, 0);
+            assert_eq!(pool.queued_lease_count(), 0);
+        }
+        assert_eq!(fixture.host.opens.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

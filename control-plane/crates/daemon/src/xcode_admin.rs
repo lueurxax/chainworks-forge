@@ -30,6 +30,12 @@ use uuid::Uuid;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "operation", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum XcodeAdminCommand {
+    AuthorityInspect {},
+    AuthorityEnroll {
+        approved_plan_digest: String,
+        decision: AuthorityEnrollmentDecision,
+        confirm_stopped_writers: bool,
+    },
     BootstrapAuthority {
         confirm_legacy_shutdown: bool,
     },
@@ -63,6 +69,14 @@ pub enum XcodeAdminCommand {
     },
 }
 
+/// Administrative enrollment of the reviewed current DB is a new trust decision.
+/// It never asserts historical continuity for a legacy authority.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthorityEnrollmentDecision {
+    EnrollCurrentDatabaseAsNewAuthority,
+}
+
 fn deserialize_revision<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<AttemptRevision, D::Error> {
@@ -92,6 +106,8 @@ pub fn parse_cli(args: &[String]) -> Result<Option<XcodeAdminCommand>> {
         matches!(
             args[1].as_str(),
             "bootstrap-authority"
+                | "authority-inspect"
+                | "authority-enroll"
                 | "trust-grant"
                 | "trust-revoke"
                 | "effects-list"
@@ -134,6 +150,9 @@ pub async fn execute(
     effects: &XcodeEffectAdmin,
 ) -> Result<serde_json::Value> {
     match command {
+        XcodeAdminCommand::AuthorityInspect { .. } | XcodeAdminCommand::AuthorityEnroll { .. } => {
+            bail!("xcode_authority_recovery_requires_maintenance_proof")
+        }
         XcodeAdminCommand::BootstrapAuthority { .. } => {
             bail!("xcode_bootstrap_requires_stop_proof")
         }
@@ -279,7 +298,7 @@ async fn require_settled_effects(connection: &mut sqlx::SqliteConnection) -> Res
     Ok(())
 }
 
-async fn process_inventory() -> Result<String> {
+pub(crate) async fn process_inventory() -> Result<String> {
     let read = async {
         let mut child = tokio::process::Command::new("/bin/ps")
             .args(["-axo", "pid=,uid=,comm="])
@@ -306,7 +325,11 @@ async fn process_inventory() -> Result<String> {
         .map_err(|_| anyhow::anyhow!("legacy_transition_unproven"))
 }
 
-fn verify_legacy_process_inventory(inventory: &str, uid: u32, self_pid: u32) -> Result<()> {
+pub(crate) fn verify_legacy_process_inventory(
+    inventory: &str,
+    uid: u32,
+    self_pid: u32,
+) -> Result<()> {
     let mut saw_self = false;
     let mut seen = std::collections::HashSet::new();
     for line in inventory.lines() {
@@ -353,13 +376,13 @@ fn verify_legacy_process_inventory(inventory: &str, uid: u32, self_pid: u32) -> 
     Ok(())
 }
 
-struct LegacyLock {
+pub(crate) struct LegacyLock {
     path: PathBuf,
     file: File,
 }
 
 impl LegacyLock {
-    fn acquire(database: &Path) -> Result<Self> {
+    pub(crate) fn acquire(database: &Path) -> Result<Self> {
         let name = database
             .file_name()
             .and_then(|n| n.to_str())
@@ -389,7 +412,7 @@ impl LegacyLock {
         Ok(guard)
     }
 
-    fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         let named = std::fs::symlink_metadata(&self.path)?;
         let opened = self.file.metadata()?;
         for metadata in [&named, &opened] {
@@ -626,5 +649,40 @@ mod tests {
         assert!(parse_cli(&args).is_err());
         std::fs::write(&path, vec![b' '; 65537]).unwrap();
         assert!(parse_cli(&args).is_err());
+    }
+    #[test]
+    fn recovery_parser_requires_the_exact_decision_and_rejects_unknown_duplicate_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("request.json");
+        let args = vec![
+            "--xcode-admin".into(),
+            "authority-enroll".into(),
+            path.to_str().unwrap().into(),
+        ];
+        let valid = serde_json::json!({"approved_plan_digest":"a".repeat(64),"decision":"enroll-current-database-as-new-authority","confirm_stopped_writers":true});
+        std::fs::write(&path, valid.to_string()).unwrap();
+        assert!(matches!(
+            parse_cli(&args).unwrap(),
+            Some(XcodeAdminCommand::AuthorityEnroll { .. })
+        ));
+        let mut wrong = valid.clone();
+        wrong["decision"] = "assert-historical-continuity".into();
+        std::fs::write(&path, wrong.to_string()).unwrap();
+        assert!(parse_cli(&args).is_err());
+        wrong = valid.clone();
+        wrong["reconcile_unknown"] = true.into();
+        std::fs::write(&path, wrong.to_string()).unwrap();
+        assert!(parse_cli(&args).is_err());
+        std::fs::write(&path, br#"{"approved_plan_digest":"a","decision":"enroll-current-database-as-new-authority","confirm_stopped_writers":true,"confirm_stopped_writers":false}"#).unwrap();
+        assert!(parse_cli(&args).is_err());
+        let inspect = vec![
+            "--xcode-admin".into(),
+            "authority-inspect".into(),
+            path.to_str().unwrap().into(),
+        ];
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(parse_cli(&inspect).is_ok());
+        std::fs::write(&path, b"{\"run_id\":\"unexpected\"}").unwrap();
+        assert!(parse_cli(&inspect).is_err());
     }
 }

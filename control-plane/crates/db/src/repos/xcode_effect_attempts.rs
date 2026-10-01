@@ -359,10 +359,20 @@ fn check_transition(
     Ok(())
 }
 
+// Legacy project keys have no persistent volume witness. UID + inode is only a
+// conservative denial alias: it may overblock another volume, but cannot grant
+// identity or trust. Both admission boundaries use the same predicate so a
+// renamed project remains held after reboot changes st_dev. Historical keys and
+// hold rows remain immutable; reconciliation still requires their exact key.
+const PROJECT_HELD_SQL: &str = "SELECT EXISTS(SELECT 1 FROM xcode_project_holds WHERE uid = ? AND (canonical_path = ? OR inode = ?))";
+
 async fn ensure_unheld(conn: &mut SqliteConnection, project: &ProjectKey) -> Result<()> {
-    let held: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM xcode_project_holds WHERE uid = ? AND (canonical_path = ? OR (device = ? AND inode = ?)))")
-        .bind(i64::from(project.uid)).bind(&project.canonical_path)
-        .bind(&project.device).bind(&project.inode).fetch_one(conn).await?;
+    let held: bool = sqlx::query_scalar(PROJECT_HELD_SQL)
+        .bind(i64::from(project.uid))
+        .bind(&project.canonical_path)
+        .bind(&project.inode)
+        .fetch_one(conn)
+        .await?;
     if held {
         Err(JournalError::ProjectHeld)
     } else {
@@ -372,9 +382,13 @@ async fn ensure_unheld(conn: &mut SqliteConnection, project: &ProjectKey) -> Res
 
 pub async fn project_is_held(pool: &SqlitePool, project: &ProjectKey) -> Result<bool> {
     project.validate()?;
-    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM xcode_project_holds WHERE uid = ? AND (canonical_path = ? OR (device = ? AND inode = ?)))")
-        .bind(i64::from(project.uid)).bind(&project.canonical_path).bind(&project.device).bind(&project.inode)
-        .fetch_one(pool).await.map_err(JournalError::from)
+    sqlx::query_scalar(PROJECT_HELD_SQL)
+        .bind(i64::from(project.uid))
+        .bind(&project.canonical_path)
+        .bind(&project.inode)
+        .fetch_one(pool)
+        .await
+        .map_err(JournalError::from)
 }
 
 async fn require_hold(conn: &mut SqliteConnection, attempt: &StoredAttempt) -> Result<()> {

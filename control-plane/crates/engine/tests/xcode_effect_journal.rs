@@ -33,11 +33,72 @@ async fn coordinator_hold_readback_covers_path_and_inode_aliases_and_fails_when_
     let mut alias = f.intent.project_key.clone();
     alias.canonical_path = "/fixture/Alias.xcodeproj".into();
     assert!(checker.is_held(&alias).await.unwrap());
+    // boundary-no-op: regression for storage hold denial; caller capabilities are unchanged.
+    alias.device = "8".into();
+    assert!(checker.is_held(&alias).await.unwrap());
     alias.inode = "99".into();
     assert!(!checker.is_held(&alias).await.unwrap());
     f.writer.shutdown().await;
     f.pool.close().await;
     assert!(checker.is_held(&f.intent.project_key).await.is_err());
+}
+
+#[tokio::test]
+async fn independent_successor_cannot_bypass_transport_lost_hold_after_device_drift() {
+    use acp::xcode_coordinator::ProjectHoldCheck;
+    let f = Fixture::new().await;
+    let mut successor = f.intent.clone();
+    successor.run_id = Uuid::new_v4();
+    successor.owner_lineage = "independent-successor".into();
+    successor.invocation_id = Uuid::new_v4();
+    successor.operation_key = Uuid::new_v4();
+    successor.project_key.canonical_path = "/renamed/App.xcodeproj".into();
+    successor.project_key.device = "8".into();
+    let successor_journal = f.scoped(successor.run_id, &successor.owner_lineage);
+    let waiting = successor_journal.prepare(&successor).await.unwrap();
+    let dispatched = f.dispatched().await;
+    let unknown = f
+        .journal
+        .complete(
+            revision(&dispatched),
+            &Completion::Unknown {
+                reason: UncertaintyReason::TransportLost,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (unknown.state, unknown.revision),
+        (AttemptState::Unknown, 2)
+    );
+    assert!(unknown.outcome.is_none());
+    // Reconstruct the coordinator adapter, as after daemon restart. This check
+    // consults the shared resource ledger, independent of successor run lineage.
+    let checker = engine::xcode_effect_journal::DbXcodeProjectHoldCheck(f.pool.clone());
+    assert!(checker.is_held(&successor.project_key).await.unwrap());
+    assert!(matches!(
+        successor_journal
+            .dispatch(waiting.nonce, &successor.request_digest, 0)
+            .await,
+        Err(XcodeJournalError::ProjectHeld)
+    ));
+    successor.operation_key = Uuid::new_v4();
+    assert!(matches!(
+        successor_journal.prepare(&successor).await,
+        Err(XcodeJournalError::ProjectHeld)
+    ));
+    assert_eq!(f.holds().await, 1);
+    assert_eq!(f.attempts().await, 2);
+    assert_eq!(
+        f.journal.get(unknown.attempt_id).await.unwrap().unwrap(),
+        unknown
+    );
+    assert!(successor_journal
+        .get(unknown.attempt_id)
+        .await
+        .unwrap()
+        .is_none());
+    f.close().await;
 }
 
 struct Fixture {

@@ -1447,6 +1447,11 @@ granting permissions, opening projects, or running local UI tests:
   ambiguity and revocation rules, sanitized phase diagnostics before and after
   dispatch, and preservation of unknown-effect holds with reconciliation-first
   recovery.
+- `xcode-authority-recovery`: APFS persistent identity, explicit authority
+  enrollment and audit evidence, project trust v3, administrative inspection,
+  typed broker diagnostics, and DB/engine unknown-effect hold protection.
+  Uses disposable files and child processes; it never enrolls live authority,
+  grants project access, reconciles a live effect, or restarts the daemon.
 - `xcode-headless-host-startup`: opt-in one-shot startup policy and readiness
   fixtures; this is not live cold-start evidence.
 

@@ -2723,6 +2723,7 @@ Available gates:
   xcode-headless-shim  Offline canonical shim route, socket authority, and temp-process fixtures
   xcode-headless-catalog  Canonical catalog permissions and direct-command scanner fixtures
   xcode-headless-project-trust  Offline project-trust admission fixtures
+  xcode-authority-recovery  Offline persistent identity, authority recovery, and hold protection
   xcode-headless-host-startup  Offline opt-in service-startup policy fixtures
   proposal-094|p094  Proposal 094 workflow-owned blocker-boundary contract/readback gate
   proposal-096|p096  Proposal 096 bounded tool output and safe-search guard retained alias gate
@@ -2807,6 +2808,22 @@ case "$GATE" in
     (
       cd "$ROOT_DIR/control-plane"
       cargo test --locked --offline -p acp --lib xcode_headless_host::tests::startup_
+    )
+    ;;
+  xcode-authority-recovery)
+    log "Xcode authority recovery: disposable identity, enrollment, inspection, and hold fixtures"
+    export RUST_MIN_STACK=8388608
+    export CHAINWORKS_AUTO_CACHE_CLEANUP=0
+    export CARGO_TARGET_DIR
+    CARGO_TARGET_DIR="$(chainworks_test_gate_cargo_target_dir "${CHAINWORKS_XCODE_CARGO_TARGET_DIR:-target/xcode-authority-recovery}")"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test --locked --offline -p acp --lib xcode_ -- --test-threads=1
+      cargo test --locked --offline -p acp --test xcode_authority_recovery --test xcode_coordinator --test xcode_project_trust
+      cargo test --locked --offline -p daemon --lib xcode_ -- --test-threads=1
+      cargo test --locked --offline -p daemon --bin control-plane xcode_ -- --test-threads=1
+      cargo test --locked --offline -p db --test xcode_effect_attempts
+      cargo test --locked --offline -p engine --test xcode_effect_journal
     )
     ;;
   xcode-headless-project-trust)

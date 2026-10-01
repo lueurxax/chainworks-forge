@@ -32,7 +32,20 @@ pub fn routes(pool: Arc<XcodeMcpBridgePool>) -> Router {
 
 async fn handle_health(State(pool): State<Arc<XcodeMcpBridgePool>>) -> impl IntoResponse {
     let health = pool.health_snapshot().await;
+    let authority_message;
     let (reason, message) = match health.state {
+        XcodeBrokerHealthState::Disabled if pool.journal_authority_failure().is_some() => {
+            // Public projection accepts only the bounded CoordinatorError code,
+            // never arbitrary privileged snapshot messages or filesystem paths.
+            authority_message = format!(
+                "Xcode journal authority unavailable: {}",
+                pool.journal_authority_failure().unwrap()
+            );
+            (
+                "xcode_journal_authority_unavailable",
+                authority_message.as_str(),
+            )
+        }
         XcodeBrokerHealthState::Disabled => ("xcode_mcp_broker_disabled", "Xcode broker disabled"),
         XcodeBrokerHealthState::Healthy => ("healthy", "Xcode broker healthy"),
         XcodeBrokerHealthState::Failed => (
@@ -1006,6 +1019,41 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["id"], 7);
         assert_wire_error(&body, json!(7), -32003, "service_unavailable");
+    }
+
+    #[tokio::test]
+    async fn xcode_mcp_health_preserves_authority_failure_without_disclosing_paths() {
+        let pool = Arc::new(
+            XcodeMcpBridgePool::new(XcodeMcpBridgePoolConfig::default())
+                .with_journal_authority_failure(
+                    acp::xcode_coordinator::CoordinatorError::AuthorityMismatch,
+                ),
+        );
+        let response = routes(pool)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/xcode-mcp/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["state"], "disabled");
+        assert_eq!(body["reason_code"], "xcode_journal_authority_unavailable");
+        assert_eq!(
+            body["operator_message"],
+            "Xcode journal authority unavailable: authority_mismatch"
+        );
+        assert_eq!(body["can_acquire_new_xcode_leases"], false);
+        assert_eq!(body["active_lease_count"], 0);
+        assert_eq!(body["backend_session_count"], 0);
+        assert!(!body
+            .to_string()
+            .contains("CHAINWORKS_XCODE_BROKER_DISABLED"));
+        assert!(!body.to_string().contains("canonical_path"));
     }
 
     #[tokio::test]

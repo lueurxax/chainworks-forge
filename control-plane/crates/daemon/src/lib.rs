@@ -7,6 +7,7 @@ pub mod steward_runtime;
 pub mod storage_startup;
 pub mod supervisor;
 pub mod xcode_admin;
+pub mod xcode_authority_recovery;
 pub mod xcode_broker_http;
 pub mod xcode_shim_socket;
 

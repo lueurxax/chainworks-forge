@@ -8,6 +8,7 @@ pub mod transport;
 pub mod xcode_broker;
 pub mod xcode_coordinator;
 pub mod xcode_effect_journal;
+pub mod xcode_filesystem_identity;
 pub mod xcode_headless;
 pub mod xcode_headless_host;
 pub mod xcode_headless_runtime;

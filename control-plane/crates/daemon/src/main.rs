@@ -250,17 +250,32 @@ async fn run_xcode_admin() -> Result<()> {
     let mode = packaging::DaemonMode::from_env_var(
         &std::env::var("MODE").unwrap_or_else(|_| "dev".into()),
     );
-    let paths = packaging::resolve_paths(mode)?;
+    let paths = packaging::resolve_existing_paths(mode)?;
     anyhow::ensure!(
         paths.principals_path.is_file(),
         "xcode_admin_existing_principals_required"
     );
-    let principals = auth::PrincipalTable::load_or_bootstrap(&paths.principals_path)?;
+    let principals = auth::PrincipalTable::load_existing(&paths.principals_path)?;
     let token = std::env::var("CHAINWORKS_MCP_TOKEN")
         .map_err(|_| anyhow::anyhow!("xcode_admin_authentication_required"))?;
     let principal = auth::resolve_bearer(&token, &principals)
         .map_err(|_| anyhow::anyhow!("xcode_admin_authentication_failed"))?;
     drop(token);
+    if matches!(
+        &command,
+        daemon::xcode_admin::XcodeAdminCommand::AuthorityInspect { .. }
+            | daemon::xcode_admin::XcodeAdminCommand::AuthorityEnroll { .. }
+    ) {
+        let result = daemon::xcode_authority_recovery::execute(
+            &command,
+            &principal,
+            &paths.database_url,
+            &paths.app_support_dir.join("xcode-project-trust"),
+        )
+        .await;
+        println!("{}", serde_json::to_string(&result?)?);
+        return Ok(());
+    }
     let readonly = !matches!(
         &command,
         daemon::xcode_admin::XcodeAdminCommand::EffectsReconcile { .. }
@@ -940,13 +955,13 @@ async fn run_daemon() -> Result<()> {
             .fetch_one(&pool)
             .await
             .context("resolve canonical Xcode journal database")?;
-    let xcode_authority = match acp::xcode_coordinator::JournalAuthority::open(
+    let (xcode_authority, xcode_authority_failure) = match acp::xcode_coordinator::JournalAuthority::open(
         std::path::Path::new(&xcode_database),
     ) {
-        Ok(authority) => Some(authority),
+        Ok(authority) => (Some(authority), None),
         Err(reason) => {
-            warn!(reason = %reason,"Headless Xcode admission held; operator bootstrap or reconciliation required");
-            None
+            warn!(reason = %reason,"Headless Xcode admission held; operator bootstrap or recovery required");
+            (None, Some(reason))
         }
     };
     let xcode_effects_recovered = if xcode_authority.is_some() {
@@ -1201,6 +1216,7 @@ async fn run_daemon() -> Result<()> {
                 port,
                 acp.xcode_runtime_observation_sink(),
                 headless_runtime.clone(),
+                xcode_authority_failure.clone(),
             );
             acp.set_xcode_broker_lease_attacher(xcode_broker_pool.clone());
             reporter.set_xcode_broker_health(xcode_broker_health_for_lifecycle(
@@ -1497,12 +1513,10 @@ fn new_daemon_xcode_broker_pool(
     port: u16,
     observation_sink: Arc<dyn XcodeRuntimeObservationSink>,
     runtime: Option<Arc<acp::xcode_headless_runtime::HeadlessRuntime>>,
+    authority_failure: Option<acp::xcode_coordinator::CoordinatorError>,
 ) -> Arc<XcodeMcpBridgePool> {
     let config = XcodeMcpBridgePoolConfig {
             base_url: format!("http://127.0.0.1:{port}/xcode-mcp"),
-            broker_disabled: std::env::var("CHAINWORKS_XCODE_BROKER_DISABLED")
-                .map(|value| value == "1")
-                .unwrap_or(false),
             tool_allowlists_by_hash: engine::mcp::load_xcode_broker_tool_allowlists()
                 .unwrap_or_else(|err| {
                     warn!(error = %err, "Failed to load Xcode broker tool allowlists from MCP registry");
@@ -1515,13 +1529,10 @@ fn new_daemon_xcode_broker_pool(
         Some(runtime) => {
             XcodeMcpBridgePool::new_with_headless_runtime(config, observation_sink, runtime)
         }
-        None => XcodeMcpBridgePool::new_with_sink(
-            XcodeMcpBridgePoolConfig {
-                broker_disabled: true,
-                ..config
-            },
-            observation_sink,
-        ),
+        None => XcodeMcpBridgePool::new_with_sink(config, observation_sink)
+            .with_journal_authority_failure(authority_failure.unwrap_or(
+                acp::xcode_coordinator::CoordinatorError::AuthorityMissing,
+            )),
     })
 }
 
@@ -2218,15 +2229,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn daemon_xcode_broker_pool_without_authority_has_no_ide_fallback() {
+    #[tokio::test]
+    async fn daemon_xcode_broker_pool_without_authority_has_no_ide_fallback() {
         let pool = new_daemon_xcode_broker_pool(
             41234,
             Arc::new(acp::NoopXcodeRuntimeObservationSink),
             None,
+            Some(acp::xcode_coordinator::CoordinatorError::AuthorityMismatch),
         );
 
         assert!(!pool.has_backend());
+        let health = xcode_broker_health_for_lifecycle(pool.health_snapshot().await);
+        assert_eq!(health.reason_code, "xcode_journal_authority_unavailable");
+        assert!(health.operator_message.contains("authority_mismatch"));
+        assert!(!health.operator_message.contains("CHAINWORKS_XCODE_BROKER_DISABLED"));
+        assert!(!health.can_acquire_new_xcode_leases);
     }
 
     #[test]
@@ -2262,6 +2279,7 @@ mcp:
             41234,
             Arc::new(acp::NoopXcodeRuntimeObservationSink),
             None,
+            Some(acp::xcode_coordinator::CoordinatorError::AuthorityMismatch),
         );
 
         assert!(pool.has_tool_allowlist_hash(&hash));

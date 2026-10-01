@@ -228,7 +228,7 @@ defined legacy compatibility exception is described below.
 
 | Action | Explicit-v3 capability | Scope |
 | --- | --- | --- |
-| `bootstrap-authority` | `xcode.global_admin` and `xcode.project_trust` | Global Operator; no `run_scope` |
+| `bootstrap-authority`, `authority-inspect`, `authority-enroll` | `xcode.global_admin` and `xcode.project_trust` | Global Operator; no `run_scope` |
 | `trust-grant`, `trust-revoke` | `xcode.global_admin` and `xcode.project_trust` | Global Operator; no `run_scope` |
 | `effects-list`, `effects-get` | `xcode.effects.list` or `xcode.effects.get` | Requested run and owner; run-limited Operator needs matching `run_scope` |
 | `effects-reconcile` | `xcode.effects.reconcile` | Requested run and owner; run-limited Operator needs matching `run_scope` |
@@ -285,8 +285,10 @@ and substitute real persisted identities for every `<placeholder>` below.
 These examples are templates, not permission or completion evidence.
 
 The CLI opens an existing database without creating it or running migrations.
-Only reconciliation opens the database for writing; explicit trust operations
-write the separate trust store, and bootstrap writes the authority record.
+Reconciliation writes the effect journal. Authority enrollment opens a write-capable
+connection only to retain a writer reservation; it rolls back without changing
+database rows. Explicit trust operations write the separate trust store, and
+bootstrap/enrollment publish authority records.
 
 ## Bootstrap and Migration
 
@@ -380,28 +382,30 @@ Directories/files are private, owner-checked, and reject inappropriate links or
 modes. Runtime lookup never creates a missing store or grants trust implicitly.
 Root/project replacement, revocation, and policy drift require fresh admission.
 
-For a `worktree` root, `dedicated` (writer) and
-`shared_implementation_worktree` (reviewer) share one v2 trust identity when every
-other root field and the full project key match. The recorded root retains the
-grant's strategy for audit; frozen request matching and invocation capabilities
-still compare/evaluate their own full inputs. Repository roots and all other
-strategies retain exact v1 identities. This does not grant additional tools or
-cover another checkout, project, UID, device, inode, root version or policy.
+New explicit grants use trust record v3. Root and project each pin an APFS volume
+UUID and a persistent 64-bit object ID, with creation metadata, UID and canonical
+path. Device numbers and boot UUIDs are observations. Cross-boot device drift is
+accepted only when the persisted identity matches; same-boot device drift,
+foreign volumes and replaced objects fail closed. Runtime checks additionally pin
+the observations accepted during that store instance's lifetime.
 
-An existing v2 record is authoritative, including a revocation or invalid record;
-runtime never falls back from it to v1. Without v2, both exact legacy strategy
-slots are validated under the same lock. One active legacy grant is accepted
-with its original digest and without writes. Revocation, corruption or two active
-legacy grants fail closed (`project_trust_ambiguous` for two active grants).
-An explicit upgraded grant may resolve valid conflicting/revoked decisions; it
-cannot repair insecure or corrupt records. Upgraded revocation first revokes
-every existing legacy slot, then publishes the v2 tombstone, so successful
-revocation also denies old runtime readers.
+For a `worktree` root, `dedicated` (writer) and `shared_implementation_worktree`
+(reviewer) share a durable trust slot when the remaining identity matches.
+Other strategies and repository identities remain distinct. The original root,
+project key and strategy remain in the grant for audit; frozen invocation inputs
+are not rewritten.
 
-Deploy runtime and trust-administration code together. Once v2 exists, old
-administrators must not change trust: they cannot update v2 authority. Old
-runtime readers cannot consume a new v2-only grant. No automatic store migration
-or implicit trust grant occurs on upgrade.
+All v1/v2 grants require a separate explicit v3 grant, including records whose
+current device numbers still match. Runtime never falls back to legacy grants,
+migrates them, or revives revoked decisions. Explicit grant checks discoverable
+exact legacy slots for corruption and leaves their bytes unchanged. Revocation
+publishes a v3 tombstone and also revokes discoverable exact legacy slots; it does
+not infer or scan old-device identities. An explicit regrant is a new operator
+trust decision. Authority enrollment alone grants no project trust.
+
+Deploy runtime and trust-administration code together. Older administrators and
+runtimes cannot consume or enforce v3 decisions and must remain stopped after
+upgrade. Unsupported or unavailable persistent filesystem identity fails closed.
 
 Headless preparation failures persist bounded `headless_preparation_failure`
 diagnostics in the existing operator runtime-preflight JSON: phase, reason,
@@ -553,6 +557,97 @@ are bounded relative opaque IDs, not absolute paths, URLs, credentials, or raw
 provider content. Reconciliation records history; it does not replay an operation
 or automatically issue a new provider binding.
 
+## Reboot identity and explicit authority recovery
+
+A mount's `st_dev` can change after reboot. Authority v2 pins the supported
+persistent filesystem identity separately from device/boot observations. The
+native reader requires local APFS, nonempty volume UUID, valid persistent-object
+and 64-bit-object capability bits, and the opened object's 64-bit file ID. Missing
+or unsupported identity information denies admission. The reader does not call
+allocating legacy object-ID APIs. Apple's
+[filesystem attribute contract](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/getattrlist.2.html)
+describes the persistent-object capability; the macOS SDK specifies `ATTR_CMN_FILEID`
+for volumes advertising 64-bit object IDs.
+
+A legacy authority v1 record contains no historical volume or boot witness.
+Unchanged path/inode and a newly observed volume UUID cannot prove continuity.
+Normal startup does not rewrite the record. `bootstrap-authority` keeps its
+original requirement for settled effects and no holds; it is not a rebind command.
+
+For reviewed administrative enrollment, the separate operator protocol is:
+
+1. Stop the app/daemon and close other SQLite connections before
+   `authority-inspect`. Inspection acquires a nonblocking macOS open-file-description
+   lock over SQLite's database lock range and copies the database and any WAL into
+   a private temporary directory. It opens only that copy with SQLite, leaving the
+   source database, WAL and SHM unchanged. A busy source, unsupported lock or
+   rollback journal blocks inspection. No migration or grant occurs. The plan
+   binds the original authority digest, current filesystem identity, schema and
+   complete bounded journal/trust inventory; enrollment rechecks the live inventory.
+2. Review its blockers and exact plan digest. Legacy v1 continuity remains
+   `continuity_unproven`; enrollment is a **new trust decision** for the current
+   database, not a claim that historical identity has been proved.
+3. `authority-enroll` requires the exact approved plan, global Operator authority,
+   stopped app/daemon writers, retained singleton/coordinator/trust locks and a
+   SQLite writer reservation. Both inspection and enrollment require WAL mode;
+   the plan binds that mode, and enrollment validates it inside its transaction.
+   Changed records, identity, inventory or plans fail closed. A missing or insecure
+   existing trust lock blocks enrollment.
+4. Publication preserves the old authority and a durable audit receipt before
+   atomically activating the new record. Database attempts, outcomes, revisions,
+   holds and project grants are not migrated or reconciled by enrollment.
+5. Review and explicitly grant each intended project separately using trust v3.
+   Recovered authority alone does not enable a held or untrusted project.
+
+Request templates (normal `--xcode-admin ACTION FILE` invocation):
+
+```json
+{}
+```
+
+Use that object with `authority-inspect`. Enrollment requires:
+
+```json
+{
+  "approved_plan_digest": "<digest returned by inspection>",
+  "decision": "enroll-current-database-as-new-authority",
+  "confirm_stopped_writers": true
+}
+```
+
+Confirmation alone is insufficient. No command in this protocol starts the daemon,
+retries a run, clears a hold, invokes a provider, or calls Xcode.
+
+Legacy holds retain their exact historical keys. Both coordinator readback and
+transactional prepare/dispatch deny by UID plus either canonical path or inode.
+The inode comparison deliberately overblocks possible aliases on other volumes;
+it never establishes equivalence or grants trust. This preserves a held project's
+fence across simultaneous rename and device drift. Reconciliation still requires
+the exact original key and historical outcome evidence.
+
+Transport loss after a dispatched `workspace_open` is a different state from
+startup authority rejection: the operation may have reached Xcode even when no
+provider session exists. The Xcode effect ledger and project holds are the source
+for that uncertainty; a zero count in the general side-effect ledger does not
+prove that no Xcode effects remain. A daemon restart, new run/owner, new operation
+key, renamed checkout or new trust grant does not settle such an effect.
+
+Use `effects-get` with the original run, owner and attempt to inspect its frozen
+contract. Reconciliation requires an authenticated operator, the exact revision,
+compatible historical result schema/digest, evidence references and proof that no
+operation remains in flight. The CLI validates that contract; the operator must
+independently verify the referenced evidence. Current project absence or a
+successful new open cannot establish the historical result. If that evidence is
+unavailable, retain UNKNOWN and its shared resource hold. No safe automatic
+replay, hold-clear or successor exemption is provided.
+
+An authority startup failure leaves the broker disabled. Health reports
+`xcode_journal_authority_unavailable` with the bounded cause such as
+`authority_mismatch`. The pre-provider error retains `xcode_mcp_broker_disabled`
+for compatibility and includes that cause; it does not invent an environment
+setting. Explicit environment disablement remains a separate reason. Overall
+`/ready` success alone is not proof of Xcode admission.
+
 ## Verification and Source Map
 
 All build/test work still goes through the canonical gate script. Focused offline
@@ -562,6 +657,7 @@ checks for these paths are:
 ./scripts/test-gate.sh xcode-headless-shim
 ./scripts/test-gate.sh xcode-headless-catalog
 ./scripts/test-gate.sh xcode-headless-project-trust
+./scripts/test-gate.sh xcode-authority-recovery
 ./scripts/test-gate.sh xcode-headless-host-startup
 ```
 

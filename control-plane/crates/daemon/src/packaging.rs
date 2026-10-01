@@ -113,7 +113,16 @@ fn reject_symlinked_auth_root_components(home: &Path) -> Result<()> {
 /// reasonable. Used once at startup in `main.rs`.
 pub fn resolve_paths(mode: DaemonMode) -> Result<ModePaths> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    resolve_paths_at(mode, home, true)
+}
 
+/// Administrative readback must never create runtime directories.
+pub fn resolve_existing_paths(mode: DaemonMode) -> Result<ModePaths> {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    resolve_paths_at(mode, home, false)
+}
+
+fn resolve_paths_at(mode: DaemonMode, home: PathBuf, create: bool) -> Result<ModePaths> {
     let (app_support_dir, default_db, default_log, default_bind) = match mode {
         DaemonMode::PackagedApp | DaemonMode::PackagedHelper => {
             let app_support = home
@@ -152,8 +161,10 @@ pub fn resolve_paths(mode: DaemonMode) -> Result<ModePaths> {
         ),
     };
 
-    std::fs::create_dir_all(&app_support_dir)
-        .with_context(|| format!("create app_support_dir {}", app_support_dir.display()))?;
+    if create {
+        std::fs::create_dir_all(&app_support_dir)
+            .with_context(|| format!("create app_support_dir {}", app_support_dir.display()))?;
+    }
 
     // SEC-M002: In packaged modes, ignore DATABASE_URL overrides from the inherited environment.
     // An attacker-controlled DATABASE_URL could redirect execution-truth storage outside the
@@ -460,6 +471,17 @@ pub fn write_build_sha_value(paths: &ModePaths, sha: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn administrative_paths_do_not_create_runtime_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = resolve_paths_at(DaemonMode::Dev, dir.path().into(), false).unwrap();
+        assert!(!paths.app_support_dir.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let startup = resolve_paths_at(DaemonMode::Dev, dir.path().into(), true).unwrap();
+        assert!(startup.app_support_dir.is_dir());
+        assert_eq!(startup.app_support_dir, paths.app_support_dir);
+    }
 
     #[test]
     fn mode_from_env_var_variants() {

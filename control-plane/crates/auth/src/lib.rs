@@ -524,6 +524,11 @@ impl PrincipalTable {
         table
     }
 
+    /// Read existing principals without ever creating a table or parent directory.
+    pub fn load_existing(path: &Path) -> Result<Self, AuthError> {
+        Self::load(path, false)
+    }
+
     /// Load from a JSON file. If the file does not exist, bootstrap a default
     /// operator-class principal, write it to disk, and return the table.
     ///
@@ -532,6 +537,10 @@ impl PrincipalTable {
     /// Callers in packaged mode should additionally verify canonical containment
     /// against the expected auth root before calling this function.
     pub fn load_or_bootstrap(path: &Path) -> Result<Self, AuthError> {
+        Self::load(path, true)
+    }
+
+    fn load(path: &Path, allow_bootstrap: bool) -> Result<Self, AuthError> {
         // Reject relative paths unconditionally: principals.json must be an absolute path
         // so the file cannot be redirected by controlling the process working directory.
         if path.is_relative() {
@@ -652,6 +661,11 @@ impl PrincipalTable {
                 entries: principals,
             })
         } else {
+            if !allow_bootstrap {
+                return Err(AuthError::TableLoadFailed(
+                    "existing principal table required".into(),
+                ));
+            }
             // Bootstrap a default operator token; boundary-aware writers emit schema_version 3.
             // SEC-M-002: use cryptographically random 256-bit token rather than UUID (which has
             // fixed bits and structured format unsuitable for bearer credentials).
@@ -2928,6 +2942,25 @@ mod tests {
             Some(CallerClass::AgentOperator),
             "agent principal with explicit surface_policies derives to agent_operator"
         );
+    }
+
+    #[test]
+    fn existing_principal_load_does_not_create_missing_file_or_directory() {
+        // boundary-no-op: read-only loading forbids bootstrap; capability and caller-class policy remain unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-auth/principals.json");
+        assert!(PrincipalTable::load_existing(&path).is_err());
+        assert!(!path.parent().unwrap().exists());
+        let path = dir.path().join("principals.json");
+        assert!(PrincipalTable::load_existing(&path).is_err());
+        assert!(!path.exists());
+        PrincipalTable::load_or_bootstrap(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        PrincipalTable::load_existing(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_file(&path).unwrap();
+        assert!(PrincipalTable::load_existing(&path).is_err());
+        assert!(!path.exists());
     }
 
     #[test]

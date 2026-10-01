@@ -680,3 +680,24 @@ async fn independent_projects_do_not_share_a_global_mutation_lock() {
         .unwrap();
     second.check_dispatch().await.unwrap();
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn v2_authority_pins_persistent_database_identity_without_rewriting_record() {
+    use acp::xcode_filesystem_identity::{observe, IdentityKind};
+    let f = Fixture::new();
+    fs::set_permissions(&f.database, fs::Permissions::from_mode(0o600)).unwrap();
+    drop(f.open_authority().unwrap());
+    let observed = observe(&f.database, IdentityKind::PrivateFile).unwrap();
+    let record = serde_json::to_vec(&serde_json::json!({
+        "version": 2, "uid": observed.uid, "database": observed, "enrollment": null
+    })).unwrap();
+    fs::write(f.authority.join("authority.json"), &record).unwrap();
+    let authority = FixtureJournalAuthority::open_existing(&f.authority, &f.database).unwrap();
+    authority.check().unwrap();
+    assert_eq!(fs::read(f.authority.join("authority.json")).unwrap(), record);
+    fs::rename(&f.database, f.database.with_extension("old")).unwrap();
+    fs::write(&f.database, b"replacement").unwrap();
+    fs::set_permissions(&f.database, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(authority.check(), Err(CoordinatorError::AuthorityMismatch));
+}

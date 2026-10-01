@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(target_os = "macos")]
 
 use acp::{
     execution_root::resolve_execution_root, xcode_headless_host::TrustedProject,
@@ -64,9 +64,18 @@ impl Fixture {
         TrustedProject::resolve(root, Some("App.xcodeproj"), self.project.key().uid).unwrap()
     }
 
-    // Construct the shipped v1 format directly so compatibility tests do not
-    // accidentally test new-grant behavior instead of historical grant reads.
+    // Construct shipped legacy formats directly, independently of v3 grants.
     fn legacy_grant(&self, project: &TrustedProject, revoked: bool) -> (PathBuf, String) {
+        self.legacy_grant_version(project, revoked, 1)
+    }
+
+    fn legacy_grant_version(
+        &self,
+        project: &TrustedProject,
+        revoked: bool,
+        version: u32,
+    ) -> (PathBuf, String) {
+        assert!([1, 2].contains(&version));
         if !self.directory.exists() {
             fs::create_dir(&self.directory).unwrap();
             fs::set_permissions(&self.directory, fs::Permissions::from_mode(0o700)).unwrap();
@@ -75,7 +84,7 @@ impl Fixture {
             fs::set_permissions(lock, fs::Permissions::from_mode(0o600)).unwrap();
         }
         let record = serde_json::json!({
-            "version": 1,
+            "version": version,
             "grant_id": uuid::Uuid::new_v4(),
             "operator_id": "legacy-operator",
             "granted_at": "2026-09-27T10:00:00Z",
@@ -86,16 +95,31 @@ impl Fixture {
             "revoked_by": revoked.then_some("legacy-operator"),
             "revoked_at": revoked.then_some("2026-09-27T11:00:00Z"),
         });
+        let mut key_root = project.root().clone();
+        if version == 2 {
+            key_root.strategy = None;
+        }
         let name = domain::xcode_contract::canonical_digest(
-            "cw.xcode.project-trust-key.v1",
-            &serde_json::json!({"root": project.root(), "project_key": project.key()}),
+            if version == 2 {
+                "cw.xcode.project-trust-key.v2"
+            } else {
+                "cw.xcode.project-trust-key.v1"
+            },
+            &serde_json::json!({"root": key_root, "project_key": project.key()}),
         )
         .unwrap();
         let path = self.directory.join(format!("{name}.json"));
         fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        let digest =
-            domain::xcode_contract::canonical_digest("cw.xcode.project-trust.v1", &record).unwrap();
+        let digest = domain::xcode_contract::canonical_digest(
+            if version == 2 {
+                "cw.xcode.project-trust.v2"
+            } else {
+                "cw.xcode.project-trust.v1"
+            },
+            &record,
+        )
+        .unwrap();
         (path, digest)
     }
 
@@ -114,21 +138,29 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn legacy_worktree_grant_covers_writer_and_reader_without_changing_its_digest_or_files() {
-    for strategy in ["dedicated", "shared_implementation_worktree"] {
-        let f = Fixture::new();
-        let writer = f.worktree_project("dedicated");
-        let reader = f.worktree_project("shared_implementation_worktree");
-        let granted = f.worktree_project(strategy);
-        let (_, digest) = f.legacy_grant(&granted, false);
-        let before = f.snapshot();
-        assert_eq!(f.store().check(&writer).await.unwrap(), digest);
-        assert_eq!(f.store().check(&reader).await.unwrap(), digest);
-        assert_eq!(
-            f.snapshot(),
-            before,
-            "compatibility lookup must be read-only"
-        );
+async fn legacy_worktree_grants_require_explicit_v3_enrollment_without_changing_files() {
+    for version in [1, 2] {
+        for strategy in ["dedicated", "shared_implementation_worktree"] {
+            let f = Fixture::new();
+            let writer = f.worktree_project("dedicated");
+            let reader = f.worktree_project("shared_implementation_worktree");
+            let granted = f.worktree_project(strategy);
+            f.legacy_grant_version(&granted, false, version);
+            let before = f.snapshot();
+            for project in [&writer, &reader] {
+                assert_eq!(
+                    f.store().check(project).await.unwrap_err().to_string(),
+                    "project_trust_required"
+                );
+            }
+            assert_eq!(f.snapshot(), before, "legacy lookup must be read-only");
+            let digest = f.store().grant(&granted, "operator").unwrap();
+            assert_eq!(f.store().check(&writer).await.unwrap(), digest);
+            assert_eq!(f.store().check(&reader).await.unwrap(), digest);
+            for (path, bytes) in before {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
+        }
     }
 }
 
@@ -167,7 +199,7 @@ async fn independent_legacy_grants_require_explicit_regrant_instead_of_arbitrary
     for project in [&writer, &reader] {
         assert_eq!(
             f.store().check(project).await.unwrap_err().to_string(),
-            "project_trust_ambiguous"
+            "project_trust_required"
         );
     }
     assert_eq!(f.snapshot(), before);
@@ -198,7 +230,7 @@ async fn either_legacy_revocation_blocks_both_strategies_until_explicit_regrant(
         for project in [&writer, &reader] {
             assert_eq!(
                 f.store().check(project).await.unwrap_err().to_string(),
-                "project_trust_revoked"
+                "project_trust_required"
             );
         }
         assert_eq!(f.snapshot(), before);
@@ -283,7 +315,7 @@ async fn authoritative_worktree_record_never_falls_back_to_an_active_legacy_gran
         } else {
             f.store().revoke(&reader, "operator").unwrap();
         }
-        // Simulate a stale v1 writer restoring the old active slot. The v2
+        // Simulate a stale v1 writer restoring the old active slot. The v3
         // tombstone/corrupt record remains authoritative to upgraded readers.
         fs::write(legacy_path, legacy_bytes).unwrap();
         for project in [&writer, &reader] {
@@ -622,5 +654,276 @@ async fn missing_or_hardlinked_trust_lock_is_not_repaired() {
         assert_ne!(error.to_string(), "project_trust_required");
         assert!(f.store().grant(&f.project, "operator").is_err());
         assert_eq!(path.exists(), hardlink);
+    }
+}
+
+// These tests alter only persisted fixture evidence. Admission still observes
+// real APFS directories through the production observer and public API.
+fn rewrite_record(f: &Fixture, edit: impl FnOnce(&mut serde_json::Value)) {
+    let path = f.record();
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    edit(&mut record);
+    fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+}
+
+fn previous_device(record: &mut serde_json::Value, component: &str, cross_boot: bool) {
+    let observation = &mut record["filesystem"][component];
+    let historical_device = observation["device"].as_u64().unwrap() + 1;
+    observation["device"] = historical_device.into();
+    if cross_boot {
+        observation["boot_session_uuid"] = "bff3189b-e088-45c2-88ee-c63941ba0ddb".into();
+    }
+    if component == "root" {
+        record["root"]["device"] = historical_device.to_string().into();
+    } else {
+        record["project_key"]["device"] = historical_device.to_string().into();
+    }
+}
+
+#[tokio::test]
+async fn v3_native_apfs_grant_accepts_only_cross_boot_device_drift_without_rewriting() {
+    for cross_boot in [false, true] {
+        let f = Fixture::new();
+        f.store().grant(&f.project, "operator").unwrap();
+        rewrite_record(&f, |record| {
+            assert_eq!(record["version"], 3);
+            for component in ["root", "project"] {
+                assert_eq!(
+                    record["filesystem"][component]["persistent"]["filesystem"],
+                    "apfs"
+                );
+                assert!(
+                    record["filesystem"][component]["birth_sec"]
+                        .as_i64()
+                        .unwrap()
+                        > 0
+                );
+                previous_device(record, component, cross_boot);
+            }
+        });
+        let before = f.snapshot();
+        let result = f.store().check(&f.project).await;
+        if cross_boot {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "persistent_identity_changed"
+            );
+        }
+        assert_eq!(
+            f.snapshot(),
+            before,
+            "runtime reads never update historical evidence"
+        );
+    }
+}
+
+#[tokio::test]
+async fn v3_root_and_project_foreign_volume_replacement_and_unsupported_evidence_fail_closed() {
+    for component in ["root", "project"] {
+        for changed in ["volume", "birth", "unsupported", "missing", "boot_mismatch"] {
+            let f = Fixture::new();
+            f.store().grant(&f.project, "operator").unwrap();
+            rewrite_record(&f, |record| {
+                let observation = &mut record["filesystem"][component];
+                match changed {
+                    "volume" => {
+                        observation["persistent"]["volume_uuid"] =
+                            "bff3189b-e088-45c2-88ee-c63941ba0ddb".into()
+                    }
+                    "birth" => {
+                        observation["birth_nsec"] =
+                            ((observation["birth_nsec"].as_i64().unwrap() + 1) % 1_000_000_000)
+                                .into()
+                    }
+                    "unsupported" => observation["persistent"]["filesystem"] = "hfs".into(),
+                    "missing" => {
+                        observation.as_object_mut().unwrap().remove("persistent");
+                    }
+                    "boot_mismatch" => {
+                        observation["boot_session_uuid"] =
+                            "bff3189b-e088-45c2-88ee-c63941ba0ddb".into()
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            let before = f.snapshot();
+            assert!(
+                f.store().check(&f.project).await.is_err(),
+                "{component}/{changed}"
+            );
+            assert!(
+                f.store().grant(&f.project, "operator").is_err(),
+                "{component}/{changed}"
+            );
+            assert_eq!(
+                f.snapshot(),
+                before,
+                "damaged evidence cannot be repaired by grant"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_v2_exact_corruption_blocks_enrollment_and_revocation() {
+    let f = Fixture::new();
+    let writer = f.worktree_project("dedicated");
+    let reader = f.worktree_project("shared_implementation_worktree");
+    let (path, _) = f.legacy_grant_version(&writer, false, 2);
+    fs::write(path, b"{broken").unwrap();
+    let before = f.snapshot();
+    assert!(f.store().grant(&reader, "operator").is_err());
+    assert!(f.store().revoke(&reader, "operator").is_err());
+    assert_eq!(f.snapshot(), before);
+}
+
+#[tokio::test]
+async fn legacy_v2_revocation_publishes_denial_and_explicit_enrollment_preserves_legacy_bytes() {
+    let f = Fixture::new();
+    let writer = f.worktree_project("dedicated");
+    let reader = f.worktree_project("shared_implementation_worktree");
+    let (path, _) = f.legacy_grant_version(&writer, false, 2);
+    f.store().revoke(&reader, "operator").unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let revoked: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(revoked["version"], 2);
+    assert!(revoked["revoked_at"].is_string());
+    assert_eq!(
+        f.store().check(&writer).await.unwrap_err().to_string(),
+        "project_trust_revoked"
+    );
+    f.store().grant(&writer, "operator").unwrap();
+    assert!(f.store().check(&reader).await.is_ok());
+    assert_eq!(fs::read(path).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn legacy_repository_slots_never_authorize_and_old_device_slots_are_not_scanned_or_rewritten()
+{
+    for old_device in [false, true] {
+        let f = Fixture::new();
+        let (mut path, _) = f.legacy_grant(&f.project, false);
+        if old_device {
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            for field in ["root", "project_key"] {
+                record[field]["device"] = (record[field]["device"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+                    + 1)
+                .to_string()
+                .into();
+            }
+            let old_name = domain::xcode_contract::canonical_digest(
+                "cw.xcode.project-trust-key.v1",
+                &serde_json::json!({"root": record["root"], "project_key": record["project_key"]}),
+            )
+            .unwrap();
+            let old_path = f.directory.join(format!("{old_name}.json"));
+            fs::rename(path, &old_path).unwrap();
+            fs::write(&old_path, serde_json::to_vec(&record).unwrap()).unwrap();
+            path = old_path;
+        }
+        let before = f.snapshot();
+        let legacy_bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            f.store().check(&f.project).await.unwrap_err().to_string(),
+            "project_trust_required"
+        );
+        if old_device {
+            assert_eq!(
+                f.store()
+                    .revoke(&f.project, "operator")
+                    .unwrap_err()
+                    .to_string(),
+                "project_trust_required"
+            );
+        }
+        assert_eq!(f.snapshot(), before);
+        f.store().grant(&f.project, "operator").unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            legacy_bytes,
+            "grant preserves every historical slot"
+        );
+        assert!(f.store().check(&f.project).await.is_ok());
+        f.store().revoke(&f.project, "operator").unwrap();
+        assert_eq!(
+            f.store().check(&f.project).await.unwrap_err().to_string(),
+            "project_trust_revoked"
+        );
+        if old_device {
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                legacy_bytes,
+                "revoke never scans old-device slots"
+            );
+        } else {
+            let legacy: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert!(
+                legacy["revoked_at"].is_string(),
+                "discoverable exact legacy slots are revoked"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn v3_evidence_is_mandatory_and_duplicate_identity_fields_are_rejected() {
+    for damage in ["missing", "legacy_version", "duplicate"] {
+        let f = Fixture::new();
+        f.store().grant(&f.project, "operator").unwrap();
+        let path = f.record();
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        match damage {
+            "missing" => {
+                record.as_object_mut().unwrap().remove("filesystem");
+            }
+            "legacy_version" => {
+                record["version"] = 1.into();
+                record.as_object_mut().unwrap().remove("filesystem");
+            }
+            "duplicate" => (),
+            _ => unreachable!(),
+        }
+        let mut bytes = serde_json::to_string(&record).unwrap();
+        if damage == "duplicate" {
+            bytes = bytes.replacen("\"birth_sec\":", "\"birth_sec\":1,\"birth_sec\":", 1);
+        }
+        fs::write(path, bytes).unwrap();
+        let before = f.snapshot();
+        assert!(f.store().check(&f.project).await.is_err(), "{damage}");
+        assert!(f.store().grant(&f.project, "operator").is_err(), "{damage}");
+        assert!(
+            f.store().revoke(&f.project, "operator").is_err(),
+            "{damage}"
+        );
+        assert_eq!(f.snapshot(), before);
+    }
+}
+
+#[test]
+fn legacy_schema_does_not_accept_a_null_v3_identity_extension() {
+    for version in [1, 2] {
+        let f = Fixture::new();
+        let writer = f.worktree_project("dedicated");
+        let (path, _) = f.legacy_grant_version(&writer, false, version);
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record["filesystem"] = serde_json::Value::Null;
+        fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let before = f.snapshot();
+        assert!(
+            f.store().grant(&writer, "operator").is_err(),
+            "legacy {version} accepted a field outside its schema"
+        );
+        assert!(f.store().revoke(&writer, "operator").is_err());
+        assert_eq!(f.snapshot(), before);
     }
 }

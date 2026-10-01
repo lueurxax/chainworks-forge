@@ -773,6 +773,80 @@ async fn hold_blocks_both_path_replacement_and_device_inode_alias() {
 }
 
 #[tokio::test]
+async fn reboot_and_rename_cannot_escape_unknown_holds_or_rewrite_history() {
+    let mut f = Fixture::new().await;
+    let i = intent();
+    let mut alias = i.clone();
+    alias.operation_key = Uuid::new_v4();
+    alias.project_key.canonical_path = "/moved/App.xcodeproj".into();
+    alias.project_key.device = "8".into();
+    let waiting = prepared(&f, &alias).await;
+    let original = dispatched(&f, &i).await;
+    let unknown = journal::complete(
+        f.tx().await,
+        &i.owner_lineage,
+        original.attempt_id,
+        original.revision,
+        &Completion::Unknown {
+            reason: UncertaintyReason::TransportLost,
+        },
+        now(2),
+    )
+    .await
+    .unwrap();
+    let raw_attempt: String = sqlx::query_scalar("SELECT json_object('intent', intent_json, 'key', project_key, 'state', state, 'revision', revision, 'outcome', outcome_json, 'digest', result_digest, 'settlement', settlement_proof_json, 'reconciliation', reconciliation_json, 'updated', updated_at) FROM xcode_effect_attempts WHERE attempt_id = ?")
+        .bind(unknown.attempt_id.to_string()).fetch_one(&f.pool).await.unwrap();
+    let raw_hold: String = sqlx::query_scalar("SELECT json_object('key', project_key, 'attempt', attempt_id, 'uid', uid, 'path', canonical_path, 'device', device, 'inode', inode) FROM xcode_project_holds")
+        .fetch_one(&f.pool).await.unwrap();
+    f.reopen().await;
+    assert!(journal::project_is_held(&f.pool, &alias.project_key)
+        .await
+        .unwrap());
+    assert!(matches!(
+        journal::dispatch(
+            f.tx().await,
+            &alias.owner_lineage,
+            waiting.nonce,
+            &alias.request_digest,
+            0,
+            now(3)
+        )
+        .await,
+        Err(JournalError::ProjectHeld)
+    ));
+    alias.operation_key = Uuid::new_v4();
+    assert!(matches!(
+        journal::prepare(f.tx().await, &alias, now(3)).await,
+        Err(JournalError::ProjectHeld)
+    ));
+    // A replaced object at the original path is also fenced across device drift.
+    alias.project_key.canonical_path = i.project_key.canonical_path.clone();
+    alias.project_key.inode = "123".into();
+    assert!(journal::project_is_held(&f.pool, &alias.project_key)
+        .await
+        .unwrap());
+    assert!(matches!(
+        journal::prepare(f.tx().await, &alias, now(3)).await,
+        Err(JournalError::ProjectHeld)
+    ));
+    assert_eq!(
+        journal::get(&f.pool, &i.owner_lineage, unknown.attempt_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        unknown
+    );
+    let current_attempt: String = sqlx::query_scalar("SELECT json_object('intent', intent_json, 'key', project_key, 'state', state, 'revision', revision, 'outcome', outcome_json, 'digest', result_digest, 'settlement', settlement_proof_json, 'reconciliation', reconciliation_json, 'updated', updated_at) FROM xcode_effect_attempts WHERE attempt_id = ?")
+        .bind(unknown.attempt_id.to_string()).fetch_one(&f.pool).await.unwrap();
+    let current_hold: String = sqlx::query_scalar("SELECT json_object('key', project_key, 'attempt', attempt_id, 'uid', uid, 'path', canonical_path, 'device', device, 'inode', inode) FROM xcode_project_holds")
+        .fetch_one(&f.pool).await.unwrap();
+    assert_eq!(current_attempt, raw_attempt);
+    assert_eq!(current_hold, raw_hold);
+    assert_eq!(f.holds().await, 1);
+    f.close().await;
+}
+
+#[tokio::test]
 async fn recovery_batch_with_stale_revision_rolls_back_every_attempt() {
     let f = Fixture::new().await;
     let i = intent();
